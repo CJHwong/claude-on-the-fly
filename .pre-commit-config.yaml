@@ -1,0 +1,36 @@
+default_stages:
+- commit
+- push
+fail_fast: false
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    -   id: end-of-file-fixer
+    -   id: trailing-whitespace
+    -   id: check-json
+    -   id: check-yaml
+        exclude: ^deployment/kubernetes/charts
+    -   id: check-toml
+    -   id: check-xml
+    -   id: check-executables-have-shebangs
+    -   id: check-shebang-scripts-are-executable
+    -   id: check-merge-conflict
+    -   id: check-added-large-files
+    -   id: debug-statements
+    -   id: detect-private-key
+-   repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+    -   id: gitleaks
+        entry: gitleaks detect --verbose --redact
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.1
+    hooks:
+    -   id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+    -   id: ruff-format
+-   repo: https://github.com/allganize/ty-pre-commit
+    rev: v0.0.17
+    hooks:
+    -   id: ty-check
