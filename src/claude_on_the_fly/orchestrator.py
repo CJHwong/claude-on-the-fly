@@ -69,9 +69,21 @@ class Orchestrator:
             await self._frontend.send_typing(chat_id)
             await asyncio.sleep(4)
 
+    @staticmethod
+    def _ensure_persona(workspace: Path) -> None:
+        """Symlink the global CLAUDE.md persona into the workspace if it exists."""
+        source = DATA_DIR / "CLAUDE.md"
+        if not source.is_file():
+            return
+        target = workspace / "CLAUDE.md"
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        target.symlink_to(source)
+
     async def _process(self, chat_id: int, text: str) -> None:
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
+        self._ensure_persona(workspace)
         session = self.session_uuid(chat_id)
         is_resume = chat_id in self._started
 
