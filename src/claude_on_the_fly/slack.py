@@ -65,6 +65,10 @@ class SlackFrontend(Frontend):
         self._orchestrator: object | None = None
         self._sessions: dict[int, tuple[str, str | None]] = {}
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
+        self._processed_ts: deque[str] = deque(maxlen=1000)
+        self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
+        self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
+        self._connected_once = False
         self._workspace_names: dict[int, str] = {}
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
@@ -90,63 +94,114 @@ class SlackFrontend(Frontend):
         @self._app.event({"type": "message"})
         async def handle_message(event, say):
             logger.debug("raw slack event: %s", event)
-            if event.get("subtype"):
-                logger.debug("skipped: subtype=%s", event.get("subtype"))
-                return
-            sender_id = event.get("user", "")
-            if event.get("ts") in self._our_sent_timestamps:
-                logger.debug("skipped: our own message ts=%s", event.get("ts"))
-                return
-            text = event.get("text", "")
-            channel = event.get("channel")
-            thread_ts = event.get("thread_ts") or event.get("ts")
-            channel_type = event.get("channel_type", "")
-            logger.debug(
-                "parsed: sender=%s channel=%s channel_type=%s thread_ts=%s text=%s",
-                sender_id,
-                channel,
-                channel_type,
-                thread_ts,
-                text[:80],
-            )
+            await self._ingest_event(event)
 
-            # Channels: only allowed users, only @mentions
-            if channel_type in ("channel", "group"):
-                if sender_id not in self._allowed_user_ids:
-                    logger.debug(
-                        "skipped: sender %s not in allowed_user_ids", sender_id
-                    )
-                    return
-                mention = f"<@{self._user_id}>"
-                if mention not in text:
-                    logger.debug("skipped: no mention of %s in text", self._user_id)
-                    return
-                text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
-
-            if not text:
-                logger.debug("skipped: empty text after processing")
-                return
-
-            session_id = _session_key(channel, thread_ts)
-            self._sessions[session_id] = (channel, thread_ts)
-            logger.debug(
-                "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
-            )
-
-            sender = await self._resolve_sender(event.get("user", "unknown"))
-            self._sender_names[session_id] = sender
-            await self._resolve_session_metadata(
-                session_id, sender, channel, channel_type, thread_ts
-            )
-            text = f"[from: {sender}] {text}"
-
-            logger.info("slack %s/%s: %s", channel, thread_ts, text[:80])
-            if self._on_message:
-                await self._on_message(session_id, text)
+        self._app.event("hello")(self._on_hello)
 
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         await self._handler.start_async()
         logger.info("Slack connected via Socket Mode (user_id=%s)", self._user_id)
+
+    async def _on_hello(self, event, say):
+        if not self._connected_once:
+            self._connected_once = True
+            logger.info("Socket Mode: initial connection")
+            return
+        logger.info("Socket Mode: reconnected, running catch-up")
+        await self._catchup()
+
+    async def _ingest_event(self, event: dict) -> None:
+        if event.get("subtype"):
+            logger.debug("skipped: subtype=%s", event.get("subtype"))
+            return
+        ts = event.get("ts", "")
+        sender_id = event.get("user", "")
+        if ts in self._our_sent_timestamps:
+            logger.debug("skipped: our own message ts=%s", ts)
+            return
+        if ts in self._processed_ts:
+            logger.debug("skipped: already processed ts=%s", ts)
+            return
+        text = event.get("text", "")
+        channel: str = event.get("channel", "")
+        if not channel:
+            logger.debug("skipped: no channel in event")
+            return
+        thread_ts: str = event.get("thread_ts") or ts
+        channel_type: str = event.get("channel_type") or self._channel_types.get(
+            channel, ""
+        )
+        logger.debug(
+            "parsed: sender=%s channel=%s channel_type=%s thread_ts=%s text=%s",
+            sender_id,
+            channel,
+            channel_type,
+            thread_ts,
+            text[:80],
+        )
+
+        # Channels: only allowed users, only @mentions
+        if channel_type in ("channel", "group"):
+            if sender_id not in self._allowed_user_ids:
+                logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
+                return
+            mention = f"<@{self._user_id}>"
+            if mention not in text:
+                logger.debug("skipped: no mention of %s in text", self._user_id)
+                return
+            text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
+
+        if not text:
+            logger.debug("skipped: empty text after processing")
+            return
+
+        self._processed_ts.append(ts)
+        self._active_channels[channel] = ts
+        if channel_type:
+            self._channel_types[channel] = channel_type
+
+        session_id = _session_key(channel, thread_ts)
+        self._sessions[session_id] = (channel, thread_ts)
+        logger.debug(
+            "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
+        )
+
+        sender = await self._resolve_sender(event.get("user", "unknown"))
+        self._sender_names[session_id] = sender
+        await self._resolve_session_metadata(
+            session_id, sender, channel, channel_type, thread_ts
+        )
+        text = f"[from: {sender}] {text}"
+
+        logger.info("slack %s/%s: %s", channel, thread_ts, text[:80])
+        if self._on_message:
+            await self._on_message(session_id, text)
+
+    async def _catchup(self) -> None:
+        """Fetch recent messages from active channels to recover missed events."""
+        if not self._active_channels:
+            return
+        for channel, last_ts in list(self._active_channels.items()):
+            try:
+                resp = await self._app.client.conversations_history(
+                    channel=channel, oldest=last_ts, inclusive=False, limit=20
+                )
+            except Exception as exc:
+                logger.warning(
+                    "catch-up: failed to fetch history for %s: %s", channel, exc
+                )
+                continue
+            messages = resp.get("messages", [])
+            if not messages:
+                continue
+            logger.info("catch-up: %d new messages in %s", len(messages), channel)
+            cached_type = self._channel_types.get(channel, "")
+            for msg in sorted(messages, key=lambda m: m.get("ts", "")):
+                if "channel" not in msg:
+                    msg["channel"] = channel
+                if "channel_type" not in msg:
+                    msg["channel_type"] = cached_type
+                await self._ingest_event(msg)
 
     async def stop(self) -> None:
         if self._handler:
