@@ -110,21 +110,10 @@ async def run(
     ]
 
     if is_resume:
-        try:
-            cli_output = await _exec(
-                workspace, [*base, "--resume", session_uuid, prompt]
-            )
-        except RuntimeError:
-            logger.warning(
-                "Resume failed for %s, falling back to new session", session_uuid
-            )
-            cli_output = await _exec(
-                workspace, [*base, "--session-id", session_uuid, prompt]
-            )
+        cmd = [*base, "--resume", session_uuid, prompt]
     else:
-        cli_output = await _exec(
-            workspace, [*base, "--session-id", session_uuid, prompt]
-        )
+        cmd = [*base, "--session-id", session_uuid, prompt]
+    cli_output = await _exec(workspace, cmd)
 
     usage = cli_output.get("usage", {})
     return Response(

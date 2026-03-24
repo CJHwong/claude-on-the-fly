@@ -67,18 +67,17 @@ class SlackFrontend(Frontend):
             if event.get("subtype"):
                 return
             sender_id = event.get("user", "")
-            if sender_id == self._user_id:
+            if event.get("ts") in self._our_sent_timestamps:
                 return
-            if sender_id not in self._allowed_user_ids:
-                return
-
             text = event.get("text", "")
             channel = event.get("channel")
             thread_ts = event.get("thread_ts") or event.get("ts")
             channel_type = event.get("channel_type", "")
 
-            # In channels, only respond to @mentions
+            # Channels: only allowed users, only @mentions
             if channel_type in ("channel", "group"):
+                if sender_id not in self._allowed_user_ids:
+                    return
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
                     return

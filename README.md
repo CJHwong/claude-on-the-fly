@@ -103,9 +103,9 @@ uv run claude-slack
 
 ### How It Works
 
-- Only messages from allowed users are processed (your `SLACK_USER_ID` + anyone in `SLACK_ALLOWED_USER_IDS`)
-- Someone DMs you -> Claude responds as you (via user token) in a thread
-- Someone @mentions you in a channel -> Claude responds in a thread
+- Anyone who DMs you triggers Claude (if they can DM you, they're trusted)
+- In channels, only allowed users (`SLACK_USER_ID` + `SLACK_ALLOWED_USER_IDS`) can trigger Claude via @mention
+- Claude responds as you (via user token) in a thread
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
 
