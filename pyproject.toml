@@ -17,9 +17,20 @@ claude-telegram = "claude_on_the_fly.telegram:main"
 claude-slack = "claude_on_the_fly.slack:main"
 claude-gmail = "claude_on_the_fly.gmail:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+    "pytest-cov>=6.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_on_the_fly"]
