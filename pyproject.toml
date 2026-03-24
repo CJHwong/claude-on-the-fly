@@ -1,7 +1,7 @@
 [project]
 name = "claude-on-the-fly"
 version = "0.1.0"
-description = "Remote access to Claude Code via Telegram and Slack"
+description = "Remote access to Claude Code via Telegram, Slack, and Gmail"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 claude-telegram = "claude_on_the_fly.telegram:main"
 claude-slack = "claude_on_the_fly.slack:main"
+claude-gmail = "claude_on_the_fly.gmail:main"
 
 [build-system]
 requires = ["hatchling"]

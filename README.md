@@ -2,7 +2,7 @@
 
 > **Experimental.** This is a personal project, not production software. It spawns Claude Code with `--permission-mode bypassPermissions`, meaning Claude has full read/write access to files on the host machine within its workspace. Use at your own risk. Do not run this on a machine with sensitive data you wouldn't want an LLM to access.
 
-Remote access to Claude Code via Telegram and Slack. Send a message, get Claude working on it, see the response with cost/latency/token stats.
+Remote access to Claude Code via Telegram, Slack, and Gmail. Send a message, get Claude working on it, see the response with cost/latency/token stats.
 
 ## Prerequisites
 
@@ -23,6 +23,11 @@ export SLACK_APP_TOKEN=xapp-...
 export SLACK_USER_TOKEN=xoxp-...
 export SLACK_USER_ID=UXXXXXXXX
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
+
+# Gmail
+export GMAIL_GCP_PROJECT=your-gcp-project
+export GMAIL_ALLOWED_SENDERS=alice@example.com,bob@example.com
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-gmail
 ```
 
 ## Local Development
@@ -31,7 +36,7 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
 git clone https://github.com/CJHwong/claude-on-the-fly && cd claude-on-the-fly
 cp .env.example .env  # fill in your tokens
 uv sync
-uv run claude-telegram  # or claude-slack
+uv run claude-telegram  # or claude-slack, claude-gmail
 ```
 
 ## Telegram Setup (2 minutes)
@@ -109,7 +114,36 @@ uv run claude-slack
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
 
-## Running Both
+## Gmail Setup (5 minutes)
+
+### Prerequisites
+
+- [gws CLI](https://github.com/googleworkspace/cli) installed and authenticated (`gws auth login`)
+- A GCP project with Gmail API and Pub/Sub API enabled
+- OAuth scope `gmail.modify`
+
+### Run
+
+```bash
+export GMAIL_GCP_PROJECT="your-gcp-project-id"
+export GMAIL_ALLOWED_SENDERS="alice@example.com,bob@example.com"
+# Optional: polling interval in seconds (default: 5)
+# export GMAIL_POLL_INTERVAL=10
+uv run claude-gmail
+```
+
+### How It Works
+
+- On startup, sweeps existing unread inbox for emails from allowed senders
+- Then watches for new emails via Gmail Pub/Sub push notifications (`gws gmail +watch`)
+- Only emails from `GMAIL_ALLOWED_SENDERS` trigger Claude sessions
+- Auto-generated emails (Jira, GitHub notifications, etc.) are filtered out
+- Each email thread = one Claude session with memory
+- Claude replies as you via `gws gmail +reply`
+- Quoted reply content is stripped (Claude already has session history)
+- If the watch process dies, it auto-restarts with exponential backoff
+
+## Running All
 
 ```bash
 # Terminal 1
@@ -117,6 +151,9 @@ TELEGRAM_BOT_TOKEN=... TELEGRAM_ALLOWED_USER_ID=... uv run claude-telegram
 
 # Terminal 2
 SLACK_APP_TOKEN=... SLACK_USER_TOKEN=... SLACK_USER_ID=... SLACK_ALLOWED_USER_IDS=... uv run claude-slack
+
+# Terminal 3
+GMAIL_GCP_PROJECT=... GMAIL_ALLOWED_SENDERS=... uv run claude-gmail
 ```
 
 Or use a `.env` file with all vars and a process manager.
@@ -131,6 +168,9 @@ Or use a `.env` file with all vars and a process manager.
 | `SLACK_USER_TOKEN` | Slack | User OAuth token (`xoxp-...`) to post as you |
 | `SLACK_USER_ID` | Slack | Your Slack member ID |
 | `SLACK_ALLOWED_USER_IDS` | Slack (optional) | Comma-separated additional allowed user IDs |
+| `GMAIL_GCP_PROJECT` | Gmail | GCP project ID (for Pub/Sub) |
+| `GMAIL_ALLOWED_SENDERS` | Gmail | Comma-separated email addresses that can trigger Claude |
+| `GMAIL_POLL_INTERVAL` | Gmail (optional) | Seconds between Pub/Sub pulls (default: 5) |
 
 
 ## Persona (CLAUDE.md)
@@ -161,6 +201,7 @@ src/claude_on_the_fly/
   protocol.py     # Frontend protocol (for adding new interfaces)
   telegram.py     # Telegram frontend
   slack.py        # Slack frontend
+  gmail.py        # Gmail frontend
 ```
 
 Each frontend implements the `Frontend` protocol (start, send, send_typing, stop) and plugs into the shared orchestrator. The orchestrator manages sessions, queues messages, and runs Claude Code via subprocess.

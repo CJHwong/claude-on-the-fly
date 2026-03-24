@@ -26,6 +26,10 @@ FORMAT_HINTS = {
         "*bold*, _italic_, `inline code`, ```code blocks```, - for lists. "
         "Do NOT use # headings, --- dividers, or ** for bold."
     ),
+    "gmail": (
+        "Format responses as plain text. No markdown, no HTML. "
+        "Use line breaks for structure. Keep it concise."
+    ),
 }
 
 

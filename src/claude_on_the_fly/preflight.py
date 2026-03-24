@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -81,6 +82,28 @@ async def check_slack(app_token: str, user_token: str, user_id: str) -> None:
         logger.info("Slack app token: format ok")
 
 
+def check_gws_cli() -> None:
+    """Verify gws CLI is installed and authenticated with Gmail scope."""
+    if not shutil.which("gws"):
+        raise SystemExit(
+            "gws CLI not found. Install it: npm install -g @googleworkspace/cli"
+        )
+    result = subprocess.run(
+        ["gws", "auth", "status"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"gws auth check failed: {result.stderr.strip()}")
+    status = json.loads(result.stdout)
+    if not status.get("token_valid"):
+        raise SystemExit("gws token invalid. Run: gws auth login")
+    if "gmail.googleapis.com" not in status.get("enabled_apis", []):
+        raise SystemExit("Gmail API not enabled in GCP project. Enable it first.")
+    logger.info("gws CLI: ok (user: %s)", status.get("user", "unknown"))
+
+
 def _setup_logging() -> None:
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -117,3 +140,18 @@ def run_slack() -> tuple[str, str, str, set[str]]:
     check_claude_cli()
     asyncio.run(check_slack(app_token, user_token, user_id))
     return app_token, user_token, user_id, allowed_user_ids
+
+
+def run_gmail() -> tuple[str, set[str]]:
+    """Validate env vars and gws CLI. Returns (gcp_project, allowed_senders)."""
+    _setup_logging()
+    gcp_project = require_env("GMAIL_GCP_PROJECT")
+    allowed_raw = require_env("GMAIL_ALLOWED_SENDERS")
+    allowed_senders = {s.strip() for s in allowed_raw.split(",") if s.strip()}
+    if not allowed_senders:
+        raise SystemExit(
+            "GMAIL_ALLOWED_SENDERS must contain at least one email address"
+        )
+    check_claude_cli()
+    check_gws_cli()
+    return gcp_project, allowed_senders
