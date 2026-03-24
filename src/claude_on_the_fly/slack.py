@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from collections import deque
@@ -19,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 def _session_key(channel: str, thread_ts: str | None) -> int:
-    return hash(f"{channel}:{thread_ts or 'root'}")
+    raw = f"{channel}:{thread_ts or 'root'}"
+    return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
 
 
 class SlackFrontend(Frontend):
@@ -117,9 +119,13 @@ class SlackFrontend(Frontend):
             return
         channel, thread_ts = route
 
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": response.body}}
-        ]
+        blocks = []
+        body = response.body
+        while body:
+            chunk, body = body[:3000], body[3000:]
+            blocks.append(
+                {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+            )
         if response.has_stats:
             blocks.append(
                 {

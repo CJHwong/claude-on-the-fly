@@ -22,7 +22,6 @@ class Orchestrator:
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
-        self._started: set[int] = set()
         self._session_counters: dict[int, int] = {}
         self._queues: dict[int, asyncio.Queue] = {}
 
@@ -33,7 +32,6 @@ class Orchestrator:
 
     def reset_session(self, chat_id: int) -> None:
         self._session_counters[chat_id] = self._session_counters.get(chat_id, 0) + 1
-        self._started.discard(chat_id)
 
     def is_busy(self, chat_id: int) -> bool:
         return chat_id in self._running and not self._running[chat_id].done()
@@ -85,7 +83,6 @@ class Orchestrator:
         workspace.mkdir(parents=True, exist_ok=True)
         self._ensure_persona(workspace)
         session = self.session_uuid(chat_id)
-        is_resume = chat_id in self._started
 
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
         try:
@@ -93,12 +90,10 @@ class Orchestrator:
                 workspace,
                 session,
                 text,
-                is_resume,
                 self._platform,
                 user_name=self._frontend.sender_name(chat_id),
                 channel_context=self._frontend.channel_context(chat_id),
             )
-            self._started.add(chat_id)
             await self._frontend.send(chat_id, response)
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)

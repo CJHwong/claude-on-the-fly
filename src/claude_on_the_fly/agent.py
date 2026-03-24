@@ -91,7 +91,6 @@ async def run(
     workspace: Path,
     session_uuid: str,
     prompt: str,
-    is_resume: bool,
     platform: str,
     user_name: str = "unknown",
     channel_context: str = "dm",
@@ -109,11 +108,13 @@ async def run(
         system_prompt,
     ]
 
-    if is_resume:
-        cmd = [*base, "--resume", session_uuid, prompt]
-    else:
-        cmd = [*base, "--session-id", session_uuid, prompt]
-    cli_output = await _exec(workspace, cmd)
+    try:
+        cli_output = await _exec(workspace, [*base, "--resume", session_uuid, prompt])
+    except RuntimeError as exc:
+        logger.info("Resume failed (%s), creating new session %s", exc, session_uuid)
+        cli_output = await _exec(
+            workspace, [*base, "--session-id", session_uuid, prompt]
+        )
 
     usage = cli_output.get("usage", {})
     return Response(

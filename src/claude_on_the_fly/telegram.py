@@ -269,6 +269,8 @@ class TelegramFrontend(Frontend):
             if group["caption"]
             else "\nPlease review the uploaded files."
         )
+        sender = self._chat_names.get(chat_id, "unknown")
+        text = f"[from: {sender}] {text}"
         logger.info("chat %s: %s", chat_id, text[:80])
         if self._on_message:
             await self._on_message(chat_id, text)
