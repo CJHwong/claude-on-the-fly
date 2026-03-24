@@ -15,6 +15,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Testing
+.coverage
+
 # Secrets
 .env
 
