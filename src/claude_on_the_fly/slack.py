@@ -223,16 +223,43 @@ class SlackFrontend(Frontend):
 
         if channel_type == "im":
             self._workspace_names[session_id] = f"dm-{sender}-{short_ts}"
-            self._channel_contexts[session_id] = "dm"
-        else:
-            try:
-                info = await self._app.client.conversations_info(channel=channel)
-                name = info["channel"]["name"]
-            except Exception as exc:
-                logger.warning("Failed to resolve channel %s: %s", channel, exc)
-                name = channel
+            self._channel_contexts[session_id] = "dm (private)"
+            return
+
+        try:
+            info = await self._app.client.conversations_info(channel=channel)
+            ch = info["channel"]
+            name = ch["name"]
+        except Exception as exc:
+            logger.warning("Failed to resolve channel %s: %s", channel, exc)
+            self._workspace_names[session_id] = f"{channel}-{short_ts}"
+            self._channel_contexts[session_id] = f"channel:{channel}"
+            return
+
+        if ch.get("is_mpim"):
+            members = await self._resolve_mpim_members(channel)
             self._workspace_names[session_id] = f"{name}-{short_ts}"
-            self._channel_contexts[session_id] = f"channel:#{name}"
+            context = f"group-dm (private)\nParticipants: {', '.join(members)}"
+            self._channel_contexts[session_id] = context
+        else:
+            visibility = "private" if ch.get("is_private") else "public"
+            self._workspace_names[session_id] = f"{name}-{short_ts}"
+            self._channel_contexts[session_id] = f"channel:#{name} ({visibility})"
+
+    async def _resolve_mpim_members(self, channel: str) -> list[str]:
+        """Resolve display names of all members in a group DM."""
+        try:
+            resp = await self._app.client.conversations_members(channel=channel)
+            member_ids = resp.get("members", [])
+        except Exception as exc:
+            logger.warning("Failed to list mpim members for %s: %s", channel, exc)
+            return ["unknown"]
+        names = []
+        for uid in member_ids:
+            if uid == self._user_id:
+                continue
+            names.append(await self._resolve_sender(uid))
+        return names or ["unknown"]
 
 
 def main() -> None:
