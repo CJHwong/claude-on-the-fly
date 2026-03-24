@@ -12,6 +12,9 @@
   },
   "oauth_config": {
     "scopes": {
+      "bot": [
+        "users:read"
+      ],
       "user": [
         "channels:history",
         "channels:read",
@@ -20,6 +23,13 @@
         "groups:read",
         "im:history",
         "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
+        "search:read",
+        "usergroups:read",
+        "usergroups:write",
         "users:read"
       ]
     }
