@@ -82,8 +82,9 @@ async def check_slack(app_token: str, user_token: str, user_id: str) -> None:
 
 
 def _setup_logging() -> None:
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
@@ -112,6 +113,7 @@ def run_slack() -> tuple[str, str, str, set[str]]:
     user_id = require_env("SLACK_USER_ID")
     allowed_raw = os.environ.get("SLACK_ALLOWED_USER_IDS", "")
     allowed_user_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
+    logger.debug("preflight: user_id=%s allowed_user_ids=%s", user_id, allowed_user_ids)
     check_claude_cli()
     asyncio.run(check_slack(app_token, user_token, user_id))
     return app_token, user_token, user_id, allowed_user_ids

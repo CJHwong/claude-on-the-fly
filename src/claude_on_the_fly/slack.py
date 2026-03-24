@@ -56,6 +56,9 @@ class SlackFrontend(Frontend):
         self._user_id = user_id
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
+        logger.debug(
+            "init: user_id=%s, allowed_user_ids=%s", user_id, self._allowed_user_ids
+        )
         self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
@@ -86,30 +89,49 @@ class SlackFrontend(Frontend):
 
         @self._app.event({"type": "message"})
         async def handle_message(event, say):
+            logger.debug("raw slack event: %s", event)
             if event.get("subtype"):
+                logger.debug("skipped: subtype=%s", event.get("subtype"))
                 return
             sender_id = event.get("user", "")
             if event.get("ts") in self._our_sent_timestamps:
+                logger.debug("skipped: our own message ts=%s", event.get("ts"))
                 return
             text = event.get("text", "")
             channel = event.get("channel")
             thread_ts = event.get("thread_ts") or event.get("ts")
             channel_type = event.get("channel_type", "")
+            logger.debug(
+                "parsed: sender=%s channel=%s channel_type=%s thread_ts=%s text=%s",
+                sender_id,
+                channel,
+                channel_type,
+                thread_ts,
+                text[:80],
+            )
 
             # Channels: only allowed users, only @mentions
             if channel_type in ("channel", "group"):
                 if sender_id not in self._allowed_user_ids:
+                    logger.debug(
+                        "skipped: sender %s not in allowed_user_ids", sender_id
+                    )
                     return
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
+                    logger.debug("skipped: no mention of %s in text", self._user_id)
                     return
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
             if not text:
+                logger.debug("skipped: empty text after processing")
                 return
 
             session_id = _session_key(channel, thread_ts)
             self._sessions[session_id] = (channel, thread_ts)
+            logger.debug(
+                "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
+            )
 
             sender = await self._resolve_sender(event.get("user", "unknown"))
             self._sender_names[session_id] = sender
@@ -124,7 +146,7 @@ class SlackFrontend(Frontend):
 
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         await self._handler.start_async()
-        logger.info("Slack bot connected via Socket Mode.")
+        logger.info("Slack connected via Socket Mode (user_id=%s)", self._user_id)
 
     async def stop(self) -> None:
         if self._handler:
@@ -138,6 +160,9 @@ class SlackFrontend(Frontend):
             logger.error("No channel found for session %s", chat_id)
             return
         channel, thread_ts = route
+        logger.debug(
+            "send: session=%s channel=%s thread_ts=%s", chat_id, channel, thread_ts
+        )
 
         blocks = []
         for chunk in _split_blocks(response.body):
@@ -152,14 +177,20 @@ class SlackFrontend(Frontend):
                 }
             )
 
-        resp = await self._app.client.chat_postMessage(
-            channel=channel,
-            text=response.body,
-            blocks=blocks,
-            thread_ts=thread_ts,
-        )
-        if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel,
+                text=response.body,
+                blocks=blocks,
+                thread_ts=thread_ts,
+            )
+            if resp.get("ok"):
+                self._our_sent_timestamps.append(resp["ts"])
+                logger.debug("send: ok ts=%s", resp["ts"])
+            else:
+                logger.warning("send: slack responded not ok: %s", resp)
+        except Exception as exc:
+            logger.error("send: failed to post message: %s", exc)
 
     async def send_typing(self, chat_id: int) -> None:
         pass

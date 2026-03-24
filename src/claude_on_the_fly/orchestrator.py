@@ -41,15 +41,18 @@ class Orchestrator:
         return queue.qsize() if queue else 0
 
     async def on_message(self, chat_id: int, text: str) -> None:
+        logger.debug("on_message: chat_id=%s text=%s", chat_id, text[:80])
         if chat_id not in self._queues:
             self._queues[chat_id] = asyncio.Queue()
         self._queues[chat_id].put_nowait(text)
         if self.is_busy(chat_id):
             queued = self._queues[chat_id].qsize()
+            logger.debug("on_message: chat_id=%s busy, queued=%s", chat_id, queued)
             await self._frontend.send(
                 chat_id, Response(body=f"Queued ({queued} pending).")
             )
         else:
+            logger.debug("on_message: chat_id=%s starting drain", chat_id)
             self._running[chat_id] = asyncio.create_task(self._drain(chat_id))
 
     async def _drain(self, chat_id: int) -> None:
@@ -88,6 +91,9 @@ class Orchestrator:
         workspace.mkdir(parents=True, exist_ok=True)
         self._ensure_persona(workspace)
         session = self.session_uuid(chat_id)
+        logger.debug(
+            "process: chat_id=%s workspace=%s session=%s", chat_id, workspace, session
+        )
 
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
         try:
@@ -98,6 +104,13 @@ class Orchestrator:
                 self._platform,
                 user_name=self._frontend.sender_name(chat_id),
                 channel_context=self._frontend.channel_context(chat_id),
+            )
+            logger.debug(
+                "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
+                chat_id,
+                response.cost,
+                response.tokens_in,
+                response.tokens_out,
             )
             await self._frontend.send(chat_id, response)
         except Exception as exc:
@@ -114,8 +127,11 @@ class Orchestrator:
 
 async def run(frontend: Frontend, platform: str) -> None:
     """Start the orchestrator with the given frontend. Blocks until SIGINT/SIGTERM."""
+    import os
+
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     (DATA_DIR / "memory" / "users").mkdir(parents=True, exist_ok=True)

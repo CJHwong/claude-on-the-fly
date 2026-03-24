@@ -70,6 +70,7 @@ class Response:
 
 
 async def _exec(workspace: Path, cmd: list[str]) -> dict:
+    logger.debug("exec: cwd=%s cmd=%s", workspace, " ".join(cmd[:6]) + "...")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -77,8 +78,16 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
         cwd=workspace,
     )
     stdout, stderr = await proc.communicate()
+    logger.debug(
+        "exec: returncode=%s stdout=%d bytes stderr=%d bytes",
+        proc.returncode,
+        len(stdout),
+        len(stderr),
+    )
     if proc.returncode != 0:
-        raise RuntimeError(stderr.decode().strip() or f"Exit code {proc.returncode}")
+        err_msg = stderr.decode().strip() or f"Exit code {proc.returncode}"
+        logger.debug("exec: failed: %s", err_msg[:200])
+        raise RuntimeError(err_msg)
     cli_output = json.loads(stdout)
     if cli_output.get("is_error") or cli_output.get("subtype", "").startswith("error"):
         raise RuntimeError(
@@ -109,6 +118,9 @@ async def run(
     ]
 
     try:
+        logger.debug(
+            "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
+        )
         cli_output = await _exec(workspace, [*base, "--resume", session_uuid, prompt])
     except RuntimeError as exc:
         if "No conversation found" not in str(exc):
