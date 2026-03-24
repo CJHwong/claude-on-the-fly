@@ -4,11 +4,15 @@
 
 Remote access to Claude Code via Telegram, Slack, and Gmail. Send a message, get Claude working on it, see the response with cost/latency/token stats.
 
+## Important: API Key Required
+
+Using a Claude subscription (Max/Pro) OAuth token with Claude Code in any external tool violates [Anthropic's Consumer Terms of Service](https://docs.anthropic.com/en/docs/claude-code/legal-and-compliance). You must use an [Anthropic API key](https://console.anthropic.com/settings/keys) (`ANTHROPIC_API_KEY`) instead.
+
 ## Prerequisites
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) package manager
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude auth login`)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated with an API key (`ANTHROPIC_API_KEY`)
 
 ## Quick Start (no clone needed)
 
