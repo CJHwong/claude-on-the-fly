@@ -55,8 +55,11 @@ class Orchestrator:
     async def _drain(self, chat_id: int) -> None:
         queue = self._queues[chat_id]
         try:
-            while not queue.empty():
-                text = await queue.get()
+            while True:
+                try:
+                    text = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
                 await self._process(chat_id, text)
         finally:
             if self._running.get(chat_id) is asyncio.current_task():
@@ -74,6 +77,8 @@ class Orchestrator:
         if not source.is_file():
             return
         target = workspace / "CLAUDE.md"
+        if target.is_symlink() and target.resolve() == source.resolve():
+            return
         if target.is_symlink() or target.exists():
             target.unlink()
         target.symlink_to(source)
@@ -119,15 +124,18 @@ async def run(frontend: Frontend, platform: str) -> None:
     orch = Orchestrator(frontend, platform)
     frontend.set_orchestrator(orch)
 
-    await frontend.start(orch.on_message)
-    logger.info("Running (%s). Ctrl+C to stop.", platform)
-
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
+
+    frontend_task = asyncio.create_task(frontend.start(orch.on_message))
+    logger.info("Running (%s). Ctrl+C to stop.", platform)
+
     await stop.wait()
 
     logger.info("Shutting down...")
+    frontend_task.cancel()
+    await asyncio.gather(frontend_task, return_exceptions=True)
     await orch.shutdown()
     await frontend.stop()

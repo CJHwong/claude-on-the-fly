@@ -259,21 +259,24 @@ class TelegramFrontend(Frontend):
         if not group:
             return
         chat_id = group["chat_id"]
-        file_lines = []
-        for file_id, file_name in group["files"]:
-            await self._save_file(chat_id, file_id, file_name)
-            file_lines.append(f"[File saved: {file_name}]")
-        text = "\n".join(file_lines)
-        text += (
-            f"\n{group['caption']}"
-            if group["caption"]
-            else "\nPlease review the uploaded files."
-        )
-        sender = self._chat_names.get(chat_id, "unknown")
-        text = f"[from: {sender}] {text}"
-        logger.info("chat %s: %s", chat_id, text[:80])
-        if self._on_message:
-            await self._on_message(chat_id, text)
+        try:
+            file_lines = []
+            for file_id, file_name in group["files"]:
+                await self._save_file(chat_id, file_id, file_name)
+                file_lines.append(f"[File saved: {file_name}]")
+            text = "\n".join(file_lines)
+            text += (
+                f"\n{group['caption']}"
+                if group["caption"]
+                else "\nPlease review the uploaded files."
+            )
+            sender = self._chat_names.get(chat_id, "unknown")
+            text = f"[from: {sender}] {text}"
+            logger.info("chat %s: %s", chat_id, text[:80])
+            if self._on_message:
+                await self._on_message(chat_id, text)
+        except Exception:
+            logger.exception("Failed to process media group for chat %s", chat_id)
 
 
 def main() -> None:

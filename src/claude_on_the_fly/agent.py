@@ -111,7 +111,9 @@ async def run(
     try:
         cli_output = await _exec(workspace, [*base, "--resume", session_uuid, prompt])
     except RuntimeError as exc:
-        logger.info("Resume failed (%s), creating new session %s", exc, session_uuid)
+        if "No conversation found" not in str(exc):
+            raise
+        logger.info("No existing session %s, creating new", session_uuid)
         cli_output = await _exec(
             workspace, [*base, "--session-id", session_uuid, prompt]
         )

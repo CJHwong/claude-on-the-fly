@@ -19,6 +19,26 @@ from claude_on_the_fly.protocol import Frontend
 logger = logging.getLogger(__name__)
 
 
+SLACK_BLOCK_LIMIT = 3000
+
+
+def _split_blocks(text: str) -> list[str]:
+    """Split text into chunks that fit Slack's block text limit, on line boundaries."""
+    chunks: list[str] = []
+    chunk = ""
+    for line in text.split("\n"):
+        candidate = f"{chunk}\n{line}" if chunk else line
+        if len(candidate) > SLACK_BLOCK_LIMIT:
+            if chunk:
+                chunks.append(chunk)
+            chunk = line[:SLACK_BLOCK_LIMIT]
+        else:
+            chunk = candidate
+    if chunk:
+        chunks.append(chunk)
+    return chunks or [""]
+
+
 def _session_key(channel: str, thread_ts: str | None) -> int:
     raw = f"{channel}:{thread_ts or 'root'}"
     return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
@@ -120,9 +140,7 @@ class SlackFrontend(Frontend):
         channel, thread_ts = route
 
         blocks = []
-        body = response.body
-        while body:
-            chunk, body = body[:3000], body[3000:]
+        for chunk in _split_blocks(response.body):
             blocks.append(
                 {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
             )
