@@ -27,6 +27,7 @@
         "mpim:history",
         "mpim:read",
         "mpim:write",
+        "reactions:write",
         "search:read",
         "usergroups:read",
         "usergroups:write",

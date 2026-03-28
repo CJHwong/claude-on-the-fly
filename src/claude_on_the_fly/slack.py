@@ -173,6 +173,7 @@ class SlackFrontend(Frontend):
         )
         text = f"[from: {sender}] {text}"
 
+        await self._react(channel, ts, "eyes")
         logger.info("slack %s/%s: %s", channel, thread_ts, text[:80])
         if self._on_message:
             await self._on_message(session_id, text)
@@ -251,6 +252,14 @@ class SlackFrontend(Frontend):
         pass
 
     # --- Helpers ---
+
+    async def _react(self, channel: str, timestamp: str, emoji: str) -> None:
+        try:
+            await self._app.client.reactions_add(
+                channel=channel, timestamp=timestamp, name=emoji
+            )
+        except Exception as exc:
+            logger.warning("react: failed to add :%s: to %s: %s", emoji, timestamp, exc)
 
     async def _resolve_sender(self, user_id: str) -> str:
         """Look up Slack user ID to display name. Cached on success only."""
