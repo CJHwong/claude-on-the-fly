@@ -107,6 +107,8 @@ export SLACK_USER_TOKEN="xoxp-..."
 export SLACK_USER_ID="UXXXXXXXX"
 # Optional: allow other users (comma-separated). Your own ID is always included.
 # export SLACK_ALLOWED_USER_IDS="U111,U222"
+# Or set to "*" to allow any sender to @mention the bot in channels:
+# export SLACK_ALLOWED_USER_IDS="*"
 uv run claude-slack
 ```
 
@@ -171,7 +173,7 @@ Or use a `.env` file with all vars and a process manager.
 | `SLACK_APP_TOKEN` | Slack | App-level token (`xapp-...`) for Socket Mode |
 | `SLACK_USER_TOKEN` | Slack | User OAuth token (`xoxp-...`) to post as you |
 | `SLACK_USER_ID` | Slack | Your Slack member ID |
-| `SLACK_ALLOWED_USER_IDS` | Slack (optional) | Comma-separated additional allowed user IDs |
+| `SLACK_ALLOWED_USER_IDS` | Slack (optional) | Comma-separated additional allowed user IDs. Use `*` to allow any sender in channels |
 | `GMAIL_GCP_PROJECT` | Gmail | GCP project ID (for Pub/Sub) |
 | `GMAIL_ALLOWED_SENDERS` | Gmail | Comma-separated email addresses that can trigger Claude |
 | `GMAIL_POLL_INTERVAL` | Gmail (optional) | Seconds between Pub/Sub pulls (default: 5) |

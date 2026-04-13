@@ -56,8 +56,12 @@ class SlackFrontend(Frontend):
         self._user_id = user_id
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
+        self._allow_all_senders = "*" in self._allowed_user_ids
         logger.debug(
-            "init: user_id=%s, allowed_user_ids=%s", user_id, self._allowed_user_ids
+            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s",
+            user_id,
+            self._allowed_user_ids,
+            self._allow_all_senders,
         )
         self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
         self._handler: AsyncSocketModeHandler | None = None
@@ -142,7 +146,7 @@ class SlackFrontend(Frontend):
 
         # Channels: only allowed users, only @mentions
         if channel_type in ("channel", "group"):
-            if sender_id not in self._allowed_user_ids:
+            if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
                 logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
                 return
             mention = f"<@{self._user_id}>"

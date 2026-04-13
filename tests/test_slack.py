@@ -116,6 +116,20 @@ class TestSlackFrontendInit:
         )
         assert frontend._allowed_user_ids == {"U_SELF"}
 
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_wildcard_sets_allow_all_flag(self, mock_app_cls):
+        frontend = SlackFrontend(
+            "xapp-tok", "xoxp-tok", "U_SELF", allowed_user_ids={"*"}
+        )
+        assert frontend._allow_all_senders is True
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_no_wildcard_keeps_allow_all_off(self, mock_app_cls):
+        frontend = SlackFrontend(
+            "xapp-tok", "xoxp-tok", "U_SELF", allowed_user_ids={"U_OTHER"}
+        )
+        assert frontend._allow_all_senders is False
+
 
 # ---------------------------------------------------------------------------
 # workspace_name / sender_name / channel_context
@@ -225,6 +239,18 @@ class TestIngestEvent:
         }
         await frontend._ingest_event(event)
         frontend._on_message.assert_not_awaited()
+
+    async def test_channel_allows_any_sender_with_wildcard(self, frontend):
+        frontend._allow_all_senders = True
+        event = {
+            "ts": "4.1",
+            "text": "<@U_SELF> hello",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_RANDOM",
+        }
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_awaited_once()
 
     async def test_channel_skips_no_mention(self, frontend):
         event = {
