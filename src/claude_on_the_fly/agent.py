@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -110,6 +111,7 @@ async def run(
 ) -> Response:
     """Run Claude Code and return a structured response."""
     system_prompt = build_system_prompt(platform, user_name, channel_context)
+    model = os.environ.get("CLAUDE_MODEL", "sonnet")
     base = [
         "claude",
         "-p",
@@ -117,6 +119,8 @@ async def run(
         "json",
         "--permission-mode",
         "bypassPermissions",
+        "--model",
+        model,
         "--system-prompt",
         system_prompt,
     ]

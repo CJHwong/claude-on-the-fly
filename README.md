@@ -177,6 +177,7 @@ Or use a `.env` file with all vars and a process manager.
 | `GMAIL_GCP_PROJECT` | Gmail | GCP project ID (for Pub/Sub) |
 | `GMAIL_ALLOWED_SENDERS` | Gmail | Comma-separated email addresses that can trigger Claude |
 | `GMAIL_POLL_INTERVAL` | Gmail (optional) | Seconds between Pub/Sub pulls (default: 5) |
+| `CLAUDE_MODEL` | All (optional) | Model passed to `claude --model` (default: `sonnet`) |
 
 
 ## Persona (CLAUDE.md)
