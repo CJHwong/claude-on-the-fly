@@ -24,6 +24,7 @@ class StubFrontend(Frontend):
     def __init__(self) -> None:
         self.sent: list[tuple[int, Response]] = []
         self.typing_sent: list[int] = []
+        self.queued_notifications: list[tuple[int, int]] = []
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         pass
@@ -33,6 +34,9 @@ class StubFrontend(Frontend):
 
     async def send_typing(self, chat_id: int) -> None:
         self.typing_sent.append(chat_id)
+
+    async def notify_queued(self, chat_id: int, position: int) -> None:
+        self.queued_notifications.append((chat_id, position))
 
     async def stop(self) -> None:
         pass
@@ -179,10 +183,9 @@ class TestOnMessage:
 
             await orch.on_message(1, "second")
 
-        # "Queued (1 pending)." was sent
-        queued_msgs = [r.body for (cid, r) in frontend.sent if "Queued" in r.body]
-        assert len(queued_msgs) == 1
-        assert "2 pending" in queued_msgs[0]
+        # notify_queued was called (chat_id, position)
+        assert frontend.queued_notifications == [(1, 2)]
+        assert frontend.sent == []  # no chat reply for queueing
 
         blocker.set_result(None)
 

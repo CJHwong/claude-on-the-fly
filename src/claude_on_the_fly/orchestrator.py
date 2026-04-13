@@ -48,9 +48,7 @@ class Orchestrator:
         if self.is_busy(chat_id):
             queued = self._queues[chat_id].qsize()
             logger.debug("on_message: chat_id=%s busy, queued=%s", chat_id, queued)
-            await self._frontend.send(
-                chat_id, Response(body=f"Queued ({queued} pending).")
-            )
+            await self._frontend.notify_queued(chat_id, queued)
         else:
             logger.debug("on_message: chat_id=%s starting drain", chat_id)
             self._running[chat_id] = asyncio.create_task(self._drain(chat_id))

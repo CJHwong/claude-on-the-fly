@@ -339,6 +339,43 @@ class TestIngestEvent:
 
 
 # ---------------------------------------------------------------------------
+# notify_queued
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyQueued:
+    async def test_reacts_with_hourglass_on_last_message(self, frontend):
+        session_id = 42
+        frontend._last_msg[session_id] = ("C1", "100.0")
+        frontend._app.client.reactions_add = AsyncMock()
+
+        await frontend.notify_queued(session_id, 2)
+
+        frontend._app.client.reactions_add.assert_awaited_once_with(
+            channel="C1", timestamp="100.0", name="hourglass_flowing_sand"
+        )
+        # should NOT post a chat message
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_no_op_when_no_last_message(self, frontend):
+        frontend._app.client.reactions_add = AsyncMock()
+        await frontend.notify_queued(99999, 1)
+        frontend._app.client.reactions_add.assert_not_awaited()
+
+    async def test_ingest_records_last_msg(self, frontend):
+        event = {
+            "ts": "12.0",
+            "text": "hi",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_SOMEONE",
+        }
+        await frontend._ingest_event(event)
+        session_id = _session_key("D1", "12.0")
+        assert frontend._last_msg[session_id] == ("D1", "12.0")
+
+
+# ---------------------------------------------------------------------------
 # send
 # ---------------------------------------------------------------------------
 

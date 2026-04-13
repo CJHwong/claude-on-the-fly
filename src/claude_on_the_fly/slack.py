@@ -77,6 +77,7 @@ class SlackFrontend(Frontend):
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
         self._user_name_cache: dict[str, str] = {}  # slack user_id -> display name
+        self._last_msg: dict[int, tuple[str, str]] = {}  # session_id -> (channel, ts)
 
     def set_orchestrator(self, orchestrator: object) -> None:
         self._orchestrator = orchestrator
@@ -177,6 +178,7 @@ class SlackFrontend(Frontend):
         )
         text = f"[from: {sender}] {text}"
 
+        self._last_msg[session_id] = (channel, ts)
         await self._react(channel, ts, "eyes")
         logger.info("slack %s/%s: %s", channel, thread_ts, text[:80])
         if self._on_message:
@@ -254,6 +256,15 @@ class SlackFrontend(Frontend):
 
     async def send_typing(self, chat_id: int) -> None:
         pass
+
+    async def notify_queued(self, chat_id: int, position: int) -> None:
+        """React with hourglass on the queued message instead of posting text."""
+        last = self._last_msg.get(chat_id)
+        if not last:
+            logger.debug("notify_queued: no last_msg for chat_id=%s", chat_id)
+            return
+        channel, ts = last
+        await self._react(channel, ts, "hourglass_flowing_sand")
 
     # --- Helpers ---
 

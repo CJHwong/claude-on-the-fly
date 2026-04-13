@@ -26,6 +26,14 @@ class Frontend(ABC):
     async def send_typing(self, chat_id: int) -> None:
         """Show typing indicator. No-op if unsupported."""
 
+    async def notify_queued(self, chat_id: int, position: int) -> None:
+        """Tell the user their message is queued behind others.
+
+        Default sends a text response. Frontends with cheaper signals (e.g.
+        emoji reactions) should override.
+        """
+        await self.send(chat_id, Response(body=f"Queued ({position} pending)."))
+
     @abstractmethod
     async def stop(self) -> None:
         """Graceful shutdown."""
