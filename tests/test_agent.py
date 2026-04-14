@@ -171,7 +171,7 @@ class TestExec:
         proc = _make_proc(0, json.dumps(payload).encode())
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="tool_error: bad stuff"):
+            with pytest.raises(RuntimeError, match="bad stuff"):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_error_subtype_raises(self):
@@ -183,15 +183,7 @@ class TestExec:
         proc = _make_proc(0, json.dumps(payload).encode())
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="error_max_turns: too many"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
-
-    async def test_is_error_missing_subtype_defaults(self):
-        payload = {"is_error": True, "result": "unknown"}
-        proc = _make_proc(0, json.dumps(payload).encode())
-
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="error: unknown"):
+            with pytest.raises(RuntimeError, match="too many"):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_is_error_missing_result_defaults(self):
@@ -199,7 +191,21 @@ class TestExec:
         proc = _make_proc(0, json.dumps(payload).encode())
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match=r"error: \?"):
+            with pytest.raises(RuntimeError, match="Unknown error"):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+    async def test_nonzero_exit_with_json_stdout_extracts_result(self):
+        payload = {
+            "is_error": True,
+            "result": "API Error: Could not process image",
+            "subtype": "success",
+        }
+        proc = _make_proc(1, json.dumps(payload).encode(), stderr=b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(
+                RuntimeError, match="API Error: Could not process image"
+            ):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
 

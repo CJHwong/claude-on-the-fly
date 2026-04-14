@@ -90,14 +90,22 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
         len(stderr),
     )
     if proc.returncode != 0:
-        err_msg = stderr.decode().strip() or f"Exit code {proc.returncode}"
-        logger.debug("exec: failed: %s", err_msg[:200])
-        raise RuntimeError(err_msg)
+        err_stderr = stderr.decode().strip()
+        err_stdout = stdout.decode().strip()
+        logger.debug(
+            "exec: failed: stderr=%s stdout=%s", err_stderr[:200], err_stdout[:500]
+        )
+        # CLI may exit non-zero but still produce valid JSON with a result
+        try:
+            cli_output = json.loads(err_stdout)
+            if cli_output.get("result"):
+                raise RuntimeError(cli_output["result"])
+        except (json.JSONDecodeError, KeyError):
+            pass
+        raise RuntimeError(err_stderr or err_stdout or f"Exit code {proc.returncode}")
     cli_output = json.loads(stdout)
     if cli_output.get("is_error") or cli_output.get("subtype", "").startswith("error"):
-        raise RuntimeError(
-            f"{cli_output.get('subtype', 'error')}: {cli_output.get('result', '?')}"
-        )
+        raise RuntimeError(cli_output.get("result", "Unknown error"))
     return cli_output
 
 
