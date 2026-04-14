@@ -211,9 +211,37 @@ def frontend():
 
 
 class TestIngestEvent:
-    async def test_skips_subtype(self, frontend):
+    async def test_skips_non_allowed_subtype(self, frontend):
         await frontend._ingest_event({"subtype": "bot_message", "ts": "1"})
         frontend._on_message.assert_not_awaited()
+
+    async def test_allows_file_share_subtype(self, frontend):
+        event = {
+            "subtype": "file_share",
+            "ts": "1.1",
+            "text": "check this",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_SOMEONE",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "screenshot.png",
+                    "url_private_download": "https://files.slack.com/f1",
+                }
+            ],
+        }
+        with patch.object(
+            frontend,
+            "_save_files",
+            new_callable=AsyncMock,
+            return_value=["[File saved: screenshot.png]"],
+        ):
+            await frontend._ingest_event(event)
+        frontend._on_message.assert_awaited_once()
+        _, call_text = frontend._on_message.call_args[0]
+        assert "[File saved: screenshot.png]" in call_text
+        assert "check this" in call_text
 
     async def test_skips_own_message(self, frontend):
         frontend._our_sent_timestamps.append("1.0")
@@ -670,3 +698,200 @@ class TestResolveMpimMembers:
         frontend._app.client.conversations_members.side_effect = Exception("boom")
         result = await frontend._resolve_mpim_members("G1")
         assert result == ["unknown"]
+
+
+# ---------------------------------------------------------------------------
+# File handling
+# ---------------------------------------------------------------------------
+
+
+class TestSaveFiles:
+    async def test_downloads_and_returns_lines(self, frontend, tmp_path):
+        frontend._workspace_names[42] = "test-ws"
+        files = [
+            {
+                "id": "F1",
+                "name": "doc.pdf",
+                "url_private_download": "https://example.com/f1",
+            },
+            {
+                "id": "F2",
+                "name": "img.png",
+                "url_private_download": "https://example.com/f2",
+            },
+        ]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(frontend, "_download_file", new_callable=AsyncMock) as mock_dl,
+        ):
+            result = await frontend._save_files(42, files)
+
+        assert result == ["[File saved: doc.pdf]", "[File saved: img.png]"]
+        assert mock_dl.await_count == 2
+
+    async def test_skips_file_without_url(self, frontend, tmp_path):
+        files = [{"id": "F1", "name": "no_url.txt"}]
+        with patch.object(frontend, "_workspace_path", return_value=tmp_path):
+            result = await frontend._save_files(42, files)
+        assert result == []
+
+    async def test_continues_on_download_failure(self, frontend, tmp_path):
+        files = [
+            {
+                "id": "F1",
+                "name": "bad.txt",
+                "url_private_download": "https://example.com/bad",
+            },
+            {
+                "id": "F2",
+                "name": "good.txt",
+                "url_private_download": "https://example.com/good",
+            },
+        ]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(
+                frontend,
+                "_download_file",
+                new_callable=AsyncMock,
+                side_effect=[Exception("network"), None],
+            ),
+        ):
+            result = await frontend._save_files(42, files)
+        assert result == ["[File saved: good.txt]"]
+
+    async def test_fallback_name_when_name_missing(self, frontend, tmp_path):
+        files = [{"id": "F99", "url_private_download": "https://example.com/f99"}]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(frontend, "_download_file", new_callable=AsyncMock),
+        ):
+            result = await frontend._save_files(42, files)
+        assert result == ["[File saved: file_F99]"]
+
+
+class TestDownloadFile:
+    @staticmethod
+    def _mock_aiohttp(content: bytes, content_type: str = "image/png"):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.content_type = content_type
+        mock_resp.read = AsyncMock(return_value=content)
+
+        mock_get_ctx = MagicMock()
+        mock_get_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_get_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_get_ctx)
+
+        mock_client_ctx = MagicMock()
+        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
+        return mock_client_ctx, mock_session
+
+    async def test_writes_bytes_to_dest(self, tmp_path):
+        dest = tmp_path / "test.png"
+        mock_ctx, mock_session = self._mock_aiohttp(b"fake image bytes")
+
+        with patch(
+            "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+        ):
+            await SlackFrontend._download_file(
+                "https://example.com/f", dest, "xoxp-tok"
+            )
+
+        assert dest.read_bytes() == b"fake image bytes"
+        mock_session.get.assert_called_once_with(
+            "https://example.com/f",
+            headers={"Authorization": "Bearer xoxp-tok"},
+            allow_redirects=True,
+        )
+
+    async def test_rejects_html_response(self, tmp_path):
+        dest = tmp_path / "test.png"
+        mock_ctx, _ = self._mock_aiohttp(b"<html>login</html>", "text/html")
+
+        with (
+            patch(
+                "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+            ),
+            pytest.raises(RuntimeError, match="got HTML"),
+        ):
+            await SlackFrontend._download_file(
+                "https://example.com/f", dest, "xoxp-tok"
+            )
+
+    async def test_rejects_empty_body(self, tmp_path):
+        dest = tmp_path / "test.png"
+        mock_ctx, _ = self._mock_aiohttp(b"", "image/png")
+
+        with (
+            patch(
+                "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+            ),
+            pytest.raises(RuntimeError, match="empty response"),
+        ):
+            await SlackFrontend._download_file(
+                "https://example.com/f", dest, "xoxp-tok"
+            )
+
+
+class TestIngestEventWithFiles:
+    async def test_file_only_no_text(self, frontend):
+        """File upload with no caption should still produce a message."""
+        event = {
+            "subtype": "file_share",
+            "ts": "50.0",
+            "text": "",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_SOMEONE",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "report.csv",
+                    "url_private_download": "https://example.com/f1",
+                }
+            ],
+        }
+        with patch.object(
+            frontend,
+            "_save_files",
+            new_callable=AsyncMock,
+            return_value=["[File saved: report.csv]"],
+        ):
+            await frontend._ingest_event(event)
+        frontend._on_message.assert_awaited_once()
+        _, call_text = frontend._on_message.call_args[0]
+        assert "[File saved: report.csv]" in call_text
+
+    async def test_file_with_caption_in_channel(self, frontend):
+        """File upload in channel with @mention and caption."""
+        event = {
+            "subtype": "file_share",
+            "ts": "51.0",
+            "text": "<@U_SELF> analyze this",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "data.xlsx",
+                    "url_private_download": "https://example.com/f1",
+                }
+            ],
+        }
+        with patch.object(
+            frontend,
+            "_save_files",
+            new_callable=AsyncMock,
+            return_value=["[File saved: data.xlsx]"],
+        ):
+            await frontend._ingest_event(event)
+        frontend._on_message.assert_awaited_once()
+        _, call_text = frontend._on_message.call_args[0]
+        assert "[File saved: data.xlsx]" in call_text
+        assert "analyze this" in call_text
+        assert "<@U_SELF>" not in call_text

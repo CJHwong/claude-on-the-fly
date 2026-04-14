@@ -7,7 +7,9 @@ import hashlib
 import logging
 import re
 from collections import deque
+from pathlib import Path
 
+import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -18,8 +20,9 @@ from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
 
-
+DATA_DIR = Path.home() / ".claude-on-the-fly"
 SLACK_BLOCK_LIMIT = 3000
+_ALLOWED_SUBTYPES = {"file_share"}
 
 
 def _split_blocks(text: str) -> list[str]:
@@ -116,8 +119,9 @@ class SlackFrontend(Frontend):
         await self._catchup()
 
     async def _ingest_event(self, event: dict) -> None:
-        if event.get("subtype"):
-            logger.debug("skipped: subtype=%s", event.get("subtype"))
+        subtype = event.get("subtype")
+        if subtype and subtype not in _ALLOWED_SUBTYPES:
+            logger.debug("skipped: subtype=%s", subtype)
             return
         ts = event.get("ts", "")
         sender_id = event.get("user", "")
@@ -156,15 +160,6 @@ class SlackFrontend(Frontend):
                 return
             text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
-        if not text:
-            logger.debug("skipped: empty text after processing")
-            return
-
-        self._processed_ts.append(ts)
-        self._active_channels[channel] = ts
-        if channel_type:
-            self._channel_types[channel] = channel_type
-
         session_id = _session_key(channel, thread_ts)
         self._sessions[session_id] = (channel, thread_ts)
         logger.debug(
@@ -176,6 +171,22 @@ class SlackFrontend(Frontend):
         await self._resolve_session_metadata(
             session_id, sender, channel, channel_type, thread_ts
         )
+
+        files = event.get("files") or []
+        if files:
+            file_lines = await self._save_files(session_id, files)
+            if file_lines:
+                text = "\n".join(file_lines) + ("\n" + text if text else "")
+
+        if not text:
+            logger.debug("skipped: empty text after processing")
+            return
+
+        self._processed_ts.append(ts)
+        self._active_channels[channel] = ts
+        if channel_type:
+            self._channel_types[channel] = channel_type
+
         text = f"[from: {sender}] {text}"
 
         self._last_msg[session_id] = (channel, ts)
@@ -275,6 +286,52 @@ class SlackFrontend(Frontend):
             )
         except Exception as exc:
             logger.warning("react: failed to add :%s: to %s: %s", emoji, timestamp, exc)
+
+    def _workspace_path(self, session_id: int) -> Path:
+        return DATA_DIR / "workspaces" / self.workspace_name(session_id)
+
+    async def _save_files(self, session_id: int, files: list[dict]) -> list[str]:
+        """Download Slack files to workspace. Returns '[File saved: name]' lines."""
+        workspace = self._workspace_path(session_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        token: str = self._app.client.token or ""
+        lines: list[str] = []
+        for f in files:
+            url = f.get("url_private_download")
+            name = f.get("name") or f"file_{f.get('id', 'unknown')}"
+            if not url:
+                logger.warning("file %s has no url_private_download, skipping", name)
+                continue
+            dest = workspace / Path(name).name
+            try:
+                await self._download_file(url, dest, token)
+                lines.append(f"[File saved: {dest.name}]")
+                logger.info("saved file %s for session %s", dest.name, session_id)
+            except Exception as exc:
+                logger.warning("failed to download file %s: %s", name, exc)
+        return lines
+
+    @staticmethod
+    async def _download_file(url: str, dest: Path, token: str) -> None:
+        headers = {"Authorization": f"Bearer {token}"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                resp.raise_for_status()
+                content_type = resp.content_type or ""
+                if content_type.startswith("text/html"):
+                    raise RuntimeError(
+                        f"got HTML instead of file data (likely auth issue): {url}"
+                    )
+                data = await resp.read()
+                if not data:
+                    raise RuntimeError(f"empty response body: {url}")
+                dest.write_bytes(data)
+                logger.debug(
+                    "downloaded %s: %d bytes, content-type=%s",
+                    dest.name,
+                    len(data),
+                    content_type,
+                )
 
     async def _resolve_sender(self, user_id: str) -> str:
         """Look up Slack user ID to display name. Cached on success only."""
