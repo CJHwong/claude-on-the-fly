@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import signal
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -128,10 +129,26 @@ async def run(frontend: Frontend, platform: str) -> None:
     import os
 
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+    # Console: respects LOG_LEVEL
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=log_fmt,
     )
+
+    # File: always DEBUG, daily rotation, 7 days
+    log_dir = DATA_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        log_dir / f"{platform}.log",
+        when="midnight",
+        backupCount=7,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(log_fmt))
+    logging.getLogger().addHandler(file_handler)
     (DATA_DIR / "memory" / "users").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
 
