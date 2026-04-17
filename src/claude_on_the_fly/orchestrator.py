@@ -94,6 +94,7 @@ class Orchestrator:
             "process: chat_id=%s workspace=%s session=%s", chat_id, workspace, session
         )
 
+        await self._frontend.notify_start(chat_id)
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
         try:
             response = await agent.run(

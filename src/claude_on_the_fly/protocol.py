@@ -34,6 +34,13 @@ class Frontend(ABC):
         """
         await self.send(chat_id, Response(body=f"Queued ({position} pending)."))
 
+    async def notify_start(self, chat_id: int) -> None:
+        """Signal that processing has started for the next pending message.
+
+        Frontends can use this to transition a queued indicator (e.g.
+        :hourglass:) into a processing indicator (e.g. :eyes:). No-op by default.
+        """
+
     @abstractmethod
     async def stop(self) -> None:
         """Graceful shutdown."""

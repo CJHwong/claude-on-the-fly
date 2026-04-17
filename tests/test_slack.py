@@ -372,9 +372,11 @@ class TestIngestEvent:
 
 
 class TestNotifyQueued:
-    async def test_reacts_with_hourglass_on_last_message(self, frontend):
+    async def test_reacts_with_hourglass_on_latest_pending(self, frontend):
+        from collections import deque
+
         session_id = 42
-        frontend._last_msg[session_id] = ("C1", "100.0")
+        frontend._pending_msg[session_id] = deque([("C1", "90.0"), ("C1", "100.0")])
         frontend._app.client.reactions_add = AsyncMock()
 
         await frontend.notify_queued(session_id, 2)
@@ -385,12 +387,12 @@ class TestNotifyQueued:
         # should NOT post a chat message
         frontend._app.client.chat_postMessage.assert_not_awaited()
 
-    async def test_no_op_when_no_last_message(self, frontend):
+    async def test_no_op_when_no_pending_message(self, frontend):
         frontend._app.client.reactions_add = AsyncMock()
         await frontend.notify_queued(99999, 1)
         frontend._app.client.reactions_add.assert_not_awaited()
 
-    async def test_ingest_records_last_msg(self, frontend):
+    async def test_ingest_records_pending_msg(self, frontend):
         event = {
             "ts": "12.0",
             "text": "hi",
@@ -400,7 +402,34 @@ class TestNotifyQueued:
         }
         await frontend._ingest_event(event)
         session_id = _session_key("D1", "12.0")
-        assert frontend._last_msg[session_id] == ("D1", "12.0")
+        assert list(frontend._pending_msg[session_id]) == [("D1", "12.0")]
+
+
+class TestNotifyStart:
+    async def test_transitions_hourglass_to_eyes_on_oldest(self, frontend):
+        from collections import deque
+
+        session_id = 7
+        frontend._pending_msg[session_id] = deque([("C1", "10.0"), ("C1", "20.0")])
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+
+        await frontend.notify_start(session_id)
+
+        frontend._app.client.reactions_remove.assert_awaited_once_with(
+            channel="C1", timestamp="10.0", name="hourglass_flowing_sand"
+        )
+        frontend._app.client.reactions_add.assert_awaited_once_with(
+            channel="C1", timestamp="10.0", name="eyes"
+        )
+        assert list(frontend._pending_msg[session_id]) == [("C1", "20.0")]
+
+    async def test_no_op_when_no_pending(self, frontend):
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        await frontend.notify_start(99999)
+        frontend._app.client.reactions_add.assert_not_awaited()
+        frontend._app.client.reactions_remove.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

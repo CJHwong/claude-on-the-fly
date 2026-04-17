@@ -80,7 +80,9 @@ class SlackFrontend(Frontend):
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
         self._user_name_cache: dict[str, str] = {}  # slack user_id -> display name
-        self._last_msg: dict[int, tuple[str, str]] = {}  # session_id -> (channel, ts)
+        self._pending_msg: dict[
+            int, deque[tuple[str, str]]
+        ] = {}  # session -> FIFO of (channel, ts)
 
     def set_orchestrator(self, orchestrator: object) -> None:
         self._orchestrator = orchestrator
@@ -189,8 +191,7 @@ class SlackFrontend(Frontend):
 
         text = f"[from: {sender}] {text}"
 
-        self._last_msg[session_id] = (channel, ts)
-        await self._react(channel, ts, "eyes")
+        self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
         logger.info("slack %s/%s: %s", channel, thread_ts, text[:80])
         if self._on_message:
             await self._on_message(session_id, text)
@@ -269,13 +270,23 @@ class SlackFrontend(Frontend):
         pass
 
     async def notify_queued(self, chat_id: int, position: int) -> None:
-        """React with hourglass on the queued message instead of posting text."""
-        last = self._last_msg.get(chat_id)
-        if not last:
-            logger.debug("notify_queued: no last_msg for chat_id=%s", chat_id)
+        """React with hourglass on the most recently ingested message."""
+        pending = self._pending_msg.get(chat_id)
+        if not pending:
+            logger.debug("notify_queued: no pending msg for chat_id=%s", chat_id)
             return
-        channel, ts = last
+        channel, ts = pending[-1]
         await self._react(channel, ts, "hourglass_flowing_sand")
+
+    async def notify_start(self, chat_id: int) -> None:
+        """Transition the oldest pending message from hourglass to eyes."""
+        pending = self._pending_msg.get(chat_id)
+        if not pending:
+            logger.debug("notify_start: no pending msg for chat_id=%s", chat_id)
+            return
+        channel, ts = pending.popleft()
+        await self._unreact(channel, ts, "hourglass_flowing_sand")
+        await self._react(channel, ts, "eyes")
 
     # --- Helpers ---
 
@@ -286,6 +297,18 @@ class SlackFrontend(Frontend):
             )
         except Exception as exc:
             logger.warning("react: failed to add :%s: to %s: %s", emoji, timestamp, exc)
+
+    async def _unreact(self, channel: str, timestamp: str, emoji: str) -> None:
+        """Remove a reaction. Silently ignores 'no_reaction' (it wasn't there)."""
+        try:
+            await self._app.client.reactions_remove(
+                channel=channel, timestamp=timestamp, name=emoji
+            )
+        except Exception as exc:
+            if "no_reaction" not in str(exc):
+                logger.warning(
+                    "unreact: failed to remove :%s: from %s: %s", emoji, timestamp, exc
+                )
 
     def _workspace_path(self, session_id: int) -> Path:
         return DATA_DIR / "workspaces" / self.workspace_name(session_id)
