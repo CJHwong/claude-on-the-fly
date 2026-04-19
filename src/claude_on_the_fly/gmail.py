@@ -10,7 +10,7 @@ import logging
 import re
 from typing import Awaitable, Callable
 
-from claude_on_the_fly.agent import Response
+from claude_on_the_fly.agent import Response, footer_parts
 from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
@@ -297,8 +297,11 @@ class GmailFrontend(Frontend):
             return
 
         body = response.body
-        if response.has_stats:
-            body = f"{body}\n\n---\n{response.format_stats()}"
+        stats, tools = footer_parts(response, "gmail")
+        if stats:
+            body = f"{body}\n\n---\n{stats}"
+        if tools:
+            body = f"{body}\n{tools}"
 
         cmd = [
             "gws",

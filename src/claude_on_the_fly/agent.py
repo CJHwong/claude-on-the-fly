@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,31 @@ MEMORY_DIR = Path.home() / ".claude-on-the-fly" / "memory"
 MEMORY_ROOT = str(MEMORY_DIR)
 KNOWLEDGE_DIR = str(MEMORY_DIR / "knowledge")
 PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text()
+
+STATS_MODES = ("off", "summary", "detailed")
+
+
+def stats_mode(platform: str) -> str:
+    """Read the reply-footer mode for a given frontend from its env var.
+
+    Returns one of STATS_MODES. Defaults to "summary" for unknown or unset.
+    Platform "telegram" reads TELEGRAM_STATS_MODE, and so on.
+    """
+    env_name = f"{platform.upper()}_STATS_MODE"
+    mode = os.environ.get(env_name, "summary").lower()
+    return mode if mode in STATS_MODES else "summary"
+
+
+def footer_parts(response: "Response", platform: str) -> tuple[str, str]:
+    """Return (stats_line, tools_line) for a reply, gated by the platform's mode.
+
+    Either value is "" when the mode suppresses that line.
+    """
+    mode = stats_mode(platform)
+    stats = response.format_stats() if mode != "off" and response.has_stats else ""
+    tools = response.format_tools() if mode == "detailed" and response.has_tools else ""
+    return stats, tools
+
 
 FORMAT_HINTS = {
     "telegram": (
@@ -57,10 +82,16 @@ class Response:
     tokens_in: int = 0
     tokens_out: int = 0
     model: str = ""
+    tool_counts: dict[str, int] = field(default_factory=dict)
+    skill_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def has_stats(self) -> bool:
         return bool(self.cost or self.model)
+
+    @property
+    def has_tools(self) -> bool:
+        return bool(self.tool_counts)
 
     def format_stats(self) -> str:
         parts = []
@@ -74,6 +105,65 @@ class Response:
             parts.append(self.model)
         return " | ".join(parts)
 
+    def format_tools(self) -> str:
+        if not self.tool_counts:
+            return ""
+        total = sum(self.tool_counts.values())
+        items = sorted(self.tool_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        breakdown = " ".join(f"{name}×{count}" for name, count in items)
+        return f"🔧 {total} ({breakdown})"
+
+
+def _fold(
+    msg: dict, tool_counts: dict[str, int], skill_counts: dict[str, int]
+) -> dict | None:
+    """Apply one parsed stream-json message to running tallies.
+
+    Returns the message dict if it is a `type: "result"` line, else None.
+    Mutates tool_counts and skill_counts in place.
+    """
+    msg_type = msg.get("type")
+    if msg_type == "assistant":
+        for block in msg.get("message", {}).get("content", []):
+            if block.get("type") != "tool_use":
+                continue
+            name = block.get("name", "unknown")
+            tool_counts[name] = tool_counts.get(name, 0) + 1
+            if name == "Skill":
+                skill = block.get("input", {}).get("skill")
+                if skill:
+                    skill_counts[skill] = skill_counts.get(skill, 0) + 1
+    elif msg_type == "result":
+        return dict(msg)
+    return None
+
+
+def parse_stream(stdout: bytes) -> dict:
+    """Batch parser for stream-json NDJSON output from `claude -p`.
+
+    Used by tests and smoke scripts. Runtime path uses _exec which streams
+    line-by-line to avoid buffering the full output in memory.
+    """
+    tool_counts: dict[str, int] = {}
+    skill_counts: dict[str, int] = {}
+    result: dict = {}
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            logger.warning("parse_stream: skipping malformed line: %s", line[:120])
+            continue
+        r = _fold(msg, tool_counts, skill_counts)
+        if r is not None:
+            result = r
+    if result:
+        result["tool_counts"] = tool_counts
+        result["skill_counts"] = skill_counts
+    return result
+
 
 async def _exec(workspace: Path, cmd: list[str]) -> dict:
     logger.debug("exec: cwd=%s cmd=%s", workspace, " ".join(cmd[:6]) + "...")
@@ -83,31 +173,63 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
     )
-    stdout, stderr = await proc.communicate()
-    logger.debug(
-        "exec: returncode=%s stdout=%d bytes stderr=%d bytes",
-        proc.returncode,
-        len(stdout),
-        len(stderr),
-    )
-    if proc.returncode != 0:
-        err_stderr = stderr.decode().strip()
-        err_stdout = stdout.decode().strip()
-        logger.debug(
-            "exec: failed: stderr=%s stdout=%s", err_stderr[:200], err_stdout[:500]
-        )
-        # CLI may exit non-zero but still produce valid JSON with a result
+    assert proc.stdout is not None and proc.stderr is not None
+
+    # Drain stderr concurrently so the subprocess can't block on a full pipe.
+    stderr_task = asyncio.create_task(proc.stderr.read())
+
+    tool_counts: dict[str, int] = {}
+    skill_counts: dict[str, int] = {}
+    result: dict = {}
+    line_count = 0
+    try:
+        async for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            line_count += 1
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("exec: skipping malformed line: %s", line[:120])
+                continue
+            r = _fold(msg, tool_counts, skill_counts)
+            if r is not None:
+                result = r
+    except BaseException:
+        stderr_task.cancel()
+        raise
+    finally:
         try:
-            cli_output = json.loads(err_stdout)
-            if cli_output.get("result"):
-                raise RuntimeError(cli_output["result"])
-        except (json.JSONDecodeError, KeyError):
-            pass
-        raise RuntimeError(err_stderr or err_stdout or f"Exit code {proc.returncode}")
-    cli_output = json.loads(stdout)
-    if cli_output.get("is_error") or cli_output.get("subtype", "").startswith("error"):
-        raise RuntimeError(cli_output.get("result", "Unknown error"))
-    return cli_output
+            stderr_bytes = await stderr_task
+        except asyncio.CancelledError:
+            stderr_bytes = b""
+
+    await proc.wait()
+    logger.debug(
+        "exec: returncode=%s lines=%d stderr=%d bytes",
+        proc.returncode,
+        line_count,
+        len(stderr_bytes),
+    )
+
+    if result:
+        result["tool_counts"] = tool_counts
+        result["skill_counts"] = skill_counts
+
+    if proc.returncode != 0:
+        err_stderr = stderr_bytes.decode().strip()
+        logger.debug(
+            "exec: failed: stderr=%s parsed_result=%s",
+            err_stderr[:200],
+            str(result.get("result", ""))[:200],
+        )
+        if result.get("result"):
+            raise RuntimeError(result["result"])
+        raise RuntimeError(err_stderr or f"Exit code {proc.returncode}")
+    if result.get("is_error") or result.get("subtype", "").startswith("error"):
+        raise RuntimeError(result.get("result", "Unknown error"))
+    return result
 
 
 async def run(
@@ -125,7 +247,8 @@ async def run(
         "claude",
         "-p",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--permission-mode",
         "bypassPermissions",
         "--model",
@@ -156,4 +279,6 @@ async def run(
         + usage.get("cache_read_input_tokens", 0),
         tokens_out=usage.get("output_tokens", 0),
         model=next(iter(cli_output.get("modelUsage", {})), ""),
+        tool_counts=cli_output.get("tool_counts", {}),
+        skill_counts=cli_output.get("skill_counts", {}),
     )

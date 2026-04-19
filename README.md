@@ -166,18 +166,39 @@ Or use a `.env` file with all vars and a process manager.
 
 ## Environment Variables
 
-| Variable | Required For | Description |
-|----------|-------------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Telegram | Bot token from BotFather |
-| `TELEGRAM_ALLOWED_USER_ID` | Telegram | Your numeric Telegram user ID |
-| `SLACK_APP_TOKEN` | Slack | App-level token (`xapp-...`) for Socket Mode |
-| `SLACK_USER_TOKEN` | Slack | User OAuth token (`xoxp-...`) to post as you |
-| `SLACK_USER_ID` | Slack | Your Slack member ID |
-| `SLACK_ALLOWED_USER_IDS` | Slack (optional) | Comma-separated additional allowed user IDs. Use `*` to allow any sender in channels |
-| `GMAIL_GCP_PROJECT` | Gmail | GCP project ID (for Pub/Sub) |
-| `GMAIL_ALLOWED_SENDERS` | Gmail | Comma-separated email addresses that can trigger Claude |
-| `GMAIL_POLL_INTERVAL` | Gmail (optional) | Seconds between Pub/Sub pulls (default: 5) |
-| `CLAUDE_MODEL` | All (optional) | Model passed to `claude --model` (default: `sonnet`) |
+### Telegram
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | yes | Bot token from BotFather |
+| `TELEGRAM_ALLOWED_USER_ID` | yes | Your numeric Telegram user ID |
+| `TELEGRAM_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
+
+### Slack
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SLACK_APP_TOKEN` | yes | App-level token (`xapp-...`) for Socket Mode |
+| `SLACK_USER_TOKEN` | yes | User OAuth token (`xoxp-...`) to post as you |
+| `SLACK_USER_ID` | yes | Your Slack member ID |
+| `SLACK_ALLOWED_USER_IDS` | no | Extra allowed user IDs (comma-separated). Use `*` to allow any sender in channels |
+| `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
+
+### Gmail
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GMAIL_GCP_PROJECT` | yes | GCP project ID (for Pub/Sub) |
+| `GMAIL_ALLOWED_SENDERS` | yes | Email addresses that can trigger Claude (comma-separated) |
+| `GMAIL_POLL_INTERVAL` | no | Seconds between Pub/Sub pulls (default: 5) |
+| `GMAIL_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
+
+### Shared
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLAUDE_MODEL` | no | Model passed to `claude --model` (default: `sonnet`) |
+| `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 
 
 ## Persona (CLAUDE.md)
@@ -215,9 +236,13 @@ Each frontend implements the `Frontend` protocol (start, send, send_typing, stop
 
 ## Response Footer
 
-Every response includes a footer with:
+Controlled per channel via `{TELEGRAM,SLACK,GMAIL}_STATS_MODE`:
+
+- `off` — no footer
+- `summary` (default) — single stats line
+- `detailed` — stats line + tool-use breakdown
 
 ```
 $0.0471 | 3.6s | ↑1523 ↓42 | claude-sonnet-4-6
-  cost    time   tokens in/out   model
+🔧 8 (Read×4 Bash×3 Grep×1)
 ```

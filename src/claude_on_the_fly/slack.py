@@ -15,7 +15,7 @@ from slack_bolt.async_app import AsyncApp
 
 from typing import Awaitable, Callable
 
-from claude_on_the_fly.agent import Response
+from claude_on_the_fly.agent import Response, footer_parts
 from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
@@ -243,12 +243,14 @@ class SlackFrontend(Frontend):
             blocks.append(
                 {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
             )
-        if response.has_stats:
+        stats, tools = footer_parts(response, "slack")
+        if stats:
             blocks.append(
-                {
-                    "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": response.format_stats()}],
-                }
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": stats}]}
+            )
+        if tools:
+            blocks.append(
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
             )
 
         try:

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,8 +14,41 @@ from claude_on_the_fly.agent import (
     Response,
     build_system_prompt,
     _exec,
+    parse_stream,
     run,
+    stats_mode,
 )
+
+
+def _ndjson(*messages: dict) -> bytes:
+    return b"\n".join(json.dumps(m).encode() for m in messages)
+
+
+def _result_line(**overrides) -> dict:
+    base = {
+        "type": "result",
+        "subtype": "success",
+        "result": "hello",
+        "is_error": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def _assistant_line(*content_blocks: dict) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"id": "msg_x", "content": list(content_blocks)},
+    }
+
+
+def _tool_use(name: str, **input_fields) -> dict:
+    return {
+        "type": "tool_use",
+        "id": f"toolu_{name}",
+        "name": name,
+        "input": input_fields,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +123,87 @@ class TestResponseFormatStats:
         r = Response(body="hi", tokens_in=0, tokens_out=0)
         assert r.format_stats() == ""
 
+    def test_tool_counts_not_included_in_stats(self):
+        """format_stats stays single-line; tools render via format_tools."""
+        r = Response(
+            body="hi",
+            cost=0.01,
+            model="sonnet",
+            tool_counts={"Read": 5},
+        )
+        assert r.format_stats() == "$0.0100 | sonnet"
+
+
+class TestResponseHasTools:
+    def test_true_when_tool_counts_populated(self):
+        assert Response(body="hi", tool_counts={"Read": 1}).has_tools is True
+
+    def test_false_when_empty(self):
+        assert Response(body="hi").has_tools is False
+
+    def test_false_for_empty_dict(self):
+        assert Response(body="hi", tool_counts={}).has_tools is False
+
+
+class TestStatsMode:
+    def test_default_is_summary(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_STATS_MODE", raising=False)
+        assert stats_mode("telegram") == "summary"
+
+    def test_reads_platform_specific_env(self, monkeypatch):
+        monkeypatch.setenv("SLACK_STATS_MODE", "detailed")
+        monkeypatch.setenv("TELEGRAM_STATS_MODE", "off")
+        assert stats_mode("slack") == "detailed"
+        assert stats_mode("telegram") == "off"
+
+    def test_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_STATS_MODE", "DETAILED")
+        assert stats_mode("gmail") == "detailed"
+
+    def test_invalid_value_falls_back_to_summary(self, monkeypatch):
+        monkeypatch.setenv("SLACK_STATS_MODE", "bogus")
+        assert stats_mode("slack") == "summary"
+
+    def test_all_three_modes_accepted(self, monkeypatch):
+        for mode in ("off", "summary", "detailed"):
+            monkeypatch.setenv("TELEGRAM_STATS_MODE", mode)
+            assert stats_mode("telegram") == mode
+
+
+class TestResponseFormatTools:
+    def test_empty_tool_counts_returns_empty(self):
+        assert Response(body="hi").format_tools() == ""
+
+    def test_single_tool(self):
+        r = Response(body="hi", tool_counts={"Read": 3})
+        assert r.format_tools() == "🔧 3 (Read×3)"
+
+    def test_shows_total_and_full_breakdown(self):
+        r = Response(
+            body="hi",
+            tool_counts={"Read": 12, "Bash": 8, "Grep": 6, "Edit": 3, "Write": 2},
+        )
+        assert r.format_tools() == "🔧 31 (Read×12 Bash×8 Grep×6 Edit×3 Write×2)"
+
+    def test_fewer_than_three_tools(self):
+        r = Response(body="hi", tool_counts={"Read": 2, "Bash": 1})
+        assert r.format_tools() == "🔧 3 (Read×2 Bash×1)"
+
+    def test_tie_broken_alphabetical(self):
+        r = Response(
+            body="hi", tool_counts={"Write": 2, "Bash": 2, "Read": 2, "Edit": 2}
+        )
+        assert r.format_tools() == "🔧 8 (Bash×2 Edit×2 Read×2 Write×2)"
+
+    def test_skill_counts_ignored_in_new_format(self):
+        """Skill sub-breakdown dropped for compactness; Skill count still shown."""
+        r = Response(
+            body="hi",
+            tool_counts={"Read": 5, "Skill": 2},
+            skill_counts={"cq": 1, "simplify": 1},
+        )
+        assert r.format_tools() == "🔧 7 (Read×5 Skill×2)"
+
 
 # ---------------------------------------------------------------------------
 # build_system_prompt
@@ -134,23 +249,64 @@ class TestBuildSystemPrompt:
 # ---------------------------------------------------------------------------
 
 
+class _AsyncLineIter:
+    """Async iterator over newline-terminated byte lines, mimicking StreamReader."""
+
+    def __init__(self, data: bytes) -> None:
+        self._lines: deque[bytes] = (
+            deque(line + b"\n" for line in data.split(b"\n") if line)
+            if data
+            else deque()
+        )
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.popleft()
+
+
 def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
-    proc = AsyncMock()
+    proc = MagicMock()
     proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.stdout = _AsyncLineIter(stdout)
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(return_value=stderr)
+    proc.wait = AsyncMock(return_value=returncode)
     return proc
 
 
 class TestExec:
-    async def test_success_returns_parsed_json(self):
-        payload = {"result": "hello", "is_error": False}
-        proc = _make_proc(0, json.dumps(payload).encode())
+    async def test_success_returns_parsed_stream(self):
+        stream = _ndjson(
+            {"type": "system", "subtype": "init"},
+            _result_line(result="hello"),
+        )
+        proc = _make_proc(0, stream)
 
         with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
             result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
-        assert result == payload
+        assert result["result"] == "hello"
+        assert result["is_error"] is False
+        assert result["tool_counts"] == {}
+        assert result["skill_counts"] == {}
         mock_exec.assert_awaited_once()
+
+    async def test_success_aggregates_tool_counts(self):
+        stream = _ndjson(
+            _assistant_line(_tool_use("Read"), _tool_use("Bash")),
+            _assistant_line(_tool_use("Read")),
+            _result_line(),
+        )
+        proc = _make_proc(0, stream)
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+        assert result["tool_counts"] == {"Read": 2, "Bash": 1}
 
     async def test_nonzero_exit_raises_with_stderr(self):
         proc = _make_proc(1, b"", stderr=b"something broke")
@@ -167,46 +323,136 @@ class TestExec:
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_is_error_true_raises(self):
-        payload = {"is_error": True, "result": "bad stuff", "subtype": "tool_error"}
-        proc = _make_proc(0, json.dumps(payload).encode())
+        stream = _ndjson(
+            _result_line(is_error=True, result="bad stuff", subtype="tool_error")
+        )
+        proc = _make_proc(0, stream)
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(RuntimeError, match="bad stuff"):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_error_subtype_raises(self):
-        payload = {
-            "is_error": False,
-            "subtype": "error_max_turns",
-            "result": "too many",
-        }
-        proc = _make_proc(0, json.dumps(payload).encode())
+        stream = _ndjson(
+            _result_line(is_error=False, subtype="error_max_turns", result="too many")
+        )
+        proc = _make_proc(0, stream)
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(RuntimeError, match="too many"):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_is_error_missing_result_defaults(self):
-        payload = {"is_error": True}
-        proc = _make_proc(0, json.dumps(payload).encode())
+        # Result line with is_error but no result field
+        stream = _ndjson({"type": "result", "is_error": True})
+        proc = _make_proc(0, stream)
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(RuntimeError, match="Unknown error"):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
-    async def test_nonzero_exit_with_json_stdout_extracts_result(self):
-        payload = {
-            "is_error": True,
-            "result": "API Error: Could not process image",
-            "subtype": "success",
-        }
-        proc = _make_proc(1, json.dumps(payload).encode(), stderr=b"")
+    async def test_nonzero_exit_with_stream_result_extracts_result(self):
+        stream = _ndjson(
+            _result_line(
+                is_error=True,
+                result="API Error: Could not process image",
+                subtype="success",
+            )
+        )
+        proc = _make_proc(1, stream, stderr=b"")
 
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             with pytest.raises(
                 RuntimeError, match="API Error: Could not process image"
             ):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+
+# ---------------------------------------------------------------------------
+# parse_stream
+# ---------------------------------------------------------------------------
+
+
+class TestParseStream:
+    def test_empty_stdout_returns_empty_dict(self):
+        assert parse_stream(b"") == {}
+
+    def test_only_system_lines_no_result_returns_empty(self):
+        stream = _ndjson({"type": "system", "subtype": "init"})
+        assert parse_stream(stream) == {}
+
+    def test_result_line_passthrough_with_empty_counts(self):
+        stream = _ndjson(_result_line(result="done", total_cost_usd=0.1))
+        out = parse_stream(stream)
+        assert out["result"] == "done"
+        assert out["total_cost_usd"] == 0.1
+        assert out["tool_counts"] == {}
+        assert out["skill_counts"] == {}
+
+    def test_tool_counts_across_multiple_assistant_messages(self):
+        stream = _ndjson(
+            _assistant_line(_tool_use("Read"), _tool_use("Read"), _tool_use("Bash")),
+            {"type": "user", "message": {"content": []}},
+            _assistant_line(_tool_use("Read")),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["tool_counts"] == {"Read": 3, "Bash": 1}
+
+    def test_skill_tool_populates_skill_counts(self):
+        stream = _ndjson(
+            _assistant_line(
+                _tool_use("Skill", skill="cq"),
+                _tool_use("Skill", skill="simplify"),
+                _tool_use("Skill", skill="cq"),
+            ),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["tool_counts"] == {"Skill": 3}
+        assert out["skill_counts"] == {"cq": 2, "simplify": 1}
+
+    def test_skill_tool_without_skill_field_counted_only_as_tool(self):
+        stream = _ndjson(
+            _assistant_line(_tool_use("Skill")),  # no skill in input
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["tool_counts"] == {"Skill": 1}
+        assert out["skill_counts"] == {}
+
+    def test_text_blocks_ignored(self):
+        stream = _ndjson(
+            _assistant_line(
+                {"type": "text", "text": "thinking..."},
+                _tool_use("Read"),
+            ),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["tool_counts"] == {"Read": 1}
+
+    def test_malformed_line_is_skipped(self):
+        stream = (
+            json.dumps(_assistant_line(_tool_use("Read"))).encode()
+            + b"\nnot-json-garbage\n"
+            + json.dumps(_result_line(result="ok")).encode()
+        )
+        out = parse_stream(stream)
+        assert out["result"] == "ok"
+        assert out["tool_counts"] == {"Read": 1}
+
+    def test_blank_lines_skipped(self):
+        stream = b"\n\n" + json.dumps(_result_line(result="ok")).encode() + b"\n\n"
+        assert parse_stream(stream)["result"] == "ok"
+
+    def test_tool_use_without_name_falls_back_to_unknown(self):
+        stream = _ndjson(
+            _assistant_line({"type": "tool_use", "id": "t", "input": {}}),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["tool_counts"] == {"unknown": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +595,44 @@ class TestRun:
             resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
 
         assert resp.body == "No response"
+
+    async def test_tool_and_skill_counts_propagate(self):
+        output = _cli_output()
+        output["tool_counts"] = {"Read": 2, "Skill": 1}
+        output["skill_counts"] = {"cq": 1}
+
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.tool_counts == {"Read": 2, "Skill": 1}
+        assert resp.skill_counts == {"cq": 1}
+
+    async def test_tool_counts_default_empty_when_missing(self):
+        output = _cli_output()
+
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.tool_counts == {}
+        assert resp.skill_counts == {}
+
+    async def test_cmd_uses_stream_json_verbose(self):
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ) as mock:
+            await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        cmd = mock.call_args[0][1]
+        assert "stream-json" in cmd
+        assert "--verbose" in cmd
+        assert "json" not in [
+            cmd[i + 1] for i, v in enumerate(cmd[:-1]) if v == "--output-format"
+        ]
 
     async def test_resume_cmd_contains_session_uuid(self):
         output = _cli_output()

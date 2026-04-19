@@ -584,6 +584,7 @@ class TestSend:
         response = MagicMock()
         response.body = "Here is the answer"
         response.has_stats = True
+        response.has_tools = False
         response.format_stats.return_value = "tokens: 100, cost: $0.01"
 
         await frontend.send(1, response)
@@ -600,12 +601,72 @@ class TestSend:
         response = MagicMock()
         response.body = "plain reply"
         response.has_stats = False
+        response.has_tools = False
 
         await frontend.send(1, response)
 
         call_args = frontend._app.bot.send_message.call_args
         sent_text = call_args.kwargs["text"]
         assert sent_text == "plain reply"
+
+    async def test_send_with_tools_appends_tool_line(
+        self, frontend: TelegramFrontend, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("TELEGRAM_STATS_MODE", "detailed")
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+
+        response = MagicMock()
+        response.body = "Here is the answer"
+        response.has_stats = True
+        response.has_tools = True
+        response.format_stats.return_value = "$0.01 | sonnet"
+        response.format_tools.return_value = "🔧 5 (Read×3 Bash×2)"
+
+        await frontend.send(1, response)
+
+        sent_text = frontend._app.bot.send_message.call_args.kwargs["text"]
+        assert "_$0.01 | sonnet_" in sent_text
+        assert "_🔧 5 (Read×3 Bash×2)_" in sent_text
+
+    async def test_send_mode_off_drops_stats_and_tools(
+        self, frontend: TelegramFrontend, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("TELEGRAM_STATS_MODE", "off")
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+
+        response = MagicMock()
+        response.body = "plain"
+        response.has_stats = True
+        response.has_tools = True
+        response.format_stats.return_value = "stats"
+        response.format_tools.return_value = "tools"
+
+        await frontend.send(1, response)
+
+        sent_text = frontend._app.bot.send_message.call_args.kwargs["text"]
+        assert sent_text == "plain"
+
+    async def test_send_mode_summary_keeps_stats_drops_tools(
+        self, frontend: TelegramFrontend, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("TELEGRAM_STATS_MODE", "summary")
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+
+        response = MagicMock()
+        response.body = "body"
+        response.has_stats = True
+        response.has_tools = True
+        response.format_stats.return_value = "stats"
+        response.format_tools.return_value = "tools"
+
+        await frontend.send(1, response)
+
+        sent_text = frontend._app.bot.send_message.call_args.kwargs["text"]
+        assert "_stats_" in sent_text
+        assert "tools" not in sent_text
 
     async def test_send_noop_when_no_app(self, frontend: TelegramFrontend) -> None:
         response = MagicMock()

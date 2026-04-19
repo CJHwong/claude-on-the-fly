@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-from claude_on_the_fly.agent import Response
+from claude_on_the_fly.agent import Response, footer_parts
 from claude_on_the_fly.protocol import Frontend
 
 if TYPE_CHECKING:
@@ -99,8 +99,11 @@ class TelegramFrontend(Frontend):
         if not self._app:
             return
         text = response.body
-        if response.has_stats:
-            text = f"{text}\n\n_{response.format_stats()}_"
+        stats, tools = footer_parts(response, "telegram")
+        if stats:
+            text = f"{text}\n\n_{stats}_"
+        if tools:
+            text = f"{text}\n_{tools}_"
         await self._send_chunked(chat_id, text)
 
     async def send_typing(self, chat_id: int) -> None:
