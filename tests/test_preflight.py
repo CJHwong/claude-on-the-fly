@@ -137,11 +137,12 @@ def _make_slack_client(post_response_json):
 class TestCheckSlack:
     @pytest.mark.asyncio
     @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
-    async def test_succeeds_with_valid_tokens(self, mock_client_cls):
+    async def test_returns_user_id_from_auth_test(self, mock_client_cls):
         mock_client_cls.return_value = _make_slack_client(
             {"ok": True, "user_id": "U123", "user": "hoss", "team": "myteam"}
         )
-        await check_slack("xapp-valid", "xoxp-valid", "U123")
+        user_id = await check_slack("xapp-valid", "xoxp-valid")
+        assert user_id == "U123"
 
     @pytest.mark.asyncio
     @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
@@ -150,16 +151,16 @@ class TestCheckSlack:
             {"ok": False, "error": "invalid_auth"}
         )
         with pytest.raises(SystemExit, match="Invalid Slack user token.*invalid_auth"):
-            await check_slack("xapp-valid", "bad-token", "U123")
+            await check_slack("xapp-valid", "bad-token")
 
     @pytest.mark.asyncio
     @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
-    async def test_exits_on_user_id_mismatch(self, mock_client_cls):
+    async def test_exits_on_missing_user_id(self, mock_client_cls):
         mock_client_cls.return_value = _make_slack_client(
-            {"ok": True, "user_id": "U999", "user": "other", "team": "t"}
+            {"ok": True, "user": "hoss", "team": "myteam"}
         )
-        with pytest.raises(SystemExit, match="SLACK_USER_ID mismatch"):
-            await check_slack("xapp-valid", "xoxp-valid", "U123")
+        with pytest.raises(SystemExit, match="no user_id"):
+            await check_slack("xapp-valid", "xoxp-valid")
 
     @pytest.mark.asyncio
     @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
@@ -168,7 +169,7 @@ class TestCheckSlack:
             {"ok": True, "user_id": "U123", "user": "hoss", "team": "t"}
         )
         with pytest.raises(SystemExit, match="must start with 'xapp-'"):
-            await check_slack("not-xapp", "xoxp-valid", "U123")
+            await check_slack("not-xapp", "xoxp-valid")
 
 
 # ---------------------------------------------------------------------------
@@ -273,12 +274,11 @@ class TestRunTelegram:
 
 
 class TestRunSlack:
-    @patch("claude_on_the_fly.preflight.asyncio.run")
+    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_returns_tokens_and_ids(self, _mock_claude, _mock_arun, monkeypatch):
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.setenv("SLACK_USER_ID", "U123")
         monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U1, U2 ,U3")
         app, user, uid, allowed = run_slack()
         assert app == "xapp-abc"
@@ -286,26 +286,24 @@ class TestRunSlack:
         assert uid == "U123"
         assert allowed == {"U1", "U2", "U3"}
 
-    @patch("claude_on_the_fly.preflight.asyncio.run")
+    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_empty_allowed_ids_yields_empty_set(
         self, _mock_claude, _mock_arun, monkeypatch
     ):
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.setenv("SLACK_USER_ID", "U123")
         monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "")
         _, _, _, allowed = run_slack()
         assert allowed == set()
 
-    @patch("claude_on_the_fly.preflight.asyncio.run")
+    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_missing_allowed_ids_yields_empty_set(
         self, _mock_claude, _mock_arun, monkeypatch
     ):
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.setenv("SLACK_USER_ID", "U123")
         monkeypatch.delenv("SLACK_ALLOWED_USER_IDS", raising=False)
         _, _, _, allowed = run_slack()
         assert allowed == set()

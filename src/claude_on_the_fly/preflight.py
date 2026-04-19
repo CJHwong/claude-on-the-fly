@@ -56,10 +56,9 @@ async def check_telegram(token: str) -> None:
         logger.info("Telegram bot: @%s", bot_name)
 
 
-async def check_slack(app_token: str, user_token: str, user_id: str) -> None:
-    """Verify Slack tokens are valid."""
+async def check_slack(app_token: str, user_token: str) -> str:
+    """Verify Slack tokens are valid. Returns the user_id owning the user token."""
     async with httpx.AsyncClient() as client:
-        # Check user token
         resp = await client.post(
             "https://slack.com/api/auth.test",
             headers={"Authorization": f"Bearer {user_token}"},
@@ -69,17 +68,20 @@ async def check_slack(app_token: str, user_token: str, user_id: str) -> None:
             raise SystemExit(
                 f"Invalid Slack user token: {data.get('error', 'unknown')}"
             )
-        actual_user = data.get("user_id")
-        if actual_user != user_id:
-            raise SystemExit(
-                f"SLACK_USER_ID mismatch: token belongs to {actual_user}, but config says {user_id}"
-            )
-        logger.info("Slack user token: %s (%s)", data.get("user"), data.get("team"))
+        user_id = data.get("user_id")
+        if not user_id:
+            raise SystemExit("Slack auth.test returned no user_id")
+        logger.info(
+            "Slack user token: %s (%s, %s)",
+            data.get("user"),
+            data.get("team"),
+            user_id,
+        )
 
-        # Check app token format
         if not app_token.startswith("xapp-"):
             raise SystemExit("SLACK_APP_TOKEN must start with 'xapp-'")
         logger.info("Slack app token: format ok")
+        return user_id
 
 
 def check_gws_cli() -> None:
@@ -129,16 +131,18 @@ def run_telegram() -> tuple[str, int]:
 
 
 def run_slack() -> tuple[str, str, str, set[str]]:
-    """Validate env vars and tokens. Returns (app_token, user_token, user_id, allowed_user_ids)."""
+    """Validate env vars and tokens. Returns (app_token, user_token, user_id, allowed_user_ids).
+
+    user_id is resolved from Slack auth.test — no need to pass it via env.
+    """
     _setup_logging()
     app_token = require_env("SLACK_APP_TOKEN")
     user_token = require_env("SLACK_USER_TOKEN")
-    user_id = require_env("SLACK_USER_ID")
     allowed_raw = os.environ.get("SLACK_ALLOWED_USER_IDS", "")
     allowed_user_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
-    logger.debug("preflight: user_id=%s allowed_user_ids=%s", user_id, allowed_user_ids)
     check_claude_cli()
-    asyncio.run(check_slack(app_token, user_token, user_id))
+    user_id = asyncio.run(check_slack(app_token, user_token))
+    logger.debug("preflight: user_id=%s allowed_user_ids=%s", user_id, allowed_user_ids)
     return app_token, user_token, user_id, allowed_user_ids
 
 

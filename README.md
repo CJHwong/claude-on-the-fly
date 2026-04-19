@@ -25,7 +25,6 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-telegram
 # Slack
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_USER_TOKEN=xoxp-...
-export SLACK_USER_ID=UXXXXXXXX
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
 
 # Gmail
@@ -94,18 +93,12 @@ Send a message to your bot. That's it.
 9. Left sidebar -> "Install App" -> "Install to Workspace" -> Allow
 10. Copy the "User OAuth Token" (`xoxp-...`)
 
-### Get Your User ID
-
-11. In Slack, click your profile picture -> "Profile"
-12. Click the three dots menu -> "Copy member ID"
-
 ### Run
 
 ```bash
 export SLACK_APP_TOKEN="xapp-..."
 export SLACK_USER_TOKEN="xoxp-..."
-export SLACK_USER_ID="UXXXXXXXX"
-# Optional: allow other users (comma-separated). Your own ID is always included.
+# Optional: allow other users (comma-separated). Your own ID is resolved from the user token.
 # export SLACK_ALLOWED_USER_IDS="U111,U222"
 # Or set to "*" to allow any sender to @mention the bot in channels:
 # export SLACK_ALLOWED_USER_IDS="*"
@@ -115,7 +108,7 @@ uv run claude-slack
 ### How It Works
 
 - Anyone who DMs you triggers Claude (if they can DM you, they're trusted)
-- In channels, only allowed users (`SLACK_USER_ID` + `SLACK_ALLOWED_USER_IDS`) can trigger Claude via @mention
+- In channels, only allowed users (your own ID + `SLACK_ALLOWED_USER_IDS`) can trigger Claude via @mention
 - Claude responds as you (via user token) in a thread
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
@@ -156,7 +149,7 @@ uv run claude-gmail
 TELEGRAM_BOT_TOKEN=... TELEGRAM_ALLOWED_USER_ID=... uv run claude-telegram
 
 # Terminal 2
-SLACK_APP_TOKEN=... SLACK_USER_TOKEN=... SLACK_USER_ID=... SLACK_ALLOWED_USER_IDS=... uv run claude-slack
+SLACK_APP_TOKEN=... SLACK_USER_TOKEN=... SLACK_ALLOWED_USER_IDS=... uv run claude-slack
 
 # Terminal 3
 GMAIL_GCP_PROJECT=... GMAIL_ALLOWED_SENDERS=... uv run claude-gmail
@@ -180,8 +173,7 @@ Or use a `.env` file with all vars and a process manager.
 |----------|----------|-------------|
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-...`) for Socket Mode |
 | `SLACK_USER_TOKEN` | yes | User OAuth token (`xoxp-...`) to post as you |
-| `SLACK_USER_ID` | yes | Your Slack member ID |
-| `SLACK_ALLOWED_USER_IDS` | no | Extra allowed user IDs (comma-separated). Use `*` to allow any sender in channels |
+| `SLACK_ALLOWED_USER_IDS` | no | Extra allowed user IDs (comma-separated). Your own ID is resolved from the user token. Use `*` to allow any sender in channels |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
 ### Gmail
