@@ -11,9 +11,11 @@ import pytest
 
 from claude_on_the_fly.agent import (
     FORMAT_HINTS,
+    NUDGE_PROMPT,
     Response,
     build_system_prompt,
     _exec,
+    _merge_cli_output,
     parse_stream,
     run,
     stats_mode,
@@ -456,6 +458,68 @@ class TestParseStream:
 
 
 # ---------------------------------------------------------------------------
+# _merge_cli_output
+# ---------------------------------------------------------------------------
+
+
+class TestMergeCliOutput:
+    def test_second_body_wins(self):
+        a = {"result": "", "total_cost_usd": 0.01}
+        b = {"result": "done", "total_cost_usd": 0.02}
+        assert _merge_cli_output(a, b)["result"] == "done"
+
+    def test_cost_and_duration_summed(self):
+        a = {"total_cost_usd": 0.10, "duration_ms": 1500}
+        b = {"total_cost_usd": 0.25, "duration_ms": 2500}
+        merged = _merge_cli_output(a, b)
+        assert merged["total_cost_usd"] == pytest.approx(0.35)
+        assert merged["duration_ms"] == 4000
+
+    def test_usage_fields_summed(self):
+        a = {
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 20,
+                "output_tokens": 5,
+            }
+        }
+        b = {
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 200,
+                "output_tokens": 50,
+            }
+        }
+        merged = _merge_cli_output(a, b)
+        assert merged["usage"] == {
+            "input_tokens": 110,
+            "cache_read_input_tokens": 220,
+            "output_tokens": 55,
+        }
+
+    def test_missing_usage_treated_as_zero(self):
+        merged = _merge_cli_output({}, {"result": "ok"})
+        assert merged["usage"] == {
+            "input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+    def test_tool_and_skill_counts_merged_by_sum(self):
+        a = {"tool_counts": {"Read": 2}, "skill_counts": {"cq": 1}}
+        b = {"tool_counts": {"Read": 3, "Edit": 1}, "skill_counts": {"cq": 2}}
+        merged = _merge_cli_output(a, b)
+        assert merged["tool_counts"] == {"Read": 5, "Edit": 1}
+        assert merged["skill_counts"] == {"cq": 3}
+
+    def test_model_usage_dicts_merged(self):
+        a = {"modelUsage": {"sonnet": {"input_tokens": 10}}}
+        b = {"modelUsage": {"opus": {"input_tokens": 20}}}
+        merged = _merge_cli_output(a, b)
+        assert set(merged["modelUsage"]) == {"sonnet", "opus"}
+
+
+# ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 
@@ -586,15 +650,102 @@ class TestRun:
         assert resp.tokens_out == 0
         assert resp.model == ""
 
-    async def test_missing_result_defaults_to_no_response(self):
-        output = {"total_cost_usd": 0.01}
+    async def test_missing_result_triggers_retry_then_defaults(self):
+        """Missing result key → retry → retry also empty → 'No response'."""
+        first = {"total_cost_usd": 0.01}
+        retry = {"result": ""}
 
         with patch(
-            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
-        ):
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ) as mock:
             resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
 
         assert resp.body == "No response"
+        assert mock.await_count == 2
+        # Second call is the nudge.
+        assert NUDGE_PROMPT in mock.call_args_list[1][0][1]
+
+    async def test_empty_result_triggers_retry(self):
+        """Empty-string result fires a retry; retry's body is returned."""
+        first = _cli_output(result="", cost=0.01, duration_ms=1000)
+        retry = _cli_output(result="actual reply", cost=0.02, duration_ms=2000)
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ) as mock:
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.body == "actual reply"
+        assert mock.await_count == 2
+        retry_cmd = mock.call_args_list[1][0][1]
+        assert "--resume" in retry_cmd
+        assert "sess-1" in retry_cmd
+        assert NUDGE_PROMPT in retry_cmd
+
+    async def test_whitespace_result_triggers_retry(self):
+        first = _cli_output(result="   \n  ")
+        retry = _cli_output(result="real answer")
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.body == "real answer"
+
+    async def test_retry_accumulates_cost_duration_tokens(self):
+        first = _cli_output(
+            result="",
+            cost=0.01,
+            duration_ms=1000,
+            input_tokens=100,
+            cache_read=50,
+            output_tokens=10,
+        )
+        retry = _cli_output(
+            result="final",
+            cost=0.02,
+            duration_ms=2500,
+            input_tokens=200,
+            cache_read=30,
+            output_tokens=80,
+        )
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.cost == pytest.approx(0.03)
+        assert resp.duration == pytest.approx(3.5)
+        assert resp.tokens_in == 380  # (100+50) + (200+30)
+        assert resp.tokens_out == 90
+
+    async def test_retry_merges_tool_counts(self):
+        first = _cli_output(result="")
+        first["tool_counts"] = {"Read": 2, "Bash": 1}
+        first["skill_counts"] = {"cq": 1}
+        retry = _cli_output(result="done")
+        retry["tool_counts"] = {"Read": 1, "Edit": 3}
+        retry["skill_counts"] = {"simplify": 1, "cq": 1}
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.tool_counts == {"Read": 3, "Bash": 1, "Edit": 3}
+        assert resp.skill_counts == {"cq": 2, "simplify": 1}
 
     async def test_tool_and_skill_counts_propagate(self):
         output = _cli_output()
@@ -633,6 +784,18 @@ class TestRun:
         assert "json" not in [
             cmd[i + 1] for i, v in enumerate(cmd[:-1]) if v == "--output-format"
         ]
+
+    async def test_no_retry_when_body_non_empty(self):
+        output = _cli_output(result="real reply")
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert mock.await_count == 1
 
     async def test_resume_cmd_contains_session_uuid(self):
         output = _cli_output()

@@ -232,6 +232,46 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
     return result
 
 
+NUDGE_PROMPT = "Please provide your final reply to the user."
+
+
+def _sum_counts(a: dict | None, b: dict | None) -> dict:
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        out[k] = out.get(k, 0) + v
+    return out
+
+
+def _merge_cli_output(first: dict, second: dict) -> dict:
+    """Combine two stream-json results for a retry: body from second, usage summed."""
+    merged = dict(second)
+    merged["total_cost_usd"] = first.get("total_cost_usd", 0) + second.get(
+        "total_cost_usd", 0
+    )
+    merged["duration_ms"] = first.get("duration_ms", 0) + second.get("duration_ms", 0)
+
+    fu = first.get("usage") or {}
+    su = second.get("usage") or {}
+    merged["usage"] = {
+        "input_tokens": fu.get("input_tokens", 0) + su.get("input_tokens", 0),
+        "cache_read_input_tokens": fu.get("cache_read_input_tokens", 0)
+        + su.get("cache_read_input_tokens", 0),
+        "output_tokens": fu.get("output_tokens", 0) + su.get("output_tokens", 0),
+    }
+
+    merged["modelUsage"] = {
+        **(first.get("modelUsage") or {}),
+        **(second.get("modelUsage") or {}),
+    }
+    merged["tool_counts"] = _sum_counts(
+        first.get("tool_counts"), second.get("tool_counts")
+    )
+    merged["skill_counts"] = _sum_counts(
+        first.get("skill_counts"), second.get("skill_counts")
+    )
+    return merged
+
+
 async def run(
     workspace: Path,
     session_uuid: str,
@@ -270,9 +310,20 @@ async def run(
             workspace, [*base, "--session-id", session_uuid, prompt]
         )
 
+    body = (cli_output.get("result") or "").strip()
+    if not body:
+        logger.warning(
+            "agent.run: empty result, retrying with nudge, session=%s", session_uuid
+        )
+        retry_output = await _exec(
+            workspace, [*base, "--resume", session_uuid, NUDGE_PROMPT]
+        )
+        cli_output = _merge_cli_output(cli_output, retry_output)
+        body = (cli_output.get("result") or "").strip() or "No response"
+
     usage = cli_output.get("usage", {})
     return Response(
-        body=cli_output.get("result", "No response"),
+        body=body,
         cost=cli_output.get("total_cost_usd", 0),
         duration=cli_output.get("duration_ms", 0) / 1000,
         tokens_in=usage.get("input_tokens", 0)
