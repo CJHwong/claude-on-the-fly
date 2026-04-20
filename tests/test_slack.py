@@ -222,7 +222,7 @@ class TestIngestEvent:
             "text": "check this",
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_SOMEONE",
+            "user": "U_ALLOWED",
             "files": [
                 {
                     "id": "F1",
@@ -322,12 +322,46 @@ class TestIngestEvent:
             "text": "hello from dm",
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_SOMEONE",
+            "user": "U_ALLOWED",
         }
         await frontend._ingest_event(event)
         frontend._on_message.assert_awaited_once()
         _, call_text = frontend._on_message.call_args[0]
         assert "hello from dm" in call_text
+
+    async def test_dm_skips_disallowed_sender(self, frontend):
+        event = {
+            "ts": "8.1",
+            "text": "hello from dm",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_RANDOM",
+        }
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_not_awaited()
+
+    async def test_mpim_skips_disallowed_sender(self, frontend):
+        event = {
+            "ts": "8.2",
+            "text": "hello from mpim",
+            "channel": "G1",
+            "channel_type": "mpim",
+            "user": "U_RANDOM",
+        }
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_not_awaited()
+
+    async def test_dm_allows_any_sender_with_wildcard(self, frontend):
+        frontend._allow_all_senders = True
+        event = {
+            "ts": "8.3",
+            "text": "hello from dm",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_RANDOM",
+        }
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_awaited_once()
 
     async def test_adds_ts_to_processed(self, frontend):
         event = {
@@ -335,7 +369,7 @@ class TestIngestEvent:
             "text": "hi",
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_SOMEONE",
+            "user": "U_ALLOWED",
         }
         await frontend._ingest_event(event)
         assert "9.0" in frontend._processed_ts
@@ -346,7 +380,7 @@ class TestIngestEvent:
             "text": "ping",
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_SOMEONE",
+            "user": "U_ALLOWED",
         }
         await frontend._ingest_event(event)
         session_id, text = frontend._on_message.call_args[0]
@@ -398,7 +432,7 @@ class TestNotifyQueued:
             "text": "hi",
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_SOMEONE",
+            "user": "U_ALLOWED",
         }
         await frontend._ingest_event(event)
         session_id = _session_key("D1", "12.0")
@@ -875,7 +909,7 @@ class TestIngestEventWithFiles:
             "text": "",
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_SOMEONE",
+            "user": "U_ALLOWED",
             "files": [
                 {
                     "id": "F1",

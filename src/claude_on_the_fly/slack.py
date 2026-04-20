@@ -268,11 +268,13 @@ class SlackFrontend(Frontend):
             fwd_refs,
         )
 
-        # Channels: only allowed users, only @mentions
+        # Allowlist applies to all channel types, including DMs and group DMs.
+        if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
+            logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
+            return
+
+        # Channels and groups additionally require an @mention.
         if channel_type in ("channel", "group"):
-            if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
-                logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
-                return
             mention = f"<@{self._user_id}>"
             if mention not in text:
                 logger.debug("skipped: no mention of %s in text", self._user_id)
