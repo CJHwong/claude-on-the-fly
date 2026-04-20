@@ -47,6 +47,117 @@ def _session_key(channel: str, thread_ts: str | None) -> int:
     return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
 
 
+def _flatten_rich_elements(elements: list[dict]) -> str:
+    """Flatten rich_text sub-elements into plain text."""
+    parts: list[str] = []
+    for el in elements or []:
+        t = el.get("type")
+        if t == "text":
+            parts.append(el.get("text", ""))
+        elif t == "user":
+            parts.append(f"<@{el.get('user_id', '')}>")
+        elif t == "link":
+            parts.append(el.get("url", ""))
+        elif t == "channel":
+            parts.append(f"<#{el.get('channel_id', '')}>")
+        elif "elements" in el:
+            parts.append(_flatten_rich_elements(el.get("elements") or []))
+    return "".join(parts)
+
+
+def _text_from_blocks(blocks: list[dict]) -> str:
+    """Extract plain text from block-kit blocks (sections, rich_text)."""
+    parts: list[str] = []
+    for block in blocks or []:
+        btype = block.get("type")
+        if btype == "rich_text":
+            for element in block.get("elements") or []:
+                if "elements" in element:
+                    parts.append(_flatten_rich_elements(element.get("elements") or []))
+        elif btype == "section":
+            txt = block.get("text") or {}
+            if txt.get("text"):
+                parts.append(txt["text"])
+    return "\n".join(p for p in parts if p)
+
+
+def _extract_forwards(event: dict) -> list[dict]:
+    """Collect forwarded/quoted messages from event attachments and blocks.
+
+    Returns a list of dicts with keys: channel_id, channel_name, ts,
+    author_name, author_id, text. Missing fields default to empty strings.
+    """
+    forwards: list[dict] = []
+
+    # Shape A: legacy attachments[] from "Share message to..." and permalink unfurls.
+    for att in event.get("attachments") or []:
+        is_unfurl = bool(att.get("is_msg_unfurl"))
+        has_ref = bool(att.get("channel_id") and att.get("ts"))
+        if not (is_unfurl or has_ref):
+            continue
+        body = att.get("text") or ""
+        if not body and att.get("blocks"):
+            body = _text_from_blocks(att["blocks"])
+        if not body:
+            continue
+        forwards.append(
+            {
+                "channel_id": att.get("channel_id", ""),
+                "channel_name": att.get("channel_name", ""),
+                "ts": att.get("ts", ""),
+                "author_name": att.get("author_name", ""),
+                "author_id": att.get("author_id", ""),
+                "text": body,
+            }
+        )
+
+    # Shape B: top-level blocks[] with rich_text_quote elements.
+    for block in event.get("blocks") or []:
+        if block.get("type") != "rich_text":
+            continue
+        for element in block.get("elements") or []:
+            if element.get("type") != "rich_text_quote":
+                continue
+            body = _flatten_rich_elements(element.get("elements") or [])
+            if not body:
+                continue
+            forwards.append(
+                {
+                    "channel_id": "",
+                    "channel_name": "",
+                    "ts": "",
+                    "author_name": "",
+                    "author_id": "",
+                    "text": body,
+                }
+            )
+
+    return forwards
+
+
+def _render_forward(fwd: dict) -> str:
+    """Render a forwarded-message dict as a labeled XML block for the prompt."""
+    lines: list[str] = ["<forwarded_message>"]
+    src_bits: list[str] = []
+    if fwd.get("channel_name"):
+        src_bits.append(f"#{fwd['channel_name']}")
+    if fwd.get("author_name"):
+        src_bits.append(f"@{fwd['author_name']}")
+    if fwd.get("ts"):
+        src_bits.append(fwd["ts"])
+    if src_bits:
+        lines.append(f"  <source>{' · '.join(src_bits)}</source>")
+    if fwd.get("channel_id"):
+        lines.append(f"  <channel_id>{fwd['channel_id']}</channel_id>")
+    if fwd.get("ts"):
+        lines.append(f"  <thread_ts>{fwd['ts']}</thread_ts>")
+    lines.append("  <body>")
+    lines.append(fwd.get("text", ""))
+    lines.append("  </body>")
+    lines.append("</forwarded_message>")
+    return "\n".join(lines)
+
+
 class SlackFrontend(Frontend):
     def __init__(
         self,
@@ -142,13 +253,19 @@ class SlackFrontend(Frontend):
         channel_type: str = event.get("channel_type") or self._channel_types.get(
             channel, ""
         )
+        forwards = _extract_forwards(event)
+        fwd_refs = ",".join(
+            f"{f.get('channel_id') or '?'}/{f.get('ts') or '?'}" for f in forwards
+        )
         logger.debug(
-            "parsed: sender=%s channel=%s channel_type=%s thread_ts=%s text=%s",
+            "parsed: sender=%s channel=%s channel_type=%s thread_ts=%s text=%s forwards=%d forward_refs=%s",
             sender_id,
             channel,
             channel_type,
             thread_ts,
             text[:80],
+            len(forwards),
+            fwd_refs,
         )
 
         # Channels: only allowed users, only @mentions
@@ -175,12 +292,11 @@ class SlackFrontend(Frontend):
         )
 
         files = event.get("files") or []
+        file_lines: list[str] = []
         if files:
             file_lines = await self._save_files(session_id, files)
-            if file_lines:
-                text = "\n".join(file_lines) + ("\n" + text if text else "")
 
-        if not text:
+        if not text and not forwards and not file_lines:
             logger.debug("skipped: empty text after processing")
             return
 
@@ -189,12 +305,33 @@ class SlackFrontend(Frontend):
         if channel_type:
             self._channel_types[channel] = channel_type
 
-        text = f"[from: {sender}] {text}"
+        cover_parts: list[str] = []
+        if file_lines:
+            cover_parts.extend(file_lines)
+        if text:
+            cover_parts.append(text)
+        cover = "\n".join(cover_parts)
+
+        segments: list[str] = [_render_forward(f) for f in forwards]
+        if cover:
+            segments.append(f"[from: {sender}] {cover}")
+        elif forwards:
+            segments.append(f"[from: {sender}]")
+        final_text = "\n\n".join(segments)
 
         self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
-        logger.info("slack %s/%s: %s", channel, thread_ts, text[:80])
+        preview = text[:80] if text else "(forward only)"
+        fwd_marker = f" (+{len(forwards)} fwd)" if forwards else ""
+        logger.info(
+            "slack %s/%s: [from: %s] %s%s",
+            channel,
+            thread_ts,
+            sender,
+            preview,
+            fwd_marker,
+        )
         if self._on_message:
-            await self._on_message(session_id, text)
+            await self._on_message(session_id, final_text)
 
     async def _catchup(self) -> None:
         """Fetch recent messages from active channels to recover missed events."""
