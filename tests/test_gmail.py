@@ -287,6 +287,66 @@ class TestHandleMessage:
         await fe._handle_message(msg)
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
 
+    async def test_domain_wildcard_accepts_matching_domain(self):
+        fe = GmailFrontend(
+            gcp_project="proj",
+            allowed_senders={"*@gofreight.com"},
+        )
+        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        msg = _make_msg(from_addr="Bob <bob@gofreight.com>")
+        await fe._handle_message(msg)
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_domain_wildcard_rejects_other_domain(self):
+        fe = GmailFrontend(
+            gcp_project="proj",
+            allowed_senders={"*@gofreight.com"},
+        )
+        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        msg = _make_msg(from_addr="Eve <eve@evil.com>")
+        await fe._handle_message(msg)
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_domain_wildcard_case_insensitive(self):
+        fe = GmailFrontend(
+            gcp_project="proj",
+            allowed_senders={"*@GoFreight.COM"},
+        )
+        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        msg = _make_msg(from_addr="Bob <BOB@gofreight.com>")
+        await fe._handle_message(msg)
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_star_accepts_anyone(self):
+        fe = GmailFrontend(
+            gcp_project="proj",
+            allowed_senders={"*"},
+        )
+        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        msg = _make_msg(from_addr="Random <random@nowhere.net>")
+        await fe._handle_message(msg)
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_mixed_entries_route_each_correctly(self):
+        fe = GmailFrontend(
+            gcp_project="proj",
+            allowed_senders={"alice@x.com", "*@gofreight.com"},
+        )
+        fe._on_message = AsyncMock()  # type: ignore[assignment]
+
+        # Exact email match.
+        await fe._handle_message(_make_msg(from_addr="Alice <alice@x.com>"))
+        # Domain match.
+        await fe._handle_message(
+            _make_msg(thread_id="t2", msg_id="m2", from_addr="Bob <bob@gofreight.com>")
+        )
+        # Neither.
+        await fe._handle_message(
+            _make_msg(thread_id="t3", msg_id="m3", from_addr="Eve <eve@evil.com>")
+        )
+
+        assert fe._on_message.await_count == 2  # type: ignore[union-attr]
+
     async def test_ignores_empty_body(self):
         fe = self._make_frontend()
         msg = _make_msg(body_text="   \n  ")

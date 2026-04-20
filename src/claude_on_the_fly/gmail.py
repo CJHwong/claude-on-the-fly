@@ -91,7 +91,19 @@ class GmailFrontend(Frontend):
         poll_interval: int = 5,
     ) -> None:
         self._gcp_project = gcp_project
-        self._allowed_senders = {s.lower() for s in allowed_senders}
+        self._allow_all_senders = False
+        self._allowed_emails: set[str] = set()
+        self._allowed_domains: set[str] = set()
+        for entry in allowed_senders:
+            normalized = entry.strip().lower()
+            if not normalized:
+                continue
+            if normalized == "*":
+                self._allow_all_senders = True
+            elif normalized.startswith("*@") and len(normalized) > 2:
+                self._allowed_domains.add(normalized[2:])
+            else:
+                self._allowed_emails.add(normalized)
         self._poll_interval = poll_interval
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
         self._watch_proc: asyncio.subprocess.Process | None = None
@@ -101,6 +113,15 @@ class GmailFrontend(Frontend):
         self._sender_names_map: dict[int, str] = {}
         self._sender_emails: dict[int, str] = {}
         self._subjects: dict[int, str] = {}
+
+    def _sender_allowed(self, sender_email: str) -> bool:
+        if self._allow_all_senders:
+            return True
+        email = sender_email.lower()
+        if email in self._allowed_emails:
+            return True
+        domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+        return bool(domain) and domain in self._allowed_domains
 
     def workspace_name(self, chat_id: int) -> str:
         sender = self._sender_emails.get(chat_id, "unknown").split("@")[0]
@@ -259,7 +280,7 @@ class GmailFrontend(Frontend):
             logger.debug("Ignored auto-generated email from %s", sender_email)
             return
 
-        if sender_email.lower() not in self._allowed_senders:
+        if not self._sender_allowed(sender_email):
             logger.debug("Ignored email from %s (not in allowlist)", sender_email)
             return
 
