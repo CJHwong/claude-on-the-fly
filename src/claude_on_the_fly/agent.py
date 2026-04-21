@@ -172,6 +172,7 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
+        limit=16 * 1024 * 1024,
     )
     assert proc.stdout is not None and proc.stderr is not None
 
