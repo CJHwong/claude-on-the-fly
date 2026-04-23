@@ -41,6 +41,13 @@ class Frontend(ABC):
         :hourglass:) into a processing indicator (e.g. :eyes:). No-op by default.
         """
 
+    async def notify_complete(self, chat_id: int) -> None:
+        """Signal that processing has finished for the oldest in-flight message.
+
+        Frontends can use this to clear a processing indicator (e.g. :eyes:)
+        once the reply has been posted. No-op by default.
+        """
+
     @abstractmethod
     async def stop(self) -> None:
         """Graceful shutdown."""

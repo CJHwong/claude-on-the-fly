@@ -118,6 +118,7 @@ class Orchestrator:
             await self._frontend.send(chat_id, Response(body=f"Error: {exc}"))
         finally:
             typing_task.cancel()
+            await self._frontend.notify_complete(chat_id)
 
     async def shutdown(self) -> None:
         for task in self._running.values():

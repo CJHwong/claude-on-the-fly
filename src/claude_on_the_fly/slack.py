@@ -194,6 +194,7 @@ class SlackFrontend(Frontend):
         self._pending_msg: dict[
             int, deque[tuple[str, str]]
         ] = {}  # session -> FIFO of (channel, ts)
+        self._in_flight: dict[int, tuple[str, str]] = {}
 
     def set_orchestrator(self, orchestrator: object) -> None:
         self._orchestrator = orchestrator
@@ -428,6 +429,16 @@ class SlackFrontend(Frontend):
         channel, ts = pending.popleft()
         await self._unreact(channel, ts, "hourglass_flowing_sand")
         await self._react(channel, ts, "eyes")
+        self._in_flight[chat_id] = (channel, ts)
+
+    async def notify_complete(self, chat_id: int) -> None:
+        """Remove :eyes: from the in-flight message."""
+        in_flight = self._in_flight.pop(chat_id, None)
+        if not in_flight:
+            logger.debug("notify_complete: no in-flight msg for chat_id=%s", chat_id)
+            return
+        channel, ts = in_flight
+        await self._unreact(channel, ts, "eyes")
 
     # --- Helpers ---
 

@@ -457,12 +457,32 @@ class TestNotifyStart:
             channel="C1", timestamp="10.0", name="eyes"
         )
         assert list(frontend._pending_msg[session_id]) == [("C1", "20.0")]
+        assert frontend._in_flight[session_id] == ("C1", "10.0")
 
     async def test_no_op_when_no_pending(self, frontend):
         frontend._app.client.reactions_add = AsyncMock()
         frontend._app.client.reactions_remove = AsyncMock()
         await frontend.notify_start(99999)
         frontend._app.client.reactions_add.assert_not_awaited()
+        frontend._app.client.reactions_remove.assert_not_awaited()
+
+
+class TestNotifyComplete:
+    async def test_removes_eyes_from_in_flight(self, frontend):
+        session_id = 7
+        frontend._in_flight[session_id] = ("C1", "10.0")
+        frontend._app.client.reactions_remove = AsyncMock()
+
+        await frontend.notify_complete(session_id)
+
+        frontend._app.client.reactions_remove.assert_awaited_once_with(
+            channel="C1", timestamp="10.0", name="eyes"
+        )
+        assert session_id not in frontend._in_flight
+
+    async def test_no_op_when_no_in_flight(self, frontend):
+        frontend._app.client.reactions_remove = AsyncMock()
+        await frontend.notify_complete(99999)
         frontend._app.client.reactions_remove.assert_not_awaited()
 
 

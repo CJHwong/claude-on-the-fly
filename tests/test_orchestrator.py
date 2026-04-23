@@ -25,6 +25,8 @@ class StubFrontend(Frontend):
         self.sent: list[tuple[int, Response]] = []
         self.typing_sent: list[int] = []
         self.queued_notifications: list[tuple[int, int]] = []
+        self.start_notifications: list[int] = []
+        self.complete_notifications: list[int] = []
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         pass
@@ -37,6 +39,12 @@ class StubFrontend(Frontend):
 
     async def notify_queued(self, chat_id: int, position: int) -> None:
         self.queued_notifications.append((chat_id, position))
+
+    async def notify_start(self, chat_id: int) -> None:
+        self.start_notifications.append(chat_id)
+
+    async def notify_complete(self, chat_id: int) -> None:
+        self.complete_notifications.append(chat_id)
 
     async def stop(self) -> None:
         pass
@@ -289,6 +297,32 @@ class TestProcess:
 
         assert len(frontend.sent) == 1
         assert "Error: boom" in frontend.sent[0][1].body
+
+    async def test_notifies_complete_on_success(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        with (
+            patch.object(orch, "_ensure_persona"),
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="ok"))
+            await orch._process(1, "question")
+
+        assert frontend.complete_notifications == [1]
+
+    async def test_notifies_complete_on_error(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        with (
+            patch.object(orch, "_ensure_persona"),
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+            await orch._process(1, "bad")
+
+        assert frontend.complete_notifications == [1]
 
     async def test_typing_loop_is_cancelled_after_process(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
