@@ -1,0 +1,587 @@
+"""Tests for claude_on_the_fly.scheduler."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import yaml
+
+from claude_on_the_fly.agent import Response
+from claude_on_the_fly.scheduler import (
+    JobSpec,
+    SchedulerFrontend,
+    load_config,
+    next_fire,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_yaml(path: Path, data: dict | str) -> Path:
+    if isinstance(data, str):
+        path.write_text(data)
+    else:
+        path.write_text(yaml.safe_dump(data))
+    return path
+
+
+def _make_script(
+    tmp_path: Path, name: str = "job.sh", body: str = "#!/bin/bash\necho ok\n"
+) -> Path:
+    script = tmp_path / name
+    script.write_text(body)
+    script.chmod(0o755)
+    return script
+
+
+# ---------------------------------------------------------------------------
+# load_config — valid
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConfigValid:
+    def test_prompt_job(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {"name": "ping", "cron": "0 3 * * *", "prompt": "hi"},
+                ]
+            },
+        )
+        specs = load_config(cfg)
+        assert len(specs) == 1
+        assert specs[0].name == "ping"
+        assert specs[0].prompt == "hi"
+        assert specs[0].script is None
+        assert specs[0].kind == "prompt"
+        assert specs[0].timeout == 1800  # default
+
+    def test_script_job(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path)
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "release",
+                        "cron": "0 18 * * 1-5",
+                        "script": str(script),
+                        "args": ["--verbose"],
+                        "timeout": 300,
+                    }
+                ]
+            },
+        )
+        specs = load_config(cfg)
+        assert specs[0].script == script
+        assert specs[0].args == ("--verbose",)
+        assert specs[0].timeout == 300
+        assert specs[0].kind == "script"
+
+    def test_tilde_expanded_in_script_path(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path)
+        # Fake ~ by using an absolute path — just verify expanduser doesn't break
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "script": str(script)}]},
+        )
+        specs = load_config(cfg)
+        assert specs[0].script == script
+
+
+# ---------------------------------------------------------------------------
+# load_config — invalid
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConfigInvalid:
+    def test_empty_jobs(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(tmp_path / "s.yaml", {"jobs": []})
+        with pytest.raises(ValueError, match="at least one entry"):
+            load_config(cfg)
+
+    def test_missing_jobs_key(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(tmp_path / "s.yaml", {"other": 1})
+        with pytest.raises(ValueError, match="'jobs' must be a list"):
+            load_config(cfg)
+
+    def test_root_not_mapping(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(tmp_path / "s.yaml", "- just a list\n")
+        with pytest.raises(ValueError, match="root must be a mapping"):
+            load_config(cfg)
+
+    def test_missing_name(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"cron": "* * * * *", "prompt": "hi"}]},
+        )
+        with pytest.raises(ValueError, match="'name' is required"):
+            load_config(cfg)
+
+    def test_invalid_name_chars(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "bad name!", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        with pytest.raises(ValueError, match=r"must match"):
+            load_config(cfg)
+
+    def test_duplicate_name(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {"name": "dup", "cron": "* * * * *", "prompt": "a"},
+                    {"name": "dup", "cron": "* * * * *", "prompt": "b"},
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="duplicate name"):
+            load_config(cfg)
+
+    def test_invalid_cron(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "not-a-cron", "prompt": "hi"}]},
+        )
+        with pytest.raises(ValueError, match="invalid cron"):
+            load_config(cfg)
+
+    def test_both_prompt_and_script(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path)
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "x",
+                        "cron": "* * * * *",
+                        "prompt": "hi",
+                        "script": str(script),
+                    }
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="'prompt' OR 'script', not both"):
+            load_config(cfg)
+
+    def test_neither_prompt_nor_script(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *"}]},
+        )
+        with pytest.raises(ValueError, match="must specify 'prompt' or 'script'"):
+            load_config(cfg)
+
+    def test_script_path_missing(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "x",
+                        "cron": "* * * * *",
+                        "script": str(tmp_path / "nope.sh"),
+                    }
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="script not found"):
+            load_config(cfg)
+
+    def test_invalid_timeout(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "x",
+                        "cron": "* * * * *",
+                        "prompt": "hi",
+                        "timeout": -1,
+                    }
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="timeout"):
+            load_config(cfg)
+
+    def test_malformed_yaml(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(tmp_path / "s.yaml", "jobs: [unclosed\n")
+        with pytest.raises(ValueError, match="YAML parse error"):
+            load_config(cfg)
+
+    def test_args_not_list(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path)
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "x",
+                        "cron": "* * * * *",
+                        "script": str(script),
+                        "args": "--not-a-list",
+                    }
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="'args' must be a list"):
+            load_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# next_fire
+# ---------------------------------------------------------------------------
+
+
+class TestNextFire:
+    def test_next_fire_advances(self) -> None:
+        now = datetime(2026, 4, 23, 12, 0, 0)
+        nxt = next_fire("30 14 * * *", now)
+        assert nxt == datetime(2026, 4, 23, 14, 30, 0)
+
+    def test_next_fire_rolls_over_day(self) -> None:
+        now = datetime(2026, 4, 23, 23, 0, 0)
+        nxt = next_fire("0 6 * * *", now)
+        assert nxt == datetime(2026, 4, 24, 6, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# JobSpec
+# ---------------------------------------------------------------------------
+
+
+class TestJobSpec:
+    def test_chat_id_stable(self) -> None:
+        a = JobSpec(name="same", cron="* * * * *", prompt="hi")
+        b = JobSpec(name="same", cron="0 0 * * *", prompt="different")
+        assert a.chat_id == b.chat_id
+
+    def test_chat_id_differs_for_different_names(self) -> None:
+        a = JobSpec(name="a", cron="* * * * *", prompt="hi")
+        b = JobSpec(name="b", cron="* * * * *", prompt="hi")
+        assert a.chat_id != b.chat_id
+
+    def test_chat_id_non_negative(self) -> None:
+        # crc32 can be > 2^31; we mask to keep it positive for int semantics.
+        spec = JobSpec(name="x" * 200, cron="* * * * *", prompt="hi")
+        assert spec.chat_id >= 0
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+
+def _fake_orch() -> MagicMock:
+    orch = MagicMock()
+    orch.reset_session = MagicMock()
+    return orch
+
+
+class TestFirePrompt:
+    async def test_resets_session_and_calls_on_message(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "ping", "cron": "* * * * *", "prompt": "hello"}]},
+        )
+        orch = _fake_orch()
+        on_message = AsyncMock()
+
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._on_message = on_message
+        fe._orch = orch
+        fe._reload()
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["ping"].spec
+            await fe._fire_prompt(spec)
+
+        orch.reset_session.assert_called_once_with(spec.chat_id)
+        on_message.assert_awaited_once_with(spec.chat_id, "hello")
+        # Log block was written
+        log = (tmp_path / "logs" / "schedule-ping.log").read_text()
+        assert "fire (prompt)" in log
+        assert "> hello" in log
+
+
+class TestRunScript:
+    async def test_script_runs_and_logs(self, tmp_path: Path) -> None:
+        script = _make_script(
+            tmp_path, body="#!/bin/bash\necho 'hello from script'\nexit 0\n"
+        )
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "job", "cron": "* * * * *", "script": str(script)}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["job"].spec
+            await fe._run_script(spec)
+
+        log = (tmp_path / "logs" / "schedule-job.log").read_text()
+        assert "hello from script" in log
+        assert "fire (script)" in log
+        assert "exit=0" in log
+
+    async def test_script_timeout_kills(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path, body="#!/bin/bash\nsleep 30\n")
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "slow",
+                        "cron": "* * * * *",
+                        "script": str(script),
+                        "timeout": 1,
+                    }
+                ]
+            },
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        started = time.monotonic()
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["slow"].spec
+            await fe._run_script(spec)
+        elapsed = time.monotonic() - started
+        assert elapsed < 5  # should have been killed quickly
+
+        log = (tmp_path / "logs" / "schedule-slow.log").read_text()
+        assert "timed out after 1s" in log
+
+
+# ---------------------------------------------------------------------------
+# Reload
+# ---------------------------------------------------------------------------
+
+
+class TestReload:
+    def test_adds_job(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        assert set(fe._state) == {"a"}
+
+        _write_yaml(
+            cfg,
+            {
+                "jobs": [
+                    {"name": "a", "cron": "* * * * *", "prompt": "hi"},
+                    {"name": "b", "cron": "0 3 * * *", "prompt": "hi"},
+                ]
+            },
+        )
+        added, removed, modified = fe._reload()
+        assert added == {"b"}
+        assert removed == set()
+        assert modified == set()
+        assert set(fe._state) == {"a", "b"}
+
+    def test_removes_job(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {"name": "a", "cron": "* * * * *", "prompt": "hi"},
+                    {"name": "b", "cron": "* * * * *", "prompt": "hi"},
+                ]
+            },
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        _write_yaml(
+            cfg,
+            {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        added, removed, modified = fe._reload()
+        assert added == set()
+        assert removed == {"b"}
+        assert set(fe._state) == {"a"}
+
+    def test_removed_job_inflight_survives(self, tmp_path: Path) -> None:
+        """In-flight script task is not cancelled when its job is removed from config."""
+        slow = _make_script(tmp_path, body="#!/bin/bash\nsleep 0.5\necho done\n")
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {"name": "slow", "cron": "* * * * *", "script": str(slow)},
+                ]
+            },
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        async def _go() -> bool:
+            with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+                spec = fe._state["slow"].spec
+                fe._spawn_script(spec)
+                # Reload with job removed while script still running
+                await asyncio.sleep(0.1)
+                _write_yaml(
+                    cfg,
+                    {"jobs": [{"name": "other", "cron": "* * * * *", "prompt": "hi"}]},
+                )
+                fe._reload()
+                assert "slow" not in fe._state
+                # Wait for the in-flight task
+                await asyncio.gather(*fe._script_tasks)
+                log = (tmp_path / "logs" / "schedule-slow.log").read_text()
+                return "done" in log
+
+        assert asyncio.run(_go())
+
+    def test_modifies_cron_recomputes_next_fire(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "0 3 * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        before = fe._state["a"].next_fire
+
+        _write_yaml(
+            cfg,
+            {"jobs": [{"name": "a", "cron": "0 15 * * *", "prompt": "hi"}]},
+        )
+        added, removed, modified = fe._reload()
+        assert modified == {"a"}
+        after = fe._state["a"].next_fire
+        assert before != after
+
+    def test_unchanged_spec_preserves_next_fire(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "0 3 * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        before = fe._state["a"].next_fire
+
+        # Re-reload with identical content
+        fe._reload()
+        after = fe._state["a"].next_fire
+        assert before == after
+
+    def test_invalid_reload_keeps_prior(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        original_state = dict(fe._state)
+        fe._mtime = cfg.stat().st_mtime
+
+        # Write invalid yaml
+        cfg.write_text("jobs: not-a-list\n")
+        # Force a different mtime
+        future_time = cfg.stat().st_mtime + 10
+        import os as _os
+
+        _os.utime(cfg, (future_time, future_time))
+
+        fe._maybe_reload()  # should log + keep prior
+        assert fe._state == original_state
+
+
+# ---------------------------------------------------------------------------
+# Frontend protocol
+# ---------------------------------------------------------------------------
+
+
+class TestFrontendProtocol:
+    async def test_send_writes_log(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "ping", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        spec = fe._state["ping"].spec
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            await fe.send(
+                spec.chat_id,
+                Response(body="answer", cost=0.01, model="claude-sonnet-4-6"),
+            )
+
+        log = (tmp_path / "logs" / "schedule-ping.log").read_text()
+        assert "answer" in log
+        assert "claude-sonnet-4-6" in log
+        assert "=== done ===" in log
+
+    def test_workspace_name_uses_job_name(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "standup", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        spec = fe._state["standup"].spec
+        assert fe.workspace_name(spec.chat_id) == "schedule/standup"
+
+    def test_channel_context_includes_cron(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "30 6 * * 1-5", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        spec = fe._state["x"].spec
+        assert fe.channel_context(spec.chat_id) == "cron:30 6 * * 1-5"
+
+    def test_set_orchestrator_rejects_wrong_type(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        with pytest.raises(TypeError):
+            fe.set_orchestrator("not an orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# Stop
+# ---------------------------------------------------------------------------
+
+
+class TestStop:
+    async def test_cancels_inflight_scripts(self, tmp_path: Path) -> None:
+        slow = _make_script(tmp_path, body="#!/bin/bash\nsleep 30\n")
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "slow", "cron": "* * * * *", "script": str(slow)}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["slow"].spec
+            fe._spawn_script(spec)
+            await asyncio.sleep(0.1)
+            assert len(fe._script_tasks) == 1
+
+            started = time.monotonic()
+            await fe.stop()
+            elapsed = time.monotonic() - started
+            assert elapsed < 5  # should not wait for the 30s sleep

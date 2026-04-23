@@ -31,6 +31,10 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
 export GMAIL_GCP_PROJECT=your-gcp-project
 export GMAIL_ALLOWED_SENDERS=alice@example.com,bob@example.com
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-gmail
+
+# Scheduler
+# write ~/.claude-on-the-fly/schedule.yaml (see Scheduler Setup)
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-schedule
 ```
 
 ## Local Development
@@ -142,6 +146,31 @@ uv run claude-gmail
 - Quoted reply content is stripped (Claude already has session history)
 - If the watch process dies, it auto-restarts with exponential backoff
 
+## Scheduler Setup (2 minutes)
+
+Run Claude prompts (and shell scripts) on a cron schedule. Write a YAML config to `~/.claude-on-the-fly/schedule.yaml`:
+
+```yaml
+jobs:
+  - name: standup-mazu
+    cron: "30 6 * * 1-5"          # Mon-Fri 06:30
+    prompt: "/gf-ops:daily mazu — post to the team channel. No confirmation."
+    timeout: 1800                 # optional, default 1800s
+
+  - name: release-bot
+    cron: "0 18 * * 1-5"
+    script: ~/scripts/release-bot.sh   # shell escape hatch for multi-step jobs
+    args: ["--verbose"]
+    timeout: 1800
+```
+
+Each job needs `prompt` (goes through Claude with a fresh session every fire) OR `script` (runs as a subprocess). Output goes to `~/.claude-on-the-fly/logs/schedule-<name>.log`. Edits to the config are picked up within a minute, no restart required.
+
+```bash
+uv run claude-schedule
+# or: uv run claude-schedule --config /path/to/schedule.yaml
+```
+
 ## Running All
 
 ```bash
@@ -153,6 +182,9 @@ SLACK_APP_TOKEN=... SLACK_USER_TOKEN=... SLACK_ALLOWED_USER_IDS=... uv run claud
 
 # Terminal 3
 GMAIL_GCP_PROJECT=... GMAIL_ALLOWED_SENDERS=... uv run claude-gmail
+
+# Terminal 4
+uv run claude-schedule
 ```
 
 Or use a `.env` file with all vars and a process manager.
@@ -219,6 +251,7 @@ src/claude_on_the_fly/
   agent.py        # Claude CLI wrapper + Response dataclass
   orchestrator.py # Session management, queuing, typing indicators
   protocol.py     # Frontend protocol (for adding new interfaces)
+  scheduler.py    # Cron-driven frontend, YAML config, auto-reload
   telegram.py     # Telegram frontend
   slack.py        # Slack frontend
   gmail.py        # Gmail frontend
