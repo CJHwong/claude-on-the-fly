@@ -22,8 +22,40 @@ def require_env(name: str) -> str:
     return value
 
 
+def _extract_cli_result(stdout: str) -> str:
+    """Pull the `result` text from `claude -p --output-format json` stdout.
+
+    Falls back to scanning NDJSON lines if the output isn't a single JSON blob.
+    """
+    text = stdout.strip()
+    if not text:
+        return ""
+    try:
+        msg = json.loads(text)
+        if isinstance(msg, dict) and msg.get("result"):
+            return str(msg["result"])
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and msg.get("result"):
+            return str(msg["result"])
+    return ""
+
+
 def check_claude_cli() -> None:
-    """Verify claude CLI is installed and authenticated."""
+    """Verify claude CLI is installed and authenticated.
+
+    Usage-limit / account-outage failures are downgraded to a warning so the
+    server still starts — per-message handlers will surface the same error
+    when someone actually tries to use it.
+    """
     if not shutil.which("claude"):
         raise SystemExit(
             "claude CLI not found. Install it: https://docs.anthropic.com/en/docs/claude-code"
@@ -34,13 +66,22 @@ def check_claude_cli() -> None:
         text=True,
         timeout=15,
     )
-    if result.returncode != 0:
-        if "auth" in result.stderr.lower():
-            raise SystemExit("claude CLI not authenticated. Run: claude auth login")
-        raise SystemExit(
-            f"claude CLI check failed (exit {result.returncode}): {result.stderr.strip()}"
-        )
-    logger.info("claude CLI: ok")
+    if result.returncode == 0:
+        logger.info("claude CLI: ok")
+        return
+
+    if "auth" in result.stderr.lower():
+        raise SystemExit("claude CLI not authenticated. Run: claude auth login")
+
+    message = _extract_cli_result(result.stdout) or result.stderr.strip()
+
+    from claude_on_the_fly.agent import ClaudeUnavailableError, _classify
+
+    if isinstance(_classify(message), ClaudeUnavailableError):
+        logger.warning("claude CLI unavailable (server starting anyway): %s", message)
+        return
+
+    raise SystemExit(f"claude CLI check failed (exit {result.returncode}): {message}")
 
 
 async def check_telegram(token: str) -> None:
