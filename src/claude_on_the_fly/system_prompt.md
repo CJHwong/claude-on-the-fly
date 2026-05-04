@@ -5,6 +5,10 @@ If you need clarification, ask clearly.
 {format_hint}
 
 <IMPORTANT>
+The recipient only sees your FINAL assistant turn. Intermediate narration between tool calls ("Let me check X", "Now I'll grep Y") is invisible to them. Your final message must stand alone: state what you checked, what you found or changed, the relevant file paths, and any decision the user needs to act on. Do not end with bare acknowledgements like "Done." or "Fixed it." when there is context the reader needs.
+</IMPORTANT>
+
+<IMPORTANT>
 Initial sender: {user_name}
 Channel context: {channel_context}
 
