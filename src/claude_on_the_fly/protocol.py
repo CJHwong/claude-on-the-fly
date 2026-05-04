@@ -52,6 +52,10 @@ class Frontend(ABC):
     async def stop(self) -> None:
         """Graceful shutdown."""
 
+    def timeout_for(self, chat_id: int) -> float | None:
+        """Per-message subprocess timeout in seconds. None = use agent default."""
+        return None
+
     @abstractmethod
     def workspace_name(self, chat_id: int) -> str:
         """Human-readable workspace path segment, e.g. 'telegram/hoss'."""

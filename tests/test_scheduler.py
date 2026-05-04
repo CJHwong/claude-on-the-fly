@@ -550,6 +550,34 @@ class TestFrontendProtocol:
         spec = fe._state["x"].spec
         assert fe.channel_context(spec.chat_id) == "cron:30 6 * * 1-5"
 
+    def test_timeout_for_returns_spec_timeout(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {
+                "jobs": [
+                    {
+                        "name": "x",
+                        "cron": "* * * * *",
+                        "prompt": "hi",
+                        "timeout": 600,
+                    }
+                ]
+            },
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        spec = fe._state["x"].spec
+        assert fe.timeout_for(spec.chat_id) == 600.0
+
+    def test_timeout_for_unknown_chat_returns_none(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        assert fe.timeout_for(999_999_999) is None
+
     def test_set_orchestrator_rejects_wrong_type(self, tmp_path: Path) -> None:
         cfg = _write_yaml(
             tmp_path / "s.yaml",

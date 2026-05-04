@@ -397,6 +397,12 @@ class SchedulerFrontend(Frontend):
             return f"cron:{self._state[name].spec.cron}"
         return "cron"
 
+    def timeout_for(self, chat_id: int) -> float | None:
+        name = self._chat_to_name.get(chat_id)
+        if name and name in self._state:
+            return float(self._state[name].spec.timeout)
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Entry point

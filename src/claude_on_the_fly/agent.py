@@ -165,15 +165,29 @@ def parse_stream(stdout: bytes) -> dict:
     return result
 
 
-async def _exec(workspace: Path, cmd: list[str]) -> dict:
-    logger.debug("exec: cwd=%s cmd=%s", workspace, " ".join(cmd[:6]) + "...")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=workspace,
-        limit=16 * 1024 * 1024,
-    )
+DEFAULT_TIMEOUT = 3600.0
+
+
+class ClaudeUnavailableError(RuntimeError):
+    """Claude CLI reports the org/account cannot use the API at all (usage limit, allocation disabled).
+
+    Distinct from per-message errors so callers can avoid retrying or noisy reporting.
+    """
+
+
+# Substrings (lowercased) that indicate the API is unusable, not a per-message failure.
+_UNAVAILABLE_PATTERNS = ("usage limit", "usage allocation")
+
+
+def _classify(message: str) -> RuntimeError:
+    low = (message or "").lower()
+    if any(p in low for p in _UNAVAILABLE_PATTERNS):
+        return ClaudeUnavailableError(message)
+    return RuntimeError(message)
+
+
+async def _consume(proc: asyncio.subprocess.Process) -> dict:
+    """Stream stdout, fold into result, validate returncode. Caller owns proc lifecycle."""
     assert proc.stdout is not None and proc.stderr is not None
 
     # Drain stderr concurrently so the subprocess can't block on a full pipe.
@@ -203,7 +217,7 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
     finally:
         try:
             stderr_bytes = await stderr_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             stderr_bytes = b""
 
     await proc.wait()
@@ -226,11 +240,43 @@ async def _exec(workspace: Path, cmd: list[str]) -> dict:
             str(result.get("result", ""))[:200],
         )
         if result.get("result"):
-            raise RuntimeError(result["result"])
-        raise RuntimeError(err_stderr or f"Exit code {proc.returncode}")
+            raise _classify(result["result"])
+        raise _classify(err_stderr or f"Exit code {proc.returncode}")
     if result.get("is_error") or result.get("subtype", "").startswith("error"):
-        raise RuntimeError(result.get("result", "Unknown error"))
+        raise _classify(result.get("result", "Unknown error"))
     return result
+
+
+async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -> dict:
+    logger.debug(
+        "exec: cwd=%s cmd=%s timeout=%s",
+        workspace,
+        " ".join(cmd[:6]) + "...",
+        timeout,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=workspace,
+        limit=16 * 1024 * 1024,
+    )
+    try:
+        if timeout is not None:
+            return await asyncio.wait_for(_consume(proc), timeout=timeout)
+        return await _consume(proc)
+    except asyncio.TimeoutError:
+        logger.warning("exec: timed out after %ss", timeout)
+        raise RuntimeError(f"Claude CLI timed out after {timeout}s")
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                logger.exception("exec: failed to reap subprocess")
 
 
 NUDGE_PROMPT = "Please provide your final reply to the user."
@@ -280,6 +326,7 @@ async def run(
     platform: str,
     user_name: str = "unknown",
     channel_context: str = "dm",
+    timeout: float | None = DEFAULT_TIMEOUT,
 ) -> Response:
     """Run Claude Code and return a structured response."""
     system_prompt = build_system_prompt(platform, user_name, channel_context)
@@ -302,13 +349,19 @@ async def run(
         logger.debug(
             "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
         )
-        cli_output = await _exec(workspace, [*base, "--resume", session_uuid, prompt])
+        cli_output = await _exec(
+            workspace, [*base, "--resume", session_uuid, prompt], timeout=timeout
+        )
+    except ClaudeUnavailableError:
+        raise
     except RuntimeError as exc:
         if "No conversation found" not in str(exc):
             raise
         logger.info("No existing session %s, creating new", session_uuid)
         cli_output = await _exec(
-            workspace, [*base, "--session-id", session_uuid, prompt]
+            workspace,
+            [*base, "--session-id", session_uuid, prompt],
+            timeout=timeout,
         )
 
     body = (cli_output.get("result") or "").strip()
@@ -317,7 +370,9 @@ async def run(
             "agent.run: empty result, retrying with nudge, session=%s", session_uuid
         )
         retry_output = await _exec(
-            workspace, [*base, "--resume", session_uuid, NUDGE_PROMPT]
+            workspace,
+            [*base, "--resume", session_uuid, NUDGE_PROMPT],
+            timeout=timeout,
         )
         cli_output = _merge_cli_output(cli_output, retry_output)
         body = (cli_output.get("result") or "").strip() or "No response"

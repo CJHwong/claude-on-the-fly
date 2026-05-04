@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
-from claude_on_the_fly.agent import Response
+from claude_on_the_fly.agent import ClaudeUnavailableError, Response
 from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,7 @@ class Orchestrator:
                 self._platform,
                 user_name=self._frontend.sender_name(chat_id),
                 channel_context=self._frontend.channel_context(chat_id),
+                timeout=self._frontend.timeout_for(chat_id),
             )
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
@@ -113,6 +114,11 @@ class Orchestrator:
                 response.tokens_out,
             )
             await self._frontend.send(chat_id, response)
+        except ClaudeUnavailableError as exc:
+            logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
+            await self._frontend.send(
+                chat_id, Response(body=f"Claude unavailable: {exc}")
+            )
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)
             await self._frontend.send(chat_id, Response(body=f"Error: {exc}"))

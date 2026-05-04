@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import deque
 from pathlib import Path
@@ -12,7 +13,9 @@ import pytest
 from claude_on_the_fly.agent import (
     FORMAT_HINTS,
     NUDGE_PROMPT,
+    ClaudeUnavailableError,
     Response,
+    _classify,
     build_system_prompt,
     _exec,
     _merge_cli_output,
@@ -369,6 +372,75 @@ class TestExec:
             ):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
+    async def test_usage_limit_raises_unavailable(self):
+        stream = _ndjson(
+            _result_line(result="You've hit your org's monthly usage limit")
+        )
+        proc = _make_proc(1, stream)
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(ClaudeUnavailableError, match="usage limit"):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+    async def test_usage_allocation_disabled_raises_unavailable(self):
+        stream = _ndjson(
+            _result_line(result="Your usage allocation has been disabled by your admin")
+        )
+        proc = _make_proc(1, stream)
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(ClaudeUnavailableError, match="allocation"):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+    async def test_timeout_kills_proc_and_raises(self):
+        # Stdout that never ends — will block the consumer.
+        class _NeverEnds:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(10)
+                raise StopAsyncIteration  # pragma: no cover
+
+        proc = MagicMock()
+        proc.returncode = None
+        proc.stdout = _NeverEnds()
+        proc.stderr = MagicMock()
+        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
+        proc.wait = AsyncMock(return_value=-9)
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(RuntimeError, match="timed out after 0.1s"):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
+
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited()
+
+
+class TestClassify:
+    def test_usage_limit_lowercased(self):
+        assert isinstance(
+            _classify("You've hit your org's monthly Usage Limit"),
+            ClaudeUnavailableError,
+        )
+
+    def test_usage_allocation_disabled(self):
+        assert isinstance(
+            _classify("Your Usage Allocation has been disabled"),
+            ClaudeUnavailableError,
+        )
+
+    def test_unrelated_error_stays_runtime(self):
+        err = _classify("API Error: Could not process image")
+        assert isinstance(err, RuntimeError)
+        assert not isinstance(err, ClaudeUnavailableError)
+
+    def test_empty_message(self):
+        err = _classify("")
+        assert isinstance(err, RuntimeError)
+        assert not isinstance(err, ClaudeUnavailableError)
+
 
 # ---------------------------------------------------------------------------
 # parse_stream
@@ -565,7 +637,7 @@ class TestRun:
     async def test_session_not_found_falls_back_to_new(self):
         output = _cli_output(result="new session reply")
 
-        async def side_effect(workspace, cmd):
+        async def side_effect(workspace, cmd, **_kwargs):
             if "--resume" in cmd:
                 raise RuntimeError("No conversation found with id sess-1")
             return output
@@ -796,6 +868,42 @@ class TestRun:
             await run(Path("/tmp"), "sess-1", "hi", "telegram")
 
         assert mock.await_count == 1
+
+    async def test_unavailable_short_circuits_fallback(self):
+        """When --resume raises ClaudeUnavailableError, do NOT try --session-id fallback."""
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            side_effect=ClaudeUnavailableError("monthly usage limit"),
+        ) as mock:
+            with pytest.raises(ClaudeUnavailableError, match="usage limit"):
+                await run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert mock.await_count == 1
+
+    async def test_timeout_threaded_to_exec(self):
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await run(Path("/tmp"), "sess-1", "hi", "telegram", timeout=42.0)
+
+        # All _exec calls should receive timeout=42.0 as kwarg.
+        assert mock.call_args.kwargs["timeout"] == 42.0
+
+    async def test_default_timeout_applied(self):
+        from claude_on_the_fly.agent import DEFAULT_TIMEOUT
+
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert mock.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT
 
     async def test_resume_cmd_contains_session_uuid(self):
         output = _cli_output()

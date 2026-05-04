@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-from claude_on_the_fly.agent import Response
+from claude_on_the_fly.agent import ClaudeUnavailableError, Response
 from claude_on_the_fly.orchestrator import Orchestrator
 from claude_on_the_fly.protocol import Frontend
 
@@ -278,6 +278,7 @@ class TestProcess:
             "test",
             user_name="user-1",
             channel_context="dm",
+            timeout=None,
         )
 
         # Response was sent
@@ -323,6 +324,39 @@ class TestProcess:
             await orch._process(1, "bad")
 
         assert frontend.complete_notifications == [1]
+
+    async def test_unavailable_error_uses_distinct_message(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        with (
+            patch.object(orch, "_ensure_persona"),
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(
+                side_effect=ClaudeUnavailableError("monthly usage limit")
+            )
+            await orch._process(1, "hi")
+
+        assert len(frontend.sent) == 1
+        body = frontend.sent[0][1].body
+        assert body.startswith("Claude unavailable:")
+        assert "monthly usage limit" in body
+
+    async def test_timeout_threaded_from_frontend(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        frontend.timeout_for = lambda chat_id: 99.0  # type: ignore[method-assign]
+
+        with (
+            patch.object(orch, "_ensure_persona"),
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="ok"))
+            await orch._process(1, "hi")
+
+        assert mock_agent.run.call_args.kwargs["timeout"] == 99.0
 
     async def test_typing_loop_is_cancelled_after_process(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
