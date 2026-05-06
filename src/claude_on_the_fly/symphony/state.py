@@ -31,9 +31,6 @@ class OrchestratorState:
     def is_claimed(self, issue_id: str) -> bool:
         return issue_id in self._running
 
-    def is_running(self, issue_id: str) -> bool:
-        return issue_id in self._running
-
     def claim(self, issue: Issue) -> RunningEntry:
         """Reserve the issue for dispatch. The task and workspace fields are filled later."""
         if issue.id in self._running:

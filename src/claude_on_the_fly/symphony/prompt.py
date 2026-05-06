@@ -11,6 +11,17 @@ from liquid import Environment, StrictUndefined
 logger = logging.getLogger(__name__)
 
 _LIQUID_ENV = Environment(undefined=StrictUndefined)
+_TEMPLATE_CACHE: dict[str, object] = {}
+
+
+def _compile(source: str):
+    """Compile-once cache: same prompt source maps to the same Liquid template object.
+    PromptStore reads new source on mtime change, so the cache key naturally invalidates."""
+    cached = _TEMPLATE_CACHE.get(source)
+    if cached is None:
+        cached = _LIQUID_ENV.from_string(source)
+        _TEMPLATE_CACHE[source] = cached
+    return cached
 
 
 class PromptStore:
@@ -71,7 +82,7 @@ def render_prompt(
             f"Status: {issue.state}\nURL: {issue.url}\n"
             f"Workspace: {workspace_path}\n"
         )
-    template = _LIQUID_ENV.from_string(template_source)
+    template = _compile(template_source)
     return template.render(
         issue=_issue_context(issue),
         attempt=attempt,

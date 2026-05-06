@@ -1,7 +1,8 @@
 """Symphony orchestrator: poll Jira, dispatch claimed tickets, drive continuation turns.
 
-Phase 2 adds: reconciliation per tick (state refresh of running workers, stall
-detection), retry queue with backoff, startup terminal-workspace cleanup.
+Per tick: reconcile running workers' state (catching mid-turn terminal/inactive
+transitions and stall timeouts), process due retries, then fetch and dispatch
+new candidates. Startup cleans up scratch dirs whose tickets are already terminal.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from .agent_runner import TicketRunner, session_uuid_for
 from .config import SymphonyConfig, TrackerConfig, load_config
 from .prompt import PromptStore
 from .retry import RetryQueue
-from .state import OrchestratorState
+from .state import OrchestratorState, RunningEntry
 from .tracker import Tracker, make_tracker
 from .tracker.issue import Issue
 from .workspace import ensure_workspace, remove_workspace
@@ -254,6 +255,50 @@ def _dispatch(
     )
 
 
+def _check_and_cancel_stall(
+    entry: RunningEntry,
+    config: SymphonyConfig,
+    retry_queue: RetryQueue,
+    now_monotonic: float,
+) -> bool:
+    """Cancel the worker and queue a failure retry if it has stalled. Returns True if stalled."""
+    if config.stall_timeout_ms <= 0:
+        return False
+    ref = (
+        entry.last_turn_end_at
+        if entry.last_turn_end_at is not None
+        else entry.started_at
+    )
+    elapsed_ms = (now_monotonic - ref) * 1000
+    if elapsed_ms <= config.stall_timeout_ms:
+        return False
+    logger.warning(
+        "[%s] stall detected (%.0fms since last progress); cancelling",
+        entry.issue_identifier,
+        elapsed_ms,
+    )
+    if entry.task is not None and not entry.task.done():
+        entry.task.cancel()
+    retry_queue.schedule_failure(
+        entry.issue_id,
+        entry.issue_identifier,
+        config.max_retry_backoff_ms,
+        attempt=entry.failure_attempt + 1,
+        error="stall timeout",
+    )
+    return True
+
+
+def _has_per_state_capacity(
+    state: OrchestratorState, issue_state: str, config: SymphonyConfig
+) -> bool:
+    """True if a new worker for issue_state can fit under the per-state cap."""
+    per_state_limit = config.max_concurrent_by_state.get(
+        issue_state.lower(), config.max_concurrent
+    )
+    return state.running_by_state(issue_state) < per_state_limit
+
+
 async def reconcile(
     state: OrchestratorState,
     tracker: Tracker,
@@ -276,29 +321,8 @@ async def reconcile(
 
     now = time.monotonic()
     for entry in running:
-        if config.stall_timeout_ms > 0:
-            ref = (
-                entry.last_turn_end_at
-                if entry.last_turn_end_at is not None
-                else entry.started_at
-            )
-            elapsed_ms = (now - ref) * 1000
-            if elapsed_ms > config.stall_timeout_ms:
-                logger.warning(
-                    "[%s] stall detected (%.0fms since last progress); cancelling",
-                    entry.issue_identifier,
-                    elapsed_ms,
-                )
-                if entry.task is not None and not entry.task.done():
-                    entry.task.cancel()
-                retry_queue.schedule_failure(
-                    entry.issue_id,
-                    entry.issue_identifier,
-                    config.max_retry_backoff_ms,
-                    attempt=entry.failure_attempt + 1,
-                    error="stall timeout",
-                )
-                continue
+        if _check_and_cancel_stall(entry, config, retry_queue, now):
+            continue
 
         new_state = statuses.get(entry.issue_identifier)
         if new_state is None:
@@ -372,49 +396,62 @@ async def _process_due_retries(
     if not due:
         return
     logger.debug("retry: %d due entries", len(due))
-    for entry in due:
-        if state.is_claimed(entry.issue_id):
-            continue
-        try:
-            issue = await tracker.fetch_one(entry.identifier)
-        except Exception:
-            logger.warning(
-                "[%s] retry: fetch failed; requeueing with same backoff",
-                entry.identifier,
-            )
-            retry_queue.requeue(
-                entry, delay_ms=entry.attempt * 1000, error="fetch failed"
-            )
-            continue
 
-        if issue.state in config.tracker.terminal_states:
+    # Batch the cheap status check first; only fetch full Issue for entries we'd dispatch.
+    unclaimed = [e for e in due if not state.is_claimed(e.issue_id)]
+    if not unclaimed:
+        return
+    try:
+        statuses = await tracker.fetch_states_by_keys([e.identifier for e in unclaimed])
+    except Exception:
+        logger.warning("retry: batch state fetch failed; requeueing all due (1s)")
+        for entry in unclaimed:
+            retry_queue.requeue(entry, delay_ms=1000, error="batch state fetch failed")
+        return
+
+    for entry in unclaimed:
+        current_state = statuses.get(entry.identifier)
+        if current_state is None:
+            retry_queue.requeue(
+                entry, delay_ms=entry.attempt * 1000, error="not visible"
+            )
+            continue
+        if current_state in config.tracker.terminal_states:
             logger.info("[%s] retry: terminal state, dropping", entry.identifier)
             continue
-        if issue.state not in config.tracker.active_states:
+        if current_state not in config.tracker.active_states:
             logger.info(
                 "[%s] retry: state %s not active, dropping",
                 entry.identifier,
-                issue.state,
+                current_state,
             )
             continue
         if state.running_count() >= config.max_concurrent:
             logger.debug(
-                "[%s] retry: no global slot, requeueing (1s)",
-                entry.identifier,
+                "[%s] retry: no global slot, requeueing (1s)", entry.identifier
             )
             retry_queue.requeue(entry, delay_ms=1000, error="no global slots")
             continue
-        per_state_limit = config.max_concurrent_by_state.get(
-            issue.state.lower(), config.max_concurrent
-        )
-        if state.running_by_state(issue.state) >= per_state_limit:
+        if not _has_per_state_capacity(state, current_state, config):
             logger.debug(
                 "[%s] retry: per-state cap hit for %s, requeueing (1s)",
                 entry.identifier,
-                issue.state,
+                current_state,
             )
             retry_queue.requeue(
-                entry, delay_ms=1000, error=f"no slots for {issue.state}"
+                entry, delay_ms=1000, error=f"no slots for {current_state}"
+            )
+            continue
+
+        try:
+            issue = await tracker.fetch_one(entry.identifier)
+        except Exception:
+            logger.warning(
+                "[%s] retry: fetch_one failed; requeueing",
+                entry.identifier,
+            )
+            retry_queue.requeue(
+                entry, delay_ms=entry.attempt * 1000, error="fetch_one failed"
             )
             continue
 
@@ -471,10 +508,7 @@ async def tick(
     for issue in candidates:
         if state.running_count() >= config.max_concurrent:
             break
-        per_state_limit = config.max_concurrent_by_state.get(
-            issue.state.lower(), config.max_concurrent
-        )
-        if state.running_by_state(issue.state) >= per_state_limit:
+        if not _has_per_state_capacity(state, issue.state, config):
             continue
         _dispatch(
             issue,
