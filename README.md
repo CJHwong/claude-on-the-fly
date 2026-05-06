@@ -35,6 +35,12 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-gmail
 # Scheduler
 # write ~/.claude-on-the-fly/schedule.yaml (see Scheduler Setup)
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-schedule
+
+# Symphony (Jira-driven daemon)
+# write ~/.claude-on-the-fly/symphony.yaml + symphony-prompt.md (see Symphony Setup)
+export JIRA_EMAIL=you@your-org.com
+export JIRA_API_TOKEN=...
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-symphony
 ```
 
 ## Local Development
@@ -171,6 +177,71 @@ uv run claude-schedule
 # or: uv run claude-schedule --config /path/to/schedule.yaml
 ```
 
+## Symphony Setup (5 minutes)
+
+Long-running daemon that polls Jira on a label gate, claims tickets, and runs Claude Code in per-ticket scratch directories until each ticket leaves an active state. Inspired by [openai/symphony](https://github.com/openai/symphony), adapted for Jira and per-org git worktrees.
+
+### Two config files
+
+**`~/.claude-on-the-fly/symphony.yaml`** — daemon settings (auth, JQL gate, polling, concurrency):
+
+```yaml
+tracker:
+  kind: jira                    # only "jira" registered today; defaults to jira if omitted
+  base_url: https://your-org.atlassian.net
+  email: $JIRA_EMAIL
+  api_token: $JIRA_API_TOKEN
+  project_key: PROJ
+  jql_extra: 'AND assignee = currentUser() AND labels = "stevedore"'
+
+# Defaults shown; uncomment only to override:
+# polling_ms: 30000
+# max_concurrent: 1
+# max_concurrent_by_state:      # per-state caps stricter than the global limit; keys lowercased
+#   "rework": 1
+#   "in progress": 5
+# max_turns: 20                 # -1 = unlimited (then stall_timeout_ms is your safety net)
+# stall_timeout_ms: 1800000
+# active_states:   ["To Do", "In Progress"]
+# terminal_states: ["Done", "Closed", "Cancelled"]
+# worktree_root: ~/code/symphony-wt
+# gate_label: stevedore
+```
+
+**Adding a new tracker** (Linear, GitHub Issues, etc.): write a class that satisfies `tracker.Tracker` Protocol (`fetch_one`, `fetch_candidates`, `fetch_states_by_keys`, `aclose`, `from_config`), register it in `SUPPORTED_TRACKERS` in `src/claude_on_the_fly/symphony/tracker/__init__.py`, then set `tracker.kind: <new-kind>` in `symphony.yaml`. No orchestrator changes needed.
+
+**`~/.claude-on-the-fly/symphony-prompt.md`** — Liquid-templated instructions the agent follows per ticket. Variables available: `issue.identifier`, `issue.title`, `issue.state`, `issue.url`, `issue.labels`, `issue.description_json`, `attempt`, `workspace_path`, `gate_label`. See `symphony-prompt.md.example` at the repo root for a starter.
+
+Edits to either file are picked up on the next tick (mtime hot reload). Restart the daemon to apply schema changes that affect already-claimed tickets.
+
+### Run
+
+```bash
+export JIRA_EMAIL="you@your-org.com"
+export JIRA_API_TOKEN="..."
+uv run claude-symphony
+# or: uv run claude-symphony /path/to/symphony.yaml
+```
+
+### How It Works
+
+- Polls JQL `project = PROJ AND status in <active_states> {jql_extra}` every `polling_ms`.
+- Add the gate label (default `stevedore`) to a ticket and the daemon picks it up on the next tick.
+- Per ticket: creates a scratch dir under `worktree_root`, spawns Claude Code with `--resume <deterministic-uuid>`, loops turns until the ticket transitions to a terminal state, transitions out of active states, or hits `max_turns`.
+- Reconciles every tick: catches mid-turn state transitions (someone moves the ticket to Done while the agent is working), cancels the worker, removes the scratch dir.
+- Failures (`ClaudeUnavailableError`, exceptions, stalls) go through a retry queue with exponential backoff. `max_turns` exhaustion gets a 1s continuation retry.
+- The agent owns git worktrees inside the scratch dir (the daemon does NOT run git). It also owns Jira writes: status transitions via `acli`, comments via direct ADF POST to the REST API (acli does not convert markdown to ADF).
+- Stop signals (escalating force): remove the gate label, transition the ticket to a terminal state, SIGINT the daemon.
+
+### Symphony Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_EMAIL` | yes | Email associated with your Jira API token |
+| `JIRA_API_TOKEN` | yes | Atlassian API token (generate at id.atlassian.com → security → API tokens) |
+
+The `tracker.base_url`, `tracker.project_key`, and `tracker.jql_extra` live in `symphony.yaml`, not env vars.
+
 ## Running All
 
 ```bash
@@ -185,6 +256,9 @@ GMAIL_GCP_PROJECT=... GMAIL_ALLOWED_SENDERS=... uv run claude-gmail
 
 # Terminal 4
 uv run claude-schedule
+
+# Terminal 5
+JIRA_EMAIL=... JIRA_API_TOKEN=... uv run claude-symphony
 ```
 
 Or use a `.env` file with all vars and a process manager.
@@ -249,15 +323,25 @@ If no `CLAUDE.md` exists, Claude runs with the default system prompt only.
 ```
 src/claude_on_the_fly/
   agent.py        # Claude CLI wrapper + Response dataclass
-  orchestrator.py # Session management, queuing, typing indicators
+  orchestrator.py # Session management, queuing, typing indicators (chat frontends)
   protocol.py     # Frontend protocol (for adding new interfaces)
   scheduler.py    # Cron-driven frontend, YAML config, auto-reload
   telegram.py     # Telegram frontend
   slack.py        # Slack frontend
   gmail.py        # Gmail frontend
+  symphony/       # Jira-driven daemon: poll, dispatch, reconcile, retry queue
+    cli.py            # entrypoint
+    config.py         # YAML schema + $VAR resolution
+    prompt.py         # markdown loader + Liquid renderer + mtime hot reload
+    state.py          # in-memory orchestrator state
+    retry.py          # exponential-backoff retry queue
+    workspace.py      # per-ticket scratch dir lifecycle (no git)
+    agent_runner.py   # bridges TicketRunner ↔ ClaudeAgent
+    orchestrator.py   # poll → reconcile → dispatch loop
+    tracker/jira.py   # Jira REST adapter (httpx, basic auth)
 ```
 
-Each frontend implements the `Frontend` protocol (start, send, send_typing, stop) and plugs into the shared orchestrator. The orchestrator manages sessions, queues messages, and runs Claude Code via subprocess.
+Each chat frontend (Telegram/Slack/Gmail) implements the `Frontend` protocol and plugs into the shared `orchestrator.py`. The scheduler implements `Frontend` to fire cron jobs through the same path. Symphony is daemon-shaped (poll/claim/dispatch instead of request/response), so it bypasses `Frontend` and runs directly on `agent.run()`. All entrypoints share `agent.py`'s subprocess driver and emit a `session: id=...` log line per Claude run for cross-integration tracing.
 
 ## Response Footer
 
