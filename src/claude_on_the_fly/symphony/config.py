@@ -45,6 +45,7 @@ def expand_path(value: Any, *, base: Path | None = None) -> Path | None:
 
 @dataclass(frozen=True)
 class TrackerConfig:
+    kind: str
     base_url: str
     email: str
     api_token: str
@@ -57,6 +58,7 @@ class TrackerConfig:
     def from_dict(cls, raw: dict | None) -> TrackerConfig:
         raw = raw or {}
         return cls(
+            kind=str(raw.get("kind") or "jira").strip().lower(),
             base_url=str(resolve_env(raw.get("base_url")) or "").rstrip("/"),
             email=str(resolve_env(raw.get("email")) or ""),
             api_token=str(resolve_env(raw.get("api_token")) or ""),
@@ -88,6 +90,10 @@ class SymphonyConfig:
     tracker: TrackerConfig
     polling_ms: int = 30000
     max_concurrent: int = 1
+    # Per-state caps, in addition to the global max_concurrent. Keys are
+    # tracker-state names (lowercased at load time); values are positive ints.
+    # Example: {"rework": 1, "pending review": 2}.
+    max_concurrent_by_state: dict[str, int] = field(default_factory=dict)
     max_turns: int = (
         20  # -1 = unlimited (rely on stall_timeout_ms or label removal to stop)
     )
@@ -131,10 +137,24 @@ class SymphonyConfig:
                 f"max_retry_backoff_ms must be >= 1000 (got {max_retry_backoff_ms})"
             )
 
+        per_state_raw = raw.get("max_concurrent_by_state") or {}
+        if not isinstance(per_state_raw, dict):
+            raise ValueError("max_concurrent_by_state must be a mapping")
+        per_state: dict[str, int] = {}
+        for state_name, limit in per_state_raw.items():
+            try:
+                limit_int = int(limit)
+            except (TypeError, ValueError):
+                continue
+            if limit_int < 1:
+                continue
+            per_state[str(state_name).strip().lower()] = limit_int
+
         return cls(
             tracker=TrackerConfig.from_dict(raw.get("tracker")),
             polling_ms=polling,
             max_concurrent=max_concurrent,
+            max_concurrent_by_state=per_state,
             max_turns=max_turns,
             turn_timeout_ms=int(raw.get("turn_timeout_ms", 3600000)),
             stall_timeout_ms=int(raw.get("stall_timeout_ms", 1800000)),

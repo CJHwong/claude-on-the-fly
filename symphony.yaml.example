@@ -3,6 +3,7 @@
 # Edit and re-save while running to hot-reload prompt; restart to apply changes here.
 
 tracker:
+  kind: jira                      # only "jira" today; see SUPPORTED_TRACKERS in src/.../tracker/__init__.py
   base_url: https://your-org.atlassian.net
   email: $JIRA_EMAIL                # resolved against os.environ
   api_token: $JIRA_API_TOKEN
@@ -12,6 +13,9 @@ tracker:
 # Defaults shown; uncomment only to override:
 # polling_ms: 30000
 # max_concurrent: 1
+# max_concurrent_by_state:                    # optional per-state caps on top of global; keys lowercased at load
+#   "rework": 1
+#   "in progress": 5
 # max_turns: 20                              # -1 = unlimited (then stall_timeout_ms is your only safety net)
 # turn_timeout_ms: 3600000
 # active_states:   ["To Do", "In Progress"]

@@ -39,6 +39,10 @@ def compose_jql(cfg: TrackerConfig) -> str:
 
 
 class JiraTracker:
+    @classmethod
+    def from_config(cls, cfg: TrackerConfig) -> JiraTracker:
+        return cls(base_url=cfg.base_url, email=cfg.email, api_token=cfg.api_token)
+
     def __init__(
         self, base_url: str, email: str, api_token: str, *, timeout: float = 15.0
     ) -> None:

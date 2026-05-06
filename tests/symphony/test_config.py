@@ -150,6 +150,61 @@ def test_load_config_max_turns_lt_negative_one_invalid(tmp_path, env_creds):
         load_config(cfg_path)
 
 
+def test_load_config_per_state_concurrency_lowercases_keys(tmp_path, env_creds):
+    cfg_path, _ = _write_pair(
+        tmp_path,
+        extras=('max_concurrent_by_state:\n  Rework: 1\n  "In Progress": 5\n'),
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.max_concurrent_by_state == {"rework": 1, "in progress": 5}
+
+
+def test_load_config_per_state_drops_invalid_entries(tmp_path, env_creds):
+    cfg_path, _ = _write_pair(
+        tmp_path,
+        extras=(
+            "max_concurrent_by_state:\n"
+            "  Building: 3\n"
+            "  Bad: 0\n"
+            "  AlsoBad: -1\n"
+            "  Garbage: abc\n"
+        ),
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.max_concurrent_by_state == {"building": 3}
+
+
+def test_load_config_per_state_must_be_mapping(tmp_path, env_creds):
+    cfg_path, _ = _write_pair(tmp_path, extras="max_concurrent_by_state: not-a-map\n")
+    with pytest.raises(ValueError, match="max_concurrent_by_state"):
+        load_config(cfg_path)
+
+
+def test_tracker_kind_defaults_to_jira():
+    cfg = TrackerConfig.from_dict(
+        {
+            "base_url": "https://x.atlassian.net",
+            "email": "a@b",
+            "api_token": "t",
+            "project_key": "P",
+        }
+    )
+    assert cfg.kind == "jira"
+
+
+def test_tracker_kind_normalizes_case():
+    cfg = TrackerConfig.from_dict(
+        {
+            "kind": "JIRA",
+            "base_url": "https://x.atlassian.net",
+            "email": "a@b",
+            "api_token": "t",
+            "project_key": "P",
+        }
+    )
+    assert cfg.kind == "jira"
+
+
 def test_load_config_missing_prompt_file(tmp_path, env_creds):
     cfg_path, prompt_path = _write_pair(tmp_path)
     prompt_path.unlink()

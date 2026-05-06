@@ -20,8 +20,8 @@ from .config import SymphonyConfig, TrackerConfig, load_config
 from .prompt import PromptStore
 from .retry import RetryQueue
 from .state import OrchestratorState
+from .tracker import Tracker, make_tracker
 from .tracker.issue import Issue
-from .tracker.jira import JiraTracker
 from .workspace import ensure_workspace, remove_workspace
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ def _select_candidates(
 async def _run_worker(
     issue: Issue,
     state: OrchestratorState,
-    tracker: JiraTracker,
+    tracker: Tracker,
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
@@ -217,7 +217,7 @@ async def _run_worker(
 def _dispatch(
     issue: Issue,
     state: OrchestratorState,
-    tracker: JiraTracker,
+    tracker: Tracker,
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
@@ -256,7 +256,7 @@ def _dispatch(
 
 async def reconcile(
     state: OrchestratorState,
-    tracker: JiraTracker,
+    tracker: Tracker,
     config: SymphonyConfig,
     retry_queue: RetryQueue,
 ) -> None:
@@ -332,7 +332,7 @@ async def reconcile(
 
 async def startup_cleanup(
     worktree_root,
-    tracker: JiraTracker,
+    tracker: Tracker,
     tracker_cfg: TrackerConfig,
 ) -> None:
     """SPEC §8.6: walk worktree_root, remove dirs whose tickets are terminal."""
@@ -362,7 +362,7 @@ async def startup_cleanup(
 
 async def _process_due_retries(
     state: OrchestratorState,
-    tracker: JiraTracker,
+    tracker: Tracker,
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
@@ -399,10 +399,23 @@ async def _process_due_retries(
             continue
         if state.running_count() >= config.max_concurrent:
             logger.debug(
-                "[%s] retry: no slot, requeueing (1s)",
+                "[%s] retry: no global slot, requeueing (1s)",
                 entry.identifier,
             )
-            retry_queue.requeue(entry, delay_ms=1000, error="no slots")
+            retry_queue.requeue(entry, delay_ms=1000, error="no global slots")
+            continue
+        per_state_limit = config.max_concurrent_by_state.get(
+            issue.state.lower(), config.max_concurrent
+        )
+        if state.running_by_state(issue.state) >= per_state_limit:
+            logger.debug(
+                "[%s] retry: per-state cap hit for %s, requeueing (1s)",
+                entry.identifier,
+                issue.state,
+            )
+            retry_queue.requeue(
+                entry, delay_ms=1000, error=f"no slots for {issue.state}"
+            )
             continue
 
         _dispatch(
@@ -421,7 +434,7 @@ async def tick(
     state: OrchestratorState,
     config: SymphonyConfig,
     prompt_source: str,
-    tracker: JiraTracker,
+    tracker: Tracker,
     retry_queue: RetryQueue,
     pending_tasks: set[asyncio.Task[None]],
 ) -> None:
@@ -458,6 +471,11 @@ async def tick(
     for issue in candidates:
         if state.running_count() >= config.max_concurrent:
             break
+        per_state_limit = config.max_concurrent_by_state.get(
+            issue.state.lower(), config.max_concurrent
+        )
+        if state.running_by_state(issue.state) >= per_state_limit:
+            continue
         _dispatch(
             issue,
             state,
@@ -478,11 +496,7 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     prompt_store = PromptStore(config.prompt_path)
     prompt_source = prompt_store.load()
 
-    tracker = JiraTracker(
-        base_url=config.tracker.base_url,
-        email=config.tracker.email,
-        api_token=config.tracker.api_token,
-    )
+    tracker = make_tracker(config.tracker)
     state = OrchestratorState()
     retry_queue = RetryQueue()
     pending_tasks: set[asyncio.Task[None]] = set()
