@@ -329,6 +329,14 @@ async def run(
     timeout: float | None = DEFAULT_TIMEOUT,
 ) -> Response:
     """Run Claude Code and return a structured response."""
+    logger.info(
+        "session: id=%s platform=%s user=%s context=%s workspace=%s",
+        session_uuid,
+        platform,
+        user_name,
+        channel_context,
+        workspace,
+    )
     system_prompt = build_system_prompt(platform, user_name, channel_context)
     model = os.environ.get("CLAUDE_MODEL", "sonnet")
     base = [

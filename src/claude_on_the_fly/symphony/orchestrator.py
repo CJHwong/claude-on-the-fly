@@ -143,9 +143,10 @@ async def _run_worker(
 
             state.mark_turn_end(issue.id)
             logger.info(
-                "[%s] turn %d done | %s | %s",
+                "[%s] turn %d done | sid=%s | %s | %s",
                 identifier,
                 attempt,
+                sid[:13],
                 response.format_stats(),
                 response.format_tools() or "-",
             )
