@@ -39,6 +39,22 @@ def test_compose_jql_appends_extra():
     assert jql.endswith('AND labels = "stevedore"')
 
 
+def test_fetch_states_by_keys_composes_jql_and_normalizes():
+    """fetch_states_by_keys should be compatible with empty input and normalize the response shape."""
+    import asyncio
+    from claude_on_the_fly.symphony.tracker.jira import JiraTracker
+
+    tracker = JiraTracker(
+        base_url="https://x.atlassian.net",
+        email="me@x.com",
+        api_token="tok",
+    )
+    # Empty list short-circuits without any API call.
+    result = asyncio.run(tracker.fetch_states_by_keys([]))
+    assert result == {}
+    asyncio.run(tracker.aclose())
+
+
 def test_issue_from_jira_normalizes_labels_lowercase():
     payload = {
         "id": "10042",

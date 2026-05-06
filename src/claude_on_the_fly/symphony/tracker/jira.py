@@ -81,6 +81,30 @@ class JiraTracker:
         resp.raise_for_status()
         return Issue.from_jira(resp.json(), self._base_url)
 
+    async def fetch_states_by_keys(self, keys: list[str]) -> dict[str, str]:
+        """Batched status-only fetch for reconciliation and startup cleanup.
+
+        Returns a dict mapping issue key to status name. Keys not found in Jira
+        (or not visible to this account) are absent from the result.
+        """
+        if not keys:
+            return {}
+        quoted = ", ".join(f'"{k}"' for k in keys)
+        body = {
+            "jql": f"key in ({quoted})",
+            "fields": ["status"],
+            "maxResults": max(len(keys), 50),
+        }
+        resp = await self._client.post("/rest/api/3/search/jql", json=body)
+        resp.raise_for_status()
+        out: dict[str, str] = {}
+        for item in (resp.json() or {}).get("issues") or []:
+            key = item.get("key")
+            status_name = ((item.get("fields") or {}).get("status") or {}).get("name")
+            if key and status_name:
+                out[str(key)] = str(status_name)
+        return out
+
     async def fetch_candidates(self, cfg: TrackerConfig) -> list[Issue]:
         """Search for dispatch candidates per the configured JQL."""
         jql = compose_jql(cfg)

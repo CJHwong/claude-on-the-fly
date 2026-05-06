@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 
 from .tracker.issue import Issue
+from .workspace import Workspace
 
 
 @dataclass
@@ -14,16 +15,18 @@ class RunningEntry:
     issue_id: str
     issue_identifier: str
     issue_state: str
-    started_at: float
-    task: asyncio.Task[None] | None  # set after task creation
+    started_at: float  # monotonic seconds
+    task: asyncio.Task[None] | None = None  # set after task creation
+    workspace: Workspace | None = None  # set when worker creates it
+    last_turn_end_at: float | None = (
+        None  # monotonic seconds; None until first turn ends
+    )
+    failure_attempt: int = 0  # consecutive failures before this dispatch
 
 
 class OrchestratorState:
     def __init__(self) -> None:
         self._running: dict[str, RunningEntry] = {}
-        # Parked for the rest of this daemon lifetime (hit max_turns, crashed,
-        # or saw Claude usage-limit). Cleared only by daemon restart.
-        self._exhausted: set[str] = set()
 
     def is_claimed(self, issue_id: str) -> bool:
         return issue_id in self._running
@@ -31,14 +34,8 @@ class OrchestratorState:
     def is_running(self, issue_id: str) -> bool:
         return issue_id in self._running
 
-    def is_exhausted(self, issue_id: str) -> bool:
-        return issue_id in self._exhausted
-
-    def mark_exhausted(self, issue_id: str) -> None:
-        self._exhausted.add(issue_id)
-
     def claim(self, issue: Issue) -> RunningEntry:
-        """Reserve the issue for dispatch. The task field is filled in after creation."""
+        """Reserve the issue for dispatch. The task and workspace fields are filled later."""
         if issue.id in self._running:
             raise RuntimeError(f"issue {issue.identifier} already claimed")
         entry = RunningEntry(
@@ -46,7 +43,6 @@ class OrchestratorState:
             issue_identifier=issue.identifier,
             issue_state=issue.state,
             started_at=time.monotonic(),
-            task=None,
         )
         self._running[issue.id] = entry
         return entry
@@ -59,6 +55,11 @@ class OrchestratorState:
         if entry is not None:
             entry.issue_state = new_state
 
+    def mark_turn_end(self, issue_id: str) -> None:
+        entry = self._running.get(issue_id)
+        if entry is not None:
+            entry.last_turn_end_at = time.monotonic()
+
     def running_count(self) -> int:
         return len(self._running)
 
@@ -67,3 +68,6 @@ class OrchestratorState:
 
     def all_running(self) -> list[RunningEntry]:
         return list(self._running.values())
+
+    def get_running(self, issue_id: str) -> RunningEntry | None:
+        return self._running.get(issue_id)

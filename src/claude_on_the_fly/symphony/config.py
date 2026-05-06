@@ -90,6 +90,8 @@ class SymphonyConfig:
     max_concurrent: int = 1
     max_turns: int = 20
     turn_timeout_ms: int = 3600000
+    stall_timeout_ms: int = 1800000  # 30m; <= 0 disables stall detection
+    max_retry_backoff_ms: int = 300000  # 5m cap on failure backoff
     worktree_root: Path = field(default_factory=lambda: DEFAULT_WORKTREE_ROOT)
     prompt_path: Path = field(
         default_factory=lambda: Path.home() / ".claude-on-the-fly" / DEFAULT_PROMPT_NAME
@@ -117,6 +119,11 @@ class SymphonyConfig:
         max_turns = int(raw.get("max_turns", 20))
         if max_turns < 1:
             raise ValueError(f"max_turns must be >= 1 (got {max_turns})")
+        max_retry_backoff_ms = int(raw.get("max_retry_backoff_ms", 300000))
+        if max_retry_backoff_ms < 1000:
+            raise ValueError(
+                f"max_retry_backoff_ms must be >= 1000 (got {max_retry_backoff_ms})"
+            )
 
         return cls(
             tracker=TrackerConfig.from_dict(raw.get("tracker")),
@@ -124,6 +131,8 @@ class SymphonyConfig:
             max_concurrent=max_concurrent,
             max_turns=max_turns,
             turn_timeout_ms=int(raw.get("turn_timeout_ms", 3600000)),
+            stall_timeout_ms=int(raw.get("stall_timeout_ms", 1800000)),
+            max_retry_backoff_ms=max_retry_backoff_ms,
             worktree_root=worktree_root,
             prompt_path=prompt_path,
             exit_label=(str(raw["exit_label"]) if raw.get("exit_label") else None),
