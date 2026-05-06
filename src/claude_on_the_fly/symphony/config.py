@@ -88,7 +88,9 @@ class SymphonyConfig:
     tracker: TrackerConfig
     polling_ms: int = 30000
     max_concurrent: int = 1
-    max_turns: int = 20
+    max_turns: int = (
+        20  # -1 = unlimited (rely on stall_timeout_ms or label removal to stop)
+    )
     turn_timeout_ms: int = 3600000
     stall_timeout_ms: int = 1800000  # 30m; <= 0 disables stall detection
     max_retry_backoff_ms: int = 300000  # 5m cap on failure backoff
@@ -96,7 +98,9 @@ class SymphonyConfig:
     prompt_path: Path = field(
         default_factory=lambda: Path.home() / ".claude-on-the-fly" / DEFAULT_PROMPT_NAME
     )
-    exit_label: str | None = None
+    gate_label: str | None = (
+        None  # the label whose presence gates dispatch via JQL; agent removes it when done
+    )
 
     @classmethod
     def from_dict(cls, raw: dict, *, base: Path) -> SymphonyConfig:
@@ -117,8 +121,10 @@ class SymphonyConfig:
         if max_concurrent < 1:
             raise ValueError(f"max_concurrent must be >= 1 (got {max_concurrent})")
         max_turns = int(raw.get("max_turns", 20))
-        if max_turns < 1:
-            raise ValueError(f"max_turns must be >= 1 (got {max_turns})")
+        if max_turns == 0 or max_turns < -1:
+            raise ValueError(
+                f"max_turns must be >= 1 or -1 for unlimited (got {max_turns})"
+            )
         max_retry_backoff_ms = int(raw.get("max_retry_backoff_ms", 300000))
         if max_retry_backoff_ms < 1000:
             raise ValueError(
@@ -135,7 +141,7 @@ class SymphonyConfig:
             max_retry_backoff_ms=max_retry_backoff_ms,
             worktree_root=worktree_root,
             prompt_path=prompt_path,
-            exit_label=(str(raw["exit_label"]) if raw.get("exit_label") else None),
+            gate_label=(str(raw["gate_label"]) if raw.get("gate_label") else None),
         )
 
     def validate(self) -> None:

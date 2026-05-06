@@ -62,7 +62,7 @@ def render_prompt(
     issue,
     attempt: int,
     workspace_path: Path,
-    exit_label: str | None,
+    gate_label: str | None,
 ) -> str:
     """Render the Liquid prompt body. Unknown variables raise per SPEC §5.4."""
     if not template_source:
@@ -76,7 +76,7 @@ def render_prompt(
         issue=_issue_context(issue),
         attempt=attempt,
         workspace_path=str(workspace_path),
-        exit_label=exit_label or "",
+        gate_label=gate_label or "",
     )
 
 

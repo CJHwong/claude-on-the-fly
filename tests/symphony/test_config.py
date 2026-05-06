@@ -98,7 +98,7 @@ def test_load_config_overrides(tmp_path, env_creds):
             "polling_ms: 5000\n"
             "max_concurrent: 3\n"
             "max_turns: 10\n"
-            "exit_label: stevedore\n"
+            "gate_label: stevedore\n"
             "worktree_root: " + str(tmp_path / "wt") + "\n"
         ),
     )
@@ -106,7 +106,7 @@ def test_load_config_overrides(tmp_path, env_creds):
     assert cfg.polling_ms == 5000
     assert cfg.max_concurrent == 3
     assert cfg.max_turns == 10
-    assert cfg.exit_label == "stevedore"
+    assert cfg.gate_label == "stevedore"
     assert cfg.worktree_root == (tmp_path / "wt").resolve()
 
 
@@ -128,6 +128,25 @@ def test_load_config_polling_min(tmp_path, env_creds):
 def test_load_config_max_concurrent_min(tmp_path, env_creds):
     cfg_path, _ = _write_pair(tmp_path, extras="max_concurrent: 0\n")
     with pytest.raises(ValueError, match="max_concurrent"):
+        load_config(cfg_path)
+
+
+def test_load_config_max_turns_unlimited(tmp_path, env_creds):
+    """max_turns: -1 means unlimited turns per worker session."""
+    cfg_path, _ = _write_pair(tmp_path, extras="max_turns: -1\n")
+    cfg = load_config(cfg_path)
+    assert cfg.max_turns == -1
+
+
+def test_load_config_max_turns_zero_invalid(tmp_path, env_creds):
+    cfg_path, _ = _write_pair(tmp_path, extras="max_turns: 0\n")
+    with pytest.raises(ValueError, match="max_turns"):
+        load_config(cfg_path)
+
+
+def test_load_config_max_turns_lt_negative_one_invalid(tmp_path, env_creds):
+    cfg_path, _ = _write_pair(tmp_path, extras="max_turns: -2\n")
+    with pytest.raises(ValueError, match="max_turns"):
         load_config(cfg_path)
 
 

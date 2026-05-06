@@ -23,5 +23,5 @@ Decide which repo(s) the ticket needs and create git worktrees under
 You own branch hygiene in source repos: clean up branches and run
 `git worktree prune` in each source repo before you finish.
 
-When the task is complete, remove the `{{ exit_label }}` label from the ticket
+When the task is complete, remove the `{{ gate_label }}` label from the ticket
 via your Jira tool (acli or MCP) so the daemon stops considering it.

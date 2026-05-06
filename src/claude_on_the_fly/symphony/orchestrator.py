@@ -10,6 +10,7 @@ import asyncio
 import logging
 import shutil
 import time
+from itertools import count
 from typing import Iterable
 
 from claude_on_the_fly.agent import ClaudeUnavailableError
@@ -115,7 +116,8 @@ async def _run_worker(
     )
 
     try:
-        for attempt in range(config.max_turns):
+        turn_iter = count() if config.max_turns < 0 else range(config.max_turns)
+        for attempt in turn_iter:
             try:
                 response = await runner.run_turn(attempt)
             except asyncio.CancelledError:
@@ -186,6 +188,7 @@ async def _run_worker(
             runner.issue = refreshed
             state.update_running_state(issue.id, refreshed.state)
 
+        # Only reachable when max_turns is a finite positive value.
         logger.info(
             "[%s] max_turns=%d reached; scheduling continuation retry",
             identifier,

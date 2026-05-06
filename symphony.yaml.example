@@ -12,10 +12,10 @@ tracker:
 # Defaults shown; uncomment only to override:
 # polling_ms: 30000
 # max_concurrent: 1
-# max_turns: 20
+# max_turns: 20                              # -1 = unlimited (then stall_timeout_ms is your only safety net)
 # turn_timeout_ms: 3600000
 # active_states:   ["To Do", "In Progress"]
 # terminal_states: ["Done", "Closed", "Cancelled"]
 # worktree_root: ~/code/symphony-wt          # daemon mkdirs <root>/<TICKET-KEY> per ticket
 # prompt: ./symphony-prompt.md               # path is relative to this config file
-# exit_label: stevedore                       # informational; agent removes via tools
+# gate_label: stevedore                       # the label that gates dispatch via JQL; agent removes it when done

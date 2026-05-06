@@ -73,7 +73,7 @@ def test_render_prompt_basic(tmp_path):
         issue=_issue(),
         attempt=2,
         workspace_path=Path("/tmp/ws"),
-        exit_label="stevedore",
+        gate_label="stevedore",
     )
     assert "PROJ-150" in out
     assert "attempt 2" in out
@@ -87,7 +87,7 @@ def test_render_prompt_unknown_var_raises():
             issue=_issue(),
             attempt=0,
             workspace_path=Path("/tmp/ws"),
-            exit_label=None,
+            gate_label=None,
         )
 
 
@@ -97,7 +97,7 @@ def test_render_prompt_default_when_template_empty():
         issue=_issue(),
         attempt=0,
         workspace_path=Path("/tmp/ws"),
-        exit_label=None,
+        gate_label=None,
     )
     assert "PROJ-150" in out
     assert "/tmp/ws" in out
