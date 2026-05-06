@@ -1,0 +1,27 @@
+You are working on Jira ticket `{{ issue.identifier }}`: {{ issue.title }}
+
+Status: {{ issue.state }}
+URL: {{ issue.url }}
+{% if issue.labels.size > 0 %}Labels: {{ issue.labels | join: ", " }}{% endif %}
+
+Workspace (your scratch dir): {{ workspace_path }}
+
+{% if attempt > 0 %}
+This is continuation turn #{{ attempt }}. Resume from current workspace state.
+Don't repeat completed investigation or validation.
+{% endif %}
+
+Description (raw ADF JSON):
+{{ issue.description_json }}
+
+Decide which repo(s) the ticket needs and create git worktrees under
+`{{ workspace_path }}`. For example:
+
+    cd {{ workspace_path }}
+    git -C ~/path/to/your-repo worktree add ./repo-name -b stevedore/{{ issue.identifier | downcase }}
+
+You own branch hygiene in source repos: clean up branches and run
+`git worktree prune` in each source repo before you finish.
+
+When the task is complete, remove the `{{ exit_label }}` label from the ticket
+via your Jira tool (acli or MCP) so the daemon stops considering it.

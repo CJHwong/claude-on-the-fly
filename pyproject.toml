@@ -9,6 +9,7 @@ dependencies = [
     "croniter>=2.0.0",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.2",
+    "python-liquid>=2.1.0",
     "python-telegram-bot>=22.7",
     "pyyaml>=6.0",
     "slack-bolt>=1.27.0",
@@ -19,6 +20,7 @@ claude-telegram = "claude_on_the_fly.telegram:main"
 claude-slack = "claude_on_the_fly.slack:main"
 claude-gmail = "claude_on_the_fly.gmail:main"
 claude-schedule = "claude_on_the_fly.scheduler:main"
+claude-symphony = "claude_on_the_fly.symphony.cli:main"
 
 [dependency-groups]
 dev = [
