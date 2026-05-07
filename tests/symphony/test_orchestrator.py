@@ -25,7 +25,6 @@ from claude_on_the_fly.symphony.orchestrator import (
 from claude_on_the_fly.symphony.retry import RetryEntry, RetryQueue
 from claude_on_the_fly.symphony.state import OrchestratorState, RunningEntry
 from claude_on_the_fly.symphony.tracker.issue import BlockerRef, Issue
-from claude_on_the_fly.symphony.workspace import Workspace
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +76,6 @@ def _config(**overrides: object) -> SymphonyConfig:
         "max_concurrent": 3,
         "max_retry_backoff_ms": 3600_000,
         "max_concurrent_by_state": {},
-        "worktree_root": Path("/tmp/symphony-worktrees"),
         "prompt_path": Path("/tmp/symphony-prompt.md"),
     }
     kwargs = defaults | {k: v for k, v in overrides.items() if k in defaults}
@@ -369,7 +367,7 @@ class TestRunWorker:
                 "claude_on_the_fly.symphony.orchestrator.TicketRunner"
             ) as mock_runner_cls,
         ):
-            mock_ew.return_value = Workspace(path=Path("/tmp/ws"), created_now=True)
+            mock_ew.return_value = Path("/tmp/ws")
             mock_runner = MagicMock()
             mock_runner.run_turn = AsyncMock(
                 side_effect=ClaudeUnavailableError("usage limit exceeded")
@@ -414,7 +412,7 @@ class TestRunWorker:
                 "claude_on_the_fly.symphony.orchestrator.TicketRunner"
             ) as mock_runner_cls,
         ):
-            mock_ew.return_value = Workspace(path=Path("/tmp/ws"), created_now=True)
+            mock_ew.return_value = Path("/tmp/ws")
             mock_runner = MagicMock()
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
@@ -446,7 +444,7 @@ class TestRunWorker:
                 "claude_on_the_fly.symphony.orchestrator.remove_workspace"
             ) as mock_rm,
         ):
-            mock_ew.return_value = Workspace(path=Path("/tmp/ws"), created_now=True)
+            mock_ew.return_value = Path("/tmp/ws")
             mock_runner = MagicMock()
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
@@ -472,7 +470,7 @@ class TestRunWorker:
                 "claude_on_the_fly.symphony.orchestrator.TicketRunner"
             ) as mock_runner_cls,
         ):
-            mock_ew.return_value = Workspace(path=Path("/tmp/ws"), created_now=True)
+            mock_ew.return_value = Path("/tmp/ws")
             mock_runner = MagicMock()
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
@@ -534,8 +532,7 @@ class TestReconcile:
         ) as mock_rm:
             await reconcile(state, tracker, cfg, RetryQueue())
 
-        mock_rm.assert_not_called()  # workspace is None, so it won't be called
-        # Workspace is None since we didn't set it, but the cancel path was hit
+        mock_rm.assert_not_called()  # workspace path is None, so it won't be called
 
     async def test_inactive_mid_run_cancels(self) -> None:
         state = OrchestratorState()
@@ -810,9 +807,7 @@ class TestRunLoop:
             patch("claude_on_the_fly.symphony.orchestrator.PromptStore") as mock_ps,
             patch("claude_on_the_fly.symphony.orchestrator.startup_cleanup") as mock_sc,
         ):
-            mock_load.return_value = _config(
-                prompt_path=prompt_path, worktree_root=tmp_path / "wts"
-            )
+            mock_load.return_value = _config(prompt_path=prompt_path)
             mock_ps_instance = MagicMock()
             mock_ps_instance.load.return_value = "prompt source"
             mock_ps_instance.maybe_reload.return_value = "prompt source"

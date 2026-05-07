@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
@@ -17,7 +18,6 @@ from claude_on_the_fly.agent import Response
 from .config import SymphonyConfig
 from .prompt import render_prompt
 from .tracker.issue import Issue
-from .workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def session_uuid_for(issue_identifier: str) -> str:
 @dataclass
 class TicketRunner:
     issue: Issue
-    workspace: Workspace
+    workspace: Path
     config: SymphonyConfig
     prompt_source: str
     session_uuid: str
@@ -40,7 +40,7 @@ class TicketRunner:
             self.prompt_source,
             issue=self.issue,
             attempt=attempt,
-            workspace_path=self.workspace.path,
+            workspace_path=self.workspace,
             gate_label=self.config.gate_label,
         )
         logger.debug(
@@ -51,7 +51,7 @@ class TicketRunner:
             self.session_uuid,
         )
         return await agent.run(
-            workspace=self.workspace.path,
+            workspace=self.workspace,
             session_uuid=self.session_uuid,
             prompt=prompt,
             platform="symphony",

@@ -263,7 +263,6 @@ class TestProcess:
     ) -> None:
         fake_response = Response(body="answer", cost=0.01, tokens_in=100, tokens_out=50)
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -291,7 +290,6 @@ class TestProcess:
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -305,7 +303,6 @@ class TestProcess:
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -318,7 +315,6 @@ class TestProcess:
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -331,7 +327,6 @@ class TestProcess:
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -351,7 +346,6 @@ class TestProcess:
         frontend.timeout_for = lambda chat_id: 99.0  # type: ignore[method-assign]
 
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -364,7 +358,6 @@ class TestProcess:
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
         with (
-            patch.object(orch, "_ensure_persona"),
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
@@ -378,79 +371,6 @@ class TestProcess:
         await asyncio.sleep(0.05)
         # If typing_task leaked we'd see ongoing send_typing calls; this is
         # covered implicitly by no hanging tasks.
-
-
-# ---------------------------------------------------------------------------
-# _ensure_persona
-# ---------------------------------------------------------------------------
-
-
-class TestEnsurePersona:
-    def test_noop_when_source_missing(self, tmp_path: Path) -> None:
-        with patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path):
-            workspace = tmp_path / "ws"
-            workspace.mkdir()
-            Orchestrator._ensure_persona(workspace)
-            assert not (workspace / "CLAUDE.md").exists()
-
-    def test_creates_symlink(self, tmp_path: Path) -> None:
-        source = tmp_path / "CLAUDE.md"
-        source.write_text("persona")
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-
-        with patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path):
-            Orchestrator._ensure_persona(workspace)
-
-        target = workspace / "CLAUDE.md"
-        assert target.is_symlink()
-        assert target.resolve() == source.resolve()
-
-    def test_replaces_existing_file_with_symlink(self, tmp_path: Path) -> None:
-        source = tmp_path / "CLAUDE.md"
-        source.write_text("persona")
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        existing = workspace / "CLAUDE.md"
-        existing.write_text("old content")
-
-        with patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path):
-            Orchestrator._ensure_persona(workspace)
-
-        assert existing.is_symlink()
-        assert existing.resolve() == source.resolve()
-
-    def test_replaces_wrong_symlink(self, tmp_path: Path) -> None:
-        source = tmp_path / "CLAUDE.md"
-        source.write_text("persona")
-        wrong_target = tmp_path / "wrong.md"
-        wrong_target.write_text("wrong")
-
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        link = workspace / "CLAUDE.md"
-        link.symlink_to(wrong_target)
-
-        with patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path):
-            Orchestrator._ensure_persona(workspace)
-
-        assert link.is_symlink()
-        assert link.resolve() == source.resolve()
-
-    def test_noop_when_symlink_already_correct(self, tmp_path: Path) -> None:
-        source = tmp_path / "CLAUDE.md"
-        source.write_text("persona")
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        link = workspace / "CLAUDE.md"
-        link.symlink_to(source)
-
-        with patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path):
-            Orchestrator._ensure_persona(workspace)
-
-        # Still the same symlink, not recreated
-        assert link.is_symlink()
-        assert link.resolve() == source.resolve()
 
 
 # ---------------------------------------------------------------------------

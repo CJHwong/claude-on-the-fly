@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from claude_on_the_fly.symphony.tracker.issue import Issue
 from claude_on_the_fly.symphony.workspace import (
-    Workspace,
-    _assert_inside,
+    WORKSPACES_ROOT,
     ensure_workspace,
     remove_workspace,
     sanitize_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_persona():
+    """ensure_workspace calls agent.ensure_persona; stub it so tests don't touch ~/.claude-on-the-fly/CLAUDE.md."""
+    with patch("claude_on_the_fly.symphony.workspace.agent.ensure_persona") as mock:
+        yield mock
 
 
 def test_sanitize_safe_chars():
@@ -27,78 +33,51 @@ def test_sanitize_replaces_unsafe():
     assert sanitize_key("../escape") == ".._escape"
 
 
-def _issue(identifier: str = "PROJ-1") -> Issue:
-    return Issue(
-        id="1",
-        identifier=identifier,
-        title="t",
-        state="To Do",
-        description_raw=None,
-        priority=None,
-        labels=(),
-        blocked_by=(),
-        parent_key=None,
-        url="",
-        created_at=None,
-        updated_at=None,
+def test_ensure_workspace_creates_dir(tmp_path: Path) -> None:
+    root = tmp_path / "wt"
+    path = ensure_workspace("PROJ-1", root=root)
+    assert path == root / "PROJ-1"
+    assert path.is_dir()
+
+
+def test_ensure_workspace_reuses_existing(tmp_path: Path) -> None:
+    root = tmp_path / "wt"
+    a = ensure_workspace("PROJ-1", root=root)
+    b = ensure_workspace("PROJ-1", root=root)
+    assert a == b
+    assert a.is_dir()
+
+
+def test_ensure_workspace_sanitizes_key(tmp_path: Path) -> None:
+    root = tmp_path / "wt"
+    path = ensure_workspace("weird/key", root=root)
+    assert path.name == "weird_key"
+    assert path.is_dir()
+
+
+def test_ensure_workspace_calls_ensure_persona(tmp_path: Path, _stub_persona) -> None:
+    root = tmp_path / "wt"
+    path = ensure_workspace("PROJ-1", root=root)
+    _stub_persona.assert_called_once_with(path)
+
+
+def test_remove_workspace_deletes_tree(tmp_path: Path) -> None:
+    root = tmp_path / "wt"
+    path = ensure_workspace("PROJ-1", root=root)
+    (path / "junk").mkdir()
+    (path / "junk" / "file.txt").write_text("data")
+    remove_workspace(path)
+    assert not path.exists()
+
+
+def test_remove_workspace_idempotent_when_missing(tmp_path: Path) -> None:
+    remove_workspace(tmp_path / "does-not-exist")  # must not raise
+
+
+def test_default_root_is_under_data_dir() -> None:
+    """WORKSPACES_ROOT lives under the standard data root, not ~/code."""
+    assert WORKSPACES_ROOT.parts[-3:] == (
+        ".claude-on-the-fly",
+        "workspaces",
+        "symphony",
     )
-
-
-def test_ensure_workspace_creates_dir(tmp_path):
-    root = tmp_path / "wt"
-    ws = ensure_workspace(_issue("PROJ-1"), root)
-    assert ws.path == (root / "PROJ-1").resolve()
-    assert ws.path.is_dir()
-    assert ws.created_now is True
-
-
-def test_ensure_workspace_reuses_existing(tmp_path):
-    root = tmp_path / "wt"
-    ws1 = ensure_workspace(_issue("PROJ-1"), root)
-    ws2 = ensure_workspace(_issue("PROJ-1"), root)
-    assert ws2.created_now is False
-    assert ws1.path == ws2.path
-
-
-def test_ensure_workspace_sanitizes_key(tmp_path):
-    root = tmp_path / "wt"
-    ws = ensure_workspace(_issue("weird/key"), root)
-    assert ws.path.name == "weird_key"
-    assert ws.path.is_dir()
-
-
-def test_remove_workspace_deletes_tree(tmp_path):
-    root = tmp_path / "wt"
-    ws = ensure_workspace(_issue("PROJ-1"), root)
-    (ws.path / "junk").mkdir()
-    (ws.path / "junk" / "file.txt").write_text("data")
-    remove_workspace(ws)
-    assert not ws.path.exists()
-
-
-def test_remove_workspace_idempotent_when_missing(tmp_path):
-    ws = Workspace(path=tmp_path / "does-not-exist", created_now=False)
-    remove_workspace(ws)  # must not raise
-
-
-def test_ensure_workspace_rejects_path_escape(tmp_path: Path) -> None:
-    """A pre-existing symlink that points outside root should trigger RuntimeError."""
-    root = tmp_path / "wt"
-    root.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    # Create a symlink inside root that points outside
-    link = root / "escape-hatch"
-    link.symlink_to(outside)
-
-    with pytest.raises(RuntimeError, match=r"workspace path .* escapes root"):
-        # The key "escape-hatch" will resolve to outside/ via the symlink
-        ensure_workspace(_issue("escape-hatch"), root)
-
-
-def test_assert_inside_rejects_escaped_path(tmp_path: Path) -> None:
-    root = tmp_path / "wt"
-    root.mkdir()
-    outside = tmp_path / "stray"
-    with pytest.raises(RuntimeError, match="workspace path .* escapes root"):
-        _assert_inside(outside, root)

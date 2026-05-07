@@ -11,10 +11,29 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-MEMORY_DIR = Path.home() / ".claude-on-the-fly" / "memory"
+DATA_DIR = Path.home() / ".claude-on-the-fly"
+MEMORY_DIR = DATA_DIR / "memory"
 MEMORY_ROOT = str(MEMORY_DIR)
 KNOWLEDGE_DIR = str(MEMORY_DIR / "knowledge")
 PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text()
+
+
+def ensure_persona(workspace: Path) -> None:
+    """Symlink the global CLAUDE.md persona into the workspace.
+
+    Idempotent: no-op when source is missing, no-op when the link is already
+    correct, replaces wrong symlinks or pre-existing files.
+    """
+    source = DATA_DIR / "CLAUDE.md"
+    if not source.is_file():
+        return
+    target = workspace / "CLAUDE.md"
+    if target.is_symlink() and target.resolve() == source.resolve():
+        return
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    target.symlink_to(source)
+
 
 STATS_MODES = ("off", "summary", "detailed")
 
@@ -56,6 +75,11 @@ FORMAT_HINTS = {
     "gmail": (
         "Format responses as plain text. No markdown, no HTML. "
         "Use line breaks for structure. Keep it concise."
+    ),
+    "symphony": (
+        "Output goes to daemon logs, not a chat user. Plain markdown is fine. "
+        "Tracker writes (status transitions, comments, label edits) are your "
+        "responsibility — see your prompt for the tools available."
     ),
 }
 

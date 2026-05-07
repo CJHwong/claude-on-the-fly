@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from .tracker.issue import Issue
-from .workspace import Workspace
 
 
 @dataclass
@@ -17,7 +17,7 @@ class RunningEntry:
     issue_state: str
     started_at: float  # monotonic seconds
     task: asyncio.Task[None] | None = None  # set after task creation
-    workspace: Workspace | None = None  # set when worker creates it
+    workspace: Path | None = None  # set when worker creates it
     last_turn_end_at: float | None = (
         None  # monotonic seconds; None until first turn ends
     )

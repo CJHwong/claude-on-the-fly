@@ -16,7 +16,6 @@ import yaml
 
 _VAR_RE = re.compile(r"^\$([A-Z][A-Z0-9_]*)$")
 
-DEFAULT_WORKTREE_ROOT = Path.home() / "code" / "symphony-wt"
 DEFAULT_PROMPT_NAME = "symphony-prompt.md"
 
 
@@ -100,7 +99,6 @@ class SymphonyConfig:
     turn_timeout_ms: int = 3600000
     stall_timeout_ms: int = 1800000  # 30m; <= 0 disables stall detection
     max_retry_backoff_ms: int = 300000  # 5m cap on failure backoff
-    worktree_root: Path = field(default_factory=lambda: DEFAULT_WORKTREE_ROOT)
     prompt_path: Path = field(
         default_factory=lambda: Path.home() / ".claude-on-the-fly" / DEFAULT_PROMPT_NAME
     )
@@ -113,9 +111,6 @@ class SymphonyConfig:
         if not isinstance(raw, dict):
             raise ValueError("config must decode to a YAML mapping")
 
-        worktree_root = (
-            expand_path(raw.get("worktree_root"), base=base) or DEFAULT_WORKTREE_ROOT
-        )
         prompt_path = expand_path(raw.get("prompt"), base=base) or (
             base / DEFAULT_PROMPT_NAME
         )
@@ -159,7 +154,6 @@ class SymphonyConfig:
             turn_timeout_ms=int(raw.get("turn_timeout_ms", 3600000)),
             stall_timeout_ms=int(raw.get("stall_timeout_ms", 1800000)),
             max_retry_backoff_ms=max_retry_backoff_ms,
-            worktree_root=worktree_root,
             prompt_path=prompt_path,
             gate_label=(str(raw["gate_label"]) if raw.get("gate_label") else None),
         )

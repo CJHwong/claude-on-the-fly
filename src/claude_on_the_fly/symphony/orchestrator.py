@@ -1,4 +1,4 @@
-"""Symphony orchestrator: poll Jira, dispatch claimed tickets, drive continuation turns.
+"""Symphony orchestrator: poll the tracker, dispatch claimed tickets, drive continuation turns.
 
 Per tick: reconcile running workers' state (catching mid-turn terminal/inactive
 transitions and stall timeouts), process due retries, then fetch and dispatch
@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 import time
 from itertools import count
+from pathlib import Path
 from typing import Iterable
 
 from claude_on_the_fly.agent import ClaudeUnavailableError
@@ -23,7 +23,7 @@ from .retry import RetryQueue
 from .state import OrchestratorState, RunningEntry
 from .tracker import Tracker, make_tracker
 from .tracker.issue import Issue
-from .workspace import ensure_workspace, remove_workspace
+from .workspace import WORKSPACES_ROOT, ensure_workspace, remove_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ async def _run_worker(
 ) -> None:
     identifier = issue.identifier
     try:
-        workspace = ensure_workspace(issue, config.worktree_root)
+        workspace = ensure_workspace(identifier)
     except Exception:
         logger.exception("[%s] worker: workspace prep failed", identifier)
         retry_queue.schedule_failure(
@@ -111,7 +111,7 @@ async def _run_worker(
     logger.info(
         "[%s] worker started: workspace=%s session=%s (failure_attempt=%d)",
         identifier,
-        workspace.path,
+        workspace,
         sid,
         starting_failure_attempt,
     )
@@ -355,14 +355,14 @@ async def reconcile(
 
 
 async def startup_cleanup(
-    worktree_root,
+    root: Path,
     tracker: Tracker,
     tracker_cfg: TrackerConfig,
 ) -> None:
-    """SPEC §8.6: walk worktree_root, remove dirs whose tickets are terminal."""
-    if not worktree_root.exists():
+    """SPEC §8.6: walk the symphony workspaces root, remove dirs whose tickets are terminal."""
+    if not root.exists():
         return
-    dirs = [d for d in worktree_root.iterdir() if d.is_dir()]
+    dirs = [d for d in root.iterdir() if d.is_dir()]
     if not dirs:
         return
     keys = [d.name for d in dirs]
@@ -376,12 +376,8 @@ async def startup_cleanup(
     for d in dirs:
         status = statuses.get(d.name)
         if status and status in terminal:
-            logger.info(
-                "startup_cleanup: removing %s (status=%s)",
-                d,
-                status,
-            )
-            shutil.rmtree(d, ignore_errors=True)
+            logger.info("startup_cleanup: %s status=%s", d, status)
+            remove_workspace(d)
 
 
 async def _process_due_retries(
@@ -542,7 +538,7 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     )
 
     try:
-        await startup_cleanup(config.worktree_root, tracker, config.tracker)
+        await startup_cleanup(WORKSPACES_ROOT, tracker, config.tracker)
 
         while not stop_event.is_set():
             prompt_source = prompt_store.maybe_reload()

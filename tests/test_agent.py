@@ -17,6 +17,7 @@ from claude_on_the_fly.agent import (
     Response,
     _classify,
     build_system_prompt,
+    ensure_persona,
     _exec,
     _merge_cli_output,
     parse_stream,
@@ -984,3 +985,76 @@ class TestRun:
         assert "--resume" in cmd
         assert "my-uuid" in cmd
         assert "hi" in cmd
+
+
+# ---------------------------------------------------------------------------
+# ensure_persona
+# ---------------------------------------------------------------------------
+
+
+class TestEnsurePersona:
+    def test_noop_when_source_missing(self, tmp_path: Path) -> None:
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            workspace = tmp_path / "ws"
+            workspace.mkdir()
+            ensure_persona(workspace)
+            assert not (workspace / "CLAUDE.md").exists()
+
+    def test_creates_symlink(self, tmp_path: Path) -> None:
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        target = workspace / "CLAUDE.md"
+        assert target.is_symlink()
+        assert target.resolve() == source.resolve()
+
+    def test_replaces_existing_file_with_symlink(self, tmp_path: Path) -> None:
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        existing = workspace / "CLAUDE.md"
+        existing.write_text("old content")
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        assert existing.is_symlink()
+        assert existing.resolve() == source.resolve()
+
+    def test_replaces_wrong_symlink(self, tmp_path: Path) -> None:
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        wrong_target = tmp_path / "wrong.md"
+        wrong_target.write_text("wrong")
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        link = workspace / "CLAUDE.md"
+        link.symlink_to(wrong_target)
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        assert link.is_symlink()
+        assert link.resolve() == source.resolve()
+
+    def test_noop_when_symlink_already_correct(self, tmp_path: Path) -> None:
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        link = workspace / "CLAUDE.md"
+        link.symlink_to(source)
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        # Still the same symlink, not recreated
+        assert link.is_symlink()
+        assert link.resolve() == source.resolve()

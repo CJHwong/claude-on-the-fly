@@ -179,7 +179,7 @@ uv run claude-schedule
 
 ## Symphony Setup (5 minutes)
 
-Long-running daemon that polls Jira on a label gate, claims tickets, and runs Claude Code in per-ticket scratch directories until each ticket leaves an active state. Inspired by [openai/symphony](https://github.com/openai/symphony), adapted for Jira and per-org git worktrees.
+Long-running daemon that polls Jira on a label gate, claims tickets, and runs Claude Code in per-ticket sessions until each ticket leaves an active state. Inspired by [openai/symphony](https://github.com/openai/symphony), adapted for Jira and per-org git worktrees.
 
 ### Two config files
 
@@ -204,7 +204,6 @@ tracker:
 # stall_timeout_ms: 1800000
 # active_states:   ["To Do", "In Progress"]
 # terminal_states: ["Done", "Closed", "Cancelled"]
-# worktree_root: ~/code/symphony-wt
 # gate_label: stevedore
 ```
 
@@ -227,10 +226,11 @@ uv run claude-symphony
 
 - Polls JQL `project = PROJ AND status in <active_states> {jql_extra}` every `polling_ms`.
 - Add the gate label (default `stevedore`) to a ticket and the daemon picks it up on the next tick.
-- Per ticket: creates a scratch dir under `worktree_root`, spawns Claude Code with `--resume <deterministic-uuid>`, loops turns until the ticket transitions to a terminal state, transitions out of active states, or hits `max_turns`.
+- Per ticket: creates a small scratch dir at `~/.claude-on-the-fly/workspaces/symphony/<TICKET-KEY>/` (with the global `CLAUDE.md` persona symlinked in), spawns Claude Code with `--resume <deterministic-uuid>`, loops turns until the ticket transitions to a terminal state, transitions out of active states, or hits `max_turns`.
+- The agent works on existing source-repo clones declared in your prompt — it `git worktree add`s alongside those clones, NOT inside the scratch dir. Edit the repo list in `symphony-prompt.md` to match your machine.
 - Reconciles every tick: catches mid-turn state transitions (someone moves the ticket to Done while the agent is working), cancels the worker, removes the scratch dir.
 - Failures (`ClaudeUnavailableError`, exceptions, stalls) go through a retry queue with exponential backoff. `max_turns` exhaustion gets a 1s continuation retry.
-- The agent owns git worktrees inside the scratch dir (the daemon does NOT run git). It also owns Jira writes: status transitions via `acli`, comments via direct ADF POST to the REST API (acli does not convert markdown to ADF).
+- The agent owns git worktrees and branch hygiene (the daemon does NOT run git). It also owns Jira writes: status transitions via `acli`, comments via direct ADF POST to the REST API (acli does not convert markdown to ADF).
 - Stop signals (escalating force): remove the gate label, transition the ticket to a terminal state, SIGINT the daemon.
 
 ### Symphony Variables

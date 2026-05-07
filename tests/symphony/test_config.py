@@ -101,7 +101,6 @@ def test_load_config_overrides(tmp_path, env_creds):
             "max_concurrent: 3\n"
             "max_turns: 10\n"
             "gate_label: stevedore\n"
-            "worktree_root: " + str(tmp_path / "wt") + "\n"
         ),
     )
     cfg = load_config(cfg_path)
@@ -109,7 +108,6 @@ def test_load_config_overrides(tmp_path, env_creds):
     assert cfg.max_concurrent == 3
     assert cfg.max_turns == 10
     assert cfg.gate_label == "stevedore"
-    assert cfg.worktree_root == (tmp_path / "wt").resolve()
 
 
 def test_load_config_explicit_prompt_path(tmp_path, env_creds):

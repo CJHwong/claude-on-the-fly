@@ -6,16 +6,13 @@ import asyncio
 import logging
 import logging.handlers
 import signal
-from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
-from claude_on_the_fly.agent import ClaudeUnavailableError, Response
+from claude_on_the_fly.agent import DATA_DIR, ClaudeUnavailableError, Response
 from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
-
-DATA_DIR = Path.home() / ".claude-on-the-fly"
 
 
 class Orchestrator:
@@ -72,23 +69,10 @@ class Orchestrator:
             await self._frontend.send_typing(chat_id)
             await asyncio.sleep(4)
 
-    @staticmethod
-    def _ensure_persona(workspace: Path) -> None:
-        """Symlink the global CLAUDE.md persona into the workspace if it exists."""
-        source = DATA_DIR / "CLAUDE.md"
-        if not source.is_file():
-            return
-        target = workspace / "CLAUDE.md"
-        if target.is_symlink() and target.resolve() == source.resolve():
-            return
-        if target.is_symlink() or target.exists():
-            target.unlink()
-        target.symlink_to(source)
-
     async def _process(self, chat_id: int, text: str) -> None:
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
-        self._ensure_persona(workspace)
+        agent.ensure_persona(workspace)
         session = self.session_uuid(chat_id)
         logger.debug(
             "process: chat_id=%s workspace=%s session=%s", chat_id, workspace, session

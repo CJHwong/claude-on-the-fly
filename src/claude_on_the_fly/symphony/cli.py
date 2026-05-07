@@ -64,8 +64,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="claude-symphony",
         description=(
-            "Long-running daemon that polls Jira and runs Claude Code in "
-            "per-ticket scratch directories."
+            "Long-running daemon that polls a tracker and runs Claude Code in "
+            "per-ticket sessions."
         ),
     )
     parser.add_argument(

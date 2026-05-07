@@ -4,7 +4,7 @@ Status: {{ issue.state }}
 URL: {{ issue.url }}
 {% if issue.labels.size > 0 %}Labels: {{ issue.labels | join: ", " }}{% endif %}
 
-Workspace (your scratch dir): {{ workspace_path }}
+Workspace (small scratch dir for notes, NOT for code): {{ workspace_path }}
 
 {% if attempt > 0 %}
 This is continuation turn #{{ attempt }}. Resume from current workspace state.
@@ -14,14 +14,28 @@ Don't repeat completed investigation or validation.
 Description (raw ADF JSON):
 {{ issue.description_json }}
 
-Decide which repo(s) the ticket needs and create git worktrees under
-`{{ workspace_path }}`. For example:
+## Repos available
 
-    cd {{ workspace_path }}
-    git -C ~/path/to/your-repo worktree add ./repo-name -b stevedore/{{ issue.identifier | downcase }}
+Use these existing local clones — do NOT clone new copies. Edit the list to
+match your machine before running the daemon.
 
-You own branch hygiene in source repos: clean up branches and run
-`git worktree prune` in each source repo before you finish.
+- ~/Workspace/your-repo
+- ~/Workspace/another-repo
 
-When the task is complete, remove the `{{ gate_label }}` label from the ticket
-via your Jira tool (acli or MCP) so the daemon stops considering it.
+## How to work on code
+
+Create a git worktree alongside the source repo (NOT inside `{{ workspace_path }}`),
+for example:
+
+    git -C ~/Workspace/your-repo worktree add \
+        ~/Workspace/your-repo-worktrees/{{ issue.identifier | downcase }} \
+        -b stevedore/{{ issue.identifier | downcase }}
+
+Do all editing, building, and testing inside that worktree. The scratch dir
+above is just for ticket-level notes and intermediate files.
+
+You own branch hygiene: clean up the branch and run `git worktree prune` in
+each source repo before you finish.
+
+When the task is complete, remove the `{{ gate_label }}` label from the
+ticket via your Jira tool (acli or MCP) so the daemon stops considering it.

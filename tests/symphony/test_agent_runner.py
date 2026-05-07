@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, patch
 from claude_on_the_fly.symphony.agent_runner import TicketRunner, session_uuid_for
 from claude_on_the_fly.symphony.config import SymphonyConfig
 from claude_on_the_fly.symphony.tracker.issue import Issue
-from claude_on_the_fly.symphony.workspace import Workspace
 
 
 def _issue(**overrides: object) -> Issue:
@@ -39,7 +38,6 @@ def _config(**overrides: object) -> SymphonyConfig:
         "max_concurrent": 3,
         "max_retry_backoff_ms": 3600_000,
         "max_concurrent_by_state": {},
-        "worktree_root": Path("/tmp/symphony-worktrees"),
         "prompt_path": Path("/tmp/symphony-prompt.md"),
     }
     return SymphonyConfig(**(defaults | overrides))  # type: ignore[arg-type]
@@ -71,7 +69,7 @@ def test_session_uuid_is_string() -> None:
 
 async def test_run_turn_calls_agent_run_with_correct_args() -> None:
     issue = _issue()
-    workspace = Workspace(path=Path("/tmp/ws"), created_now=True)
+    workspace = Path("/tmp/ws")
     config = _config()
     runner = TicketRunner(
         issue=issue,
@@ -115,7 +113,7 @@ async def test_run_turn_calls_agent_run_with_correct_args() -> None:
 async def test_run_turn_attempt_zero() -> None:
     """First turn (attempt=0)."""
     issue = _issue()
-    workspace = Workspace(path=Path("/tmp/ws"), created_now=True)
+    workspace = Path("/tmp/ws")
     runner = TicketRunner(
         issue=issue,
         workspace=workspace,
@@ -141,7 +139,7 @@ async def test_run_turn_attempt_zero() -> None:
 async def test_run_turn_custom_timeout() -> None:
     """Verify timeout_ms is converted to seconds for agent.run."""
     issue = _issue()
-    workspace = Workspace(path=Path("/tmp/ws"), created_now=False)
+    workspace = Path("/tmp/ws")
     config = _config(turn_timeout_ms=120_000)
     runner = TicketRunner(
         issue=issue,
