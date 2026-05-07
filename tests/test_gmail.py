@@ -250,7 +250,7 @@ class TestHandleMessage:
             gcp_project="proj",
             allowed_senders={"alice@x.com"},
         )
-        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        fe._on_message = AsyncMock()
         return fe
 
     async def test_ignores_sent_messages(self):
@@ -292,7 +292,7 @@ class TestHandleMessage:
             gcp_project="proj",
             allowed_senders={"*@gofreight.com"},
         )
-        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        fe._on_message = AsyncMock()
         msg = _make_msg(from_addr="Bob <bob@gofreight.com>")
         await fe._handle_message(msg)
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
@@ -302,7 +302,7 @@ class TestHandleMessage:
             gcp_project="proj",
             allowed_senders={"*@gofreight.com"},
         )
-        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        fe._on_message = AsyncMock()
         msg = _make_msg(from_addr="Eve <eve@evil.com>")
         await fe._handle_message(msg)
         fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
@@ -312,7 +312,7 @@ class TestHandleMessage:
             gcp_project="proj",
             allowed_senders={"*@GoFreight.COM"},
         )
-        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        fe._on_message = AsyncMock()
         msg = _make_msg(from_addr="Bob <BOB@gofreight.com>")
         await fe._handle_message(msg)
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
@@ -322,7 +322,7 @@ class TestHandleMessage:
             gcp_project="proj",
             allowed_senders={"*"},
         )
-        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        fe._on_message = AsyncMock()
         msg = _make_msg(from_addr="Random <random@nowhere.net>")
         await fe._handle_message(msg)
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
@@ -332,7 +332,7 @@ class TestHandleMessage:
             gcp_project="proj",
             allowed_senders={"alice@x.com", "*@gofreight.com"},
         )
-        fe._on_message = AsyncMock()  # type: ignore[assignment]
+        fe._on_message = AsyncMock()
 
         # Exact email match.
         await fe._handle_message(_make_msg(from_addr="Alice <alice@x.com>"))
@@ -345,7 +345,7 @@ class TestHandleMessage:
             _make_msg(thread_id="t3", msg_id="m3", from_addr="Eve <eve@evil.com>")
         )
 
-        assert fe._on_message.await_count == 2  # type: ignore[union-attr]
+        assert fe._on_message.await_count == 2
 
     async def test_ignores_empty_body(self):
         fe = self._make_frontend()
@@ -837,3 +837,78 @@ class TestStop:
 
         await fe.stop()
         mock_task.cancel.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _handle_message: sender filtering edge cases
+# ---------------------------------------------------------------------------
+
+
+async def test_whitespace_only_entry_skipped() -> None:
+    """A sender entry that normalizes to empty string is ignored via continue."""
+    fe = GmailFrontend(gcp_project="proj", allowed_senders={"  ", "a@x.com"})
+    msg = _make_msg(from_addr="Alice <a@x.com>")
+    await fe._handle_message(msg)
+
+
+# ---------------------------------------------------------------------------
+# _read_stream: handle_message raises
+# ---------------------------------------------------------------------------
+
+
+class TestReadStreamHandleMessageError:
+    async def test_handle_message_exception_logged_and_continues(self) -> None:
+        fe = GmailFrontend(gcp_project="proj", allowed_senders={"a@x.com"})
+
+        msg = _make_msg(msg_id="m1")
+        lines = [
+            json.dumps(msg).encode() + b"\n",
+            b"",
+        ]
+        line_iter = iter(lines)
+
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = AsyncMock(side_effect=lambda: next(line_iter))
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = mock_stdout
+        mock_proc.stderr = AsyncMock()
+        mock_proc.stderr.read = AsyncMock(return_value=b"")
+        mock_proc.wait = AsyncMock(return_value=0)
+        mock_proc.returncode = 0
+
+        fe._watch_proc = mock_proc
+
+        with patch.object(
+            fe, "_handle_message", new_callable=AsyncMock, side_effect=Exception("boom")
+        ):
+            count = await fe._read_stream()
+            assert count == 0  # error counts as not processed
+
+
+# ---------------------------------------------------------------------------
+# send: tools footer
+# ---------------------------------------------------------------------------
+
+
+class TestSendToolsFooter:
+    async def test_appends_tools_when_present(self, monkeypatch) -> None:
+        monkeypatch.setenv("GMAIL_STATS_MODE", "detailed")
+        fe = GmailFrontend(gcp_project="proj", allowed_senders={"a@x.com"})
+        fe._sessions[1] = "msg_abc"
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = 0
+
+        resp = Response(body="Done", tool_counts={"Read": 1})
+
+        with patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc
+        ) as mock_exec:
+            await fe.send(1, resp)
+
+            call_args = mock_exec.call_args[0]
+            idx = list(call_args).index("--body")
+            body_sent = call_args[idx + 1]
+            assert "Read" in body_sent

@@ -101,3 +101,63 @@ def test_render_prompt_default_when_template_empty():
     )
     assert "PROJ-150" in out
     assert "/tmp/ws" in out
+
+
+def test_prompt_store_path_property(tmp_path: Path) -> None:
+    p = tmp_path / "prompt.md"
+    p.write_text("hello")
+    store = PromptStore(p)
+    assert store.path == p
+
+
+def test_prompt_store_load_missing_file(tmp_path: Path) -> None:
+    p = tmp_path / "nonexistent.md"
+    store = PromptStore(p)
+    with pytest.raises(FileNotFoundError):
+        store.load()
+
+
+def test_prompt_store_load_stat_fails_after_read(tmp_path: Path) -> None:
+    """stat() raises FileNotFoundError after read_text() succeeds (race)."""
+    from unittest.mock import MagicMock
+
+    p = tmp_path / "prompt.md"
+    p.write_text("hello")
+    store = PromptStore(p)
+    # Mock stat() to fail even though file exists
+    mock_path = MagicMock()
+    mock_path.read_text.return_value = "hello"
+    mock_path.stat.side_effect = FileNotFoundError("gone")
+    store._path = mock_path
+
+    result = store.load()
+    assert result == "hello"
+    assert store._mtime is None
+
+
+def test_prompt_store_maybe_reload_without_prior_load(tmp_path: Path) -> None:
+    p = tmp_path / "prompt.md"
+    p.write_text("content")
+    store = PromptStore(p)
+    # maybe_reload() without load() calls load() first
+    result = store.maybe_reload()
+    assert result == "content"
+
+
+def test_prompt_store_maybe_reload_read_failure(tmp_path: Path) -> None:
+    """read_text() raises after mtime change: should keep last good source."""
+    from unittest.mock import MagicMock
+
+    p = tmp_path / "prompt.md"
+    p.write_text("initial")
+    store = PromptStore(p)
+    store.load()
+
+    # Mock stat() to return a new mtime, then read_text() fails
+    mock_path = MagicMock()
+    mock_path.stat.return_value.st_mtime = 99999.0  # different mtime
+    mock_path.read_text.side_effect = PermissionError("denied")
+    store._path = mock_path
+
+    result = store.maybe_reload()
+    assert result == "initial"

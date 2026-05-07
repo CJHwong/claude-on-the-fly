@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 
 from claude_on_the_fly.symphony.tracker.issue import Issue
 from claude_on_the_fly.symphony.workspace import (
     Workspace,
+    _assert_inside,
     ensure_workspace,
     remove_workspace,
     sanitize_key,
@@ -75,3 +79,26 @@ def test_remove_workspace_deletes_tree(tmp_path):
 def test_remove_workspace_idempotent_when_missing(tmp_path):
     ws = Workspace(path=tmp_path / "does-not-exist", created_now=False)
     remove_workspace(ws)  # must not raise
+
+
+def test_ensure_workspace_rejects_path_escape(tmp_path: Path) -> None:
+    """A pre-existing symlink that points outside root should trigger RuntimeError."""
+    root = tmp_path / "wt"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    # Create a symlink inside root that points outside
+    link = root / "escape-hatch"
+    link.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match=r"workspace path .* escapes root"):
+        # The key "escape-hatch" will resolve to outside/ via the symlink
+        ensure_workspace(_issue("escape-hatch"), root)
+
+
+def test_assert_inside_rejects_escaped_path(tmp_path: Path) -> None:
+    root = tmp_path / "wt"
+    root.mkdir()
+    outside = tmp_path / "stray"
+    with pytest.raises(RuntimeError, match="workspace path .* escapes root"):
+        _assert_inside(outside, root)

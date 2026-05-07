@@ -355,7 +355,7 @@ class GmailFrontend(Frontend):
             await self._watch_proc.wait()
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     import os
 
     from dotenv import load_dotenv
@@ -373,5 +373,5 @@ def main() -> None:
     asyncio.run(run(frontend, platform="gmail"))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

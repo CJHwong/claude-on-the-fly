@@ -127,16 +127,18 @@ class TestIsBusy:
     def test_false_when_no_task(self, orch: Orchestrator) -> None:
         assert orch.is_busy(1) is False
 
-    def test_true_when_task_running(self, orch: Orchestrator) -> None:
-        pending_future = asyncio.get_event_loop().create_future()
+    async def test_true_when_task_running(self, orch: Orchestrator) -> None:
+        loop = asyncio.get_running_loop()
+        pending_future = loop.create_future()
         orch._running[1] = asyncio.ensure_future(pending_future)  # type: ignore[assignment]
         try:
             assert orch.is_busy(1) is True
         finally:
             pending_future.set_result(None)
 
-    def test_false_when_task_done(self, orch: Orchestrator) -> None:
-        done_future = asyncio.get_event_loop().create_future()
+    async def test_false_when_task_done(self, orch: Orchestrator) -> None:
+        loop = asyncio.get_running_loop()
+        done_future = loop.create_future()
         done_future.set_result(None)
         orch._running[1] = asyncio.ensure_future(done_future)  # type: ignore[assignment]
         assert orch.is_busy(1) is False

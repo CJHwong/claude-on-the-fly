@@ -417,6 +417,73 @@ class TestExec:
         proc.kill.assert_called_once()
         proc.wait.assert_awaited()
 
+    async def test_whitespace_only_lines_skipped(self) -> None:
+        """Lines that strip to empty bytes are skipped without incrementing line_count."""
+        stream = _ndjson(_result_line(result="ok")) + b"\n    \n"
+        proc = _make_proc(0, stream)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        assert result["result"] == "ok"
+        assert result["is_error"] is False
+
+    async def test_malformed_json_line_skipped(self) -> None:
+        """Non-JSON lines are logged and skipped; valid lines still processed."""
+        # Each message gets a trailing \n so _AsyncLineIter splits correctly
+        raw = (
+            _ndjson(_assistant_line(_tool_use("Read"))) + b"\n"
+            b"not-json\n" + _ndjson(_result_line(result="final")) + b"\n"
+        )
+        proc = _make_proc(0, raw)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        assert result["result"] == "final"
+        assert result["tool_counts"] == {"Read": 1}
+
+    async def test_stderr_read_exception_handled_gracefully(self) -> None:
+        """When stderr.read raises, the exception is swallowed and stdout still works."""
+        stream = _ndjson(_result_line(result="good"))
+        proc = _make_proc(0, stream)
+        proc.stderr.read = AsyncMock(side_effect=Exception("stderr pipe broken"))
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        assert result["result"] == "good"
+
+    async def test_timeout_kill_raises_process_lookup_error(self) -> None:
+        """kill() raises ProcessLookupError — swallowed, timeout still propagates."""
+        proc = _never_ending_proc()
+        proc.kill = MagicMock(side_effect=ProcessLookupError)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(RuntimeError, match="timed out after 0.1s"):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
+        proc.kill.assert_called_once()
+
+    async def test_timeout_kill_raises_generic_exception(self) -> None:
+        """kill() raises a generic Exception — logged, timeout still propagates."""
+        proc = _never_ending_proc()
+        proc.kill = MagicMock(side_effect=Exception("OS kill failed"))
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(RuntimeError, match="timed out after 0.1s"):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
+        proc.kill.assert_called_once()
+
+
+def _never_ending_proc() -> MagicMock:
+    class _NeverEnds:
+        def __aiter__(self) -> _NeverEnds:
+            return self
+
+        async def __anext__(self) -> bytes:
+            await asyncio.sleep(10)
+            raise StopAsyncIteration  # pragma: no cover
+
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdout = _NeverEnds()
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(return_value=b"")
+    proc.wait = AsyncMock(return_value=-9)
+    return proc
+
 
 class TestClassify:
     def test_usage_limit_lowercased(self):

@@ -576,8 +576,9 @@ class TestStop:
 
 class TestSend:
     async def test_send_appends_stats_when_present(
-        self, frontend: TelegramFrontend
+        self, frontend: TelegramFrontend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("TELEGRAM_STATS_MODE", "summary")
         frontend._app = MagicMock()
         frontend._app.bot.send_message = AsyncMock()
 
@@ -969,3 +970,19 @@ class TestFlushMediaGroup:
                 await frontend._flush_media_group("grp3")  # should not raise
 
         frontend._on_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# notify_queued (default Frontend impl, not overridden by Telegram)
+# ---------------------------------------------------------------------------
+
+
+async def test_notify_queued_sends_text(frontend: TelegramFrontend) -> None:
+    frontend._app = MagicMock()
+    frontend._app.bot.send_message = AsyncMock()
+
+    await frontend.notify_queued(1, 3)
+
+    call_args = frontend._app.bot.send_message.call_args
+    sent_text = call_args.kwargs["text"]
+    assert "Queued (3 pending)" in sent_text

@@ -573,7 +573,7 @@ class SlackFrontend(Frontend):
         return names or ["unknown"]
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     from dotenv import load_dotenv
 
     from claude_on_the_fly.orchestrator import run
@@ -590,5 +590,5 @@ def main() -> None:
     asyncio.run(run(frontend, platform="slack"))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

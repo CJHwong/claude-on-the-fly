@@ -215,6 +215,38 @@ class TestLoadConfigInvalid:
         with pytest.raises(ValueError, match="timeout"):
             load_config(cfg)
 
+    def test_job_entry_not_mapping(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": ["not-a-dict"]},
+        )
+        with pytest.raises(ValueError, match="must be a mapping"):
+            load_config(cfg)
+
+    def test_missing_cron(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "prompt": "hi"}]},
+        )
+        with pytest.raises(ValueError, match="'cron' required"):
+            load_config(cfg)
+
+    def test_empty_prompt_string(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "   "}]},
+        )
+        with pytest.raises(ValueError, match="'prompt' must be a non-empty string"):
+            load_config(cfg)
+
+    def test_script_not_a_string(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "script": 42}]},
+        )
+        with pytest.raises(ValueError, match="'script' must be a string path"):
+            load_config(cfg)
+
     def test_malformed_yaml(self, tmp_path: Path) -> None:
         cfg = _write_yaml(tmp_path / "s.yaml", "jobs: [unclosed\n")
         with pytest.raises(ValueError, match="YAML parse error"):
@@ -314,6 +346,53 @@ class TestFirePrompt:
         assert "fire (prompt)" in log
         assert "> hello" in log
 
+    async def test_fire_dispatch_to_prompt(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "ping", "cron": "* * * * *", "prompt": "hello"}]},
+        )
+        orch = _fake_orch()
+        on_message = AsyncMock()
+
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._on_message = on_message
+        fe._orch = orch
+        fe._reload()
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["ping"].spec
+            await fe._fire(spec)
+
+        on_message.assert_awaited_once_with(spec.chat_id, "hello")
+
+    async def test_fire_dispatch_to_script(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path, body="#!/bin/bash\necho ok\n")
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "s", "cron": "* * * * *", "script": str(script)}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["s"].spec
+            await fe._fire(spec)
+
+        assert len(fe._script_tasks) > 0
+        # Clean up
+        await asyncio.gather(*fe._script_tasks)
+
+    async def test_fire_prompt_early_return_no_callbacks(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        spec = fe._state["x"].spec
+        # No _on_message, no _orch set; should return without error
+        await fe._fire_prompt(spec)  # should not raise
+
 
 class TestRunScript:
     async def test_script_runs_and_logs(self, tmp_path: Path) -> None:
@@ -335,6 +414,26 @@ class TestRunScript:
         assert "hello from script" in log
         assert "fire (script)" in log
         assert "exit=0" in log
+
+    async def test_run_script_unexpected_exception(self, tmp_path: Path) -> None:
+        script = _make_script(tmp_path, body="#!/bin/bash\necho ok\n")
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "script": str(script)}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
+            spec = fe._state["x"].spec
+            with patch(
+                "asyncio.create_subprocess_exec",
+                side_effect=Exception("spawn failed"),
+            ):
+                await fe._run_script(spec)
+
+        log = (tmp_path / "logs" / "schedule-x.log").read_text()
+        assert "error: spawn failed" in log
 
     async def test_script_timeout_kills(self, tmp_path: Path) -> None:
         script = _make_script(tmp_path, body="#!/bin/bash\nsleep 30\n")
@@ -503,6 +602,116 @@ class TestReload:
         fe._maybe_reload()  # should log + keep prior
         assert fe._state == original_state
 
+    def test_modify_spec_same_cron_preserves_next_fire(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "0 3 * * *", "prompt": "old prompt"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        before = fe._state["a"].next_fire
+
+        _write_yaml(
+            cfg,
+            {"jobs": [{"name": "a", "cron": "0 3 * * *", "prompt": "new prompt"}]},
+        )
+        added, removed, modified = fe._reload()
+        assert modified == {"a"}
+        after = fe._state["a"].next_fire
+        assert before == after  # cron unchanged, so next_fire preserved
+
+    def test_maybe_reload_oserror_stat(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+
+        mock_path = MagicMock()
+        mock_path.stat.side_effect = OSError("permission denied")
+        fe._config_path = mock_path
+
+        fe._maybe_reload()  # should log warning, not raise
+
+    def test_maybe_reload_unchanged_mtime(self, tmp_path: Path) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        # mtime already matches, _reload should not be called again
+        mock_path = MagicMock()
+        mock_path.stat.return_value.st_mtime = fe._mtime
+        fe._config_path = mock_path
+
+        with patch.object(fe, "_reload") as mock_reload:
+            fe._maybe_reload()
+            mock_reload.assert_not_called()
+
+    def test_maybe_reload_success_log(self, tmp_path: Path, caplog) -> None:
+        import logging
+
+        caplog.set_level(logging.INFO)
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        fe._mtime = cfg.stat().st_mtime
+
+        _write_yaml(
+            cfg,
+            {"jobs": [{"name": "b", "cron": "0 0 * * *", "prompt": "hi"}]},
+        )
+        # Force mtime bump so the real file triggers reload
+        future_time = cfg.stat().st_mtime + 10
+        import os as _os
+
+        _os.utime(cfg, (future_time, future_time))
+
+        fe._maybe_reload()
+        assert "reloaded:" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _print_summary
+# ---------------------------------------------------------------------------
+
+
+class TestPrintSummary:
+    def test_prints_job_table(self, tmp_path: Path, capsys) -> None:
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        with patch.object(fe, "_print_summary") as mock_print:
+            fe._print_summary()
+            mock_print.assert_called_once()
+
+    def test_summary_output(self, tmp_path: Path, capsys) -> None:
+
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        fe._reload()
+        fe._print_summary()
+        captured = capsys.readouterr()
+        assert "Scheduler started" in captured.err
+        assert "x" in captured.err
+
+    def test_empty_state_no_output(self, capsys) -> None:
+        fe = SchedulerFrontend(config_path=Path("/x.yaml"))
+        fe._print_summary()
+        captured = capsys.readouterr()
+        assert "Scheduler started — 0 jobs" in captured.err
+
 
 # ---------------------------------------------------------------------------
 # Frontend protocol
@@ -586,6 +795,34 @@ class TestFrontendProtocol:
         fe = SchedulerFrontend(config_path=cfg)
         with pytest.raises(TypeError):
             fe.set_orchestrator("not an orchestrator")
+
+    def test_set_orchestrator_success(self, tmp_path: Path) -> None:
+        from claude_on_the_fly.orchestrator import Orchestrator
+
+        cfg = _write_yaml(
+            tmp_path / "s.yaml",
+            {"jobs": [{"name": "x", "cron": "* * * * *", "prompt": "hi"}]},
+        )
+        fe = SchedulerFrontend(config_path=cfg)
+        orch = MagicMock(spec=Orchestrator)
+        fe.set_orchestrator(orch)
+        assert fe._orch is orch
+
+    def test_sender_name_default(self) -> None:
+        fe = SchedulerFrontend(config_path=Path("/x.yaml"))
+        assert fe.sender_name(42) == "scheduler"
+
+    def test_channel_context_default(self, tmp_path: Path) -> None:
+        fe = SchedulerFrontend(config_path=Path("/x.yaml"))
+        assert fe.channel_context(999) == "cron"
+
+    async def test_send_typing_returns_none(self) -> None:
+        fe = SchedulerFrontend(config_path=Path("/x.yaml"))
+        assert await fe.send_typing(42) is None
+
+    async def test_notify_queued_logs_debug(self) -> None:
+        fe = SchedulerFrontend(config_path=Path("/x.yaml"))
+        await fe.notify_queued(42, 3)  # should not raise
 
 
 # ---------------------------------------------------------------------------

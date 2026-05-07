@@ -79,3 +79,13 @@ def test_running_entry_default_fields():
     assert entry.workspace is None
     assert entry.last_turn_end_at is None
     assert entry.failure_attempt == 0
+
+
+def test_all_running_returns_all_entries() -> None:
+    s = OrchestratorState()
+    s.claim(_issue("1", "PROJ-1"))
+    s.claim(_issue("2", "PROJ-2"))
+    running = s.all_running()
+    assert len(running) == 2
+    identifiers = {r.issue_identifier for r in running}
+    assert identifiers == {"PROJ-1", "PROJ-2"}

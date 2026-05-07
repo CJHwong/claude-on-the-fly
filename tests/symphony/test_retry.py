@@ -103,5 +103,14 @@ def test_continuation_preserves_prior_failure_count():
 def test_continuation_with_no_prior_starts_at_zero():
     q = RetryQueue()
     q.schedule_continuation("id1", "PROJ-1")
-    # Fresh continuation: zero prior failures
     assert q.get_attempt("id1") == 0
+
+
+def test_due_now_default_now_ms() -> None:
+    """Calling due_now() without args uses _now_ms() internally."""
+    q = RetryQueue()
+    q.schedule_continuation("id1", "PROJ-1")
+    # Immediately after scheduling, the entry is still in the future
+    due = q.due_now()  # no explicit now_ms
+    assert due == []
+    assert q.has("id1")

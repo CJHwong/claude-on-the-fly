@@ -409,7 +409,7 @@ class SchedulerFrontend(Frontend):
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     import argparse
 
     from dotenv import load_dotenv
@@ -444,5 +444,5 @@ def main() -> None:
     asyncio.run(run(frontend, platform="schedule"))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

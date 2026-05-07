@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from claude_on_the_fly.symphony.config import (
@@ -225,3 +227,76 @@ def test_load_config_not_a_mapping(tmp_path):
     cfg_path.write_text("- just\n- a\n- list\n")
     with pytest.raises(ValueError, match="mapping"):
         load_config(cfg_path)
+
+
+def test_expand_path_empty_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When env var is empty string, resolve_env returns '' and expand_path returns None."""
+    monkeypatch.setenv("EMPTY_VAR", "")
+    result = expand_path("$EMPTY_VAR")
+    assert result is None
+
+
+def test_expand_path_relative_with_base(tmp_path: Path) -> None:
+    """Relative path resolved against base."""
+    base = tmp_path / "base"
+    result = expand_path("foo/bar", base=base)
+    assert result == (base / "foo/bar").resolve()
+
+
+def test_tracker_validate_base_url_required() -> None:
+    cfg = TrackerConfig.from_dict(
+        {
+            "base_url": "",
+            "email": "e@x.com",
+            "api_token": "tok",
+            "project_key": "PROJ",
+        }
+    )
+    with pytest.raises(ValueError, match="tracker.base_url is required"):
+        cfg.validate()
+
+
+def test_tracker_validate_api_token_required() -> None:
+    cfg = TrackerConfig.from_dict(
+        {
+            "base_url": "https://x.atlassian.net",
+            "email": "e@x.com",
+            "api_token": "",
+            "project_key": "PROJ",
+        }
+    )
+    with pytest.raises(ValueError, match="tracker.api_token is required"):
+        cfg.validate()
+
+
+def test_tracker_validate_project_key_required() -> None:
+    cfg = TrackerConfig.from_dict(
+        {
+            "base_url": "https://x.atlassian.net",
+            "email": "e@x.com",
+            "api_token": "tok",
+            "project_key": "",
+        }
+    )
+    with pytest.raises(ValueError, match="tracker.project_key is required"):
+        cfg.validate()
+
+
+def test_max_retry_backoff_ms_validation(tmp_path, env_creds) -> None:
+    cfg_path, _ = _write_pair(tmp_path, extras="max_retry_backoff_ms: 500\n")
+    with pytest.raises(ValueError, match="max_retry_backoff_ms must be >= 1000"):
+        load_config(cfg_path)
+
+
+def test_symphony_config_from_dict_non_dict() -> None:
+    from pathlib import Path as _Path
+
+    from claude_on_the_fly.symphony.config import SymphonyConfig
+
+    with pytest.raises(ValueError, match="config must decode to a YAML mapping"):
+        SymphonyConfig.from_dict("not a dict", base=_Path("/tmp"))  # type: ignore[arg-type]
+
+
+def test_load_config_missing_file(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="config not found"):
+        load_config(tmp_path / "nonexistent.yaml")

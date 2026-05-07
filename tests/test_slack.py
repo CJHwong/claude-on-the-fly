@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -513,6 +514,21 @@ class TestSend:
         assert any(b["type"] == "section" for b in blocks)
         assert any(b["type"] == "context" for b in blocks)
 
+    async def test_tools_footer_in_context_block(self, frontend, monkeypatch):
+        monkeypatch.setenv("SLACK_STATS_MODE", "detailed")
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+
+        response = Response(body="done", tool_counts={"Read": 1})
+        await frontend.send(session_id, response)
+
+        blocks = frontend._app.client.chat_postMessage.call_args[1]["blocks"]
+        context_blocks = [b for b in blocks if b["type"] == "context"]
+        assert len(context_blocks) >= 1
+        tools_text = context_blocks[-1]["elements"][0]["text"]
+        assert "Read" in tools_text
+
     async def test_tracks_sent_timestamp(self, frontend):
         session_id = _session_key("C1", "t1")
         frontend._sessions[session_id] = ("C1", "t1")
@@ -520,6 +536,16 @@ class TestSend:
 
         await frontend.send(session_id, Response(body="hi"))
         assert "99.0" in frontend._our_sent_timestamps
+
+    async def test_send_ok_false_logs_warning(self, frontend: SlackFrontend) -> None:
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {  # type: ignore[assignment]
+            "ok": False,
+            "error": "channel_not_found",
+        }
+        await frontend.send(session_id, Response(body="hi"))
+        # Should not raise; error is logged
 
     async def test_handles_api_failure(self, frontend):
         session_id = _session_key("C1", "t1")
@@ -710,12 +736,24 @@ class TestCatchup:
         assert mock_ingest.await_count == 2
         first_call_msg = mock_ingest.call_args_list[0][0][0]
         second_call_msg = mock_ingest.call_args_list[1][0][0]
-        # Sorted by ts: 101 before 102
         assert first_call_msg["ts"] == "101.0"
         assert second_call_msg["ts"] == "102.0"
-        # channel and channel_type injected
         assert first_call_msg["channel"] == "C1"
         assert first_call_msg["channel_type"] == "im"
+
+    async def test_empty_messages_skips_channel(self, frontend: SlackFrontend) -> None:
+        """When conversations_history returns empty messages, continue to next channel."""
+        frontend._active_channels = {"C1": "100.0", "C2": "200.0"}
+        frontend._channel_types["C2"] = "im"
+        frontend._app.client.conversations_history.side_effect = [  # type: ignore[assignment]
+            {"messages": []},
+            {"messages": [{"ts": "201.0", "text": "msg"}]},
+        ]
+        with patch.object(
+            frontend, "_ingest_event", new_callable=AsyncMock
+        ) as mock_ingest:
+            await frontend._catchup()
+        assert mock_ingest.await_count == 1
 
     async def test_api_failure_continues(self, frontend):
         frontend._active_channels = {"C1": "100.0", "C2": "200.0"}
@@ -978,3 +1016,45 @@ class TestIngestEventWithFiles:
         assert "[File saved: data.xlsx]" in call_text
         assert "analyze this" in call_text
         assert "<@U_SELF>" not in call_text
+
+
+# ---------------------------------------------------------------------------
+# _react / _unreact error handling
+# ---------------------------------------------------------------------------
+
+
+class TestReactErrorHandling:
+    async def test_react_logs_warning_on_exception(self, frontend, caplog):
+        frontend._app.client.reactions_add = AsyncMock(
+            side_effect=Exception("rate_limited")
+        )
+        await frontend._react("C1", "100.0", "eyes")
+        assert "react: failed to add" in caplog.text
+
+    async def test_unreact_silently_ignores_no_reaction(self, frontend, caplog):
+        frontend._app.client.reactions_remove = AsyncMock(
+            side_effect=Exception("no_reaction")
+        )
+        await frontend._unreact("C1", "100.0", "eyes")
+        assert "unreact: failed to remove" not in caplog.text
+
+    async def test_unreact_logs_warning_on_other_exception(self, frontend, caplog):
+        frontend._app.client.reactions_remove = AsyncMock(
+            side_effect=Exception("rate_limited")
+        )
+        await frontend._unreact("C1", "100.0", "eyes")
+        assert "unreact: failed to remove" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _workspace_path
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspacePath:
+    @patch("claude_on_the_fly.slack.DATA_DIR", Path("/data"))
+    def test_returns_data_dir_workspaces_path(self):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "my-ws"
+        result = fe._workspace_path(42)
+        assert result == Path("/data/workspaces/slack/my-ws")

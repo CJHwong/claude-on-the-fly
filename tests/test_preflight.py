@@ -78,6 +78,80 @@ class TestCheckClaudeCli:
         )
         check_claude_cli()  # should not raise
 
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/claude")
+    def test_downgrades_claude_unavailable_to_warning(
+        self, _mock_which, mock_run, caplog
+    ):
+        from claude_on_the_fly.agent import ClaudeUnavailableError
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="usage limit exceeded",
+        )
+        with patch(
+            "claude_on_the_fly.agent._classify",
+            return_value=ClaudeUnavailableError("overloaded"),
+        ):
+            check_claude_cli()  # should warn, not raise
+
+        assert "claude CLI unavailable" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _extract_cli_result
+# ---------------------------------------------------------------------------
+
+
+def test_extract_cli_result_ndjson_fallback():
+    from claude_on_the_fly.preflight import _extract_cli_result
+
+    # Non-JSON first line, but valid NDJSON lines follow
+    stdout = "garbage\n" + json.dumps({"result": "hello from ndjson"})
+    assert _extract_cli_result(stdout) == "hello from ndjson"
+
+
+def test_extract_cli_result_skips_non_result_lines():
+    from claude_on_the_fly.preflight import _extract_cli_result
+
+    stdout = "\n".join(
+        [
+            "not json at all",
+            json.dumps({"no_result": True}),
+            json.dumps({"result": "found it"}),
+        ]
+    )
+    assert _extract_cli_result(stdout) == "found it"
+
+
+def test_extract_cli_result_empty_input():
+    from claude_on_the_fly.preflight import _extract_cli_result
+
+    assert _extract_cli_result("") == ""
+    assert _extract_cli_result("   ") == ""
+
+
+def test_extract_cli_result_single_json_blob():
+    from claude_on_the_fly.preflight import _extract_cli_result
+
+    assert _extract_cli_result(json.dumps({"result": "direct"})) == "direct"
+
+
+def test_extract_cli_result_no_result_anywhere():
+    from claude_on_the_fly.preflight import _extract_cli_result
+
+    assert _extract_cli_result("no result here") == ""
+
+
+def test_extract_cli_result_blank_lines_skipped():
+    from claude_on_the_fly.preflight import _extract_cli_result
+
+    # Blank line in NDJSON scan: last line has no "result", blank, then first has "result"
+    stdout = json.dumps({"result": "first"}) + "\n\n" + json.dumps({"x": 1})
+    assert _extract_cli_result(stdout) == "first"
+
 
 # ---------------------------------------------------------------------------
 # check_telegram

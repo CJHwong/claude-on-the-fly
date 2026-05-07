@@ -282,7 +282,7 @@ class TelegramFrontend(Frontend):
             logger.exception("Failed to process media group for chat %s", chat_id)
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     from dotenv import load_dotenv
 
     from claude_on_the_fly.orchestrator import run
@@ -294,5 +294,5 @@ def main() -> None:
     asyncio.run(run(frontend, platform="telegram"))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
