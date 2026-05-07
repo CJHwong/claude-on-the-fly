@@ -374,9 +374,7 @@ class SlackFrontend(Frontend):
             logger.error("No channel found for session %s", chat_id)
             return
         channel, thread_ts = route
-        logger.debug(
-            "send: session=%s channel=%s thread_ts=%s", chat_id, channel, thread_ts
-        )
+        logger.info("slack %s/%s => %s", channel, thread_ts, response.body[:80])
 
         blocks = []
         for chunk in _split_blocks(response.body):

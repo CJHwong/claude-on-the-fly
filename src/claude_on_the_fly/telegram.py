@@ -104,6 +104,7 @@ class TelegramFrontend(Frontend):
             text = f"{text}\n\n_{stats}_"
         if tools:
             text = f"{text}\n_{tools}_"
+        logger.info("chat %s => %s", chat_id, text[:80])
         await self._send_chunked(chat_id, text)
 
     async def send_typing(self, chat_id: int) -> None:
