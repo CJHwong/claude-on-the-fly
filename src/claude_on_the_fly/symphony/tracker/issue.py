@@ -25,6 +25,9 @@ class Issue:
     url: str
     created_at: str | None
     updated_at: str | None
+    type: str = (
+        ""  # tracker-native type name (Jira: "Story", "Bug", "DevEx", "Sub-task")
+    )
 
     @classmethod
     def from_jira(cls, payload: dict, base_url: str) -> Issue:
@@ -32,6 +35,7 @@ class Issue:
         status = f.get("status") or {}
         priority = f.get("priority") or {}
         parent = f.get("parent") or {}
+        issuetype = f.get("issuetype") or {}
         priority_id = priority.get("id")
         try:
             prio = int(priority_id) if priority_id is not None else None
@@ -75,4 +79,5 @@ class Issue:
             url=f"{base_url.rstrip('/')}/browse/{key}" if key else "",
             created_at=f.get("created"),
             updated_at=f.get("updated"),
+            type=str(issuetype.get("name") or ""),
         )

@@ -96,6 +96,7 @@ def _issue_context(issue) -> dict:
         "id": issue.id,
         "identifier": issue.identifier,
         "title": issue.title,
+        "type": issue.type,
         "state": issue.state,
         "priority": issue.priority,
         "labels": list(issue.labels),
