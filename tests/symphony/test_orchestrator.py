@@ -734,6 +734,50 @@ class TestProcessDueRetries:
         )
         assert rq.has("1") is True  # requeued
 
+    async def test_gate_label_missing_drops(self) -> None:
+        # Agent removed the gate label to park the ticket. Retry path must drop it
+        # rather than re-dispatch, so the daemon honors the agent's pause signal.
+        cfg = _config()  # gate_label="symphony-active"
+        rq = RetryQueue()
+        rq._entries["1"] = RetryEntry(
+            issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
+        )
+        tracker = _mock_tracker()
+        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_one.return_value = _issue(labels=("other-label",))
+        pending: set[asyncio.Task[None]] = set()
+
+        with patch(
+            "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
+        ):
+            await _process_due_retries(
+                OrchestratorState(), tracker, cfg, "prompt", rq, pending
+            )
+
+        assert rq.has("1") is False  # dropped, not requeued
+        # _dispatch was NOT called: no worker task was created
+        assert len(pending) == 0
+
+    async def test_gate_label_present_dispatches(self) -> None:
+        cfg = _config()  # gate_label="symphony-active"
+        rq = RetryQueue()
+        rq._entries["1"] = RetryEntry(
+            issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
+        )
+        tracker = _mock_tracker()
+        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_one.return_value = _issue(labels=("symphony-active",))
+        pending: set[asyncio.Task[None]] = set()
+
+        with patch(
+            "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
+        ):
+            await _process_due_retries(
+                OrchestratorState(), tracker, cfg, "prompt", rq, pending
+            )
+
+        tracker.fetch_one.assert_awaited_once_with("PROJ-1")
+
 
 # ---------------------------------------------------------------------------
 # tick

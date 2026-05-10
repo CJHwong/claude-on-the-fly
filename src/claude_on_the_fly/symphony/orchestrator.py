@@ -451,6 +451,14 @@ async def _process_due_retries(
             )
             continue
 
+        if config.gate_label and config.gate_label.lower() not in issue.labels:
+            logger.info(
+                "[%s] retry: gate_label '%s' missing, dropping",
+                entry.identifier,
+                config.gate_label,
+            )
+            continue
+
         _dispatch(
             issue,
             state,
