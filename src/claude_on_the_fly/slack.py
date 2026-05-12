@@ -81,6 +81,87 @@ def _text_from_blocks(blocks: list[dict]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _text_from_context_block(block: dict) -> str:
+    """Extract text from a context block's elements (plain_text/mrkdwn)."""
+    parts: list[str] = []
+    for el in block.get("elements") or []:
+        if el.get("type") in ("plain_text", "mrkdwn"):
+            txt = el.get("text")
+            if txt:
+                parts.append(txt)
+    return " ".join(parts)
+
+
+def _text_from_primary_blocks(blocks: list[dict]) -> str:
+    """Extract text from non-rich_text blocks (section, header, context).
+
+    rich_text blocks are skipped because they typically duplicate event.text
+    in regular user messages. App posts and rich-block messages use the
+    other block types, which is what we want to surface.
+    """
+    parts: list[str] = []
+    for block in blocks or []:
+        btype = block.get("type")
+        if btype in ("section", "header"):
+            txt = (block.get("text") or {}).get("text") or ""
+            if txt:
+                parts.append(txt)
+        elif btype == "context":
+            txt = _text_from_context_block(block)
+            if txt:
+                parts.append(txt)
+    return "\n".join(parts)
+
+
+def _is_forward_attachment(att: dict) -> bool:
+    return bool(att.get("is_msg_unfurl")) or bool(
+        att.get("channel_id") and att.get("ts")
+    )
+
+
+def _render_attachment(att: dict) -> str:
+    """Render a non-forward attachment (app post, link preview) as plain text."""
+    lines: list[str] = []
+    if att.get("pretext"):
+        lines.append(att["pretext"])
+    if att.get("title"):
+        lines.append(att["title"])
+    if att.get("text"):
+        lines.append(att["text"])
+    if att.get("blocks") and not att.get("text"):
+        block_text = _text_from_primary_blocks(att["blocks"])
+        if block_text:
+            lines.append(block_text)
+    for field in att.get("fields") or []:
+        title = field.get("title") or ""
+        value = field.get("value") or ""
+        if title and value:
+            lines.append(f"{title}: {value}")
+        elif value:
+            lines.append(value)
+    return "\n".join(lines)
+
+
+def _flatten_primary_content(event: dict) -> str:
+    """Capture block-kit / attachment content from the primary message.
+
+    Surfaces app-bot posts, link unfurls, and rich-block messages that would
+    otherwise be lost because event.text is empty or a degraded fallback.
+    Skips attachments handled by _extract_forwards to avoid double-rendering.
+    """
+    parts: list[str] = []
+    blocks_text = _text_from_primary_blocks(event.get("blocks") or [])
+    if blocks_text:
+        parts.append(blocks_text)
+    for att in event.get("attachments") or []:
+        if _is_forward_attachment(att):
+            continue
+        rendered = _render_attachment(att)
+        if rendered:
+            parts.append(rendered)
+    return "\n".join(parts)
+
+
 def _extract_forwards(event: dict) -> list[dict]:
     """Collect forwarded/quoted messages from event attachments and blocks.
 
@@ -255,6 +336,7 @@ class SlackFrontend(Frontend):
             channel, ""
         )
         forwards = _extract_forwards(event)
+        extra_content = _flatten_primary_content(event)
         fwd_refs = ",".join(
             f"{f.get('channel_id') or '?'}/{f.get('ts') or '?'}" for f in forwards
         )
@@ -299,7 +381,7 @@ class SlackFrontend(Frontend):
         if files:
             file_lines = await self._save_files(session_id, files)
 
-        if not text and not forwards and not file_lines:
+        if not text and not forwards and not file_lines and not extra_content:
             logger.debug("skipped: empty text after processing")
             return
 
@@ -313,6 +395,8 @@ class SlackFrontend(Frontend):
             cover_parts.extend(file_lines)
         if text:
             cover_parts.append(text)
+        if extra_content:
+            cover_parts.append(extra_content)
         cover = "\n".join(cover_parts)
 
         segments: list[str] = [_render_forward(f) for f in forwards]

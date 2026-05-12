@@ -8,9 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from claude_on_the_fly.slack import (
     SlackFrontend,
     _extract_forwards,
+    _flatten_primary_content,
     _flatten_rich_elements,
+    _render_attachment,
     _render_forward,
     _text_from_blocks,
+    _text_from_primary_blocks,
 )
 
 
@@ -81,6 +84,189 @@ class TestTextFromBlocks:
 
     def test_empty_list(self):
         assert _text_from_blocks([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# _text_from_primary_blocks
+# ---------------------------------------------------------------------------
+
+
+class TestTextFromPrimaryBlocks:
+    def test_section_extracted(self):
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "section body"}}
+        ]
+        assert _text_from_primary_blocks(blocks) == "section body"
+
+    def test_header_extracted(self):
+        blocks = [{"type": "header", "text": {"type": "plain_text", "text": "Title"}}]
+        assert _text_from_primary_blocks(blocks) == "Title"
+
+    def test_context_extracted(self):
+        blocks = [
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": "footer line"},
+                    {"type": "plain_text", "text": "extra"},
+                ],
+            }
+        ]
+        assert _text_from_primary_blocks(blocks) == "footer line extra"
+
+    def test_rich_text_skipped(self):
+        # rich_text duplicates event.text; explicitly excluded here.
+        blocks = [
+            {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "hi"}],
+                    }
+                ],
+            }
+        ]
+        assert _text_from_primary_blocks(blocks) == ""
+
+    def test_mixed_blocks_joined(self):
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": "Alert"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "details here"}},
+        ]
+        assert _text_from_primary_blocks(blocks) == "Alert\ndetails here"
+
+    def test_empty_returns_empty(self):
+        assert _text_from_primary_blocks([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# _render_attachment
+# ---------------------------------------------------------------------------
+
+
+class TestRenderAttachment:
+    def test_title_text_fields(self):
+        att = {
+            "title": "Sentry Alert",
+            "text": "error in production",
+            "fields": [
+                {"title": "Env", "value": "prod"},
+                {"title": "Count", "value": "42"},
+            ],
+        }
+        rendered = _render_attachment(att)
+        assert "Sentry Alert" in rendered
+        assert "error in production" in rendered
+        assert "Env: prod" in rendered
+        assert "Count: 42" in rendered
+
+    def test_field_without_title_just_value(self):
+        att = {"fields": [{"value": "lonely value"}]}
+        assert _render_attachment(att) == "lonely value"
+
+    def test_pretext_first(self):
+        att = {"pretext": "heads up", "title": "thing", "text": "details"}
+        rendered = _render_attachment(att)
+        assert rendered.index("heads up") < rendered.index("thing")
+        assert rendered.index("thing") < rendered.index("details")
+
+    def test_attachment_blocks_used_when_no_text(self):
+        att = {
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "from blocks"}}
+            ]
+        }
+        assert "from blocks" in _render_attachment(att)
+
+    def test_empty_attachment_returns_empty(self):
+        assert _render_attachment({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# _flatten_primary_content
+# ---------------------------------------------------------------------------
+
+
+class TestFlattenPrimaryContent:
+    def test_app_post_with_blocks_only(self):
+        event = {
+            "text": "GitHub",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": "PR #42"}},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "opened by alice"},
+                },
+            ],
+        }
+        content = _flatten_primary_content(event)
+        assert "PR #42" in content
+        assert "opened by alice" in content
+
+    def test_non_forward_attachment_extracted(self):
+        event = {
+            "attachments": [
+                {"title": "preview title", "text": "preview body"},
+            ],
+        }
+        content = _flatten_primary_content(event)
+        assert "preview title" in content
+        assert "preview body" in content
+
+    def test_forward_attachment_skipped(self):
+        # Already handled by _extract_forwards; must not duplicate here.
+        event = {
+            "attachments": [
+                {
+                    "is_msg_unfurl": True,
+                    "channel_id": "C1",
+                    "ts": "1.2",
+                    "text": "forwarded body",
+                }
+            ],
+        }
+        assert _flatten_primary_content(event) == ""
+
+    def test_attachment_with_channel_ref_skipped(self):
+        event = {
+            "attachments": [{"channel_id": "C1", "ts": "1.2", "text": "ref body"}],
+        }
+        assert _flatten_primary_content(event) == ""
+
+    def test_rich_text_block_does_not_duplicate(self):
+        event = {
+            "text": "hi there",
+            "blocks": [
+                {
+                    "type": "rich_text",
+                    "elements": [
+                        {
+                            "type": "rich_text_section",
+                            "elements": [{"type": "text", "text": "hi there"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        assert _flatten_primary_content(event) == ""
+
+    def test_empty_event_returns_empty(self):
+        assert _flatten_primary_content({}) == ""
+
+    def test_mixed_blocks_and_attachments(self):
+        event = {
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "block A"}},
+            ],
+            "attachments": [
+                {"title": "att title", "text": "att body"},
+            ],
+        }
+        content = _flatten_primary_content(event)
+        assert "block A" in content
+        assert "att title" in content
+        assert "att body" in content
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +566,70 @@ class TestIngestEventForwards:
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
         _, text = fe._on_message.call_args[0]  # type: ignore[union-attr]
         assert text == "[from: chopin] just a normal DM"
+
+    async def test_app_post_blocks_reach_prompt(self):
+        fe = _make_frontend()
+        event = {
+            "type": "message",
+            "user": "U03DXM5L8KX",
+            "text": "GitHub",
+            "channel": "D0AMMU8BJSY",
+            "channel_type": "im",
+            "ts": "1776700010.000000",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": "PR #99"}},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "merged by bob"},
+                },
+            ],
+        }
+        await fe._ingest_event(event)
+
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "PR #99" in payload
+        assert "merged by bob" in payload
+
+    async def test_non_forward_attachment_reaches_prompt(self):
+        fe = _make_frontend()
+        event = {
+            "type": "message",
+            "user": "U03DXM5L8KX",
+            "text": "check this out",
+            "channel": "D0AMMU8BJSY",
+            "channel_type": "im",
+            "ts": "1776700011.000000",
+            "attachments": [
+                {"title": "Article title", "text": "Article preview body"},
+            ],
+        }
+        await fe._ingest_event(event)
+
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "check this out" in payload
+        assert "Article title" in payload
+        assert "Article preview body" in payload
+
+    async def test_app_only_blocks_no_text_still_processed(self):
+        # event.text is empty but blocks carry content; should not be skipped.
+        fe = _make_frontend()
+        event = {
+            "type": "message",
+            "user": "U03DXM5L8KX",
+            "text": "",
+            "channel": "D0AMMU8BJSY",
+            "channel_type": "im",
+            "ts": "1776700012.000000",
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "lone block"}},
+            ],
+        }
+        await fe._ingest_event(event)
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "lone block" in payload
 
     async def test_rich_text_quote_from_blocks(self):
         fe = _make_frontend()
