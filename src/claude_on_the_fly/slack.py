@@ -12,6 +12,7 @@ from pathlib import Path
 import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 
 from typing import Awaitable, Callable
 
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path.home() / ".claude-on-the-fly"
 SLACK_BLOCK_LIMIT = 3000
 _ALLOWED_SUBTYPES = {"file_share"}
+_FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
 
 def _split_blocks(text: str) -> list[str]:
@@ -40,6 +42,23 @@ def _split_blocks(text: str) -> list[str]:
     if chunk:
         chunks.append(chunk)
     return chunks or [""]
+
+
+def _build_response_blocks(body: str, response: Response) -> list[dict]:
+    """Render a Response as Slack block-kit: section chunks + stats/tools context."""
+    blocks: list[dict] = []
+    for chunk in _split_blocks(body):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+    stats, tools = footer_parts(response, "slack")
+    if stats:
+        blocks.append(
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": stats}]}
+        )
+    if tools:
+        blocks.append(
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
+        )
+    return blocks
 
 
 def _session_key(channel: str, thread_ts: str | None) -> int:
@@ -272,6 +291,8 @@ class SlackFrontend(Frontend):
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
         self._user_name_cache: dict[str, str] = {}  # slack user_id -> display name
+        self._session_sender_ids: dict[int, str] = {}  # session -> slack user_id
+        self._dm_channels: dict[str, str] = {}  # slack user_id -> im channel id
         self._pending_msg: dict[
             int, deque[tuple[str, str]]
         ] = {}  # session -> FIFO of (channel, ts)
@@ -391,6 +412,7 @@ class SlackFrontend(Frontend):
             logger.debug("skipped: empty text after processing")
             return
 
+        self._session_sender_ids[session_id] = sender_id
         self._processed_ts.append(ts)
         self._active_channels[channel] = ts
         if channel_type:
@@ -469,20 +491,7 @@ class SlackFrontend(Frontend):
         channel, thread_ts = route
         logger.info("slack %s/%s => %s", channel, thread_ts, response.body[:80])
 
-        blocks = []
-        for chunk in _split_blocks(response.body):
-            blocks.append(
-                {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
-            )
-        stats, tools = footer_parts(response, "slack")
-        if stats:
-            blocks.append(
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": stats}]}
-            )
-        if tools:
-            blocks.append(
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
-            )
+        blocks = _build_response_blocks(response.body, response)
 
         try:
             resp = await self._app.client.chat_postMessage(
@@ -491,13 +500,24 @@ class SlackFrontend(Frontend):
                 blocks=blocks,
                 thread_ts=thread_ts,
             )
-            if resp.get("ok"):
-                self._our_sent_timestamps.append(resp["ts"])
-                logger.debug("send: ok ts=%s", resp["ts"])
-            else:
-                logger.warning("send: slack responded not ok: %s", resp)
+        except SlackApiError as exc:
+            error = exc.response.get("error", "unknown_error")
+            logger.error("send: slack api error %s: %s", error, exc)
+            if error in _FALLBACK_ERRORS:
+                await self._fallback_dm(chat_id, response, channel, error)
+            return
         except Exception as exc:
             logger.error("send: failed to post message: %s", exc)
+            return
+
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+            logger.debug("send: ok ts=%s", resp["ts"])
+            return
+        error = resp.get("error", "unknown_error")
+        logger.warning("send: slack responded not ok: %s", resp)
+        if error in _FALLBACK_ERRORS:
+            await self._fallback_dm(chat_id, response, channel, error)
 
     async def send_typing(self, chat_id: int) -> None:
         pass
@@ -552,6 +572,59 @@ class SlackFrontend(Frontend):
                 logger.warning(
                     "unreact: failed to remove :%s: from %s: %s", emoji, timestamp, exc
                 )
+
+    async def _open_dm_channel(self, user_id: str) -> str | None:
+        """Resolve a user_id to their IM channel id. Cached after first call."""
+        cached = self._dm_channels.get(user_id)
+        if cached:
+            return cached
+        try:
+            dm = await self._app.client.conversations_open(users=user_id)
+        except Exception as exc:
+            logger.error("open_dm: cannot open DM with %s: %s", user_id, exc)
+            return None
+        channel_id = dm["channel"]["id"]
+        self._dm_channels[user_id] = channel_id
+        return channel_id
+
+    async def _fallback_dm(
+        self, chat_id: int, response: Response, channel: str, error: str
+    ) -> None:
+        """Deliver a response via DM when the original channel post fails."""
+        sender_id = self._session_sender_ids.get(chat_id)
+        if not sender_id:
+            logger.warning(
+                "fallback_dm: no sender_id for session %s, response lost", chat_id
+            )
+            return
+        dm_channel = await self._open_dm_channel(sender_id)
+        if not dm_channel:
+            return
+
+        prefix = (
+            f"_(I couldn't post my reply in <#{channel}>: `{error}`. "
+            f"Here it is via DM instead.)_\n\n"
+        )
+        body = prefix + response.body
+        blocks = _build_response_blocks(body, response)
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=dm_channel,
+                text=body,
+                blocks=blocks,
+            )
+        except Exception as exc:
+            logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
+            return
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+            logger.info(
+                "fallback_dm: delivered response to %s for session %s",
+                sender_id,
+                chat_id,
+            )
+        else:
+            logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
 
     def _workspace_path(self, session_id: int) -> Path:
         return DATA_DIR / "workspaces" / self.workspace_name(session_id)
