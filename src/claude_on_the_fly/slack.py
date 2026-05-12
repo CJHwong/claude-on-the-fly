@@ -365,10 +365,16 @@ class SlackFrontend(Frontend):
             text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
         session_id = _session_key(channel, thread_ts)
+        is_new_session = session_id not in self._sessions
+        is_mid_thread = bool(event.get("thread_ts")) and event["thread_ts"] != ts
         self._sessions[session_id] = (channel, thread_ts)
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
+
+        thread_context = ""
+        if is_new_session and is_mid_thread:
+            thread_context = await self._fetch_thread_context(channel, thread_ts, ts)
 
         sender = await self._resolve_sender(event.get("user", "unknown"))
         self._sender_names[session_id] = sender
@@ -399,7 +405,10 @@ class SlackFrontend(Frontend):
             cover_parts.append(extra_content)
         cover = "\n".join(cover_parts)
 
-        segments: list[str] = [_render_forward(f) for f in forwards]
+        segments: list[str] = []
+        if thread_context:
+            segments.append(thread_context)
+        segments.extend(_render_forward(f) for f in forwards)
         if cover:
             segments.append(f"[from: {sender}] {cover}")
         elif forwards:
@@ -589,6 +598,71 @@ class SlackFrontend(Frontend):
                     len(data),
                     content_type,
                 )
+
+    async def _resolve_message_author(self, msg: dict) -> str:
+        """Best-effort author display name for a thread-replay message."""
+        user_id = msg.get("user")
+        if user_id:
+            return await self._resolve_sender(user_id)
+        return msg.get("username") or msg.get("bot_id") or "unknown"
+
+    async def _fetch_thread_context(
+        self, channel: str, thread_ts: str, current_ts: str
+    ) -> str:
+        """Fetch prior messages in this thread and render them as a context block.
+
+        Called only on the first time the bot sees this session_id when the
+        triggering message is a reply in an existing thread. Skips the current
+        message itself and degrades to an empty string on API failure.
+        """
+        try:
+            resp = await self._app.client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=50
+            )
+        except Exception as exc:
+            logger.warning(
+                "thread-context: conversations.replies failed for %s/%s: %s",
+                channel,
+                thread_ts,
+                exc,
+            )
+            return ""
+
+        messages = resp.get("messages") or []
+        if not messages:
+            return ""
+
+        lines: list[str] = ["<thread_context>"]
+        rendered = 0
+        for msg in messages:
+            msg_ts = msg.get("ts", "")
+            if msg_ts == current_ts:
+                continue
+            author = await self._resolve_message_author(msg)
+            body_parts: list[str] = []
+            body = msg.get("text") or ""
+            if body:
+                body_parts.append(body)
+            extra = _flatten_primary_content(msg)
+            if extra:
+                body_parts.append(extra)
+            body_text = "\n".join(body_parts).strip()
+            if not body_text:
+                continue
+            lines.append(
+                f'  <message author="{author}" ts="{msg_ts}">{body_text}</message>'
+            )
+            rendered += 1
+        if rendered == 0:
+            return ""
+        lines.append("</thread_context>")
+        logger.info(
+            "thread-context: included %d prior messages for %s/%s",
+            rendered,
+            channel,
+            thread_ts,
+        )
+        return "\n".join(lines)
 
     async def _resolve_sender(self, user_id: str) -> str:
         """Look up Slack user ID to display name. Cached on success only."""

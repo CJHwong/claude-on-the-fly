@@ -460,11 +460,22 @@ def _make_frontend() -> SlackFrontend:
             user_id="UBOT",
             allowed_user_ids={"*"},
         )
-    fe._on_message = AsyncMock()  # type: ignore[assignment]
+    fe._on_message = AsyncMock()
     # short-circuit helpers that would hit the network
     fe._resolve_sender = AsyncMock(return_value="chopin")  # type: ignore[assignment]
     fe._resolve_session_metadata = AsyncMock()  # type: ignore[assignment]
     return fe
+
+
+def _install_replies_mock(fe: SlackFrontend, **kwargs) -> AsyncMock:
+    """Attach an AsyncMock to fe._app.client.conversations_replies and return it.
+
+    Returning the mock directly avoids the static type checker losing track
+    of the attribute as it's overwritten on a slack_sdk client.
+    """
+    mock = AsyncMock(**kwargs)
+    fe._app.client.conversations_replies = mock  # type: ignore[invalid-assignment]
+    return mock
 
 
 class TestIngestEventForwards:
@@ -660,3 +671,164 @@ class TestIngestEventForwards:
         _, text = fe._on_message.call_args[0]  # type: ignore[union-attr]
         assert "quoted content here" in text
         assert "thoughts?" in text
+
+
+# ---------------------------------------------------------------------------
+# Thread-context fetch (mid-thread mention)
+# ---------------------------------------------------------------------------
+
+
+def _mid_thread_event(
+    text: str = "<@UBOT> help", ts: str = "1776800010.000000"
+) -> dict:
+    return {
+        "type": "message",
+        "user": "U03DXM5L8KX",
+        "text": text,
+        "channel": "C9999",
+        "channel_type": "channel",
+        "ts": ts,
+        "thread_ts": "1776800001.000000",
+    }
+
+
+class TestThreadContextFetch:
+    async def test_mid_thread_mention_fetches_and_includes_context(self):
+        fe = _make_frontend()
+        replies = _install_replies_mock(
+            fe,
+            return_value={
+                "messages": [
+                    {
+                        "ts": "1776800001.000000",
+                        "user": "U_ALICE",
+                        "text": "starting point",
+                    },
+                    {
+                        "ts": "1776800002.000000",
+                        "user": "U_BOB",
+                        "text": "follow up",
+                    },
+                    {
+                        "ts": "1776800010.000000",
+                        "user": "U03DXM5L8KX",
+                        "text": "<@UBOT> help",
+                    },
+                ]
+            },
+        )
+        await fe._ingest_event(_mid_thread_event())
+
+        replies.assert_awaited_once()
+        kwargs = replies.call_args.kwargs
+        assert kwargs["channel"] == "C9999"
+        assert kwargs["ts"] == "1776800001.000000"
+
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "<thread_context>" in payload
+        assert "starting point" in payload
+        assert "follow up" in payload
+        # current message must NOT appear inside the context block.
+        ctx_block = payload.split("</thread_context>")[0]
+        assert "1776800010.000000" not in ctx_block
+        # context block precedes the [from:] cover.
+        assert payload.index("<thread_context>") < payload.index("[from:")
+
+    async def test_top_level_message_does_not_fetch(self):
+        fe = _make_frontend()
+        replies = _install_replies_mock(fe)
+        event = {
+            "type": "message",
+            "user": "U03DXM5L8KX",
+            "text": "<@UBOT> hi",
+            "channel": "C9999",
+            "channel_type": "channel",
+            "ts": "1776800020.000000",
+            # no thread_ts → top-level message
+        }
+        await fe._ingest_event(event)
+        replies.assert_not_called()
+
+    async def test_thread_root_message_does_not_fetch(self):
+        # thread_ts == ts means this IS the thread root, not a reply into one.
+        fe = _make_frontend()
+        replies = _install_replies_mock(fe)
+        event = {
+            "type": "message",
+            "user": "U03DXM5L8KX",
+            "text": "<@UBOT> kick off",
+            "channel": "C9999",
+            "channel_type": "channel",
+            "ts": "1776800030.000000",
+            "thread_ts": "1776800030.000000",
+        }
+        await fe._ingest_event(event)
+        replies.assert_not_called()
+
+    async def test_second_message_in_session_skips_refetch(self):
+        fe = _make_frontend()
+        replies = _install_replies_mock(
+            fe,
+            return_value={
+                "messages": [
+                    {
+                        "ts": "1776800001.000000",
+                        "user": "U_ALICE",
+                        "text": "earlier",
+                    },
+                ]
+            },
+        )
+        await fe._ingest_event(_mid_thread_event(ts="1776800010.000000"))
+        await fe._ingest_event(_mid_thread_event(ts="1776800011.000000"))
+        # Only the first ingest in this session should trigger the fetch.
+        assert replies.await_count == 1
+
+    async def test_api_failure_does_not_block_message(self):
+        fe = _make_frontend()
+        _install_replies_mock(fe, side_effect=RuntimeError("slack api down"))
+        await fe._ingest_event(_mid_thread_event())
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "<thread_context>" not in payload
+        assert "[from: chopin]" in payload
+
+    async def test_empty_thread_response_no_context_block(self):
+        fe = _make_frontend()
+        _install_replies_mock(
+            fe,
+            return_value={
+                "messages": [
+                    # only the current message comes back; nothing prior.
+                    {
+                        "ts": "1776800010.000000",
+                        "user": "U03DXM5L8KX",
+                        "text": "<@UBOT> help",
+                    },
+                ]
+            },
+        )
+        await fe._ingest_event(_mid_thread_event())
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "<thread_context>" not in payload
+
+    async def test_app_bot_message_uses_username(self):
+        fe = _make_frontend()
+        _install_replies_mock(
+            fe,
+            return_value={
+                "messages": [
+                    {
+                        "ts": "1776800001.000000",
+                        "bot_id": "B1",
+                        "username": "github-bot",
+                        "text": "PR opened",
+                    },
+                ]
+            },
+        )
+        await fe._ingest_event(_mid_thread_event())
+        _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert 'author="github-bot"' in payload
+        assert "PR opened" in payload
