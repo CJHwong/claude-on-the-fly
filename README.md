@@ -326,7 +326,7 @@ For claude, cost in the stats footer reflects Ollama's billing for `:cloud` mode
 
 Codex differs from claude in a few ways:
 
-- **No cost reporting.** Codex's JSONL output omits cost; footer always shows `$0`.
+- **Cost is computed locally.** Codex's CLI doesn't emit a cost field, so we look the model up in [OpenRouter's public model registry](https://openrouter.ai/api/v1/models) and multiply by token counts. The table is fetched on demand and cached at `~/.claude-on-the-fly/pricing/openrouter.json` (TTL 7 days, configurable via `COTF_PRICING_TTL_SECONDS`). OpenRouter covers native API models (`gpt-5.4`, `gpt-4.1`, …) and ollama-cloud variants (`deepseek-v4-flash:cloud`, `deepseek-v4-pro:cloud`). Lookup strips the vendor prefix from registry keys (`deepseek/deepseek-v4-flash` → `deepseek-v4-flash`) and tries `:cloud`-stripped and date-stripped variants for snapshot drift (`gpt-4.1-2025-04-14` → `gpt-4.1`). Misses return `$0` rather than guessing — purely local ollama models (qwen, gemma) aren't in the registry and stay $0 (which is correct, they don't bill). Prices may differ slightly from your provider's billing (OpenRouter charges a routing markup) — within 10-20% is the expected accuracy.
 - **Session model.** Codex assigns its own `thread_id` per session, so we persist a `<workspace>/.codex_sessions/<our-session-uuid>` mapping file after the first turn and pass `resume <thread_id>` on follow-ups.
 - **No system-prompt flag.** Codex has no `--system-prompt`, so the format hint is prepended to each user message. Your persona `~/.claude-on-the-fly/CLAUDE.md` is symlinked into the workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex), so both backends see it.
 - **No skill tracking.** Codex has no skill concept; `skill_counts` is always empty. Tool counts come from `item.completed` event types (e.g. `command_execution`, `file_change`).
@@ -360,6 +360,8 @@ src/claude_on_the_fly/
   backends/
     claude.py     # Drives `claude -p` directly; optional ollama-launch prefix
     codex.py      # Drives `codex exec --json`; tracks codex thread_ids per session
+  transcript.py   # Cross-backend conversation handoff: parses prior backend's session JSONL when daemon switches
+  pricing.py      # OpenRouter-backed price-table lookup for codex (claude reports its own cost)
   orchestrator.py # Session management, queuing, typing indicators (chat frontends)
   protocol.py     # Frontend protocol (for adding new interfaces)
   scheduler.py    # Cron-driven frontend, YAML config, auto-reload

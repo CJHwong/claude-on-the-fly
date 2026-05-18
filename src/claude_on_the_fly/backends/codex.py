@@ -9,7 +9,7 @@ import os
 import time
 from pathlib import Path
 
-from claude_on_the_fly import agent, transcript
+from claude_on_the_fly import agent, pricing, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
@@ -251,14 +251,24 @@ class CodexBackend:
             if thread_for_lookup
             else None
         ) or configured_label
+        tokens_in = usage.get("input_tokens", 0) + usage.get("cached_input_tokens", 0)
+        tokens_out = usage.get("output_tokens", 0) + usage.get(
+            "reasoning_output_tokens", 0
+        )
+        # Codex CLI doesn't emit cost; look it up from a price table off-thread
+        # so the rare fetch never blocks the event loop. None coalesces to 0.
+        computed_cost = (
+            await asyncio.to_thread(
+                pricing.cost_for, model_label, tokens_in, tokens_out
+            )
+            or 0
+        )
         return Response(
             body=body,
-            cost=0,
+            cost=computed_cost,
             duration=duration,
-            tokens_in=usage.get("input_tokens", 0)
-            + usage.get("cached_input_tokens", 0),
-            tokens_out=usage.get("output_tokens", 0)
-            + usage.get("reasoning_output_tokens", 0),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             model=model_label,
             tool_counts=result.get("tool_counts", {}),
             skill_counts={},
