@@ -370,7 +370,9 @@ class TestCodexBackendRun:
         assert not composed.startswith("\n")
         assert composed.endswith("USER_TEXT_TOKEN")
 
-    async def test_response_sums_input_and_cached_tokens(self, tmp_path: Path):
+    async def test_tokens_in_does_not_double_count_cached(self, tmp_path: Path):
+        """OpenAI's `cached_input_tokens` is a subset of `input_tokens`, so
+        do not sum them like we do for Anthropic's cache_read field."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
 
@@ -381,7 +383,76 @@ class TestCodexBackendRun:
         ):
             resp = await CodexBackend().run(workspace, "sess", "hi", "telegram")
 
-        assert resp.tokens_in == 500
+        # input_tokens already includes the cached portion
+        assert resp.tokens_in == 200
+
+    async def test_tokens_in_uses_session_file_delta(self, tmp_path: Path):
+        """When session-file totals are available, report this exec's delta,
+        not codex stdout's cumulative running total."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sessions_dir = workspace / ".codex_sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "sess-resume").write_text("existing-thread")
+
+        # Simulate: pre-exec total was 12000 in, 100 out.
+        # Post-exec total is 26000 in, 250 out. This exec contributed 14000 / 150.
+        pre = {
+            "input_tokens": 12000,
+            "output_tokens": 100,
+            "reasoning_output_tokens": 0,
+        }
+        post = {
+            "input_tokens": 26000,
+            "output_tokens": 250,
+            "reasoning_output_tokens": 0,
+        }
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
+                side_effect=[pre, post],
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                # stdout reports cumulative (the bug we're fixing) — ignored when
+                # session-file delta is available.
+                return_value=_success_result(
+                    thread_id="existing-thread", input_tokens=26000
+                ),
+            ),
+        ):
+            resp = await CodexBackend().run(
+                workspace, "sess-resume", "next turn", "telegram"
+            )
+
+        assert resp.tokens_in == 14000
+        assert resp.tokens_out == 150
+
+    async def test_tokens_in_falls_back_to_stdout_when_no_session_data(
+        self, tmp_path: Path
+    ):
+        """No prior turn (fresh thread) + post-exec session file unreachable:
+        fall back to stdout usage. For a fresh thread, stdout = per-turn anyway."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
+                return_value=None,
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(input_tokens=5000, output_tokens=50),
+            ),
+        ):
+            resp = await CodexBackend().run(workspace, "sess-fresh", "hi", "telegram")
+
+        assert resp.tokens_in == 5000
+        assert resp.tokens_out == 50 + 5  # output + reasoning default of 5
 
     async def test_response_sums_output_and_reasoning_tokens(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -532,7 +603,9 @@ class TestCodexBackendNudgeRetry:
         ):
             resp = await CodexBackend().run(workspace, "sess-y", "hi", "telegram")
 
-        assert resp.tokens_in == 100 + 20 + 200 + 10
+        # cached_input_tokens is a subset of input_tokens for codex (OpenAI
+        # semantics), so only input_tokens contributes to tokens_in.
+        assert resp.tokens_in == 100 + 200
         assert resp.tokens_out == 5 + 3 + 15 + 4
         assert resp.tool_counts == {"command_execution": 3, "file_change": 1}
 

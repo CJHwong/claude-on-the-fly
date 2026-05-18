@@ -159,6 +159,35 @@ def extract_codex_model(thread_id: str) -> str | None:
     return None
 
 
+def extract_codex_cumulative_tokens(thread_id: str) -> dict | None:
+    """Return the cumulative `total_token_usage` snapshot for a codex thread.
+
+    Codex's stdout `turn.completed.usage` re-reports the thread's running
+    total on every exec, not per-turn — so by turn N, `input_tokens` has
+    been summed N times. The session file carries the same `total_token_usage`
+    on every `event_msg/token_count` event, growing monotonically. Snapshot
+    it before and after one exec call and the delta is that exec's true
+    contribution (including any internal tool-fanout sub-calls).
+
+    Returns the `total_token_usage` dict from the LAST `token_count` event,
+    or None when no event exists yet.
+    """
+    rollout = _find_codex_rollout(thread_id)
+    if rollout is None:
+        return None
+    latest: dict | None = None
+    for msg in _iter_jsonl(rollout):
+        if msg.get("type") != "event_msg":
+            continue
+        payload = msg.get("payload") or {}
+        if payload.get("type") != "token_count":
+            continue
+        total = (payload.get("info") or {}).get("total_token_usage")
+        if isinstance(total, dict):
+            latest = total
+    return latest
+
+
 def _render_line(turn: Turn) -> str:
     return f"{turn.role.capitalize()}: {turn.text}"
 

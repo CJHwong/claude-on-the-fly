@@ -204,6 +204,15 @@ class CodexBackend:
             logger.debug("codex: starting new thread session=%s", session_uuid)
             cmd = [*base, composed_prompt]
 
+        # Snapshot the thread's cumulative token usage before invoking codex
+        # so we can compute this exec's per-turn delta afterward. For fresh
+        # threads there's no prior session, so pre-totals are zero.
+        pre_totals = (
+            transcript.extract_codex_cumulative_tokens(existing_thread)
+            if existing_thread
+            else None
+        )
+
         started_at = time.monotonic()
         result = await _run_codex_exec(workspace, cmd, timeout=timeout)
         duration = time.monotonic() - started_at
@@ -237,7 +246,6 @@ class CodexBackend:
             else:
                 body = "No response"
 
-        usage = result.get("usage") or {}
         # Prefer the model codex actually recorded in its session file; fall
         # back to whatever the user configured. In native mode without
         # CODEX_MODEL the configured value is just the literal "codex", which
@@ -251,10 +259,33 @@ class CodexBackend:
             if thread_for_lookup
             else None
         ) or configured_label
-        tokens_in = usage.get("input_tokens", 0) + usage.get("cached_input_tokens", 0)
-        tokens_out = usage.get("output_tokens", 0) + usage.get(
-            "reasoning_output_tokens", 0
+        # Codex's stdout `turn.completed.usage` re-reports the thread's
+        # running total on every exec, not per-turn. Diff cumulative totals
+        # from the session file to get this exec's true contribution. Falls
+        # back to stdout usage when the session file isn't reachable (mocked
+        # tests, rare race) — accepted to be cumulative in that path.
+        post_totals = (
+            transcript.extract_codex_cumulative_tokens(thread_for_lookup)
+            if thread_for_lookup
+            else None
         )
+        if post_totals is not None:
+            pre_in = (pre_totals or {}).get("input_tokens", 0)
+            pre_out = (pre_totals or {}).get("output_tokens", 0)
+            pre_reasoning = (pre_totals or {}).get("reasoning_output_tokens", 0)
+            tokens_in = post_totals.get("input_tokens", 0) - pre_in
+            tokens_out = (
+                post_totals.get("output_tokens", 0)
+                + post_totals.get("reasoning_output_tokens", 0)
+                - pre_out
+                - pre_reasoning
+            )
+        else:
+            usage = result.get("usage") or {}
+            tokens_in = usage.get("input_tokens", 0)
+            tokens_out = usage.get("output_tokens", 0) + usage.get(
+                "reasoning_output_tokens", 0
+            )
         # Codex CLI doesn't emit cost; look it up from a price table off-thread
         # so the rare fetch never blocks the event loop. None coalesces to 0.
         computed_cost = (

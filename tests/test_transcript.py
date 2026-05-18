@@ -10,6 +10,7 @@ from claude_on_the_fly.transcript import (
     Turn,
     extract_claude,
     extract_codex,
+    extract_codex_cumulative_tokens,
     extract_codex_model,
     format_handoff,
 )
@@ -380,6 +381,71 @@ class TestExtractCodexModel:
             )
         )
         assert extract_codex_model("thread-y") == "real-model"
+
+
+class TestExtractCodexCumulativeTokens:
+    def test_returns_none_when_no_rollout(self, codex_sessions_dir):
+        assert extract_codex_cumulative_tokens("nonexistent") is None
+
+    def test_returns_latest_total_token_usage(self, codex_sessions_dir, ndjson):
+        rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-abc.jsonl"
+        rollout.write_bytes(
+            ndjson(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 100,
+                                "output_tokens": 10,
+                                "reasoning_output_tokens": 0,
+                            },
+                            "last_token_usage": {"input_tokens": 100},
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 300,
+                                "output_tokens": 40,
+                                "reasoning_output_tokens": 5,
+                            },
+                            "last_token_usage": {"input_tokens": 200},
+                        },
+                    },
+                },
+            )
+        )
+        out = extract_codex_cumulative_tokens("thread-abc")
+        assert out == {
+            "input_tokens": 300,
+            "output_tokens": 40,
+            "reasoning_output_tokens": 5,
+        }
+
+    def test_skips_non_dict_total(self, codex_sessions_dir, ndjson):
+        rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-x.jsonl"
+        rollout.write_bytes(
+            ndjson(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": "not a dict"},
+                    },
+                },
+            )
+        )
+        assert extract_codex_cumulative_tokens("thread-x") is None
 
 
 class TestPrependHandoff:
