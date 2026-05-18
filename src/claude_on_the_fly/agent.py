@@ -24,8 +24,21 @@ KNOWLEDGE_DIR = str(MEMORY_DIR / "knowledge")
 PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text()
 
 
+def _link_persona(source: Path, target: Path) -> None:
+    if target.is_symlink() and target.resolve() == source.resolve():
+        return
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    target.symlink_to(source)
+
+
+# Filenames each agent CLI reads as project-level persona/instructions.
+PERSONA_FILENAMES = ("CLAUDE.md", "AGENTS.md")
+
+
 def ensure_persona(workspace: Path) -> None:
-    """Symlink the global CLAUDE.md persona into the workspace.
+    """Symlink the global CLAUDE.md persona into the workspace under every
+    name an agent CLI might read (CLAUDE.md for claude, AGENTS.md for codex).
 
     Idempotent: no-op when source is missing, no-op when the link is already
     correct, replaces wrong symlinks or pre-existing files.
@@ -33,12 +46,8 @@ def ensure_persona(workspace: Path) -> None:
     source = DATA_DIR / "CLAUDE.md"
     if not source.is_file():
         return
-    target = workspace / "CLAUDE.md"
-    if target.is_symlink() and target.resolve() == source.resolve():
-        return
-    if target.is_symlink() or target.exists():
-        target.unlink()
-    target.symlink_to(source)
+    for filename in PERSONA_FILENAMES:
+        _link_persona(source, workspace / filename)
 
 
 STATS_MODES = ("off", "summary", "detailed")
@@ -379,7 +388,9 @@ def get_backend() -> AgentBackend:
     name = os.environ.get("AGENT_BACKEND", "claude").lower()
     if name == "claude":
         return _build_claude_backend()
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude)")
+    if name == "codex":
+        return _build_codex_backend()
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
 
 
 def _build_claude_backend() -> AgentBackend:
@@ -394,6 +405,20 @@ def _build_claude_backend() -> AgentBackend:
             raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
         return ClaudeBackend(launcher=OllamaLauncher(model=model))
     raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+
+
+def _build_codex_backend() -> AgentBackend:
+    from claude_on_the_fly.backends.codex import CodexBackend
+
+    mode = os.environ.get("CODEX_MODE", "native").lower()
+    if mode == "native":
+        return CodexBackend()
+    if mode == "ollama":
+        model = os.environ.get("OLLAMA_MODEL", "").strip()
+        if not model:
+            raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
+        return CodexBackend(launcher=OllamaLauncher(model=model))
+    raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
 
 
 async def run(

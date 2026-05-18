@@ -295,23 +295,42 @@ Or use a `.env` file with all vars and a process manager.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AGENT_BACKEND` | no | Agent CLI to drive (default: `claude`; only value supported today) |
+| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default) or `codex` |
 | `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude` (default: `native`) |
-| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
+| `CODEX_MODE` | no | `native` runs `codex` directly; `ollama` wraps it in `ollama launch codex` (default: `native`) |
+| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama` or `CODEX_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
 | `CLAUDE_MODEL` | no | Model passed to `claude --model` in native mode (default: `sonnet`). Ignored in ollama mode |
+| `CODEX_MODEL` | no | Model passed to `codex exec -m` in native mode (e.g. `o3`, `gpt-4.1`). Ignored in ollama mode |
 | `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 
 #### ollama launch mode
 
-Routes claude's model calls through a local or cloud Ollama model instead of Anthropic. Requires both `claude` and `ollama` CLIs installed, and the target model already pulled (`ollama pull <name>`):
+Routes the agent's model calls through a local or cloud Ollama model instead of the agent's native API. Requires the agent CLI (`claude` or `codex`) and `ollama` installed, and the target model already pulled (`ollama pull <name>`):
 
 ```bash
+# Claude via ollama
 export CLAUDE_MODE=ollama
+export OLLAMA_MODEL=deepseek-v4-flash:cloud
+uv run claude-telegram
+
+# Codex via ollama
+export AGENT_BACKEND=codex
+export CODEX_MODE=ollama
 export OLLAMA_MODEL=deepseek-v4-flash:cloud
 uv run claude-telegram
 ```
 
-Cost in the stats footer reflects Ollama's billing for `:cloud` models, or `$0` for local ones. Session resume, tool use, and Skills behave the same as native mode — only the model provider changes.
+For claude, cost in the stats footer reflects Ollama's billing for `:cloud` models, or `$0` for local ones. Session resume, tool use, and Skills behave the same as native mode — only the model provider changes.
+
+#### codex backend notes
+
+Codex differs from claude in a few ways:
+
+- **No cost reporting.** Codex's JSONL output omits cost; footer always shows `$0`.
+- **Session model.** Codex assigns its own `thread_id` per session, so we persist a `<workspace>/.codex_sessions/<our-session-uuid>` mapping file after the first turn and pass `resume <thread_id>` on follow-ups.
+- **No system-prompt flag.** Codex has no `--system-prompt`, so the format hint is prepended to each user message. Your persona `~/.claude-on-the-fly/CLAUDE.md` is symlinked into the workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex), so both backends see it.
+- **No skill tracking.** Codex has no skill concept; `skill_counts` is always empty. Tool counts come from `item.completed` event types (e.g. `command_execution`, `file_change`).
+- **Image input degraded.** Frontends save uploaded images to the workspace and claude reads them via its `Read` tool. Codex doesn't get them via `-i`; it can `cat`/`file` them via shell but can't see image bytes directly.
 
 
 ## Persona (CLAUDE.md)
@@ -340,6 +359,7 @@ src/claude_on_the_fly/
   agent.py        # Backend dispatch (AgentBackend protocol, OllamaLauncher, get_backend) + Response + shared helpers
   backends/
     claude.py     # Drives `claude -p` directly; optional ollama-launch prefix
+    codex.py      # Drives `codex exec --json`; tracks codex thread_ids per session
   orchestrator.py # Session management, queuing, typing indicators (chat frontends)
   protocol.py     # Frontend protocol (for adding new interfaces)
   scheduler.py    # Cron-driven frontend, YAML config, auto-reload

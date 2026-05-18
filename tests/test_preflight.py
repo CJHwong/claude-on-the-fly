@@ -11,6 +11,7 @@ import pytest
 from claude_on_the_fly.preflight import (
     check_backend,
     check_claude_cli,
+    check_codex_cli,
     check_gws_cli,
     check_ollama_mode,
     check_slack,
@@ -181,7 +182,7 @@ class TestCheckBackend:
         mock_check.assert_called_once()
 
     def test_unknown_backend_exits(self, clear_backend_env, monkeypatch):
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "gemini")
         with pytest.raises(SystemExit, match="Unknown AGENT_BACKEND"):
             check_backend()
 
@@ -189,6 +190,41 @@ class TestCheckBackend:
         monkeypatch.setenv("CLAUDE_MODE", "magic")
         with pytest.raises(SystemExit, match="Unknown CLAUDE_MODE"):
             check_backend()
+
+    @patch("claude_on_the_fly.preflight.check_codex_cli")
+    def test_codex_native_dispatches(self, mock_check, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        check_backend()
+        mock_check.assert_called_once()
+
+    @patch("claude_on_the_fly.preflight.check_ollama_mode")
+    def test_codex_ollama_dispatches(self, mock_check, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "ollama")
+        check_backend()
+        mock_check.assert_called_once_with("codex")
+
+    def test_codex_unknown_mode_exits(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "magic")
+        with pytest.raises(SystemExit, match="Unknown CODEX_MODE"):
+            check_backend()
+
+
+# ---------------------------------------------------------------------------
+# check_codex_cli
+# ---------------------------------------------------------------------------
+
+
+class TestCheckCodexCli:
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value=None)
+    def test_exits_if_not_found(self, _mock_which):
+        with pytest.raises(SystemExit, match="codex CLI not found"):
+            check_codex_cli()
+
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/codex")
+    def test_succeeds_when_present(self, _mock_which):
+        check_codex_cli()  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +303,27 @@ class TestCheckOllamaMode:
             stderr="",
         )
         check_ollama_mode()  # should not raise
+
+    @patch(
+        "claude_on_the_fly.preflight.shutil.which",
+        side_effect=lambda name: None if name == "codex" else "/usr/bin/" + name,
+    )
+    def test_exits_when_codex_missing_in_codex_mode(
+        self, _mock_which, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "x")
+        with pytest.raises(SystemExit, match="codex CLI not found"):
+            check_ollama_mode("codex")
+
+    def test_codex_mode_message_references_codex_env_var(
+        self, clear_backend_env, monkeypatch
+    ):
+        # No OLLAMA_MODEL -> error message names CODEX_MODE for codex agent
+        with patch(
+            "claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x"
+        ):
+            with pytest.raises(SystemExit, match="CODEX_MODE=ollama"):
+                check_ollama_mode("codex")
 
 
 # ---------------------------------------------------------------------------

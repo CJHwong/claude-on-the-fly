@@ -1062,6 +1062,49 @@ class TestEnsurePersona:
         assert link.is_symlink()
         assert link.resolve() == source.resolve()
 
+    def test_also_creates_agents_md_for_codex(self, tmp_path: Path) -> None:
+        """codex reads AGENTS.md, not CLAUDE.md — ensure both are linked."""
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        agents = workspace / "AGENTS.md"
+        assert agents.is_symlink()
+        assert agents.resolve() == source.resolve()
+
+    def test_agents_md_replaces_existing_file(self, tmp_path: Path) -> None:
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        existing = workspace / "AGENTS.md"
+        existing.write_text("stale codex instructions")
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        assert existing.is_symlink()
+        assert existing.resolve() == source.resolve()
+
+    def test_both_links_idempotent(self, tmp_path: Path) -> None:
+        source = tmp_path / "CLAUDE.md"
+        source.write_text("persona")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+            ensure_persona(workspace)  # second call must not raise
+
+        for filename in ("CLAUDE.md", "AGENTS.md"):
+            link = workspace / filename
+            assert link.is_symlink()
+            assert link.resolve() == source.resolve()
+
 
 # ---------------------------------------------------------------------------
 # OllamaLauncher
@@ -1131,8 +1174,8 @@ class TestGetBackend:
             get_backend()
 
     def test_unknown_backend_raises(self, clear_backend_env, monkeypatch):
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        with pytest.raises(ValueError, match="codex"):
+        monkeypatch.setenv("AGENT_BACKEND", "gemini")
+        with pytest.raises(ValueError, match="gemini"):
             get_backend()
 
     def test_unknown_claude_mode_raises(self, clear_backend_env, monkeypatch):

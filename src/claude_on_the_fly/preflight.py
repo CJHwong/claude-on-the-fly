@@ -49,37 +49,64 @@ def _extract_cli_result(stdout: str) -> str:
     return ""
 
 
+_AGENT_INSTALL_HINTS = {
+    "claude": "https://docs.anthropic.com/en/docs/claude-code",
+    "codex": "https://github.com/openai/codex",
+}
+
+
 def check_backend() -> None:
     """Validate the configured agent backend before startup.
 
-    Dispatches by `AGENT_BACKEND` (default `claude`) and `CLAUDE_MODE`
-    (default `native`). Native mode runs the live `claude -p ping`;
-    ollama mode skips the live ping and validates the ollama wrap instead.
+    Dispatches by `AGENT_BACKEND` (default `claude`) and `<AGENT>_MODE`
+    (default `native`). Native mode runs the agent-specific live check;
+    ollama mode skips it and validates the ollama wrap instead.
     """
     backend_name = os.environ.get("AGENT_BACKEND", "claude").lower()
-    if backend_name != "claude":
-        raise SystemExit(f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude)")
-    mode = os.environ.get("CLAUDE_MODE", "native").lower()
-    if mode == "native":
-        check_claude_cli()
-        return
-    if mode == "ollama":
-        check_ollama_mode()
-        return
-    raise SystemExit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+    if backend_name == "claude":
+        mode = os.environ.get("CLAUDE_MODE", "native").lower()
+        if mode == "native":
+            check_claude_cli()
+            return
+        if mode == "ollama":
+            check_ollama_mode("claude")
+            return
+        raise SystemExit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+    if backend_name == "codex":
+        mode = os.environ.get("CODEX_MODE", "native").lower()
+        if mode == "native":
+            check_codex_cli()
+            return
+        if mode == "ollama":
+            check_ollama_mode("codex")
+            return
+        raise SystemExit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+    raise SystemExit(
+        f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex)"
+    )
 
 
-def check_ollama_mode() -> None:
-    """Validate `ollama launch claude` mode: both CLIs present, model available."""
-    if not shutil.which("claude"):
+def check_codex_cli() -> None:
+    """Verify codex CLI is installed. Auth is checked at first use."""
+    if not shutil.which("codex"):
         raise SystemExit(
-            "claude CLI not found. Install it: https://docs.anthropic.com/en/docs/claude-code"
+            f"codex CLI not found. Install it: {_AGENT_INSTALL_HINTS['codex']}"
+        )
+    logger.info("codex CLI: ok")
+
+
+def check_ollama_mode(agent_name: str = "claude") -> None:
+    """Validate `ollama launch <agent>` mode: both CLIs present, model available."""
+    if not shutil.which(agent_name):
+        raise SystemExit(
+            f"{agent_name} CLI not found. Install it: {_AGENT_INSTALL_HINTS[agent_name]}"
         )
     if not shutil.which("ollama"):
         raise SystemExit("ollama CLI not found. Install it: https://ollama.com")
     model = os.environ.get("OLLAMA_MODEL", "").strip()
     if not model:
-        raise SystemExit("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
+        env_var = f"{agent_name.upper()}_MODE"
+        raise SystemExit(f"{env_var}=ollama requires OLLAMA_MODEL to be set")
     result = subprocess.run(
         ["ollama", "list"],
         capture_output=True,
@@ -98,7 +125,7 @@ def check_ollama_mode() -> None:
             f"OLLAMA_MODEL={model!r} not found in `ollama list`. "
             f"Pull it first: ollama pull {model}"
         )
-    logger.info("ollama launch mode: ok (model=%s)", model)
+    logger.info("ollama launch mode: ok (agent=%s model=%s)", agent_name, model)
 
 
 def check_claude_cli() -> None:
@@ -110,7 +137,7 @@ def check_claude_cli() -> None:
     """
     if not shutil.which("claude"):
         raise SystemExit(
-            "claude CLI not found. Install it: https://docs.anthropic.com/en/docs/claude-code"
+            f"claude CLI not found. Install it: {_AGENT_INSTALL_HINTS['claude']}"
         )
     result = subprocess.run(
         ["claude", "-p", "--output-format", "json", "ping"],
