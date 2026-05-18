@@ -9,7 +9,7 @@ import os
 import time
 from pathlib import Path
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
@@ -156,7 +156,6 @@ class CodexBackend:
         )
         # Codex has no --system-prompt flag, so steer via prompt prepend.
         system_prompt = build_system_prompt(platform, user_name, channel_context)
-        composed_prompt = f"{system_prompt}\n\n---\n\n{prompt}"
 
         sessions_dir = workspace / ".codex_sessions"
         session_file = sessions_dir / session_uuid
@@ -164,12 +163,30 @@ class CodexBackend:
             session_file.read_text().strip() if session_file.exists() else None
         )
 
+        # First codex turn for this session: forward any prior claude history.
+        user_payload = (
+            transcript.prepend_handoff(
+                workspace,
+                session_uuid,
+                prompt,
+                from_backend="claude",
+                extractor=transcript.extract_claude,
+            )
+            if not existing_thread
+            else prompt
+        )
+        composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"
+
+        # `ollama launch codex` already invokes the codex binary; repeating
+        # "codex" after `--` would make it argv[1], which codex treats as the
+        # subcommand. Skip the binary when the launcher is set.
         prefix = self.launcher.prefix("codex") if self.launcher else []
+        binary = [] if self.launcher else ["codex"]
         model_env = os.environ.get("CODEX_MODEL", "").strip()
         model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
         base = [
             *prefix,
-            "codex",
+            *binary,
             "exec",
             "--json",
             "--skip-git-repo-check",

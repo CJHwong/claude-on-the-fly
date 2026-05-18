@@ -14,6 +14,7 @@ from claude_on_the_fly.backends.codex import (
     _merge_codex_results,
     parse_codex_stream,
 )
+from claude_on_the_fly.transcript import Turn
 
 
 def _ndjson(*messages: dict) -> bytes:
@@ -291,8 +292,9 @@ class TestCodexBackendRun:
             "--yes",
             "--",
         ]
-        assert cmd[7] == "codex"
-        assert cmd[8] == "exec"
+        # The codex binary is NOT repeated after `--`; first real arg is `exec`.
+        assert cmd[7] == "exec"
+        assert "codex" not in cmd[7:], "redundant codex binary in launcher cmd"
 
     async def test_launcher_drops_codex_model_flag(self, tmp_path: Path, monkeypatch):
         """With a launcher, codex's own -m must be omitted (ollama overrides it)."""
@@ -597,6 +599,115 @@ class TestCodexBackendNudgeRetry:
             resp = await CodexBackend().run(workspace, "sess-v", "hi", "telegram")
 
         assert resp.body == "No response"
+
+
+# ---------------------------------------------------------------------------
+# Cross-backend transcript handoff
+# ---------------------------------------------------------------------------
+
+
+class TestCodexBackendHandoff:
+    async def test_fresh_thread_injects_claude_handoff(self, tmp_path: Path):
+        """When no codex state exists but claude has prior turns, prepend them."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        prior_turns = [
+            Turn("user", "earlier question"),
+            Turn("assistant", "earlier answer"),
+        ]
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_claude",
+                return_value=prior_turns,
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(),
+            ) as mock,
+        ):
+            await CodexBackend().run(
+                workspace, "sess-handoff", "CURRENT_USER_TEXT", "telegram"
+            )
+
+        composed = mock.call_args[0][1][-1]
+        assert "[Prior conversation via claude" in composed
+        assert "earlier question" in composed
+        assert "earlier answer" in composed
+        # User's current prompt is still there, and follows the handoff.
+        assert composed.endswith("CURRENT_USER_TEXT")
+        # System prompt and handoff appear in the right order.
+        assert composed.index("[Prior conversation via claude") < composed.index(
+            "CURRENT_USER_TEXT"
+        )
+
+    async def test_existing_thread_skips_handoff(self, tmp_path: Path):
+        """Don't re-forward history when we're resuming an existing codex thread."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sessions_dir = workspace / ".codex_sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "sess-resume").write_text("existing-thread")
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_claude"
+            ) as mock_extract,
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(),
+            ) as mock,
+        ):
+            await CodexBackend().run(workspace, "sess-resume", "msg", "telegram")
+
+        # extract_claude must not even be called when resuming.
+        mock_extract.assert_not_called()
+        composed = mock.call_args[0][1][-1]
+        assert "[Prior conversation via claude" not in composed
+
+    async def test_no_claude_history_no_handoff(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_claude",
+                return_value=None,
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(),
+            ) as mock,
+        ):
+            await CodexBackend().run(workspace, "sess-clean", "msg", "telegram")
+
+        composed = mock.call_args[0][1][-1]
+        assert "[Prior conversation" not in composed
+
+    async def test_extractor_exception_falls_through_silently(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_claude",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(),
+            ) as mock,
+        ):
+            resp = await CodexBackend().run(workspace, "sess-broken", "msg", "telegram")
+
+        # Backend must not blow up — user keeps getting a reply.
+        assert resp.body == "hello"
+        composed = mock.call_args[0][1][-1]
+        assert "[Prior conversation" not in composed
 
 
 # ---------------------------------------------------------------------------

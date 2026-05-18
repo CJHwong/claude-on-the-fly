@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     ClaudeUnavailableError,
@@ -48,7 +48,11 @@ class ClaudeBackend:
             workspace,
         )
         system_prompt = build_system_prompt(platform, user_name, channel_context)
+        # `ollama launch claude` already invokes the claude binary; repeating
+        # "claude" after `--` would make it argv[1], which -p mode parses as
+        # the prompt and silently drops the real one.
         prefix = self.launcher.prefix("claude") if self.launcher else []
+        binary = [] if self.launcher else ["claude"]
         model_args = (
             []
             if self.launcher
@@ -56,7 +60,7 @@ class ClaudeBackend:
         )
         base = [
             *prefix,
-            "claude",
+            *binary,
             "-p",
             "--output-format",
             "stream-json",
@@ -81,9 +85,16 @@ class ClaudeBackend:
             if "No conversation found" not in str(exc):
                 raise
             logger.info("No existing session %s, creating new", session_uuid)
+            handoff_prompt = transcript.prepend_handoff(
+                workspace,
+                session_uuid,
+                prompt,
+                from_backend="codex",
+                extractor=transcript.extract_codex,
+            )
             cli_output = await agent._exec(
                 workspace,
-                [*base, "--session-id", session_uuid, prompt],
+                [*base, "--session-id", session_uuid, handoff_prompt],
                 timeout=timeout,
             )
 

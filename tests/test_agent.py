@@ -27,6 +27,7 @@ from claude_on_the_fly.agent import (
     stats_mode,
 )
 from claude_on_the_fly.backends.claude import ClaudeBackend
+from claude_on_the_fly.transcript import Turn
 
 
 def _ndjson(*messages: dict) -> bytes:
@@ -1225,8 +1226,10 @@ class TestClaudeBackendLauncher:
             "--yes",
             "--",
         ]
-        assert cmd[7] == "claude"
-        assert cmd[8] == "-p"
+        # The claude binary is NOT repeated after `--` — ollama launch already
+        # invokes it. The first real arg is the -p flag.
+        assert cmd[7] == "-p"
+        assert "claude" not in cmd[7:], "redundant claude binary in launcher cmd"
 
     async def test_launcher_drops_claude_model_flag(self):
         """Launcher decides the model; claude's --model is omitted to avoid dead args."""
@@ -1246,6 +1249,25 @@ class TestClaudeBackendLauncher:
         model_indices = [i for i, v in enumerate(cmd) if v == "--model"]
         assert model_indices == [3]
 
+    async def test_launcher_does_not_repeat_claude_binary(self):
+        """Regression: ollama launch claude already invokes the binary; a
+        second "claude" after `--` becomes argv[1] which -p parses as the prompt."""
+        output = _cli_output()
+        launcher = OllamaLauncher(model="qwen3.6:latest")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+
+        cmd = mock.call_args[0][1]
+        # "claude" appears exactly once: inside the launcher prefix.
+        assert cmd.count("claude") == 1
+        assert cmd[2] == "claude"
+
     async def test_get_backend_factory_drives_run(self, clear_backend_env, monkeypatch):
         """agent.run() routes through get_backend() and honors ollama mode."""
         monkeypatch.setenv("CLAUDE_MODE", "ollama")
@@ -1261,3 +1283,112 @@ class TestClaudeBackendLauncher:
         cmd = mock.call_args[0][1]
         assert cmd[:3] == ["ollama", "launch", "claude"]
         assert "qwen3.6:latest" in cmd
+
+
+# ---------------------------------------------------------------------------
+# ClaudeBackend cross-backend transcript handoff
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeBackendHandoff:
+    async def test_fallback_path_injects_codex_handoff(self):
+        output = _cli_output(result="new session reply")
+
+        async def side_effect(workspace, cmd, **_kwargs):
+            if "--resume" in cmd:
+                raise RuntimeError("No conversation found with id sess-1")
+            return output
+
+        prior_turns = [
+            Turn("user", "prior codex msg"),
+            Turn("assistant", "prior codex reply"),
+        ]
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.transcript.extract_codex",
+                return_value=prior_turns,
+            ),
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                side_effect=side_effect,
+            ) as mock,
+        ):
+            await run(Path("/tmp"), "sess-1", "CURRENT_TEXT", "telegram")
+
+        # Second call is the --session-id fallback; its prompt arg should contain
+        # both the handoff preamble and the user's actual text.
+        fallback_cmd = mock.call_args_list[1][0][1]
+        prompt_arg = fallback_cmd[-1]
+        assert "[Prior conversation via codex" in prompt_arg
+        assert "prior codex msg" in prompt_arg
+        assert "prior codex reply" in prompt_arg
+        assert prompt_arg.endswith("CURRENT_TEXT")
+
+    async def test_fallback_with_no_codex_history_just_uses_prompt(self):
+        output = _cli_output(result="new session reply")
+
+        async def side_effect(workspace, cmd, **_kwargs):
+            if "--resume" in cmd:
+                raise RuntimeError("No conversation found with id sess-2")
+            return output
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.transcript.extract_codex",
+                return_value=None,
+            ),
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                side_effect=side_effect,
+            ) as mock,
+        ):
+            await run(Path("/tmp"), "sess-2", "JUST_THIS", "telegram")
+
+        fallback_cmd = mock.call_args_list[1][0][1]
+        assert "[Prior conversation" not in fallback_cmd[-1]
+        assert fallback_cmd[-1] == "JUST_THIS"
+
+    async def test_extractor_exception_falls_through_silently(self):
+        output = _cli_output(result="new session reply")
+
+        async def side_effect(workspace, cmd, **_kwargs):
+            if "--resume" in cmd:
+                raise RuntimeError("No conversation found with id sess-3")
+            return output
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.transcript.extract_codex",
+                side_effect=RuntimeError("read failed"),
+            ),
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                side_effect=side_effect,
+            ) as mock,
+        ):
+            resp = await run(Path("/tmp"), "sess-3", "TEXT", "telegram")
+
+        # Daemon must keep serving the user even when transcript extraction breaks.
+        assert resp.body == "new session reply"
+        assert mock.call_args_list[1][0][1][-1] == "TEXT"
+
+    async def test_resume_success_skips_extractor(self):
+        """No fallback fires → handoff path is never consulted."""
+        output = _cli_output()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.transcript.extract_codex"
+            ) as mock_extract,
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=output,
+            ),
+        ):
+            await run(Path("/tmp"), "sess-4", "hi", "telegram")
+
+        mock_extract.assert_not_called()
