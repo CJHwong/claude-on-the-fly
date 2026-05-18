@@ -91,6 +91,18 @@ def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     return turns or None
 
 
+def _find_codex_rollout(thread_id: str) -> Path | None:
+    """Locate the codex session JSONL for a given thread_id (newest if multiple)."""
+    if not thread_id:
+        return None
+    matches = sorted(
+        CODEX_SESSIONS_DIR.glob(f"**/rollout-*-{thread_id}.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
 def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
     """Return the user/assistant turns from the codex rollout file, or None.
 
@@ -103,18 +115,12 @@ def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
         thread_id = session_file.read_text().strip()
     except OSError:
         return None
-    if not thread_id:
-        return None
-    matches = sorted(
-        CODEX_SESSIONS_DIR.glob(f"**/rollout-*-{thread_id}.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not matches:
+    rollout = _find_codex_rollout(thread_id)
+    if rollout is None:
         logger.debug("transcript: no codex rollout for thread=%s", thread_id)
         return None
     turns: list[Turn] = []
-    for msg in _iter_jsonl(matches[0]):
+    for msg in _iter_jsonl(rollout):
         if msg.get("type") != "event_msg":
             continue
         payload = msg.get("payload") or {}
@@ -131,6 +137,26 @@ def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
             if text:
                 turns.append(Turn("assistant", text))
     return turns or None
+
+
+def extract_codex_model(thread_id: str) -> str | None:
+    """Return the model codex actually used for a thread, or None.
+
+    Codex's `--json` stdout omits the model; it only appears in the persisted
+    session file as `turn_context.payload.model`. Needed because our backend
+    can otherwise only label runs with whatever the user configured (which is
+    blank in native mode without CODEX_MODEL).
+    """
+    rollout = _find_codex_rollout(thread_id)
+    if rollout is None:
+        return None
+    for msg in _iter_jsonl(rollout):
+        if msg.get("type") != "turn_context":
+            continue
+        model = (msg.get("payload") or {}).get("model")
+        if isinstance(model, str) and model:
+            return model
+    return None
 
 
 def _render_line(turn: Turn) -> str:

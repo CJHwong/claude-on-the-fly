@@ -238,7 +238,19 @@ class CodexBackend:
                 body = "No response"
 
         usage = result.get("usage") or {}
-        model_label = self.launcher.model if self.launcher else (model_env or "codex")
+        # Prefer the model codex actually recorded in its session file; fall
+        # back to whatever the user configured. In native mode without
+        # CODEX_MODEL the configured value is just the literal "codex", which
+        # is uninformative — the session-file lookup gives us the real name.
+        configured_label = (
+            self.launcher.model if self.launcher else (model_env or "codex")
+        )
+        thread_for_lookup = result.get("thread_id") or existing_thread
+        model_label = (
+            transcript.extract_codex_model(thread_for_lookup)
+            if thread_for_lookup
+            else None
+        ) or configured_label
         return Response(
             body=body,
             cost=0,

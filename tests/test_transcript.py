@@ -10,6 +10,7 @@ from claude_on_the_fly.transcript import (
     Turn,
     extract_claude,
     extract_codex,
+    extract_codex_model,
     format_handoff,
 )
 
@@ -329,6 +330,56 @@ class TestFormatHandoff:
 # ---------------------------------------------------------------------------
 # prepend_handoff
 # ---------------------------------------------------------------------------
+
+
+class TestExtractCodexModel:
+    def test_returns_none_when_no_rollout(self, codex_sessions_dir):
+        assert extract_codex_model("nonexistent-thread") is None
+
+    def test_returns_none_when_empty_thread_id(self, codex_sessions_dir):
+        assert extract_codex_model("") is None
+
+    def test_extracts_model_from_turn_context(self, codex_sessions_dir, ndjson):
+        rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-abc.jsonl"
+        rollout.write_bytes(
+            ndjson(
+                {"type": "session_meta", "payload": {"id": "x"}},
+                {
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-4.1", "provider": "openai"},
+                },
+                {"type": "event_msg", "payload": {"type": "user_message"}},
+            )
+        )
+        assert extract_codex_model("thread-abc") == "gpt-4.1"
+
+    def test_returns_first_turn_context_model(self, codex_sessions_dir, ndjson):
+        """Codex emits turn_context per turn; the first hit is sufficient."""
+        rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-x.jsonl"
+        rollout.write_bytes(
+            ndjson(
+                {"type": "turn_context", "payload": {"model": "first-model"}},
+                {"type": "turn_context", "payload": {"model": "second-model"}},
+            )
+        )
+        assert extract_codex_model("thread-x") == "first-model"
+
+    def test_skips_non_string_model_values(self, codex_sessions_dir, ndjson):
+        rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-y.jsonl"
+        rollout.write_bytes(
+            ndjson(
+                {"type": "turn_context", "payload": {"model": None}},
+                {"type": "turn_context", "payload": {"model": ""}},
+                {"type": "turn_context", "payload": {"model": "real-model"}},
+            )
+        )
+        assert extract_codex_model("thread-y") == "real-model"
 
 
 class TestPrependHandoff:
