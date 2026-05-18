@@ -154,28 +154,29 @@ class CodexBackend:
             channel_context,
             workspace,
         )
-        # Codex has no --system-prompt flag, so steer via prompt prepend.
-        system_prompt = build_system_prompt(platform, user_name, channel_context)
-
         sessions_dir = workspace / ".codex_sessions"
         session_file = sessions_dir / session_uuid
         existing_thread = (
             session_file.read_text().strip() if session_file.exists() else None
         )
 
-        # First codex turn for this session: forward any prior claude history.
-        user_payload = (
-            transcript.prepend_handoff(
+        # First codex turn for this session: forward any prior claude history,
+        # and prepend the system prompt (codex has no --system-prompt flag, so
+        # this is our only way to deliver it). On subsequent turns the system
+        # prompt is already in the thread's persisted history — re-sending it
+        # every turn inflates tokens (~4.7KB per turn) and bloats context.
+        if existing_thread:
+            composed_prompt = prompt
+        else:
+            user_payload = transcript.prepend_handoff(
                 workspace,
                 session_uuid,
                 prompt,
                 from_backend="claude",
                 extractor=transcript.extract_claude,
             )
-            if not existing_thread
-            else prompt
-        )
-        composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"
+            system_prompt = build_system_prompt(platform, user_name, channel_context)
+            composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"
 
         # `ollama launch codex` already invokes the codex binary; repeating
         # "codex" after `--` would make it argv[1], which codex treats as the

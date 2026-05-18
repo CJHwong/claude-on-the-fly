@@ -716,7 +716,10 @@ class TestCodexBackendHandoff:
         )
 
     async def test_existing_thread_skips_handoff(self, tmp_path: Path):
-        """Don't re-forward history when we're resuming an existing codex thread."""
+        """Don't re-forward history when we're resuming an existing codex thread.
+        Also confirms the system prompt is NOT prepended on resume: codex
+        already has it from the first turn's persisted history, and re-sending
+        it bloats input tokens by ~4.7KB per turn for nothing."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         sessions_dir = workspace / ".codex_sessions"
@@ -733,12 +736,19 @@ class TestCodexBackendHandoff:
                 return_value=_success_result(),
             ) as mock,
         ):
-            await CodexBackend().run(workspace, "sess-resume", "msg", "telegram")
+            await CodexBackend().run(
+                workspace, "sess-resume", "USER_TEXT_ONLY", "telegram"
+            )
 
         # extract_claude must not even be called when resuming.
         mock_extract.assert_not_called()
         composed = mock.call_args[0][1][-1]
         assert "[Prior conversation via claude" not in composed
+        # System-prompt content (any of the FORMAT_HINTS) must NOT be present
+        # on resume — the composed prompt should be exactly the user's text.
+        assert composed == "USER_TEXT_ONLY"
+        assert "Memory System" not in composed
+        assert "Format responses" not in composed
 
     async def test_no_claude_history_no_handoff(self, tmp_path: Path):
         workspace = tmp_path / "ws"
