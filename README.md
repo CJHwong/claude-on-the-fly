@@ -295,8 +295,23 @@ Or use a `.env` file with all vars and a process manager.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CLAUDE_MODEL` | no | Model passed to `claude --model` (default: `sonnet`) |
+| `AGENT_BACKEND` | no | Agent CLI to drive (default: `claude`; only value supported today) |
+| `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude` (default: `native`) |
+| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
+| `CLAUDE_MODEL` | no | Model passed to `claude --model` in native mode (default: `sonnet`). Ignored in ollama mode |
 | `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
+
+#### ollama launch mode
+
+Routes claude's model calls through a local or cloud Ollama model instead of Anthropic. Requires both `claude` and `ollama` CLIs installed, and the target model already pulled (`ollama pull <name>`):
+
+```bash
+export CLAUDE_MODE=ollama
+export OLLAMA_MODEL=deepseek-v4-flash:cloud
+uv run claude-telegram
+```
+
+Cost in the stats footer reflects Ollama's billing for `:cloud` models, or `$0` for local ones. Session resume, tool use, and Skills behave the same as native mode — only the model provider changes.
 
 
 ## Persona (CLAUDE.md)
@@ -322,7 +337,9 @@ If no `CLAUDE.md` exists, Claude runs with the default system prompt only.
 
 ```
 src/claude_on_the_fly/
-  agent.py        # Claude CLI wrapper + Response dataclass
+  agent.py        # Backend dispatch (AgentBackend protocol, OllamaLauncher, get_backend) + Response + shared helpers
+  backends/
+    claude.py     # Drives `claude -p` directly; optional ollama-launch prefix
   orchestrator.py # Session management, queuing, typing indicators (chat frontends)
   protocol.py     # Frontend protocol (for adding new interfaces)
   scheduler.py    # Cron-driven frontend, YAML config, auto-reload

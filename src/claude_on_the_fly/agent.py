@@ -1,4 +1,9 @@
-"""Claude Code CLI wrapper."""
+"""Agent dispatch and shared helpers.
+
+Public surface: `Response`, `AgentBackend` protocol, `OllamaLauncher`,
+`get_backend()` factory, `run()` facade, and prompt/format helpers used by
+frontends. Claude-CLI specifics live in `claude_on_the_fly.backends.claude`.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +349,53 @@ def _merge_cli_output(first: dict, second: dict) -> dict:
     return merged
 
 
+class AgentBackend(Protocol):
+    """Minimal contract every backend implements."""
+
+    async def run(
+        self,
+        workspace: Path,
+        session_uuid: str,
+        prompt: str,
+        platform: str,
+        user_name: str = "unknown",
+        channel_context: str = "dm",
+        timeout: float | None = DEFAULT_TIMEOUT,
+    ) -> Response: ...
+
+
+@dataclass(frozen=True)
+class OllamaLauncher:
+    """Wraps an agent CLI invocation in `ollama launch <agent> --model <X> --yes --`."""
+
+    model: str
+
+    def prefix(self, agent_name: str) -> list[str]:
+        return ["ollama", "launch", agent_name, "--model", self.model, "--yes", "--"]
+
+
+def get_backend() -> AgentBackend:
+    """Pick a backend from env vars. Raises ValueError on misconfiguration."""
+    name = os.environ.get("AGENT_BACKEND", "claude").lower()
+    if name == "claude":
+        return _build_claude_backend()
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude)")
+
+
+def _build_claude_backend() -> AgentBackend:
+    from claude_on_the_fly.backends.claude import ClaudeBackend
+
+    mode = os.environ.get("CLAUDE_MODE", "native").lower()
+    if mode == "native":
+        return ClaudeBackend()
+    if mode == "ollama":
+        model = os.environ.get("OLLAMA_MODEL", "").strip()
+        if not model:
+            raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
+        return ClaudeBackend(launcher=OllamaLauncher(model=model))
+    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+
+
 async def run(
     workspace: Path,
     session_uuid: str,
@@ -352,72 +405,12 @@ async def run(
     channel_context: str = "dm",
     timeout: float | None = DEFAULT_TIMEOUT,
 ) -> Response:
-    """Run Claude Code and return a structured response."""
-    logger.info(
-        "session: id=%s platform=%s user=%s context=%s workspace=%s",
-        session_uuid,
-        platform,
-        user_name,
-        channel_context,
+    return await get_backend().run(
         workspace,
-    )
-    system_prompt = build_system_prompt(platform, user_name, channel_context)
-    model = os.environ.get("CLAUDE_MODEL", "sonnet")
-    base = [
-        "claude",
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "bypassPermissions",
-        "--model",
-        model,
-        "--system-prompt",
-        system_prompt,
-    ]
-
-    try:
-        logger.debug(
-            "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
-        )
-        cli_output = await _exec(
-            workspace, [*base, "--resume", session_uuid, prompt], timeout=timeout
-        )
-    except ClaudeUnavailableError:
-        raise
-    except RuntimeError as exc:
-        if "No conversation found" not in str(exc):
-            raise
-        logger.info("No existing session %s, creating new", session_uuid)
-        cli_output = await _exec(
-            workspace,
-            [*base, "--session-id", session_uuid, prompt],
-            timeout=timeout,
-        )
-
-    body = (cli_output.get("result") or "").strip()
-    if not body:
-        logger.warning(
-            "agent.run: empty result, retrying with nudge, session=%s", session_uuid
-        )
-        retry_output = await _exec(
-            workspace,
-            [*base, "--resume", session_uuid, NUDGE_PROMPT],
-            timeout=timeout,
-        )
-        cli_output = _merge_cli_output(cli_output, retry_output)
-        body = (cli_output.get("result") or "").strip() or "No response"
-
-    usage = cli_output.get("usage", {})
-    return Response(
-        body=body,
-        cost=cli_output.get("total_cost_usd", 0),
-        duration=cli_output.get("duration_ms", 0) / 1000,
-        tokens_in=usage.get("input_tokens", 0)
-        + usage.get("cache_read_input_tokens", 0),
-        tokens_out=usage.get("output_tokens", 0),
-        model=next(iter(cli_output.get("modelUsage", {})), ""),
-        tool_counts=cli_output.get("tool_counts", {}),
-        skill_counts=cli_output.get("skill_counts", {}),
+        session_uuid,
+        prompt,
+        platform,
+        user_name=user_name,
+        channel_context=channel_context,
+        timeout=timeout,
     )

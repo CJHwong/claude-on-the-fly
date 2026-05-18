@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from claude_on_the_fly.preflight import (
+    check_backend,
     check_claude_cli,
     check_gws_cli,
+    check_ollama_mode,
     check_slack,
     check_telegram,
     require_env,
@@ -151,6 +153,120 @@ def test_extract_cli_result_blank_lines_skipped():
     # Blank line in NDJSON scan: last line has no "result", blank, then first has "result"
     stdout = json.dumps({"result": "first"}) + "\n\n" + json.dumps({"x": 1})
     assert _extract_cli_result(stdout) == "first"
+
+
+# ---------------------------------------------------------------------------
+# check_backend dispatcher
+# ---------------------------------------------------------------------------
+
+
+class TestCheckBackend:
+    @patch("claude_on_the_fly.preflight.check_claude_cli")
+    def test_default_dispatches_native(self, mock_check, clear_backend_env):
+        check_backend()
+        mock_check.assert_called_once()
+
+    @patch("claude_on_the_fly.preflight.check_claude_cli")
+    def test_explicit_native_dispatches(
+        self, mock_check, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_MODE", "native")
+        check_backend()
+        mock_check.assert_called_once()
+
+    @patch("claude_on_the_fly.preflight.check_ollama_mode")
+    def test_ollama_mode_dispatches(self, mock_check, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        check_backend()
+        mock_check.assert_called_once()
+
+    def test_unknown_backend_exits(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        with pytest.raises(SystemExit, match="Unknown AGENT_BACKEND"):
+            check_backend()
+
+    def test_unknown_mode_exits(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "magic")
+        with pytest.raises(SystemExit, match="Unknown CLAUDE_MODE"):
+            check_backend()
+
+
+# ---------------------------------------------------------------------------
+# check_ollama_mode
+# ---------------------------------------------------------------------------
+
+
+class TestCheckOllamaMode:
+    @patch(
+        "claude_on_the_fly.preflight.shutil.which",
+        side_effect=lambda name: None if name == "claude" else "/usr/bin/" + name,
+    )
+    def test_exits_when_claude_missing(
+        self, _mock_which, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "x")
+        with pytest.raises(SystemExit, match="claude CLI not found"):
+            check_ollama_mode()
+
+    @patch(
+        "claude_on_the_fly.preflight.shutil.which",
+        side_effect=lambda name: None if name == "ollama" else "/usr/bin/" + name,
+    )
+    def test_exits_when_ollama_missing(
+        self, _mock_which, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "x")
+        with pytest.raises(SystemExit, match="ollama CLI not found"):
+            check_ollama_mode()
+
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x")
+    def test_exits_when_model_missing(self, _mock_which, clear_backend_env):
+        with pytest.raises(SystemExit, match="OLLAMA_MODEL"):
+            check_ollama_mode()
+
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x")
+    def test_exits_when_list_fails(
+        self, _mock_which, mock_run, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "x")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"
+        )
+        with pytest.raises(SystemExit, match="ollama list failed.*boom"):
+            check_ollama_mode()
+
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x")
+    def test_exits_when_model_not_in_list(
+        self, _mock_which, mock_run, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "missing-model")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="NAME    ID    SIZE    MODIFIED\nother:latest    abc    1GB    1d\n",
+            stderr="",
+        )
+        with pytest.raises(SystemExit, match="missing-model"):
+            check_ollama_mode()
+
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x")
+    def test_succeeds_when_model_present(
+        self, _mock_which, mock_run, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "deepseek-v4-flash:cloud")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "NAME    ID    SIZE    MODIFIED\n"
+                "deepseek-v4-flash:cloud    abc    -    2d\n"
+            ),
+            stderr="",
+        )
+        check_ollama_mode()  # should not raise
 
 
 # ---------------------------------------------------------------------------

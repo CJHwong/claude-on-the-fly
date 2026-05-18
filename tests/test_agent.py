@@ -14,16 +14,19 @@ from claude_on_the_fly.agent import (
     FORMAT_HINTS,
     NUDGE_PROMPT,
     ClaudeUnavailableError,
+    OllamaLauncher,
     Response,
     _classify,
     build_system_prompt,
     ensure_persona,
     _exec,
     _merge_cli_output,
+    get_backend,
     parse_stream,
     run,
     stats_mode,
 )
+from claude_on_the_fly.backends.claude import ClaudeBackend
 
 
 def _ndjson(*messages: dict) -> bytes:
@@ -1058,3 +1061,160 @@ class TestEnsurePersona:
         # Still the same symlink, not recreated
         assert link.is_symlink()
         assert link.resolve() == source.resolve()
+
+
+# ---------------------------------------------------------------------------
+# OllamaLauncher
+# ---------------------------------------------------------------------------
+
+
+class TestOllamaLauncher:
+    def test_prefix_for_claude(self):
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        assert launcher.prefix("claude") == [
+            "ollama",
+            "launch",
+            "claude",
+            "--model",
+            "deepseek-v4-flash:cloud",
+            "--yes",
+            "--",
+        ]
+
+    def test_prefix_parametrizes_agent_name(self):
+        """Other agents (codex, gemini, ...) will reuse the same launcher."""
+        launcher = OllamaLauncher(model="qwen3.6:latest")
+        assert launcher.prefix("codex")[:3] == ["ollama", "launch", "codex"]
+
+    def test_frozen(self):
+        from dataclasses import FrozenInstanceError
+
+        launcher = OllamaLauncher(model="x")
+        with pytest.raises(FrozenInstanceError):
+            launcher.model = "y"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# get_backend factory
+# ---------------------------------------------------------------------------
+
+
+class TestGetBackend:
+    def test_default_returns_claude_native(self, clear_backend_env):
+        backend = get_backend()
+        assert isinstance(backend, ClaudeBackend)
+        assert backend.launcher is None
+
+    def test_claude_native_explicit(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "claude")
+        monkeypatch.setenv("CLAUDE_MODE", "native")
+        backend = get_backend()
+        assert isinstance(backend, ClaudeBackend)
+        assert backend.launcher is None
+
+    def test_claude_ollama_mode(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "deepseek-v4-flash:cloud")
+        backend = get_backend()
+        assert isinstance(backend, ClaudeBackend)
+        assert backend.launcher == OllamaLauncher(model="deepseek-v4-flash:cloud")
+
+    def test_ollama_without_model_raises(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        with pytest.raises(ValueError, match="OLLAMA_MODEL"):
+            get_backend()
+
+    def test_ollama_blank_model_raises(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "   ")
+        with pytest.raises(ValueError, match="OLLAMA_MODEL"):
+            get_backend()
+
+    def test_unknown_backend_raises(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        with pytest.raises(ValueError, match="codex"):
+            get_backend()
+
+    def test_unknown_claude_mode_raises(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "magic")
+        with pytest.raises(ValueError, match="magic"):
+            get_backend()
+
+
+# ---------------------------------------------------------------------------
+# ClaudeBackend launcher injection
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeBackendLauncher:
+    async def test_no_launcher_includes_model_flag(self):
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        cmd = mock.call_args[0][1]
+        assert cmd[0] == "claude"
+        assert "--model" in cmd
+
+    async def test_launcher_prepends_prefix(self):
+        output = _cli_output()
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+
+        cmd = mock.call_args[0][1]
+        assert cmd[:7] == [
+            "ollama",
+            "launch",
+            "claude",
+            "--model",
+            "deepseek-v4-flash:cloud",
+            "--yes",
+            "--",
+        ]
+        assert cmd[7] == "claude"
+        assert cmd[8] == "-p"
+
+    async def test_launcher_drops_claude_model_flag(self):
+        """Launcher decides the model; claude's --model is omitted to avoid dead args."""
+        output = _cli_output()
+        launcher = OllamaLauncher(model="qwen3.6:latest")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+
+        cmd = mock.call_args[0][1]
+        # The only --model in the command should be the launcher prefix's at index 3.
+        model_indices = [i for i, v in enumerate(cmd) if v == "--model"]
+        assert model_indices == [3]
+
+    async def test_get_backend_factory_drives_run(self, clear_backend_env, monkeypatch):
+        """agent.run() routes through get_backend() and honors ollama mode."""
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen3.6:latest")
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        cmd = mock.call_args[0][1]
+        assert cmd[:3] == ["ollama", "launch", "claude"]
+        assert "qwen3.6:latest" in cmd

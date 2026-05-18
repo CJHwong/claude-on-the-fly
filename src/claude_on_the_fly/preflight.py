@@ -49,6 +49,58 @@ def _extract_cli_result(stdout: str) -> str:
     return ""
 
 
+def check_backend() -> None:
+    """Validate the configured agent backend before startup.
+
+    Dispatches by `AGENT_BACKEND` (default `claude`) and `CLAUDE_MODE`
+    (default `native`). Native mode runs the live `claude -p ping`;
+    ollama mode skips the live ping and validates the ollama wrap instead.
+    """
+    backend_name = os.environ.get("AGENT_BACKEND", "claude").lower()
+    if backend_name != "claude":
+        raise SystemExit(f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude)")
+    mode = os.environ.get("CLAUDE_MODE", "native").lower()
+    if mode == "native":
+        check_claude_cli()
+        return
+    if mode == "ollama":
+        check_ollama_mode()
+        return
+    raise SystemExit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+
+
+def check_ollama_mode() -> None:
+    """Validate `ollama launch claude` mode: both CLIs present, model available."""
+    if not shutil.which("claude"):
+        raise SystemExit(
+            "claude CLI not found. Install it: https://docs.anthropic.com/en/docs/claude-code"
+        )
+    if not shutil.which("ollama"):
+        raise SystemExit("ollama CLI not found. Install it: https://ollama.com")
+    model = os.environ.get("OLLAMA_MODEL", "").strip()
+    if not model:
+        raise SystemExit("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
+    result = subprocess.run(
+        ["ollama", "list"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise SystemExit(f"ollama list failed: {detail}")
+    # First column of each non-header line is the model name.
+    available = {
+        line.split()[0] for line in result.stdout.splitlines()[1:] if line.strip()
+    }
+    if model not in available:
+        raise SystemExit(
+            f"OLLAMA_MODEL={model!r} not found in `ollama list`. "
+            f"Pull it first: ollama pull {model}"
+        )
+    logger.info("ollama launch mode: ok (model=%s)", model)
+
+
 def check_claude_cli() -> None:
     """Verify claude CLI is installed and authenticated.
 
@@ -166,7 +218,7 @@ def run_telegram() -> tuple[str, int]:
         raise SystemExit(
             f"TELEGRAM_ALLOWED_USER_ID must be an integer, got: {raw_user_id!r}"
         )
-    check_claude_cli()
+    check_backend()
     asyncio.run(check_telegram(token))
     return token, allowed_user_id
 
@@ -181,7 +233,7 @@ def run_slack() -> tuple[str, str, str, set[str]]:
     user_token = require_env("SLACK_USER_TOKEN")
     allowed_raw = os.environ.get("SLACK_ALLOWED_USER_IDS", "")
     allowed_user_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
-    check_claude_cli()
+    check_backend()
     user_id = asyncio.run(check_slack(app_token, user_token))
     logger.debug("preflight: user_id=%s allowed_user_ids=%s", user_id, allowed_user_ids)
     return app_token, user_token, user_id, allowed_user_ids
@@ -197,6 +249,6 @@ def run_gmail() -> tuple[str, set[str]]:
         raise SystemExit(
             "GMAIL_ALLOWED_SENDERS must contain at least one email address"
         )
-    check_claude_cli()
+    check_backend()
     check_gws_cli()
     return gcp_project, allowed_senders
