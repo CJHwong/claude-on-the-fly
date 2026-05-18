@@ -330,7 +330,7 @@ Codex differs from claude in a few ways:
 - **Session model.** Codex assigns its own `thread_id` per session, so we persist a `<workspace>/.codex_sessions/<our-session-uuid>` mapping file after the first turn and pass `resume <thread_id>` on follow-ups.
 - **No system-prompt flag.** Codex has no `--system-prompt`, so the format hint is prepended to each user message. Your persona `~/.claude-on-the-fly/CLAUDE.md` is symlinked into the workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex), so both backends see it.
 - **No skill tracking.** Codex has no skill concept; `skill_counts` is always empty. Tool counts come from `item.completed` event types (e.g. `command_execution`, `file_change`).
-- **Image input degraded.** Frontends save uploaded images to the workspace and claude reads them via its `Read` tool. Codex doesn't get them via `-i`; it can `cat`/`file` them via shell but can't see image bytes directly.
+- **Image input.** Works the same as claude. Frontends save uploaded images to the workspace and codex reads them through its own file-read tooling — the underlying model is multimodal, so it sees image content directly, no `-i` flag needed.
 
 
 ## Persona (CLAUDE.md)
