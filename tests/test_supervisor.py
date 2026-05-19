@@ -254,3 +254,143 @@ class TestQuery:
     def test_read_pid_falls_back_to_pid_file(self, isolated_state):
         (supervisor.STATE_DIR / "telegram.pid").write_text("99")
         assert supervisor.read_pid("telegram") == 99
+
+
+# ---------------------------------------------------------------------------
+# stop_all / resume
+# ---------------------------------------------------------------------------
+
+
+class TestStopAll:
+    def test_no_running_returns_empty(self, isolated_state, monkeypatch):
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        assert supervisor.stop_all() == []
+
+    def test_stops_each_running(self, isolated_state, monkeypatch):
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=11)
+        _write_heartbeat(supervisor.STATE_DIR, "slack", pid=22)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+        kills: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        # Simulate clean SIGTERM by flipping process_exists to False after SIGTERM.
+        sigterm_called = {"v": False}
+
+        def fake_exists(pid: int) -> bool:
+            return not sigterm_called["v"] or pid not in (11, 22) and False or False
+
+        # Simpler: keep alive for is_running checks, then after stop's SIGTERM,
+        # report dead. Use a stateful counter per pid.
+        liveness = {11: True, 22: True}
+
+        def liveness_check(pid: int) -> bool:
+            return liveness.get(pid, False)
+
+        def kill_kills(pid: int, sig: int) -> None:
+            kills.append((pid, sig))
+            if sig == signal.SIGTERM:
+                liveness[pid] = False
+
+        monkeypatch.setattr(supervisor, "_process_exists", liveness_check)
+        monkeypatch.setattr(os, "kill", kill_kills)
+        monkeypatch.setattr(supervisor, "KILL_POLL_INTERVAL_S", 0.001)
+
+        stopped = supervisor.stop_all(grace_s=0.05)
+        names = {n for n, _ in stopped}
+        assert names == {"telegram", "slack"}
+
+    def test_writes_last_running_file(self, isolated_state, monkeypatch):
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=11)
+        liveness = {11: True}
+        monkeypatch.setattr(
+            supervisor, "_process_exists", lambda pid: liveness.get(pid, False)
+        )
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if sig == signal.SIGTERM:
+                liveness[pid] = False
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+        monkeypatch.setattr(supervisor, "KILL_POLL_INTERVAL_S", 0.001)
+
+        supervisor.stop_all(grace_s=0.05)
+
+        last = supervisor.read_last_running()
+        assert last == ["telegram"]
+
+    def test_no_running_does_not_overwrite_last_running(
+        self, isolated_state, monkeypatch
+    ):
+        # Pre-populate with a stale list; if nothing was running, don't clobber.
+        supervisor._write_last_running(["slack", "gmail"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+
+        supervisor.stop_all()
+
+        assert supervisor.read_last_running() == ["slack", "gmail"]
+
+
+class TestResume:
+    def test_no_last_running_returns_empty(self, isolated_state):
+        assert supervisor.resume() == []
+
+    def test_spawns_each_recorded(self, isolated_state, monkeypatch):
+        supervisor._write_last_running(["telegram"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "1")
+        # schedule.yaml is not in last_running, no config check needed.
+        popen = MagicMock(return_value=MagicMock(pid=4242))
+
+        results = supervisor.resume(popen_factory=popen, wait_for_heartbeat=False)
+
+        assert len(results) == 1
+        name, pid, exc = results[0]
+        assert name == "telegram"
+        assert pid == 4242
+        assert exc is None
+
+    def test_skips_already_running(self, isolated_state, monkeypatch):
+        supervisor._write_last_running(["telegram"])
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=999)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+        popen = MagicMock()
+
+        results = supervisor.resume(popen_factory=popen)
+
+        assert len(results) == 1
+        name, pid, exc = results[0]
+        assert name == "telegram"
+        assert pid == 999
+        assert exc is None
+        popen.assert_not_called()
+
+    def test_captures_per_frontend_failures(self, isolated_state, monkeypatch):
+        supervisor._write_last_running(["telegram", "slack"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        # Telegram has valid env; slack has nothing -> PreflightFailed.
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "1")
+        monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_USER_TOKEN", raising=False)
+        popen = MagicMock(return_value=MagicMock(pid=4242))
+
+        results = supervisor.resume(popen_factory=popen, wait_for_heartbeat=False)
+
+        by_name = {r[0]: r for r in results}
+        assert by_name["telegram"][2] is None  # success
+        assert isinstance(by_name["slack"][2], supervisor.PreflightFailed)
+
+    def test_ignores_unknown_frontends_in_state(self, isolated_state):
+        # Deliberately tamper with the file to include a junk entry.
+        path = supervisor._last_running_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"frontends": ["telegram", "not-real"]}')
+
+        assert supervisor.read_last_running() == ["telegram"]
+
+    def test_corrupt_state_file_yields_empty(self, isolated_state):
+        path = supervisor._last_running_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not json")
+
+        assert supervisor.read_last_running() == []

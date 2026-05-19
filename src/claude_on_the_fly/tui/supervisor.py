@@ -48,6 +48,12 @@ KILL_POLL_INTERVAL_S = 0.1
 HEARTBEAT_POLL_INTERVAL_S = 0.1
 HEARTBEAT_FRESH_WINDOW_S = 30.0
 
+
+def _last_running_file() -> Path:
+    """Resolved lazily so tests can monkeypatch STATE_DIR."""
+    return STATE_DIR / "last_running.json"
+
+
 # Frontend name → module path runnable via `python -m`. Skips the `uv run`
 # launcher (saves ~3s of startup delay) and gives us the real interpreter pid.
 _FRONTEND_MODULE: dict[str, str] = {
@@ -387,3 +393,89 @@ def restart(
         wait_for_heartbeat=wait_for_heartbeat,
         spawn_timeout_s=spawn_timeout_s,
     )
+
+
+# ---------------------------------------------------------------------------
+# Bulk operations — stop_all / resume
+# ---------------------------------------------------------------------------
+
+
+def _write_last_running(frontends: list[str]) -> None:
+    """Persist the list of just-stopped daemons so `resume` can restore them."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    target = _last_running_file()
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"frontends": frontends}))
+    tmp.replace(target)
+
+
+def read_last_running() -> list[str]:
+    """Read the last-running list, or [] if absent/corrupt."""
+    path = _last_running_file()
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    fronts = data.get("frontends")
+    if not isinstance(fronts, list):
+        return []
+    return [
+        f for f in fronts if isinstance(f, str) and f in checks.SUPERVISABLE_FRONTENDS
+    ]
+
+
+def stop_all(*, grace_s: float = DEFAULT_GRACE_S) -> list[tuple[str, int]]:
+    """Stop every currently-running daemon. Returns (frontend, pid) per stop.
+
+    Sequential (one at a time) so a single misbehaving daemon does not block
+    the others' grace windows. Records the list of stopped daemons to the
+    last_running file so `resume` can restore them.
+    """
+    stopped: list[tuple[str, int]] = []
+    for name in checks.SUPERVISABLE_FRONTENDS:
+        if not is_running(name):
+            continue
+        try:
+            pid = stop(name, grace_s=grace_s)
+        except NotRunning:
+            continue
+        stopped.append((name, pid))
+    if stopped:
+        _write_last_running([name for name, _ in stopped])
+    return stopped
+
+
+def resume(
+    *,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+    env: Mapping[str, str] | None = None,
+    popen_factory=subprocess.Popen,
+    wait_for_heartbeat: bool = True,
+    spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
+) -> list[tuple[str, int | None, Exception | None]]:
+    """Spawn every frontend recorded by the most recent stop_all().
+
+    Skips daemons that are already running. Returns (frontend, pid, error)
+    triples — error is None on success, the raised exception otherwise.
+    Per-frontend failures do not abort the rest.
+    """
+    results: list[tuple[str, int | None, Exception | None]] = []
+    for name in read_last_running():
+        if is_running(name):
+            results.append((name, _resolve_pid(name), None))
+            continue
+        try:
+            pid = spawn(
+                name,
+                env_file=env_file,
+                env=env,
+                popen_factory=popen_factory,
+                wait_for_heartbeat=wait_for_heartbeat,
+                spawn_timeout_s=spawn_timeout_s,
+            )
+            results.append((name, pid, None))
+        except Exception as exc:
+            results.append((name, None, exc))
+    return results

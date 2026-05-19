@@ -38,6 +38,8 @@ class DashboardScreen(Screen):
         ("s", "start", "Start"),
         ("k", "stop", "Stop"),
         ("r", "restart", "Restart"),
+        ("K", "stop_all", "Stop all"),
+        ("u", "resume", "Resume"),
         ("e", "edit_env", "Edit .env"),
         ("R", "refresh_now", "Refresh"),
         ("q", "app.quit", "Quit"),
@@ -141,6 +143,47 @@ class DashboardScreen(Screen):
 
     async def action_restart(self) -> None:
         await self._run_supervisor_action("restart", supervisor.restart)
+
+    async def action_stop_all(self) -> None:
+        if self._busy_msg:
+            return
+        self._set_busy("stopping all daemons")
+        try:
+            stopped = await asyncio.to_thread(supervisor.stop_all)
+            if not stopped:
+                self._notify("nothing running", "warning")
+                return
+            names = ", ".join(name for name, _ in stopped)
+            self._notify(
+                f"stopped {len(stopped)}: {names} (press u to resume)",
+                "information",
+            )
+        finally:
+            self._clear_busy()
+            self._refresh()
+
+    async def action_resume(self) -> None:
+        if self._busy_msg:
+            return
+        recorded = supervisor.read_last_running()
+        if not recorded:
+            self._notify("nothing to resume (no last-running record)", "warning")
+            return
+        self._set_busy(f"resuming {len(recorded)} daemon(s)")
+        try:
+            results = await asyncio.to_thread(supervisor.resume)
+            successes = [name for name, _, exc in results if exc is None]
+            failures = [(name, exc) for name, _, exc in results if exc is not None]
+            if successes:
+                self._notify(
+                    f"started {len(successes)}: {', '.join(successes)}",
+                    "information",
+                )
+            for name, exc in failures:
+                self._notify(f"{name}: {exc}", "error")
+        finally:
+            self._clear_busy()
+            self._refresh()
 
     def _set_busy(self, msg: str) -> None:
         self._busy_msg = msg

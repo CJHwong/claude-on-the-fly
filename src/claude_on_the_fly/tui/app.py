@@ -6,6 +6,8 @@ Subcommands:
     claude-tui start <frontend>      spawn a detached daemon
     claude-tui stop <frontend>       SIGTERM then SIGKILL
     claude-tui restart <frontend>    stop + spawn
+    claude-tui stop-all              stop every running daemon
+    claude-tui resume                respawn whatever stop-all stopped
 """
 
 from __future__ import annotations
@@ -57,6 +59,32 @@ def cmd_stop(frontend: str) -> int:
         return 1
     print(f"stopped {frontend} (pid {pid})")
     return 0
+
+
+def cmd_stop_all() -> int:
+    stopped = supervisor.stop_all()
+    if not stopped:
+        print("nothing running")
+        return 0
+    for name, pid in stopped:
+        print(f"stopped {name} (pid {pid})")
+    print(f"\n{len(stopped)} daemon(s) stopped. Use `claude-tui resume` to restart.")
+    return 0
+
+
+def cmd_resume(env_file: Path | None) -> int:
+    results = supervisor.resume(env_file=env_file)
+    if not results:
+        print("nothing to resume (no last-running record found)")
+        return 0
+    failed = 0
+    for name, pid, exc in results:
+        if exc is None:
+            print(f"started {name} (pid {pid})")
+        else:
+            failed += 1
+            print(f"failed {name}: {exc}", file=sys.stderr)
+    return 0 if failed == 0 else 2
 
 
 def cmd_restart(frontend: str, env_file: Path | None) -> int:
@@ -128,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     _add_frontend_arg(restart)
     _add_env_arg(restart)
 
+    sub.add_parser("stop-all", help="Stop every running daemon")
+
+    resume = sub.add_parser("resume", help="Respawn whatever stop-all stopped")
+    _add_env_arg(resume)
+
     args = parser.parse_args(argv)
 
     if args.cmd == "status":
@@ -138,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stop(args.frontend)
     if args.cmd == "restart":
         return cmd_restart(args.frontend, args.env_file)
+    if args.cmd == "stop-all":
+        return cmd_stop_all()
+    if args.cmd == "resume":
+        return cmd_resume(args.env_file)
     return cmd_interactive()
 
 
