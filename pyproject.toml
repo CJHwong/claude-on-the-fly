@@ -12,7 +12,9 @@ dependencies = [
     "python-liquid>=2.1.0",
     "python-telegram-bot>=22.7",
     "pyyaml>=6.0",
+    "rich>=15.0.0",
     "slack-bolt>=1.27.0",
+    "textual>=8.2.6",
 ]
 
 [project.scripts]
@@ -21,6 +23,7 @@ claude-slack = "claude_on_the_fly.slack:main"
 claude-gmail = "claude_on_the_fly.gmail:main"
 claude-schedule = "claude_on_the_fly.scheduler:main"
 claude-symphony = "claude_on_the_fly.symphony.cli:main"
+claude-tui = "claude_on_the_fly.tui.app:main"
 
 [dependency-groups]
 dev = [
