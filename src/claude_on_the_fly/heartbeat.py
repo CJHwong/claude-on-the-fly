@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -65,6 +66,7 @@ class HeartbeatWriter:
         self._pid = pid if pid is not None else os.getpid()
         self._started_at = _utcnow_iso()
         self._version = _package_version()
+        self._executable = sys.executable
         self._path = self._state_dir / f"{frontend}.json"
 
     @property
@@ -86,6 +88,7 @@ class HeartbeatWriter:
                 "started_at": self._started_at,
                 "last_heartbeat": _utcnow_iso(),
                 "version": self._version,
+                "executable": self._executable,
                 "extra": extra,
             }
             tmp = self._path.with_suffix(".json.tmp")

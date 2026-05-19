@@ -18,6 +18,10 @@ class ClaudeTuiApp(App):
     #dashboard-body {
         padding: 1 2;
     }
+    #dashboard-body #stale-banner {
+        height: auto;
+        padding: 0 0 1 0;
+    }
     #dashboard-body #frontends {
         height: auto;
     }

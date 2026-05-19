@@ -30,6 +30,8 @@ def _write_heartbeat(
     last_heartbeat: str = "2026-05-19T13:00:00Z",
     started_at: str = "2026-05-19T12:00:00Z",
     extra: dict | None = None,
+    version: str | None = "0.1.0",
+    executable: str | None = "/venv/bin/python",
 ) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -37,9 +39,12 @@ def _write_heartbeat(
         "pid": pid,
         "started_at": started_at,
         "last_heartbeat": last_heartbeat,
-        "version": "0.1.0",
         "extra": extra or {},
     }
+    if version is not None:
+        payload["version"] = version
+    if executable is not None:
+        payload["executable"] = executable
     (state_dir / f"{frontend}.json").write_text(json.dumps(payload))
 
 
@@ -217,6 +222,139 @@ class TestJobs:
         snap = snapshot(empty_state, schedule, process_check=alive_check)
         assert snap.jobs == []
         assert snap.schedule_error is not None
+
+
+# ---------------------------------------------------------------------------
+# Snapshot — stale detection (post-upgrade)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleDetection:
+    def test_matching_version_and_executable_not_stale(self, empty_state, alive_check):
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            version="0.1.0",
+            executable="/venv/bin/python",
+        )
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=alive_check,
+            self_version="0.1.0",
+            self_executable="/venv/bin/python",
+        )
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.state == "running"
+        assert tg.stale is False
+
+    def test_different_executable_marks_running_daemon_stale(
+        self, empty_state, alive_check
+    ):
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            version="0.1.0",
+            executable="/old-venv/bin/python",
+        )
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=alive_check,
+            self_version="0.1.0",
+            self_executable="/new-venv/bin/python",
+        )
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.stale is True
+
+    def test_different_version_marks_running_daemon_stale(
+        self, empty_state, alive_check
+    ):
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            version="0.1.0",
+            executable="/venv/bin/python",
+        )
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=alive_check,
+            self_version="0.2.0",
+            self_executable="/venv/bin/python",
+        )
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.stale is True
+
+    def test_stopped_daemon_never_stale(self, empty_state, dead_check):
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            version="0.1.0",
+            executable="/old/bin/python",
+        )
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=dead_check,
+            self_version="0.2.0",
+            self_executable="/new/bin/python",
+        )
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.state == "stopped"
+        assert tg.stale is False
+
+    def test_missing_executable_field_does_not_false_positive(
+        self, empty_state, alive_check
+    ):
+        # Pre-feature heartbeat (no executable field) — can't compare, treat as not stale.
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            version="0.1.0",
+            executable=None,
+        )
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=alive_check,
+            self_version="0.1.0",
+            self_executable="/whatever/bin/python",
+        )
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.stale is False
+        assert tg.executable is None
+
+    def test_propagates_version_and_executable_into_status(
+        self, empty_state, alive_check
+    ):
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            version="0.1.0",
+            executable="/venv/bin/python",
+        )
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=alive_check,
+            self_version="0.1.0",
+            self_executable="/venv/bin/python",
+        )
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.version == "0.1.0"
+        assert tg.executable == "/venv/bin/python"
 
 
 # ---------------------------------------------------------------------------

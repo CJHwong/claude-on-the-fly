@@ -15,9 +15,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Literal
 
@@ -52,6 +55,9 @@ class FrontendStatus:
     last_heartbeat_age_s: float | None = None
     extra: dict = field(default_factory=dict)
     error: str | None = None  # parse error, etc.
+    version: str | None = None
+    executable: str | None = None
+    stale: bool = False  # running but code/env differs from TUI's own
 
 
 @dataclass(frozen=True)
@@ -105,11 +111,41 @@ def parse_iso_utc(ts: str) -> datetime:
 _parse_iso_utc = parse_iso_utc
 
 
+def tui_version() -> str:
+    """Resolved package version of the currently running TUI."""
+    try:
+        return _pkg_version("claude-on-the-fly")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _is_stale(
+    state_str: FrontendState,
+    daemon_version: str | None,
+    daemon_executable: str | None,
+    self_version: str,
+    self_executable: str,
+) -> bool:
+    """A daemon is stale when it's running but its recorded version or
+    executable path differs from the TUI's own. Missing fields (older
+    daemons without `executable` in the heartbeat) are treated as
+    "can't tell" so we don't false-positive during a rollout."""
+    if state_str != "running":
+        return False
+    if daemon_version is not None and daemon_version != self_version:
+        return True
+    if daemon_executable is not None and daemon_executable != self_executable:
+        return True
+    return False
+
+
 def _frontend_status_from_heartbeat(
     name: str,
     state_dir: Path,
     now: datetime,
     process_check: Callable[[int], bool],
+    self_version: str,
+    self_executable: str,
 ) -> FrontendStatus:
     path = state_dir / f"{name}.json"
     if not path.is_file():
@@ -126,6 +162,14 @@ def _frontend_status_from_heartbeat(
     last_heartbeat = payload.get("last_heartbeat")
     started_at = payload.get("started_at")
     extra = payload.get("extra") or {}
+    daemon_version = (
+        payload.get("version") if isinstance(payload.get("version"), str) else None
+    )
+    daemon_executable = (
+        payload.get("executable")
+        if isinstance(payload.get("executable"), str)
+        else None
+    )
 
     if not isinstance(pid, int) or not isinstance(last_heartbeat, str):
         return FrontendStatus(
@@ -160,6 +204,11 @@ def _frontend_status_from_heartbeat(
         last_heartbeat=last_heartbeat,
         last_heartbeat_age_s=age_s,
         extra=extra if isinstance(extra, dict) else {},
+        version=daemon_version,
+        executable=daemon_executable,
+        stale=_is_stale(
+            state, daemon_version, daemon_executable, self_version, self_executable
+        ),
     )
 
 
@@ -214,14 +263,22 @@ def snapshot(
     *,
     now: datetime | None = None,
     process_check: Callable[[int], bool] = _process_exists,
+    self_version: str | None = None,
+    self_executable: str | None = None,
 ) -> Snapshot:
-    """Snapshot the current state of every supervisable frontend + scheduler."""
+    """Snapshot the current state of every supervisable frontend + scheduler.
+
+    self_version / self_executable default to the live TUI's values; tests
+    can override either to simulate a fresh upgrade.
+    """
     sd = state_dir if state_dir is not None else STATE_DIR
     sy = schedule_yaml if schedule_yaml is not None else DEFAULT_SCHEDULE_YAML
     ts = now if now is not None else datetime.now(timezone.utc)
+    sv = self_version if self_version is not None else tui_version()
+    se = self_executable if self_executable is not None else sys.executable
 
     frontends = [
-        _frontend_status_from_heartbeat(name, sd, ts, process_check)
+        _frontend_status_from_heartbeat(name, sd, ts, process_check, sv, se)
         for name in SUPERVISABLE_FRONTENDS
     ]
     jobs, schedule_error = _jobs_from_schedule(sy, ts)

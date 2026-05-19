@@ -23,3 +23,6 @@ wheels/
 
 # Runtime
 workspaces/
+
+# hatch-vcs writes the resolved version here at build time
+src/claude_on_the_fly/_version.py

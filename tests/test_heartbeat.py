@@ -28,6 +28,11 @@ class TestWriteOnce:
         assert "started_at" in payload
         assert "last_heartbeat" in payload
         assert "version" in payload
+        assert "executable" in payload
+        assert (
+            payload["executable"].endswith("python")
+            or "python" in payload["executable"]
+        )
         assert payload["extra"] == {}
 
     def test_extra_provider_embedded(self, tmp_path):

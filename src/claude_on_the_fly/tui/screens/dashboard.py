@@ -55,6 +55,7 @@ class DashboardScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="dashboard-body"):
+            yield Static(id="stale-banner", markup=True)
             yield DataTable(id="frontends", cursor_type="row", zebra_stripes=True)
             yield Static(id="jobs-content")
             yield Static(id="log-header", markup=True)
@@ -304,3 +305,14 @@ class DashboardScreen(Screen):
             )
         else:
             jobs_widget.update(Text("No schedule.yaml found.", style="dim"))
+
+        stale = [f.name for f in snap.frontends if f.stale]
+        banner = self.query_one("#stale-banner", Static)
+        if stale:
+            names = ", ".join(stale)
+            banner.update(
+                f"[bold yellow]⚠ {len(stale)} daemon(s) out of date "
+                f"({names}) — press Shift+K then u to upgrade.[/bold yellow]"
+            )
+        else:
+            banner.update("")
