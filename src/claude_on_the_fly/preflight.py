@@ -1,4 +1,9 @@
-"""Preflight checks - validate tokens and tools before starting."""
+"""Preflight checks - validate tokens and tools before starting.
+
+Env validation is delegated to claude_on_the_fly.checks (structured CheckResult
+model, also consumed by the TUI doctor view). Live checks (httpx token probes,
+subprocess CLI probes) live here.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,9 @@ import subprocess
 
 import httpx
 
+from claude_on_the_fly import checks
+from claude_on_the_fly.checks import CheckResult
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,6 +28,17 @@ def require_env(name: str) -> str:
     if not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+def _raise_on_failures(results: list[CheckResult]) -> None:
+    """Raise SystemExit on the first non-ok result, preserving its detail."""
+    fail = checks.first_failure(results)
+    if fail is None:
+        return
+    msg = f"{fail.name}: {fail.detail}"
+    if fail.fix_hint:
+        msg += f" — {fail.fix_hint}"
+    raise SystemExit(msg)
 
 
 def _extract_cli_result(stdout: str) -> str:
@@ -237,14 +256,9 @@ def _setup_logging() -> None:
 def run_telegram() -> tuple[str, int]:
     """Validate env vars and tokens. Returns (token, allowed_user_id)."""
     _setup_logging()
-    token = require_env("TELEGRAM_BOT_TOKEN")
-    raw_user_id = require_env("TELEGRAM_ALLOWED_USER_ID")
-    try:
-        allowed_user_id = int(raw_user_id)
-    except ValueError:
-        raise SystemExit(
-            f"TELEGRAM_ALLOWED_USER_ID must be an integer, got: {raw_user_id!r}"
-        )
+    _raise_on_failures(checks.check_telegram(os.environ))
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    allowed_user_id = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
     check_backend()
     asyncio.run(check_telegram(token))
     return token, allowed_user_id
@@ -256,8 +270,9 @@ def run_slack() -> tuple[str, str, str, set[str]]:
     user_id is resolved from Slack auth.test — no need to pass it via env.
     """
     _setup_logging()
-    app_token = require_env("SLACK_APP_TOKEN")
-    user_token = require_env("SLACK_USER_TOKEN")
+    _raise_on_failures(checks.check_slack(os.environ))
+    app_token = os.environ["SLACK_APP_TOKEN"]
+    user_token = os.environ["SLACK_USER_TOKEN"]
     allowed_raw = os.environ.get("SLACK_ALLOWED_USER_IDS", "")
     allowed_user_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
     check_backend()
@@ -269,13 +284,10 @@ def run_slack() -> tuple[str, str, str, set[str]]:
 def run_gmail() -> tuple[str, set[str]]:
     """Validate env vars and gws CLI. Returns (gcp_project, allowed_senders)."""
     _setup_logging()
-    gcp_project = require_env("GMAIL_GCP_PROJECT")
-    allowed_raw = require_env("GMAIL_ALLOWED_SENDERS")
+    _raise_on_failures(checks.check_gmail(os.environ))
+    gcp_project = os.environ["GMAIL_GCP_PROJECT"]
+    allowed_raw = os.environ["GMAIL_ALLOWED_SENDERS"]
     allowed_senders = {s.strip() for s in allowed_raw.split(",") if s.strip()}
-    if not allowed_senders:
-        raise SystemExit(
-            "GMAIL_ALLOWED_SENDERS must contain at least one email address"
-        )
     check_backend()
     check_gws_cli()
     return gcp_project, allowed_senders
