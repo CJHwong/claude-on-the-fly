@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
 from claude_on_the_fly.agent import DATA_DIR, ClaudeUnavailableError, Response
+from claude_on_the_fly.heartbeat import HeartbeatWriter
 from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
@@ -152,13 +153,21 @@ async def run(frontend: Frontend, platform: str) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    heartbeat = HeartbeatWriter(platform)
+    heartbeat_task = asyncio.create_task(heartbeat.run())
+
     frontend_task = asyncio.create_task(frontend.start(orch.on_message))
     logger.info("Running (%s). Ctrl+C to stop.", platform)
 
     await stop.wait()
 
     logger.info("Shutting down...")
+    heartbeat_task.cancel()
     frontend_task.cancel()
-    await asyncio.gather(frontend_task, return_exceptions=True)
+    await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
     await orch.shutdown()
     await frontend.stop()
+    try:
+        heartbeat.path.unlink()
+    except FileNotFoundError:
+        pass

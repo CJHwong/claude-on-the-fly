@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 from claude_on_the_fly.agent import ClaudeUnavailableError
+from claude_on_the_fly.heartbeat import HeartbeatWriter
 
 from .agent_runner import TicketRunner, session_uuid_for
 from .config import SymphonyConfig, TrackerConfig, load_config
@@ -539,6 +540,16 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     retry_queue = RetryQueue()
     pending_tasks: set[asyncio.Task[None]] = set()
 
+    heartbeat = HeartbeatWriter(
+        "symphony",
+        extra_provider=lambda: {
+            "running": state.running_count(),
+            "pending_workers": len(pending_tasks),
+            "retry_queue": len(retry_queue.all_pending()),
+        },
+    )
+    heartbeat_task = asyncio.create_task(heartbeat.run())
+
     logger.info(
         "symphony: started (poll every %dms, prompt=%s)",
         config.polling_ms,
@@ -572,5 +583,11 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
     finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        try:
+            heartbeat.path.unlink()
+        except FileNotFoundError:
+            pass
         await tracker.aclose()
         logger.info("symphony: shut down")
