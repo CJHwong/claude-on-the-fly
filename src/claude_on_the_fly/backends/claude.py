@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
 
-from claude_on_the_fly import agent, transcript
+from claude_on_the_fly import agent, pricing, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     ClaudeUnavailableError,
@@ -112,14 +113,33 @@ class ClaudeBackend:
             body = (cli_output.get("result") or "").strip() or "No response"
 
         usage = cli_output.get("usage", {})
+        tokens_in = usage.get("input_tokens", 0) + usage.get(
+            "cache_read_input_tokens", 0
+        )
+        tokens_out = usage.get("output_tokens", 0)
+        model = next(iter(cli_output.get("modelUsage", {})), "")
+
+        # In ollama mode the claude CLI still computes total_cost_usd from
+        # Anthropic's price table, which is meaningless when ollama is
+        # actually serving the model. Look up the routed model's price in
+        # the OpenRouter registry instead, matching how the codex backend
+        # handles its own cost. Native mode keeps the CLI's value, which
+        # reflects Anthropic's real billing.
+        if self.launcher is not None:
+            cost = (
+                await asyncio.to_thread(pricing.cost_for, model, tokens_in, tokens_out)
+                or 0
+            )
+        else:
+            cost = cli_output.get("total_cost_usd", 0)
+
         return Response(
             body=body,
-            cost=cli_output.get("total_cost_usd", 0),
+            cost=cost,
             duration=cli_output.get("duration_ms", 0) / 1000,
-            tokens_in=usage.get("input_tokens", 0)
-            + usage.get("cache_read_input_tokens", 0),
-            tokens_out=usage.get("output_tokens", 0),
-            model=next(iter(cli_output.get("modelUsage", {})), ""),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            model=model,
             tool_counts=cli_output.get("tool_counts", {}),
             skill_counts=cli_output.get("skill_counts", {}),
         )

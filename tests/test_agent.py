@@ -1249,6 +1249,64 @@ class TestClaudeBackendLauncher:
         model_indices = [i for i, v in enumerate(cmd) if v == "--model"]
         assert model_indices == [3]
 
+    async def test_native_mode_uses_cli_total_cost_usd(self):
+        """Without a launcher, cost comes straight from claude's billing field."""
+        output = _cli_output(cost=0.05)
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ):
+            resp = await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert resp.cost == 0.05
+
+    async def test_launcher_mode_ignores_cli_total_cost_usd(self):
+        """Ollama mode: CLI's Anthropic-priced cost is bogus; pricing.cost_for wins."""
+        output = _cli_output(
+            cost=0.99,  # nonsense Anthropic-priced value from CLI
+            input_tokens=100,
+            cache_read=50,
+            output_tokens=200,
+            model="deepseek-v4-flash:cloud",
+        )
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with (
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=output,
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude.pricing.cost_for",
+                return_value=0.0042,
+            ) as mock_pricing,
+        ):
+            resp = await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        assert resp.cost == 0.0042
+        mock_pricing.assert_called_once_with("deepseek-v4-flash:cloud", 150, 200)
+
+    async def test_launcher_mode_unknown_model_yields_zero(self):
+        """Local models (e.g. gpt-oss:20b) aren't in OpenRouter — cost is $0."""
+        output = _cli_output(cost=0.50, model="gpt-oss:20b")
+        launcher = OllamaLauncher(model="gpt-oss:20b")
+        with (
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=output,
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude.pricing.cost_for",
+                return_value=None,
+            ),
+        ):
+            resp = await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        assert resp.cost == 0
+
     async def test_launcher_does_not_repeat_claude_binary(self):
         """Regression: ollama launch claude already invokes the binary; a
         second "claude" after `--` becomes argv[1] which -p parses as the prompt."""
