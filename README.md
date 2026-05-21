@@ -37,7 +37,7 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-gmail
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-schedule
 
 # Symphony (Jira-driven daemon)
-# write ~/.claude-on-the-fly/symphony.yaml + symphony-prompt.md (see Symphony Setup)
+# write ~/.claude-on-the-fly/symphony.yaml + symphony-prompt-{jira,github}.md (see Symphony Setup)
 export JIRA_EMAIL=you@your-org.com
 export JIRA_API_TOKEN=...
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-symphony
@@ -179,37 +179,42 @@ uv run claude-schedule
 
 ## Symphony Setup (5 minutes)
 
-Long-running daemon that polls Jira on a label gate, claims tickets, and runs Claude Code in per-ticket sessions until each ticket leaves an active state. Inspired by [openai/symphony](https://github.com/openai/symphony), adapted for Jira and per-org git worktrees.
+Long-running daemon that polls one or more trackers (Jira, GitHub PRs), claims tickets, and runs Claude Code in per-ticket sessions until each ticket leaves an active state. Inspired by [openai/symphony](https://github.com/openai/symphony), extended for multi-source dispatch.
 
 ### Two config files
 
-**`~/.claude-on-the-fly/symphony.yaml`** — daemon settings (auth, JQL gate, polling, concurrency):
+**`~/.claude-on-the-fly/symphony.yaml`** — daemon settings. Multi-tracker shape (each source has its own active/terminal states, gate label, and prompt):
 
 ```yaml
-tracker:
-  kind: jira                    # only "jira" registered today; defaults to jira if omitted
-  base_url: https://your-org.atlassian.net
-  email: $JIRA_EMAIL
-  api_token: $JIRA_API_TOKEN
-  project_key: PROJ
-  jql_extra: 'AND assignee = currentUser() AND labels = "stevedore"'
+trackers:
+  jira:
+    kind: jira
+    base_url: https://your-org.atlassian.net
+    email: $JIRA_EMAIL
+    api_token: $JIRA_API_TOKEN
+    project_key: PROJ
+    jql_extra: 'AND assignee = currentUser() AND labels = "stevedore"'
+    gate_label: stevedore
+    prompt: ./symphony-prompt-jira.md
 
-# Defaults shown; uncomment only to override:
+  github:
+    kind: github                  # PRs requesting your review (gh CLI auth)
+    prompt: ./symphony-prompt-github.md
+    # No gate label: submitting any review removes you from reviewRequests,
+    # which is symphony's "done" signal.
+
+# Defaults shown; uncomment to override:
 # polling_ms: 30000
-# max_concurrent: 1
-# max_concurrent_by_state:      # per-state caps stricter than the global limit; keys lowercased
-#   "rework": 1
-#   "in progress": 5
-# max_turns: 20                 # -1 = unlimited (then stall_timeout_ms is your safety net)
+# max_concurrent: 1               # global cap across ALL trackers
+# max_turns: 20                   # -1 = unlimited (rely on stall_timeout_ms)
 # stall_timeout_ms: 1800000
-# active_states:   ["To Do", "In Progress"]
-# terminal_states: ["Done", "Closed", "Cancelled"]
-# gate_label: stevedore
 ```
 
-**Adding a new tracker** (Linear, GitHub Issues, etc.): write a class that satisfies `tracker.Tracker` Protocol (`fetch_one`, `fetch_candidates`, `fetch_states_by_keys`, `aclose`, `from_config`), register it in `SUPPORTED_TRACKERS` in `src/claude_on_the_fly/symphony/tracker/__init__.py`, then set `tracker.kind: <new-kind>` in `symphony.yaml`. No orchestrator changes needed.
+The legacy singular `tracker:` form (with top-level `prompt:`, `gate_label:`, `max_concurrent_by_state:`) is still accepted and auto-wrapped into a single-entry trackers map. Existing configs keep working unchanged.
 
-**`~/.claude-on-the-fly/symphony-prompt.md`** — Liquid-templated instructions the agent follows per ticket. Variables available: `issue.identifier`, `issue.title`, `issue.state`, `issue.url`, `issue.labels`, `issue.description_json`, `attempt`, `workspace_path`, `gate_label`. See `symphony-prompt.md.example` at the repo root for a starter.
+**Adding a new tracker** (Linear, GitHub Issues, etc.): write a class that satisfies `tracker.Tracker` Protocol (`fetch_one`, `fetch_candidates`, `fetch_summaries_by_keys`, `is_terminal`, `is_active`, `issue_to_summary`, `aclose`, `from_config`), register it in `SUPPORTED_TRACKERS` in `src/claude_on_the_fly/symphony/tracker/__init__.py`, then add a stanza under `trackers:` in `symphony.yaml`. No orchestrator changes needed.
+
+**`~/.claude-on-the-fly/symphony-prompt-{source}.md`** — Liquid-templated instructions the agent follows per ticket. Variables available: `issue.identifier`, `issue.title`, `issue.state`, `issue.url`, `issue.labels`, `issue.description_json` (Jira), `issue.body_text` (GitHub), `attempt`, `workspace_path`, `gate_label`. See `symphony-prompt-jira.md.example` and `symphony-prompt-github.md.example` at the repo root.
 
 Edits to either file are picked up on the next tick (mtime hot reload). Restart the daemon to apply schema changes that affect already-claimed tickets.
 
@@ -224,14 +229,14 @@ uv run claude-symphony
 
 ### How It Works
 
-- Polls JQL `project = PROJ AND status in <active_states> {jql_extra}` every `polling_ms`.
-- Add the gate label (default `stevedore`) to a ticket and the daemon picks it up on the next tick.
-- Per ticket: creates a small scratch dir at `~/.claude-on-the-fly/workspaces/symphony/<TICKET-KEY>/` (with the global `CLAUDE.md` persona symlinked in), spawns Claude Code with `--resume <deterministic-uuid>`, loops turns until the ticket transitions to a terminal state, transitions out of active states, or hits `max_turns`.
-- The agent works on existing source-repo clones declared in your prompt — it `git worktree add`s alongside those clones, NOT inside the scratch dir. Edit the repo list in `symphony-prompt.md` to match your machine.
-- Reconciles every tick: catches mid-turn state transitions (someone moves the ticket to Done while the agent is working), cancels the worker, removes the scratch dir.
+- Polls every configured tracker each `polling_ms`. Jira: JQL `project = PROJ AND status in <active_states> {jql_extra}`. GitHub: `gh search prs --review-requested=@me --state=open --draft=false`.
+- Gating: Jira uses a label (default `stevedore`) that the agent removes when done. GitHub uses review assignment — submitting any review removes you from `reviewRequests` automatically.
+- Per ticket: creates a per-source scratch dir at `~/.claude-on-the-fly/workspaces/symphony/<source>/<KEY>/` (with the global `CLAUDE.md` persona symlinked in), spawns Claude Code with `--resume <deterministic-uuid>`, loops turns until the ticket reaches a terminal state, leaves active states, or hits `max_turns`.
+- The agent works on existing source-repo clones declared in your prompt — it `git worktree add`s alongside those clones, NOT inside the scratch dir. GitHub PR review uses `gh` directly without cloning. Edit the repo list in `symphony-prompt-jira.md` to match your machine.
+- Reconciles every tick using each tracker's `is_terminal` / `is_active` predicates. Catches mid-turn state transitions (ticket moved to Done while the agent is working, or `@me` removed from a PR's reviewRequests), cancels the worker, removes the scratch dir.
 - Failures (`ClaudeUnavailableError`, exceptions, stalls) go through a retry queue with exponential backoff. `max_turns` exhaustion gets a 1s continuation retry.
-- The agent owns git worktrees and branch hygiene (the daemon does NOT run git). It also owns Jira writes: status transitions via `acli`, comments via direct ADF POST to the REST API (acli does not convert markdown to ADF).
-- Stop signals (escalating force): remove the gate label, transition the ticket to a terminal state, SIGINT the daemon.
+- The agent owns git worktrees and branch hygiene (the daemon does NOT run git). It also owns tracker writes: Jira status transitions via `acli`, comments via direct ADF POST to the REST API; GitHub reviews via `gh pr review` and `gh api`.
+- Stop signals (escalating force): Jira — remove the gate label, transition to terminal state, SIGINT. GitHub — submit any review, close the PR, SIGINT.
 
 ### Symphony Variables
 

@@ -5,6 +5,7 @@ the `Tracker` Protocol from `base.py` and registering in `SUPPORTED_TRACKERS`.
 from __future__ import annotations
 
 from .base import Tracker
+from .github import GitHubTracker
 from .issue import BlockerRef, Issue
 from .jira import JiraTracker
 
@@ -12,6 +13,7 @@ from .jira import JiraTracker
 # Each adapter must implement Tracker Protocol and provide from_config(cfg).
 SUPPORTED_TRACKERS: dict[str, type[Tracker]] = {
     "jira": JiraTracker,
+    "github": GitHubTracker,
 }
 
 
@@ -38,6 +40,7 @@ def make_trackers(config) -> dict[str, Tracker]:
 
 __all__ = [
     "BlockerRef",
+    "GitHubTracker",
     "Issue",
     "JiraTracker",
     "SUPPORTED_TRACKERS",

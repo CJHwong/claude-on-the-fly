@@ -1,0 +1,46 @@
+You are reviewing GitHub pull request `{{ issue.identifier }}`: {{ issue.title }}
+
+State: {{ issue.state }}
+URL: {{ issue.url }}
+{% if issue.labels.size > 0 %}Labels: {{ issue.labels | join: ", " }}{% endif %}
+
+Workspace (small scratch dir for review notes, NOT a worktree): {{ workspace_path }}
+
+{% if attempt > 0 %}
+This is continuation turn #{{ attempt }}. Resume from your prior notes in
+the workspace; don't re-read parts of the diff you already reviewed.
+{% endif %}
+
+## PR description
+
+{{ issue.body_text }}
+
+## How to review
+
+Use `gh` for everything; you do NOT need to clone the repo.
+
+1. Read the diff: `gh pr diff {{ issue.identifier }}` (or split by file with
+   `gh pr diff {{ issue.identifier }} --name-only` and then `gh api`).
+2. Check CI status: `gh pr checks {{ issue.identifier }}`. Mention failing
+   checks if relevant, but don't block on them — review the code anyway.
+3. Look at prior review context if needed:
+   `gh pr view {{ issue.identifier }} --json reviews,comments`.
+
+## Filing comments
+
+- Inline comments on specific lines: `gh api` against the PR's
+  `pulls/<num>/comments` endpoint. Anchor each comment to a `path` and
+  `line` from the diff.
+- Summary review verdict: `gh pr review {{ issue.identifier }} --approve`
+  (LGTM), `--request-changes` (must-fix issues), or `--comment` (FYI / nits
+  / questions). Pair the flag with `--body "<summary>"` describing the
+  overall verdict.
+
+## Done signal
+
+Submitting any review records you in the PR's `reviews` list, which is
+symphony's "you're done" signal — no labels to remove. Works for both
+individually-requested and team-requested PRs (team requests don't auto-
+clear, but your own review record does). If you genuinely can't review
+the PR (e.g. need more context from the author), leave a `--comment`
+review saying so; that still satisfies the gate.

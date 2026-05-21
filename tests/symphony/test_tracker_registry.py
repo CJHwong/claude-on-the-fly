@@ -7,6 +7,7 @@ import pytest
 from claude_on_the_fly.symphony.config import TrackerConfig
 from claude_on_the_fly.symphony.tracker import (
     SUPPORTED_TRACKERS,
+    GitHubTracker,
     JiraTracker,
     Tracker,
     make_tracker,
@@ -28,6 +29,8 @@ def _cfg(kind: str = "jira") -> TrackerConfig:
 def test_supported_trackers_registered():
     assert "jira" in SUPPORTED_TRACKERS
     assert SUPPORTED_TRACKERS["jira"] is JiraTracker
+    assert "github" in SUPPORTED_TRACKERS
+    assert SUPPORTED_TRACKERS["github"] is GitHubTracker
 
 
 def test_make_tracker_returns_jira():
@@ -43,10 +46,24 @@ def test_make_tracker_unknown_kind_raises():
 
 def test_make_tracker_error_lists_supported():
     cfg = _cfg("notreal")
-    with pytest.raises(ValueError, match=r"Available: \['jira'\]"):
+    with pytest.raises(ValueError, match=r"Available: \['github', 'jira'\]"):
         make_tracker(cfg)
 
 
 def test_jira_tracker_satisfies_protocol():
     t = make_tracker(_cfg())
     assert isinstance(t, Tracker)  # runtime_checkable Protocol
+
+
+def test_github_tracker_satisfies_protocol():
+    from unittest.mock import patch
+
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    with patch(
+        "claude_on_the_fly.symphony.tracker.github.shutil.which",
+        return_value="/usr/local/bin/gh",
+    ):
+        t = make_tracker(GitHubTrackerConfig(kind="github"))
+    assert isinstance(t, Tracker)
+    assert isinstance(t, GitHubTracker)
