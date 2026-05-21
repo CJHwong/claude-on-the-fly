@@ -25,13 +25,50 @@ class ClaudeTuiApp(App):
     #dashboard-body #frontends {
         height: auto;
     }
-    #dashboard-body #jobs-content {
+    #dashboard-body #jobs-row {
         height: auto;
     }
-    #dashboard-body #log-header {
-        padding: 1 0 0 0;
+    #dashboard-body #jobs-pane {
+        width: 1fr;
+        height: auto;
     }
-    #dashboard-body #log-pane {
+    #dashboard-body #symphony-pane {
+        width: 1fr;
+        height: auto;
+        padding: 0 0 0 2;
+    }
+    #dashboard-body #jobs-header,
+    #dashboard-body #symphony-header {
+        height: auto;
+        padding: 0 0 0 1;
+    }
+    #dashboard-body #jobs-content,
+    #dashboard-body #symphony-tickets {
+        height: auto;
+    }
+    #dashboard-body #symphony-tickets-hint {
+        height: auto;
+    }
+    #dashboard-body #log-row {
+        height: 1fr;
+        min-height: 8;
+    }
+    #dashboard-body #log-daemon-col {
+        width: 1fr;
+        height: 1fr;
+    }
+    #dashboard-body #log-watch-col {
+        width: 1fr;
+        height: 1fr;
+        padding: 0 0 0 2;
+    }
+    #dashboard-body #log-header,
+    #dashboard-body #watch-header {
+        padding: 1 0 0 0;
+        height: auto;
+    }
+    #dashboard-body #log-pane,
+    #dashboard-body #watch-pane {
         height: 1fr;
         min-height: 8;
         border: solid grey;

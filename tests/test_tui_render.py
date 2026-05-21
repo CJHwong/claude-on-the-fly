@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from rich.console import Console
 
 from claude_on_the_fly.tui.render import (
     _fmt_age,
     _fmt_uptime,
+    _format_extra_notes,
+    frontends_table,
     render_snapshot_json,
     render_snapshot_rich,
+    tail_lines,
 )
 from claude_on_the_fly.tui.state import FrontendStatus, JobInfo, Snapshot
 
@@ -118,3 +122,111 @@ class TestJsonRender:
         snap = _make_snapshot(jobs=[], schedule_error="boom")
         payload = json.loads(render_snapshot_json(snap))
         assert payload["schedule_error"] == "boom"
+
+
+class TestFormatExtraNotes:
+    def test_scalars_only(self):
+        assert _format_extra_notes({"a": 1, "b": "x"}) == "a=1, b=x"
+
+    def test_lists_and_dicts_omitted(self):
+        notes = _format_extra_notes(
+            {"running": 2, "running_tickets": [{"id": "P-1"}], "meta": {"x": 1}}
+        )
+        assert notes == "running=2"
+
+    def test_empty_dict(self):
+        assert _format_extra_notes({}) == ""
+
+
+class TestFrontendsTableWithNestedExtras:
+    def test_running_tickets_omitted_from_notes(self):
+        from claude_on_the_fly.tui.state import FrontendStatus
+
+        f = FrontendStatus(
+            name="symphony",
+            state="running",
+            pid=42,
+            started_at="2026-05-19T12:00:00Z",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            last_heartbeat_age_s=5.0,
+            extra={
+                "running": 2,
+                "running_tickets": [{"identifier": "PROJ-1"}],
+            },
+        )
+        out = self._render(
+            frontends_table([f], datetime(2026, 5, 19, 13, 0, 5, tzinfo=timezone.utc))
+        )
+        assert "running=2" in out
+        assert "PROJ-1" not in out
+
+    def _render(self, table) -> str:
+        import io
+
+        buf = io.StringIO()
+        Console(file=buf, width=160, force_terminal=False).print(table)
+        return buf.getvalue()
+
+
+class TestTailLines:
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        assert tail_lines(tmp_path / "missing.log", 5) == []
+
+    def test_empty_file_returns_empty(self, tmp_path: Path) -> None:
+        p = tmp_path / "empty.log"
+        p.write_text("")
+        assert tail_lines(p, 5) == []
+
+    def test_n_zero_returns_empty(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text("a\nb\n")
+        assert tail_lines(p, 0) == []
+
+    def test_fewer_lines_than_n(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text("one\ntwo\nthree\n")
+        # Caller-visible contract: lines include their trailing newline.
+        assert tail_lines(p, 10) == ["one\n", "two\n", "three\n"]
+
+    def test_exactly_n_lines(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text("a\nb\nc\n")
+        assert tail_lines(p, 3) == ["a\n", "b\n", "c\n"]
+
+    def test_more_lines_than_n_returns_last_n(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text("\n".join(str(i) for i in range(100)) + "\n")
+        assert tail_lines(p, 5) == ["95\n", "96\n", "97\n", "98\n", "99\n"]
+
+    def test_no_trailing_newline(self, tmp_path: Path) -> None:
+        # File without a final newline still returns the last line intact.
+        p = tmp_path / "log.log"
+        p.write_text("alpha\nbeta\ngamma")
+        # Last segment has no \n in the source, so we preserve it as-is
+        # (callers strip trailing newlines anyway).
+        result = tail_lines(p, 2)
+        assert result == ["beta\n", "gamma\n"]
+
+    def test_handles_large_file_without_loading_all(self, tmp_path: Path) -> None:
+        # 200KB file with 2000 short lines; we ask for the last 5.
+        p = tmp_path / "big.log"
+        with p.open("w") as f:
+            for i in range(2000):
+                f.write(f"line-{i:04d}\n")
+        result = tail_lines(p, 5)
+        assert result == [
+            "line-1995\n",
+            "line-1996\n",
+            "line-1997\n",
+            "line-1998\n",
+            "line-1999\n",
+        ]
+
+    def test_very_long_lines_force_chunk_growth(self, tmp_path: Path) -> None:
+        # Lines longer than the initial 8KB read chunk — exercises the
+        # exponential-growth path that handles worst-case line widths.
+        p = tmp_path / "wide.log"
+        big = "x" * 20_000
+        p.write_text(f"first\n{big}\nlast\n")
+        assert tail_lines(p, 1) == ["last\n"]
+        assert tail_lines(p, 2) == [f"{big}\n", "last\n"]

@@ -18,17 +18,29 @@ from typing import Callable, Literal
 from rich.text import Text
 
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
-from claude_on_the_fly.agent import DATA_DIR
+from claude_on_the_fly.agent import DATA_DIR, get_backend
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
+from claude_on_the_fly.symphony import watch
+from claude_on_the_fly.symphony.agent_runner import session_uuid_for
+from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
 from claude_on_the_fly.tui import env_editor, render, state, supervisor
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
 
 LOG_DIR = DATA_DIR / "logs"
 TAIL_LINES = 200
+# When showing a symphony ticket watch, tail this many raw JSONL events; each
+# formats to 1–4 visible lines so the rendered pane stays manageable.
+WATCH_EVENTS = 80
+# Cap on RichLog growth so a 24/7 dashboard doesn't accumulate unbounded memory.
+LOG_PANE_MAX_LINES = 10_000
+SYMPHONY_HINT = (
+    "[dim]Watch live: claude-symphony watch <TICKET>    "
+    "Take over: claude-symphony takeover <TICKET>[/dim]"
+)
 
 
 class DashboardScreen(Screen):
@@ -47,8 +59,16 @@ class DashboardScreen(Screen):
 
     def __init__(self) -> None:
         super().__init__()
+        # Daemon log pane state.
         self._log_path: Path | None = None
         self._log_mtime: float | None = None
+        # Watch pane state, tracked separately so the two panes refresh
+        # independently. _watch_target encodes what's being watched, e.g.
+        # "symphony:PROJ-1" or "schedule:cleanup-job", so we know to force
+        # a reload when the user navigates to a different item.
+        self._watch_path: Path | None = None
+        self._watch_mtime: float | None = None
+        self._watch_target: str | None = None
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
 
@@ -57,15 +77,57 @@ class DashboardScreen(Screen):
         with Vertical(id="dashboard-body"):
             yield Static(id="stale-banner", markup=True)
             yield DataTable(id="frontends", cursor_type="row", zebra_stripes=True)
-            yield Static(id="jobs-content")
-            yield Static(id="log-header", markup=True)
-            yield RichLog(id="log-pane", wrap=False, highlight=False, auto_scroll=True)
+            with Horizontal(id="jobs-row"):
+                with Vertical(id="jobs-pane"):
+                    yield Static(id="jobs-header", markup=True)
+                    yield DataTable(
+                        id="jobs-content",
+                        cursor_type="row",
+                        zebra_stripes=True,
+                    )
+                with Vertical(id="symphony-pane"):
+                    yield Static(id="symphony-header", markup=True)
+                    yield DataTable(
+                        id="symphony-tickets",
+                        cursor_type="row",
+                        zebra_stripes=True,
+                    )
+                    yield Static(id="symphony-tickets-hint", markup=True)
+            with Horizontal(id="log-row"):
+                with Vertical(id="log-daemon-col"):
+                    yield Static(id="log-header", markup=True)
+                    yield RichLog(
+                        id="log-pane",
+                        wrap=False,
+                        highlight=False,
+                        auto_scroll=True,
+                        max_lines=LOG_PANE_MAX_LINES,
+                    )
+                with Vertical(id="log-watch-col"):
+                    yield Static(id="watch-header", markup=True)
+                    yield RichLog(
+                        id="watch-pane",
+                        wrap=False,
+                        highlight=False,
+                        markup=True,
+                        auto_scroll=True,
+                        max_lines=LOG_PANE_MAX_LINES,
+                    )
             yield Static(id="status-line", markup=True)
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#frontends", DataTable)
         table.add_columns("name", "state", "pid", "uptime", "heartbeat", "notes")
+        jobs = self.query_one("#jobs-content", DataTable)
+        jobs.add_columns("name", "cron", "kind", "next fire")
+        tickets = self.query_one("#symphony-tickets", DataTable)
+        tickets.add_columns("ticket", "state", "uptime", "last turn", "retries")
+        self.query_one("#jobs-header", Static).update("[bold]Scheduled jobs[/bold]")
+        self.query_one("#symphony-header", Static).update(
+            "[bold]Symphony tickets[/bold]"
+        )
+        self.query_one("#symphony-tickets-hint", Static).update(SYMPHONY_HINT)
         self._refresh()
         self.set_interval(1.0, self._refresh)
         self.set_interval(1.0, self._refresh_log)
@@ -87,6 +149,27 @@ class DashboardScreen(Screen):
 
     def _selected_frontend(self) -> str | None:
         table = self.query_one("#frontends", DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        return str(row_key.value) if row_key.value is not None else None
+
+    def _selected_ticket(self) -> str | None:
+        """Highlighted ticket identifier in the symphony tickets DataTable, or None."""
+        return self._datatable_cursor_key("#symphony-tickets")
+
+    def _selected_job(self) -> str | None:
+        """Highlighted job name in the scheduled jobs DataTable, or None."""
+        return self._datatable_cursor_key("#jobs-content")
+
+    def _datatable_cursor_key(self, selector: str) -> str | None:
+        try:
+            table = self.query_one(selector, DataTable)
+        except Exception:
+            return None
         if table.row_count == 0:
             return None
         try:
@@ -212,6 +295,16 @@ class DashboardScreen(Screen):
         self._refresh()
 
     def _refresh_log(self, *, force_reload: bool = False) -> None:
+        """Refresh both panes: daemon log on the left, ticket watch on the right.
+
+        The right column is hidden unless symphony is the selected frontend AND
+        a ticket is highlighted in the tickets table — then the daemon log
+        column gives up its space to the watch.
+        """
+        self._refresh_daemon_log(force_reload=force_reload)
+        self._refresh_watch_pane(force_reload=force_reload)
+
+    def _refresh_daemon_log(self, *, force_reload: bool) -> None:
         name = self._selected_frontend()
         header = self.query_one("#log-header", Static)
         pane = self.query_one("#log-pane", RichLog)
@@ -237,7 +330,7 @@ class DashboardScreen(Screen):
 
         switched = path != self._log_path
         if not switched and not force_reload and mtime == self._log_mtime:
-            return  # nothing to update
+            return
 
         self._log_path = path
         self._log_mtime = mtime
@@ -249,6 +342,150 @@ class DashboardScreen(Screen):
             return
         for line in lines:
             pane.write(line.rstrip("\n"))
+
+    def _refresh_watch_pane(self, *, force_reload: bool) -> None:
+        """Show the watch column for two cases:
+          - symphony selected + ticket highlighted → JSONL with format_event
+          - schedule selected + job highlighted    → per-job schedule-<name>.log
+        Otherwise the column is hidden so the daemon log gets full width.
+        """
+        col = self.query_one("#log-watch-col", Vertical)
+        name = self._selected_frontend()
+
+        target: str | None = None  # "symphony:KEY" or "schedule:NAME"
+        if name == "symphony":
+            ticket = self._selected_ticket()
+            if ticket is not None:
+                target = f"symphony:{ticket}"
+        elif name == "schedule":
+            job = self._selected_job()
+            if job is not None:
+                target = f"schedule:{job}"
+
+        if target is None:
+            if col.display:
+                col.display = False
+                self._watch_path = None
+                self._watch_mtime = None
+                self._watch_target = None
+            return
+
+        if not col.display:
+            col.display = True
+
+        if target != self._watch_target:
+            self._watch_target = target
+            self._watch_path = None
+            self._watch_mtime = None
+            force_reload = True
+
+        header = self.query_one("#watch-header", Static)
+        pane = self.query_one("#watch-pane", RichLog)
+
+        mode, _, target_id = target.partition(":")
+        if mode == "symphony":
+            self._refresh_watch_symphony(target_id, header, pane, force_reload)
+        else:
+            self._refresh_watch_scheduler(target_id, header, pane, force_reload)
+
+    def _refresh_watch_symphony(
+        self, ticket: str, header: Static, pane: RichLog, force_reload: bool
+    ) -> None:
+        workspace = WORKSPACES_ROOT / sanitize_key(ticket)
+        session_uuid = session_uuid_for(ticket)
+        try:
+            path = get_backend().session_log_path(workspace, session_uuid)
+        except Exception:
+            path = None
+
+        if path is None:
+            if force_reload or self._watch_path is not None:
+                self._watch_path = None
+                self._watch_mtime = None
+                pane.clear()
+                pane.write(
+                    f"[dim]no session log yet for {ticket} — "
+                    f"agent hasn't run a turn[/dim]"
+                )
+                header.update(
+                    f"[bold]watch: {ticket}[/bold] [dim](no session yet)[/dim]"
+                )
+            return
+
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+
+        switched = path != self._watch_path
+        if not switched and not force_reload and mtime == self._watch_mtime:
+            return
+
+        self._watch_path = path
+        self._watch_mtime = mtime
+        header.update(f"[bold]watch: {ticket}[/bold] [dim]{path.name}[/dim]")
+        pane.clear()
+        import json
+
+        raw_lines = render.tail_lines(path, WATCH_EVENTS)
+        any_rendered = False
+        for raw in raw_lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            formatted = watch.format_event(event)
+            if formatted is None:
+                continue
+            for line in formatted.split("\n"):
+                pane.write(line)
+            any_rendered = True
+        if not any_rendered:
+            pane.write(f"[dim](no displayable events yet in {path.name})[/dim]")
+
+    def _refresh_watch_scheduler(
+        self, job: str, header: Static, pane: RichLog, force_reload: bool
+    ) -> None:
+        """Tail the per-job log at logs/schedule-<name>.log as plain text.
+
+        Markup is bypassed via rich.text.Text so literal log brackets like
+        [INFO] survive intact even though the pane has markup=True (which the
+        symphony branch relies on for colors).
+        """
+        path = LOG_DIR / f"schedule-{job}.log"
+        if not path.is_file():
+            if force_reload or self._watch_path is not None:
+                self._watch_path = None
+                self._watch_mtime = None
+                pane.clear()
+                pane.write(
+                    f"[dim]no log yet at {path} — job hasn't fired since startup[/dim]"
+                )
+                header.update(f"[bold]job: {job}[/bold] [dim](no log)[/dim]")
+            return
+
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+
+        switched = path != self._watch_path
+        if not switched and not force_reload and mtime == self._watch_mtime:
+            return
+
+        self._watch_path = path
+        self._watch_mtime = mtime
+        header.update(f"[bold]job: {job}[/bold] [dim]{path.name}[/dim]")
+        pane.clear()
+        lines = render.tail_lines(path, TAIL_LINES)
+        if not lines:
+            pane.write(f"[dim]({path.name} is empty)[/dim]")
+            return
+        for line in lines:
+            pane.write(Text(line.rstrip("\n")))
 
     def _notify(
         self, msg: str, severity: Literal["information", "warning", "error"]
@@ -272,7 +509,7 @@ class DashboardScreen(Screen):
         for f in snap.frontends:
             notes = f.error or ""
             if not notes and f.extra:
-                notes = ", ".join(f"{k}={v}" for k, v in sorted(f.extra.items()))
+                notes = render._format_extra_notes(f.extra)
             table.add_row(
                 f.name,
                 render.state_cell(f.state),
@@ -296,15 +533,57 @@ class DashboardScreen(Screen):
                     pass
                 break
 
-        jobs_widget = self.query_one("#jobs-content", Static)
-        if snap.jobs:
-            jobs_widget.update(render.jobs_table(snap.jobs, snap.timestamp))
-        elif snap.schedule_error:
-            jobs_widget.update(
-                Text(f"Scheduler config error: {snap.schedule_error}", style="red")
+        jobs_table = self.query_one("#jobs-content", DataTable)
+        jobs_header = self.query_one("#jobs-header", Static)
+        previously_selected_job = self._selected_job()
+        jobs_table.clear()
+        if snap.schedule_error:
+            jobs_header.update(
+                f"[bold]Scheduled jobs[/bold] [red]({snap.schedule_error})[/red]"
             )
         else:
-            jobs_widget.update(Text("No schedule.yaml found.", style="dim"))
+            jobs_header.update("[bold]Scheduled jobs[/bold]")
+        for j in snap.jobs:
+            jobs_table.add_row(
+                j.name,
+                j.cron,
+                j.kind,
+                render._fmt_next_fire(j.next_fire, snap.timestamp),
+                key=j.name,
+            )
+        for i, j in enumerate(snap.jobs):
+            if j.name == previously_selected_job:
+                try:
+                    jobs_table.move_cursor(row=i)
+                except Exception:
+                    pass
+                break
+
+        tickets_table = self.query_one("#symphony-tickets", DataTable)
+        symphony = next((f for f in snap.frontends if f.name == "symphony"), None)
+        tickets = (symphony.extra.get("running_tickets") if symphony else None) or []
+        # Preserve cursor by ticket identifier across refreshes; if the previously
+        # selected ticket disappeared (agent finished it), the cursor falls back
+        # to whatever row sits at the same index.
+        previously_selected_ticket = self._selected_ticket()
+        tickets_table.clear()
+        for t in tickets:
+            identifier = str(t.get("identifier", "?"))
+            tickets_table.add_row(
+                identifier,
+                str(t.get("state", "?")),
+                render.fmt_age(t.get("uptime_s")),
+                render.fmt_age(t.get("last_turn_end_age_s")),
+                str(t.get("failure_attempt", 0)),
+                key=identifier,
+            )
+        for i, t in enumerate(tickets):
+            if str(t.get("identifier")) == previously_selected_ticket:
+                try:
+                    tickets_table.move_cursor(row=i)
+                except Exception:
+                    pass
+                break
 
         stale = [f.name for f in snap.frontends if f.stale]
         banner = self.query_one("#stale-banner", Static)

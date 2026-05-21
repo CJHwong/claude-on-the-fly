@@ -5,7 +5,6 @@ multiple TUI screens (tail_lines)."""
 from __future__ import annotations
 
 import json
-from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,10 +46,35 @@ def state_cell(state_str: str) -> Text:
 
 
 def tail_lines(path: Path, n: int) -> list[str]:
-    """Return the last n lines of a text file. Empty list on read error."""
+    """Return the last n lines of a text file. Empty list on read error.
+
+    Reads backwards from EOF in growing chunks instead of streaming the whole
+    file — matters for large JSONLs (session logs reach 10MB+) tailed every
+    second from the TUI.
+    """
+    if n <= 0:
+        return []
     try:
-        with path.open("r", errors="replace") as f:
-            return list(deque(f, maxlen=n))
+        with path.open("rb") as f:
+            f.seek(0, 2)  # SEEK_END
+            size = f.tell()
+            if size == 0:
+                return []
+            data = b""
+            cursor = size
+            chunk = 8192
+            while cursor > 0 and data.count(b"\n") <= n:
+                read = min(chunk, cursor)
+                cursor -= read
+                f.seek(cursor)
+                data = f.read(read) + data
+                chunk *= 2  # Exponential growth caps long-line worst cases.
+        text = data.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        # Drop trailing empty entry from the final newline if present.
+        if lines and lines[-1] == "":
+            lines.pop()
+        return [ln + "\n" for ln in lines[-n:]]
     except OSError:
         return []
 
@@ -85,6 +109,13 @@ def _fmt_next_fire(when: datetime, now: datetime) -> str:
     return f"{when_str}  (in {delta / 86400:.1f}d)"
 
 
+def _format_extra_notes(extra: dict) -> str:
+    """Flatten scalar heartbeat extras into `k=v, k=v` notes. Nested structures
+    (lists/dicts like symphony's running_tickets) are rendered elsewhere."""
+    scalars = {k: v for k, v in extra.items() if not isinstance(v, (list, dict))}
+    return ", ".join(f"{k}={v}" for k, v in sorted(scalars.items()))
+
+
 def frontends_table(frontends: list[FrontendStatus], now: datetime) -> Table:
     table = Table(title="Frontends", show_header=True, header_style="bold")
     table.add_column("name")
@@ -97,7 +128,7 @@ def frontends_table(frontends: list[FrontendStatus], now: datetime) -> Table:
     for f in frontends:
         notes = f.error or ""
         if not notes and f.extra:
-            notes = ", ".join(f"{k}={v}" for k, v in sorted(f.extra.items()))
+            notes = _format_extra_notes(f.extra)
         table.add_row(
             f.name,
             state_cell(f.state),
