@@ -8,12 +8,38 @@ from pathlib import Path
 
 from claude_on_the_fly.transcript import (
     Turn,
+    _workspace_to_claude_hash,
     extract_claude,
     extract_codex,
     extract_codex_cumulative_tokens,
     extract_codex_model,
     format_handoff,
 )
+
+
+# ---------------------------------------------------------------------------
+# _workspace_to_claude_hash — must match claude's own scheme byte-for-byte
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceToClaudeHash:
+    def test_plain_path(self) -> None:
+        assert (
+            _workspace_to_claude_hash(Path("/Users/me/Workspace"))
+            == "-Users-me-Workspace"
+        )
+
+    def test_dotted_dir_becomes_double_dash(self) -> None:
+        # `/Users/me/.claude-on-the-fly/foo` → `-Users-me--claude-on-the-fly-foo`.
+        # The `.` is replaced with `-` just like `/`, producing the double dash
+        # where the dot used to sit. Cross-checked against a live claude
+        # session directory at ~/.claude/projects/.
+        assert (
+            _workspace_to_claude_hash(
+                Path("/Users/me/.claude-on-the-fly/workspaces/symphony/proj-1")
+            )
+            == "-Users-me--claude-on-the-fly-workspaces-symphony-proj-1"
+        )
 
 
 # ---------------------------------------------------------------------------
