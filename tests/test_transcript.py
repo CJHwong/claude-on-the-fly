@@ -41,6 +41,23 @@ class TestWorkspaceToClaudeHash:
             == "-Users-me--claude-on-the-fly-workspaces-symphony-proj-1"
         )
 
+    def test_underscore_in_segment_becomes_dash(self) -> None:
+        # Sanitized github workspaces look like `hardcoretech_gf-external-api_754`
+        # (sanitize_key turns `/` and `#` into `_`). Claude CLI normalises
+        # underscores to dashes too, so the hash must match.
+        # Cross-checked against:
+        # ~/.claude/projects/-Users-me--claude-on-the-fly-workspaces-symphony-github-hardcoretech-gf-external-api-754/
+        assert (
+            _workspace_to_claude_hash(
+                Path(
+                    "/Users/me/.claude-on-the-fly/workspaces/symphony/github/"
+                    "hardcoretech_gf-external-api_754"
+                )
+            )
+            == "-Users-me--claude-on-the-fly-workspaces-symphony-github-"
+            "hardcoretech-gf-external-api-754"
+        )
+
 
 # ---------------------------------------------------------------------------
 # extract_claude

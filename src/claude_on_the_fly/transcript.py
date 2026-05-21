@@ -41,14 +41,20 @@ class Turn:
 
 
 def _workspace_to_claude_hash(workspace: Path) -> str:
-    """`/Users/me/.claude-on-the-fly/foo` -> `-Users-me--claude-on-the-fly-foo`.
+    """`/Users/me/.claude-on-the-fly/foo_bar` -> `-Users-me--claude-on-the-fly-foo-bar`.
 
-    Mirrors claude's own scheme: both `/` and `.` are replaced with `-` so a
-    dotted directory like `.claude-on-the-fly` produces a double dash where
-    the leading dot used to be. Resolve symlinks first — the claude CLI
-    resolves `/tmp` → `/private/tmp` on macOS before computing the hash.
+    Mirrors claude's own scheme: `/`, `.`, and `_` are all replaced with `-`.
+    A leading dotted directory like `.claude-on-the-fly` produces a double
+    dash where the dot used to be; underscores in sanitized identifiers
+    (like the github PR workspace `owner_repo_123`) are also normalised so
+    the hash matches what the claude CLI computes for the same path.
+
+    Resolve symlinks first — the claude CLI resolves `/tmp` → `/private/tmp`
+    on macOS before computing the hash.
     """
-    return str(workspace.resolve()).replace("/", "-").replace(".", "-")
+    return (
+        str(workspace.resolve()).replace("/", "-").replace(".", "-").replace("_", "-")
+    )
 
 
 def _iter_jsonl(path: Path):
