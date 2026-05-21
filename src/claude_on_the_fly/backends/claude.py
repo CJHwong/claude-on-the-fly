@@ -15,6 +15,10 @@ from claude_on_the_fly.agent import (
     Response,
     build_system_prompt,
 )
+from claude_on_the_fly.transcript import (
+    CLAUDE_PROJECTS_DIR,
+    _workspace_to_claude_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,3 +147,19 @@ class ClaudeBackend:
             tool_counts=cli_output.get("tool_counts", {}),
             skill_counts=cli_output.get("skill_counts", {}),
         )
+
+    def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
+        """`claude --resume <uuid>` when a JSONL exists for this workspace+uuid."""
+        path = self.session_log_path(workspace, session_uuid)
+        if path is None:
+            return None
+        return f"claude --resume {session_uuid}"
+
+    def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
+        """Live JSONL claude appends to as the session runs."""
+        path = (
+            CLAUDE_PROJECTS_DIR
+            / _workspace_to_claude_hash(workspace)
+            / f"{session_uuid}.jsonl"
+        )
+        return path if path.is_file() else None

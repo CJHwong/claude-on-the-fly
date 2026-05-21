@@ -372,6 +372,23 @@ class AgentBackend(Protocol):
         timeout: float | None = DEFAULT_TIMEOUT,
     ) -> Response: ...
 
+    def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
+        """Return the interactive resume command for an existing session, or None.
+
+        Returns the bare CLI invocation (e.g. `claude --resume <uuid>`); callers
+        compose the full `cd <workspace> && <cmd>` one-liner. None signals that
+        no session has been created yet for this workspace + uuid.
+        """
+        ...
+
+    def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
+        """Return the live JSONL path appended to as the session runs, or None.
+
+        Used by `claude-symphony watch` to tail per-turn events. None signals
+        either no session yet, or the backend doesn't expose a streamable log.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class OllamaLauncher:

@@ -1450,3 +1450,74 @@ class TestClaudeBackendHandoff:
             await run(Path("/tmp"), "sess-4", "hi", "telegram")
 
         mock_extract.assert_not_called()
+
+
+class TestClaudeBackendTakeoverCommand:
+    def test_returns_resume_command_when_session_jsonl_exists(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_uuid = "deadbeef-1234"
+
+        # Mirror claude's projects/<hash>/<uuid>.jsonl layout in a fake home.
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        projects_dir = tmp_path / ".claude" / "projects"
+        session_dir = projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True)
+        (session_dir / f"{session_uuid}.jsonl").write_text("{}\n")
+
+        with patch(
+            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
+        ):
+            cmd = ClaudeBackend().takeover_command(workspace, session_uuid)
+
+        assert cmd == f"claude --resume {session_uuid}"
+
+    def test_returns_none_when_no_session_jsonl(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        projects_dir = tmp_path / ".claude" / "projects"
+        projects_dir.mkdir(parents=True)
+
+        with patch(
+            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
+        ):
+            cmd = ClaudeBackend().takeover_command(workspace, "missing-uuid")
+
+        assert cmd is None
+
+
+class TestClaudeBackendSessionLogPath:
+    def test_returns_path_when_jsonl_exists(self, tmp_path: Path) -> None:
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_uuid = "live-uuid"
+        projects_dir = tmp_path / ".claude" / "projects"
+        session_dir = projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True)
+        expected = session_dir / f"{session_uuid}.jsonl"
+        expected.write_text("")
+
+        with patch(
+            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
+        ):
+            path = ClaudeBackend().session_log_path(workspace, session_uuid)
+
+        assert path == expected
+
+    def test_returns_none_when_missing(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        projects_dir = tmp_path / ".claude" / "projects"
+        projects_dir.mkdir(parents=True)
+
+        with patch(
+            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
+        ):
+            path = ClaudeBackend().session_log_path(workspace, "absent")
+
+        assert path is None

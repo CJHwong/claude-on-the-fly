@@ -824,3 +824,38 @@ class TestGetBackendCodex:
         monkeypatch.setenv("CODEX_MODE", "voodoo")
         with pytest.raises(ValueError, match="voodoo"):
             get_backend()
+
+
+class TestCodexBackendTakeoverCommand:
+    def test_returns_resume_command_when_thread_mapping_exists(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "ws"
+        sessions_dir = workspace / ".codex_sessions"
+        sessions_dir.mkdir(parents=True)
+        session_uuid = "deadbeef-1234"
+        thread_id = "thread-abc-xyz"
+        (sessions_dir / session_uuid).write_text(f"{thread_id}\n")
+
+        cmd = CodexBackend().takeover_command(workspace, session_uuid)
+        assert cmd == f"codex resume {thread_id}"
+
+    def test_returns_none_when_no_mapping_file(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        assert CodexBackend().takeover_command(workspace, "missing-uuid") is None
+
+    def test_returns_none_when_mapping_file_empty(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        sessions_dir = workspace / ".codex_sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "empty-uuid").write_text("")
+        assert CodexBackend().takeover_command(workspace, "empty-uuid") is None
+
+
+class TestCodexBackendSessionLogPath:
+    def test_always_returns_none_for_now(self, tmp_path: Path) -> None:
+        """Codex format isn't wired through the watch formatter — explicitly None."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        assert CodexBackend().session_log_path(workspace, "any-uuid") is None

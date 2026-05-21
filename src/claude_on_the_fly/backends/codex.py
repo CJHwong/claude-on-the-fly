@@ -305,3 +305,19 @@ class CodexBackend:
             tool_counts=result.get("tool_counts", {}),
             skill_counts={},
         )
+
+    def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
+        """`codex resume <thread_id>` when a thread mapping exists for this uuid."""
+        session_file = workspace / ".codex_sessions" / session_uuid
+        if not session_file.is_file():
+            return None
+        thread_id = session_file.read_text().strip()
+        if not thread_id:
+            return None
+        return f"codex resume {thread_id}"
+
+    def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
+        """Codex's rollout schema differs from claude's stream-json; live watching
+        isn't wired through the symphony watch formatter yet. Returning None
+        keeps the CLI's unsupported-backend branch clean."""
+        return None
