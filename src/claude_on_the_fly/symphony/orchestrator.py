@@ -187,6 +187,13 @@ async def _run_worker(
                     current_state,
                 )
                 return
+            if not _gate_label_attached(config, refreshed.labels):
+                logger.info(
+                    "[%s] gate label '%s' removed (agent parked); stopping",
+                    identifier,
+                    config.gate_label,
+                )
+                return
 
             runner.issue = refreshed
             state.update_running_state(issue.id, refreshed.state)
@@ -306,14 +313,15 @@ async def reconcile(
     config: SymphonyConfig,
     retry_queue: RetryQueue,
 ) -> None:
-    """SPEC §8.5: refresh state of running workers; cancel on terminal/inactive/stalled."""
+    """SPEC §8.5: refresh state of running workers; cancel on terminal / inactive /
+    gate-label-removed / stalled."""
     running = state.all_running()
     if not running:
         return
 
     keys = [r.issue_identifier for r in running]
     try:
-        statuses = await tracker.fetch_states_by_keys(keys)
+        summaries = await tracker.fetch_summaries_by_keys(keys)
     except Exception:
         logger.exception(
             "reconcile: state fetch failed (skipping; will retry next tick)"
@@ -325,9 +333,10 @@ async def reconcile(
         if _check_and_cancel_stall(entry, config, retry_queue, now):
             continue
 
-        new_state = statuses.get(entry.issue_identifier)
-        if new_state is None:
+        summary = summaries.get(entry.issue_identifier)
+        if summary is None:
             continue
+        new_state = summary.state
 
         if new_state in config.tracker.terminal_states:
             logger.info(
@@ -351,6 +360,16 @@ async def reconcile(
                 entry.task.cancel()
             continue
 
+        if not _gate_label_attached(config, summary.labels):
+            logger.info(
+                "[%s] gate label '%s' removed mid-run; cancelling worker (workspace left)",
+                entry.issue_identifier,
+                config.gate_label,
+            )
+            if entry.task is not None and not entry.task.done():
+                entry.task.cancel()
+            continue
+
         if new_state != entry.issue_state:
             state.update_running_state(entry.issue_id, new_state)
 
@@ -368,16 +387,16 @@ async def startup_cleanup(
         return
     keys = [d.name for d in dirs]
     try:
-        statuses = await tracker.fetch_states_by_keys(keys)
+        summaries = await tracker.fetch_summaries_by_keys(keys)
     except Exception:
         logger.warning("startup_cleanup: state fetch failed; skipping")
         return
 
     terminal = set(tracker_cfg.terminal_states)
     for d in dirs:
-        status = statuses.get(d.name)
-        if status and status in terminal:
-            logger.info("startup_cleanup: %s status=%s", d, status)
+        summary = summaries.get(d.name)
+        if summary and summary.state in terminal:
+            logger.info("startup_cleanup: %s status=%s", d, summary.state)
             remove_workspace(d)
 
 
@@ -399,7 +418,9 @@ async def _process_due_retries(
     if not unclaimed:
         return
     try:
-        statuses = await tracker.fetch_states_by_keys([e.identifier for e in unclaimed])
+        summaries = await tracker.fetch_summaries_by_keys(
+            [e.identifier for e in unclaimed]
+        )
     except Exception:
         logger.warning("retry: batch state fetch failed; requeueing all due (1s)")
         for entry in unclaimed:
@@ -407,12 +428,13 @@ async def _process_due_retries(
         return
 
     for entry in unclaimed:
-        current_state = statuses.get(entry.identifier)
-        if current_state is None:
+        summary = summaries.get(entry.identifier)
+        if summary is None:
             retry_queue.requeue(
                 entry, delay_ms=entry.attempt * 1000, error="not visible"
             )
             continue
+        current_state = summary.state
         if current_state in config.tracker.terminal_states:
             logger.info("[%s] retry: terminal state, dropping", entry.identifier)
             continue
@@ -421,6 +443,13 @@ async def _process_due_retries(
                 "[%s] retry: state %s not active, dropping",
                 entry.identifier,
                 current_state,
+            )
+            continue
+        if not _gate_label_attached(config, summary.labels):
+            logger.info(
+                "[%s] retry: gate_label '%s' missing, dropping",
+                entry.identifier,
+                config.gate_label,
             )
             continue
         if state.running_count() >= config.max_concurrent:
@@ -452,7 +481,7 @@ async def _process_due_retries(
             )
             continue
 
-        if config.gate_label and config.gate_label.lower() not in issue.labels:
+        if not _gate_label_attached(config, issue.labels):
             logger.info(
                 "[%s] retry: gate_label '%s' missing, dropping",
                 entry.identifier,
@@ -527,10 +556,83 @@ async def tick(
         )
 
 
+def _gate_label_attached(
+    config: SymphonyConfig, labels: tuple[str, ...] | list[str]
+) -> bool:
+    """True when the configured gate label is present on the ticket (or no gate is set)."""
+    if not config.gate_label:
+        return True
+    return config.gate_label.lower() in labels
+
+
+def _redact_token(token: str) -> str:
+    if not token:
+        return "<unset>"
+    if len(token) <= 4:
+        return "***"
+    return f"{token[:2]}***{token[-2:]}"
+
+
+def _log_config_summary(config: SymphonyConfig) -> None:
+    """Dump the resolved config to the log at startup. Redacts the api token."""
+    t = config.tracker
+    logger.info("symphony config:")
+    logger.info("  tracker.kind        = %s", t.kind)
+    logger.info("  tracker.base_url    = %s", t.base_url)
+    logger.info("  tracker.email       = %s", t.email)
+    logger.info("  tracker.api_token   = %s", _redact_token(t.api_token))
+    logger.info("  tracker.project_key = %s", t.project_key)
+    logger.info("  tracker.jql_extra   = %s", t.jql_extra or "<none>")
+    logger.info("  tracker.active_states   = %s", list(t.active_states))
+    logger.info("  tracker.terminal_states = %s", list(t.terminal_states))
+    logger.info("  polling_ms          = %d", config.polling_ms)
+    logger.info("  max_concurrent      = %d", config.max_concurrent)
+    logger.info(
+        "  max_concurrent_by_state = %s",
+        dict(config.max_concurrent_by_state) or "<none>",
+    )
+    logger.info("  max_turns           = %d", config.max_turns)
+    logger.info("  turn_timeout_ms     = %d", config.turn_timeout_ms)
+    logger.info("  stall_timeout_ms    = %d", config.stall_timeout_ms)
+    logger.info("  max_retry_backoff_ms = %d", config.max_retry_backoff_ms)
+    logger.info("  prompt_path         = %s", config.prompt_path)
+    logger.info("  gate_label          = %s", config.gate_label or "<none>")
+
+
+def _heartbeat_extra(
+    state: OrchestratorState,
+    pending_tasks: set[asyncio.Task[None]],
+    retry_queue: RetryQueue,
+) -> dict:
+    """Snapshot symphony state for the TUI to render. Called every heartbeat tick."""
+    now = time.monotonic()
+    running_tickets = [
+        {
+            "identifier": e.issue_identifier,
+            "state": e.issue_state,
+            "uptime_s": int(now - e.started_at),
+            "last_turn_end_age_s": (
+                int(now - e.last_turn_end_at)
+                if e.last_turn_end_at is not None
+                else None
+            ),
+            "failure_attempt": e.failure_attempt,
+        }
+        for e in state.all_running()
+    ]
+    return {
+        "running": state.running_count(),
+        "pending_workers": len(pending_tasks),
+        "retry_queue": len(retry_queue.all_pending()),
+        "running_tickets": running_tickets,
+    }
+
+
 async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     """Main daemon loop. Hot-reloads prompt; ticks at configured cadence."""
     config = load_config(config_path)
     config.validate()
+    _log_config_summary(config)
 
     prompt_store = PromptStore(config.prompt_path)
     prompt_source = prompt_store.load()
@@ -542,11 +644,7 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
 
     heartbeat = HeartbeatWriter(
         "symphony",
-        extra_provider=lambda: {
-            "running": state.running_count(),
-            "pending_workers": len(pending_tasks),
-            "retry_queue": len(retry_queue.all_pending()),
-        },
+        extra_provider=lambda: _heartbeat_extra(state, pending_tasks, retry_queue),
     )
     heartbeat_task = asyncio.create_task(heartbeat.run())
 

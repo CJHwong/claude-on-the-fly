@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from claude_on_the_fly.symphony.config import SymphonyConfig, TrackerConfig
 from claude_on_the_fly.symphony.orchestrator import (
@@ -13,7 +14,10 @@ from claude_on_the_fly.symphony.orchestrator import (
     _dispatch,
     _eligible,
     _has_per_state_capacity,
+    _heartbeat_extra,
+    _log_config_summary,
     _process_due_retries,
+    _redact_token,
     _run_worker,
     _select_candidates,
     _sort_key,
@@ -24,7 +28,17 @@ from claude_on_the_fly.symphony.orchestrator import (
 )
 from claude_on_the_fly.symphony.retry import RetryEntry, RetryQueue
 from claude_on_the_fly.symphony.state import OrchestratorState, RunningEntry
-from claude_on_the_fly.symphony.tracker.issue import BlockerRef, Issue
+from claude_on_the_fly.symphony.tracker.issue import BlockerRef, Issue, IssueSummary
+
+
+def _summaries(
+    d: dict[str, str], *, label: str = "symphony-active"
+) -> dict[str, IssueSummary]:
+    """Helper: turn `{key: state}` into `{key: IssueSummary(state, (label,))}`.
+
+    Default label matches `_config()`'s gate_label so existing tests that
+    don't care about labels keep working with the new label check."""
+    return {k: IssueSummary(state=v, labels=(label,)) for k, v in d.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +54,10 @@ def _issue(**overrides: object) -> Issue:
         "state": "In Progress",
         "description_raw": None,
         "priority": 3,
-        "labels": (),
+        # Default carries the gate_label that _config() uses, so the orchestrator's
+        # post-turn "label removed → exit" check doesn't fire spuriously. Tests
+        # that exercise parking-by-label pass labels=() explicitly.
+        "labels": ("symphony-active",),
         "blocked_by": (),
         "parent_key": None,
         "url": "https://jira.example.com/browse/PROJ-1",
@@ -85,10 +102,121 @@ def _config(**overrides: object) -> SymphonyConfig:
 def _mock_tracker() -> MagicMock:
     t = MagicMock()
     t.fetch_one = AsyncMock()
-    t.fetch_states_by_keys = AsyncMock()
+    t.fetch_summaries_by_keys = AsyncMock()
     t.fetch_candidates = AsyncMock()
     t.aclose = AsyncMock()
     return t
+
+
+# ---------------------------------------------------------------------------
+# _redact_token / _log_config_summary
+# ---------------------------------------------------------------------------
+
+
+class TestRedactToken:
+    def test_empty_returns_unset(self) -> None:
+        assert _redact_token("") == "<unset>"
+
+    def test_short_token_masked(self) -> None:
+        assert _redact_token("abcd") == "***"
+
+    def test_long_token_partial(self) -> None:
+        assert _redact_token("abcdef12345") == "ab***45"
+
+
+class TestLogConfigSummary:
+    def test_dumps_fields_and_redacts_token(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        cfg = _config(
+            tracker=_tracker_cfg(
+                base_url="https://j.example.com",
+                email="bot@example.com",
+                api_token="supersecrettoken",
+                project_key="PROJ",
+            ),
+            polling_ms=15000,
+            max_concurrent=3,
+            gate_label="ready_for_ai",
+        )
+        with caplog.at_level(
+            _logging.INFO, logger="claude_on_the_fly.symphony.orchestrator"
+        ):
+            _log_config_summary(cfg)
+
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "symphony config:" in text
+        assert "tracker.base_url    = https://j.example.com" in text
+        assert "tracker.email       = bot@example.com" in text
+        assert "polling_ms          = 15000" in text
+        assert "max_concurrent      = 3" in text
+        assert "gate_label          = ready_for_ai" in text
+        assert "PROJ" in text
+        # Redaction: real token never appears, masked form does.
+        assert "supersecrettoken" not in text
+        assert "su***en" in text
+
+
+# ---------------------------------------------------------------------------
+# _heartbeat_extra
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatExtra:
+    def test_empty_state_yields_empty_list(self) -> None:
+        state = OrchestratorState()
+        extra = _heartbeat_extra(state, pending_tasks=set(), retry_queue=RetryQueue())
+        assert extra["running"] == 0
+        assert extra["pending_workers"] == 0
+        assert extra["retry_queue"] == 0
+        assert extra["running_tickets"] == []
+
+    def test_running_ticket_summary(self) -> None:
+        state = OrchestratorState()
+        state.claim(_issue(id="9", identifier="PROJ-9", state="In Progress"))
+        entry = state.get_running("9")
+        assert entry is not None
+        # Fix started_at so uptime is deterministic.
+        entry.started_at = 100.0
+        entry.failure_attempt = 2
+
+        with patch(
+            "claude_on_the_fly.symphony.orchestrator.time.monotonic",
+            return_value=160.0,
+        ):
+            extra = _heartbeat_extra(
+                state, pending_tasks=set(), retry_queue=RetryQueue()
+            )
+
+        assert extra["running"] == 1
+        tickets = extra["running_tickets"]
+        assert len(tickets) == 1
+        t = tickets[0]
+        assert t["identifier"] == "PROJ-9"
+        assert t["state"] == "In Progress"
+        assert t["uptime_s"] == 60
+        assert t["last_turn_end_age_s"] is None
+        assert t["failure_attempt"] == 2
+
+    def test_last_turn_end_age(self) -> None:
+        state = OrchestratorState()
+        state.claim(_issue(id="9", identifier="PROJ-9", state="In Progress"))
+        entry = state.get_running("9")
+        assert entry is not None
+        entry.started_at = 100.0
+        entry.last_turn_end_at = 150.0
+
+        with patch(
+            "claude_on_the_fly.symphony.orchestrator.time.monotonic",
+            return_value=160.0,
+        ):
+            extra = _heartbeat_extra(
+                state, pending_tasks=set(), retry_queue=RetryQueue()
+            )
+
+        assert extra["running_tickets"][0]["last_turn_end_age_s"] == 10
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +625,35 @@ class TestRunWorker:
 
         assert rq.has(issue.id) is True
 
+    async def test_gate_label_removed_between_turns_exits(self) -> None:
+        """Agent parks itself by removing the gate label — worker must stop."""
+        issue = _issue()  # labels=("symphony-active",) by default
+        state = OrchestratorState()
+        state.claim(issue)
+        tracker = _mock_tracker()
+        config = _config(max_turns=10)  # plenty of headroom
+        rq = RetryQueue()
+
+        with (
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.ensure_workspace"
+            ) as mock_ew,
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.TicketRunner"
+            ) as mock_runner_cls,
+        ):
+            mock_ew.return_value = Path("/tmp/ws")
+            mock_runner = MagicMock()
+            mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
+            mock_runner_cls.return_value = mock_runner
+            # Post-turn refresh shows state still active BUT gate label gone.
+            tracker.fetch_one.return_value = _issue(state="In Progress", labels=())
+            await _run_worker(issue, state, tracker, config, "prompt", rq)
+
+        # Exactly one turn ran, no retry scheduled (clean park).
+        assert mock_runner.run_turn.await_count == 1
+        assert rq.has(issue.id) is False
+
 
 # ---------------------------------------------------------------------------
 # reconcile
@@ -508,16 +665,16 @@ class TestReconcile:
         state = OrchestratorState()
         tracker = _mock_tracker()
         await reconcile(state, tracker, _config(), RetryQueue())
-        tracker.fetch_states_by_keys.assert_not_called()
+        tracker.fetch_summaries_by_keys.assert_not_called()
 
     async def test_fetch_failure_logs_and_returns(self) -> None:
         state = OrchestratorState()
         issue = _issue()
         state.claim(issue)
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.side_effect = ConnectionError("down")
+        tracker.fetch_summaries_by_keys.side_effect = ConnectionError("down")
         await reconcile(state, tracker, _config(stall_timeout_ms=0), RetryQueue())
-        tracker.fetch_states_by_keys.assert_awaited_once()
+        tracker.fetch_summaries_by_keys.assert_awaited_once()
 
     async def test_terminal_mid_run_cancels_and_removes_workspace(self) -> None:
         state = OrchestratorState()
@@ -525,7 +682,7 @@ class TestReconcile:
         state.claim(issue)
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "Done"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Done"})
 
         with patch(
             "claude_on_the_fly.symphony.orchestrator.remove_workspace"
@@ -543,7 +700,7 @@ class TestReconcile:
         entry.task = task
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "Backlog"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Backlog"})
 
         await reconcile(state, tracker, cfg, RetryQueue())
         task.cancel.assert_called_once()
@@ -554,10 +711,47 @@ class TestReconcile:
         entry = state.claim(issue)
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
 
         await reconcile(state, tracker, cfg, RetryQueue())
         assert entry.issue_state == "In Progress"
+
+    async def test_gate_label_removed_mid_run_cancels(self) -> None:
+        """Mid-run label removal cancels the worker even when state stays active."""
+        state = OrchestratorState()
+        issue = _issue()  # state="In Progress" (active), labels=("symphony-active",)
+        entry = state.claim(issue)
+        task = MagicMock()
+        task.done.return_value = False
+        entry.task = task
+        cfg = _config(stall_timeout_ms=0)
+        tracker = _mock_tracker()
+        # Active state, but label gone.
+        tracker.fetch_summaries_by_keys.return_value = {
+            "PROJ-1": IssueSummary(state="In Progress", labels=("other-label",)),
+        }
+
+        await reconcile(state, tracker, cfg, RetryQueue())
+        task.cancel.assert_called_once()
+
+    async def test_gate_label_present_does_not_cancel(self) -> None:
+        """Sanity check the new branch doesn't fire when the label is still there."""
+        state = OrchestratorState()
+        issue = _issue()
+        entry = state.claim(issue)
+        task = MagicMock()
+        task.done.return_value = False
+        entry.task = task
+        cfg = _config(stall_timeout_ms=0)
+        tracker = _mock_tracker()
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
+
+        await reconcile(state, tracker, cfg, RetryQueue())
+        task.cancel.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +770,7 @@ class TestStartupCleanup:
             await startup_cleanup(root, tracker, _tracker_cfg())
 
         _asyncio.run(_run())
-        tracker.fetch_states_by_keys.assert_not_called()
+        tracker.fetch_summaries_by_keys.assert_not_called()
 
     def test_no_dirs(self, tmp_path: Path) -> None:
         tracker = _mock_tracker()
@@ -587,7 +781,7 @@ class TestStartupCleanup:
             await startup_cleanup(root, tracker, _tracker_cfg())
 
         asyncio.run(_run())
-        tracker.fetch_states_by_keys.assert_not_called()
+        tracker.fetch_summaries_by_keys.assert_not_called()
 
     def test_removes_terminal_dirs(self, tmp_path: Path) -> None:
         tracker = _mock_tracker()
@@ -595,7 +789,7 @@ class TestStartupCleanup:
         root.mkdir()
         d = root / "PROJ-1"
         d.mkdir()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "Done"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Done"})
 
         async def _run() -> None:
             await startup_cleanup(root, tracker, _tracker_cfg())
@@ -609,7 +803,9 @@ class TestStartupCleanup:
         root.mkdir()
         d = root / "PROJ-2"
         d.mkdir()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-2": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-2": "In Progress"}
+        )
 
         async def _run() -> None:
             await startup_cleanup(root, tracker, _tracker_cfg())
@@ -622,7 +818,7 @@ class TestStartupCleanup:
         root = tmp_path / "worktrees"
         root.mkdir()
         (root / "PROJ-1").mkdir()
-        tracker.fetch_states_by_keys.side_effect = ConnectionError("down")
+        tracker.fetch_summaries_by_keys.side_effect = ConnectionError("down")
 
         async def _run() -> None:
             await startup_cleanup(root, tracker, _tracker_cfg())
@@ -645,7 +841,7 @@ class TestProcessDueRetries:
         await _process_due_retries(
             OrchestratorState(), tracker, _config(), "prompt", rq, pending
         )
-        tracker.fetch_states_by_keys.assert_not_called()
+        tracker.fetch_summaries_by_keys.assert_not_called()
 
     async def test_terminal_state_dropped(self) -> None:
         cfg = _config()
@@ -659,7 +855,7 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=2, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "Done"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Done"})
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(
@@ -674,7 +870,7 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "Backlog"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Backlog"})
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(
@@ -692,7 +888,9 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(state, tracker, cfg, "prompt", rq, pending)
@@ -705,7 +903,9 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
         tracker.fetch_one.return_value = _issue()
         pending: set[asyncio.Task[None]] = set()
 
@@ -725,7 +925,9 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=2, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
         tracker.fetch_one.side_effect = ConnectionError("down")
         pending: set[asyncio.Task[None]] = set()
 
@@ -743,7 +945,9 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
         tracker.fetch_one.return_value = _issue(labels=("other-label",))
         pending: set[asyncio.Task[None]] = set()
 
@@ -765,7 +969,9 @@ class TestProcessDueRetries:
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {"PROJ-1": "In Progress"}
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
         tracker.fetch_one.return_value = _issue(labels=("symphony-active",))
         pending: set[asyncio.Task[None]] = set()
 
@@ -791,7 +997,7 @@ class TestTick:
         state.claim(_issue(id="1", state="In Progress"))
         state.claim(_issue(id="2", state="In Progress"))
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {}
+        tracker.fetch_summaries_by_keys.return_value = {}
         pending: set[asyncio.Task[None]] = set()
 
         await tick(state, cfg, "prompt", tracker, RetryQueue(), pending)
@@ -801,7 +1007,7 @@ class TestTick:
         cfg = _config(max_concurrent=3)
         state = OrchestratorState()
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {}
+        tracker.fetch_summaries_by_keys.return_value = {}
         tracker.fetch_candidates.return_value = [
             _issue(id="1", identifier="PROJ-1", state="In Progress", priority=1),
         ]
@@ -817,7 +1023,7 @@ class TestTick:
     async def test_fetch_candidates_failure(self) -> None:
         cfg = _config()
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {}
+        tracker.fetch_summaries_by_keys.return_value = {}
         tracker.fetch_candidates.side_effect = ConnectionError("down")
         pending: set[asyncio.Task[None]] = set()
 
@@ -837,7 +1043,7 @@ class TestRunLoop:
         prompt_path.write_text("# Prompt")
 
         tracker = _mock_tracker()
-        tracker.fetch_states_by_keys.return_value = {}
+        tracker.fetch_summaries_by_keys.return_value = {}
         tracker.fetch_candidates.return_value = []
 
         stop = asyncio.Event()

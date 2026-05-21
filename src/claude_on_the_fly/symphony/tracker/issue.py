@@ -12,6 +12,20 @@ class BlockerRef:
 
 
 @dataclass(frozen=True)
+class IssueSummary:
+    """Reconciliation-time snapshot of a ticket: state + labels, no description.
+
+    Used by the batched `fetch_summaries_by_keys` call. The orchestrator needs
+    both fields to decide whether an in-flight worker should keep running:
+    state out-of-active means done/parked-by-status; gate label removed means
+    parked-by-label even if the status stayed active.
+    """
+
+    state: str
+    labels: tuple[str, ...]  # lowercased to match Issue.labels
+
+
+@dataclass(frozen=True)
 class Issue:
     id: str  # tracker-internal numeric id (Jira: "10042")
     identifier: str  # human key (Jira: "PROJ-1133")

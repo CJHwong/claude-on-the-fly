@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from .issue import Issue
+from .issue import Issue, IssueSummary
 
 if TYPE_CHECKING:
     from ..config import TrackerConfig
@@ -37,9 +37,9 @@ class Tracker(Protocol):
         """Return tickets matching the active-state gate. Daemon polls this every tick."""
         ...
 
-    async def fetch_states_by_keys(self, keys: list[str]) -> dict[str, str]:
-        """Batched status-only fetch for reconciliation. Returns key → status name.
-        Keys not visible to this account are absent from the result."""
+    async def fetch_summaries_by_keys(self, keys: list[str]) -> dict[str, IssueSummary]:
+        """Batched snapshot fetch for reconciliation. Returns key → IssueSummary
+        (state + labels). Keys not visible to this account are absent."""
         ...
 
     async def aclose(self) -> None:

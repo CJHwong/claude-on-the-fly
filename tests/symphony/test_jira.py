@@ -92,11 +92,11 @@ def test_compose_jql_appends_extra() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fetch_states_by_keys (empty list)
+# fetch_summaries_by_keys (empty list)
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_states_by_keys_empty_short_circuits() -> None:
+def test_fetch_summaries_by_keys_empty_short_circuits() -> None:
     import asyncio
 
     tracker = JiraTracker(
@@ -104,7 +104,7 @@ def test_fetch_states_by_keys_empty_short_circuits() -> None:
         email="me@x.com",
         api_token="tok",
     )
-    result = asyncio.run(tracker.fetch_states_by_keys([]))
+    result = asyncio.run(tracker.fetch_summaries_by_keys([]))
     assert result == {}
     asyncio.run(tracker.aclose())
 
@@ -273,24 +273,38 @@ async def test_fetch_one_raises_on_error(mock_client_cls: MagicMock) -> None:
 
 
 # ---------------------------------------------------------------------------
-# fetch_states_by_keys (non-empty, HTTP mock)
+# fetch_summaries_by_keys (non-empty, HTTP mock)
 # ---------------------------------------------------------------------------
 
 
 @patch("httpx.AsyncClient")
-async def test_fetch_states_by_keys_non_empty(mock_client_cls: MagicMock) -> None:
+async def test_fetch_summaries_by_keys_non_empty(mock_client_cls: MagicMock) -> None:
+    from claude_on_the_fly.symphony.tracker.issue import IssueSummary
+
     jira_resp = {
         "issues": [
-            {"key": "PROJ-1", "fields": {"status": {"name": "In Progress"}}},
-            {"key": "PROJ-2", "fields": {"status": {"name": "Done"}}},
+            {
+                "key": "PROJ-1",
+                "fields": {
+                    "status": {"name": "In Progress"},
+                    "labels": ["Important", "extra"],
+                },
+            },
+            {
+                "key": "PROJ-2",
+                "fields": {"status": {"name": "Done"}, "labels": []},
+            },
         ]
     }
     mock_client_cls.return_value = _make_mock_client(200, jira_resp)
     tracker = JiraTracker(
         base_url="https://j.example.com", email="e@x.com", api_token="tok"
     )
-    result = await tracker.fetch_states_by_keys(["PROJ-1", "PROJ-2"])
-    assert result == {"PROJ-1": "In Progress", "PROJ-2": "Done"}
+    result = await tracker.fetch_summaries_by_keys(["PROJ-1", "PROJ-2"])
+    assert result == {
+        "PROJ-1": IssueSummary(state="In Progress", labels=("important", "extra")),
+        "PROJ-2": IssueSummary(state="Done", labels=()),
+    }
     await tracker.aclose()
 
 
