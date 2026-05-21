@@ -25,7 +25,7 @@ def _cfg(kind: str = "jira") -> TrackerConfig:
     )
 
 
-def test_supported_trackers_has_jira():
+def test_supported_trackers_registered():
     assert "jira" in SUPPORTED_TRACKERS
     assert SUPPORTED_TRACKERS["jira"] is JiraTracker
 
@@ -42,7 +42,7 @@ def test_make_tracker_unknown_kind_raises():
 
 
 def test_make_tracker_error_lists_supported():
-    cfg = _cfg("github")
+    cfg = _cfg("notreal")
     with pytest.raises(ValueError, match=r"Available: \['jira'\]"):
         make_tracker(cfg)
 

@@ -107,4 +107,9 @@ def _issue_context(issue) -> dict:
             if issue.description_raw is not None
             else ""
         ),
+        # Multi-tracker fields. `body_text` is GitHub's PR body (Jira leaves
+        # this empty; the ADF lives in description_json). `source` lets a
+        # single shared template branch on tracker kind if needed.
+        "body_text": issue.body_text or "",
+        "source": issue.source,
     }

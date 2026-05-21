@@ -54,6 +54,11 @@ class DashboardScreen(Screen):
         ("u", "resume", "Resume"),
         ("e", "edit_env", "Edit .env"),
         ("R", "refresh_now", "Refresh"),
+        # `c` copies the tail of the highlighted log to the clipboard via
+        # OSC 52 so you can share errors quickly. For partial selections,
+        # hold Option (macOS) or Shift while click-dragging to bypass
+        # Textual's mouse capture and use the terminal's native selection.
+        ("c", "copy_log", "Copy tail"),
         ("q", "app.quit", "Quit"),
     ]
 
@@ -64,11 +69,15 @@ class DashboardScreen(Screen):
         self._log_mtime: float | None = None
         # Watch pane state, tracked separately so the two panes refresh
         # independently. _watch_target encodes what's being watched, e.g.
-        # "symphony:PROJ-1" or "schedule:cleanup-job", so we know to force
-        # a reload when the user navigates to a different item.
+        # "symphony:jira:PROJ-1" or "schedule:cleanup-job", so we know to
+        # force a reload when the user navigates to a different item.
         self._watch_path: Path | None = None
         self._watch_mtime: float | None = None
         self._watch_target: str | None = None
+        # Heartbeat publishes `source` per running ticket; cache the
+        # ticket → source mapping so the watch pane knows which per-source
+        # workspace dir to read from when the user highlights a row.
+        self._ticket_sources: dict[str, str] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
 
@@ -142,6 +151,45 @@ class DashboardScreen(Screen):
     def action_refresh_now(self) -> None:
         self._refresh()
         self._refresh_log(force_reload=True)
+
+    def _current_log_path(self) -> Path | None:
+        """Whichever log pane is more specific takes precedence: the watch
+        pane (per-ticket session log) when something's highlighted there,
+        otherwise the daemon log for the highlighted frontend."""
+        return self._watch_path if self._watch_path else self._log_path
+
+    def action_copy_log(self) -> None:
+        """Copy the tail of the currently-relevant log to the clipboard.
+
+        For "share the whole error context with someone". For partial
+        selections, hold Option (macOS) or Shift while click-dragging to
+        bypass Textual's mouse capture and use the terminal's native
+        selection + ⌘C.
+        """
+        path = self._current_log_path()
+        if path is None:
+            self._notify("no log selected to copy", "warning")
+            return
+        try:
+            content = path.read_text(errors="replace")
+        except Exception as exc:
+            self._notify(f"copy failed: {exc}", "error")
+            return
+        lines = content.splitlines()
+        tail_n = 500
+        tail = "\n".join(lines[-tail_n:])
+        try:
+            # Textual's clipboard uses OSC 52 — works in iTerm2, kitty,
+            # WezTerm, Alacritty out of the box.
+            self.app.copy_to_clipboard(tail)
+        except Exception as exc:
+            self._notify(f"clipboard write failed: {exc}", "error")
+            return
+        shown = min(len(lines), tail_n)
+        self._notify(
+            f"copied last {shown} line(s) of {path.name} to clipboard",
+            "information",
+        )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         # Reload the log pane immediately when the cursor moves.
@@ -352,11 +400,12 @@ class DashboardScreen(Screen):
         col = self.query_one("#log-watch-col", Vertical)
         name = self._selected_frontend()
 
-        target: str | None = None  # "symphony:KEY" or "schedule:NAME"
+        target: str | None = None  # "symphony:<source>:<KEY>" or "schedule:NAME"
         if name == "symphony":
             ticket = self._selected_ticket()
             if ticket is not None:
-                target = f"symphony:{ticket}"
+                source = self._ticket_sources.get(ticket, "jira")
+                target = f"symphony:{source}:{ticket}"
         elif name == "schedule":
             job = self._selected_job()
             if job is not None:
@@ -382,17 +431,24 @@ class DashboardScreen(Screen):
         header = self.query_one("#watch-header", Static)
         pane = self.query_one("#watch-pane", RichLog)
 
-        mode, _, target_id = target.partition(":")
+        mode, _, rest = target.partition(":")
         if mode == "symphony":
-            self._refresh_watch_symphony(target_id, header, pane, force_reload)
+            # rest = "<source>:<KEY>"
+            source, _, target_id = rest.partition(":")
+            self._refresh_watch_symphony(target_id, source, header, pane, force_reload)
         else:
-            self._refresh_watch_scheduler(target_id, header, pane, force_reload)
+            self._refresh_watch_scheduler(rest, header, pane, force_reload)
 
     def _refresh_watch_symphony(
-        self, ticket: str, header: Static, pane: RichLog, force_reload: bool
+        self,
+        ticket: str,
+        source: str,
+        header: Static,
+        pane: RichLog,
+        force_reload: bool,
     ) -> None:
-        workspace = WORKSPACES_ROOT / sanitize_key(ticket)
-        session_uuid = session_uuid_for(ticket)
+        workspace = WORKSPACES_ROOT / source / sanitize_key(ticket)
+        session_uuid = session_uuid_for(ticket, source=source)
         try:
             path = get_backend().session_log_path(workspace, session_uuid)
         except Exception:
@@ -567,10 +623,18 @@ class DashboardScreen(Screen):
         # to whatever row sits at the same index.
         previously_selected_ticket = self._selected_ticket()
         tickets_table.clear()
+        # Rebuild the identifier → source map from this heartbeat snapshot so
+        # the watch pane resolves to the correct per-source workspace dir.
+        self._ticket_sources = {}
         for t in tickets:
             identifier = str(t.get("identifier", "?"))
+            source = str(t.get("source") or "jira")
+            self._ticket_sources[identifier] = source
+            # One-char source badge ("J", "G") prefixed to the ticket cell —
+            # keeps the table narrow while making the source obvious.
+            badge = source[:1].upper() if source else "?"
             tickets_table.add_row(
-                identifier,
+                f"{badge} {identifier}",
                 str(t.get("state", "?")),
                 render.fmt_age(t.get("uptime_s")),
                 render.fmt_age(t.get("last_turn_end_age_s")),

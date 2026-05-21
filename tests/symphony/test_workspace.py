@@ -10,6 +10,7 @@ import pytest
 from claude_on_the_fly.symphony.workspace import (
     WORKSPACES_ROOT,
     ensure_workspace,
+    read_workspace_identifier,
     remove_workspace,
     sanitize_key,
 )
@@ -36,7 +37,7 @@ def test_sanitize_replaces_unsafe():
 def test_ensure_workspace_creates_dir(tmp_path: Path) -> None:
     root = tmp_path / "wt"
     path = ensure_workspace("PROJ-1", root=root)
-    assert path == root / "PROJ-1"
+    assert path == root / "jira" / "PROJ-1"
     assert path.is_dir()
 
 
@@ -52,7 +53,57 @@ def test_ensure_workspace_sanitizes_key(tmp_path: Path) -> None:
     root = tmp_path / "wt"
     path = ensure_workspace("weird/key", root=root)
     assert path.name == "weird_key"
+    assert path.parent.name == "jira"
     assert path.is_dir()
+
+
+def test_ensure_workspace_routes_by_source(tmp_path: Path) -> None:
+    """GitHub PRs land under a different subdir so identifiers can't collide
+    with Jira keys on disk."""
+    root = tmp_path / "wt"
+    jira_path = ensure_workspace("PROJ-1", source="jira", root=root)
+    gh_path = ensure_workspace("owner/repo#1", source="github", root=root)
+    assert jira_path == root / "jira" / "PROJ-1"
+    assert gh_path == root / "github" / "owner_repo_1"
+    assert jira_path != gh_path
+
+
+def test_ensure_workspace_writes_identifier_sidecar(tmp_path: Path) -> None:
+    """The sidecar stashes the original (unsanitized) identifier so
+    startup_cleanup can reverse the sanitization when the dir name alone
+    is lossy (`/` and `#` both become `_`)."""
+    root = tmp_path / "wt"
+    path = ensure_workspace("owner/repo#42", source="github", root=root)
+    sidecar = path / ".identifier"
+    assert sidecar.is_file()
+    assert sidecar.read_text() == "owner/repo#42"
+    # Helper round-trip.
+    assert read_workspace_identifier(path) == "owner/repo#42"
+
+
+def test_read_workspace_identifier_returns_none_when_missing(
+    tmp_path: Path,
+) -> None:
+    """Legacy dirs created before the sidecar landed return None — caller
+    falls back to the dir name."""
+    legacy = tmp_path / "wt" / "jira" / "PROJ-1"
+    legacy.mkdir(parents=True)
+    assert read_workspace_identifier(legacy) is None
+
+
+def test_ensure_workspace_sidecar_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Re-calling ensure_workspace on the same identifier doesn't rewrite
+    the sidecar unnecessarily (preserves mtime so file watchers don't
+    re-fire)."""
+    root = tmp_path / "wt"
+    path = ensure_workspace("owner/repo#1", source="github", root=root)
+    sidecar = path / ".identifier"
+    first_mtime = sidecar.stat().st_mtime_ns
+    # Second call with the same identifier — sidecar should be untouched.
+    ensure_workspace("owner/repo#1", source="github", root=root)
+    assert sidecar.stat().st_mtime_ns == first_mtime
 
 
 def test_ensure_workspace_calls_ensure_persona(tmp_path: Path, _stub_persona) -> None:

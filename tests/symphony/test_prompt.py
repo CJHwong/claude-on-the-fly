@@ -80,6 +80,51 @@ def test_render_prompt_basic(tmp_path):
     assert "/tmp/ws" in out
 
 
+def test_render_prompt_exposes_body_text_and_source() -> None:
+    """GitHub-shaped Issues stash the PR body in `body_text` and `source`
+    is the tracker kind. Templates need both — without them, the GitHub
+    prompt template crashes with UndefinedError on `{{ issue.body_text }}`."""
+    gh_issue = Issue(
+        id="pr_node",
+        identifier="owner/repo#42",
+        title="Fix bug",
+        state="open",
+        description_raw=None,
+        priority=None,
+        labels=(),
+        blocked_by=(),
+        parent_key=None,
+        url="https://github.com/owner/repo/pull/42",
+        created_at=None,
+        updated_at=None,
+        source="github",
+        body_text="Some PR description text.",
+    )
+    out = render_prompt(
+        "src={{ issue.source }} body={{ issue.body_text }}",
+        issue=gh_issue,
+        attempt=0,
+        workspace_path=Path("/tmp/ws"),
+        gate_label=None,
+    )
+    assert "src=github" in out
+    assert "body=Some PR description text." in out
+
+
+def test_render_prompt_body_text_empty_string_when_none() -> None:
+    """Jira Issues leave body_text=None (description lives in description_json).
+    Liquid is in StrictUndefined mode, so `body_text` must still be set to
+    an empty string in the context — not omitted — to avoid raising."""
+    out = render_prompt(
+        "[{{ issue.body_text }}]",
+        issue=_issue(),  # source=jira (default), body_text=None
+        attempt=0,
+        workspace_path=Path("/tmp/ws"),
+        gate_label=None,
+    )
+    assert out == "[]"
+
+
 def test_render_prompt_unknown_var_raises():
     with pytest.raises(UndefinedError):
         render_prompt(

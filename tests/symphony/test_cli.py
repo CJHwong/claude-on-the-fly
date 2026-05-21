@@ -12,12 +12,15 @@ import pytest
 
 from claude_on_the_fly.symphony.cli import (
     DEFAULT_CONFIG,
+    _auto_detect_source,
     _cmd_takeover,
     _cmd_watch,
     _normalize_argv,
     _run,
+    _scan_workspace_sources,
     _setup_logging,
     main,
+    resolve_source,
 )
 
 
@@ -279,7 +282,7 @@ def test_main_takeover_dispatches_to_cmd_takeover() -> None:
         rc = main()
 
     assert rc == 0
-    mock_cmd.assert_called_once_with("PROJ-9")
+    mock_cmd.assert_called_once_with("PROJ-9", source=None)
 
 
 # ---------------------------------------------------------------------------
@@ -365,4 +368,78 @@ def test_main_watch_dispatches() -> None:
         rc = main()
 
     assert rc == 0
-    mock_cmd.assert_called_once_with("PROJ-9")
+    mock_cmd.assert_called_once_with("PROJ-9", source=None)
+
+
+def test_main_watch_passes_explicit_source() -> None:
+    """`--source` flag flows through to the command handler."""
+    with (
+        patch("claude_on_the_fly.symphony.cli.load_dotenv"),
+        patch.object(
+            sys,
+            "argv",
+            ["claude-symphony", "watch", "owner/repo#9", "--source", "github"],
+        ),
+        patch("claude_on_the_fly.symphony.cli._cmd_watch", return_value=0) as mock_cmd,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_cmd.assert_called_once_with("owner/repo#9", source="github")
+
+
+# ---------------------------------------------------------------------------
+# Source resolution
+# ---------------------------------------------------------------------------
+
+
+def test_auto_detect_jira_shape() -> None:
+    assert _auto_detect_source("PROJ-123") == "jira"
+    assert _auto_detect_source("ACE-42") == "jira"
+    assert _auto_detect_source("FIS_99-1") == "jira"
+
+
+def test_auto_detect_github_pr_shape() -> None:
+    assert _auto_detect_source("owner/repo#123") == "github"
+    assert _auto_detect_source("hardcoretech/fms#999") == "github"
+
+
+def test_auto_detect_returns_none_for_unknown_shape() -> None:
+    assert _auto_detect_source("just-a-string") is None
+    assert _auto_detect_source("lowercase-1") is None  # Jira keys start uppercase
+    assert _auto_detect_source("") is None
+
+
+def test_resolve_source_prefers_explicit() -> None:
+    assert resolve_source("PROJ-1", explicit="github") == "github"
+
+
+def test_resolve_source_falls_back_to_auto_detect() -> None:
+    assert resolve_source("PROJ-1") == "jira"
+    assert resolve_source("owner/repo#1") == "github"
+
+
+def test_resolve_source_scans_workspace_when_ambiguous(tmp_path: Path) -> None:
+    """When auto-detect fails (e.g. weird key shape) but exactly one source
+    has a matching workspace dir, use it."""
+    (tmp_path / "github" / "weird_key").mkdir(parents=True)
+    matches = _scan_workspace_sources("weird/key", root=tmp_path)
+    assert matches == ["github"]
+
+
+def test_resolve_source_raises_when_undetermined() -> None:
+    """Unknown key shape AND no matching workspace dir → callers get a
+    pointed error to surface."""
+    with pytest.raises(ValueError, match="cannot determine source"):
+        resolve_source("not-a-key-shape")
+
+
+def test_resolve_source_raises_when_multi_match() -> None:
+    """Same sanitized name exists under two sources — caller must pass
+    `--source` to disambiguate."""
+    with patch(
+        "claude_on_the_fly.symphony.cli._scan_workspace_sources",
+        return_value=["jira", "github"],
+    ):
+        with pytest.raises(ValueError, match="multiple sources"):
+            resolve_source("weird/key")

@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Mapping
+
+_EMPTY_EXTRA: Mapping[str, Any] = MappingProxyType({})
+
+
+def make_key(source: str, raw_id: str) -> str:
+    """Compose `<source>:<raw_id>` for state / retry tracking. Defined at
+    module level so callers can use it without an Issue instance handy."""
+    return f"{source}:{raw_id}"
 
 
 @dataclass(frozen=True)
@@ -13,25 +23,26 @@ class BlockerRef:
 
 @dataclass(frozen=True)
 class IssueSummary:
-    """Reconciliation-time snapshot of a ticket: state + labels, no description.
+    """Reconciliation-time snapshot of a ticket: state + adapter-specific fields.
 
-    Used by the batched `fetch_summaries_by_keys` call. The orchestrator needs
-    both fields to decide whether an in-flight worker should keep running:
-    state out-of-active means done/parked-by-status; gate label removed means
-    parked-by-label even if the status stayed active.
+    Used by the batched `fetch_summaries_by_keys` call. Each adapter populates
+    `extra` with whatever its `is_terminal`/`is_active` predicates need:
+    Jira fills `{"labels": (...)}`; GitHub fills
+    `{"review_requested_by_me": bool}`. Orchestrator never reads `extra` —
+    it hands the summary back to the tracker's predicate.
     """
 
     state: str
-    labels: tuple[str, ...]  # lowercased to match Issue.labels
+    extra: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_EXTRA)
 
 
 @dataclass(frozen=True)
 class Issue:
-    id: str  # tracker-internal numeric id (Jira: "10042")
-    identifier: str  # human key (Jira: "PROJ-1133")
+    id: str  # tracker-internal numeric id (Jira: "10042"; GitHub: PR node id)
+    identifier: str  # human key (Jira: "PROJ-1133"; GitHub: "owner/repo#123")
     title: str
     state: str
-    description_raw: dict | None  # raw ADF JSON; agent parses
+    description_raw: dict | None  # raw ADF JSON; agent parses (Jira). None for GitHub.
     priority: int | None  # 1=highest, lower=preferred per SPEC §8.2
     labels: tuple[str, ...]  # lowercased per SPEC §4.2
     blocked_by: tuple[BlockerRef, ...]
@@ -42,6 +53,23 @@ class Issue:
     type: str = (
         ""  # tracker-native type name (Jira: "Story", "Bug", "DevEx", "Sub-task")
     )
+    source: str = "jira"  # tracker kind that produced this issue
+    body_text: str | None = (
+        None  # plaintext/markdown body for prompts that don't want raw ADF
+    )
+    # Adapter-specific structured fields the predicates may need (e.g.
+    # GitHub stashes `review_requested_by_me` here so `issue_to_summary`
+    # can project it back into an `IssueSummary` without an extra fetch).
+    extra: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_EXTRA)
+
+    @property
+    def key(self) -> str:
+        """Composite (source, id) key used by OrchestratorState and RetryQueue.
+
+        Two trackers can independently mint the same raw `id`, so the
+        in-memory state always keys by source-prefixed composite.
+        """
+        return make_key(self.source, self.id)
 
     @classmethod
     def from_jira(cls, payload: dict, base_url: str) -> Issue:
@@ -94,4 +122,5 @@ class Issue:
             created_at=f.get("created"),
             updated_at=f.get("updated"),
             type=str(issuetype.get("name") or ""),
+            source="jira",
         )

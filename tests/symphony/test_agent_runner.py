@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 
 from claude_on_the_fly.symphony.agent_runner import TicketRunner, session_uuid_for
-from claude_on_the_fly.symphony.config import SymphonyConfig
+from claude_on_the_fly.symphony.config import JiraTrackerConfig, SymphonyConfig
 from claude_on_the_fly.symphony.tracker.issue import Issue
 
 
@@ -28,19 +28,27 @@ def _issue(**overrides: object) -> Issue:
 
 
 def _config(**overrides: object) -> SymphonyConfig:
-    defaults = {
-        "tracker": None,
-        "gate_label": "exit_label",
+    tracker = JiraTrackerConfig(
+        kind="jira",
+        base_url="https://x.atlassian.net",
+        email="me@x.com",
+        api_token="tok",
+        project_key="PROJ",
+        gate_label="exit_label",
+        prompt_path=Path("/tmp/symphony-prompt.md"),
+    )
+    global_defaults = {
         "turn_timeout_ms": 60_000,
         "max_turns": 10,
         "stall_timeout_ms": 300_000,
         "polling_ms": 30_000,
         "max_concurrent": 3,
         "max_retry_backoff_ms": 3600_000,
-        "max_concurrent_by_state": {},
-        "prompt_path": Path("/tmp/symphony-prompt.md"),
     }
-    return SymphonyConfig(**(defaults | overrides))  # type: ignore[arg-type]
+    return SymphonyConfig(
+        trackers={"jira": tracker},
+        **(global_defaults | overrides),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +70,19 @@ def test_session_uuid_is_string() -> None:
     assert len(result) == 36  # standard UUID
 
 
+def test_session_uuid_includes_source_in_seed() -> None:
+    """The same identifier across two sources mints distinct UUIDs so a
+    Jira ticket and a GitHub PR with overlapping keys don't collide."""
+    jira_uuid = session_uuid_for("PROJ-1", source="jira")
+    gh_uuid = session_uuid_for("PROJ-1", source="github")
+    assert jira_uuid != gh_uuid
+
+    # Determinism per (source, identifier).
+    assert session_uuid_for("owner/repo#1", source="github") == session_uuid_for(
+        "owner/repo#1", source="github"
+    )
+
+
 # ---------------------------------------------------------------------------
 # TicketRunner.run_turn
 # ---------------------------------------------------------------------------
@@ -75,6 +96,7 @@ async def test_run_turn_calls_agent_run_with_correct_args() -> None:
         issue=issue,
         workspace=workspace,
         config=config,
+        tracker_cfg=config.tracker,
         prompt_source="You are a helpful assistant.",
         session_uuid="test-uuid",
     )
@@ -114,10 +136,12 @@ async def test_run_turn_attempt_zero() -> None:
     """First turn (attempt=0)."""
     issue = _issue()
     workspace = Path("/tmp/ws")
+    cfg = _config()
     runner = TicketRunner(
         issue=issue,
         workspace=workspace,
-        config=_config(),
+        config=cfg,
+        tracker_cfg=cfg.tracker,
         prompt_source="prompt src",
         session_uuid="uuid-0",
     )
@@ -145,6 +169,7 @@ async def test_run_turn_custom_timeout() -> None:
         issue=issue,
         workspace=workspace,
         config=config,
+        tracker_cfg=config.tracker,
         prompt_source="src",
         session_uuid="u",
     )

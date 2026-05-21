@@ -15,16 +15,18 @@ from uuid import NAMESPACE_URL, uuid5
 from claude_on_the_fly import agent
 from claude_on_the_fly.agent import Response
 
-from .config import SymphonyConfig
+from .config import SymphonyConfig, TrackerCommonConfig
 from .prompt import render_prompt
 from .tracker.issue import Issue
 
 logger = logging.getLogger(__name__)
 
 
-def session_uuid_for(issue_identifier: str) -> str:
-    """Deterministic UUID per ticket so daemon restarts resume the prior session."""
-    return str(uuid5(NAMESPACE_URL, f"claude-symphony/{issue_identifier}"))
+def session_uuid_for(issue_identifier: str, source: str = "jira") -> str:
+    """Deterministic UUID per ticket so daemon restarts resume the prior
+    session. Source is in the seed so two trackers minting the same
+    `identifier` get distinct UUIDs."""
+    return str(uuid5(NAMESPACE_URL, f"claude-symphony/{source}/{issue_identifier}"))
 
 
 @dataclass
@@ -32,6 +34,7 @@ class TicketRunner:
     issue: Issue
     workspace: Path
     config: SymphonyConfig
+    tracker_cfg: TrackerCommonConfig
     prompt_source: str
     session_uuid: str
 
@@ -41,7 +44,7 @@ class TicketRunner:
             issue=self.issue,
             attempt=attempt,
             workspace_path=self.workspace,
-            gate_label=self.config.gate_label,
+            gate_label=self.tracker_cfg.gate_label,
         )
         logger.debug(
             "[%s] turn %d: prompt len=%d session=%s",

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from claude_on_the_fly.symphony.config import TrackerConfig
-from claude_on_the_fly.symphony.tracker.issue import Issue
+from claude_on_the_fly.symphony.tracker.issue import Issue, IssueSummary
 from claude_on_the_fly.symphony.tracker.jira import JiraTracker, compose_jql
 
 
@@ -133,6 +133,8 @@ def test_issue_from_jira_normalizes_labels_lowercase() -> None:
     issue = Issue.from_jira(payload, "https://x.atlassian.net")
     assert issue.labels == ("foo", "bar")
     assert issue.url == "https://x.atlassian.net/browse/PROJ-1"
+    assert issue.source == "jira"
+    assert issue.body_text is None
 
 
 def test_issue_from_jira_collects_only_inward_blockers() -> None:
@@ -302,8 +304,10 @@ async def test_fetch_summaries_by_keys_non_empty(mock_client_cls: MagicMock) -> 
     )
     result = await tracker.fetch_summaries_by_keys(["PROJ-1", "PROJ-2"])
     assert result == {
-        "PROJ-1": IssueSummary(state="In Progress", labels=("important", "extra")),
-        "PROJ-2": IssueSummary(state="Done", labels=()),
+        "PROJ-1": IssueSummary(
+            state="In Progress", extra={"labels": ("important", "extra")}
+        ),
+        "PROJ-2": IssueSummary(state="Done", extra={"labels": ()}),
     }
     await tracker.aclose()
 
@@ -339,3 +343,97 @@ async def test_async_context_manager(mock_client_cls: MagicMock) -> None:
         base_url="https://j.example.com", email="e@x.com", api_token="tok"
     ) as tracker:
         assert isinstance(tracker, JiraTracker)
+
+
+# ---------------------------------------------------------------------------
+# is_terminal / is_active predicates
+# ---------------------------------------------------------------------------
+
+
+def _tracker_for_predicates() -> JiraTracker:
+    """Bare tracker; predicates don't touch HTTP so the client doesn't matter."""
+    return JiraTracker(
+        base_url="https://j.example.com", email="e@x.com", api_token="tok"
+    )
+
+
+def test_is_terminal_true_for_terminal_state() -> None:
+    cfg = _tracker(terminal_states=("Done", "Closed"))
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="Done", extra={"labels": ()})
+    assert tracker.is_terminal(summary, cfg) is True
+
+
+def test_is_terminal_false_for_active_state() -> None:
+    cfg = _tracker(terminal_states=("Done",))
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="In Progress", extra={"labels": ()})
+    assert tracker.is_terminal(summary, cfg) is False
+
+
+def test_is_active_true_when_state_active_and_gate_label_present() -> None:
+    cfg = _tracker(
+        active_states=("In Progress",),
+        gate_label="stevedore",
+    )
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="In Progress", extra={"labels": ("stevedore",)})
+    assert tracker.is_active(summary, cfg) is True
+
+
+def test_is_active_false_when_gate_label_missing() -> None:
+    cfg = _tracker(
+        active_states=("In Progress",),
+        gate_label="stevedore",
+    )
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="In Progress", extra={"labels": ("other",)})
+    assert tracker.is_active(summary, cfg) is False
+
+
+def test_is_active_true_when_no_gate_configured() -> None:
+    cfg = _tracker(active_states=("In Progress",), gate_label=None)
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="In Progress", extra={"labels": ()})
+    assert tracker.is_active(summary, cfg) is True
+
+
+def test_is_active_false_when_state_not_active() -> None:
+    cfg = _tracker(active_states=("In Progress",), gate_label="stevedore")
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="Backlog", extra={"labels": ("stevedore",)})
+    assert tracker.is_active(summary, cfg) is False
+
+
+def test_is_active_handles_missing_labels_key() -> None:
+    """If extra has no `labels` entry (e.g. partial summary), treat as no
+    labels — gate label is effectively missing."""
+    cfg = _tracker(active_states=("In Progress",), gate_label="stevedore")
+    tracker = _tracker_for_predicates()
+    summary = IssueSummary(state="In Progress", extra={})
+    assert tracker.is_active(summary, cfg) is False
+
+
+def test_issue_to_summary_packs_state_and_labels() -> None:
+    """Refreshed Issue projects back into an IssueSummary the predicates can
+    consume — no extra summaries fetch needed in the worker."""
+    tracker = _tracker_for_predicates()
+    payload = {
+        "id": "10",
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "t",
+            "status": {"name": "In Progress"},
+            "labels": ["stevedore", "needs-design"],
+            "issuelinks": [],
+            "parent": None,
+            "description": None,
+            "priority": None,
+            "created": None,
+            "updated": None,
+        },
+    }
+    issue = Issue.from_jira(payload, "https://x")
+    summary = tracker.issue_to_summary(issue)
+    assert summary.state == "In Progress"
+    assert summary.extra["labels"] == ("stevedore", "needs-design")

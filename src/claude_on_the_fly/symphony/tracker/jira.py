@@ -8,7 +8,7 @@ import os
 
 import httpx
 
-from ..config import TrackerConfig
+from ..config import TrackerCommonConfig, TrackerConfig
 from .issue import Issue, IssueSummary
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,9 @@ class JiraTracker:
                 str(label).lower() for label in (fields.get("labels") or []) if label
             )
             if key and status_name:
-                out[str(key)] = IssueSummary(state=str(status_name), labels=labels)
+                out[str(key)] = IssueSummary(
+                    state=str(status_name), extra={"labels": labels}
+                )
         return out
 
     async def fetch_candidates(self, cfg: TrackerConfig) -> list[Issue]:
@@ -129,6 +131,26 @@ class JiraTracker:
             Issue.from_jira(item, self._base_url)
             for item in payload.get("issues") or []
         ]
+
+    def is_terminal(self, summary: IssueSummary, cfg: TrackerCommonConfig) -> bool:
+        """Jira: terminal when state is in cfg.terminal_states."""
+        return summary.state in cfg.terminal_states
+
+    def is_active(self, summary: IssueSummary, cfg: TrackerCommonConfig) -> bool:
+        """Jira: keep running iff state is active AND gate label is attached
+        (or no gate configured). Labels come from `summary.extra["labels"]`."""
+        if summary.state not in cfg.active_states:
+            return False
+        if cfg.gate_label is None:
+            return True
+        labels = summary.extra.get("labels") or ()
+        return cfg.gate_label.lower() in labels
+
+    def issue_to_summary(self, issue: Issue) -> IssueSummary:
+        """Project a refreshed Jira Issue into a summary the predicates can
+        read. Jira's labels are already on the Issue, so this is a trivial
+        repack."""
+        return IssueSummary(state=issue.state, extra={"labels": issue.labels})
 
     async def aclose(self) -> None:
         await self._client.aclose()

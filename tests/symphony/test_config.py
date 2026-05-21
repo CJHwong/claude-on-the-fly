@@ -80,17 +80,21 @@ def test_tracker_missing_required():
 
 
 def test_load_config_defaults(tmp_path, env_creds):
+    from claude_on_the_fly.symphony.config import JiraTrackerConfig
+
     cfg_path, prompt_path = _write_pair(tmp_path)
     cfg = load_config(cfg_path)
     cfg.validate()
-    assert cfg.tracker.email == "me@x.com"
-    assert cfg.tracker.api_token == "tok"
-    assert cfg.tracker.project_key == "PROJ"
-    assert cfg.tracker.active_states == ("To Do", "In Progress")
+    tracker = cfg.tracker
+    assert isinstance(tracker, JiraTrackerConfig)
+    assert tracker.email == "me@x.com"
+    assert tracker.api_token == "tok"
+    assert tracker.project_key == "PROJ"
+    assert tracker.active_states == ("To Do", "In Progress")
     assert cfg.polling_ms == 30000
     assert cfg.max_concurrent == 1
     assert cfg.max_turns == 20
-    assert cfg.prompt_path == prompt_path.resolve()
+    assert tracker.prompt_path == prompt_path.resolve()
 
 
 def test_load_config_overrides(tmp_path, env_creds):
@@ -107,7 +111,7 @@ def test_load_config_overrides(tmp_path, env_creds):
     assert cfg.polling_ms == 5000
     assert cfg.max_concurrent == 3
     assert cfg.max_turns == 10
-    assert cfg.gate_label == "stevedore"
+    assert cfg.tracker.gate_label == "stevedore"
 
 
 def test_load_config_explicit_prompt_path(tmp_path, env_creds):
@@ -116,7 +120,7 @@ def test_load_config_explicit_prompt_path(tmp_path, env_creds):
     cfg_path, _ = _write_pair(tmp_path, extras=f"prompt: {custom_prompt}\n")
     cfg = load_config(cfg_path)
     cfg.validate()
-    assert cfg.prompt_path == custom_prompt.resolve()
+    assert cfg.tracker.prompt_path == custom_prompt.resolve()
 
 
 def test_load_config_polling_min(tmp_path, env_creds):
@@ -156,7 +160,7 @@ def test_load_config_per_state_concurrency_lowercases_keys(tmp_path, env_creds):
         extras=('max_concurrent_by_state:\n  Rework: 1\n  "In Progress": 5\n'),
     )
     cfg = load_config(cfg_path)
-    assert cfg.max_concurrent_by_state == {"rework": 1, "in progress": 5}
+    assert cfg.tracker.max_concurrent_by_state == {"rework": 1, "in progress": 5}
 
 
 def test_load_config_per_state_drops_invalid_entries(tmp_path, env_creds):
@@ -171,7 +175,7 @@ def test_load_config_per_state_drops_invalid_entries(tmp_path, env_creds):
         ),
     )
     cfg = load_config(cfg_path)
-    assert cfg.max_concurrent_by_state == {"building": 3}
+    assert cfg.tracker.max_concurrent_by_state == {"building": 3}
 
 
 def test_load_config_per_state_must_be_mapping(tmp_path, env_creds):
@@ -298,3 +302,89 @@ def test_symphony_config_from_dict_non_dict() -> None:
 def test_load_config_missing_file(tmp_path) -> None:
     with pytest.raises(FileNotFoundError, match="config not found"):
         load_config(tmp_path / "nonexistent.yaml")
+
+
+# ---------------------------------------------------------------------------
+# Multi-tracker shape + backward compat
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_new_multi_tracker_shape(tmp_path, env_creds):
+    """`trackers:` map with both jira and github stanzas constructs a
+    SymphonyConfig with one entry per source."""
+    cfg_path = tmp_path / "symphony.yaml"
+    jira_prompt = tmp_path / "symphony-prompt-jira.md"
+    gh_prompt = tmp_path / "symphony-prompt-github.md"
+    jira_prompt.write_text("jira prompt")
+    gh_prompt.write_text("github prompt")
+    cfg_path.write_text(
+        f"""
+trackers:
+  jira:
+    kind: jira
+    base_url: https://x.atlassian.net
+    email: $J_EMAIL
+    api_token: $J_TOK
+    project_key: PROJ
+    gate_label: stevedore
+    prompt: {jira_prompt}
+  github:
+    kind: github
+    prompt: {gh_prompt}
+polling_ms: 5000
+"""
+    )
+    cfg = load_config(cfg_path)
+    cfg.validate()
+    assert set(cfg.trackers) == {"jira", "github"}
+    jira = cfg.trackers["jira"]
+    gh = cfg.trackers["github"]
+    assert jira.kind == "jira"
+    assert jira.gate_label == "stevedore"
+    assert jira.prompt_path == jira_prompt.resolve()
+    assert gh.kind == "github"
+    assert gh.gate_label is None  # no gate label for github
+    assert gh.active_states == ("open",)
+    assert gh.terminal_states == ("closed", "merged")
+    assert gh.prompt_path == gh_prompt.resolve()
+    assert cfg.polling_ms == 5000
+
+
+def test_load_config_legacy_singular_tracker_form_is_wrapped(tmp_path, env_creds):
+    """Old shape with `tracker:` + top-level prompt/gate_label is auto-wrapped
+    into the new `trackers:` map, hoisting those fields into the wrapped
+    tracker so existing configs keep working."""
+    cfg_path, _ = _write_pair(tmp_path, extras="gate_label: stevedore\n")
+    cfg = load_config(cfg_path)
+    cfg.validate()
+    # The wrapped tracker is keyed by its `kind`.
+    assert set(cfg.trackers) == {"jira"}
+    jira = cfg.trackers["jira"]
+    assert jira.gate_label == "stevedore"
+    # Singular alias and convenience properties still work.
+    assert cfg.tracker is jira
+    assert cfg.tracker.gate_label == "stevedore"
+
+
+def test_load_config_unsupported_kind_raises(tmp_path, env_creds):
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text("trackers:\n  bogus:\n    kind: linear\n")
+    with pytest.raises(ValueError, match="tracker.kind='linear' unsupported"):
+        load_config(cfg_path)
+
+
+def test_github_tracker_config_defaults_no_auth_fields_needed():
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    cfg = GitHubTrackerConfig.from_dict({"kind": "github"})
+    assert cfg.kind == "github"
+    assert cfg.active_states == ("open",)
+    assert cfg.terminal_states == ("closed", "merged")
+    assert cfg.gate_label is None
+
+
+def test_trackers_must_be_mapping(tmp_path, env_creds):
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text("trackers: not-a-map\n")
+    with pytest.raises(ValueError, match="`trackers` must be a mapping"):
+        load_config(cfg_path)

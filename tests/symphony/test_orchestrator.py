@@ -28,17 +28,23 @@ from claude_on_the_fly.symphony.orchestrator import (
 )
 from claude_on_the_fly.symphony.retry import RetryEntry, RetryQueue
 from claude_on_the_fly.symphony.state import OrchestratorState, RunningEntry
-from claude_on_the_fly.symphony.tracker.issue import BlockerRef, Issue, IssueSummary
+from claude_on_the_fly.symphony.tracker import Tracker
+from claude_on_the_fly.symphony.tracker.issue import (
+    BlockerRef,
+    Issue,
+    IssueSummary,
+    make_key,
+)
 
 
 def _summaries(
     d: dict[str, str], *, label: str = "symphony-active"
 ) -> dict[str, IssueSummary]:
-    """Helper: turn `{key: state}` into `{key: IssueSummary(state, (label,))}`.
+    """Helper: turn `{key: state}` into `{key: IssueSummary(state, {"labels": (label,)})}`.
 
     Default label matches `_config()`'s gate_label so existing tests that
     don't care about labels keep working with the new label check."""
-    return {k: IssueSummary(state=v, labels=(label,)) for k, v in d.items()}
+    return {k: IssueSummary(state=v, extra={"labels": (label,)}) for k, v in d.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +69,25 @@ def _issue(**overrides: object) -> Issue:
         "url": "https://jira.example.com/browse/PROJ-1",
         "created_at": "2026-01-01T00:00:00",
         "updated_at": "2026-01-02T00:00:00",
+        "source": "jira",
+        "body_text": None,
     }
     return Issue(**(defaults | {k: v for k, v in overrides.items() if k in defaults}))  # type: ignore[arg-type]
+
+
+_TRACKER_FIELDS = {
+    "kind",
+    "base_url",
+    "email",
+    "api_token",
+    "project_key",
+    "jql_extra",
+    "active_states",
+    "terminal_states",
+    "gate_label",
+    "prompt_path",
+    "max_concurrent_by_state",
+}
 
 
 def _tracker_cfg(**overrides: object) -> TrackerConfig:
@@ -77,35 +100,80 @@ def _tracker_cfg(**overrides: object) -> TrackerConfig:
         "jql_extra": 'AND status != "Done"',
         "active_states": ("In Progress", "To Do", "In Review"),
         "terminal_states": ("Done", "Cancelled"),
+        "gate_label": "symphony-active",
+        "prompt_path": Path("/tmp/symphony-prompt.md"),
+        "max_concurrent_by_state": {},
     }
-    kwargs = defaults | {k: v for k, v in overrides.items() if k in defaults}
+    kwargs = defaults | {k: v for k, v in overrides.items() if k in _TRACKER_FIELDS}
     return TrackerConfig(**kwargs)  # type: ignore[arg-type]
 
 
 def _config(**overrides: object) -> SymphonyConfig:
-    defaults = {
-        "tracker": _tracker_cfg(),
-        "gate_label": "symphony-active",
+    # Route tracker-shaped overrides into the JiraTrackerConfig; remaining
+    # globals stay on SymphonyConfig. If `tracker=` is also passed, layer
+    # any tracker-shaped overrides on top via dataclasses.replace().
+    from dataclasses import replace as _dc_replace
+
+    tracker_overrides = {k: v for k, v in overrides.items() if k in _TRACKER_FIELDS}
+    if "tracker" in overrides:
+        tracker = overrides["tracker"]
+        if tracker_overrides:
+            tracker = _dc_replace(tracker, **tracker_overrides)  # type: ignore[arg-type]
+    else:
+        tracker = _tracker_cfg(**tracker_overrides)
+
+    global_defaults = {
         "turn_timeout_ms": 60_000,
         "max_turns": 10,
         "stall_timeout_ms": 300_000,
         "polling_ms": 30_000,
         "max_concurrent": 3,
         "max_retry_backoff_ms": 3600_000,
-        "max_concurrent_by_state": {},
-        "prompt_path": Path("/tmp/symphony-prompt.md"),
     }
-    kwargs = defaults | {k: v for k, v in overrides.items() if k in defaults}
-    return SymphonyConfig(**kwargs)  # type: ignore[arg-type]
+    global_overrides = {k: v for k, v in overrides.items() if k in global_defaults}
+    return SymphonyConfig(
+        trackers={"jira": tracker},  # type: ignore[dict-item]
+        **(global_defaults | global_overrides),
+    )
 
 
-def _mock_tracker() -> MagicMock:
+def _mock_tracker(*, gate_label: str = "symphony-active") -> MagicMock:
+    """Mock tracker that behaves like Jira: predicates check state list +
+    optional gate label. Tests override `is_terminal` / `is_active` /
+    `issue_to_summary` when they need different semantics."""
     t = MagicMock()
     t.fetch_one = AsyncMock()
     t.fetch_summaries_by_keys = AsyncMock()
     t.fetch_candidates = AsyncMock()
     t.aclose = AsyncMock()
+
+    def _is_terminal(summary, cfg):
+        return summary.state in cfg.terminal_states
+
+    def _is_active(summary, cfg):
+        if summary.state not in cfg.active_states:
+            return False
+        if cfg.gate_label is None:
+            return True
+        labels = summary.extra.get("labels") or ()
+        return cfg.gate_label.lower() in labels
+
+    def _issue_to_summary(issue):
+        from claude_on_the_fly.symphony.tracker.issue import IssueSummary
+
+        return IssueSummary(state=issue.state, extra={"labels": issue.labels})
+
+    t.is_terminal = MagicMock(side_effect=_is_terminal)
+    t.is_active = MagicMock(side_effect=_is_active)
+    t.issue_to_summary = MagicMock(side_effect=_issue_to_summary)
     return t
+
+
+def _trackers(t: MagicMock | None = None) -> dict[str, Tracker]:
+    """Wrap a single mock tracker into a `{"jira": tracker}` dict matching
+    SymphonyConfig.trackers. Convenience for tests that exercise the
+    multi-source orchestrator code paths with one source."""
+    return {"jira": t if t is not None else _mock_tracker()}  # type: ignore[dict-item]
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +216,12 @@ class TestLogConfigSummary:
 
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "symphony config:" in text
-        assert "tracker.base_url    = https://j.example.com" in text
-        assert "tracker.email       = bot@example.com" in text
+        assert "[jira]" in text
+        assert "https://j.example.com" in text
+        assert "bot@example.com" in text
         assert "polling_ms          = 15000" in text
         assert "max_concurrent      = 3" in text
-        assert "gate_label          = ready_for_ai" in text
+        assert "ready_for_ai" in text  # gate_label
         assert "PROJ" in text
         # Redaction: real token never appears, masked form does.
         assert "supersecrettoken" not in text
@@ -176,7 +245,7 @@ class TestHeartbeatExtra:
     def test_running_ticket_summary(self) -> None:
         state = OrchestratorState()
         state.claim(_issue(id="9", identifier="PROJ-9", state="In Progress"))
-        entry = state.get_running("9")
+        entry = state.get_running(make_key("jira", "9"))
         assert entry is not None
         # Fix started_at so uptime is deterministic.
         entry.started_at = 100.0
@@ -203,7 +272,7 @@ class TestHeartbeatExtra:
     def test_last_turn_end_age(self) -> None:
         state = OrchestratorState()
         state.claim(_issue(id="9", identifier="PROJ-9", state="In Progress"))
-        entry = state.get_running("9")
+        entry = state.get_running(make_key("jira", "9"))
         assert entry is not None
         entry.started_at = 100.0
         entry.last_turn_end_at = 150.0
@@ -339,21 +408,37 @@ class TestSelectCandidates:
 class TestHasPerStateCapacity:
     def test_under_global_cap_when_no_per_state_cap(self) -> None:
         state = OrchestratorState()
-        assert _has_per_state_capacity(state, "In Progress", _config()) is True
+        cfg = _config()
+        assert (
+            _has_per_state_capacity(
+                state, "In Progress", cfg.tracker, cfg.max_concurrent
+            )
+            is True
+        )
 
     def test_at_per_state_cap(self) -> None:
         config = _config(max_concurrent_by_state={"in progress": 1})
         state = OrchestratorState()
         issue = _issue(state="In Progress")
         state.claim(issue)
-        assert _has_per_state_capacity(state, "In Progress", config) is False
+        assert (
+            _has_per_state_capacity(
+                state, "In Progress", config.tracker, config.max_concurrent
+            )
+            is False
+        )
 
     def test_under_per_state_cap(self) -> None:
         config = _config(max_concurrent_by_state={"in progress": 2})
         state = OrchestratorState()
         issue = _issue(state="In Progress")
         state.claim(issue)
-        assert _has_per_state_capacity(state, "In Progress", config) is True
+        assert (
+            _has_per_state_capacity(
+                state, "In Progress", config.tracker, config.max_concurrent
+            )
+            is True
+        )
 
     def test_falls_back_to_global_concurrent(self) -> None:
         config = _config(max_concurrent_by_state={})
@@ -361,7 +446,12 @@ class TestHasPerStateCapacity:
         # Claim until full under global cap
         for i in range(config.max_concurrent):
             state.claim(_issue(id=str(i), state="In Progress"))
-        assert _has_per_state_capacity(state, "In Progress", config) is False
+        assert (
+            _has_per_state_capacity(
+                state, "In Progress", config.tracker, config.max_concurrent
+            )
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +489,7 @@ class TestCheckAndCancelStall:
         result = _check_and_cancel_stall(entry, config, rq, 110.0)
         assert result is True
         task.cancel.assert_called_once()
-        assert rq.has("1") is True
+        assert rq.has(make_key("jira", "1")) is True
 
     def test_stalled_uses_last_turn_end(self) -> None:
         config = _config(stall_timeout_ms=5_000)
@@ -433,7 +523,7 @@ class TestCheckAndCancelStall:
         result = _check_and_cancel_stall(entry, config, rq, 110.0)
         assert result is True
         task.cancel.assert_not_called()
-        assert rq.has("1") is True
+        assert rq.has(make_key("jira", "1")) is True
 
 
 # ---------------------------------------------------------------------------
@@ -453,9 +543,10 @@ class TestDispatch:
             "claude_on_the_fly.symphony.orchestrator._run_worker"
         ) as mock_run_worker:
             mock_run_worker.return_value = None
-            _dispatch(issue, state, tracker, _config(), "prompt", rq, pending)
+            cfg = _config()
+            _dispatch(issue, state, tracker, cfg.tracker, cfg, "prompt", rq, pending)
 
-        assert state.is_claimed(issue.id) is True
+        assert state.is_claimed(issue.key) is True
         assert len(pending) == 1
 
     async def test_dispatch_raises_on_duplicate(self) -> None:
@@ -465,7 +556,10 @@ class TestDispatch:
         tracker = _mock_tracker()
         pending: set[asyncio.Task[None]] = set()
 
-        _dispatch(issue, state, tracker, _config(), "prompt", RetryQueue(), pending)
+        cfg = _config()
+        _dispatch(
+            issue, state, tracker, cfg.tracker, cfg, "prompt", RetryQueue(), pending
+        )
         # Should not raise; just silently returns
         assert len(pending) == 0
 
@@ -502,10 +596,12 @@ class TestRunWorker:
             )
             mock_runner_cls.return_value = mock_runner
 
-            await _run_worker(issue, state, tracker, config, "prompt", rq)
+            await _run_worker(
+                issue, state, tracker, config.tracker, config, "prompt", rq
+            )
 
-        assert rq.has(issue.id) is True
-        assert state.is_claimed(issue.id) is False
+        assert rq.has(issue.key) is True
+        assert state.is_claimed(issue.key) is False
 
     async def test_workspace_prep_failure(self) -> None:
         issue = _issue()
@@ -519,10 +615,12 @@ class TestRunWorker:
             "claude_on_the_fly.symphony.orchestrator.ensure_workspace",
             side_effect=OSError("disk full"),
         ):
-            await _run_worker(issue, state, tracker, config, "prompt", rq)
+            await _run_worker(
+                issue, state, tracker, config.tracker, config, "prompt", rq
+            )
 
-        assert rq.has(issue.id) is True
-        assert state.is_claimed(issue.id) is False
+        assert rq.has(issue.key) is True
+        assert state.is_claimed(issue.key) is False
 
     async def test_max_turns_reached_schedules_continuation(self) -> None:
         issue = _issue()
@@ -548,10 +646,17 @@ class TestRunWorker:
             # Each turn — tracker.fetch_one returns active state so we loop
             tracker.fetch_one.return_value = _issue(state="In Progress")
             await _run_worker(
-                issue, state, tracker, config, "prompt", rq, starting_failure_attempt=0
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                starting_failure_attempt=0,
             )
 
-        assert rq.has(issue.id) is True
+        assert rq.has(issue.key) is True
 
     async def test_terminal_state_after_turn(self) -> None:
         issue = _issue()
@@ -578,7 +683,9 @@ class TestRunWorker:
             mock_runner_cls.return_value = mock_runner
 
             tracker.fetch_one.return_value = _issue(state="Done")
-            await _run_worker(issue, state, tracker, config, "prompt", rq)
+            await _run_worker(
+                issue, state, tracker, config.tracker, config, "prompt", rq
+            )
 
         mock_rm.assert_called_once()
 
@@ -604,9 +711,11 @@ class TestRunWorker:
             mock_runner_cls.return_value = mock_runner
 
             tracker.fetch_one.return_value = _issue(state="Backlog")
-            await _run_worker(issue, state, tracker, config, "prompt", rq)
+            await _run_worker(
+                issue, state, tracker, config.tracker, config, "prompt", rq
+            )
 
-        assert state.is_claimed(issue.id) is False
+        assert state.is_claimed(issue.key) is False
 
     async def test_worker_crash_schedules_failure(self) -> None:
         issue = _issue()
@@ -621,9 +730,11 @@ class TestRunWorker:
             side_effect=RuntimeError("boom"),
         ):
             # This actually falls into workspace prep failure path
-            await _run_worker(issue, state, tracker, config, "prompt", rq)
+            await _run_worker(
+                issue, state, tracker, config.tracker, config, "prompt", rq
+            )
 
-        assert rq.has(issue.id) is True
+        assert rq.has(issue.key) is True
 
     async def test_gate_label_removed_between_turns_exits(self) -> None:
         """Agent parks itself by removing the gate label — worker must stop."""
@@ -648,11 +759,13 @@ class TestRunWorker:
             mock_runner_cls.return_value = mock_runner
             # Post-turn refresh shows state still active BUT gate label gone.
             tracker.fetch_one.return_value = _issue(state="In Progress", labels=())
-            await _run_worker(issue, state, tracker, config, "prompt", rq)
+            await _run_worker(
+                issue, state, tracker, config.tracker, config, "prompt", rq
+            )
 
         # Exactly one turn ran, no retry scheduled (clean park).
         assert mock_runner.run_turn.await_count == 1
-        assert rq.has(issue.id) is False
+        assert rq.has(issue.key) is False
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +777,7 @@ class TestReconcile:
     async def test_no_running_workers_returns_early(self) -> None:
         state = OrchestratorState()
         tracker = _mock_tracker()
-        await reconcile(state, tracker, _config(), RetryQueue())
+        await reconcile(state, _trackers(tracker), _config(), RetryQueue())
         tracker.fetch_summaries_by_keys.assert_not_called()
 
     async def test_fetch_failure_logs_and_returns(self) -> None:
@@ -673,7 +786,9 @@ class TestReconcile:
         state.claim(issue)
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.side_effect = ConnectionError("down")
-        await reconcile(state, tracker, _config(stall_timeout_ms=0), RetryQueue())
+        await reconcile(
+            state, _trackers(tracker), _config(stall_timeout_ms=0), RetryQueue()
+        )
         tracker.fetch_summaries_by_keys.assert_awaited_once()
 
     async def test_terminal_mid_run_cancels_and_removes_workspace(self) -> None:
@@ -687,7 +802,7 @@ class TestReconcile:
         with patch(
             "claude_on_the_fly.symphony.orchestrator.remove_workspace"
         ) as mock_rm:
-            await reconcile(state, tracker, cfg, RetryQueue())
+            await reconcile(state, _trackers(tracker), cfg, RetryQueue())
 
         mock_rm.assert_not_called()  # workspace path is None, so it won't be called
 
@@ -702,7 +817,7 @@ class TestReconcile:
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Backlog"})
 
-        await reconcile(state, tracker, cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
         task.cancel.assert_called_once()
 
     async def test_state_update_when_changed_and_still_active(self) -> None:
@@ -715,7 +830,7 @@ class TestReconcile:
             {"PROJ-1": "In Progress"}
         )
 
-        await reconcile(state, tracker, cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
         assert entry.issue_state == "In Progress"
 
     async def test_gate_label_removed_mid_run_cancels(self) -> None:
@@ -730,10 +845,12 @@ class TestReconcile:
         tracker = _mock_tracker()
         # Active state, but label gone.
         tracker.fetch_summaries_by_keys.return_value = {
-            "PROJ-1": IssueSummary(state="In Progress", labels=("other-label",)),
+            "PROJ-1": IssueSummary(
+                state="In Progress", extra={"labels": ("other-label",)}
+            ),
         }
 
-        await reconcile(state, tracker, cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
         task.cancel.assert_called_once()
 
     async def test_gate_label_present_does_not_cancel(self) -> None:
@@ -750,7 +867,7 @@ class TestReconcile:
             {"PROJ-1": "In Progress"}
         )
 
-        await reconcile(state, tracker, cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
         task.cancel.assert_not_called()
 
 
@@ -767,7 +884,7 @@ class TestStartupCleanup:
         import asyncio as _asyncio
 
         async def _run() -> None:
-            await startup_cleanup(root, tracker, _tracker_cfg())
+            await startup_cleanup(root, _trackers(tracker), _config())
 
         _asyncio.run(_run())
         tracker.fetch_summaries_by_keys.assert_not_called()
@@ -778,7 +895,7 @@ class TestStartupCleanup:
         root.mkdir()
 
         async def _run() -> None:
-            await startup_cleanup(root, tracker, _tracker_cfg())
+            await startup_cleanup(root, _trackers(tracker), _config())
 
         asyncio.run(_run())
         tracker.fetch_summaries_by_keys.assert_not_called()
@@ -786,13 +903,14 @@ class TestStartupCleanup:
     def test_removes_terminal_dirs(self, tmp_path: Path) -> None:
         tracker = _mock_tracker()
         root = tmp_path / "worktrees"
-        root.mkdir()
-        d = root / "PROJ-1"
+        # New per-source layout: cleanup walks `root / <source>`.
+        (root / "jira").mkdir(parents=True)
+        d = root / "jira" / "PROJ-1"
         d.mkdir()
         tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Done"})
 
         async def _run() -> None:
-            await startup_cleanup(root, tracker, _tracker_cfg())
+            await startup_cleanup(root, _trackers(tracker), _config())
 
         asyncio.run(_run())
         assert not d.exists()
@@ -800,15 +918,15 @@ class TestStartupCleanup:
     def test_leaves_non_terminal_dirs(self, tmp_path: Path) -> None:
         tracker = _mock_tracker()
         root = tmp_path / "worktrees"
-        root.mkdir()
-        d = root / "PROJ-2"
+        (root / "jira").mkdir(parents=True)
+        d = root / "jira" / "PROJ-2"
         d.mkdir()
         tracker.fetch_summaries_by_keys.return_value = _summaries(
             {"PROJ-2": "In Progress"}
         )
 
         async def _run() -> None:
-            await startup_cleanup(root, tracker, _tracker_cfg())
+            await startup_cleanup(root, _trackers(tracker), _config())
 
         asyncio.run(_run())
         assert d.exists()
@@ -816,16 +934,16 @@ class TestStartupCleanup:
     def test_fetch_failure_logs_and_skips(self, tmp_path: Path) -> None:
         tracker = _mock_tracker()
         root = tmp_path / "worktrees"
-        root.mkdir()
-        (root / "PROJ-1").mkdir()
+        (root / "jira").mkdir(parents=True)
+        (root / "jira" / "PROJ-1").mkdir()
         tracker.fetch_summaries_by_keys.side_effect = ConnectionError("down")
 
         async def _run() -> None:
-            await startup_cleanup(root, tracker, _tracker_cfg())
+            await startup_cleanup(root, _trackers(tracker), _config())
 
         asyncio.run(_run())
         # DIR not removed because fetch failed
-        assert (root / "PROJ-1").exists()
+        assert (root / "jira" / "PROJ-1").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +957,12 @@ class TestProcessDueRetries:
         tracker = _mock_tracker()
         pending: set[asyncio.Task[None]] = set()
         await _process_due_retries(
-            OrchestratorState(), tracker, _config(), "prompt", rq, pending
+            OrchestratorState(),
+            _trackers(tracker),
+            _config(),
+            {"jira": "prompt"},
+            rq,
+            pending,
         )
         tracker.fetch_summaries_by_keys.assert_not_called()
 
@@ -851,7 +974,7 @@ class TestProcessDueRetries:
             "1", "PROJ-1", cfg.max_retry_backoff_ms, attempt=2, error="test"
         )
         # Override due_at so it's "due now"
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=2, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -859,14 +982,19 @@ class TestProcessDueRetries:
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(
-            OrchestratorState(), tracker, cfg, "prompt", rq, pending
+            OrchestratorState(),
+            _trackers(tracker),
+            cfg,
+            {"jira": "prompt"},
+            rq,
+            pending,
         )
-        assert rq.has("1") is False  # dropped, not requeued
+        assert rq.has(make_key("jira", "1")) is False  # dropped, not requeued
 
     async def test_inactive_state_dropped(self) -> None:
         cfg = _config()
         rq = RetryQueue()
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -874,9 +1002,14 @@ class TestProcessDueRetries:
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(
-            OrchestratorState(), tracker, cfg, "prompt", rq, pending
+            OrchestratorState(),
+            _trackers(tracker),
+            cfg,
+            {"jira": "prompt"},
+            rq,
+            pending,
         )
-        assert rq.has("1") is False
+        assert rq.has(make_key("jira", "1")) is False
 
     async def test_no_global_slots_requeues(self) -> None:
         cfg = _config(max_concurrent=2)
@@ -884,7 +1017,7 @@ class TestProcessDueRetries:
         state.claim(_issue(id="99", state="In Progress"))
         state.claim(_issue(id="100", state="In Progress"))
         rq = RetryQueue()
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -893,13 +1026,15 @@ class TestProcessDueRetries:
         )
         pending: set[asyncio.Task[None]] = set()
 
-        await _process_due_retries(state, tracker, cfg, "prompt", rq, pending)
-        assert rq.has("1") is True  # requeued
+        await _process_due_retries(
+            state, _trackers(tracker), cfg, {"jira": "prompt"}, rq, pending
+        )
+        assert rq.has(make_key("jira", "1")) is True  # requeued
 
     async def test_dispatches_when_slots_available(self) -> None:
         cfg = _config(max_concurrent=3)
         rq = RetryQueue()
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -913,7 +1048,12 @@ class TestProcessDueRetries:
             "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
         ):
             await _process_due_retries(
-                OrchestratorState(), tracker, cfg, "prompt", rq, pending
+                OrchestratorState(),
+                _trackers(tracker),
+                cfg,
+                {"jira": "prompt"},
+                rq,
+                pending,
             )
 
         tracker.fetch_one.assert_awaited_once_with("PROJ-1")
@@ -921,7 +1061,7 @@ class TestProcessDueRetries:
     async def test_fetch_one_failure_requeues(self) -> None:
         cfg = _config()
         rq = RetryQueue()
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=2, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -932,16 +1072,21 @@ class TestProcessDueRetries:
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(
-            OrchestratorState(), tracker, cfg, "prompt", rq, pending
+            OrchestratorState(),
+            _trackers(tracker),
+            cfg,
+            {"jira": "prompt"},
+            rq,
+            pending,
         )
-        assert rq.has("1") is True  # requeued
+        assert rq.has(make_key("jira", "1")) is True  # requeued
 
     async def test_gate_label_missing_drops(self) -> None:
         # Agent removed the gate label to park the ticket. Retry path must drop it
         # rather than re-dispatch, so the daemon honors the agent's pause signal.
         cfg = _config()  # gate_label="symphony-active"
         rq = RetryQueue()
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -955,17 +1100,22 @@ class TestProcessDueRetries:
             "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
         ):
             await _process_due_retries(
-                OrchestratorState(), tracker, cfg, "prompt", rq, pending
+                OrchestratorState(),
+                _trackers(tracker),
+                cfg,
+                {"jira": "prompt"},
+                rq,
+                pending,
             )
 
-        assert rq.has("1") is False  # dropped, not requeued
+        assert rq.has(make_key("jira", "1")) is False  # dropped, not requeued
         # _dispatch was NOT called: no worker task was created
         assert len(pending) == 0
 
     async def test_gate_label_present_dispatches(self) -> None:
         cfg = _config()  # gate_label="symphony-active"
         rq = RetryQueue()
-        rq._entries["1"] = RetryEntry(
+        rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
@@ -979,7 +1129,12 @@ class TestProcessDueRetries:
             "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
         ):
             await _process_due_retries(
-                OrchestratorState(), tracker, cfg, "prompt", rq, pending
+                OrchestratorState(),
+                _trackers(tracker),
+                cfg,
+                {"jira": "prompt"},
+                rq,
+                pending,
             )
 
         tracker.fetch_one.assert_awaited_once_with("PROJ-1")
@@ -1000,7 +1155,9 @@ class TestTick:
         tracker.fetch_summaries_by_keys.return_value = {}
         pending: set[asyncio.Task[None]] = set()
 
-        await tick(state, cfg, "prompt", tracker, RetryQueue(), pending)
+        await tick(
+            state, cfg, {"jira": "prompt"}, _trackers(tracker), RetryQueue(), pending
+        )
         tracker.fetch_candidates.assert_not_called()
 
     async def test_dispatches_candidates(self) -> None:
@@ -1016,7 +1173,14 @@ class TestTick:
         with patch(
             "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
         ):
-            await tick(state, cfg, "prompt", tracker, RetryQueue(), pending)
+            await tick(
+                state,
+                cfg,
+                {"jira": "prompt"},
+                _trackers(tracker),
+                RetryQueue(),
+                pending,
+            )
 
         tracker.fetch_candidates.assert_awaited_once()
 
@@ -1028,7 +1192,212 @@ class TestTick:
         pending: set[asyncio.Task[None]] = set()
 
         # Should not raise
-        await tick(OrchestratorState(), cfg, "prompt", tracker, RetryQueue(), pending)
+        await tick(
+            OrchestratorState(),
+            cfg,
+            {"jira": "prompt"},
+            _trackers(tracker),
+            RetryQueue(),
+            pending,
+        )
+
+    async def test_multi_source_dispatch_honors_global_cap(self) -> None:
+        """Two trackers both have candidates; orchestrator merges them, sorts
+        globally, and honors a global cap of 2 across sources."""
+        from dataclasses import replace as _dc_replace
+
+        # Build a two-source config (jira + github).
+        jira_cfg = _tracker_cfg(kind="jira", gate_label=None)
+        gh_cfg = _tracker_cfg(
+            kind="github",
+            active_states=("open",),
+            terminal_states=("closed", "merged"),
+            gate_label=None,
+        )
+        # SymphonyConfig: pass `trackers` directly via dataclasses.replace to
+        # bypass the test helper's single-source default.
+        base_cfg = _config()
+        cfg = _dc_replace(base_cfg, trackers={"jira": jira_cfg, "github": gh_cfg})
+        cfg = _dc_replace(cfg, max_concurrent=2)
+
+        jira_tracker = _mock_tracker()
+        gh_tracker = _mock_tracker()
+        jira_tracker.fetch_summaries_by_keys.return_value = {}
+        gh_tracker.fetch_summaries_by_keys.return_value = {}
+        jira_tracker.fetch_candidates.return_value = [
+            _issue(
+                id="1",
+                identifier="PROJ-1",
+                state="In Progress",
+                priority=1,
+                labels=(),
+                source="jira",
+            ),
+            _issue(
+                id="2",
+                identifier="PROJ-2",
+                state="In Progress",
+                priority=3,
+                labels=(),
+                source="jira",
+            ),
+        ]
+        gh_tracker.fetch_candidates.return_value = [
+            _issue(
+                id="100",
+                identifier="owner/repo#100",
+                state="open",
+                priority=2,
+                labels=(),
+                source="github",
+            ),
+        ]
+        trackers = {"jira": jira_tracker, "github": gh_tracker}
+        state = OrchestratorState()
+        pending: set[asyncio.Task[None]] = set()
+
+        with patch(
+            "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
+        ):
+            await tick(
+                state,
+                cfg,
+                {"jira": "jira-prompt", "github": "gh-prompt"},
+                trackers,
+                RetryQueue(),
+                pending,
+            )
+
+        # Both trackers were polled.
+        jira_tracker.fetch_candidates.assert_awaited_once()
+        gh_tracker.fetch_candidates.assert_awaited_once()
+        # Global cap of 2 honored.
+        assert state.running_count() == 2
+        # Lowest-priority issue (PROJ-1 prio=1) dispatched first, then
+        # owner/repo#100 (prio=2); PROJ-2 (prio=3) skipped due to cap.
+        running_ids = {e.issue_identifier for e in state.all_running()}
+        assert "PROJ-1" in running_ids
+        assert "owner/repo#100" in running_ids
+        assert "PROJ-2" not in running_ids
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat extra includes source
+# ---------------------------------------------------------------------------
+
+
+class TestMultiSourceReconcile:
+    async def test_each_source_uses_its_own_tracker_for_predicates(self) -> None:
+        """Two workers running, one Jira and one GitHub. Reconcile fetches
+        summaries from each tracker independently and applies that tracker's
+        is_terminal/is_active predicates — the orchestrator stays agnostic."""
+        from dataclasses import replace as _dc_replace
+
+        jira_cfg = _tracker_cfg(kind="jira", gate_label=None)
+        gh_cfg = _tracker_cfg(
+            kind="github",
+            active_states=("open",),
+            terminal_states=("closed", "merged"),
+            gate_label=None,
+        )
+        base_cfg = _config()
+        cfg = _dc_replace(base_cfg, trackers={"jira": jira_cfg, "github": gh_cfg})
+
+        jira_tracker = _mock_tracker()
+        gh_tracker = _mock_tracker()
+
+        # GitHub-specific predicates: open AND user hasn't reviewed yet.
+        def gh_is_terminal(summary, c):
+            return summary.state in c.terminal_states
+
+        def gh_is_active(summary, c):
+            return summary.state == "open" and not bool(
+                summary.extra.get("user_has_reviewed")
+            )
+
+        gh_tracker.is_terminal = MagicMock(side_effect=gh_is_terminal)
+        gh_tracker.is_active = MagicMock(side_effect=gh_is_active)
+
+        # Two running workers.
+        state = OrchestratorState()
+        jira_issue = _issue(
+            id="1", identifier="PROJ-1", state="In Progress", source="jira"
+        )
+        gh_issue = _issue(
+            id="200",
+            identifier="owner/repo#200",
+            state="open",
+            source="github",
+        )
+        state.claim(jira_issue)
+        state.claim(gh_issue)
+
+        # Each tracker returns its own summary. Jira is still active
+        # (predicate returns True); GitHub PR's reviewRequests no longer
+        # contains @me, so its predicate returns False — worker should be
+        # cancelled but workspace left.
+        jira_tracker.fetch_summaries_by_keys.return_value = {
+            "PROJ-1": IssueSummary(
+                state="In Progress", extra={"labels": ("symphony-active",)}
+            ),
+        }
+        gh_tracker.fetch_summaries_by_keys.return_value = {
+            "owner/repo#200": IssueSummary(
+                state="open", extra={"user_has_reviewed": True}
+            ),
+        }
+
+        # Attach tasks so reconcile has something to cancel.
+        jira_task = MagicMock()
+        jira_task.done.return_value = False
+        gh_task = MagicMock()
+        gh_task.done.return_value = False
+        jira_entry = state.get_running(jira_issue.key)
+        gh_entry = state.get_running(gh_issue.key)
+        assert jira_entry is not None and gh_entry is not None
+        jira_entry.task = jira_task
+        gh_entry.task = gh_task
+
+        await reconcile(
+            state,
+            {"jira": jira_tracker, "github": gh_tracker},  # type: ignore[dict-item]
+            cfg,
+            RetryQueue(),
+        )
+
+        # Jira stayed running, GitHub got cancelled.
+        jira_task.cancel.assert_not_called()
+        gh_task.cancel.assert_called_once()
+        # Each tracker's summaries fetch was called exactly once, with its own keys.
+        jira_tracker.fetch_summaries_by_keys.assert_awaited_once_with(["PROJ-1"])
+        gh_tracker.fetch_summaries_by_keys.assert_awaited_once_with(["owner/repo#200"])
+
+
+class TestHeartbeatSource:
+    def test_running_ticket_carries_source(self) -> None:
+        state = OrchestratorState()
+        from claude_on_the_fly.symphony.tracker.issue import Issue as _Issue
+
+        gh_issue = _Issue(
+            id="99",
+            identifier="owner/repo#99",
+            title="t",
+            state="open",
+            description_raw=None,
+            priority=None,
+            labels=(),
+            blocked_by=(),
+            parent_key=None,
+            url="",
+            created_at=None,
+            updated_at=None,
+            source="github",
+        )
+        state.claim(gh_issue)
+        extra = _heartbeat_extra(state, set(), RetryQueue())
+        tickets = extra["running_tickets"]
+        assert tickets[0]["source"] == "github"
+        assert tickets[0]["identifier"] == "owner/repo#99"
 
 
 # ---------------------------------------------------------------------------
@@ -1051,8 +1420,8 @@ class TestRunLoop:
         with (
             patch("claude_on_the_fly.symphony.orchestrator.load_config") as mock_load,
             patch(
-                "claude_on_the_fly.symphony.orchestrator.make_tracker",
-                return_value=tracker,
+                "claude_on_the_fly.symphony.orchestrator.make_trackers",
+                return_value={"jira": tracker},
             ),
             patch("claude_on_the_fly.symphony.orchestrator.PromptStore") as mock_ps,
             patch("claude_on_the_fly.symphony.orchestrator.startup_cleanup") as mock_sc,

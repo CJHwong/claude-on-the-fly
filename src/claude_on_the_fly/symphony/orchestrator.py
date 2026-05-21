@@ -1,8 +1,17 @@
-"""Symphony orchestrator: poll the tracker, dispatch claimed tickets, drive continuation turns.
+"""Symphony orchestrator: poll the trackers, dispatch claimed tickets, drive
+continuation turns.
 
-Per tick: reconcile running workers' state (catching mid-turn terminal/inactive
-transitions and stall timeouts), process due retries, then fetch and dispatch
-new candidates. Startup cleans up scratch dirs whose tickets are already terminal.
+Multi-source: each tick reconciles running workers' state per source (catching
+mid-turn terminal/inactive transitions and stall timeouts), processes due
+retries per source, then fetches and dispatches new candidates from each
+source. Global `max_concurrent` is shared across sources; per-state caps live
+on each tracker config.
+
+Source-vs-tracker terminology:
+- `trackers: dict[str, Tracker]` keys are source names (`"jira"`, `"github"`).
+- `config.trackers: dict[str, TrackerCommonConfig]` mirrors that keying.
+- `prompt_sources: dict[str, str]` holds the rendered prompt template per
+  source so workers from different sources can use different prompts.
 """
 
 from __future__ import annotations
@@ -18,13 +27,18 @@ from claude_on_the_fly.agent import ClaudeUnavailableError
 from claude_on_the_fly.heartbeat import HeartbeatWriter
 
 from .agent_runner import TicketRunner, session_uuid_for
-from .config import SymphonyConfig, TrackerConfig, load_config
+from .config import SymphonyConfig, TrackerCommonConfig, load_config
 from .prompt import PromptStore
 from .retry import RetryQueue
 from .state import OrchestratorState, RunningEntry
-from .tracker import Tracker, make_tracker
+from .tracker import Tracker, make_trackers
 from .tracker.issue import Issue
-from .workspace import WORKSPACES_ROOT, ensure_workspace, remove_workspace
+from .workspace import (
+    WORKSPACES_ROOT,
+    ensure_workspace,
+    read_workspace_identifier,
+    remove_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +47,11 @@ def _eligible(
     issue: Issue,
     state: OrchestratorState,
     retry_queue: RetryQueue,
-    tracker_cfg: TrackerConfig,
+    tracker_cfg: TrackerCommonConfig,
 ) -> bool:
-    if state.is_claimed(issue.id):
+    if state.is_claimed(issue.key):
         return False
-    if retry_queue.has(issue.id):
+    if retry_queue.has(issue.key):
         return False
     if not issue.id or not issue.identifier or not issue.title or not issue.state:
         return False
@@ -64,7 +78,7 @@ def _select_candidates(
     fetched: Iterable[Issue],
     state: OrchestratorState,
     retry_queue: RetryQueue,
-    tracker_cfg: TrackerConfig,
+    tracker_cfg: TrackerCommonConfig,
 ) -> list[Issue]:
     return sorted(
         [i for i in fetched if _eligible(i, state, retry_queue, tracker_cfg)],
@@ -76,14 +90,17 @@ async def _run_worker(
     issue: Issue,
     state: OrchestratorState,
     tracker: Tracker,
+    tracker_cfg: TrackerCommonConfig,
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
     starting_failure_attempt: int = 0,
 ) -> None:
     identifier = issue.identifier
+    key = issue.key
+    source = issue.source
     try:
-        workspace = ensure_workspace(identifier)
+        workspace = ensure_workspace(identifier, source=source)
     except Exception:
         logger.exception("[%s] worker: workspace prep failed", identifier)
         retry_queue.schedule_failure(
@@ -92,20 +109,22 @@ async def _run_worker(
             config.max_retry_backoff_ms,
             attempt=starting_failure_attempt + 1,
             error="workspace prep failed",
+            source=source,
         )
-        state.release(issue.id)
+        state.release(key)
         return
 
-    entry = state.get_running(issue.id)
+    entry = state.get_running(key)
     if entry is not None:
         entry.workspace = workspace
         entry.failure_attempt = starting_failure_attempt
 
-    sid = session_uuid_for(identifier)
+    sid = session_uuid_for(identifier, source=source)
     runner = TicketRunner(
         issue=issue,
         workspace=workspace,
         config=config,
+        tracker_cfg=tracker_cfg,
         prompt_source=prompt_source,
         session_uuid=sid,
     )
@@ -140,10 +159,11 @@ async def _run_worker(
                     config.max_retry_backoff_ms,
                     attempt=starting_failure_attempt + 1,
                     error=str(exc),
+                    source=source,
                 )
                 return
 
-            state.mark_turn_end(issue.id)
+            state.mark_turn_end(key)
             logger.info(
                 "[%s] turn %d done | sid=%s | %s | %s",
                 identifier,
@@ -168,35 +188,31 @@ async def _run_worker(
                     config.max_retry_backoff_ms,
                     attempt=starting_failure_attempt + 1,
                     error="post-turn refresh failed",
+                    source=source,
                 )
                 return
 
-            current_state = refreshed.state
-            if current_state in config.tracker.terminal_states:
+            # Apply the tracker's predicates against the refreshed issue so the
+            # decision logic for "stop / park / continue" lives in the adapter.
+            refreshed_summary = tracker.issue_to_summary(refreshed)
+            if tracker.is_terminal(refreshed_summary, tracker_cfg):
                 logger.info(
                     "[%s] terminal state %s; removing workspace",
                     identifier,
-                    current_state,
+                    refreshed.state,
                 )
                 remove_workspace(workspace)
                 return
-            if current_state not in config.tracker.active_states:
+            if not tracker.is_active(refreshed_summary, tracker_cfg):
                 logger.info(
-                    "[%s] state %s neither active nor terminal; leaving workspace",
+                    "[%s] inactive after turn (state=%s); leaving workspace",
                     identifier,
-                    current_state,
-                )
-                return
-            if not _gate_label_attached(config, refreshed.labels):
-                logger.info(
-                    "[%s] gate label '%s' removed (agent parked); stopping",
-                    identifier,
-                    config.gate_label,
+                    refreshed.state,
                 )
                 return
 
             runner.issue = refreshed
-            state.update_running_state(issue.id, refreshed.state)
+            state.update_running_state(key, refreshed.state)
 
         # Only reachable when max_turns is a finite positive value.
         logger.info(
@@ -204,7 +220,7 @@ async def _run_worker(
             identifier,
             config.max_turns,
         )
-        retry_queue.schedule_continuation(issue.id, identifier)
+        retry_queue.schedule_continuation(issue.id, identifier, source=source)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -218,15 +234,17 @@ async def _run_worker(
             config.max_retry_backoff_ms,
             attempt=starting_failure_attempt + 1,
             error="worker crashed",
+            source=source,
         )
     finally:
-        state.release(issue.id)
+        state.release(key)
 
 
 def _dispatch(
     issue: Issue,
     state: OrchestratorState,
     tracker: Tracker,
+    tracker_cfg: TrackerCommonConfig,
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
@@ -243,6 +261,7 @@ def _dispatch(
             issue,
             state,
             tracker,
+            tracker_cfg,
             config,
             prompt_source,
             retry_queue,
@@ -254,8 +273,9 @@ def _dispatch(
     pending_tasks.add(task)
     task.add_done_callback(pending_tasks.discard)
     logger.info(
-        "[%s] dispatched (state=%s, prio=%s, labels=%s, failure_attempt=%d)",
+        "[%s] dispatched (source=%s, state=%s, prio=%s, labels=%s, failure_attempt=%d)",
         issue.identifier,
+        issue.source,
         issue.state,
         issue.priority,
         list(issue.labels),
@@ -293,118 +313,182 @@ def _check_and_cancel_stall(
         config.max_retry_backoff_ms,
         attempt=entry.failure_attempt + 1,
         error="stall timeout",
+        source=entry.source,
     )
     return True
 
 
 def _has_per_state_capacity(
-    state: OrchestratorState, issue_state: str, config: SymphonyConfig
+    state: OrchestratorState,
+    issue_state: str,
+    tracker_cfg: TrackerCommonConfig,
+    global_max_concurrent: int,
 ) -> bool:
-    """True if a new worker for issue_state can fit under the per-state cap."""
-    per_state_limit = config.max_concurrent_by_state.get(
-        issue_state.lower(), config.max_concurrent
+    """True if a new worker for issue_state can fit under the per-state cap.
+
+    The cap lives on the tracker config (per-source); fall back to global
+    `max_concurrent` when the state isn't explicitly limited.
+    """
+    per_state_limit = tracker_cfg.max_concurrent_by_state.get(
+        issue_state.lower(), global_max_concurrent
     )
     return state.running_by_state(issue_state) < per_state_limit
 
 
 async def reconcile(
     state: OrchestratorState,
-    tracker: Tracker,
+    trackers: dict[str, Tracker],
     config: SymphonyConfig,
     retry_queue: RetryQueue,
 ) -> None:
-    """SPEC §8.5: refresh state of running workers; cancel on terminal / inactive /
-    gate-label-removed / stalled."""
+    """SPEC §8.5: refresh state of running workers; cancel on terminal /
+    inactive / stalled. Each source's running entries are reconciled against
+    its own tracker."""
     running = state.all_running()
     if not running:
         return
 
-    keys = [r.issue_identifier for r in running]
-    try:
-        summaries = await tracker.fetch_summaries_by_keys(keys)
-    except Exception:
-        logger.exception(
-            "reconcile: state fetch failed (skipping; will retry next tick)"
-        )
+    # Group by source so each tracker only fetches summaries for its own keys.
+    by_source: dict[str, list[RunningEntry]] = {}
+    for r in running:
+        by_source.setdefault(r.source, []).append(r)
+
+    # Skip any source whose tracker vanished from config mid-run (rare),
+    # then fetch all surviving sources in parallel. Independent network calls
+    # shouldn't serialize the tick.
+    runnable: list[tuple[str, Tracker, TrackerCommonConfig, list[RunningEntry]]] = []
+    for source, entries in by_source.items():
+        tracker = trackers.get(source)
+        tracker_cfg = config.trackers.get(source)
+        if tracker is None or tracker_cfg is None:
+            logger.warning(
+                "reconcile[%s]: source not configured; skipping %d entrie(s)",
+                source,
+                len(entries),
+            )
+            continue
+        runnable.append((source, tracker, tracker_cfg, entries))
+
+    if not runnable:
         return
 
+    fetch_results = await asyncio.gather(
+        *(
+            tracker.fetch_summaries_by_keys([e.issue_identifier for e in entries])
+            for _source, tracker, _cfg, entries in runnable
+        ),
+        return_exceptions=True,
+    )
+
     now = time.monotonic()
-    for entry in running:
-        if _check_and_cancel_stall(entry, config, retry_queue, now):
-            continue
-
-        summary = summaries.get(entry.issue_identifier)
-        if summary is None:
-            continue
-        new_state = summary.state
-
-        if new_state in config.tracker.terminal_states:
-            logger.info(
-                "[%s] became terminal mid-run (%s); cancelling worker and removing workspace",
-                entry.issue_identifier,
-                new_state,
+    for (source, tracker, tracker_cfg, entries), summaries in zip(
+        runnable, fetch_results
+    ):
+        if isinstance(summaries, BaseException):
+            logger.exception(
+                "reconcile[%s]: state fetch failed (skipping; will retry next tick)",
+                source,
+                exc_info=summaries,
             )
-            if entry.workspace is not None:
-                remove_workspace(entry.workspace)
-            if entry.task is not None and not entry.task.done():
-                entry.task.cancel()
             continue
 
-        if new_state not in config.tracker.active_states:
-            logger.info(
-                "[%s] became inactive mid-run (%s); cancelling worker (workspace left)",
-                entry.issue_identifier,
-                new_state,
-            )
-            if entry.task is not None and not entry.task.done():
-                entry.task.cancel()
-            continue
+        for entry in entries:
+            if _check_and_cancel_stall(entry, config, retry_queue, now):
+                continue
 
-        if not _gate_label_attached(config, summary.labels):
-            logger.info(
-                "[%s] gate label '%s' removed mid-run; cancelling worker (workspace left)",
-                entry.issue_identifier,
-                config.gate_label,
-            )
-            if entry.task is not None and not entry.task.done():
-                entry.task.cancel()
-            continue
+            summary = summaries.get(entry.issue_identifier)
+            if summary is None:
+                continue
 
-        if new_state != entry.issue_state:
-            state.update_running_state(entry.issue_id, new_state)
+            if tracker.is_terminal(summary, tracker_cfg):
+                logger.info(
+                    "[%s] became terminal mid-run (%s); cancelling worker and removing workspace",
+                    entry.issue_identifier,
+                    summary.state,
+                )
+                if entry.workspace is not None:
+                    remove_workspace(entry.workspace)
+                if entry.task is not None and not entry.task.done():
+                    entry.task.cancel()
+                continue
+
+            if not tracker.is_active(summary, tracker_cfg):
+                logger.info(
+                    "[%s] inactive mid-run (state=%s); cancelling worker (workspace left)",
+                    entry.issue_identifier,
+                    summary.state,
+                )
+                if entry.task is not None and not entry.task.done():
+                    entry.task.cancel()
+                continue
+
+            if summary.state != entry.issue_state:
+                state.update_running_state(entry.key, summary.state)
 
 
 async def startup_cleanup(
     root: Path,
-    tracker: Tracker,
-    tracker_cfg: TrackerConfig,
+    trackers: dict[str, Tracker],
+    config: SymphonyConfig,
 ) -> None:
-    """SPEC §8.6: walk the symphony workspaces root, remove dirs whose tickets are terminal."""
-    if not root.exists():
-        return
-    dirs = [d for d in root.iterdir() if d.is_dir()]
-    if not dirs:
-        return
-    keys = [d.name for d in dirs]
-    try:
-        summaries = await tracker.fetch_summaries_by_keys(keys)
-    except Exception:
-        logger.warning("startup_cleanup: state fetch failed; skipping")
+    """SPEC §8.6: per source, walk the workspace subdir and remove dirs whose
+    tickets are terminal.
+
+    Resolves each dir to the original (unsanitized) identifier via the
+    `.identifier` sidecar — needed because some sources (github) sanitize
+    `/` and `#` both to `_`, which can't be reversed from the dir name alone.
+    Dirs without a sidecar (legacy or manually-created) fall back to the
+    dir name, which works correctly for sources like jira where sanitization
+    is a no-op.
+    """
+    # Collect per-source work upfront so the fetches can run in parallel.
+    plans: list[tuple[str, Tracker, dict[Path, str]]] = []
+    for source, tracker in trackers.items():
+        source_root = root / source
+        if not source_root.exists():
+            continue
+        dirs = [d for d in source_root.iterdir() if d.is_dir()]
+        if not dirs:
+            continue
+        dir_to_ident: dict[Path, str] = {
+            d: (read_workspace_identifier(d) or d.name) for d in dirs
+        }
+        plans.append((source, tracker, dir_to_ident))
+
+    if not plans:
         return
 
-    terminal = set(tracker_cfg.terminal_states)
-    for d in dirs:
-        summary = summaries.get(d.name)
-        if summary and summary.state in terminal:
-            logger.info("startup_cleanup: %s status=%s", d, summary.state)
-            remove_workspace(d)
+    fetch_results = await asyncio.gather(
+        *(
+            tracker.fetch_summaries_by_keys(list(dir_to_ident.values()))
+            for _source, tracker, dir_to_ident in plans
+        ),
+        return_exceptions=True,
+    )
+
+    for (source, _tracker, dir_to_ident), summaries in zip(plans, fetch_results):
+        if isinstance(summaries, BaseException):
+            logger.warning(
+                "startup_cleanup[%s]: state fetch failed; skipping (%s)",
+                source,
+                summaries,
+            )
+            continue
+        terminal = set(config.trackers[source].terminal_states)
+        for d, ident in dir_to_ident.items():
+            summary = summaries.get(ident)
+            if summary and summary.state in terminal:
+                logger.info(
+                    "startup_cleanup[%s]: %s status=%s", source, d, summary.state
+                )
+                remove_workspace(d)
 
 
 async def _process_due_retries(
     state: OrchestratorState,
-    tracker: Tracker,
+    trackers: dict[str, Tracker],
     config: SymphonyConfig,
-    prompt_source: str,
+    prompt_sources: dict[str, str],
     retry_queue: RetryQueue,
     pending_tasks: set[asyncio.Task[None]],
 ) -> None:
@@ -413,109 +497,146 @@ async def _process_due_retries(
         return
     logger.debug("retry: %d due entries", len(due))
 
-    # Batch the cheap status check first; only fetch full Issue for entries we'd dispatch.
-    unclaimed = [e for e in due if not state.is_claimed(e.issue_id)]
+    # Cheap check: only dispatch entries that aren't already claimed.
+    unclaimed = [e for e in due if not state.is_claimed(e.key)]
     if not unclaimed:
         return
-    try:
-        summaries = await tracker.fetch_summaries_by_keys(
-            [e.identifier for e in unclaimed]
-        )
-    except Exception:
-        logger.warning("retry: batch state fetch failed; requeueing all due (1s)")
-        for entry in unclaimed:
-            retry_queue.requeue(entry, delay_ms=1000, error="batch state fetch failed")
+
+    # Group by source for batched summary fetches.
+    by_source: dict[str, list] = {}
+    for e in unclaimed:
+        by_source.setdefault(e.source, []).append(e)
+
+    # Collect runnable plans, then fetch all sources concurrently.
+    runnable: list[tuple[str, Tracker, TrackerCommonConfig, list]] = []
+    for source, entries in by_source.items():
+        tracker = trackers.get(source)
+        tracker_cfg = config.trackers.get(source)
+        if tracker is None or tracker_cfg is None:
+            logger.warning(
+                "retry[%s]: source not configured; dropping %d entrie(s)",
+                source,
+                len(entries),
+            )
+            continue
+        runnable.append((source, tracker, tracker_cfg, entries))
+
+    if not runnable:
         return
 
-    for entry in unclaimed:
-        summary = summaries.get(entry.identifier)
-        if summary is None:
-            retry_queue.requeue(
-                entry, delay_ms=entry.attempt * 1000, error="not visible"
-            )
-            continue
-        current_state = summary.state
-        if current_state in config.tracker.terminal_states:
-            logger.info("[%s] retry: terminal state, dropping", entry.identifier)
-            continue
-        if current_state not in config.tracker.active_states:
-            logger.info(
-                "[%s] retry: state %s not active, dropping",
-                entry.identifier,
-                current_state,
-            )
-            continue
-        if not _gate_label_attached(config, summary.labels):
-            logger.info(
-                "[%s] retry: gate_label '%s' missing, dropping",
-                entry.identifier,
-                config.gate_label,
-            )
-            continue
-        if state.running_count() >= config.max_concurrent:
-            logger.debug(
-                "[%s] retry: no global slot, requeueing (1s)", entry.identifier
-            )
-            retry_queue.requeue(entry, delay_ms=1000, error="no global slots")
-            continue
-        if not _has_per_state_capacity(state, current_state, config):
-            logger.debug(
-                "[%s] retry: per-state cap hit for %s, requeueing (1s)",
-                entry.identifier,
-                current_state,
-            )
-            retry_queue.requeue(
-                entry, delay_ms=1000, error=f"no slots for {current_state}"
-            )
-            continue
+    fetch_results = await asyncio.gather(
+        *(
+            tracker.fetch_summaries_by_keys([e.identifier for e in entries])
+            for _source, tracker, _cfg, entries in runnable
+        ),
+        return_exceptions=True,
+    )
 
-        try:
-            issue = await tracker.fetch_one(entry.identifier)
-        except Exception:
+    for (source, tracker, tracker_cfg, entries), summaries in zip(
+        runnable, fetch_results
+    ):
+        if isinstance(summaries, BaseException):
             logger.warning(
-                "[%s] retry: fetch_one failed; requeueing",
-                entry.identifier,
+                "retry[%s]: batch state fetch failed; requeueing all due (1s): %s",
+                source,
+                summaries,
             )
-            retry_queue.requeue(
-                entry, delay_ms=entry.attempt * 1000, error="fetch_one failed"
-            )
+            for entry in entries:
+                retry_queue.requeue(
+                    entry, delay_ms=1000, error="batch state fetch failed"
+                )
             continue
 
-        if not _gate_label_attached(config, issue.labels):
-            logger.info(
-                "[%s] retry: gate_label '%s' missing, dropping",
-                entry.identifier,
-                config.gate_label,
-            )
-            continue
+        prompt_source = prompt_sources.get(source, "")
+        for entry in entries:
+            summary = summaries.get(entry.identifier)
+            if summary is None:
+                retry_queue.requeue(
+                    entry, delay_ms=entry.attempt * 1000, error="not visible"
+                )
+                continue
+            if tracker.is_terminal(summary, tracker_cfg):
+                logger.info("[%s] retry: terminal state, dropping", entry.identifier)
+                continue
+            if not tracker.is_active(summary, tracker_cfg):
+                logger.info(
+                    "[%s] retry: inactive (state=%s), dropping",
+                    entry.identifier,
+                    summary.state,
+                )
+                continue
+            if state.running_count() >= config.max_concurrent:
+                logger.debug(
+                    "[%s] retry: no global slot, requeueing (1s)", entry.identifier
+                )
+                retry_queue.requeue(entry, delay_ms=1000, error="no global slots")
+                continue
+            if not _has_per_state_capacity(
+                state, summary.state, tracker_cfg, config.max_concurrent
+            ):
+                logger.debug(
+                    "[%s] retry: per-state cap hit for %s, requeueing (1s)",
+                    entry.identifier,
+                    summary.state,
+                )
+                retry_queue.requeue(
+                    entry,
+                    delay_ms=1000,
+                    error=f"no slots for {summary.state}",
+                )
+                continue
 
-        _dispatch(
-            issue,
-            state,
-            tracker,
-            config,
-            prompt_source,
-            retry_queue,
-            pending_tasks,
-            starting_failure_attempt=entry.attempt,
-        )
+            try:
+                issue = await tracker.fetch_one(entry.identifier)
+            except Exception:
+                logger.warning(
+                    "[%s] retry: fetch_one failed; requeueing",
+                    entry.identifier,
+                )
+                retry_queue.requeue(
+                    entry, delay_ms=entry.attempt * 1000, error="fetch_one failed"
+                )
+                continue
+
+            # Race window: state changed between summary check and fetch_one.
+            fresh_summary = tracker.issue_to_summary(issue)
+            if not tracker.is_active(fresh_summary, tracker_cfg):
+                logger.info(
+                    "[%s] retry: became inactive between summary and fetch, dropping",
+                    entry.identifier,
+                )
+                continue
+
+            _dispatch(
+                issue,
+                state,
+                tracker,
+                tracker_cfg,
+                config,
+                prompt_source,
+                retry_queue,
+                pending_tasks,
+                starting_failure_attempt=entry.attempt,
+            )
 
 
 async def tick(
     state: OrchestratorState,
     config: SymphonyConfig,
-    prompt_source: str,
-    tracker: Tracker,
+    prompt_sources: dict[str, str],
+    trackers: dict[str, Tracker],
     retry_queue: RetryQueue,
     pending_tasks: set[asyncio.Task[None]],
 ) -> None:
-    """One scheduling pass: reconcile -> process retries -> fetch and dispatch."""
-    await reconcile(state, tracker, config, retry_queue)
+    """One scheduling pass: reconcile -> process retries -> fetch and dispatch
+    new candidates from every source. Global `max_concurrent` is shared
+    across sources."""
+    await reconcile(state, trackers, config, retry_queue)
     await _process_due_retries(
         state,
-        tracker,
+        trackers,
         config,
-        prompt_source,
+        prompt_sources,
         retry_queue,
         pending_tasks,
     )
@@ -523,46 +644,63 @@ async def tick(
     if state.running_count() >= config.max_concurrent:
         return
 
-    try:
-        fetched = await tracker.fetch_candidates(config.tracker)
-    except Exception:
-        logger.exception("tick: fetch_candidates failed; skipping dispatch")
-        return
+    # Fetch from each source in parallel — independent network calls
+    # shouldn't serialize the tick. Then filter to eligible, merge, sort,
+    # and dispatch under the global capacity ceiling.
+    sources = list(trackers.items())
+    fetch_results = await asyncio.gather(
+        *(
+            tracker.fetch_candidates(config.trackers[source])
+            for source, tracker in sources
+        ),
+        return_exceptions=True,
+    )
 
-    candidates = _select_candidates(fetched, state, retry_queue, config.tracker)
+    candidates: list[tuple[Issue, str]] = []  # (issue, source)
+    for (source, _tracker), fetched in zip(sources, fetch_results):
+        if isinstance(fetched, BaseException):
+            logger.exception(
+                "tick[%s]: fetch_candidates failed; skipping dispatch",
+                source,
+                exc_info=fetched,
+            )
+            continue
+        tracker_cfg = config.trackers[source]
+        for issue in _select_candidates(fetched, state, retry_queue, tracker_cfg):
+            candidates.append((issue, source))
+
     if not candidates:
         return
 
+    candidates.sort(key=lambda pair: _sort_key(pair[0]))
+
     logger.debug(
-        "tick: %d eligible candidates, capacity=%d",
+        "tick: %d eligible candidates (across %d source(s)), capacity=%d",
         len(candidates),
+        len(trackers),
         config.max_concurrent - state.running_count(),
     )
 
-    for issue in candidates:
+    for issue, source in candidates:
         if state.running_count() >= config.max_concurrent:
             break
-        if not _has_per_state_capacity(state, issue.state, config):
+        tracker = trackers[source]
+        tracker_cfg = config.trackers[source]
+        if not _has_per_state_capacity(
+            state, issue.state, tracker_cfg, config.max_concurrent
+        ):
             continue
         _dispatch(
             issue,
             state,
             tracker,
+            tracker_cfg,
             config,
-            prompt_source,
+            prompt_sources.get(source, ""),
             retry_queue,
             pending_tasks,
             starting_failure_attempt=0,
         )
-
-
-def _gate_label_attached(
-    config: SymphonyConfig, labels: tuple[str, ...] | list[str]
-) -> bool:
-    """True when the configured gate label is present on the ticket (or no gate is set)."""
-    if not config.gate_label:
-        return True
-    return config.gate_label.lower() in labels
 
 
 def _redact_token(token: str) -> str:
@@ -575,28 +713,36 @@ def _redact_token(token: str) -> str:
 
 def _log_config_summary(config: SymphonyConfig) -> None:
     """Dump the resolved config to the log at startup. Redacts the api token."""
-    t = config.tracker
+    from .config import JiraTrackerConfig
+
     logger.info("symphony config:")
-    logger.info("  tracker.kind        = %s", t.kind)
-    logger.info("  tracker.base_url    = %s", t.base_url)
-    logger.info("  tracker.email       = %s", t.email)
-    logger.info("  tracker.api_token   = %s", _redact_token(t.api_token))
-    logger.info("  tracker.project_key = %s", t.project_key)
-    logger.info("  tracker.jql_extra   = %s", t.jql_extra or "<none>")
-    logger.info("  tracker.active_states   = %s", list(t.active_states))
-    logger.info("  tracker.terminal_states = %s", list(t.terminal_states))
+    logger.info("  trackers: %d configured", len(config.trackers))
+    for source, t in config.trackers.items():
+        logger.info("  [%s] kind            = %s", source, t.kind)
+        if isinstance(t, JiraTrackerConfig):
+            logger.info("  [%s] base_url        = %s", source, t.base_url)
+            logger.info("  [%s] email           = %s", source, t.email)
+            logger.info("  [%s] project_key     = %s", source, t.project_key)
+            if t.jql_extra:
+                logger.info("  [%s] jql_extra       = %s", source, t.jql_extra)
+            logger.info(
+                "  [%s] api_token       = %s", source, _redact_token(t.api_token)
+            )
+        logger.info("  [%s] active_states   = %s", source, list(t.active_states))
+        logger.info("  [%s] terminal_states = %s", source, list(t.terminal_states))
+        logger.info("  [%s] gate_label      = %s", source, t.gate_label or "<none>")
+        logger.info("  [%s] prompt_path     = %s", source, t.prompt_path)
+        logger.info(
+            "  [%s] max_concurrent_by_state = %s",
+            source,
+            dict(t.max_concurrent_by_state) or "<none>",
+        )
     logger.info("  polling_ms          = %d", config.polling_ms)
     logger.info("  max_concurrent      = %d", config.max_concurrent)
-    logger.info(
-        "  max_concurrent_by_state = %s",
-        dict(config.max_concurrent_by_state) or "<none>",
-    )
     logger.info("  max_turns           = %d", config.max_turns)
     logger.info("  turn_timeout_ms     = %d", config.turn_timeout_ms)
     logger.info("  stall_timeout_ms    = %d", config.stall_timeout_ms)
     logger.info("  max_retry_backoff_ms = %d", config.max_retry_backoff_ms)
-    logger.info("  prompt_path         = %s", config.prompt_path)
-    logger.info("  gate_label          = %s", config.gate_label or "<none>")
 
 
 def _heartbeat_extra(
@@ -609,6 +755,7 @@ def _heartbeat_extra(
     running_tickets = [
         {
             "identifier": e.issue_identifier,
+            "source": e.source,
             "state": e.issue_state,
             "uptime_s": int(now - e.started_at),
             "last_turn_end_age_s": (
@@ -629,15 +776,22 @@ def _heartbeat_extra(
 
 
 async def run_loop(config_path, stop_event: asyncio.Event) -> None:
-    """Main daemon loop. Hot-reloads prompt; ticks at configured cadence."""
+    """Main daemon loop. Hot-reloads prompts; ticks at configured cadence."""
     config = load_config(config_path)
     config.validate()
     _log_config_summary(config)
 
-    prompt_store = PromptStore(config.prompt_path)
-    prompt_source = prompt_store.load()
+    # One PromptStore per source; mtime-based hot-reload kicks in on
+    # `maybe_reload()` each tick.
+    prompt_stores: dict[str, PromptStore] = {
+        source: PromptStore(tracker_cfg.prompt_path)
+        for source, tracker_cfg in config.trackers.items()
+    }
+    prompt_sources: dict[str, str] = {
+        source: store.load() for source, store in prompt_stores.items()
+    }
 
-    tracker = make_tracker(config.tracker)
+    trackers = make_trackers(config)
     state = OrchestratorState()
     retry_queue = RetryQueue()
     pending_tasks: set[asyncio.Task[None]] = set()
@@ -649,20 +803,26 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     heartbeat_task = asyncio.create_task(heartbeat.run())
 
     logger.info(
-        "symphony: started (poll every %dms, prompt=%s)",
+        "symphony: started (poll every %dms, sources=%s)",
         config.polling_ms,
-        config.prompt_path,
+        sorted(trackers),
     )
 
     try:
-        await startup_cleanup(WORKSPACES_ROOT, tracker, config.tracker)
+        await startup_cleanup(WORKSPACES_ROOT, trackers, config)
 
         while not stop_event.is_set():
-            prompt_source = prompt_store.maybe_reload()
+            for source, store in prompt_stores.items():
+                prompt_sources[source] = store.maybe_reload()
 
             try:
                 await tick(
-                    state, config, prompt_source, tracker, retry_queue, pending_tasks
+                    state,
+                    config,
+                    prompt_sources,
+                    trackers,
+                    retry_queue,
+                    pending_tasks,
                 )
             except Exception:
                 logger.exception("tick: unexpected failure (continuing)")
@@ -687,5 +847,6 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
             heartbeat.path.unlink()
         except FileNotFoundError:
             pass
-        await tracker.aclose()
+        for tracker in trackers.values():
+            await tracker.aclose()
         logger.info("symphony: shut down")

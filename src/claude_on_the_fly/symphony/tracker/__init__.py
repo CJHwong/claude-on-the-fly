@@ -26,6 +26,16 @@ def make_tracker(cfg) -> Tracker:
     return cls.from_config(cfg)
 
 
+def make_trackers(config) -> dict[str, Tracker]:
+    """Construct one tracker per entry in `config.trackers`. Keys preserve
+    the user's source naming (`jira`, `github`, ...). Raises if any
+    configured kind has no registered adapter."""
+    return {
+        source: make_tracker(tracker_cfg)
+        for source, tracker_cfg in config.trackers.items()
+    }
+
+
 __all__ = [
     "BlockerRef",
     "Issue",
@@ -33,4 +43,5 @@ __all__ = [
     "SUPPORTED_TRACKERS",
     "Tracker",
     "make_tracker",
+    "make_trackers",
 ]
