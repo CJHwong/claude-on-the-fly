@@ -12,6 +12,9 @@ import pytest
 
 from claude_on_the_fly.symphony.cli import (
     DEFAULT_CONFIG,
+    _cmd_takeover,
+    _cmd_watch,
+    _normalize_argv,
     _run,
     _setup_logging,
     main,
@@ -181,3 +184,185 @@ def test_argparse_custom_config() -> None:
     parser.add_argument("config", nargs="?", default=str(DEFAULT_CONFIG))
     args = parser.parse_args(["/custom/path.yaml"])
     assert args.config == "/custom/path.yaml"
+
+
+# ---------------------------------------------------------------------------
+# _normalize_argv: legacy [config] form rewrites to ["run", config]
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeArgv:
+    def test_empty_becomes_run(self) -> None:
+        assert _normalize_argv([]) == ["run"]
+
+    def test_bare_config_path_prepends_run(self) -> None:
+        assert _normalize_argv(["/tmp/cfg.yaml"]) == ["run", "/tmp/cfg.yaml"]
+
+    def test_run_subcommand_passthrough(self) -> None:
+        assert _normalize_argv(["run", "/tmp/cfg.yaml"]) == ["run", "/tmp/cfg.yaml"]
+
+    def test_takeover_subcommand_passthrough(self) -> None:
+        assert _normalize_argv(["takeover", "PROJ-1"]) == ["takeover", "PROJ-1"]
+
+    def test_help_flag_passthrough(self) -> None:
+        assert _normalize_argv(["--help"]) == ["--help"]
+
+
+# ---------------------------------------------------------------------------
+# takeover subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_takeover_prints_resume_one_liner(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    ticket = "PROJ-42"
+    fake_workspace = tmp_path / "ws"
+    fake_workspace.mkdir()
+    fake_uuid = "uuid-abc"
+
+    backend = MagicMock()
+    backend.takeover_command.return_value = f"claude --resume {fake_uuid}"
+
+    with (
+        patch(
+            "claude_on_the_fly.symphony.cli.ensure_workspace",
+            return_value=fake_workspace,
+        ),
+        patch(
+            "claude_on_the_fly.symphony.cli.session_uuid_for",
+            return_value=fake_uuid,
+        ),
+        patch("claude_on_the_fly.symphony.cli.get_backend", return_value=backend),
+    ):
+        rc = _cmd_takeover(ticket)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"cd {fake_workspace}" in out
+    assert f"claude --resume {fake_uuid}" in out
+    assert "claude-tui stop symphony" in out
+    assert "claude-tui resume" in out
+
+
+def test_cmd_takeover_no_session_yet_exits_1(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    backend = MagicMock()
+    backend.takeover_command.return_value = None
+
+    with (
+        patch(
+            "claude_on_the_fly.symphony.cli.ensure_workspace",
+            return_value=tmp_path / "ws",
+        ),
+        patch(
+            "claude_on_the_fly.symphony.cli.session_uuid_for", return_value="missing"
+        ),
+        patch("claude_on_the_fly.symphony.cli.get_backend", return_value=backend),
+    ):
+        rc = _cmd_takeover("PROJ-1")
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no session yet" in err
+
+
+def test_main_takeover_dispatches_to_cmd_takeover() -> None:
+    with (
+        patch("claude_on_the_fly.symphony.cli.load_dotenv"),
+        patch.object(sys, "argv", ["claude-symphony", "takeover", "PROJ-9"]),
+        patch(
+            "claude_on_the_fly.symphony.cli._cmd_takeover", return_value=0
+        ) as mock_cmd,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_cmd.assert_called_once_with("PROJ-9")
+
+
+# ---------------------------------------------------------------------------
+# watch subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_watch_no_session_exits_1(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    backend = MagicMock()
+    backend.session_log_path.return_value = None
+
+    with (
+        patch(
+            "claude_on_the_fly.symphony.cli.ensure_workspace",
+            return_value=tmp_path / "ws",
+        ),
+        patch(
+            "claude_on_the_fly.symphony.cli.session_uuid_for", return_value="missing"
+        ),
+        patch("claude_on_the_fly.symphony.cli.get_backend", return_value=backend),
+    ):
+        rc = _cmd_watch("PROJ-1")
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no session log" in err
+
+
+def test_cmd_watch_tails_and_formats(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    fake_log = tmp_path / "session.jsonl"
+    fake_log.write_text("")
+
+    backend = MagicMock()
+    backend.session_log_path.return_value = fake_log
+
+    # tail() yields one event, then we simulate the user hitting Ctrl-C so
+    # _cmd_watch exits cleanly without hanging.
+    fake_events = iter(
+        [
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T04:53:36.000Z",
+                "message": {"content": [{"type": "text", "text": "Hello"}]},
+            },
+        ]
+    )
+
+    def fake_tail(path, **kwargs):
+        yield next(fake_events)
+        raise KeyboardInterrupt
+
+    with (
+        patch(
+            "claude_on_the_fly.symphony.cli.ensure_workspace",
+            return_value=tmp_path / "ws",
+        ),
+        patch("claude_on_the_fly.symphony.cli.session_uuid_for", return_value="u"),
+        patch("claude_on_the_fly.symphony.cli.get_backend", return_value=backend),
+        patch("claude_on_the_fly.symphony.cli.watch.tail", side_effect=fake_tail),
+    ):
+        rc = _cmd_watch("PROJ-1")
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Rich's Console strips markup tags when stdout isn't a TTY (capsys), so
+    # we assert on the visible content rather than the markup syntax.
+    assert "watching" in out
+    assert "ASSISTANT" in out
+    assert "Hello" in out
+    assert "stopped." in out
+
+
+def test_main_watch_dispatches() -> None:
+    with (
+        patch("claude_on_the_fly.symphony.cli.load_dotenv"),
+        patch.object(sys, "argv", ["claude-symphony", "watch", "PROJ-9"]),
+        patch("claude_on_the_fly.symphony.cli._cmd_watch", return_value=0) as mock_cmd,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_cmd.assert_called_once_with("PROJ-9")
