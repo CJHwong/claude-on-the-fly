@@ -26,15 +26,33 @@ Use `gh` for everything; you do NOT need to clone the repo.
 3. Look at prior review context if needed:
    `gh pr view {{ issue.identifier }} --json reviews,comments`.
 
-## Filing comments
+## Filing the review
 
-- Inline comments on specific lines: `gh api` against the PR's
-  `pulls/<num>/comments` endpoint. Anchor each comment to a `path` and
-  `line` from the diff.
-- Summary review verdict: `gh pr review {{ issue.identifier }} --approve`
-  (LGTM), `--request-changes` (must-fix issues), or `--comment` (FYI / nits
-  / questions). Pair the flag with `--body "<summary>"` describing the
-  overall verdict.
+Submit ONE batched review with all inline comments + verdict in a single
+API call. Do NOT loop `POST /pulls/<num>/comments` per line — each call
+creates its own COMMENTED review entry and spams the PR's reviews list.
+
+    REPO="$(echo '{{ issue.identifier }}' | awk -F# '{print $1}')"
+    PR_NUM="$(echo '{{ issue.identifier }}' | awk -F# '{print $2}')"
+    gh api "repos/$REPO/pulls/$PR_NUM/reviews" \
+      --method POST \
+      --field event=APPROVE \
+      --field body='<summary>' \
+      --raw-field comments='[
+        {"path":"foo.py","line":42,"side":"RIGHT","body":"..."}
+      ]'
+
+`event` values: `APPROVE` (LGTM), `REQUEST_CHANGES` (must-fix),
+`COMMENT` (FYI / nits / questions, or you can't fully review yet).
+
+Verify the review landed:
+
+    gh api "repos/$REPO/pulls/$PR_NUM/reviews" \
+      --jq '.[-1] | {user: .user.login, state, body}'
+
+Avoid `gh pr review` — it exits 0 with empty stdout on success, which
+will trick you into retrying and double-approving the PR. Stick with
+`gh api` so the response body confirms success.
 
 ## Done signal
 
