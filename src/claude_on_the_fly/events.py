@@ -1,16 +1,19 @@
-"""Append-only JSONL audit log of orchestrator state transitions.
+"""Append-only JSONL audit log of AI-job lifecycle events.
 
-Symphony's heartbeat tells the TUI what's currently running. This log tells
-it what *has happened* — every dispatch, cancel, retry, terminal cleanup.
-The TUI's History pane reads via `tail(n)` so users can find inactive jobs
-that have aged out of the live tickets pane and re-attach to them.
+Every AI run, whether triggered by symphony, telegram, slack, or gmail,
+emits its dispatch / complete / failure transitions here. Heartbeats tell
+the TUI what is currently running; this log tells it what *has happened*
+so users can find jobs that have aged out of the live pane and re-attach
+to them.
 
 Format: one JSON object per line. Required keys: ts (ISO-8601 UTC), type,
-source, identifier. Optional: workspace, session_uuid, plus type-specific
-extras (state, reason, attempt, error).
+source, identifier. `source` is the frontend ("symphony" | "telegram" |
+"slack" | "gmail"). For symphony rows, the tracker (jira | github) lives
+in an optional `tracker` field. Optional everywhere: workspace,
+session_uuid, plus type-specific extras (state, reason, attempt, error).
 
 Concurrency: writers use `os.write` with O_APPEND, which POSIX guarantees
-atomic for line-sized writes — safe across the daemon process and any
+atomic for line-sized writes, safe across the daemon process and any
 co-running ad-hoc CLI invocations. Readers don't lock; malformed lines
 (partial writes after a hard crash) are skipped.
 """

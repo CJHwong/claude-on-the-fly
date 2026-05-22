@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from .tracker.issue import make_key
 
 if TYPE_CHECKING:
-    from .events import EventLog
+    from claude_on_the_fly.events import EventLog
 
 logger = logging.getLogger(__name__)
 
@@ -179,11 +179,12 @@ class RetryQueue:
     ) -> None:
         if self._event_log is None:
             return
-        from .events import EVENT_RETRY_SCHEDULED
+        from claude_on_the_fly.events import EVENT_RETRY_SCHEDULED
 
         self._event_log.append(
             EVENT_RETRY_SCHEDULED,
-            source=source,
+            source="symphony",
+            tracker=source,
             identifier=identifier,
             attempt=attempt,
             delay_ms=delay_ms,

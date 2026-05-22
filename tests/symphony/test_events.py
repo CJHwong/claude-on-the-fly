@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from claude_on_the_fly.symphony.events import (
+from claude_on_the_fly.events import (
     EVENT_CANCELLED,
     EVENT_DISPATCHED,
     EVENT_RETRY_SCHEDULED,

@@ -6,10 +6,17 @@ import asyncio
 import logging
 import logging.handlers
 import signal
+import time
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
 from claude_on_the_fly.agent import DATA_DIR, ClaudeUnavailableError, Response
+from claude_on_the_fly.events import (
+    EVENT_DISPATCHED,
+    EVENT_WORKER_DONE,
+    EVENT_WORKER_FAILED,
+    EventLog,
+)
 from claude_on_the_fly.heartbeat import HeartbeatWriter
 from claude_on_the_fly.protocol import Frontend
 
@@ -17,12 +24,22 @@ logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    def __init__(self, frontend: Frontend, platform: str) -> None:
+    def __init__(
+        self,
+        frontend: Frontend,
+        platform: str,
+        event_log: EventLog | None = None,
+    ) -> None:
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
         self._session_counters: dict[int, int] = {}
         self._queues: dict[int, asyncio.Queue] = {}
+        self._event_log = event_log if event_log is not None else EventLog()
+        # chat_id -> {identifier, started_at_monotonic, session_uuid}.
+        # Populated at dispatch, cleared on completion. Drives the heartbeat
+        # `running_jobs` slot consumed by the TUI's Active AI jobs pane.
+        self._in_flight: dict[int, dict] = {}
 
     def session_uuid(self, chat_id: int) -> str:
         counter = self._session_counters.get(chat_id, 0)
@@ -75,9 +92,23 @@ class Orchestrator:
         workspace.mkdir(parents=True, exist_ok=True)
         agent.ensure_persona(workspace)
         session = self.session_uuid(chat_id)
+        identifier = self._frontend.workspace_name(chat_id)
         logger.debug(
             "process: chat_id=%s workspace=%s session=%s", chat_id, workspace, session
         )
+
+        self._event_log.append(
+            EVENT_DISPATCHED,
+            source=self._platform,
+            identifier=identifier,
+            workspace=workspace,
+            session_uuid=session,
+        )
+        self._in_flight[chat_id] = {
+            "identifier": identifier,
+            "started_at_monotonic": time.monotonic(),
+            "session_uuid": session,
+        }
 
         await self._frontend.notify_start(chat_id)
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
@@ -99,17 +130,63 @@ class Orchestrator:
                 response.tokens_out,
             )
             await self._frontend.send(chat_id, response)
+            self._event_log.append(
+                EVENT_WORKER_DONE,
+                source=self._platform,
+                identifier=identifier,
+                workspace=workspace,
+                session_uuid=session,
+                cost=response.cost,
+                tokens_in=response.tokens_in,
+                tokens_out=response.tokens_out,
+            )
         except ClaudeUnavailableError as exc:
             logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
             await self._frontend.send(
                 chat_id, Response(body=f"Claude unavailable: {exc}")
             )
+            self._event_log.append(
+                EVENT_WORKER_FAILED,
+                source=self._platform,
+                identifier=identifier,
+                workspace=workspace,
+                session_uuid=session,
+                error=str(exc),
+                reason="unavailable",
+            )
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)
             await self._frontend.send(chat_id, Response(body=f"Error: {exc}"))
+            self._event_log.append(
+                EVENT_WORKER_FAILED,
+                source=self._platform,
+                identifier=identifier,
+                workspace=workspace,
+                session_uuid=session,
+                error=str(exc),
+            )
         finally:
+            self._in_flight.pop(chat_id, None)
             typing_task.cancel()
             await self._frontend.notify_complete(chat_id)
+
+    def heartbeat_extra(self) -> dict:
+        """Snapshot in-flight chat jobs for the TUI's Active AI jobs pane.
+
+        Shape mirrors symphony's running_tickets so the dashboard can merge
+        across sources with a single normalizer.
+        """
+        now = time.monotonic()
+        running_jobs = [
+            {
+                "identifier": j["identifier"],
+                "chat_id": chat_id,
+                "uptime_s": int(now - j["started_at_monotonic"]),
+                "session_uuid": j["session_uuid"],
+            }
+            for chat_id, j in self._in_flight.items()
+        ]
+        return {"running_jobs": running_jobs}
 
     async def shutdown(self) -> None:
         for task in self._running.values():
@@ -190,7 +267,7 @@ async def run(frontend: Frontend, platform: str) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    heartbeat = HeartbeatWriter(platform)
+    heartbeat = HeartbeatWriter(platform, extra_provider=orch.heartbeat_extra)
     heartbeat_task = asyncio.create_task(heartbeat.run())
 
     frontend_task = asyncio.create_task(frontend.start(orch.on_message))

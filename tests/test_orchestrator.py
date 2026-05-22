@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, Response
+from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import Orchestrator
 from claude_on_the_fly.protocol import Frontend
 
@@ -70,8 +71,13 @@ def frontend() -> StubFrontend:
 
 
 @pytest.fixture
-def orch(frontend: StubFrontend) -> Orchestrator:
-    return Orchestrator(frontend, "test")
+def event_log(tmp_path: Path) -> EventLog:
+    return EventLog(tmp_path / "events.jsonl")
+
+
+@pytest.fixture
+def orch(frontend: StubFrontend, event_log: EventLog) -> Orchestrator:
+    return Orchestrator(frontend, "test", event_log=event_log)
 
 
 # ---------------------------------------------------------------------------
@@ -458,3 +464,134 @@ class TestShutdown:
 
         assert task1.cancelled()
         assert task2.cancelled()
+
+
+# ---------------------------------------------------------------------------
+# Event log emission (cross-frontend audit trail)
+# ---------------------------------------------------------------------------
+
+
+class TestEventEmission:
+    async def test_dispatched_and_worker_done_on_success(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+    ) -> None:
+        response = Response(body="ok", cost=0.02, tokens_in=10, tokens_out=20)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=response)
+            await orch._process(7, "hi")
+
+        events = event_log.tail(10)
+        types = [e["type"] for e in events]
+        assert types == ["dispatched", "worker_done"]
+        for e in events:
+            assert e["source"] == "test"
+            assert e["identifier"] == "test/7"
+        done = events[-1]
+        assert done["cost"] == 0.02
+        assert done["tokens_in"] == 10
+        assert done["tokens_out"] == 20
+
+    async def test_worker_failed_on_unavailable_error(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+    ) -> None:
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=ClaudeUnavailableError("rate limit"))
+            await orch._process(7, "hi")
+
+        events = event_log.tail(10)
+        types = [e["type"] for e in events]
+        assert types == ["dispatched", "worker_failed"]
+        failed = events[-1]
+        assert failed["source"] == "test"
+        assert failed["reason"] == "unavailable"
+        assert "rate limit" in failed["error"]
+
+    async def test_worker_failed_on_generic_exception(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+    ) -> None:
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+            await orch._process(7, "hi")
+
+        events = event_log.tail(10)
+        types = [e["type"] for e in events]
+        assert types == ["dispatched", "worker_failed"]
+        failed = events[-1]
+        assert failed["source"] == "test"
+        assert "reason" not in failed
+        assert "boom" in failed["error"]
+
+    async def test_in_flight_cleared_after_run(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+    ) -> None:
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="ok"))
+            await orch._process(7, "hi")
+            mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+            await orch._process(8, "hi")
+
+        # Both chat_ids should be removed from in-flight after _process exits.
+        assert orch._in_flight == {}
+
+    async def test_heartbeat_extra_lists_in_flight_jobs(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def hang(*_a, **_kw) -> Response:
+            await gate.wait()
+            return Response(body="ok")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=hang)
+            task = asyncio.create_task(orch._process(9, "hi"))
+            # Yield until the orchestrator has registered the in-flight slot.
+            for _ in range(20):
+                if orch._in_flight:
+                    break
+                await asyncio.sleep(0.01)
+
+            extra = orch.heartbeat_extra()
+            assert len(extra["running_jobs"]) == 1
+            job = extra["running_jobs"][0]
+            assert job["identifier"] == "test/9"
+            assert job["chat_id"] == 9
+            assert "session_uuid" in job
+
+            gate.set()
+            await task
+
+        assert orch.heartbeat_extra() == {"running_jobs": []}

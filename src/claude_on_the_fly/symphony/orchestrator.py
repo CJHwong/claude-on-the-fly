@@ -28,7 +28,7 @@ from claude_on_the_fly.heartbeat import HeartbeatWriter
 
 from .agent_runner import TicketRunner, session_uuid_for
 from .config import SymphonyConfig, TrackerCommonConfig, load_config
-from .events import (
+from claude_on_the_fly.events import (
     EVENT_CANCELLED,
     EVENT_DISPATCHED,
     EVENT_WORKER_DONE,
@@ -212,7 +212,8 @@ async def _run_worker(
                 remove_workspace(workspace)
                 event_log.append(
                     EVENT_WORKER_DONE,
-                    source=source,
+                    source="symphony",
+                    tracker=source,
                     identifier=identifier,
                     workspace=workspace,
                     session_uuid=sid,
@@ -228,7 +229,8 @@ async def _run_worker(
                 )
                 event_log.append(
                     EVENT_WORKER_DONE,
-                    source=source,
+                    source="symphony",
+                    tracker=source,
                     identifier=identifier,
                     workspace=workspace,
                     session_uuid=sid,
@@ -256,7 +258,8 @@ async def _run_worker(
         )
         event_log.append(
             EVENT_WORKER_FAILED,
-            source=source,
+            source="symphony",
+            tracker=source,
             identifier=identifier,
             workspace=workspace,
             session_uuid=sid,
@@ -319,7 +322,8 @@ def _dispatch(
     )
     event_log.append(
         EVENT_DISPATCHED,
-        source=issue.source,
+        source="symphony",
+        tracker=issue.source,
         identifier=issue.identifier,
         state=issue.state,
         priority=issue.priority,
@@ -354,7 +358,8 @@ def _check_and_cancel_stall(
         entry.task.cancel()
     event_log.append(
         EVENT_CANCELLED,
-        source=entry.source,
+        source="symphony",
+        tracker=entry.source,
         identifier=entry.issue_identifier,
         workspace=entry.workspace,
         reason="stall",
@@ -466,7 +471,8 @@ async def reconcile(
                     entry.task.cancel()
                 event_log.append(
                     EVENT_CANCELLED,
-                    source=entry.source,
+                    source="symphony",
+                    tracker=entry.source,
                     identifier=entry.issue_identifier,
                     workspace=entry.workspace,
                     reason="terminal",
@@ -484,7 +490,8 @@ async def reconcile(
                     entry.task.cancel()
                 event_log.append(
                     EVENT_CANCELLED,
-                    source=entry.source,
+                    source="symphony",
+                    tracker=entry.source,
                     identifier=entry.issue_identifier,
                     workspace=entry.workspace,
                     reason="inactive",
