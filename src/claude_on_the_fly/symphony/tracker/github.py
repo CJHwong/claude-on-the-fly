@@ -36,6 +36,8 @@ import json
 import logging
 import re
 import shutil
+import time
+from datetime import datetime
 from typing import Any
 
 from ..config import TrackerCommonConfig
@@ -220,13 +222,15 @@ class GitHubTracker:
 
     async def fetch_candidates(self, cfg: TrackerCommonConfig) -> list[Issue]:
         """Open non-draft PRs DIRECTLY requesting the user's review where
-        the user hasn't already reviewed the *current head SHA*.
+        the user hasn't already reviewed the *current head SHA* AND the PR
+        is older than `cool_down_ms` (0 = no delay).
 
         Uses GraphQL search so each PR's `headRefOid` + the user's latest
         review's commit OID come back in one call. We filter SHA-stale
         reviews client-side: drop PRs where the user reviewed at the same
         SHA the PR's head now points at (no new code to review), keep PRs
-        where the user reviewed at an older SHA (re-review the new commits).
+        where the user reviewed at an older SHA (re-review the new commits),
+        and skip PRs younger than the configured cool-down window.
 
         Stateless — no local cache. Every tick re-queries fresh state.
         """
@@ -256,6 +260,8 @@ class GitHubTracker:
 
         candidates: list[Issue] = []
         skipped_already_reviewed = 0
+        skipped_too_fresh = 0
+        now_s = time.time()
         for node in nodes:
             if not isinstance(node, dict):
                 continue
@@ -268,14 +274,24 @@ class GitHubTracker:
             if user_reviewed_head:
                 skipped_already_reviewed += 1
                 continue
+            cool_down_ms = getattr(cfg, "cool_down_ms", 0) or 0
+            if cool_down_ms > 0:
+                created_at = node.get("createdAt")
+                if created_at:
+                    created_dt = datetime.fromisoformat(created_at)
+                    age_s = now_s - created_dt.timestamp()
+                    if age_s * 1000 < cool_down_ms:
+                        skipped_too_fresh += 1
+                        continue
             candidates.append(
                 self._payload_to_issue(node, user_reviewed_current_head=False)
             )
-        if skipped_already_reviewed:
+        if skipped_already_reviewed or skipped_too_fresh:
             logger.info(
-                "github fetch_candidates: %d candidate(s), %d skipped (already reviewed at head)",
+                "github fetch_candidates: %d candidate(s), %d skipped (already reviewed at head), %d skipped (cool-down)",
                 len(candidates),
                 skipped_already_reviewed,
+                skipped_too_fresh,
             )
         return candidates
 

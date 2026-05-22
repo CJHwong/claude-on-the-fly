@@ -186,6 +186,7 @@ class GitHubTrackerConfig(TrackerCommonConfig):
     active_states: tuple[str, ...] = ("open",)
     terminal_states: tuple[str, ...] = ("closed", "merged")
     search_query: str = "is:pr is:open -is:draft user-review-requested:@me"
+    cool_down_ms: int = 0
 
     @classmethod
     def from_dict(
@@ -200,6 +201,9 @@ class GitHubTrackerConfig(TrackerCommonConfig):
             raw.get("max_concurrent_by_state") or {}
         )
         search_query = str(raw.get("search_query") or "").strip()
+        cool_down_ms = int(raw.get("cool_down_ms") or 0)
+        if cool_down_ms < 0:
+            raise ValueError("cool_down_ms must be >= 0")
         return cls(
             kind=kind,
             active_states=tuple(raw.get("active_states") or ("open",)),
@@ -210,6 +214,7 @@ class GitHubTrackerConfig(TrackerCommonConfig):
             search_query=search_query
             if search_query
             else "is:pr is:open -is:draft user-review-requested:@me",
+            cool_down_ms=cool_down_ms,
         )
 
 
