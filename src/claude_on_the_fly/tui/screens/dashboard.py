@@ -41,6 +41,15 @@ SYMPHONY_HINT = (
     "[dim]Press h to open the history view (takeover copy lives there).[/dim]"
 )
 
+# Single-letter badge shown in the source column of the Active AI jobs pane.
+# Symphony rows render `S`, chat sources render the first letter of their name.
+_SOURCE_BADGES: dict[str, str] = {
+    "symphony": "S",
+    "telegram": "T",
+    "slack": "L",
+    "gmail": "G",
+}
+
 
 class DashboardScreen(Screen):
     # Section spacing — the three logical zones (services / jobs+symphony /
@@ -89,6 +98,10 @@ class DashboardScreen(Screen):
         # ticket → source mapping so the watch pane knows which per-source
         # workspace dir to read from when the user highlights a row.
         self._ticket_sources: dict[str, str] = {}
+        # Active-AI-jobs row key ("<frontend>:<identifier>") → session_uuid.
+        # Symphony uses a deterministic UUID computed from the ticket, chat
+        # frontends publish the UUID directly in heartbeat.running_jobs.
+        self._job_sessions: dict[str, str] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
 
@@ -151,13 +164,14 @@ class DashboardScreen(Screen):
         jobs.add_column("next fire", width=24)
         tickets = self.query_one("#symphony-tickets", DataTable)
         # Explicit widths so column headers stay readable when rows are sparse.
+        tickets.add_column("src", width=4)
         tickets.add_column("job", width=24)
         tickets.add_column("state", width=14)
         tickets.add_column("uptime", width=8)
         tickets.add_column("last turn", width=10)
         tickets.add_column("retries", width=8)
         self.query_one("#jobs-header", Static).update("[bold]Scheduled jobs[/bold]")
-        self.query_one("#symphony-header", Static).update("[bold]Symphony jobs[/bold]")
+        self.query_one("#symphony-header", Static).update("[bold]Active AI jobs[/bold]")
         self.query_one("#symphony-tickets-hint", Static).update(SYMPHONY_HINT)
         self._refresh()
         self.set_interval(1.0, self._refresh)
@@ -414,20 +428,22 @@ class DashboardScreen(Screen):
             pane.write(line.rstrip("\n"))
 
     def _refresh_watch_pane(self, *, force_reload: bool) -> None:
-        """Show the watch column for two cases:
-          - symphony selected + ticket highlighted → JSONL with format_event
-          - schedule selected + job highlighted    → per-job schedule-<name>.log
-        Otherwise the column is hidden so the daemon log gets full width.
+        """Show the watch column when the selected frontend matches a row
+        highlighted in the Active AI jobs pane (symphony / telegram / slack /
+        gmail) or when the schedule frontend has a job highlighted. Otherwise
+        the column is hidden so the daemon log gets full width.
         """
         col = self.query_one("#log-watch-col", Vertical)
         name = self._selected_frontend()
 
-        target: str | None = None  # "symphony:<source>:<KEY>" or "schedule:NAME"
-        if name == "symphony":
-            ticket = self._selected_ticket()
-            if ticket is not None:
-                source = self._ticket_sources.get(ticket, "jira")
-                target = f"symphony:{source}:{ticket}"
+        target: str | None = None
+        # "session:<frontend>:<identifier>" for any AI job row,
+        # "schedule:<name>" for a cron job tail.
+        if name in ("symphony", "telegram", "slack", "gmail"):
+            cursor = self._selected_ticket()
+            if cursor is not None and cursor.startswith(f"{name}:"):
+                identifier = cursor.split(":", 1)[1]
+                target = f"session:{name}:{identifier}"
         elif name == "schedule":
             job = self._selected_job()
             if job is not None:
@@ -454,23 +470,44 @@ class DashboardScreen(Screen):
         pane = self.query_one("#watch-pane", RichLog)
 
         mode, _, rest = target.partition(":")
-        if mode == "symphony":
-            # rest = "<source>:<KEY>"
-            source, _, target_id = rest.partition(":")
-            self._refresh_watch_symphony(target_id, source, header, pane, force_reload)
+        if mode == "session":
+            # rest = "<frontend>:<identifier>"
+            source, _, identifier = rest.partition(":")
+            self._refresh_watch_session(source, identifier, header, pane, force_reload)
         else:
             self._refresh_watch_scheduler(rest, header, pane, force_reload)
 
-    def _refresh_watch_symphony(
+    def _refresh_watch_session(
         self,
-        ticket: str,
         source: str,
+        identifier: str,
         header: Static,
         pane: RichLog,
         force_reload: bool,
     ) -> None:
-        workspace = WORKSPACES_ROOT / source / sanitize_key(ticket)
-        session_uuid = session_uuid_for(ticket, source=source)
+        """Tail the live backend session JSONL for any AI job row.
+
+        Symphony workspaces live under `WORKSPACES_ROOT/<tracker>/<key>`;
+        chat workspaces live under `DATA_DIR/workspaces/<frontend>/<user>`.
+        The backend itself is agnostic — it just needs (workspace, uuid).
+        """
+        if source == "symphony":
+            tracker = self._ticket_sources.get(identifier, "jira")
+            workspace = WORKSPACES_ROOT / tracker / sanitize_key(identifier)
+        else:
+            # `identifier` is the chat workspace_name, e.g. "telegram/H".
+            workspace = DATA_DIR / "workspaces" / identifier
+
+        session_uuid = self._job_sessions.get(f"{source}:{identifier}")
+        if not session_uuid:
+            if force_reload or self._watch_path is not None:
+                self._watch_path = None
+                self._watch_mtime = None
+                pane.clear()
+                pane.write(f"[dim]no session uuid for {identifier} yet[/dim]")
+                header.update(f"[bold]watch: {identifier}[/bold] [dim](pending)[/dim]")
+            return
+
         try:
             path = get_backend().session_log_path(workspace, session_uuid)
         except Exception:
@@ -482,11 +519,11 @@ class DashboardScreen(Screen):
                 self._watch_mtime = None
                 pane.clear()
                 pane.write(
-                    f"[dim]no session log yet for {ticket} — "
+                    f"[dim]no session log yet for {identifier} — "
                     f"agent hasn't run a turn[/dim]"
                 )
                 header.update(
-                    f"[bold]watch: {ticket}[/bold] [dim](no session yet)[/dim]"
+                    f"[bold]watch: {identifier}[/bold] [dim](no session yet)[/dim]"
                 )
             return
 
@@ -501,7 +538,7 @@ class DashboardScreen(Screen):
 
         self._watch_path = path
         self._watch_mtime = mtime
-        header.update(f"[bold]watch: {ticket}[/bold] [dim]{path.name}[/dim]")
+        header.update(f"[bold]watch: {identifier}[/bold] [dim]{path.name}[/dim]")
         pane.clear()
         import json
 
@@ -653,33 +690,69 @@ class DashboardScreen(Screen):
                 break
 
         tickets_table = self.query_one("#symphony-tickets", DataTable)
-        symphony = next((f for f in snap.frontends if f.name == "symphony"), None)
-        tickets = (symphony.extra.get("running_tickets") if symphony else None) or []
-        # Preserve cursor by ticket identifier across refreshes; if the previously
-        # selected ticket disappeared (agent finished it), the cursor falls back
-        # to whatever row sits at the same index.
-        previously_selected_ticket = self._selected_ticket()
-        tickets_table.clear()
-        # Rebuild the identifier → source map from this heartbeat snapshot so
-        # the watch pane resolves to the correct per-source workspace dir.
+        # Merge in-flight jobs across every frontend that publishes them.
+        # Symphony uses `running_tickets`; chat orchestrators use `running_jobs`.
+        # Rows are normalized into a single shape (source + identifier + display
+        # cells), and the symphony tracker (jira | github) is stashed in
+        # `_ticket_sources` so the watch pane keeps resolving per-tracker
+        # workspace dirs the same way it did before.
+        rows: list[tuple[str, str, str, str, str, str]] = []
         self._ticket_sources = {}
-        for t in tickets:
-            identifier = str(t.get("identifier", "?"))
-            source = str(t.get("source") or "jira")
-            self._ticket_sources[identifier] = source
-            # One-char source badge ("J", "G") prefixed to the ticket cell —
-            # keeps the table narrow while making the source obvious.
-            badge = source[:1].upper() if source else "?"
+        self._job_sessions = {}
+        for f in snap.frontends:
+            extra = f.extra or {}
+            if f.name == "symphony":
+                for t in extra.get("running_tickets") or []:
+                    identifier = str(t.get("identifier", "?"))
+                    tracker = str(t.get("source") or "jira")
+                    self._ticket_sources[identifier] = tracker
+                    self._job_sessions[f"symphony:{identifier}"] = session_uuid_for(
+                        identifier, source=tracker
+                    )
+                    rows.append(
+                        (
+                            "symphony",
+                            identifier,
+                            str(t.get("state", "?")),
+                            render.fmt_age(t.get("uptime_s")),
+                            render.fmt_age(t.get("last_turn_end_age_s")),
+                            str(t.get("failure_attempt", 0)),
+                        )
+                    )
+            elif f.name in ("telegram", "slack", "gmail"):
+                for j in extra.get("running_jobs") or []:
+                    identifier = str(j.get("identifier", "?"))
+                    session = j.get("session_uuid")
+                    if session:
+                        self._job_sessions[f"{f.name}:{identifier}"] = str(session)
+                    rows.append(
+                        (
+                            f.name,
+                            identifier,
+                            "—",
+                            render.fmt_age(j.get("uptime_s")),
+                            "—",
+                            "—",
+                        )
+                    )
+
+        # Compound cursor key keeps two sources from colliding when they
+        # happen to share an identifier (rare today; cheap insurance).
+        previously_selected = self._selected_ticket()
+        tickets_table.clear()
+        for source, identifier, state_label, uptime, last_turn, retries in rows:
+            badge = _SOURCE_BADGES.get(source, source[:1].upper() if source else "?")
             tickets_table.add_row(
-                f"{badge} {identifier}",
-                str(t.get("state", "?")),
-                render.fmt_age(t.get("uptime_s")),
-                render.fmt_age(t.get("last_turn_end_age_s")),
-                str(t.get("failure_attempt", 0)),
-                key=identifier,
+                badge,
+                identifier,
+                state_label,
+                uptime,
+                last_turn,
+                retries,
+                key=f"{source}:{identifier}",
             )
-        for i, t in enumerate(tickets):
-            if str(t.get("identifier")) == previously_selected_ticket:
+        for i, row in enumerate(rows):
+            if f"{row[0]}:{row[1]}" == previously_selected:
                 try:
                     tickets_table.move_cursor(row=i)
                 except Exception:
