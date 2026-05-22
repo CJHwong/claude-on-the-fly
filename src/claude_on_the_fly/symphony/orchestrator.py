@@ -28,6 +28,13 @@ from claude_on_the_fly.heartbeat import HeartbeatWriter
 
 from .agent_runner import TicketRunner, session_uuid_for
 from .config import SymphonyConfig, TrackerCommonConfig, load_config
+from .events import (
+    EVENT_CANCELLED,
+    EVENT_DISPATCHED,
+    EVENT_WORKER_DONE,
+    EVENT_WORKER_FAILED,
+    EventLog,
+)
 from .prompt import PromptStore
 from .retry import RetryQueue
 from .state import OrchestratorState, RunningEntry
@@ -94,6 +101,7 @@ async def _run_worker(
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
+    event_log: EventLog,
     starting_failure_attempt: int = 0,
 ) -> None:
     identifier = issue.identifier
@@ -202,12 +210,30 @@ async def _run_worker(
                     refreshed.state,
                 )
                 remove_workspace(workspace)
+                event_log.append(
+                    EVENT_WORKER_DONE,
+                    source=source,
+                    identifier=identifier,
+                    workspace=workspace,
+                    session_uuid=sid,
+                    state=refreshed.state,
+                    reason="terminal",
+                )
                 return
             if not tracker.is_active(refreshed_summary, tracker_cfg):
                 logger.info(
                     "[%s] inactive after turn (state=%s); leaving workspace",
                     identifier,
                     refreshed.state,
+                )
+                event_log.append(
+                    EVENT_WORKER_DONE,
+                    source=source,
+                    identifier=identifier,
+                    workspace=workspace,
+                    session_uuid=sid,
+                    state=refreshed.state,
+                    reason="inactive",
                 )
                 return
 
@@ -223,10 +249,18 @@ async def _run_worker(
         retry_queue.schedule_continuation(issue.id, identifier, source=source)
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "[%s] worker crashed; scheduling failure retry",
             identifier,
+        )
+        event_log.append(
+            EVENT_WORKER_FAILED,
+            source=source,
+            identifier=identifier,
+            workspace=workspace,
+            session_uuid=sid,
+            error=f"worker crashed: {exc}",
         )
         retry_queue.schedule_failure(
             issue.id,
@@ -248,6 +282,7 @@ def _dispatch(
     config: SymphonyConfig,
     prompt_source: str,
     retry_queue: RetryQueue,
+    event_log: EventLog,
     pending_tasks: set[asyncio.Task[None]],
     starting_failure_attempt: int = 0,
 ) -> None:
@@ -265,6 +300,7 @@ def _dispatch(
             config,
             prompt_source,
             retry_queue,
+            event_log,
             starting_failure_attempt=starting_failure_attempt,
         ),
         name=f"symphony-worker-{issue.identifier}",
@@ -281,12 +317,21 @@ def _dispatch(
         list(issue.labels),
         starting_failure_attempt,
     )
+    event_log.append(
+        EVENT_DISPATCHED,
+        source=issue.source,
+        identifier=issue.identifier,
+        state=issue.state,
+        priority=issue.priority,
+        failure_attempt=starting_failure_attempt,
+    )
 
 
 def _check_and_cancel_stall(
     entry: RunningEntry,
     config: SymphonyConfig,
     retry_queue: RetryQueue,
+    event_log: EventLog,
     now_monotonic: float,
 ) -> bool:
     """Cancel the worker and queue a failure retry if it has stalled. Returns True if stalled."""
@@ -307,6 +352,14 @@ def _check_and_cancel_stall(
     )
     if entry.task is not None and not entry.task.done():
         entry.task.cancel()
+    event_log.append(
+        EVENT_CANCELLED,
+        source=entry.source,
+        identifier=entry.issue_identifier,
+        workspace=entry.workspace,
+        reason="stall",
+        elapsed_ms=int(elapsed_ms),
+    )
     retry_queue.schedule_failure(
         entry.issue_id,
         entry.issue_identifier,
@@ -340,6 +393,7 @@ async def reconcile(
     trackers: dict[str, Tracker],
     config: SymphonyConfig,
     retry_queue: RetryQueue,
+    event_log: EventLog,
 ) -> None:
     """SPEC §8.5: refresh state of running workers; cancel on terminal /
     inactive / stalled. Each source's running entries are reconciled against
@@ -393,7 +447,7 @@ async def reconcile(
             continue
 
         for entry in entries:
-            if _check_and_cancel_stall(entry, config, retry_queue, now):
+            if _check_and_cancel_stall(entry, config, retry_queue, event_log, now):
                 continue
 
             summary = summaries.get(entry.issue_identifier)
@@ -410,6 +464,14 @@ async def reconcile(
                     remove_workspace(entry.workspace)
                 if entry.task is not None and not entry.task.done():
                     entry.task.cancel()
+                event_log.append(
+                    EVENT_CANCELLED,
+                    source=entry.source,
+                    identifier=entry.issue_identifier,
+                    workspace=entry.workspace,
+                    reason="terminal",
+                    state=summary.state,
+                )
                 continue
 
             if not tracker.is_active(summary, tracker_cfg):
@@ -420,6 +482,14 @@ async def reconcile(
                 )
                 if entry.task is not None and not entry.task.done():
                     entry.task.cancel()
+                event_log.append(
+                    EVENT_CANCELLED,
+                    source=entry.source,
+                    identifier=entry.issue_identifier,
+                    workspace=entry.workspace,
+                    reason="inactive",
+                    state=summary.state,
+                )
                 continue
 
             if summary.state != entry.issue_state:
@@ -490,6 +560,7 @@ async def _process_due_retries(
     config: SymphonyConfig,
     prompt_sources: dict[str, str],
     retry_queue: RetryQueue,
+    event_log: EventLog,
     pending_tasks: set[asyncio.Task[None]],
 ) -> None:
     due = retry_queue.due_now()
@@ -615,6 +686,7 @@ async def _process_due_retries(
                 config,
                 prompt_source,
                 retry_queue,
+                event_log,
                 pending_tasks,
                 starting_failure_attempt=entry.attempt,
             )
@@ -626,18 +698,20 @@ async def tick(
     prompt_sources: dict[str, str],
     trackers: dict[str, Tracker],
     retry_queue: RetryQueue,
+    event_log: EventLog,
     pending_tasks: set[asyncio.Task[None]],
 ) -> None:
     """One scheduling pass: reconcile -> process retries -> fetch and dispatch
     new candidates from every source. Global `max_concurrent` is shared
     across sources."""
-    await reconcile(state, trackers, config, retry_queue)
+    await reconcile(state, trackers, config, retry_queue, event_log)
     await _process_due_retries(
         state,
         trackers,
         config,
         prompt_sources,
         retry_queue,
+        event_log,
         pending_tasks,
     )
 
@@ -698,6 +772,7 @@ async def tick(
             config,
             prompt_sources.get(source, ""),
             retry_queue,
+            event_log,
             pending_tasks,
             starting_failure_attempt=0,
         )
@@ -793,7 +868,8 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
 
     trackers = make_trackers(config)
     state = OrchestratorState()
-    retry_queue = RetryQueue()
+    event_log = EventLog()
+    retry_queue = RetryQueue(event_log=event_log)
     pending_tasks: set[asyncio.Task[None]] = set()
 
     heartbeat = HeartbeatWriter(
@@ -822,6 +898,7 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
                     prompt_sources,
                     trackers,
                     retry_queue,
+                    event_log,
                     pending_tasks,
                 )
             except Exception:

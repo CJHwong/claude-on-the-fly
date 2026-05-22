@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from claude_on_the_fly.symphony.config import SymphonyConfig, TrackerConfig
+from claude_on_the_fly.symphony.events import EventLog
 from claude_on_the_fly.symphony.orchestrator import (
     _check_and_cancel_stall,
     _dispatch,
@@ -173,7 +174,21 @@ def _trackers(t: MagicMock | None = None) -> dict[str, Tracker]:
     """Wrap a single mock tracker into a `{"jira": tracker}` dict matching
     SymphonyConfig.trackers. Convenience for tests that exercise the
     multi-source orchestrator code paths with one source."""
-    return {"jira": t if t is not None else _mock_tracker()}  # type: ignore[dict-item]
+    return {"jira": t if t is not None else _mock_tracker()}
+
+
+def _stub_event_log() -> MagicMock:
+    """No-op event log for tests that don't assert on event emission.
+
+    `spec=EventLog` so accidental misuse fails at test time, not at runtime
+    inside the orchestrator."""
+    return MagicMock(spec=EventLog)
+
+
+def _real_event_log(tmp_path: Path) -> EventLog:
+    """Real on-disk EventLog at tmp_path/events.jsonl, for tests that assert
+    on emitted events via `event_log.tail()`."""
+    return EventLog(tmp_path / "events.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -465,14 +480,24 @@ class TestCheckAndCancelStall:
         entry = RunningEntry(
             issue_id="1", issue_identifier="P-1", issue_state="S", started_at=0.0
         )
-        assert _check_and_cancel_stall(entry, config, RetryQueue(), 999_999.0) is False
+        assert (
+            _check_and_cancel_stall(
+                entry, config, RetryQueue(), _stub_event_log(), 999_999.0
+            )
+            is False
+        )
 
     def test_not_stalled(self) -> None:
         config = _config(stall_timeout_ms=10_000)
         entry = RunningEntry(
             issue_id="1", issue_identifier="P-1", issue_state="S", started_at=100.0
         )
-        assert _check_and_cancel_stall(entry, config, RetryQueue(), 105.0) is False
+        assert (
+            _check_and_cancel_stall(
+                entry, config, RetryQueue(), _stub_event_log(), 105.0
+            )
+            is False
+        )
 
     def test_stalled_cancels_task_and_schedules_failure(self) -> None:
         config = _config(stall_timeout_ms=5_000)
@@ -486,7 +511,7 @@ class TestCheckAndCancelStall:
             started_at=100.0,
             task=task,
         )
-        result = _check_and_cancel_stall(entry, config, rq, 110.0)
+        result = _check_and_cancel_stall(entry, config, rq, _stub_event_log(), 110.0)
         assert result is True
         task.cancel.assert_called_once()
         assert rq.has(make_key("jira", "1")) is True
@@ -505,7 +530,7 @@ class TestCheckAndCancelStall:
             task=task,
         )
         # now = 210.0, 10s since last turn end -> stalled
-        result = _check_and_cancel_stall(entry, config, rq, 210.0)
+        result = _check_and_cancel_stall(entry, config, rq, _stub_event_log(), 210.0)
         assert result is True
 
     def test_stalled_does_not_cancel_already_done(self) -> None:
@@ -520,7 +545,7 @@ class TestCheckAndCancelStall:
             started_at=100.0,
             task=task,
         )
-        result = _check_and_cancel_stall(entry, config, rq, 110.0)
+        result = _check_and_cancel_stall(entry, config, rq, _stub_event_log(), 110.0)
         assert result is True
         task.cancel.assert_not_called()
         assert rq.has(make_key("jira", "1")) is True
@@ -544,7 +569,17 @@ class TestDispatch:
         ) as mock_run_worker:
             mock_run_worker.return_value = None
             cfg = _config()
-            _dispatch(issue, state, tracker, cfg.tracker, cfg, "prompt", rq, pending)
+            _dispatch(
+                issue,
+                state,
+                tracker,
+                cfg.tracker,
+                cfg,
+                "prompt",
+                rq,
+                _stub_event_log(),
+                pending,
+            )
 
         assert state.is_claimed(issue.key) is True
         assert len(pending) == 1
@@ -558,7 +593,15 @@ class TestDispatch:
 
         cfg = _config()
         _dispatch(
-            issue, state, tracker, cfg.tracker, cfg, "prompt", RetryQueue(), pending
+            issue,
+            state,
+            tracker,
+            cfg.tracker,
+            cfg,
+            "prompt",
+            RetryQueue(),
+            _stub_event_log(),
+            pending,
         )
         # Should not raise; just silently returns
         assert len(pending) == 0
@@ -597,7 +640,14 @@ class TestRunWorker:
             mock_runner_cls.return_value = mock_runner
 
             await _run_worker(
-                issue, state, tracker, config.tracker, config, "prompt", rq
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
             )
 
         assert rq.has(issue.key) is True
@@ -616,7 +666,14 @@ class TestRunWorker:
             side_effect=OSError("disk full"),
         ):
             await _run_worker(
-                issue, state, tracker, config.tracker, config, "prompt", rq
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
             )
 
         assert rq.has(issue.key) is True
@@ -653,6 +710,7 @@ class TestRunWorker:
                 config,
                 "prompt",
                 rq,
+                _stub_event_log(),
                 starting_failure_attempt=0,
             )
 
@@ -684,7 +742,14 @@ class TestRunWorker:
 
             tracker.fetch_one.return_value = _issue(state="Done")
             await _run_worker(
-                issue, state, tracker, config.tracker, config, "prompt", rq
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
             )
 
         mock_rm.assert_called_once()
@@ -712,7 +777,14 @@ class TestRunWorker:
 
             tracker.fetch_one.return_value = _issue(state="Backlog")
             await _run_worker(
-                issue, state, tracker, config.tracker, config, "prompt", rq
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
             )
 
         assert state.is_claimed(issue.key) is False
@@ -731,7 +803,14 @@ class TestRunWorker:
         ):
             # This actually falls into workspace prep failure path
             await _run_worker(
-                issue, state, tracker, config.tracker, config, "prompt", rq
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
             )
 
         assert rq.has(issue.key) is True
@@ -760,7 +839,14 @@ class TestRunWorker:
             # Post-turn refresh shows state still active BUT gate label gone.
             tracker.fetch_one.return_value = _issue(state="In Progress", labels=())
             await _run_worker(
-                issue, state, tracker, config.tracker, config, "prompt", rq
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
             )
 
         # Exactly one turn ran, no retry scheduled (clean park).
@@ -777,7 +863,9 @@ class TestReconcile:
     async def test_no_running_workers_returns_early(self) -> None:
         state = OrchestratorState()
         tracker = _mock_tracker()
-        await reconcile(state, _trackers(tracker), _config(), RetryQueue())
+        await reconcile(
+            state, _trackers(tracker), _config(), RetryQueue(), _stub_event_log()
+        )
         tracker.fetch_summaries_by_keys.assert_not_called()
 
     async def test_fetch_failure_logs_and_returns(self) -> None:
@@ -787,7 +875,11 @@ class TestReconcile:
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.side_effect = ConnectionError("down")
         await reconcile(
-            state, _trackers(tracker), _config(stall_timeout_ms=0), RetryQueue()
+            state,
+            _trackers(tracker),
+            _config(stall_timeout_ms=0),
+            RetryQueue(),
+            _stub_event_log(),
         )
         tracker.fetch_summaries_by_keys.assert_awaited_once()
 
@@ -802,7 +894,9 @@ class TestReconcile:
         with patch(
             "claude_on_the_fly.symphony.orchestrator.remove_workspace"
         ) as mock_rm:
-            await reconcile(state, _trackers(tracker), cfg, RetryQueue())
+            await reconcile(
+                state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log()
+            )
 
         mock_rm.assert_not_called()  # workspace path is None, so it won't be called
 
@@ -817,7 +911,7 @@ class TestReconcile:
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Backlog"})
 
-        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         task.cancel.assert_called_once()
 
     async def test_state_update_when_changed_and_still_active(self) -> None:
@@ -830,7 +924,7 @@ class TestReconcile:
             {"PROJ-1": "In Progress"}
         )
 
-        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         assert entry.issue_state == "In Progress"
 
     async def test_gate_label_removed_mid_run_cancels(self) -> None:
@@ -850,7 +944,7 @@ class TestReconcile:
             ),
         }
 
-        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         task.cancel.assert_called_once()
 
     async def test_gate_label_present_does_not_cancel(self) -> None:
@@ -867,7 +961,7 @@ class TestReconcile:
             {"PROJ-1": "In Progress"}
         )
 
-        await reconcile(state, _trackers(tracker), cfg, RetryQueue())
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         task.cancel.assert_not_called()
 
 
@@ -962,6 +1056,7 @@ class TestProcessDueRetries:
             _config(),
             {"jira": "prompt"},
             rq,
+            _stub_event_log(),
             pending,
         )
         tracker.fetch_summaries_by_keys.assert_not_called()
@@ -987,6 +1082,7 @@ class TestProcessDueRetries:
             cfg,
             {"jira": "prompt"},
             rq,
+            _stub_event_log(),
             pending,
         )
         assert rq.has(make_key("jira", "1")) is False  # dropped, not requeued
@@ -1007,6 +1103,7 @@ class TestProcessDueRetries:
             cfg,
             {"jira": "prompt"},
             rq,
+            _stub_event_log(),
             pending,
         )
         assert rq.has(make_key("jira", "1")) is False
@@ -1027,7 +1124,13 @@ class TestProcessDueRetries:
         pending: set[asyncio.Task[None]] = set()
 
         await _process_due_retries(
-            state, _trackers(tracker), cfg, {"jira": "prompt"}, rq, pending
+            state,
+            _trackers(tracker),
+            cfg,
+            {"jira": "prompt"},
+            rq,
+            _stub_event_log(),
+            pending,
         )
         assert rq.has(make_key("jira", "1")) is True  # requeued
 
@@ -1053,6 +1156,7 @@ class TestProcessDueRetries:
                 cfg,
                 {"jira": "prompt"},
                 rq,
+                _stub_event_log(),
                 pending,
             )
 
@@ -1077,6 +1181,7 @@ class TestProcessDueRetries:
             cfg,
             {"jira": "prompt"},
             rq,
+            _stub_event_log(),
             pending,
         )
         assert rq.has(make_key("jira", "1")) is True  # requeued
@@ -1105,6 +1210,7 @@ class TestProcessDueRetries:
                 cfg,
                 {"jira": "prompt"},
                 rq,
+                _stub_event_log(),
                 pending,
             )
 
@@ -1134,6 +1240,7 @@ class TestProcessDueRetries:
                 cfg,
                 {"jira": "prompt"},
                 rq,
+                _stub_event_log(),
                 pending,
             )
 
@@ -1156,7 +1263,13 @@ class TestTick:
         pending: set[asyncio.Task[None]] = set()
 
         await tick(
-            state, cfg, {"jira": "prompt"}, _trackers(tracker), RetryQueue(), pending
+            state,
+            cfg,
+            {"jira": "prompt"},
+            _trackers(tracker),
+            RetryQueue(),
+            _stub_event_log(),
+            pending,
         )
         tracker.fetch_candidates.assert_not_called()
 
@@ -1179,6 +1292,7 @@ class TestTick:
                 {"jira": "prompt"},
                 _trackers(tracker),
                 RetryQueue(),
+                _stub_event_log(),
                 pending,
             )
 
@@ -1198,6 +1312,7 @@ class TestTick:
             {"jira": "prompt"},
             _trackers(tracker),
             RetryQueue(),
+            _stub_event_log(),
             pending,
         )
 
@@ -1265,6 +1380,7 @@ class TestTick:
                 {"jira": "jira-prompt", "github": "gh-prompt"},
                 trackers,
                 RetryQueue(),
+                _stub_event_log(),
                 pending,
             )
 
@@ -1360,9 +1476,10 @@ class TestMultiSourceReconcile:
 
         await reconcile(
             state,
-            {"jira": jira_tracker, "github": gh_tracker},  # type: ignore[dict-item]
+            {"jira": jira_tracker, "github": gh_tracker},
             cfg,
             RetryQueue(),
+            _stub_event_log(),
         )
 
         # Jira stayed running, GitHub got cancelled.
@@ -1442,3 +1559,157 @@ class TestRunLoop:
             await t
 
             tracker.aclose.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Event emission — black-box checks that each transition writes to EventLog
+# ---------------------------------------------------------------------------
+
+
+class TestEventEmission:
+    async def test_dispatch_emits_dispatched_event(self, tmp_path: Path) -> None:
+        issue = _issue(identifier="PROJ-EV1")
+        state = OrchestratorState()
+        tracker = _mock_tracker()
+        event_log = _real_event_log(tmp_path)
+        pending: set[asyncio.Task[None]] = set()
+
+        with patch("claude_on_the_fly.symphony.orchestrator._run_worker") as mock_rw:
+            mock_rw.return_value = None
+            cfg = _config()
+            _dispatch(
+                issue,
+                state,
+                tracker,
+                cfg.tracker,
+                cfg,
+                "prompt",
+                RetryQueue(),
+                event_log,
+                pending,
+            )
+
+        events = event_log.tail(10)
+        assert len(events) == 1
+        assert events[0]["type"] == "dispatched"
+        assert events[0]["identifier"] == "PROJ-EV1"
+        assert events[0]["source"] == "jira"
+
+    async def test_stall_emits_cancelled_with_reason(self, tmp_path: Path) -> None:
+        event_log = _real_event_log(tmp_path)
+        config = _config(stall_timeout_ms=5_000)
+        rq = RetryQueue(event_log=event_log)
+        task = MagicMock()
+        task.done.return_value = False
+        entry = RunningEntry(
+            issue_id="1",
+            issue_identifier="PROJ-EV2",
+            issue_state="In Progress",
+            started_at=100.0,
+            task=task,
+        )
+        _check_and_cancel_stall(entry, config, rq, event_log, 110.0)
+
+        events = event_log.tail(10)
+        types = [e["type"] for e in events]
+        # cancelled comes first (the cancel itself), then retry_scheduled
+        assert "cancelled" in types
+        cancelled = next(e for e in events if e["type"] == "cancelled")
+        assert cancelled["reason"] == "stall"
+        assert cancelled["identifier"] == "PROJ-EV2"
+        assert "retry_scheduled" in types
+
+    async def test_reconcile_terminal_emits_cancelled(self, tmp_path: Path) -> None:
+        event_log = _real_event_log(tmp_path)
+        state = OrchestratorState()
+        issue = _issue(identifier="PROJ-EV3")
+        state.claim(issue)
+        cfg = _config(stall_timeout_ms=0)
+        tracker = _mock_tracker()
+        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-EV3": "Done"})
+
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue(), event_log)
+
+        events = event_log.tail(10)
+        cancelled = [e for e in events if e["type"] == "cancelled"]
+        assert len(cancelled) == 1
+        assert cancelled[0]["reason"] == "terminal"
+
+    async def test_reconcile_inactive_emits_cancelled(self, tmp_path: Path) -> None:
+        event_log = _real_event_log(tmp_path)
+        state = OrchestratorState()
+        issue = _issue(identifier="PROJ-EV4")
+        state.claim(issue)
+        cfg = _config(stall_timeout_ms=0)
+        tracker = _mock_tracker()
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-EV4": "Backlog"}
+        )
+
+        await reconcile(state, _trackers(tracker), cfg, RetryQueue(), event_log)
+
+        events = event_log.tail(10)
+        cancelled = [e for e in events if e["type"] == "cancelled"]
+        assert len(cancelled) == 1
+        assert cancelled[0]["reason"] == "inactive"
+
+    async def test_worker_done_terminal_emits_event(self, tmp_path: Path) -> None:
+        event_log = _real_event_log(tmp_path)
+        issue = _issue(identifier="PROJ-EV5")
+        state = OrchestratorState()
+        state.claim(issue)
+        tracker = _mock_tracker()
+        config = _config(max_turns=10)
+
+        with (
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.ensure_workspace"
+            ) as mock_ew,
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.TicketRunner"
+            ) as mock_runner_cls,
+            patch("claude_on_the_fly.symphony.orchestrator.remove_workspace"),
+        ):
+            mock_ew.return_value = Path("/tmp/ws")
+            mock_runner = MagicMock()
+            mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
+            mock_runner_cls.return_value = mock_runner
+            tracker.fetch_one.return_value = _issue(identifier="PROJ-EV5", state="Done")
+            await _run_worker(
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                RetryQueue(),
+                event_log,
+            )
+
+        events = event_log.tail(10)
+        done = [e for e in events if e["type"] == "worker_done"]
+        assert len(done) == 1
+        assert done[0]["reason"] == "terminal"
+
+    async def test_retry_schedule_emits_event(self, tmp_path: Path) -> None:
+        event_log = _real_event_log(tmp_path)
+        rq = RetryQueue(event_log=event_log)
+        rq.schedule_failure(
+            "1", "PROJ-EV6", max_backoff_ms=60_000, attempt=2, error="boom"
+        )
+
+        events = event_log.tail(10)
+        assert len(events) == 1
+        assert events[0]["type"] == "retry_scheduled"
+        assert events[0]["kind"] == "failure"
+        assert events[0]["attempt"] == 2
+
+    async def test_retry_continuation_emits_event(self, tmp_path: Path) -> None:
+        event_log = _real_event_log(tmp_path)
+        rq = RetryQueue(event_log=event_log)
+        rq.schedule_continuation("1", "PROJ-EV7")
+
+        events = event_log.tail(10)
+        assert len(events) == 1
+        assert events[0]["type"] == "retry_scheduled"
+        assert events[0]["kind"] == "continuation"

@@ -16,8 +16,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from .tracker.issue import make_key
+
+if TYPE_CHECKING:
+    from .events import EventLog
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +55,15 @@ class RetryEntry:
 
 class RetryQueue:
     """Tracks scheduled retry intentions per composite key. Single-entry per
-    key (a new schedule replaces any pending one)."""
+    key (a new schedule replaces any pending one).
 
-    def __init__(self) -> None:
+    If an `event_log` is supplied, each `schedule_failure` / `schedule_continuation`
+    call also writes a `retry_scheduled` event for the TUI History pane.
+    """
+
+    def __init__(self, event_log: "EventLog | None" = None) -> None:
         self._entries: dict[str, RetryEntry] = {}
+        self._event_log = event_log
 
     def has(self, key: str) -> bool:
         """Caller passes the composite `<source>:<id>` key."""
@@ -83,6 +92,14 @@ class RetryQueue:
             "retry: continuation scheduled for %s in %dms",
             identifier,
             CONTINUATION_DELAY_MS,
+        )
+        self._emit_scheduled(
+            source=source,
+            identifier=identifier,
+            attempt=attempt,
+            delay_ms=CONTINUATION_DELAY_MS,
+            kind="continuation",
+            error=None,
         )
 
     def schedule_failure(
@@ -113,6 +130,14 @@ class RetryQueue:
             delay,
             error or "-",
         )
+        self._emit_scheduled(
+            source=source,
+            identifier=identifier,
+            attempt=attempt,
+            delay_ms=delay,
+            kind="failure",
+            error=error,
+        )
 
     def cancel(self, key: str) -> None:
         if self._entries.pop(key, None) is not None:
@@ -141,3 +166,27 @@ class RetryQueue:
 
     def all_pending(self) -> list[RetryEntry]:
         return list(self._entries.values())
+
+    def _emit_scheduled(
+        self,
+        *,
+        source: str,
+        identifier: str,
+        attempt: int,
+        delay_ms: int,
+        kind: str,
+        error: str | None,
+    ) -> None:
+        if self._event_log is None:
+            return
+        from .events import EVENT_RETRY_SCHEDULED
+
+        self._event_log.append(
+            EVENT_RETRY_SCHEDULED,
+            source=source,
+            identifier=identifier,
+            attempt=attempt,
+            delay_ms=delay_ms,
+            kind=kind,
+            error=error,
+        )
