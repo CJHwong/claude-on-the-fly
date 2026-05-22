@@ -310,6 +310,18 @@ class SlackFrontend(Frontend):
     def channel_context(self, chat_id: int) -> str:
         return self._channel_contexts.get(chat_id, "dm")
 
+    def describe(self) -> dict[str, str]:
+        from claude_on_the_fly.orchestrator import _redact_token
+
+        allowed = (
+            "*" if self._allow_all_senders else ",".join(sorted(self._allowed_user_ids))
+        )
+        return {
+            "app_token": _redact_token(self._app_token),
+            "user_id": self._user_id,
+            "allowed_users": allowed or "<none>",
+        }
+
     # --- Lifecycle ---
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:

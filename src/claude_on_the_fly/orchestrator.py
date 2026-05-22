@@ -117,6 +117,41 @@ class Orchestrator:
         await asyncio.gather(*self._running.values(), return_exceptions=True)
 
 
+def _redact_token(token: str) -> str:
+    """Mask a secret for log output. Matches symphony's redaction format."""
+    if not token:
+        return "<unset>"
+    if len(token) <= 4:
+        return "***"
+    return f"{token[:2]}***{token[-2:]}"
+
+
+def _log_settings_summary(platform: str, frontend: Frontend) -> None:
+    """Dump the resolved runtime settings at startup, symphony-style.
+
+    Pulls shared bits (log level, data dir, agent backend) from env, then
+    appends frontend-specific fields via Frontend.describe(). Secrets are
+    expected to be redacted by the frontend before being returned.
+    """
+    import os
+
+    backend = os.environ.get("AGENT_BACKEND", "claude").lower()
+    mode_var = f"{backend.upper()}_MODE"
+    mode = os.environ.get(mode_var, "native").lower()
+
+    logger.info("%s settings:", platform)
+    logger.info("  platform        = %s", platform)
+    logger.info("  log_level       = %s", os.environ.get("LOG_LEVEL", "INFO").upper())
+    logger.info("  data_dir        = %s", DATA_DIR)
+    logger.info("  agent_backend   = %s", backend)
+    logger.info("  %-15s = %s", mode_var.lower(), mode)
+    if mode == "ollama":
+        logger.info("  ollama_model    = %s", os.environ.get("OLLAMA_MODEL", "<unset>"))
+
+    for label, value in frontend.describe().items():
+        logger.info("  %-15s = %s", label, value)
+
+
 async def run(frontend: Frontend, platform: str) -> None:
     """Start the orchestrator with the given frontend. Blocks until SIGINT/SIGTERM."""
     import os
@@ -144,6 +179,8 @@ async def run(frontend: Frontend, platform: str) -> None:
     logging.getLogger().addHandler(file_handler)
     (DATA_DIR / "memory" / "users").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+
+    _log_settings_summary(platform, frontend)
 
     orch = Orchestrator(frontend, platform)
     frontend.set_orchestrator(orch)

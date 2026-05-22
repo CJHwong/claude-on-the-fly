@@ -59,6 +59,14 @@ class TelegramFrontend(Frontend):
     def channel_context(self, chat_id: int) -> str:
         return "dm"  # Telegram bot is always a DM
 
+    def describe(self) -> dict[str, str]:
+        from claude_on_the_fly.orchestrator import _redact_token
+
+        return {
+            "bot_token": _redact_token(self._token),
+            "allowed_user_id": str(self._allowed_user_id),
+        }
+
     # --- Lifecycle ---
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:

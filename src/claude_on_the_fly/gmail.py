@@ -136,6 +136,19 @@ class GmailFrontend(Frontend):
         sender = self._sender_emails.get(chat_id, "unknown")
         return f'email:thread subject="{subject}" from={sender}'
 
+    def describe(self) -> dict[str, str]:
+        if self._allow_all_senders:
+            allowed = "*"
+        else:
+            parts: list[str] = sorted(self._allowed_emails)
+            parts.extend(f"*@{d}" for d in sorted(self._allowed_domains))
+            allowed = ",".join(parts) or "<none>"
+        return {
+            "gcp_project": self._gcp_project,
+            "poll_interval_s": str(self._poll_interval),
+            "allowed_senders": allowed,
+        }
+
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         self._on_message = on_message
 

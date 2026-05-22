@@ -67,3 +67,12 @@ class Frontend(ABC):
     @abstractmethod
     def channel_context(self, chat_id: int) -> str:
         """Where this conversation is happening, e.g. 'dm', 'channel:#general'."""
+
+    def describe(self) -> dict[str, str]:
+        """Frontend-specific settings to print in the startup preview.
+
+        Keys are field labels, values are stringified settings. Secrets must
+        already be redacted by the frontend. Default is empty so frontends
+        opt in only to what's useful.
+        """
+        return {}

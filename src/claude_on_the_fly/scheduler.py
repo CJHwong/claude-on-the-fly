@@ -403,6 +403,9 @@ class SchedulerFrontend(Frontend):
             return float(self._state[name].spec.timeout)
         return None
 
+    def describe(self) -> dict[str, str]:
+        return {"config_path": str(self._config_path)}
+
 
 # ---------------------------------------------------------------------------
 # Entry point
