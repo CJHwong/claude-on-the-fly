@@ -596,6 +596,35 @@ async def test_fetch_summaries_skips_invalid_identifiers() -> None:
     assert list(result.keys()) == ["owner/repo#1"]
 
 
+@pytest.mark.asyncio
+async def test_fetch_candidates_uses_custom_search_query() -> None:
+    """When GitHubTrackerConfig.search_query is set, it's sent to gh instead
+    of the default."""
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    t = _tracker()
+    t._login = "CJHwong"
+    cfg = GitHubTrackerConfig(
+        kind="github",
+        search_query="is:pr is:open org:gofreight label:bug",
+    )
+    captured: dict = {}
+
+    async def capture(*args, **kwargs):
+        captured["args"] = list(args)
+        return _stub_proc(_graphql_envelope([]))
+
+    with patch(
+        "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
+        new=capture,
+    ):
+        await t.fetch_candidates(cfg)
+
+    joined = " ".join(captured["args"])
+    assert "org:gofreight" in joined
+    assert "label:bug" in joined
+
+
 # ---------------------------------------------------------------------------
 # async context manager
 # ---------------------------------------------------------------------------

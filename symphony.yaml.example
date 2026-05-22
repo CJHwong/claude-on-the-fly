@@ -28,8 +28,14 @@ trackers:
   github:
     kind: github                    # PRs requesting your review (gh CLI auth)
     # `gh` must be on PATH and authenticated (gh auth login).
-    # GitHub adapter needs no extra fields — submitting any review removes
-    # you from `reviewRequests`, which is symphony's "done" signal.
+    # Submitting any review removes you from `reviewRequests`, which is
+    # symphony's "done" signal.
+    # search_query: "is:pr is:open -is:draft user-review-requested:@me"
+    #   GitHub code-search syntax. Add org:, repo:, updated:, label:, etc.
+    #   e.g. to scope to an org and recent PRs:
+    #   "is:pr is:open -is:draft user-review-requested:@me org:gofreight updated:>=2026-05-15"
+    #   To include drafts, drop -is:draft. To monitor all repo PRs,
+    #   drop user-review-requested:@me and add repo:owner/name.
     # Defaults shown; uncomment to override:
     # active_states:   ["open"]
     # terminal_states: ["closed", "merged"]

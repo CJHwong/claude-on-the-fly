@@ -383,6 +383,32 @@ def test_github_tracker_config_defaults_no_auth_fields_needed():
     assert cfg.gate_label is None
 
 
+def test_github_tracker_config_search_query_default():
+    """Default search_query matches the current hardcoded value."""
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    cfg = GitHubTrackerConfig.from_dict({"kind": "github"})
+    assert cfg.search_query == "is:pr is:open -is:draft user-review-requested:@me"
+
+
+def test_github_tracker_config_search_query_custom():
+    """Custom search_query is parsed from config dict."""
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    cfg = GitHubTrackerConfig.from_dict(
+        {"kind": "github", "search_query": "is:pr is:open org:gofreight"}
+    )
+    assert cfg.search_query == "is:pr is:open org:gofreight"
+
+
+def test_github_tracker_config_search_query_empty_falls_back():
+    """Empty string falls back to the default query."""
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    cfg = GitHubTrackerConfig.from_dict({"kind": "github", "search_query": ""})
+    assert cfg.search_query == "is:pr is:open -is:draft user-review-requested:@me"
+
+
 def test_trackers_must_be_mapping(tmp_path, env_creds):
     cfg_path = tmp_path / "symphony.yaml"
     cfg_path.write_text("trackers: not-a-map\n")

@@ -185,6 +185,7 @@ class GitHubTrackerConfig(TrackerCommonConfig):
 
     active_states: tuple[str, ...] = ("open",)
     terminal_states: tuple[str, ...] = ("closed", "merged")
+    search_query: str = "is:pr is:open -is:draft user-review-requested:@me"
 
     @classmethod
     def from_dict(
@@ -198,6 +199,7 @@ class GitHubTrackerConfig(TrackerCommonConfig):
         per_state = _parse_per_state_concurrency(
             raw.get("max_concurrent_by_state") or {}
         )
+        search_query = str(raw.get("search_query") or "").strip()
         return cls(
             kind=kind,
             active_states=tuple(raw.get("active_states") or ("open",)),
@@ -205,6 +207,9 @@ class GitHubTrackerConfig(TrackerCommonConfig):
             gate_label=(str(raw["gate_label"]) if raw.get("gate_label") else None),
             prompt_path=prompt_path,
             max_concurrent_by_state=per_state,
+            search_query=search_query
+            if search_query
+            else "is:pr is:open -is:draft user-review-requested:@me",
         )
 
 

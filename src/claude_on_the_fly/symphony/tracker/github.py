@@ -231,7 +231,10 @@ class GitHubTracker:
         Stateless — no local cache. Every tick re-queries fresh state.
         """
         login = await self._get_login()
-        query = "is:pr is:open -is:draft user-review-requested:@me"
+        query = (
+            getattr(cfg, "search_query", None)
+            or "is:pr is:open -is:draft user-review-requested:@me"
+        )
         args = [
             "api",
             "graphql",
