@@ -38,15 +38,26 @@ WATCH_EVENTS = 80
 # Cap on RichLog growth so a 24/7 dashboard doesn't accumulate unbounded memory.
 LOG_PANE_MAX_LINES = 10_000
 SYMPHONY_HINT = (
-    "[dim]Watch live: claude-symphony watch <TICKET>    "
-    "Take over: claude-symphony takeover <TICKET>[/dim]"
+    "[dim]Press h to open the history view (takeover copy lives there).[/dim]"
 )
 
 
 class DashboardScreen(Screen):
+    # Section spacing — the three logical zones (services / jobs+symphony /
+    # logs) read better with a row of breathing room between them than they
+    # do crammed together.
+    DEFAULT_CSS = """
+    #jobs-row {
+        margin-top: 1;
+    }
+    """
+
     BINDINGS = [
         ("l", "app.push_screen('logs')", "Logs"),
         ("d", "app.push_screen('doctor')", "Doctor"),
+        # `h` opens the symphony event history full-screen — separate from
+        # the live tickets pane so the dashboard stays focused on now.
+        ("h", "app.push_screen('history')", "History"),
         ("s", "start", "Start"),
         ("k", "stop", "Stop"),
         ("r", "restart", "Restart"),
@@ -127,15 +138,26 @@ class DashboardScreen(Screen):
 
     def on_mount(self) -> None:
         table = self.query_one("#frontends", DataTable)
-        table.add_columns("name", "state", "pid", "uptime", "heartbeat", "notes")
+        table.add_column("name", width=10)
+        table.add_column("state", width=10)
+        table.add_column("pid", width=8)
+        table.add_column("uptime", width=8)
+        table.add_column("heartbeat", width=10)
+        table.add_column("notes", width=40)
         jobs = self.query_one("#jobs-content", DataTable)
-        jobs.add_columns("name", "cron", "kind", "next fire")
+        jobs.add_column("name", width=12)
+        jobs.add_column("cron", width=14)
+        jobs.add_column("kind", width=10)
+        jobs.add_column("next fire", width=24)
         tickets = self.query_one("#symphony-tickets", DataTable)
-        tickets.add_columns("ticket", "state", "uptime", "last turn", "retries")
+        # Explicit widths so column headers stay readable when rows are sparse.
+        tickets.add_column("job", width=24)
+        tickets.add_column("state", width=14)
+        tickets.add_column("uptime", width=8)
+        tickets.add_column("last turn", width=10)
+        tickets.add_column("retries", width=8)
         self.query_one("#jobs-header", Static).update("[bold]Scheduled jobs[/bold]")
-        self.query_one("#symphony-header", Static).update(
-            "[bold]Symphony tickets[/bold]"
-        )
+        self.query_one("#symphony-header", Static).update("[bold]Symphony jobs[/bold]")
         self.query_one("#symphony-tickets-hint", Static).update(SYMPHONY_HINT)
         self._refresh()
         self.set_interval(1.0, self._refresh)
@@ -593,18 +615,33 @@ class DashboardScreen(Screen):
         jobs_header = self.query_one("#jobs-header", Static)
         previously_selected_job = self._selected_job()
         jobs_table.clear()
+        # The scheduler frontend is what actually fires cron jobs; if it
+        # isn't running, the cron-derived "next fire" is misleading because
+        # nothing will execute it. Show `-` in that case.
+        schedule_running = any(
+            f.name == "schedule" and f.state == "running" for f in snap.frontends
+        )
         if snap.schedule_error:
             jobs_header.update(
                 f"[bold]Scheduled jobs[/bold] [red]({snap.schedule_error})[/red]"
             )
+        elif not schedule_running:
+            jobs_header.update(
+                "[bold]Scheduled jobs[/bold] [dim](scheduler stopped)[/dim]"
+            )
         else:
             jobs_header.update("[bold]Scheduled jobs[/bold]")
         for j in snap.jobs:
+            next_fire_str = (
+                render._fmt_next_fire(j.next_fire, snap.timestamp)
+                if schedule_running
+                else "-"
+            )
             jobs_table.add_row(
                 j.name,
                 j.cron,
                 j.kind,
-                render._fmt_next_fire(j.next_fire, snap.timestamp),
+                next_fire_str,
                 key=j.name,
             )
         for i, j in enumerate(snap.jobs):

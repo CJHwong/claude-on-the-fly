@@ -10,6 +10,7 @@ from textual.app import App
 
 from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 from claude_on_the_fly.tui.screens.doctor import DoctorScreen
+from claude_on_the_fly.tui.screens.history import HistoryScreen
 from claude_on_the_fly.tui.screens.logs import LogsScreen
 
 
@@ -96,6 +97,7 @@ class ClaudeTuiApp(App):
         "dashboard": DashboardScreen,
         "logs": LogsScreen,
         "doctor": DoctorScreen,
+        "history": HistoryScreen,
     }
 
     def on_mount(self) -> None:
