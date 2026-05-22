@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -123,6 +124,14 @@ class Response:
     model: str = ""
     tool_counts: dict[str, int] = field(default_factory=dict)
     skill_counts: dict[str, int] = field(default_factory=dict)
+    # Optional statusline-derived fields, only populated in CLAUDE_MODE=snap.
+    rate_limits_5h_pct: int | None = None
+    rate_limits_5h_resets_at: int | None = None
+    rate_limits_7d_pct: int | None = None
+    rate_limits_7d_resets_at: int | None = None
+    context_window_pct: int | None = None
+    exceeds_200k: bool = False
+    fast_mode: bool = False
 
     @property
     def has_stats(self) -> bool:
@@ -140,6 +149,19 @@ class Response:
             parts.append(f"{self.duration:.1f}s")
         if self.tokens_in or self.tokens_out:
             parts.append(f"↑{self.tokens_in} ↓{self.tokens_out}")
+        if self.context_window_pct is not None:
+            parts.append(f"ctx {self.context_window_pct}%")
+        # Only surface the 5h budget when it's actually loud; the 7d window
+        # rarely matters in chat. resets_at is a Unix timestamp from snap.
+        if (
+            self.rate_limits_5h_pct is not None
+            and self.rate_limits_5h_pct >= 50
+            and self.rate_limits_5h_resets_at is not None
+        ):
+            reset = datetime.fromtimestamp(self.rate_limits_5h_resets_at).strftime(
+                "%H:%M"
+            )
+            parts.append(f"5h {self.rate_limits_5h_pct}% → {reset}")
         if self.model:
             parts.append(self.model)
         return " | ".join(parts)
@@ -421,7 +443,9 @@ def _build_claude_backend() -> AgentBackend:
         if not model:
             raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
         return ClaudeBackend(launcher=OllamaLauncher(model=model))
-    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+    if mode == "snap":
+        return ClaudeBackend(snap=True)
+    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)")
 
 
 def _build_codex_backend() -> AgentBackend:

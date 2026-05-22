@@ -181,6 +181,12 @@ class TestCheckBackend:
         check_backend()
         mock_check.assert_called_once()
 
+    @patch("claude_on_the_fly.preflight.check_snap_mode")
+    def test_snap_mode_dispatches(self, mock_check, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "snap")
+        check_backend()
+        mock_check.assert_called_once()
+
     def test_unknown_backend_exits(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "gemini")
         with pytest.raises(SystemExit, match="Unknown AGENT_BACKEND"):

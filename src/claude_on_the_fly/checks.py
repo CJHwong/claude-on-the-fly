@@ -226,6 +226,8 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
 
 _VALID_BACKENDS = ("claude", "codex")
 _VALID_MODES = ("native", "ollama")
+# Snap is claude-only; codex has no equivalent wrapper.
+_VALID_CLAUDE_MODES = ("native", "ollama", "snap")
 
 
 def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
@@ -248,14 +250,15 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
     )
 
     mode_var = f"{backend.upper()}_MODE"
+    valid_modes = _VALID_CLAUDE_MODES if backend == "claude" else _VALID_MODES
     mode = env.get(mode_var, "native").lower()
-    if mode not in _VALID_MODES:
+    if mode not in valid_modes:
         results.append(
             CheckResult(
                 name=mode_var,
                 status="invalid",
-                detail=f"{mode!r} (supported: {', '.join(_VALID_MODES)})",
-                fix_hint=f"Set {mode_var}=native or ollama",
+                detail=f"{mode!r} (supported: {', '.join(valid_modes)})",
+                fix_hint=f"Set {mode_var}={' or '.join(valid_modes)}",
             )
         )
         return results
@@ -310,8 +313,112 @@ def check_binaries(env: Mapping[str, str]) -> list[CheckResult]:
     mode = env.get(f"{backend.upper()}_MODE", "native").lower()
     if mode == "ollama":
         results.append(_which("ollama", "Install: https://ollama.com"))
+    if mode == "snap" and backend == "claude":
+        results.extend(check_snap_setup())
 
     return results
+
+
+def check_snap_setup() -> list[CheckResult]:
+    """Validate claude-snap install + hook wiring for CLAUDE_MODE=snap.
+
+    Three sub-checks: the snap binary resolves, jq is on PATH (snap shells out
+    to it), and ~/.claude/settings.json has snap's Stop hook + statusline shim
+    wired in (without them, snap hangs forever waiting on an envelope file).
+    """
+    from claude_on_the_fly.backends.claude import (
+        SNAP_INSTALL_HINT,
+        SNAP_PROJECT_SLUG,
+        resolve_snap_binary,
+    )
+
+    results: list[CheckResult] = []
+
+    snap_path = resolve_snap_binary()
+    if snap_path:
+        results.append(CheckResult(name="claude-snap", status="ok", detail=snap_path))
+    else:
+        results.append(
+            CheckResult(
+                name="claude-snap",
+                status="missing",
+                detail=f"not on PATH or ~/.local/share/{SNAP_PROJECT_SLUG}/bin",
+                fix_hint=SNAP_INSTALL_HINT,
+            )
+        )
+
+    results.append(_which("jq", "Install: brew install jq (snap shells out to jq)"))
+
+    results.append(check_snap_hooks())
+    return results
+
+
+def check_snap_hooks() -> CheckResult:
+    """Verify ~/.claude/settings.json wires snap's Stop hook + statusline shim.
+
+    The two hooks are what make snap work — without them claude-snap hangs
+    forever. install.sh writes them; this check catches a stale config.
+    """
+    from claude_on_the_fly.backends.claude import (
+        SNAP_INSTALL_HINT,
+        SNAP_PROJECT_SLUG,
+    )
+
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    settings_path = Path(config_dir) / "settings.json"
+    if not settings_path.is_file():
+        return CheckResult(
+            name="claude-snap hooks",
+            status="missing",
+            detail=f"no settings.json at {settings_path}",
+            fix_hint=SNAP_INSTALL_HINT,
+        )
+
+    import json as _json
+
+    try:
+        config = _json.loads(settings_path.read_text())
+    except (_json.JSONDecodeError, OSError) as exc:
+        return CheckResult(
+            name="claude-snap hooks",
+            status="invalid",
+            detail=f"cannot parse {settings_path}: {exc}",
+            fix_hint="Fix the JSON or restore from the backup install.sh left",
+        )
+
+    statusline_cmd = ""
+    statusline_node = config.get("statusLine")
+    if isinstance(statusline_node, dict):
+        statusline_cmd = str(statusline_node.get("command", ""))
+    has_statusline = SNAP_PROJECT_SLUG in statusline_cmd
+
+    has_stop_hook = False
+    for entry in config.get("hooks", {}).get("Stop", []) or []:
+        for hook in entry.get("hooks", []) or []:
+            if SNAP_PROJECT_SLUG in str(hook.get("command", "")):
+                has_stop_hook = True
+                break
+        if has_stop_hook:
+            break
+
+    if has_statusline and has_stop_hook:
+        return CheckResult(
+            name="claude-snap hooks",
+            status="ok",
+            detail="Stop hook + statusline shim wired",
+        )
+
+    missing = []
+    if not has_statusline:
+        missing.append("statusLine shim")
+    if not has_stop_hook:
+        missing.append("Stop hook")
+    return CheckResult(
+        name="claude-snap hooks",
+        status="missing",
+        detail=f"settings.json missing: {', '.join(missing)}",
+        fix_hint=SNAP_INSTALL_HINT,
+    )
 
 
 def check_gws_binary() -> CheckResult:

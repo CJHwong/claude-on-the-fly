@@ -301,7 +301,7 @@ Or use a `.env` file with all vars and a process manager.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default) or `codex` |
-| `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude` (default: `native`) |
+| `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude`; `snap` drives `claude-snap` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) to surface rate-limit and context-window stats (default: `native`) |
 | `CODEX_MODE` | no | `native` runs `codex` directly; `ollama` wraps it in `ollama launch codex` (default: `native`) |
 | `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama` or `CODEX_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
 | `CLAUDE_MODEL` | no | Model passed to `claude --model` in native mode (default: `sonnet`). Ignored in ollama mode |
@@ -326,6 +326,25 @@ uv run claude-telegram
 ```
 
 For claude, cost in the stats footer reflects Ollama's billing for `:cloud` models, or `$0` for local ones. Session resume, tool use, and Skills behave the same as native mode — only the model provider changes.
+
+#### snap mode (claude only)
+
+Drives `claude-snap` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) under a PTY, so the reply footer can include `ctx N%` (context-window usage) and `5h N% → HH:MM` (5-hour rate-limit budget with reset time) — fields that `claude -p` doesn't expose. Wall-clock is roughly 1–2 seconds slower per turn due to TUI bringup.
+
+One-time install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash
+```
+
+Then:
+
+```bash
+export CLAUDE_MODE=snap
+uv run claude-telegram
+```
+
+The doctor surfaces three failure modes if the install is stale: missing `claude-snap` binary, missing `jq`, or missing Stop-hook / statusline-shim wiring in `~/.claude/settings.json`. Tool/skill counts are not surfaced in snap mode.
 
 #### codex backend notes
 

@@ -1521,3 +1521,321 @@ class TestClaudeBackendSessionLogPath:
             path = ClaudeBackend().session_log_path(workspace, "absent")
 
         assert path is None
+
+
+# ---------------------------------------------------------------------------
+# ClaudeBackend snap mode
+# ---------------------------------------------------------------------------
+
+
+def _snap_envelope(
+    result: str = "snap reply",
+    cost: float = 0.05,
+    duration_ms: int = 3000,
+    model: str = "claude-haiku-4-5-20251001",
+    input_tokens: int = 20,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 76208,
+    output_tokens: int = 102,
+    rate_5h_pct: int = 33,
+    rate_5h_resets_at: int = 1779429600,
+    rate_7d_pct: int = 33,
+    rate_7d_resets_at: int = 1779854400,
+    context_pct: int = 19,
+    exceeds_200k: bool = False,
+    fast_mode: bool = False,
+) -> dict:
+    """Mirrors the live claude-snap envelope shape we captured during planning."""
+    return {
+        "type": "result",
+        "subtype": "success",
+        "result": result,
+        "is_error": False,
+        "total_cost_usd": cost,
+        "duration_ms": duration_ms,
+        "usage": {
+            "input_tokens": input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "output_tokens": output_tokens,
+        },
+        "modelUsage": {
+            model: {
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "cacheReadInputTokens": cache_read_input_tokens,
+                "cacheCreationInputTokens": cache_creation_input_tokens,
+                "webSearchRequests": 0,
+            }
+        },
+        "statusline": {
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": rate_5h_pct,
+                    "resets_at": rate_5h_resets_at,
+                },
+                "seven_day": {
+                    "used_percentage": rate_7d_pct,
+                    "resets_at": rate_7d_resets_at,
+                },
+            },
+            "context_window": {"used_percentage": context_pct},
+            "exceeds_200k_tokens": exceeds_200k,
+            "fast_mode": fast_mode,
+        },
+    }
+
+
+class TestClaudeBackendSnap:
+    async def test_argv_uses_snap_binary_and_drops_p_flags(self):
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_snap_binary",
+                return_value="/fake/bin/claude-snap",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_snap",
+                new_callable=AsyncMock,
+                return_value=_snap_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(snap=True).run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        cmd = mock.call_args[0][1]
+        assert cmd[0] == "/fake/bin/claude-snap"
+        assert "-p" not in cmd
+        assert "--output-format" not in cmd
+        assert "--verbose" not in cmd
+        assert "--permission-mode" in cmd
+        assert "bypassPermissions" in cmd
+        assert "--model" in cmd
+        assert "--system-prompt" in cmd
+        assert "--resume" in cmd
+        assert cmd[-1] == "hi"
+
+    async def test_response_carries_rate_limits_and_context_window(self):
+        envelope = _snap_envelope(
+            rate_5h_pct=73,
+            rate_5h_resets_at=1779429600,
+            context_pct=42,
+            fast_mode=True,
+        )
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_snap_binary",
+                return_value="/fake/bin/claude-snap",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_snap",
+                new_callable=AsyncMock,
+                return_value=envelope,
+            ),
+        ):
+            resp = await ClaudeBackend(snap=True).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+
+        assert resp.rate_limits_5h_pct == 73
+        assert resp.rate_limits_5h_resets_at == 1779429600
+        assert resp.rate_limits_7d_pct == 33
+        assert resp.context_window_pct == 42
+        assert resp.fast_mode is True
+        assert resp.exceeds_200k is False
+
+    async def test_tokens_derived_from_model_usage_not_usage(self):
+        """modelUsage carries cross-turn aggregates; usage is last-message-only.
+
+        We sum modelUsage entries — using `usage` would undercount on
+        multi-step turns.
+        """
+        envelope = _snap_envelope(
+            input_tokens=10,  # `usage` shows last message only
+            output_tokens=51,
+            cache_read_input_tokens=0,
+        )
+        # Override modelUsage to reflect the cross-turn total
+        envelope["modelUsage"]["claude-haiku-4-5-20251001"] = {
+            "inputTokens": 200,
+            "outputTokens": 500,
+            "cacheReadInputTokens": 100,
+            "cacheCreationInputTokens": 0,
+            "webSearchRequests": 0,
+        }
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_snap_binary",
+                return_value="/fake/bin/claude-snap",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_snap",
+                new_callable=AsyncMock,
+                return_value=envelope,
+            ),
+        ):
+            resp = await ClaudeBackend(snap=True).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+
+        # 200 inputTokens + 100 cacheReadInputTokens = 300, NOT 10 from `usage`.
+        assert resp.tokens_in == 300
+        assert resp.tokens_out == 500
+
+    async def test_empty_body_retry_takes_second_envelope_wholesale(self):
+        """Snap empty-body retry skips _merge_cli_output: snap envelopes have
+        no per-tool counts to merge and `usage` is last-message-only."""
+        first = _snap_envelope(result="", cost=0.10, duration_ms=1000)
+        second = _snap_envelope(result="recovered", cost=0.05, duration_ms=500)
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_snap_binary",
+                return_value="/fake/bin/claude-snap",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_snap",
+                new_callable=AsyncMock,
+                side_effect=[first, second],
+            ),
+            patch(
+                "claude_on_the_fly.agent._merge_cli_output",
+            ) as mock_merge,
+        ):
+            resp = await ClaudeBackend(snap=True).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+
+        mock_merge.assert_not_called()
+        assert resp.body == "recovered"
+        # Cost/duration come from the second envelope, not summed.
+        assert resp.cost == 0.05
+        assert resp.duration == 0.5
+
+    async def test_native_response_has_no_rate_limits(self):
+        """Regression: native (non-snap) backend leaves snap-only fields as None/False."""
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ):
+            resp = await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+
+        assert resp.rate_limits_5h_pct is None
+        assert resp.rate_limits_5h_resets_at is None
+        assert resp.context_window_pct is None
+        assert resp.fast_mode is False
+        assert resp.exceeds_200k is False
+
+    def test_launcher_and_snap_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ClaudeBackend(launcher=OllamaLauncher(model="qwen"), snap=True)
+
+
+# ---------------------------------------------------------------------------
+# resolve_snap_binary
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSnapBinary:
+    def test_prefers_path_when_present(self, monkeypatch):
+        from claude_on_the_fly.backends.claude import resolve_snap_binary
+
+        monkeypatch.setattr(
+            "claude_on_the_fly.backends.claude.shutil.which",
+            lambda name: (
+                "/usr/local/bin/claude-snap" if name == "claude-snap" else None
+            ),
+        )
+        assert resolve_snap_binary() == "/usr/local/bin/claude-snap"
+
+    def test_falls_back_to_install_home(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.claude import resolve_snap_binary
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        snap = bin_dir / "claude-snap"
+        snap.write_text("#!/bin/sh\n")
+        snap.chmod(0o755)
+
+        monkeypatch.setattr(
+            "claude_on_the_fly.backends.claude.shutil.which", lambda _: None
+        )
+        monkeypatch.setenv("CLAUDE_INTERACTIVE_P_HOME", str(tmp_path))
+        assert resolve_snap_binary() == str(snap)
+
+    def test_returns_none_when_missing(self, monkeypatch, tmp_path):
+        from claude_on_the_fly.backends.claude import resolve_snap_binary
+
+        monkeypatch.setattr(
+            "claude_on_the_fly.backends.claude.shutil.which", lambda _: None
+        )
+        monkeypatch.setenv("CLAUDE_INTERACTIVE_P_HOME", str(tmp_path / "nowhere"))
+        assert resolve_snap_binary() is None
+
+
+# ---------------------------------------------------------------------------
+# Response snap-derived footer formatting
+# ---------------------------------------------------------------------------
+
+
+class TestResponseSnapFooter:
+    def test_appends_context_window_pct(self):
+        r = Response(body="x", cost=0.01, model="haiku", context_window_pct=42)
+        stats = r.format_stats()
+        assert "ctx 42%" in stats
+
+    def test_skips_5h_below_threshold(self):
+        r = Response(
+            body="x",
+            cost=0.01,
+            model="haiku",
+            rate_limits_5h_pct=12,
+            rate_limits_5h_resets_at=1779429600,
+        )
+        assert "5h" not in r.format_stats()
+
+    def test_includes_5h_above_threshold_with_reset_time(self):
+        r = Response(
+            body="x",
+            cost=0.01,
+            model="haiku",
+            rate_limits_5h_pct=73,
+            rate_limits_5h_resets_at=1779429600,
+        )
+        stats = r.format_stats()
+        assert "5h 73%" in stats
+        # resets_at -> HH:MM, format depends on local tz; just check the arrow.
+        assert "→" in stats
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE_MODE=snap factory wiring
+# ---------------------------------------------------------------------------
+
+
+class TestSnapModeFactory:
+    def test_claude_snap_mode(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "snap")
+        with patch(
+            "claude_on_the_fly.backends.claude.resolve_snap_binary",
+            return_value="/fake/bin/claude-snap",
+        ):
+            backend = get_backend()
+        assert isinstance(backend, ClaudeBackend)
+        assert backend.snap is True
+        assert backend.launcher is None
+
+    def test_snap_mode_missing_binary_raises(self, clear_backend_env, monkeypatch):
+        """Defense in depth: ctor raises if the binary vanished after preflight."""
+        monkeypatch.setenv("CLAUDE_MODE", "snap")
+        with patch(
+            "claude_on_the_fly.backends.claude.resolve_snap_binary",
+            return_value=None,
+        ):
+            with pytest.raises(RuntimeError, match="claude-snap binary not found"):
+                get_backend()
+
+    def test_unknown_mode_message_lists_snap(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "garbage")
+        with pytest.raises(ValueError, match="snap"):
+            get_backend()

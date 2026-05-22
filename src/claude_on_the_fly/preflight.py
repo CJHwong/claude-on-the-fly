@@ -90,7 +90,12 @@ def check_backend() -> None:
         if mode == "ollama":
             check_ollama_mode("claude")
             return
-        raise SystemExit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama)")
+        if mode == "snap":
+            check_snap_mode()
+            return
+        raise SystemExit(
+            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)"
+        )
     if backend_name == "codex":
         mode = os.environ.get("CODEX_MODE", "native").lower()
         if mode == "native":
@@ -145,6 +150,19 @@ def check_ollama_mode(agent_name: str = "claude") -> None:
             f"Pull it first: ollama pull {model}"
         )
     logger.info("ollama launch mode: ok (agent=%s model=%s)", agent_name, model)
+
+
+def check_snap_mode() -> None:
+    """Validate `CLAUDE_MODE=snap`: binary resolves, jq present, hooks wired.
+
+    Reuses the structured `checks.check_snap_setup` so doctor view and
+    preflight see the same failures.
+    """
+    from claude_on_the_fly import checks as _checks
+
+    results = _checks.check_snap_setup()
+    _raise_on_failures(results)
+    logger.info("claude-snap mode: ok")
 
 
 def check_claude_cli() -> None:
