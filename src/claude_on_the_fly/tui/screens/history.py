@@ -16,6 +16,7 @@ terminal widths.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -25,7 +26,7 @@ from textual.coordinate import Coordinate
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
-from claude_on_the_fly.agent import DATA_DIR, get_backend
+from claude_on_the_fly.agent import DATA_DIR, current_backend_key, get_backend
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
@@ -59,6 +60,152 @@ def _event_source(e: dict) -> str:
     if src in ("jira", "github"):
         return "symphony"
     return src
+
+
+def _format_runtime(seconds: float | None) -> str:
+    """Compact wall-clock duration: 12s, 1m23s, 1h05m. None → '—'."""
+    if seconds is None or seconds < 1:
+        return "—" if seconds is None else "0s"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def _format_backend(value: object) -> str:
+    """Trim the backend key for display. Drop the leading `claude:` /
+    `codex:` when present so the column can be narrower; full key stays
+    in the event log for any deeper inspection."""
+    text = str(value or "—")
+    if text == "—":
+        return text
+    for prefix in ("claude:", "codex:"):
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return text
+
+
+@dataclass
+class _JobAggregate:
+    """Per-(identifier, source) accumulator used while scanning newest-first."""
+
+    identifier: str
+    source: str
+    last_event: dict
+    latest_event_ts: float | None
+    runs: int = 0
+    latest_dispatch_ts: float | None = None
+
+
+def _aggregate_by_job(events_newest_first: list[dict]) -> list[dict]:
+    """Collapse the event log into one record per (identifier, source).
+
+    Each output dict is a synthesised "job summary" with the latest event's
+    payload plus aggregate stats:
+
+    - `runs`       : number of `dispatched` events seen for this job
+    - `runtime`    : seconds elapsed between the latest dispatch and the
+                     latest event (None when no dispatch exists in window)
+    - `last_event` : the full latest event dict — drives time, type, detail
+    - `backend`    : backend recorded on the latest event
+    - `session_uuid`: latest event's session_uuid (or None for symphony rows,
+                     since symphony events don't include it on every type)
+
+    Newest-first input keeps the first occurrence of each key as the latest,
+    so we don't have to compare timestamps explicitly.
+    """
+    seen_order: list[tuple[str, str]] = []
+    rows: dict[tuple[str, str], _JobAggregate] = {}
+    for e in events_newest_first:
+        ident = str(e.get("identifier", "?"))
+        src = _event_source(e)
+        key = (ident, src)
+        bucket = rows.get(key)
+        if bucket is None:
+            bucket = _JobAggregate(
+                identifier=ident,
+                source=src,
+                last_event=e,
+                latest_event_ts=_parse_ts(e.get("ts")),
+            )
+            rows[key] = bucket
+            seen_order.append(key)
+        if e.get("type") == "dispatched":
+            bucket.runs += 1
+            # Newest-first scan: the first dispatch we hit IS the latest.
+            if bucket.latest_dispatch_ts is None:
+                bucket.latest_dispatch_ts = _parse_ts(e.get("ts"))
+    out: list[dict] = []
+    for key in seen_order:
+        bucket = rows[key]
+        e = bucket.last_event
+        dispatch_ts = bucket.latest_dispatch_ts
+        latest_ts = bucket.latest_event_ts
+        runtime: float | None
+        if dispatch_ts is None or latest_ts is None:
+            runtime = None
+        else:
+            runtime = max(0.0, latest_ts - dispatch_ts)
+        out.append(
+            {
+                "identifier": bucket.identifier,
+                "source": bucket.source,
+                "runs": bucket.runs,
+                "runtime": runtime,
+                "last_event": e,
+                "backend": e.get("backend"),
+                "session_uuid": e.get("session_uuid"),
+                "tracker": e.get("tracker") or e.get("source"),
+            }
+        )
+    return out
+
+
+def _compute_runtimes(events_oldest_first: list[dict]) -> dict[int, float | None]:
+    """For each event index (matching `events_oldest_first` order), return
+    the seconds elapsed since the most recent `dispatched` for the same
+    (identifier, source). Dispatched rows themselves carry 0.
+
+    Runtime resets on every fresh `dispatched`, so a retry shows time since
+    the retry started, not since the original first attempt. Events that
+    arrive before any matching dispatch (legacy rows, log truncated) get
+    None — rendered as the em-dash placeholder."""
+    last_dispatch: dict[tuple[str, str], float] = {}
+    out: dict[int, float | None] = {}
+    for idx, e in enumerate(events_oldest_first):
+        ident = str(e.get("identifier", "?"))
+        src = _event_source(e)
+        key = (ident, src)
+        ts = _parse_ts(e.get("ts"))
+        if e.get("type") == "dispatched":
+            if ts is not None:
+                last_dispatch[key] = ts
+            out[idx] = 0.0
+            continue
+        anchor = last_dispatch.get(key)
+        if anchor is None or ts is None:
+            out[idx] = None
+        else:
+            out[idx] = max(0.0, ts - anchor)
+    return out
+
+
+def _parse_ts(value: object) -> float | None:
+    """ISO-8601 UTC timestamp → epoch seconds. None on parse failure."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        from datetime import datetime
+
+        # EventLog writes ISO-8601 with a trailing 'Z'; fromisoformat needs
+        # '+00:00' on Python < 3.11. 3.12 accepts both, but normalise so the
+        # parse never regresses on an older interpreter.
+        normalised = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalised).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 def _format_detail(e: dict) -> str:
@@ -117,6 +264,7 @@ class HistoryScreen(Screen):
         ("q", "app.pop_screen", "Back"),
         ("r", "refresh_now", "Refresh"),
         ("s", "cycle_source", "Filter source"),
+        ("a", "toggle_view", "Aggregated/Events"),
         ("t", "copy_takeover", "Copy takeover"),
         ("w", "toggle_watch", "Watch session"),
     ]
@@ -125,6 +273,10 @@ class HistoryScreen(Screen):
         super().__init__()
         self._event_log = EventLog()
         self._filter: SourceFilter = "all"
+        # Default to the aggregated "one row per job" view since the event
+        # log gets noisy fast under retries; `a` toggles to the raw event
+        # stream for debugging.
+        self._view_mode: Literal["aggregated", "events"] = "aggregated"
         # Cache the identifier → source map of *visible* rows so the takeover
         # binding can resolve the highlighted row without re-tailing the log.
         self._row_sources: dict[str, str] = {}
@@ -158,19 +310,12 @@ class HistoryScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#history-table", DataTable)
-        # Explicit widths so column headers don't collapse when the column's
-        # widest cell is empty (e.g. an empty `detail` column).
-        table.add_column("time", width=10)
-        table.add_column("src", width=4)
-        table.add_column("job", width=36)
-        table.add_column("event", width=18)
-        table.add_column("detail", width=40)
+        self._apply_columns()
         # Watch pane stays hidden until user presses `w`.
         self.query_one("#hist-watch-wrap", Vertical).display = False
         self.query_one("#history-footer-hint", Static).update(
-            "[dim]r refresh    s cycle source filter    t copy takeover    "
-            "w toggle watch    Esc back[/dim]"
+            "[dim]r refresh    s cycle source filter    a aggregated/events    "
+            "t copy takeover    w toggle watch    Esc back[/dim]"
         )
         self._refresh()
         self.set_interval(2.0, self._refresh_if_changed)
@@ -185,6 +330,37 @@ class HistoryScreen(Screen):
         self._filter = _SOURCE_CYCLE[(idx + 1) % len(_SOURCE_CYCLE)]
         self._mtime = None  # force reload
         self._refresh()
+
+    def action_toggle_view(self) -> None:
+        self._view_mode = "events" if self._view_mode == "aggregated" else "aggregated"
+        self._apply_columns()
+        self._mtime = None  # force reload
+        self._refresh()
+
+    def _apply_columns(self) -> None:
+        """Rebuild the table columns to match the current view mode.
+
+        Textual's DataTable doesn't show/hide columns dynamically, so the
+        toggle clears the whole table and re-adds the right set."""
+        table = self.query_one("#history-table", DataTable)
+        table.clear(columns=True)
+        if self._view_mode == "aggregated":
+            table.add_column("time", width=10)
+            table.add_column("src", width=4)
+            table.add_column("job", width=28)
+            table.add_column("backend", width=22)
+            table.add_column("event", width=16)
+            table.add_column("runs", width=5)
+            table.add_column("runtime", width=8)
+            table.add_column("detail", width=24)
+        else:
+            table.add_column("time", width=10)
+            table.add_column("src", width=4)
+            table.add_column("job", width=28)
+            table.add_column("backend", width=22)
+            table.add_column("event", width=16)
+            table.add_column("runtime", width=8)
+            table.add_column("detail", width=28)
 
     def action_toggle_watch(self) -> None:
         col = self.query_one("#hist-watch-wrap", Vertical)
@@ -238,16 +414,20 @@ class HistoryScreen(Screen):
         if not isinstance(row_key, str):
             self._notify("no row selected", "warning")
             return
-        # Row keys are "<idx>:<identifier>" so the same identifier can appear
-        # multiple times without collision.
-        _, _, ident = row_key.partition(":")
+        # Row keys are "evt:<idx>:<identifier>" or "agg:<src>:<identifier>".
+        # The identifier is everything after the last colon — either form
+        # parses the same way with rpartition.
+        _, _, ident = row_key.rpartition(":")
         tracker = self._row_sources.get(ident)
-        if not ident or not tracker:
+        resolved = self._row_watch.get(row_key)
+        if not ident or not tracker or resolved is None:
             self._notify("no takeover for this row", "warning")
             return
 
-        workspace = WORKSPACES_ROOT / tracker / sanitize_key(ident)
-        sid = session_uuid_for(ident, source=tracker)
+        # Use the row-specific (workspace, session_uuid) pair so a takeover
+        # copied from a row produced by, e.g., `claude:ollama:qwen2.5-coder`
+        # resumes that exact session — not whatever the current env points at.
+        workspace, sid = resolved
         try:
             cmd = get_backend().takeover_command(workspace, sid)
         except Exception as exc:
@@ -314,43 +494,92 @@ class HistoryScreen(Screen):
         header = self.query_one("#history-header", Static)
         header.update(
             f"[bold]AI job history[/bold] "
-            f"[dim]({len(events)} rows, filter={self._filter})[/dim]"
+            f"[dim]({len(events)} events, view={self._view_mode}, "
+            f"filter={self._filter})[/dim]"
         )
 
         table = self.query_one("#history-table", DataTable)
         table.clear()
-        # `_row_sources` is the takeover lookup: identifier -> tracker (jira /
-        # github). Only symphony rows populate it because takeover-resume is
-        # a symphony concept today. Chat rows show up in the table but their
-        # `t` keybind no-ops with a notice.
+        # `_row_sources` is identifier -> tracker (jira / github); only
+        # symphony rows populate it. The `t` keybind on a chat row no-ops.
         self._row_sources = {}
-        # `_row_watch` resolves per-row (workspace, session_uuid) for the
-        # watch pane. Symphony rows derive the uuid; chat rows read it from
-        # the event payload (orchestrator emits session_uuid on dispatch).
+        # `_row_watch` resolves per-row (workspace, session_uuid). Symphony
+        # rows derive the uuid from (identifier, tracker, backend_key); chat
+        # rows read it directly off the event payload.
         self._row_watch = {}
 
-        if not events:
-            table.add_row("—", "—", "no events", "—", "—", key="__empty__")
-            return
+        if self._view_mode == "aggregated":
+            self._render_aggregated(table, events)
+        else:
+            self._render_events(table, events)
 
+    def _resolve_session(
+        self, ident: str, src: str, e: dict
+    ) -> tuple[Path, str] | None:
+        """Map an event row to its (workspace, session_uuid). Picks the
+        backend from the event so historical rows resolve to the right
+        JSONL even after the dev switches CLAUDE_MODE / models."""
+        row_backend = str(e.get("backend") or current_backend_key())
+        if src == "symphony":
+            tracker = str(e.get("tracker") or e.get("source") or "jira")
+            self._row_sources.setdefault(ident, tracker)
+            return (
+                WORKSPACES_ROOT / tracker / sanitize_key(ident),
+                session_uuid_for(ident, source=tracker, backend_key=row_backend),
+            )
+        if src in ("telegram", "slack", "gmail"):
+            session_uuid = e.get("session_uuid")
+            if session_uuid:
+                return DATA_DIR / "workspaces" / ident, str(session_uuid)
+        return None
+
+    def _render_events(self, table: DataTable, events: list[dict]) -> None:
+        """One row per raw event — the original audit-trail view."""
+        if not events:
+            table.add_row("—", "—", "no events", "—", "—", "—", "—", key="__empty__")
+            return
+        oldest_first = list(reversed(events))
+        runtime_by_oldest_idx = _compute_runtimes(oldest_first)
+        total = len(events)
         for idx, e in enumerate(events):
             ident = str(e.get("identifier", "?"))
             src = _event_source(e)
-            row_key = f"{idx}:{ident}"
-            if src == "symphony":
-                tracker = str(e.get("tracker") or e.get("source") or "jira")
-                self._row_sources.setdefault(ident, tracker)
-                self._row_watch[row_key] = (
-                    WORKSPACES_ROOT / tracker / sanitize_key(ident),
-                    session_uuid_for(ident, source=tracker),
-                )
-            elif src in ("telegram", "slack", "gmail"):
-                session_uuid = e.get("session_uuid")
-                if session_uuid:
-                    self._row_watch[row_key] = (
-                        DATA_DIR / "workspaces" / ident,
-                        str(session_uuid),
-                    )
+            row_key = f"evt:{idx}:{ident}"
+            resolved = self._resolve_session(ident, src, e)
+            if resolved is not None:
+                self._row_watch[row_key] = resolved
+            badge = src[:1].upper() if src else "?"
+            ts = str(e.get("ts", ""))
+            short_ts = ts[11:19] if len(ts) >= 19 else ts
+            runtime = runtime_by_oldest_idx.get(total - 1 - idx)
+            table.add_row(
+                short_ts,
+                badge,
+                ident,
+                _format_backend(e.get("backend")),
+                str(e.get("type", "?")),
+                _format_runtime(runtime),
+                _format_detail(e),
+                key=row_key,
+            )
+
+    def _render_aggregated(self, table: DataTable, events: list[dict]) -> None:
+        """One row per (identifier, source) — collapses retries into a
+        single line showing the latest status + dispatch count."""
+        rows = _aggregate_by_job(events)
+        if not rows:
+            table.add_row(
+                "—", "—", "no events", "—", "—", "—", "—", "—", key="__empty__"
+            )
+            return
+        for row in rows:
+            ident = row["identifier"]
+            src = row["source"]
+            e = row["last_event"]
+            row_key = f"agg:{src}:{ident}"
+            resolved = self._resolve_session(ident, src, e)
+            if resolved is not None:
+                self._row_watch[row_key] = resolved
             badge = src[:1].upper() if src else "?"
             ts = str(e.get("ts", ""))
             short_ts = ts[11:19] if len(ts) >= 19 else ts
@@ -358,7 +587,10 @@ class HistoryScreen(Screen):
                 short_ts,
                 badge,
                 ident,
+                _format_backend(row["backend"]),
                 str(e.get("type", "?")),
+                str(row["runs"]),
+                _format_runtime(row["runtime"]),
                 _format_detail(e),
                 key=row_key,
             )
@@ -406,7 +638,7 @@ class HistoryScreen(Screen):
 
         self._watch_path = path
         self._watch_mtime = mtime
-        _, _, ident = self._watch_target.partition(":")
+        _, _, ident = self._watch_target.rpartition(":")
         header.update(f"[bold]watch: {ident}[/bold] [dim]{path.name}[/dim]")
         pane.clear()
 
