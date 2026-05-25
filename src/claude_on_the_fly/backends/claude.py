@@ -12,13 +12,11 @@ from pathlib import Path
 from claude_on_the_fly import agent, pricing, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
-    ClaudeUnavailableError,
     OllamaLauncher,
     Response,
     build_system_prompt,
 )
 from claude_on_the_fly.transcript import (
-    CLAUDE_PROJECTS_DIR,
     _workspace_to_claude_hash,
 )
 
@@ -132,18 +130,33 @@ class ClaudeBackend:
             ]
             executor = agent._exec
 
-        try:
+        # Pick --resume vs --session-id deterministically by checking whether
+        # the session JSONL exists on disk. Old code sniffed claude's error
+        # message ("No conversation found") on a failed --resume, but:
+        #   1) Snap mode wraps stderr behind "no envelope produced (claude
+        #      rc=1)", so the sniff never matched in snap mode.
+        #   2) claude 2.1.150 changed the message to "--resume requires a
+        #      valid session ID...", so the sniff stopped matching in native
+        #      mode too.
+        # Codex backend already takes the existence-check approach; mirror it
+        # here so first-turn dispatches don't crash before the new-session
+        # branch can run.
+        # Read via the transcript module rather than the imported symbol so
+        # tests that monkeypatch CLAUDE_PROJECTS_DIR via the fixture see the
+        # redirected value.
+        session_path = (
+            transcript.CLAUDE_PROJECTS_DIR
+            / _workspace_to_claude_hash(workspace)
+            / f"{session_uuid}.jsonl"
+        )
+        if session_path.is_file():
             logger.debug(
                 "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
             )
             cli_output = await executor(
                 workspace, [*base, "--resume", session_uuid, prompt], timeout=timeout
             )
-        except ClaudeUnavailableError:
-            raise
-        except RuntimeError as exc:
-            if "No conversation found" not in str(exc):
-                raise
+        else:
             logger.info("No existing session %s, creating new", session_uuid)
             handoff_prompt = transcript.prepend_latest_handoff(
                 workspace, prompt, exclude_uuid=session_uuid
@@ -250,9 +263,16 @@ class ClaudeBackend:
         return f"claude --resume {session_uuid}"
 
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
-        """Live JSONL claude appends to as the session runs."""
+        """Live JSONL claude appends to as the session runs.
+
+        Reads CLAUDE_PROJECTS_DIR through the transcript module so tests
+        that monkeypatch it via the `claude_projects_dir` fixture (or a
+        direct `setattr`) see the redirected location. The bare import
+        captures the value at module-load time and is invisible to
+        monkeypatch.
+        """
         path = (
-            CLAUDE_PROJECTS_DIR
+            transcript.CLAUDE_PROJECTS_DIR
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )

@@ -22,7 +22,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
-from claude_on_the_fly.agent import DATA_DIR, get_backend
+from claude_on_the_fly.agent import DATA_DIR, current_backend_key, get_backend
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
@@ -706,8 +706,12 @@ class DashboardScreen(Screen):
                     identifier = str(t.get("identifier", "?"))
                     tracker = str(t.get("source") or "jira")
                     self._ticket_sources[identifier] = tracker
+                    # Heartbeats reflect what symphony is running NOW, so the
+                    # session uuid must be derived with the daemon's current
+                    # backend_key — not the session_uuid_for default. Mirrors
+                    # what the orchestrator itself does when dispatching.
                     self._job_sessions[f"symphony:{identifier}"] = session_uuid_for(
-                        identifier, source=tracker
+                        identifier, source=tracker, backend_key=current_backend_key()
                     )
                     rows.append(
                         (

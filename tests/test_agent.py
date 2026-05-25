@@ -716,29 +716,53 @@ class TestRun:
     async def test_session_not_found_falls_back_to_new(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
-        """Fallback path runs `find_latest_prior_transcript` which scans the
-        workspace's project dir on disk — use tmp_path + the redirect
-        fixtures so the test never touches the developer's real
-        ~/.claude/projects/ or ~/.codex/sessions/."""
+        """No session JSONL on disk → backend skips --resume entirely and
+        goes straight to --session-id with a handoff preamble. Uses
+        tmp_path + the redirect fixtures so the existence check sees only
+        the test sandbox."""
         output = _cli_output(result="new session reply")
         workspace = tmp_path / "ws"
         workspace.mkdir()
 
-        async def side_effect(_workspace, cmd, **_kwargs):
-            if "--resume" in cmd:
-                raise RuntimeError("No conversation found with id sess-1")
-            return output
-
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
-            side_effect=side_effect,
+            return_value=output,
         ) as mock:
             resp = await run(workspace, "sess-1", "hello", "slack", "alice")
 
         assert resp.body == "new session reply"
-        # Called twice: resume attempt + new session
-        assert mock.await_count == 2
+        # Existence check fails → single call with --session-id, no failed
+        # --resume attempt first.
+        assert mock.await_count == 1
+        cmd = mock.call_args_list[0][0][1]
+        assert "--session-id" in cmd
+        assert "--resume" not in cmd
+
+    async def test_existing_session_resumes(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """JSONL present in the projects dir → backend uses --resume; no
+        fallback to --session-id."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        output = _cli_output(result="resumed")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-existing.jsonl").write_text('{"type":"user"}\n')
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await run(workspace, "sess-existing", "hi", "telegram")
+
+        cmd = mock.call_args_list[0][0][1]
+        assert "--resume" in cmd
+        assert "--session-id" not in cmd
 
     async def test_other_runtime_error_reraised(self):
         with patch(
@@ -992,13 +1016,25 @@ class TestRun:
 
         assert mock.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT
 
-    async def test_resume_cmd_contains_session_uuid(self):
+    async def test_resume_cmd_contains_session_uuid(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """Pre-create the session JSONL so the backend takes the --resume
+        branch (not --session-id), then verify the uuid+prompt make it
+        through."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
         output = _cli_output()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "my-uuid.jsonl").write_text('{"type":"user"}\n')
 
         with patch(
             "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
         ) as mock:
-            await run(Path("/tmp"), "my-uuid", "hi", "telegram", "hoss", "channel:dev")
+            await run(workspace, "my-uuid", "hi", "telegram", "hoss", "channel:dev")
 
         cmd = mock.call_args[0][1]
         assert "--resume" in cmd
@@ -1432,18 +1468,18 @@ class TestClaudeBackendLauncher:
 
 class TestClaudeBackendHandoff:
     @pytest.fixture(autouse=True)
-    def _reset_backend_env(self, clear_backend_env):
+    def _reset_backend_env(
+        self, clear_backend_env, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
         """Force native backend selection so `CLAUDE_MODE=snap` in the dev's
-        shell can't reroute these tests to the real `claude-snap` binary."""
+        shell can't reroute these tests to the real `claude-snap` binary.
+        Also redirect the projects dir so the new "session JSONL exists?"
+        check finds nothing and routes to the new-session branch."""
+        self._workspace = tmp_path / "ws"
+        self._workspace.mkdir()
 
-    async def test_fallback_path_injects_codex_handoff(self):
+    async def test_new_session_injects_codex_handoff(self):
         output = _cli_output(result="new session reply")
-
-        async def side_effect(workspace, cmd, **_kwargs):
-            if "--resume" in cmd:
-                raise RuntimeError("No conversation found with id sess-1")
-            return output
-
         prior_turns = [
             Turn("user", "prior codex msg"),
             Turn("assistant", "prior codex reply"),
@@ -1456,28 +1492,22 @@ class TestClaudeBackendHandoff:
             patch(
                 "claude_on_the_fly.agent._exec",
                 new_callable=AsyncMock,
-                side_effect=side_effect,
+                return_value=output,
             ) as mock,
         ):
-            await run(Path("/tmp"), "sess-1", "CURRENT_TEXT", "telegram")
+            await run(self._workspace, "sess-1", "CURRENT_TEXT", "telegram")
 
-        # Second call is the --session-id fallback; its prompt arg should contain
-        # both the handoff preamble and the user's actual text.
-        fallback_cmd = mock.call_args_list[1][0][1]
-        prompt_arg = fallback_cmd[-1]
+        # No prior session JSONL → backend goes straight to --session-id.
+        cmd = mock.call_args_list[0][0][1]
+        assert "--session-id" in cmd
+        prompt_arg = cmd[-1]
         assert "[Prior conversation via codex" in prompt_arg
         assert "prior codex msg" in prompt_arg
         assert "prior codex reply" in prompt_arg
         assert prompt_arg.endswith("CURRENT_TEXT")
 
-    async def test_fallback_with_no_codex_history_just_uses_prompt(self):
+    async def test_new_session_with_no_codex_history_just_uses_prompt(self):
         output = _cli_output(result="new session reply")
-
-        async def side_effect(workspace, cmd, **_kwargs):
-            if "--resume" in cmd:
-                raise RuntimeError("No conversation found with id sess-2")
-            return output
-
         with (
             patch(
                 "claude_on_the_fly.backends.claude.transcript.find_latest_prior_transcript",
@@ -1486,23 +1516,17 @@ class TestClaudeBackendHandoff:
             patch(
                 "claude_on_the_fly.agent._exec",
                 new_callable=AsyncMock,
-                side_effect=side_effect,
+                return_value=output,
             ) as mock,
         ):
-            await run(Path("/tmp"), "sess-2", "JUST_THIS", "telegram")
+            await run(self._workspace, "sess-2", "JUST_THIS", "telegram")
 
-        fallback_cmd = mock.call_args_list[1][0][1]
-        assert "[Prior conversation" not in fallback_cmd[-1]
-        assert fallback_cmd[-1] == "JUST_THIS"
+        cmd = mock.call_args_list[0][0][1]
+        assert "[Prior conversation" not in cmd[-1]
+        assert cmd[-1] == "JUST_THIS"
 
     async def test_extractor_exception_falls_through_silently(self):
         output = _cli_output(result="new session reply")
-
-        async def side_effect(workspace, cmd, **_kwargs):
-            if "--resume" in cmd:
-                raise RuntimeError("No conversation found with id sess-3")
-            return output
-
         with (
             patch(
                 "claude_on_the_fly.backends.claude.transcript.find_latest_prior_transcript",
@@ -1511,18 +1535,35 @@ class TestClaudeBackendHandoff:
             patch(
                 "claude_on_the_fly.agent._exec",
                 new_callable=AsyncMock,
-                side_effect=side_effect,
+                return_value=output,
             ) as mock,
         ):
-            resp = await run(Path("/tmp"), "sess-3", "TEXT", "telegram")
+            resp = await run(self._workspace, "sess-3", "TEXT", "telegram")
 
         # Daemon must keep serving the user even when transcript extraction breaks.
         assert resp.body == "new session reply"
-        assert mock.call_args_list[1][0][1][-1] == "TEXT"
+        assert mock.call_args_list[0][0][1][-1] == "TEXT"
 
-    async def test_resume_success_skips_extractor(self):
-        """No fallback fires → handoff path is never consulted."""
+    async def test_resume_skips_extractor_when_session_exists(self):
+        """When the JSONL is present, backend takes the resume branch and
+        never consults the handoff extractor."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
         output = _cli_output()
+        # Pre-create the session JSONL so the existence check passes.
+        session_dir = (
+            self._workspace.parent.parent
+            / "claude-projects"
+            / _workspace_to_claude_hash(self._workspace)
+        )
+        # claude_projects_dir fixture set CLAUDE_PROJECTS_DIR to tmp_path/claude-projects.
+        from claude_on_the_fly import transcript
+
+        session_dir = transcript.CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(
+            self._workspace
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-4.jsonl").write_text('{"type":"user"}\n')
 
         with (
             patch(
@@ -1534,7 +1575,7 @@ class TestClaudeBackendHandoff:
                 return_value=output,
             ),
         ):
-            await run(Path("/tmp"), "sess-4", "hi", "telegram")
+            await run(self._workspace, "sess-4", "hi", "telegram")
 
         mock_extract.assert_not_called()
 
@@ -1555,9 +1596,7 @@ class TestClaudeBackendTakeoverCommand:
         session_dir.mkdir(parents=True)
         (session_dir / f"{session_uuid}.jsonl").write_text("{}\n")
 
-        with patch(
-            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
-        ):
+        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
             cmd = ClaudeBackend().takeover_command(workspace, session_uuid)
 
         assert cmd == f"claude --resume {session_uuid}"
@@ -1568,9 +1607,7 @@ class TestClaudeBackendTakeoverCommand:
         projects_dir = tmp_path / ".claude" / "projects"
         projects_dir.mkdir(parents=True)
 
-        with patch(
-            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
-        ):
+        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
             cmd = ClaudeBackend().takeover_command(workspace, "missing-uuid")
 
         assert cmd is None
@@ -1589,9 +1626,7 @@ class TestClaudeBackendSessionLogPath:
         expected = session_dir / f"{session_uuid}.jsonl"
         expected.write_text("")
 
-        with patch(
-            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
-        ):
+        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
             path = ClaudeBackend().session_log_path(workspace, session_uuid)
 
         assert path == expected
@@ -1602,9 +1637,7 @@ class TestClaudeBackendSessionLogPath:
         projects_dir = tmp_path / ".claude" / "projects"
         projects_dir.mkdir(parents=True)
 
-        with patch(
-            "claude_on_the_fly.backends.claude.CLAUDE_PROJECTS_DIR", projects_dir
-        ):
+        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
             path = ClaudeBackend().session_log_path(workspace, "absent")
 
         assert path is None
@@ -1674,7 +1707,19 @@ def _snap_envelope(
 
 
 class TestClaudeBackendSnap:
-    async def test_argv_uses_snap_binary_and_drops_p_flags(self):
+    async def test_argv_uses_snap_binary_and_drops_p_flags(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        # Pre-create the session JSONL so the backend takes the --resume
+        # branch; this test asserts on resume-mode argv shape.
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-1.jsonl").write_text('{"type":"user"}\n')
+
         with (
             patch(
                 "claude_on_the_fly.backends.claude.resolve_snap_binary",
@@ -1686,7 +1731,7 @@ class TestClaudeBackendSnap:
                 return_value=_snap_envelope(),
             ) as mock,
         ):
-            await ClaudeBackend(snap=True).run(Path("/tmp"), "sess-1", "hi", "telegram")
+            await ClaudeBackend(snap=True).run(workspace, "sess-1", "hi", "telegram")
 
         cmd = mock.call_args[0][1]
         assert cmd[0] == "/fake/bin/claude-snap"
