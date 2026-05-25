@@ -190,8 +190,13 @@ class GitHubTracker:
         )
 
     # GraphQL query for fetch_candidates: one round-trip pulls every PR
-    # requesting our review along with its head SHA and our latest review
-    # (if any), so we can filter SHA-stale reviews client-side without N+1.
+    # requesting our review along with its head SHA and the full reviews
+    # list. We use the same `reviews + submittedAt`-sort algorithm as
+    # fetch_one (single source of truth) so the dispatcher and the
+    # reconciler never disagree about whether the user has reviewed the
+    # current head. latestReviews had subtle staleness vs the REST `reviews`
+    # endpoint, which caused dispatch/cancel oscillation: dispatcher saw an
+    # old oid, dispatched; reconciler saw the new oid, cancelled; repeat.
     _SEARCH_GQL = """
     query($q: String!, $first: Int!) {
       search(query: $q, type: ISSUE, first: $first) {
@@ -208,9 +213,10 @@ class GitHubTracker:
             headRefOid
             repository { nameWithOwner }
             labels(first: 20) { nodes { name } }
-            latestReviews(first: 20) {
+            reviews(first: 100, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) {
               nodes {
                 author { login }
+                submittedAt
                 commit { oid }
               }
             }
@@ -265,13 +271,9 @@ class GitHubTracker:
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            head_oid = node.get("headRefOid")
-            latest = (node.get("latestReviews") or {}).get("nodes") or []
-            user_review_oid = self._user_latest_review_oid(latest, login)
-            user_reviewed_head = bool(
-                user_review_oid and head_oid and user_review_oid == head_oid
-            )
-            if user_reviewed_head:
+            head_oid = node.get("headRefOid") or ""
+            reviews = (node.get("reviews") or {}).get("nodes") or []
+            if self._reviews_match_head(reviews, head_oid, login):
                 skipped_already_reviewed += 1
                 continue
             cool_down_ms = getattr(cfg, "cool_down_ms", 0) or 0
@@ -296,17 +298,34 @@ class GitHubTracker:
         return candidates
 
     @staticmethod
-    def _user_latest_review_oid(reviews: list, login: str) -> str | None:
-        """Pluck the commit.oid from the user's latest review entry, if any."""
+    def _reviews_match_head(reviews: list, head_oid: str, login: str) -> bool:
+        """True iff `login`'s most-recently-submitted review (by submittedAt)
+        was filed against `head_oid`. Empty inputs → False.
+
+        Shared by fetch_candidates (GraphQL `reviews(first: 100)`) and
+        fetch_one / fetch_summaries_by_keys (REST `reviews`). Both sources
+        expose the same shape — `[{author: {login}, submittedAt, commit:
+        {oid}}, ...]` — so the same algorithm decides "user reviewed
+        current head" everywhere. Single source of truth eliminates the
+        latestReviews vs reviews disagreement that caused dispatch/cancel
+        loops on already-reviewed PRs.
+        """
+        if not head_oid:
+            return False
+        latest_oid: str | None = None
+        latest_when: str | None = None
         for review in reviews:
             if not isinstance(review, dict):
                 continue
             author = review.get("author") or {}
             if author.get("login") != login:
                 continue
-            commit = review.get("commit") or {}
-            return commit.get("oid")
-        return None
+            when = review.get("submittedAt") or ""
+            # ISO 8601 strings sort lexicographically by time.
+            if latest_when is None or when > latest_when:
+                latest_when = when
+                latest_oid = (review.get("commit") or {}).get("oid")
+        return latest_oid is not None and latest_oid == head_oid
 
     async def fetch_one(self, key: str) -> Issue:
         """`owner/repo#N` → fully populated Issue, with
@@ -332,33 +351,16 @@ class GitHubTracker:
         return self._payload_to_issue(payload, user_reviewed_current_head=reviewed)
 
     @staticmethod
+    @staticmethod
     def _user_reviewed_current_head(payload: dict, login: str) -> bool:
-        """True iff `login` has a review whose `commit.oid` matches the PR's
-        current `headRefOid`.
-
-        Scans `payload["reviews"]` (a list, not a `latestReviews` shape) and
-        finds the user's most-recent review by `submittedAt`, then checks
-        whether that review's commit OID equals the PR's head SHA. Returns
-        False if the user has never reviewed OR if every review they have
-        is at an older SHA.
+        """True iff `login`'s most-recent review (by submittedAt) is at the
+        PR's current `headRefOid`. Wraps the shared `_reviews_match_head`
+        helper so fetch_one stays compatible with the REST `reviews` shape
+        coming back from `gh pr view --json reviews`.
         """
         head_oid = payload.get("headRefOid") or ""
-        if not head_oid:
-            return False
-        latest_oid: str | None = None
-        latest_when: str | None = None
-        for review in payload.get("reviews") or []:
-            if not isinstance(review, dict):
-                continue
-            author = review.get("author") or {}
-            if author.get("login") != login:
-                continue
-            when = review.get("submittedAt") or ""
-            # ISO 8601 strings sort lexicographically by time.
-            if latest_when is None or when > latest_when:
-                latest_when = when
-                latest_oid = (review.get("commit") or {}).get("oid")
-        return latest_oid is not None and latest_oid == head_oid
+        reviews = payload.get("reviews") or []
+        return GitHubTracker._reviews_match_head(reviews, head_oid, login)
 
     async def fetch_summaries_by_keys(self, keys: list[str]) -> dict[str, IssueSummary]:
         """Per-key `gh pr view` fetch, run concurrently. The N subprocess

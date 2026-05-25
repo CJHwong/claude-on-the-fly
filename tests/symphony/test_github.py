@@ -291,21 +291,24 @@ def _graphql_pr_node(
     labels: list[str] | None = None,
     body: str = "PR body",
 ) -> dict:
-    latest_reviews = []
+    # The search GraphQL query now pulls the full `reviews` list and uses
+    # submittedAt ordering (same algorithm as fetch_one's REST data), so the
+    # fixture mirrors that shape.
+    reviews = []
     if user_latest_oid is not None:
-        latest_reviews.append(
+        reviews.append(
             {
                 "author": {"login": user_login},
+                "submittedAt": "2026-05-21T11:00:00Z",
                 "commit": {"oid": user_latest_oid},
-                "state": "COMMENTED",
             }
         )
     # An unrelated reviewer's entry to make sure we filter by login.
-    latest_reviews.append(
+    reviews.append(
         {
             "author": {"login": "someone-else"},
+            "submittedAt": "2026-05-21T12:00:00Z",
             "commit": {"oid": "irrelevant"},
-            "state": "APPROVED",
         }
     )
     return {
@@ -320,7 +323,7 @@ def _graphql_pr_node(
         "headRefOid": head_oid,
         "repository": {"nameWithOwner": repo},
         "labels": {"nodes": [{"name": n} for n in (labels or [])]},
-        "latestReviews": {"nodes": latest_reviews},
+        "reviews": {"nodes": reviews},
     }
 
 
