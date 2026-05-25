@@ -10,7 +10,12 @@ import time
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
-from claude_on_the_fly.agent import DATA_DIR, ClaudeUnavailableError, Response
+from claude_on_the_fly.agent import (
+    DATA_DIR,
+    ClaudeUnavailableError,
+    Response,
+    current_backend_key,
+)
 from claude_on_the_fly.events import (
     EVENT_DISPATCHED,
     EVENT_WORKER_DONE,
@@ -100,6 +105,7 @@ class Orchestrator:
         self._event_log.append(
             EVENT_DISPATCHED,
             source=self._platform,
+            backend=current_backend_key(),
             identifier=identifier,
             workspace=workspace,
             session_uuid=session,
@@ -133,6 +139,7 @@ class Orchestrator:
             self._event_log.append(
                 EVENT_WORKER_DONE,
                 source=self._platform,
+                backend=current_backend_key(),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -148,6 +155,7 @@ class Orchestrator:
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
+                backend=current_backend_key(),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -160,6 +168,7 @@ class Orchestrator:
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
+                backend=current_backend_key(),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,

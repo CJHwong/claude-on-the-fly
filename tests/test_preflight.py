@@ -495,6 +495,12 @@ class TestCheckGwsCli:
 
 
 class TestRunTelegram:
+    @pytest.fixture(autouse=True)
+    def _reset_backend_env(self, clear_backend_env):
+        """Force native backend dispatch so a dev's `CLAUDE_MODE=snap` doesn't
+        route check_backend() through check_snap_mode() and skip the patched
+        check_claude_cli."""
+
     @patch("claude_on_the_fly.preflight.asyncio.run")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_returns_token_and_user_id(self, _mock_claude, _mock_arun, monkeypatch):
@@ -527,6 +533,11 @@ class TestRunTelegram:
 
 
 class TestRunSlack:
+    @pytest.fixture(autouse=True)
+    def _reset_backend_env(self, clear_backend_env):
+        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=snap` from
+        the dev's shell from rerouting backend dispatch in run_slack()."""
+
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_returns_tokens_and_ids(self, _mock_claude, _mock_arun, monkeypatch):
@@ -568,6 +579,11 @@ class TestRunSlack:
 
 
 class TestRunGmail:
+    @pytest.fixture(autouse=True)
+    def _reset_backend_env(self, clear_backend_env):
+        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=snap` from
+        the dev's shell from rerouting backend dispatch in run_gmail()."""
+
     @patch("claude_on_the_fly.preflight.check_gws_cli")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_returns_project_and_senders(self, _mock_claude, _mock_gws, monkeypatch):

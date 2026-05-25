@@ -537,3 +537,249 @@ class TestPrependHandoff:
         assert "[Prior conversation via claude" in out
         assert "earlier" in out
         assert out.endswith("USER_TEXT")
+
+
+# ---------------------------------------------------------------------------
+# find_latest_prior_transcript — newest-by-mtime scan across backends
+# ---------------------------------------------------------------------------
+
+
+class TestFindLatestPriorTranscript:
+    def _claude_session(
+        self,
+        claude_projects_dir,
+        workspace: Path,
+        uuid: str,
+        ndjson,
+        *,
+        text: str = "from claude",
+        mtime: float | None = None,
+    ) -> Path:
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        path = session_dir / f"{uuid}.jsonl"
+        path.write_bytes(ndjson(_claude_user("hi"), _claude_assistant_text(text)))
+        if mtime is not None:
+            import os
+
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _codex_session(
+        self,
+        codex_sessions_dir,
+        workspace: Path,
+        uuid: str,
+        thread_id: str,
+        ndjson,
+        *,
+        text: str = "from codex",
+        mtime: float | None = None,
+    ) -> Path:
+        (workspace / ".codex_sessions").mkdir(parents=True, exist_ok=True)
+        (workspace / ".codex_sessions" / uuid).write_text(thread_id)
+        rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        rollout = rollout_dir / f"rollout-2026-05-18T12-00-00-{thread_id}.jsonl"
+        rollout.write_bytes(
+            ndjson(
+                _codex_user("SYS\n\n---\n\nhi"),
+                _codex_agent(text),
+            )
+        )
+        if mtime is not None:
+            import os
+
+            os.utime(rollout, (mtime, mtime))
+        return rollout
+
+    def test_returns_none_when_no_prior_sessions(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir
+    ):
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        assert find_latest_prior_transcript(workspace) is None
+
+    def test_picks_only_claude_session(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        self._claude_session(claude_projects_dir, workspace, "u1", ndjson)
+
+        result = find_latest_prior_transcript(workspace)
+        assert result is not None
+        turns, backend = result
+        assert backend == "claude"
+        assert any(t.text == "from claude" for t in turns)
+
+    def test_picks_only_codex_session(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        self._codex_session(codex_sessions_dir, workspace, "u1", "thread-abc", ndjson)
+
+        result = find_latest_prior_transcript(workspace)
+        assert result is not None
+        turns, backend = result
+        assert backend == "codex"
+        assert any(t.text == "from codex" for t in turns)
+
+    def test_picks_newest_across_backends(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        """Cross-backend tiebreak: file with the newest mtime wins."""
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        # Older claude session, newer codex session.
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u1",
+            ndjson,
+            text="old claude turn",
+            mtime=1000.0,
+        )
+        self._codex_session(
+            codex_sessions_dir,
+            workspace,
+            "u2",
+            "thread-new",
+            ndjson,
+            text="new codex turn",
+            mtime=2000.0,
+        )
+
+        result = find_latest_prior_transcript(workspace)
+        assert result is not None
+        turns, backend = result
+        assert backend == "codex"
+        assert any(t.text == "new codex turn" for t in turns)
+
+    def test_picks_newest_across_two_claude_modes(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        """Multiple claude sessions (one per backend_key) live side-by-side
+        under the same project dir; the newest one is the handoff source."""
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u-ollama",
+            ndjson,
+            text="ollama turn",
+            mtime=1000.0,
+        )
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u-native",
+            ndjson,
+            text="native turn",
+            mtime=5000.0,
+        )
+
+        result = find_latest_prior_transcript(workspace)
+        assert result is not None
+        turns, backend = result
+        assert backend == "claude"
+        assert any(t.text == "native turn" for t in turns)
+
+    def test_exclude_uuid_skips_current_session(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        """The caller's own session must not match itself — that would
+        prepend the current conversation onto its own continuation."""
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u-current",
+            ndjson,
+            text="current turn",
+            mtime=5000.0,
+        )
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u-prior",
+            ndjson,
+            text="prior turn",
+            mtime=1000.0,
+        )
+
+        result = find_latest_prior_transcript(workspace, exclude_uuid="u-current")
+        assert result is not None
+        turns, _ = result
+        assert any(t.text == "prior turn" for t in turns)
+        assert not any(t.text == "current turn" for t in turns)
+
+    def test_exclude_uuid_returns_none_when_only_self_exists(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        from claude_on_the_fly.transcript import find_latest_prior_transcript
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u-only",
+            ndjson,
+        )
+        assert find_latest_prior_transcript(workspace, exclude_uuid="u-only") is None
+
+    def test_falls_through_to_next_candidate_when_newest_yields_no_turns(
+        self, tmp_path: Path, claude_projects_dir, codex_sessions_dir, ndjson
+    ):
+        """An empty/tool-only newest session must not block the handoff —
+        scan continues to the next candidate."""
+        from claude_on_the_fly.transcript import (
+            _workspace_to_claude_hash,
+            find_latest_prior_transcript,
+        )
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        # Newest session yields no turns (tool-use only).
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        empty_path = session_dir / "u-empty.jsonl"
+        empty_path.write_bytes(
+            ndjson(_claude_assistant_tooluse(), _claude_user_toolresult())
+        )
+        import os
+
+        os.utime(empty_path, (5000.0, 5000.0))
+
+        self._claude_session(
+            claude_projects_dir,
+            workspace,
+            "u-prior",
+            ndjson,
+            text="prior turn",
+            mtime=1000.0,
+        )
+
+        result = find_latest_prior_transcript(workspace)
+        assert result is not None
+        turns, backend = result
+        assert backend == "claude"
+        assert any(t.text == "prior turn" for t in turns)

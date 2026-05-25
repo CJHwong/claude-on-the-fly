@@ -12,6 +12,12 @@ Public surface:
   thread_id persisted under <workspace>/.codex_sessions/<session_uuid>
 - `format_handoff(turns, from_backend)` renders a labeled preamble, capped by
   turn count and char budget from the most recent backward
+- `find_latest_prior_transcript(workspace, exclude_uuid)` scans both backends'
+  per-workspace session stores and returns (turns, from_backend) for the
+  newest one — used to seed handoff after a model/backend switch mints a
+  fresh session UUID
+- `prepend_latest_handoff(workspace, prompt, exclude_uuid)` higher-level
+  wrapper that combines find + format + prepend, swallowing scan errors
 """
 
 from __future__ import annotations
@@ -230,6 +236,131 @@ def format_handoff(
         f"{body}\n\n"
         f"[Continue from here]\n\n"
     )
+
+
+def _list_claude_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
+    """Return (path, uuid, mtime) for every claude JSONL under the workspace's
+    project dir. Missing dir → []."""
+    project_dir = CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace)
+    if not project_dir.is_dir():
+        return []
+    out: list[tuple[Path, str, float]] = []
+    for path in project_dir.glob("*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        out.append((path, path.stem, mtime))
+    return out
+
+
+def _list_codex_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
+    """Return (rollout_path, our_uuid, rollout_mtime) for every codex mapping
+    under <workspace>/.codex_sessions whose rollout still exists."""
+    sessions_dir = workspace / ".codex_sessions"
+    if not sessions_dir.is_dir():
+        return []
+    out: list[tuple[Path, str, float]] = []
+    for mapping in sessions_dir.iterdir():
+        if not mapping.is_file():
+            continue
+        try:
+            thread_id = mapping.read_text().strip()
+        except OSError:
+            continue
+        rollout = _find_codex_rollout(thread_id)
+        if rollout is None:
+            continue
+        try:
+            mtime = rollout.stat().st_mtime
+        except OSError:
+            continue
+        out.append((rollout, mapping.name, mtime))
+    return out
+
+
+def find_latest_prior_transcript(
+    workspace: Path,
+    *,
+    exclude_uuid: str | None = None,
+) -> tuple[list[Turn], BackendName] | None:
+    """Newest prior transcript for this workspace, across all backend_keys.
+
+    Scans both claude's per-workspace project dir and codex's per-workspace
+    sessions dir, picks the file with the newest mtime (excluding
+    `exclude_uuid` so the current session never matches itself), runs the
+    matching extractor, and returns (turns, from_backend).
+
+    Returns None when no prior session exists, or the newest one yields no
+    extractable turns. Used by both backends to seed a handoff preamble when
+    a new (source, backend_key, ticket) combo starts fresh — typically right
+    after a model switch.
+    """
+    candidates: list[tuple[float, str, BackendName, str]] = []
+    for _path, uuid, mtime in _list_claude_session_files(workspace):
+        if uuid == exclude_uuid:
+            continue
+        candidates.append((mtime, uuid, "claude", uuid))
+    for _path, uuid, mtime in _list_codex_session_files(workspace):
+        if uuid == exclude_uuid:
+            continue
+        candidates.append((mtime, uuid, "codex", uuid))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    extractors: dict[BackendName, Callable[[Path, str], list[Turn] | None]] = {
+        "claude": extract_claude,
+        "codex": extract_codex,
+    }
+    for _mtime, _uuid, backend, lookup_uuid in candidates:
+        try:
+            turns = extractors[backend](workspace, lookup_uuid)
+        except Exception:
+            logger.exception(
+                "transcript: %s extraction failed for uuid=%s; trying next",
+                backend,
+                lookup_uuid,
+            )
+            continue
+        if turns:
+            return turns, backend
+    return None
+
+
+def prepend_latest_handoff(
+    workspace: Path,
+    prompt: str,
+    *,
+    exclude_uuid: str | None = None,
+) -> str:
+    """Return `prompt` with a preamble drawn from the newest prior transcript
+    (any backend) for this workspace. No-op when nothing prior exists.
+
+    Use this from both backends after a fresh-session branch (no JSONL for
+    the current uuid) so the new model picks up context written by whatever
+    backend ran last — including a different mode of the *same* CLI.
+
+    Wraps the lookup in a broad except so a misbehaving transcript scan never
+    crashes the caller; the user still gets a reply, just without handoff
+    context."""
+    try:
+        found = find_latest_prior_transcript(workspace, exclude_uuid=exclude_uuid)
+    except Exception:
+        logger.exception("transcript: latest-prior lookup failed; starting clean")
+        return prompt
+    if found is None:
+        return prompt
+    turns, from_backend = found
+    handoff = format_handoff(turns, from_backend=from_backend)
+    if not handoff:
+        return prompt
+    logger.info(
+        "transcript: forwarding %d %s turn(s) to next backend for workspace=%s",
+        len(turns),
+        from_backend,
+        workspace,
+    )
+    return f"{handoff}{prompt}"
 
 
 def prepend_handoff(

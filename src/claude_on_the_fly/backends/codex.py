@@ -168,12 +168,8 @@ class CodexBackend:
         if existing_thread:
             composed_prompt = prompt
         else:
-            user_payload = transcript.prepend_handoff(
-                workspace,
-                session_uuid,
-                prompt,
-                from_backend="claude",
-                extractor=transcript.extract_claude,
+            user_payload = transcript.prepend_latest_handoff(
+                workspace, prompt, exclude_uuid=session_uuid
             )
             system_prompt = build_system_prompt(platform, user_name, channel_context)
             composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"

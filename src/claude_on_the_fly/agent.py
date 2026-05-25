@@ -432,6 +432,48 @@ def get_backend() -> AgentBackend:
     raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
 
 
+def current_backend_key() -> str:
+    """Canonical `backend:mode:model` string for the currently-configured agent.
+
+    Folded into session UUID seeds so each (backend, mode, model) combo gets
+    its own session JSONL. Switching between e.g. claude-native and
+    claude-via-ollama no longer poisons the saved session — the new combo
+    starts a fresh thread and picks up prior context via the cross-backend
+    handoff path in `transcript`.
+
+    Raises ValueError on the same misconfigurations as `get_backend()` so
+    callers fail loudly instead of silently colliding sessions.
+    """
+    name = os.environ.get("AGENT_BACKEND", "claude").lower()
+    if name == "claude":
+        mode = os.environ.get("CLAUDE_MODE", "native").lower()
+        if mode == "native":
+            return f"claude:native:{os.environ.get('CLAUDE_MODEL', 'sonnet')}"
+        if mode == "ollama":
+            model = os.environ.get("OLLAMA_MODEL", "").strip()
+            if not model:
+                raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
+            return f"claude:ollama:{model}"
+        if mode == "snap":
+            return f"claude:snap:{os.environ.get('CLAUDE_MODEL', 'sonnet')}"
+        raise ValueError(
+            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)"
+        )
+    if name == "codex":
+        mode = os.environ.get("CODEX_MODE", "native").lower()
+        if mode == "native":
+            return (
+                f"codex:native:{os.environ.get('CODEX_MODEL', '').strip() or 'default'}"
+            )
+        if mode == "ollama":
+            model = os.environ.get("OLLAMA_MODEL", "").strip()
+            if not model:
+                raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
+            return f"codex:ollama:{model}"
+        raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+
+
 def _build_claude_backend() -> AgentBackend:
     from claude_on_the_fly.backends.claude import ClaudeBackend
 

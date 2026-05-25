@@ -18,6 +18,7 @@ from claude_on_the_fly.agent import (
     Response,
     _classify,
     build_system_prompt,
+    current_backend_key,
     ensure_persona,
     _exec,
     _merge_cli_output,
@@ -691,6 +692,12 @@ def _cli_output(
 
 
 class TestRun:
+    @pytest.fixture(autouse=True)
+    def _reset_backend_env(self, clear_backend_env):
+        """Auto-apply env reset so a dev's `CLAUDE_MODE=snap` (or similar)
+        doesn't route these mocked tests through `_exec_snap` and spawn the
+        real claude-snap binary."""
+
     async def test_happy_path_resume(self):
         output = _cli_output()
 
@@ -706,10 +713,18 @@ class TestRun:
         assert resp.tokens_out == 200
         assert resp.model == "claude-sonnet-4-20250514"
 
-    async def test_session_not_found_falls_back_to_new(self):
+    async def test_session_not_found_falls_back_to_new(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """Fallback path runs `find_latest_prior_transcript` which scans the
+        workspace's project dir on disk — use tmp_path + the redirect
+        fixtures so the test never touches the developer's real
+        ~/.claude/projects/ or ~/.codex/sessions/."""
         output = _cli_output(result="new session reply")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
 
-        async def side_effect(workspace, cmd, **_kwargs):
+        async def side_effect(_workspace, cmd, **_kwargs):
             if "--resume" in cmd:
                 raise RuntimeError("No conversation found with id sess-1")
             return output
@@ -719,7 +734,7 @@ class TestRun:
             new_callable=AsyncMock,
             side_effect=side_effect,
         ) as mock:
-            resp = await run(Path("/tmp"), "sess-1", "hello", "slack", "alice")
+            resp = await run(workspace, "sess-1", "hello", "slack", "alice")
 
         assert resp.body == "new session reply"
         # Called twice: resume attempt + new session
@@ -1186,6 +1201,73 @@ class TestGetBackend:
 
 
 # ---------------------------------------------------------------------------
+# current_backend_key — fold backend/mode/model into a canonical string
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentBackendKey:
+    def test_default_is_claude_native_sonnet(self, clear_backend_env, monkeypatch):
+        monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+        assert current_backend_key() == "claude:native:sonnet"
+
+    def test_claude_native_includes_explicit_model(
+        self, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        assert current_backend_key() == "claude:native:opus"
+
+    def test_claude_ollama_includes_model(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
+        assert current_backend_key() == "claude:ollama:qwen2.5-coder:32b"
+
+    def test_claude_snap_includes_model(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "snap")
+        monkeypatch.setenv("CLAUDE_MODEL", "sonnet")
+        assert current_backend_key() == "claude:snap:sonnet"
+
+    def test_codex_native_includes_model(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODEL", "gpt-5")
+        assert current_backend_key() == "codex:native:gpt-5"
+
+    def test_codex_native_blank_model_defaults(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.delenv("CODEX_MODEL", raising=False)
+        assert current_backend_key() == "codex:native:default"
+
+    def test_codex_ollama_includes_model(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "llama3.1")
+        assert current_backend_key() == "codex:ollama:llama3.1"
+
+    def test_ollama_without_model_raises(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        with pytest.raises(ValueError, match="OLLAMA_MODEL"):
+            current_backend_key()
+
+    def test_unknown_backend_raises(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "gemini")
+        with pytest.raises(ValueError, match="gemini"):
+            current_backend_key()
+
+    def test_switching_modes_produces_distinct_keys(
+        self, clear_backend_env, monkeypatch
+    ):
+        """The whole point of this helper: each combo must give a unique key
+        so session UUIDs derived from it don't collide across model switches."""
+        monkeypatch.setenv("CLAUDE_MODE", "native")
+        native_key = current_backend_key()
+
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5-coder")
+        ollama_key = current_backend_key()
+
+        assert native_key != ollama_key
+
+
+# ---------------------------------------------------------------------------
 # ClaudeBackend launcher injection
 # ---------------------------------------------------------------------------
 
@@ -1349,6 +1431,11 @@ class TestClaudeBackendLauncher:
 
 
 class TestClaudeBackendHandoff:
+    @pytest.fixture(autouse=True)
+    def _reset_backend_env(self, clear_backend_env):
+        """Force native backend selection so `CLAUDE_MODE=snap` in the dev's
+        shell can't reroute these tests to the real `claude-snap` binary."""
+
     async def test_fallback_path_injects_codex_handoff(self):
         output = _cli_output(result="new session reply")
 
@@ -1363,8 +1450,8 @@ class TestClaudeBackendHandoff:
         ]
         with (
             patch(
-                "claude_on_the_fly.backends.claude.transcript.extract_codex",
-                return_value=prior_turns,
+                "claude_on_the_fly.backends.claude.transcript.find_latest_prior_transcript",
+                return_value=(prior_turns, "codex"),
             ),
             patch(
                 "claude_on_the_fly.agent._exec",
@@ -1393,7 +1480,7 @@ class TestClaudeBackendHandoff:
 
         with (
             patch(
-                "claude_on_the_fly.backends.claude.transcript.extract_codex",
+                "claude_on_the_fly.backends.claude.transcript.find_latest_prior_transcript",
                 return_value=None,
             ),
             patch(
@@ -1418,7 +1505,7 @@ class TestClaudeBackendHandoff:
 
         with (
             patch(
-                "claude_on_the_fly.backends.claude.transcript.extract_codex",
+                "claude_on_the_fly.backends.claude.transcript.find_latest_prior_transcript",
                 side_effect=RuntimeError("read failed"),
             ),
             patch(
@@ -1439,7 +1526,7 @@ class TestClaudeBackendHandoff:
 
         with (
             patch(
-                "claude_on_the_fly.backends.claude.transcript.extract_codex"
+                "claude_on_the_fly.backends.claude.transcript.find_latest_prior_transcript"
             ) as mock_extract,
             patch(
                 "claude_on_the_fly.agent._exec",

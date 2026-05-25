@@ -179,12 +179,14 @@ class RetryQueue:
     ) -> None:
         if self._event_log is None:
             return
+        from claude_on_the_fly.agent import current_backend_key
         from claude_on_the_fly.events import EVENT_RETRY_SCHEDULED
 
         self._event_log.append(
             EVENT_RETRY_SCHEDULED,
             source="symphony",
             tracker=source,
+            backend=current_backend_key(),
             identifier=identifier,
             attempt=attempt,
             delay_ms=delay_ms,

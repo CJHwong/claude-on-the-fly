@@ -83,6 +83,26 @@ def test_session_uuid_includes_source_in_seed() -> None:
     )
 
 
+def test_session_uuid_includes_backend_key_in_seed() -> None:
+    """Switching model/backend must mint a distinct UUID so the saved JSONL
+    from a different upstream is never replayed under an incompatible CLI."""
+    native = session_uuid_for(
+        "PROJ-1", source="jira", backend_key="claude:native:sonnet"
+    )
+    ollama = session_uuid_for(
+        "PROJ-1", source="jira", backend_key="claude:ollama:qwen2.5-coder"
+    )
+    codex_native = session_uuid_for(
+        "PROJ-1", source="jira", backend_key="codex:native:gpt-5"
+    )
+    assert len({native, ollama, codex_native}) == 3
+
+    # Same (source, identifier, backend_key) is still deterministic.
+    assert native == session_uuid_for(
+        "PROJ-1", source="jira", backend_key="claude:native:sonnet"
+    )
+
+
 # ---------------------------------------------------------------------------
 # TicketRunner.run_turn
 # ---------------------------------------------------------------------------

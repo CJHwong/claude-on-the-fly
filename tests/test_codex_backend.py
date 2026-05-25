@@ -691,8 +691,8 @@ class TestCodexBackendHandoff:
         ]
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_claude",
-                return_value=prior_turns,
+                "claude_on_the_fly.backends.codex.transcript.find_latest_prior_transcript",
+                return_value=(prior_turns, "claude"),
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -728,8 +728,8 @@ class TestCodexBackendHandoff:
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_claude"
-            ) as mock_extract,
+                "claude_on_the_fly.backends.codex.transcript.find_latest_prior_transcript"
+            ) as mock_lookup,
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
                 new_callable=AsyncMock,
@@ -740,8 +740,8 @@ class TestCodexBackendHandoff:
                 workspace, "sess-resume", "USER_TEXT_ONLY", "telegram"
             )
 
-        # extract_claude must not even be called when resuming.
-        mock_extract.assert_not_called()
+        # The lookup must not even be called when resuming an existing thread.
+        mock_lookup.assert_not_called()
         composed = mock.call_args[0][1][-1]
         assert "[Prior conversation via claude" not in composed
         # System-prompt content (any of the FORMAT_HINTS) must NOT be present
@@ -756,7 +756,7 @@ class TestCodexBackendHandoff:
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_claude",
+                "claude_on_the_fly.backends.codex.transcript.find_latest_prior_transcript",
                 return_value=None,
             ),
             patch(
@@ -776,7 +776,7 @@ class TestCodexBackendHandoff:
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_claude",
+                "claude_on_the_fly.backends.codex.transcript.find_latest_prior_transcript",
                 side_effect=RuntimeError("boom"),
             ),
             patch(

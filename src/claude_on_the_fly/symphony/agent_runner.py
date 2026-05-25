@@ -22,11 +22,23 @@ from .tracker.issue import Issue
 logger = logging.getLogger(__name__)
 
 
-def session_uuid_for(issue_identifier: str, source: str = "jira") -> str:
-    """Deterministic UUID per ticket so daemon restarts resume the prior
-    session. Source is in the seed so two trackers minting the same
-    `identifier` get distinct UUIDs."""
-    return str(uuid5(NAMESPACE_URL, f"claude-symphony/{source}/{issue_identifier}"))
+def session_uuid_for(
+    issue_identifier: str,
+    source: str = "jira",
+    backend_key: str = "claude:native:sonnet",
+) -> str:
+    """Deterministic UUID per (source, backend_key, ticket) so daemon restarts
+    resume the prior session for the same backend/model combo. Source is in
+    the seed so two trackers minting the same `identifier` get distinct UUIDs;
+    backend_key isolates sessions across model switches (e.g. claude-native vs
+    claude-via-ollama) so the saved JSONL is never replayed against an
+    incompatible upstream. Cross-key context survives via the handoff path
+    in `transcript.find_latest_prior_transcript`."""
+    return str(
+        uuid5(
+            NAMESPACE_URL, f"claude-symphony/{source}/{backend_key}/{issue_identifier}"
+        )
+    )
 
 
 @dataclass

@@ -145,12 +145,8 @@ class ClaudeBackend:
             if "No conversation found" not in str(exc):
                 raise
             logger.info("No existing session %s, creating new", session_uuid)
-            handoff_prompt = transcript.prepend_handoff(
-                workspace,
-                session_uuid,
-                prompt,
-                from_backend="codex",
-                extractor=transcript.extract_codex,
+            handoff_prompt = transcript.prepend_latest_handoff(
+                workspace, prompt, exclude_uuid=session_uuid
             )
             cli_output = await executor(
                 workspace,

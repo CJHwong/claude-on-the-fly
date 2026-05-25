@@ -23,7 +23,7 @@ from itertools import count
 from pathlib import Path
 from typing import Iterable
 
-from claude_on_the_fly.agent import ClaudeUnavailableError
+from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
 from claude_on_the_fly.heartbeat import HeartbeatWriter
 
 from .agent_runner import TicketRunner, session_uuid_for
@@ -127,7 +127,7 @@ async def _run_worker(
         entry.workspace = workspace
         entry.failure_attempt = starting_failure_attempt
 
-    sid = session_uuid_for(identifier, source=source)
+    sid = session_uuid_for(identifier, source=source, backend_key=current_backend_key())
     runner = TicketRunner(
         issue=issue,
         workspace=workspace,
@@ -214,6 +214,7 @@ async def _run_worker(
                     EVENT_WORKER_DONE,
                     source="symphony",
                     tracker=source,
+                    backend=current_backend_key(),
                     identifier=identifier,
                     workspace=workspace,
                     session_uuid=sid,
@@ -231,6 +232,7 @@ async def _run_worker(
                     EVENT_WORKER_DONE,
                     source="symphony",
                     tracker=source,
+                    backend=current_backend_key(),
                     identifier=identifier,
                     workspace=workspace,
                     session_uuid=sid,
@@ -260,6 +262,7 @@ async def _run_worker(
             EVENT_WORKER_FAILED,
             source="symphony",
             tracker=source,
+            backend=current_backend_key(),
             identifier=identifier,
             workspace=workspace,
             session_uuid=sid,
@@ -324,6 +327,7 @@ def _dispatch(
         EVENT_DISPATCHED,
         source="symphony",
         tracker=issue.source,
+        backend=current_backend_key(),
         identifier=issue.identifier,
         state=issue.state,
         priority=issue.priority,
@@ -360,6 +364,7 @@ def _check_and_cancel_stall(
         EVENT_CANCELLED,
         source="symphony",
         tracker=entry.source,
+        backend=current_backend_key(),
         identifier=entry.issue_identifier,
         workspace=entry.workspace,
         reason="stall",
@@ -473,6 +478,7 @@ async def reconcile(
                     EVENT_CANCELLED,
                     source="symphony",
                     tracker=entry.source,
+                    backend=current_backend_key(),
                     identifier=entry.issue_identifier,
                     workspace=entry.workspace,
                     reason="terminal",
@@ -492,6 +498,7 @@ async def reconcile(
                     EVENT_CANCELLED,
                     source="symphony",
                     tracker=entry.source,
+                    backend=current_backend_key(),
                     identifier=entry.issue_identifier,
                     workspace=entry.workspace,
                     reason="inactive",

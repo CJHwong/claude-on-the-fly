@@ -28,7 +28,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from claude_on_the_fly.agent import get_backend
+from claude_on_the_fly.agent import current_backend_key, get_backend
 
 from . import orchestrator, watch
 from .agent_runner import session_uuid_for
@@ -163,7 +163,9 @@ def _cmd_takeover(ticket: str, source: str | None = None) -> int:
         return 1
 
     workspace = ensure_workspace(ticket, source=resolved_source)
-    session_uuid = session_uuid_for(ticket, source=resolved_source)
+    session_uuid = session_uuid_for(
+        ticket, source=resolved_source, backend_key=current_backend_key()
+    )
     backend = get_backend()
     cmd = backend.takeover_command(workspace, session_uuid)
 
@@ -201,7 +203,9 @@ def _cmd_watch(ticket: str, source: str | None = None) -> int:
         return 1
 
     workspace = ensure_workspace(ticket, source=resolved_source)
-    session_uuid = session_uuid_for(ticket, source=resolved_source)
+    session_uuid = session_uuid_for(
+        ticket, source=resolved_source, backend_key=current_backend_key()
+    )
     backend = get_backend()
     log_path = backend.session_log_path(workspace, session_uuid)
 
