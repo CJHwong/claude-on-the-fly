@@ -18,7 +18,10 @@ stages:
 Triggers re-review when:
 - Never reviewed → trigger
 - Reviewed at SHA X, head is now Y ≠ X → trigger (new commits to review)
-- Reviewed at SHA X, head is still X → SKIP (don't re-review identical code)
+- Reviewed at SHA X, head is still X, but the user is back in
+  `reviewRequests` (someone explicitly re-requested after dismissing /
+  approving) → trigger (on-demand re-review even without new commits)
+- Reviewed at SHA X, head is still X, NOT in `reviewRequests` → SKIP
 
 This is stateless — no local cache. Every tick re-queries fresh state.
 The agent's "I'm done" signal is submitting any review on the current head
@@ -213,6 +216,14 @@ class GitHubTracker:
             headRefOid
             repository { nameWithOwner }
             labels(first: 20) { nodes { name } }
+            reviewRequests(first: 100) {
+              nodes {
+                requestedReviewer {
+                  __typename
+                  ... on User { login }
+                }
+              }
+            }
             reviews(first: 100, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) {
               nodes {
                 author { login }
@@ -228,15 +239,21 @@ class GitHubTracker:
 
     async def fetch_candidates(self, cfg: TrackerCommonConfig) -> list[Issue]:
         """Open non-draft PRs DIRECTLY requesting the user's review where
-        the user hasn't already reviewed the *current head SHA* AND the PR
-        is older than `cool_down_ms` (0 = no delay).
+        the user isn't already "done with the current head" AND the PR is
+        older than `cool_down_ms` (0 = no delay).
 
-        Uses GraphQL search so each PR's `headRefOid` + the user's latest
-        review's commit OID come back in one call. We filter SHA-stale
-        reviews client-side: drop PRs where the user reviewed at the same
-        SHA the PR's head now points at (no new code to review), keep PRs
-        where the user reviewed at an older SHA (re-review the new commits),
-        and skip PRs younger than the configured cool-down window.
+        Uses GraphQL search so each PR's `headRefOid`, latest reviews, and
+        current `reviewRequests` come back in one call. The dedup is two-part:
+
+        1. SHA-stale review check — drop PRs where the user's latest review's
+           commit OID matches the PR's headRefOid (no new code to re-review),
+           keep PRs where the user reviewed only at older SHAs.
+        2. Re-request override — if the user is still in `reviewRequests`
+           (someone re-requested after a prior approval / dismissal), keep
+           the PR even if SHA matches. GitHub auto-clears reviewRequests on
+           review submission, so being back in the list is itself a signal.
+
+        Skip PRs younger than the configured cool-down window.
 
         Stateless — no local cache. Every tick re-queries fresh state.
         """
@@ -271,9 +288,7 @@ class GitHubTracker:
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            head_oid = node.get("headRefOid") or ""
-            reviews = (node.get("reviews") or {}).get("nodes") or []
-            if self._reviews_match_head(reviews, head_oid, login):
+            if self._user_done_with_head(node, login):
                 skipped_already_reviewed += 1
                 continue
             cool_down_ms = getattr(cfg, "cool_down_ms", 0) or 0
@@ -329,7 +344,8 @@ class GitHubTracker:
 
     async def fetch_one(self, key: str) -> Issue:
         """`owner/repo#N` → fully populated Issue, with
-        `user_reviewed_current_head` derived from headRefOid + reviews."""
+        `user_reviewed_current_head` derived from headRefOid, reviews, and
+        reviewRequests (see `_user_done_with_head`)."""
         owner, repo, number = parse_identifier(key)
         args = [
             "pr",
@@ -338,7 +354,7 @@ class GitHubTracker:
             "--repo",
             f"{owner}/{repo}",
             "--json",
-            "number,title,body,labels,state,createdAt,updatedAt,headRefOid,reviews,url,id",
+            "number,title,body,labels,state,createdAt,updatedAt,headRefOid,reviews,reviewRequests,url,id",
         ]
         payload = await self._run_gh_json(args)
         if not isinstance(payload, dict):
@@ -347,19 +363,56 @@ class GitHubTracker:
         # so _identifier_from_payload can rebuild the canonical identifier.
         payload.setdefault("repository", {"nameWithOwner": f"{owner}/{repo}"})
         login = await self._get_login()
-        reviewed = self._user_reviewed_current_head(payload, login)
-        return self._payload_to_issue(payload, user_reviewed_current_head=reviewed)
+        done = self._user_done_with_head(payload, login)
+        return self._payload_to_issue(payload, user_reviewed_current_head=done)
 
     @staticmethod
-    @staticmethod
-    def _user_reviewed_current_head(payload: dict, login: str) -> bool:
-        """True iff `login`'s most-recent review (by submittedAt) is at the
-        PR's current `headRefOid`. Wraps the shared `_reviews_match_head`
-        helper so fetch_one stays compatible with the REST `reviews` shape
-        coming back from `gh pr view --json reviews`.
+    def _extract_review_requests(payload: dict) -> list[dict]:
+        """Normalize the `reviewRequests` field to a flat list of reviewer
+        dicts, each carrying a `login` key.
+
+        Handles both shapes:
+        - GraphQL: `{"nodes": [{"requestedReviewer": {"login": ...}}]}`
+        - REST (`gh pr view`): `[{"__typename": "User", "login": ...}]`
         """
+        field = payload.get("reviewRequests")
+        if isinstance(field, dict):
+            nodes = field.get("nodes") or []
+            return [
+                node["requestedReviewer"]
+                for node in nodes
+                if isinstance(node, dict)
+                and isinstance(node.get("requestedReviewer"), dict)
+            ]
+        if isinstance(field, list):
+            return [r for r in field if isinstance(r, dict)]
+        return []
+
+    @staticmethod
+    def _user_done_with_head(payload: dict, login: str) -> bool:
+        """True iff the user has fully discharged the current head: their
+        latest review's commit OID matches `headRefOid` AND they are NOT
+        currently in `reviewRequests`.
+
+        The reviewRequests check catches the "re-requested without new
+        push" case — someone explicitly re-asks for review after the user's
+        prior approval was dismissed (or just to get another look). GitHub
+        auto-clears reviewRequests when a review is submitted, so being
+        back in the list always means a fresh ask.
+        """
+        if any(
+            r.get("login") == login
+            for r in GitHubTracker._extract_review_requests(payload)
+        ):
+            return False
         head_oid = payload.get("headRefOid") or ""
-        reviews = payload.get("reviews") or []
+        reviews_field = payload.get("reviews")
+        if isinstance(reviews_field, dict):
+            reviews = reviews_field.get("nodes") or []
+        elif isinstance(reviews_field, list):
+            reviews = reviews_field
+        else:
+            reviews = []
         return GitHubTracker._reviews_match_head(reviews, head_oid, login)
 
     async def fetch_summaries_by_keys(self, keys: list[str]) -> dict[str, IssueSummary]:
@@ -395,7 +448,7 @@ class GitHubTracker:
                 "--repo",
                 f"{owner}/{repo}",
                 "--json",
-                "state,reviews,headRefOid",
+                "state,reviews,reviewRequests,headRefOid",
             ]
             try:
                 payload = await self._run_gh_json(args)
@@ -407,10 +460,10 @@ class GitHubTracker:
             if not isinstance(payload, dict):
                 return None
             state = _normalize_state(payload.get("state") or "")
-            reviewed = self._user_reviewed_current_head(payload, login)
+            done = self._user_done_with_head(payload, login)
             return key, IssueSummary(
                 state=state,
-                extra={"user_reviewed_current_head": reviewed},
+                extra={"user_reviewed_current_head": done},
             )
 
         results = await asyncio.gather(

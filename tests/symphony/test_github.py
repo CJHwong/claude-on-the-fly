@@ -151,11 +151,11 @@ def test_issue_to_summary_carries_review_flag() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _user_reviewed_current_head (the SHA-match helper)
+# _user_done_with_head (SHA-match AND not re-requested)
 # ---------------------------------------------------------------------------
 
 
-def test_user_reviewed_current_head_picks_latest_review_only() -> None:
+def test_user_done_with_head_picks_latest_review_only() -> None:
     """Older reviews at different SHAs shouldn't fool the check. The user's
     LATEST review (by submittedAt) is what counts."""
     payload = {
@@ -173,10 +173,10 @@ def test_user_reviewed_current_head_picks_latest_review_only() -> None:
             },
         ],
     }
-    assert GitHubTracker._user_reviewed_current_head(payload, "CJHwong") is True
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is True
 
 
-def test_user_reviewed_current_head_returns_false_when_only_old_sha() -> None:
+def test_user_done_with_head_returns_false_when_only_old_sha() -> None:
     """Reviewed at older SHA, then author pushed new commits → re-review needed."""
     payload = {
         "headRefOid": "newSHA",
@@ -188,10 +188,10 @@ def test_user_reviewed_current_head_returns_false_when_only_old_sha() -> None:
             },
         ],
     }
-    assert GitHubTracker._user_reviewed_current_head(payload, "CJHwong") is False
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is False
 
 
-def test_user_reviewed_current_head_returns_false_when_never_reviewed() -> None:
+def test_user_done_with_head_returns_false_when_never_reviewed() -> None:
     payload = {
         "headRefOid": "newSHA",
         "reviews": [
@@ -202,13 +202,13 @@ def test_user_reviewed_current_head_returns_false_when_never_reviewed() -> None:
             },
         ],
     }
-    assert GitHubTracker._user_reviewed_current_head(payload, "CJHwong") is False
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is False
 
 
-def test_user_reviewed_current_head_returns_false_when_head_missing() -> None:
+def test_user_done_with_head_returns_false_when_head_missing() -> None:
     """Defensive: if the payload has no headRefOid (e.g. malformed response),
-    treat as not-reviewed-at-head so the worker keeps running rather than
-    silently exiting on missing data."""
+    treat as not-done so the worker keeps running rather than silently
+    exiting on missing data."""
     payload = {
         "reviews": [
             {
@@ -218,7 +218,63 @@ def test_user_reviewed_current_head_returns_false_when_head_missing() -> None:
             },
         ],
     }
-    assert GitHubTracker._user_reviewed_current_head(payload, "CJHwong") is False
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is False
+
+
+def test_user_done_with_head_returns_false_when_user_re_requested_rest_shape() -> None:
+    """Re-request override: even with a review at the current head, if the
+    user is back in `reviewRequests` (REST shape from `gh pr view`), treat
+    as not-done so the worker re-engages."""
+    payload = {
+        "headRefOid": "currentSHA",
+        "reviews": [
+            {
+                "author": {"login": "CJHwong"},
+                "commit": {"oid": "currentSHA"},
+                "submittedAt": "2026-05-21T12:00:00Z",
+            },
+        ],
+        "reviewRequests": [{"__typename": "User", "login": "CJHwong"}],
+    }
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is False
+
+
+def test_user_done_with_head_returns_false_when_user_re_requested_graphql_shape() -> (
+    None
+):
+    """Same as above but with the GraphQL `{nodes: [{requestedReviewer}]}` shape."""
+    payload = {
+        "headRefOid": "currentSHA",
+        "reviews": {
+            "nodes": [
+                {
+                    "author": {"login": "CJHwong"},
+                    "commit": {"oid": "currentSHA"},
+                    "submittedAt": "2026-05-21T12:00:00Z",
+                },
+            ]
+        },
+        "reviewRequests": {
+            "nodes": [{"requestedReviewer": {"__typename": "User", "login": "CJHwong"}}]
+        },
+    }
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is False
+
+
+def test_user_done_with_head_ignores_other_users_in_review_requests() -> None:
+    """Someone else being re-requested doesn't reactivate the current user."""
+    payload = {
+        "headRefOid": "currentSHA",
+        "reviews": [
+            {
+                "author": {"login": "CJHwong"},
+                "commit": {"oid": "currentSHA"},
+                "submittedAt": "2026-05-21T12:00:00Z",
+            },
+        ],
+        "reviewRequests": [{"__typename": "User", "login": "someone-else"}],
+    }
+    assert GitHubTracker._user_done_with_head(payload, "CJHwong") is True
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +346,7 @@ def _graphql_pr_node(
     state: str = "OPEN",
     labels: list[str] | None = None,
     body: str = "PR body",
+    review_requested_logins: list[str] | None = None,
 ) -> dict:
     # The search GraphQL query now pulls the full `reviews` list and uses
     # submittedAt ordering (same algorithm as fetch_one's REST data), so the
@@ -311,6 +368,10 @@ def _graphql_pr_node(
             "commit": {"oid": "irrelevant"},
         }
     )
+    review_requests_nodes = [
+        {"requestedReviewer": {"__typename": "User", "login": login}}
+        for login in (review_requested_logins or [])
+    ]
     return {
         "id": f"PR_id_{number}",
         "number": number,
@@ -323,6 +384,7 @@ def _graphql_pr_node(
         "headRefOid": head_oid,
         "repository": {"nameWithOwner": repo},
         "labels": {"nodes": [{"name": n} for n in (labels or [])]},
+        "reviewRequests": {"nodes": review_requests_nodes},
         "reviews": {"nodes": reviews},
     }
 
@@ -360,6 +422,66 @@ async def test_fetch_candidates_filters_already_reviewed_at_head() -> None:
     assert "owner/repo#2" not in identifiers  # already reviewed at head
     for c in candidates:
         assert c.extra["user_reviewed_current_head"] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_keeps_pr_when_user_re_requested_at_same_head() -> None:
+    """Re-request override: a PR where the user's last review matches the
+    current head SHA is STILL a candidate if the user is back in
+    `reviewRequests` (someone re-requested after their prior review)."""
+    t = _tracker()
+    t._login = "CJHwong"
+    nodes = [
+        # SHA matches head AND no re-request → skip (existing dedup).
+        _graphql_pr_node(number=1, head_oid="abc", user_latest_oid="abc"),
+        # SHA matches head BUT user re-requested → keep (new behavior).
+        _graphql_pr_node(
+            number=2,
+            head_oid="abc",
+            user_latest_oid="abc",
+            review_requested_logins=["CJHwong"],
+        ),
+        # SHA matches head, someone else re-requested → skip (still done).
+        _graphql_pr_node(
+            number=3,
+            head_oid="abc",
+            user_latest_oid="abc",
+            review_requested_logins=["someone-else"],
+        ),
+    ]
+    with patch(
+        "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=_stub_proc(_graphql_envelope(nodes))),
+    ):
+        candidates = await t.fetch_candidates(_tracker_cfg())
+
+    identifiers = {c.identifier for c in candidates}
+    assert "owner/repo#1" not in identifiers
+    assert "owner/repo#2" in identifiers
+    assert "owner/repo#3" not in identifiers
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_query_pulls_review_requests() -> None:
+    """The GraphQL query must include `reviewRequests` so the dispatcher
+    can detect the re-request override."""
+    t = _tracker()
+    t._login = "CJHwong"
+    captured: dict = {}
+
+    async def capture(*args, **kwargs):
+        captured["args"] = list(args)
+        return _stub_proc(_graphql_envelope([]))
+
+    with patch(
+        "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
+        new=capture,
+    ):
+        await t.fetch_candidates(_tracker_cfg())
+
+    joined = " ".join(captured["args"])
+    assert "reviewRequests" in joined
+    assert "requestedReviewer" in joined
 
 
 @pytest.mark.asyncio
@@ -412,6 +534,7 @@ def _pr_view_payload(
     state: str = "OPEN",
     user_review_oid: str | None = None,
     head_oid: str = "headSHA",
+    review_requested_logins: list[str] | None = None,
 ) -> dict:
     reviews = []
     if user_review_oid is not None:
@@ -443,6 +566,10 @@ def _pr_view_payload(
         "headRefOid": head_oid,
         "url": "https://github.com/owner/repo/pull/42",
         "reviews": reviews,
+        "reviewRequests": [
+            {"__typename": "User", "login": login}
+            for login in (review_requested_logins or [])
+        ],
     }
 
 
@@ -466,6 +593,24 @@ async def test_fetch_one_marks_not_reviewed_when_sha_differs() -> None:
     t = _tracker()
     t._login = "CJHwong"
     payload = _pr_view_payload(head_oid="newSHA", user_review_oid="oldSHA")
+    with patch(
+        "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=_stub_proc(json.dumps(payload).encode())),
+    ):
+        issue = await t.fetch_one("owner/repo#42")
+    assert issue.extra["user_reviewed_current_head"] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_one_marks_not_done_when_user_re_requested_at_same_head() -> None:
+    """SHA matches head but user is back in reviewRequests → not done."""
+    t = _tracker()
+    t._login = "CJHwong"
+    payload = _pr_view_payload(
+        head_oid="SHA1",
+        user_review_oid="SHA1",
+        review_requested_logins=["CJHwong"],
+    )
     with patch(
         "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=_stub_proc(json.dumps(payload).encode())),
@@ -550,6 +695,37 @@ async def test_fetch_summaries_applies_sha_aware_review_check() -> None:
 
     assert result["owner/repo#1"].extra["user_reviewed_current_head"] is False
     assert result["owner/repo#2"].extra["user_reviewed_current_head"] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_summaries_treats_re_requested_user_as_not_done() -> None:
+    """A worker on a PR where the user got re-requested at the same head SHA
+    must keep running, so `user_reviewed_current_head` surfaces as False."""
+    t = _tracker()
+    t._login = "CJHwong"
+    payload = _stub_proc(
+        json.dumps(
+            {
+                "state": "OPEN",
+                "headRefOid": "currentSHA",
+                "reviews": [
+                    {
+                        "author": {"login": "CJHwong"},
+                        "commit": {"oid": "currentSHA"},
+                        "submittedAt": "2026-05-21T00:00:00Z",
+                    }
+                ],
+                "reviewRequests": [{"__typename": "User", "login": "CJHwong"}],
+            }
+        ).encode()
+    )
+    with patch(
+        "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=[payload]),
+    ):
+        result = await t.fetch_summaries_by_keys(["owner/repo#1"])
+
+    assert result["owner/repo#1"].extra["user_reviewed_current_head"] is False
 
 
 @pytest.mark.asyncio
