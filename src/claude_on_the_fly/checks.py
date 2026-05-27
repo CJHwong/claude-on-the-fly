@@ -440,13 +440,40 @@ _ENV_CHECKERS: dict[str, Callable[[Mapping[str, str]], list[CheckResult]]] = {
 }
 
 
+def check_symphony_acli() -> CheckResult:
+    """Symphony shells out to `acli` for every Jira read.
+
+    Auth lives in `acli auth login`. We can probe the binary cheaply; full
+    auth verification would require a network call so we leave that to the
+    daemon's first poll (which raises with a clear error if unauth'd).
+    """
+    if shutil.which("acli"):
+        return CheckResult(
+            name="acli",
+            status="ok",
+            detail="installed (auth verified on first poll)",
+        )
+    return CheckResult(
+        name="acli",
+        status="missing",
+        detail="not on PATH",
+        fix_hint=(
+            "Install acli (https://developer.atlassian.com/cloud/acli/) "
+            "and run `acli auth login`"
+        ),
+    )
+
+
 def check_frontend(frontend: str, env: Mapping[str, str]) -> list[CheckResult]:
-    """Per-frontend checks: env vars + required config files (if any)."""
+    """Per-frontend checks: env vars + required config files + tool auth."""
     if frontend not in SUPERVISABLE_FRONTENDS:
         raise ValueError(f"unknown frontend: {frontend!r}")
     env_checker = _ENV_CHECKERS.get(frontend)
     env_checks = env_checker(env) if env_checker else []
-    return env_checks + check_config_file(frontend)
+    extra: list[CheckResult] = []
+    if frontend == "symphony":
+        extra.append(check_symphony_acli())
+    return env_checks + check_config_file(frontend) + extra
 
 
 def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResult]]:

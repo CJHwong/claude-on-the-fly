@@ -156,9 +156,17 @@ def check_snap_mode() -> None:
     """Validate `CLAUDE_MODE=snap`: binary resolves, jq present, hooks wired.
 
     Reuses the structured `checks.check_snap_setup` so doctor view and
-    preflight see the same failures.
+    preflight see the same failures. If the binary is missing on an
+    interactive TTY, offer to install it via the canonical curl script.
     """
     from claude_on_the_fly import checks as _checks
+    from claude_on_the_fly import snap_install
+
+    if not snap_install.is_snap_installed():
+        outcome = snap_install.ensure_snap_installed()
+        if not outcome.installed:
+            raise SystemExit(outcome.message)
+        logger.info("claude-snap: %s", outcome.message)
 
     results = _checks.check_snap_setup()
     _raise_on_failures(results)

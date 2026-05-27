@@ -30,6 +30,22 @@ SNAP_INSTALL_HINT = (
 )
 
 
+def _session_has_content(path: Path) -> bool:
+    """True if the session JSONL exists and holds at least one non-blank line.
+
+    The file merely existing is not proof the session was established: a failed
+    first turn (the LLM never started) can leave an empty file. When there is
+    real content, claude has already persisted the system prompt into the
+    session, so a --resume need not re-send it. When there is none, the caller
+    must re-supply the system prompt to avoid running the agent prompt-less.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return any(line.strip() for line in handle)
+    except OSError:
+        return False
+
+
 def resolve_snap_binary() -> str | None:
     """Find the `claude-snap` binary.
 
@@ -100,9 +116,12 @@ class ClaudeBackend:
             workspace,
         )
         system_prompt = build_system_prompt(platform, user_name, channel_context)
+        # --system-prompt is only attached when (re-)establishing a session; a
+        # healthy --resume reuses the prompt already persisted in the session.
+        sysprompt_args = ["--system-prompt", system_prompt]
 
         if self.snap:
-            base = self._snap_base_argv(system_prompt)
+            base = self._snap_base_argv()
             executor = _exec_snap
         else:
             # `ollama launch claude` already invokes the claude binary; repeating
@@ -110,11 +129,10 @@ class ClaudeBackend:
             # the prompt and silently drops the real one.
             prefix = self.launcher.prefix("claude") if self.launcher else []
             binary = [] if self.launcher else ["claude"]
-            model_args = (
-                []
-                if self.launcher
-                else ["--model", os.environ.get("CLAUDE_MODEL", "sonnet")]
-            )
+            # Empty/unset CLAUDE_MODEL → omit --model and let the claude CLI use
+            # its own default (don't pin sonnet).
+            _model = "" if self.launcher else os.environ.get("CLAUDE_MODEL", "").strip()
+            model_args = ["--model", _model] if _model else []
             base = [
                 *prefix,
                 *binary,
@@ -125,8 +143,6 @@ class ClaudeBackend:
                 "--permission-mode",
                 "bypassPermissions",
                 *model_args,
-                "--system-prompt",
-                system_prompt,
             ]
             executor = agent._exec
 
@@ -149,23 +165,32 @@ class ClaudeBackend:
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )
-        if session_path.is_file():
+        if _session_has_content(session_path):
+            # Healthy resume: claude already persisted the system prompt into
+            # the session, so don't re-send it (cuts tokens and stops every
+            # turn re-asserting the whole prompt).
             logger.debug(
                 "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
             )
-            cli_output = await executor(
-                workspace, [*base, "--resume", session_uuid, prompt], timeout=timeout
+            argv = [*base, "--resume", session_uuid, prompt]
+        elif session_path.is_file():
+            # The file exists but has no content: a prior turn opened the
+            # session yet the LLM never produced output (empty/synthetic reply).
+            # Resume but RE-SUPPLY the system prompt — otherwise the agent runs
+            # with no system prompt at all.
+            logger.warning(
+                "agent.run: session=%s exists but is empty; re-supplying system "
+                "prompt on resume",
+                session_uuid,
             )
+            argv = [*base, *sysprompt_args, "--resume", session_uuid, prompt]
         else:
             logger.info("No existing session %s, creating new", session_uuid)
-            handoff_prompt = transcript.prepend_latest_handoff(
+            prompt = transcript.prepend_latest_handoff(
                 workspace, prompt, exclude_uuid=session_uuid
             )
-            cli_output = await executor(
-                workspace,
-                [*base, "--session-id", session_uuid, handoff_prompt],
-                timeout=timeout,
-            )
+            argv = [*base, *sysprompt_args, "--session-id", session_uuid, prompt]
+        cli_output = await executor(workspace, argv, timeout=timeout)
 
         body = (cli_output.get("result") or "").strip()
         if not body:
@@ -217,16 +242,17 @@ class ClaudeBackend:
             **_statusline_response_fields(statusline),
         )
 
-    def _snap_base_argv(self, system_prompt: str) -> list[str]:
+    def _snap_base_argv(self) -> list[str]:
+        """Snap argv minus the prompt and --system-prompt; the caller appends
+        --system-prompt only when (re-)establishing a session."""
         assert self._snap_path is not None  # set in __init__ when snap=True
+        model = os.environ.get("CLAUDE_MODEL", "").strip()
+        model_args = ["--model", model] if model else []
         return [
             self._snap_path,
             "--permission-mode",
             "bypassPermissions",
-            "--model",
-            os.environ.get("CLAUDE_MODEL", "sonnet"),
-            "--system-prompt",
-            system_prompt,
+            *model_args,
         ]
 
     def _extract_tokens(self, cli_output: dict) -> tuple[int, int]:

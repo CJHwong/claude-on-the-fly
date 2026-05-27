@@ -304,7 +304,7 @@ Or use a `.env` file with all vars and a process manager.
 | `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude`; `snap` drives `claude-snap` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) to surface rate-limit and context-window stats (default: `native`) |
 | `CODEX_MODE` | no | `native` runs `codex` directly; `ollama` wraps it in `ollama launch codex` (default: `native`) |
 | `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama` or `CODEX_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
-| `CLAUDE_MODEL` | no | Model passed to `claude --model` in native mode (default: `sonnet`). Ignored in ollama mode |
+| `CLAUDE_MODEL` | no | Model passed to `claude --model` in native/snap mode. Unset (default) omits `--model` so the claude CLI uses its own default. Ignored in ollama mode |
 | `CODEX_MODEL` | no | Model passed to `codex exec -m` in native mode (e.g. `o3`, `gpt-4.1`). Ignored in ollama mode |
 | `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 

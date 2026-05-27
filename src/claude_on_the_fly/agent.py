@@ -448,14 +448,14 @@ def current_backend_key() -> str:
     if name == "claude":
         mode = os.environ.get("CLAUDE_MODE", "native").lower()
         if mode == "native":
-            return f"claude:native:{os.environ.get('CLAUDE_MODEL', 'sonnet')}"
+            return f"claude:native:{os.environ.get('CLAUDE_MODEL', '').strip()}"
         if mode == "ollama":
             model = os.environ.get("OLLAMA_MODEL", "").strip()
             if not model:
                 raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"claude:ollama:{model}"
         if mode == "snap":
-            return f"claude:snap:{os.environ.get('CLAUDE_MODEL', 'sonnet')}"
+            return f"claude:snap:{os.environ.get('CLAUDE_MODEL', '').strip()}"
         raise ValueError(
             f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)"
         )

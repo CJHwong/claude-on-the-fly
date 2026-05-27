@@ -1242,9 +1242,10 @@ class TestGetBackend:
 
 
 class TestCurrentBackendKey:
-    def test_default_is_claude_native_sonnet(self, clear_backend_env, monkeypatch):
+    def test_default_native_model_is_empty(self, clear_backend_env, monkeypatch):
+        """No CLAUDE_MODEL → empty model segment (don't pin sonnet)."""
         monkeypatch.delenv("CLAUDE_MODEL", raising=False)
-        assert current_backend_key() == "claude:native:sonnet"
+        assert current_backend_key() == "claude:native:"
 
     def test_claude_native_includes_explicit_model(
         self, clear_backend_env, monkeypatch
@@ -1309,18 +1310,29 @@ class TestCurrentBackendKey:
 
 
 class TestClaudeBackendLauncher:
-    async def test_no_launcher_includes_model_flag(self):
+    async def test_model_flag_follows_env(self, monkeypatch):
         output = _cli_output()
+        # Explicit CLAUDE_MODEL → --model present.
+        monkeypatch.setenv("CLAUDE_MODEL", "opus")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
             await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
-
         cmd = mock.call_args[0][1]
         assert cmd[0] == "claude"
-        assert "--model" in cmd
+        assert "--model" in cmd and "opus" in cmd
+
+        # Unset CLAUDE_MODEL → --model omitted (claude CLI picks its default).
+        monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock2:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert "--model" not in mock2.call_args[0][1]
 
     async def test_launcher_prepends_prefix(self):
         output = _cli_output()
@@ -1708,10 +1720,12 @@ def _snap_envelope(
 
 class TestClaudeBackendSnap:
     async def test_argv_uses_snap_binary_and_drops_p_flags(
-        self, tmp_path, claude_projects_dir, codex_sessions_dir
+        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
     ):
         from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
+        # Explicit model so --model is in the argv (it's omitted when unset).
+        monkeypatch.setenv("CLAUDE_MODEL", "sonnet")
         workspace = tmp_path / "ws"
         workspace.mkdir()
         # Pre-create the session JSONL so the backend takes the --resume
@@ -1741,7 +1755,9 @@ class TestClaudeBackendSnap:
         assert "--permission-mode" in cmd
         assert "bypassPermissions" in cmd
         assert "--model" in cmd
-        assert "--system-prompt" in cmd
+        # Healthy resume (session JSONL has content) reuses the persisted
+        # system prompt, so --system-prompt is NOT re-sent.
+        assert "--system-prompt" not in cmd
         assert "--resume" in cmd
         assert cmd[-1] == "hi"
 
@@ -1861,6 +1877,74 @@ class TestClaudeBackendSnap:
     def test_launcher_and_snap_mutually_exclusive(self):
         with pytest.raises(ValueError, match="mutually exclusive"):
             ClaudeBackend(launcher=OllamaLauncher(model="qwen"), snap=True)
+
+
+class TestResumeSystemPrompt:
+    """--system-prompt is attached only when (re-)establishing a session.
+
+    A healthy resume reuses the prompt claude persisted into the session, so
+    re-sending it every turn is wasted tokens. But the session file merely
+    existing isn't proof the session was established — a failed first turn can
+    leave it empty — so an empty/absent session must re-supply the prompt or
+    the agent would run prompt-less.
+    """
+
+    async def test_missing_session_creates_with_system_prompt(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=_cli_output(),
+        ) as mock:
+            await ClaudeBackend().run(workspace, "sess-missing", "hi", "telegram")
+        cmd = mock.call_args_list[0][0][1]
+        assert "--session-id" in cmd
+        assert "--system-prompt" in cmd
+
+    async def test_empty_session_resumes_with_system_prompt(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-empty.jsonl").write_text("")  # exists, no content
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=_cli_output(),
+        ) as mock:
+            await ClaudeBackend().run(workspace, "sess-empty", "hi", "telegram")
+        cmd = mock.call_args_list[0][0][1]
+        assert "--resume" in cmd
+        assert "--system-prompt" in cmd
+
+    async def test_content_session_resumes_without_system_prompt(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-real.jsonl").write_text('{"type":"user"}\n')
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=_cli_output(),
+        ) as mock:
+            await ClaudeBackend().run(workspace, "sess-real", "hi", "telegram")
+        cmd = mock.call_args_list[0][0][1]
+        assert "--resume" in cmd
+        assert "--system-prompt" not in cmd
 
 
 # ---------------------------------------------------------------------------
