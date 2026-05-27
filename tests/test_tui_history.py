@@ -6,8 +6,8 @@ from claude_on_the_fly.tui.screens.history import (
     _aggregate_by_job,
     _compute_runtimes,
     _event_source,
-    _format_backend,
     _format_detail,
+    _format_local_time,
     _format_runtime,
     _parse_ts,
 )
@@ -110,20 +110,25 @@ class TestFormatRuntime:
         assert _format_runtime(3725.0) == "1h02m"
 
 
-class TestFormatBackend:
-    def test_strips_claude_prefix(self) -> None:
-        assert _format_backend("claude:native:sonnet") == "native:sonnet"
+class TestFormatLocalTime:
+    def test_utc_converts_to_system_local_time(self) -> None:
+        from datetime import datetime, timezone
 
-    def test_strips_codex_prefix(self) -> None:
-        assert _format_backend("codex:ollama:llama3.1") == "ollama:llama3.1"
+        ts = "2026-05-25T10:00:00Z"
+        # Independent reference: same instant rendered in the local zone.
+        expected = (
+            datetime(2026, 5, 25, 10, 0, 0, tzinfo=timezone.utc)
+            .astimezone()
+            .strftime("%H:%M:%S")
+        )
+        assert _format_local_time(ts) == expected
 
-    def test_keeps_unknown_prefix(self) -> None:
-        # Future-proofing: a foreign key shape passes through unchanged.
-        assert _format_backend("mistral:hosted:large") == "mistral:hosted:large"
+    def test_unparseable_falls_back_to_raw(self) -> None:
+        assert _format_local_time("not-a-date") == "not-a-date"
 
-    def test_missing_renders_em_dash(self) -> None:
-        assert _format_backend(None) == "—"
-        assert _format_backend("") == "—"
+    def test_empty_returns_empty(self) -> None:
+        assert _format_local_time(None) == ""
+        assert _format_local_time("") == ""
 
 
 class TestParseTs:

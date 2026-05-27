@@ -74,17 +74,16 @@ def _format_runtime(seconds: float | None) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def _format_backend(value: object) -> str:
-    """Trim the backend key for display. Drop the leading `claude:` /
-    `codex:` when present so the column can be narrower; full key stays
-    in the event log for any deeper inspection."""
-    text = str(value or "—")
-    if text == "—":
-        return text
-    for prefix in ("claude:", "codex:"):
-        if text.startswith(prefix):
-            return text[len(prefix) :]
-    return text
+def _format_local_time(value: object) -> str:
+    """UTC ISO-8601 timestamp → local HH:MM:SS in the system timezone. Falls
+    back to the raw HH:MM:SS slice when the value can't be parsed."""
+    epoch = _parse_ts(value)
+    if epoch is None:
+        text = str(value or "")
+        return text[11:19] if len(text) >= 19 else text
+    from datetime import datetime
+
+    return datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
 
 
 @dataclass
@@ -351,7 +350,6 @@ class HistoryScreen(Screen):
             table.add_column("time", width=10)
             table.add_column("src", width=4)
             table.add_column("job", width=28)
-            table.add_column("backend", width=22)
             table.add_column("event", width=16)
             table.add_column("runs", width=5)
             table.add_column("runtime", width=8)
@@ -360,7 +358,6 @@ class HistoryScreen(Screen):
             table.add_column("time", width=10)
             table.add_column("src", width=4)
             table.add_column("job", width=28)
-            table.add_column("backend", width=22)
             table.add_column("event", width=16)
             table.add_column("runtime", width=8)
             table.add_column("detail", width=28)
@@ -597,7 +594,7 @@ class HistoryScreen(Screen):
     def _render_events(self, table: DataTable, events: list[dict]) -> None:
         """One row per raw event — the original audit-trail view."""
         if not events:
-            table.add_row("—", "—", "no events", "—", "—", "—", "—", key="__empty__")
+            table.add_row("—", "—", "no events", "—", "—", "—", key="__empty__")
             return
         oldest_first = list(reversed(events))
         runtime_by_oldest_idx = _compute_runtimes(oldest_first)
@@ -610,14 +607,11 @@ class HistoryScreen(Screen):
             if resolved is not None:
                 self._row_watch[row_key] = resolved
             badge = src[:1].upper() if src else "?"
-            ts = str(e.get("ts", ""))
-            short_ts = ts[11:19] if len(ts) >= 19 else ts
             runtime = runtime_by_oldest_idx.get(total - 1 - idx)
             table.add_row(
-                short_ts,
+                _format_local_time(e.get("ts")),
                 badge,
                 ident,
-                _format_backend(e.get("backend")),
                 str(e.get("type", "?")),
                 _format_runtime(runtime),
                 _format_detail(e),
@@ -629,9 +623,7 @@ class HistoryScreen(Screen):
         single line showing the latest status + dispatch count."""
         rows = _aggregate_by_job(events)
         if not rows:
-            table.add_row(
-                "—", "—", "no events", "—", "—", "—", "—", "—", key="__empty__"
-            )
+            table.add_row("—", "—", "no events", "—", "—", "—", "—", key="__empty__")
             return
         for row in rows:
             ident = row["identifier"]
@@ -642,13 +634,10 @@ class HistoryScreen(Screen):
             if resolved is not None:
                 self._row_watch[row_key] = resolved
             badge = src[:1].upper() if src else "?"
-            ts = str(e.get("ts", ""))
-            short_ts = ts[11:19] if len(ts) >= 19 else ts
             table.add_row(
-                short_ts,
+                _format_local_time(e.get("ts")),
                 badge,
                 ident,
-                _format_backend(row["backend"]),
                 str(e.get("type", "?")),
                 str(row["runs"]),
                 _format_runtime(row["runtime"]),
