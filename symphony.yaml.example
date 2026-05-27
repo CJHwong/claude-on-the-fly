@@ -1,55 +1,70 @@
-# claude-symphony daemon config.
-# Place at ~/.claude-on-the-fly/symphony.yaml.
-# Edit and re-save while running to hot-reload prompts; restart to apply changes
-# in this file (e.g. adding a tracker, changing polling cadence).
+# claude-symphony config. Lives at ~/.claude-on-the-fly/symphony.yaml.
+# Edit + save while the daemon runs to hot-reload (structural changes apply on
+# the next poll tick; instruction-file edits apply on the next turn).
+#
+# ── Auth (no tokens in this file) ───────────────────────────────────────────
+#   Jira   → run `acli auth login` once; symphony shells out to acli.
+#   GitHub → run `gh auth login`   once; symphony shells out to gh.
+#
+# ── Instruction files (the agent's prompt) ──────────────────────────────────
+#   Each tracker picks ONE instruction file by stem via `instruction:`.
+#   Resolved from, local winning over remote:
+#     ~/.claude-on-the-fly/symphony/<kind>/<stem>.md          (local)
+#     <remote config cache>/prompts/<kind>/<stem>.md           (if config_source)
+#   So jira's default is ~/.claude-on-the-fly/symphony/jira/_default.md.
+#   Drop pm.md / qa.md / rnd.md next to it and set `instruction:` to pick one.
 
-# -- Multi-tracker shape (recommended) ---------------------------------------
-# Each source has its own active/terminal states, gate label, and prompt path.
-# The daemon polls every configured tracker in parallel and shares the global
-# `max_concurrent` budget across sources.
-
+# The tracker's key (jira / github) is its `kind`. Only add an explicit
+# `kind:` line if you name a stanza something else (e.g. a second github).
 trackers:
   jira:
-    kind: jira                      # registered in SUPPORTED_TRACKERS
+    # base_url is used only to build issue URLs in the prompt — NOT for auth.
     base_url: https://your-org.atlassian.net
-    email: $JIRA_EMAIL                # resolved against os.environ
-    api_token: $JIRA_API_TOKEN
     project_key: PROJ
-    jql_extra: 'AND assignee = currentUser() AND labels = "stevedore"'
-    # Defaults shown; uncomment to override:
-    # active_states:   ["To Do", "In Progress"]
-    # terminal_states: ["Done", "Closed", "Cancelled"]
-    # gate_label: stevedore           # agent removes this to park / finish
-    prompt: ./symphony-prompt-jira.md
-    # max_concurrent_by_state:        # per-state caps on top of global
+    # `jql` is the single candidate filter — the full clause, no leading AND.
+    # Effective query: project = "<project_key>" AND (<jql>).
+    # Encode your active-status filter here. A ticket that STOPS matching the
+    # jql (moved to Done, reassigned, label removed) is how the daemon knows to
+    # stop working it — there are no active_states / terminal_states lists.
+    jql: 'status not in ("Done") AND assignee = currentUser()'
+    # Max tickets worked at once for THIS tracker (no global cap across trackers).
+    max_concurrent: 1
+    # Which instruction file to use (stem, no .md). Default: _default.
+    instruction: _default
+    # Optional per-status sub-caps under max_concurrent (lowercased status names):
+    # max_concurrent_by_state:
     #   "rework": 1
     #   "in progress": 5
 
   github:
-    kind: github                    # PRs requesting your review (gh CLI auth)
-    # `gh` must be on PATH and authenticated (gh auth login).
-    # Submitting any review removes you from `reviewRequests`, which is
-    # symphony's "done" signal.
-    # search_query: "is:pr is:open -is:draft user-review-requested:@me"
-    #   GitHub code-search syntax. Add org:, repo:, updated:, label:, etc.
-    #   e.g. to scope to an org and recent PRs:
-    #   "is:pr is:open -is:draft user-review-requested:@me org:gofreight updated:>=2026-05-15"
-    #   To include drafts, drop -is:draft. To monitor all repo PRs,
-    #   drop user-review-requested:@me and add repo:owner/name.
-    # Defaults shown; uncomment to override:
-    # active_states:   ["open"]
-    # terminal_states: ["closed", "merged"]
-    prompt: ./symphony-prompt-github.md
+    # GitHub code-search syntax. PR states (open/closed/merged) are hardcoded;
+    # the "done" signal is submitting any review (removes you from reviewRequests).
+    # Add org:/repo:/label:/updated: to scope. Drop -is:draft to include drafts.
+    search_query: "is:pr is:open -is:draft user-review-requested:@me"
+    max_concurrent: 1
+    instruction: _default
+    # Per-repo instruction overrides (owner/repo -> stem). Repos not listed
+    # use `instruction` above. Files live at symphony/github/<stem>.md.
+    # instruction_by_repo:
+    #   hardcoretech/fms: fms-review
+    #   hardcoretech/svc-rocket: rocket-review
+    # Skip PRs younger than this many ms (0 = no delay). Useful to let CI settle.
+    # cool_down_ms: 1200000
 
-# -- Global limits (apply across all sources) --------------------------------
-# polling_ms: 30000
-# max_concurrent: 1                  # cap across ALL trackers combined
-# max_turns: 20                      # -1 = unlimited; then stall_timeout_ms only
-# turn_timeout_ms: 3600000
-# stall_timeout_ms: 1800000
-# max_retry_backoff_ms: 300000
+# ── Global limits ────────────────────────────────────────────────────────────
+polling_ms: 30000          # how often to poll each tracker (min 1000)
+max_turns: 20              # turns per worker session before a continuation retry
+                           # (-1 = unlimited; rely on stall_timeout_ms to stop)
+turn_timeout_ms: 3600000   # hard timeout for a single agent turn
+stall_timeout_ms: 1800000  # cancel a worker idle this long (0 disables)
+max_no_progress_turns: 3   # stop after this many consecutive turns with zero
+                           # tool use (the agent is producing nothing; 0 disables)
+max_retry_backoff_ms: 300000   # cap on exponential backoff after failures
 
-# -- Backward compat ---------------------------------------------------------
-# The legacy singular `tracker:` form (with top-level `prompt:`, `gate_label:`,
-# and `max_concurrent_by_state:`) is still accepted and auto-wrapped into a
-# single-entry trackers map. Existing configs keep working without edits.
+# ── Online config (optional) ─────────────────────────────────────────────────
+# Pull structural config + instruction files from a git repo. The local file
+# then holds only the source pointer + any scalar overrides of remote keys.
+# Auth is git's own (HTTPS credential helper / SSH). Private + public both work.
+# config_source: git+https://github.com/<your-org>/symphony-config@main
+# config_path: pm/                 # optional subdir within the repo
+# config_refresh_ms: 300000        # re-fetch cadence (min 30s)

@@ -21,8 +21,6 @@ def _write_pair(tmp_path, *, body: str = "hi", extras: str = "") -> tuple:
         f"""
 tracker:
   base_url: https://x.atlassian.net
-  email: $J_EMAIL
-  api_token: $J_TOK
   project_key: PROJ
 {extras}
 """
@@ -33,8 +31,9 @@ tracker:
 
 @pytest.fixture
 def env_creds(monkeypatch):
-    monkeypatch.setenv("J_EMAIL", "me@x.com")
-    monkeypatch.setenv("J_TOK", "tok")
+    """No-op fixture retained so existing test signatures stay stable. Auth
+    moved to `acli auth login` and is no longer config-driven."""
+    return None
 
 
 def test_resolve_env_passthrough():
@@ -67,16 +66,29 @@ def test_expand_path_tilde(tmp_path, monkeypatch):
 
 
 def test_tracker_missing_required():
+    """base_url and project_key are still required; email/token are gone."""
     cfg = TrackerConfig.from_dict(
         {
-            "base_url": "https://x.atlassian.net",
-            "email": "",
-            "api_token": "",
-            "project_key": "PROJ",
+            "base_url": "",
+            "project_key": "",
         }
     )
     with pytest.raises(ValueError):
         cfg.validate()
+
+
+def test_tracker_rejects_legacy_email_and_api_token():
+    """Old configs that still carry email/api_token must fail loudly so
+    operators know to switch to `acli auth login`."""
+    with pytest.raises(ValueError, match="acli auth login"):
+        TrackerConfig.from_dict(
+            {
+                "base_url": "https://x.atlassian.net",
+                "email": "me@x.com",
+                "api_token": "tok",
+                "project_key": "PROJ",
+            }
+        )
 
 
 def test_load_config_defaults(tmp_path, env_creds):
@@ -87,40 +99,77 @@ def test_load_config_defaults(tmp_path, env_creds):
     cfg.validate()
     tracker = cfg.tracker
     assert isinstance(tracker, JiraTrackerConfig)
-    assert tracker.email == "me@x.com"
-    assert tracker.api_token == "tok"
+    assert tracker.base_url == "https://x.atlassian.net"
     assert tracker.project_key == "PROJ"
-    assert tracker.active_states == ("To Do", "In Progress")
+    assert tracker.jql == ""  # no candidate filter by default
     assert cfg.polling_ms == 30000
-    assert cfg.max_concurrent == 1
+    assert tracker.max_concurrent == 1  # default per-tracker budget
     assert cfg.max_turns == 20
-    assert tracker.prompt_path == prompt_path.resolve()
+    assert tracker.instruction == "_default"  # default instruction selection
 
 
 def test_load_config_overrides(tmp_path, env_creds):
+    """Legacy shape: top-level max_concurrent is hoisted into the wrapped
+    Jira tracker (back-compat with old singular `tracker:` configs)."""
     cfg_path, _ = _write_pair(
         tmp_path,
-        extras=(
-            "polling_ms: 5000\n"
-            "max_concurrent: 3\n"
-            "max_turns: 10\n"
-            "gate_label: stevedore\n"
-        ),
+        extras=("polling_ms: 5000\nmax_concurrent: 3\nmax_turns: 10\n"),
     )
     cfg = load_config(cfg_path)
     assert cfg.polling_ms == 5000
-    assert cfg.max_concurrent == 3
+    assert cfg.tracker.max_concurrent == 3
     assert cfg.max_turns == 10
-    assert cfg.tracker.gate_label == "stevedore"
 
 
-def test_load_config_explicit_prompt_path(tmp_path, env_creds):
-    custom_prompt = tmp_path / "custom.md"
-    custom_prompt.write_text("custom")
-    cfg_path, _ = _write_pair(tmp_path, extras=f"prompt: {custom_prompt}\n")
+def test_load_config_top_level_max_concurrent_rejected_with_new_trackers_shape(
+    tmp_path,
+):
+    """Under the new `trackers:` shape, top-level `max_concurrent:` is
+    ambiguous and rejected — operators must put it under each tracker."""
+    cfg_path = tmp_path / "symphony.yaml"
+    prompt = tmp_path / "symphony-prompt.md"
+    prompt.write_text("hi")
+    cfg_path.write_text(
+        """
+trackers:
+  jira:
+    kind: jira
+    base_url: https://x.atlassian.net
+    project_key: PROJ
+max_concurrent: 5
+"""
+    )
+    with pytest.raises(ValueError, match="Top-level `max_concurrent` is no longer"):
+        load_config(cfg_path)
+
+
+def test_load_config_instruction_parsed(tmp_path, env_creds):
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text(
+        """
+tracker:
+  base_url: https://x.atlassian.net
+  project_key: PROJ
+  instruction: pm
+"""
+    )
     cfg = load_config(cfg_path)
     cfg.validate()
-    assert cfg.tracker.prompt_path == custom_prompt.resolve()
+    assert cfg.tracker.instruction == "pm"
+
+
+def test_load_config_rejects_legacy_prompt_key(tmp_path, env_creds):
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text(
+        """
+tracker:
+  base_url: https://x.atlassian.net
+  project_key: PROJ
+  prompt: ./some-prompt.md
+"""
+    )
+    with pytest.raises(ValueError, match="tracker.prompt / tracker.prompts_dir"):
+        load_config(cfg_path)
 
 
 def test_load_config_polling_min(tmp_path, env_creds):
@@ -130,8 +179,18 @@ def test_load_config_polling_min(tmp_path, env_creds):
 
 
 def test_load_config_max_concurrent_min(tmp_path, env_creds):
+    """Per-tracker max_concurrent must be >= 1."""
     cfg_path, _ = _write_pair(tmp_path, extras="max_concurrent: 0\n")
-    with pytest.raises(ValueError, match="max_concurrent"):
+    cfg = load_config(cfg_path)
+    with pytest.raises(ValueError, match="tracker.max_concurrent must be >= 1"):
+        cfg.validate()
+
+
+def test_load_config_max_concurrent_non_numeric(tmp_path, env_creds):
+    """A non-numeric max_concurrent fails with a clean message, not a raw
+    int() ValueError."""
+    cfg_path, _ = _write_pair(tmp_path, extras="max_concurrent: two\n")
+    with pytest.raises(ValueError, match="max_concurrent must be an integer"):
         load_config(cfg_path)
 
 
@@ -188,8 +247,6 @@ def test_tracker_kind_defaults_to_jira():
     cfg = TrackerConfig.from_dict(
         {
             "base_url": "https://x.atlassian.net",
-            "email": "a@b",
-            "api_token": "t",
             "project_key": "P",
         }
     )
@@ -201,20 +258,30 @@ def test_tracker_kind_normalizes_case():
         {
             "kind": "JIRA",
             "base_url": "https://x.atlassian.net",
-            "email": "a@b",
-            "api_token": "t",
             "project_key": "P",
         }
     )
     assert cfg.kind == "jira"
 
 
-def test_load_config_missing_prompt_file(tmp_path, env_creds):
-    cfg_path, prompt_path = _write_pair(tmp_path)
-    prompt_path.unlink()
+def test_load_config_missing_instruction_file_is_not_a_validate_error(
+    tmp_path, env_creds
+):
+    """The instruction file is resolved at runtime (local + remote dirs), so a
+    missing file is NOT a config-validation error — the daemon falls back to
+    the built-in prompt and logs a warning."""
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text(
+        """
+tracker:
+  base_url: https://x.atlassian.net
+  project_key: PROJ
+  instruction: nonexistent
+"""
+    )
     cfg = load_config(cfg_path)
-    with pytest.raises(ValueError, match="prompt file not found"):
-        cfg.validate()
+    cfg.validate()  # must not raise
+    assert cfg.tracker.instruction == "nonexistent"
 
 
 def test_load_config_invalid_yaml(tmp_path):
@@ -249,8 +316,6 @@ def test_tracker_validate_base_url_required() -> None:
     cfg = TrackerConfig.from_dict(
         {
             "base_url": "",
-            "email": "e@x.com",
-            "api_token": "tok",
             "project_key": "PROJ",
         }
     )
@@ -258,25 +323,10 @@ def test_tracker_validate_base_url_required() -> None:
         cfg.validate()
 
 
-def test_tracker_validate_api_token_required() -> None:
-    cfg = TrackerConfig.from_dict(
-        {
-            "base_url": "https://x.atlassian.net",
-            "email": "e@x.com",
-            "api_token": "",
-            "project_key": "PROJ",
-        }
-    )
-    with pytest.raises(ValueError, match="tracker.api_token is required"):
-        cfg.validate()
-
-
 def test_tracker_validate_project_key_required() -> None:
     cfg = TrackerConfig.from_dict(
         {
             "base_url": "https://x.atlassian.net",
-            "email": "e@x.com",
-            "api_token": "tok",
             "project_key": "",
         }
     )
@@ -313,57 +363,71 @@ def test_load_config_new_multi_tracker_shape(tmp_path, env_creds):
     """`trackers:` map with both jira and github stanzas constructs a
     SymphonyConfig with one entry per source."""
     cfg_path = tmp_path / "symphony.yaml"
-    jira_prompt = tmp_path / "symphony-prompt-jira.md"
-    gh_prompt = tmp_path / "symphony-prompt-github.md"
-    jira_prompt.write_text("jira prompt")
-    gh_prompt.write_text("github prompt")
     cfg_path.write_text(
-        f"""
+        """
 trackers:
   jira:
-    kind: jira
     base_url: https://x.atlassian.net
-    email: $J_EMAIL
-    api_token: $J_TOK
     project_key: PROJ
-    gate_label: stevedore
-    prompt: {jira_prompt}
+    instruction: rnd
   github:
-    kind: github
-    prompt: {gh_prompt}
+    instruction: qa
 polling_ms: 5000
 """
     )
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
     cfg = load_config(cfg_path)
     cfg.validate()
     assert set(cfg.trackers) == {"jira", "github"}
     jira = cfg.trackers["jira"]
     gh = cfg.trackers["github"]
-    assert jira.kind == "jira"
-    assert jira.gate_label == "stevedore"
-    assert jira.prompt_path == jira_prompt.resolve()
-    assert gh.kind == "github"
-    assert gh.gate_label is None  # no gate label for github
-    assert gh.active_states == ("open",)
-    assert gh.terminal_states == ("closed", "merged")
-    assert gh.prompt_path == gh_prompt.resolve()
+    assert isinstance(gh, GitHubTrackerConfig)  # narrows for search_query below
+    assert jira.kind == "jira"  # inferred from the key
+    assert jira.instruction == "rnd"
+    assert gh.kind == "github"  # inferred from the key
+    assert gh.search_query == "is:pr is:open -is:draft user-review-requested:@me"
+    assert gh.instruction == "qa"
     assert cfg.polling_ms == 5000
 
 
+def test_kind_inferred_from_key_no_explicit_kind(tmp_path, env_creds):
+    """A stanza with no `kind:` takes its kind from the key name."""
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text(
+        """
+trackers:
+  github:
+    search_query: is:pr is:open
+"""
+    )
+    cfg = load_config(cfg_path)
+    cfg.validate()
+    assert cfg.trackers["github"].kind == "github"
+
+
 def test_load_config_legacy_singular_tracker_form_is_wrapped(tmp_path, env_creds):
-    """Old shape with `tracker:` + top-level prompt/gate_label is auto-wrapped
-    into the new `trackers:` map, hoisting those fields into the wrapped
-    tracker so existing configs keep working."""
-    cfg_path, _ = _write_pair(tmp_path, extras="gate_label: stevedore\n")
+    """Old shape with `tracker:` is auto-wrapped into the new `trackers:` map."""
+    cfg_path, _ = _write_pair(tmp_path)
     cfg = load_config(cfg_path)
     cfg.validate()
     # The wrapped tracker is keyed by its `kind`.
     assert set(cfg.trackers) == {"jira"}
-    jira = cfg.trackers["jira"]
-    assert jira.gate_label == "stevedore"
-    # Singular alias and convenience properties still work.
-    assert cfg.tracker is jira
-    assert cfg.tracker.gate_label == "stevedore"
+    assert cfg.tracker.kind == "jira"
+
+
+def test_load_config_rejects_gate_label(tmp_path, env_creds):
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text(
+        """
+tracker:
+  base_url: https://x.atlassian.net
+  project_key: PROJ
+  gate_label: stevedore
+"""
+    )
+    with pytest.raises(ValueError, match="tracker.gate_label is no longer"):
+        load_config(cfg_path)
 
 
 def test_load_config_unsupported_kind_raises(tmp_path, env_creds):
@@ -378,9 +442,7 @@ def test_github_tracker_config_defaults_no_auth_fields_needed():
 
     cfg = GitHubTrackerConfig.from_dict({"kind": "github"})
     assert cfg.kind == "github"
-    assert cfg.active_states == ("open",)
-    assert cfg.terminal_states == ("closed", "merged")
-    assert cfg.gate_label is None
+    assert cfg.search_query == "is:pr is:open -is:draft user-review-requested:@me"
 
 
 def test_github_tracker_config_search_query_default():
@@ -414,3 +476,57 @@ def test_trackers_must_be_mapping(tmp_path, env_creds):
     cfg_path.write_text("trackers: not-a-map\n")
     with pytest.raises(ValueError, match="`trackers` must be a mapping"):
         load_config(cfg_path)
+
+
+def test_dump_effective_config_renders_yaml():
+    from claude_on_the_fly.symphony.config import (
+        GitHubTrackerConfig,
+        JiraTrackerConfig,
+        SymphonyConfig,
+        dump_effective_config,
+    )
+
+    cfg = SymphonyConfig(
+        trackers={
+            "jira": JiraTrackerConfig(
+                kind="jira",
+                base_url="https://x.atlassian.net",
+                project_key="ACES",
+                jql='status = "In Progress"',
+                instruction="_default",
+            ),
+            "github": GitHubTrackerConfig(
+                kind="github", instruction="qa", max_concurrent=5
+            ),
+        }
+    )
+    out = dump_effective_config(cfg)
+    # Readable, sorted YAML with the per-tracker fields present.
+    assert "trackers:" in out
+    assert "project_key: ACES" in out
+    assert "instruction: _default" in out
+    assert "instruction: qa" in out
+    assert "polling_ms:" in out
+    # `kind` is inferred from the stanza key — don't echo it back.
+    assert "kind:" not in out
+
+
+def test_dump_effective_config_keeps_overridden_kind():
+    """A stanza whose kind differs from its key is a real override — keep it."""
+    from claude_on_the_fly.symphony.config import (
+        JiraTrackerConfig,
+        SymphonyConfig,
+        dump_effective_config,
+    )
+
+    cfg = SymphonyConfig(
+        trackers={
+            "secondary": JiraTrackerConfig(
+                kind="jira",
+                base_url="https://x.atlassian.net",
+                project_key="ACES",
+            )
+        }
+    )
+    out = dump_effective_config(cfg)
+    assert "kind: jira" in out
