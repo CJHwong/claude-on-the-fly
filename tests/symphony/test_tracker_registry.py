@@ -19,8 +19,6 @@ def _cfg(kind: str = "jira") -> TrackerConfig:
         {
             "kind": kind,
             "base_url": "https://x.atlassian.net",
-            "email": "me@x.com",
-            "api_token": "tok",
             "project_key": "PROJ",
         }
     )

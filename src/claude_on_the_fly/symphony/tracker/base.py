@@ -37,18 +37,27 @@ class Tracker(Protocol):
         """Return tickets matching the active-state gate. Daemon polls this every tick."""
         ...
 
-    async def fetch_summaries_by_keys(self, keys: list[str]) -> dict[str, IssueSummary]:
+    async def fetch_summaries_by_keys(
+        self, keys: list[str], cfg: TrackerCommonConfig
+    ) -> dict[str, IssueSummary]:
         """Batched snapshot fetch for reconciliation. Returns key → IssueSummary
-        (state + adapter-specific `extra` fields). Keys not visible to this
-        account are absent."""
+        (state + adapter-specific `extra` fields).
+
+        `cfg` is passed so adapters whose active/done decision depends on
+        config (Jira: the `jql` filter) can compute it. The orchestrator
+        treats a *missing* key as "transient failure, skip" — so adapters
+        that want a key cancelled must return a summary for it with the
+        relevant `extra` flag set, not omit it.
+        """
         ...
 
     def is_terminal(self, summary: IssueSummary, cfg: TrackerCommonConfig) -> bool:
-        """True when the issue has reached a terminal state — orchestrator
-        cancels the worker AND removes its workspace.
+        """True when the issue is done-done — orchestrator cancels the worker
+        AND removes its workspace.
 
-        Jira: `state in cfg.terminal_states`.
-        GitHub: PR closed or merged.
+        Jira: always False (cleanup is deferred to startup GC; there is no
+        terminal status list anymore).
+        GitHub: PR closed or merged (universal lifecycle constants).
         """
         ...
 
@@ -56,8 +65,8 @@ class Tracker(Protocol):
         """True when the issue should keep its worker running. False means
         cancel the worker but leave the workspace ("parked").
 
-        Jira: state in active_states AND gate label still attached (or no gate).
-        GitHub: PR open AND current user still in `reviewRequests`.
+        Jira: the ticket still matches the candidate `jql`.
+        GitHub: PR open AND user hasn't reviewed the current head SHA.
         """
         ...
 

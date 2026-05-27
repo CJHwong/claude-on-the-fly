@@ -83,6 +83,10 @@ class GhCliError(RuntimeError):
 class GitHubTracker:
     """Adapter for GitHub pull-request review work."""
 
+    # PR lifecycle states are universal GitHub constants, not user config.
+    _ACTIVE_STATES: tuple[str, ...] = ("open",)
+    _TERMINAL_STATES: tuple[str, ...] = ("closed", "merged")
+
     def __init__(self, *, timeout_s: float = 30.0) -> None:
         if shutil.which("gh") is None:
             raise RuntimeError(
@@ -94,9 +98,9 @@ class GitHubTracker:
 
     @classmethod
     def from_config(cls, cfg: TrackerCommonConfig) -> GitHubTracker:
-        # GitHubTrackerConfig carries no GitHub-specific fields today; gh CLI
-        # handles auth via its own state. Common fields like active_states /
-        # terminal_states are used at the predicate level, not at construction.
+        # gh CLI handles auth via its own state. PR lifecycle states are
+        # hardcoded in the adapter (see _ACTIVE_STATES / _TERMINAL_STATES),
+        # not read from config.
         return cls()
 
     async def _run_gh(self, args: list[str]) -> bytes:
@@ -415,10 +419,16 @@ class GitHubTracker:
             reviews = []
         return GitHubTracker._reviews_match_head(reviews, head_oid, login)
 
-    async def fetch_summaries_by_keys(self, keys: list[str]) -> dict[str, IssueSummary]:
+    async def fetch_summaries_by_keys(
+        self, keys: list[str], cfg: TrackerCommonConfig | None = None
+    ) -> dict[str, IssueSummary]:
         """Per-key `gh pr view` fetch, run concurrently. The N subprocess
         spawns still happen but they're awaited together — for 5 running
-        PRs that's one wall-clock round-trip instead of five sequential."""
+        PRs that's one wall-clock round-trip instead of five sequential.
+
+        `cfg` is accepted for protocol parity with Jira but unused — GitHub's
+        active/done decision is self-contained (PR state + reviewed-at-head).
+        """
         if not keys:
             return {}
         login = await self._get_login()
@@ -482,8 +492,9 @@ class GitHubTracker:
         return out
 
     def is_terminal(self, summary: IssueSummary, cfg: TrackerCommonConfig) -> bool:
-        """GitHub PRs are terminal once closed or merged."""
-        return summary.state in cfg.terminal_states
+        """GitHub PRs are terminal once closed or merged. The states are
+        universal GitHub constants, not config."""
+        return summary.state in self._TERMINAL_STATES
 
     def is_active(self, summary: IssueSummary, cfg: TrackerCommonConfig) -> bool:
         """Keep running while the PR is open AND the user hasn't reviewed
@@ -495,7 +506,7 @@ class GitHubTracker:
         after the review, the head SHA changes and the worker (or a fresh
         dispatch) re-engages.
         """
-        if summary.state not in cfg.active_states:
+        if summary.state not in self._ACTIVE_STATES:
             return False
         return not bool(summary.extra.get("user_reviewed_current_head"))
 
