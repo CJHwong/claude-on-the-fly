@@ -64,6 +64,7 @@ class DashboardScreen(Screen):
     BINDINGS = [
         ("l", "app.push_screen('logs')", "Logs"),
         ("d", "app.push_screen('doctor')", "Doctor"),
+        ("g", "app.push_screen('config')", "Config"),
         # `h` opens the symphony event history full-screen — separate from
         # the live tickets pane so the dashboard stays focused on now.
         ("h", "app.push_screen('history')", "History"),

@@ -134,3 +134,54 @@ class TestEditAndDiff:
 
         diff = edit_and_diff(env_file, runner=runner)
         assert diff.changed == {"TELEGRAM_BOT_TOKEN": ("old", "new")}
+
+
+# ---------------------------------------------------------------------------
+# open_in_editor — generic config-file editor launch (used for symphony.yaml)
+# ---------------------------------------------------------------------------
+
+
+class TestOpenInEditor:
+    def test_seeds_template_when_missing(self, tmp_path):
+
+        from claude_on_the_fly.tui.env_editor import open_in_editor
+
+        calls = []
+
+        def fake_runner(cmd, **kwargs):
+            calls.append(cmd)
+
+        target = tmp_path / "sub" / "symphony.yaml"
+        created = open_in_editor(target, seed="# template\n", runner=fake_runner)
+        assert created is True
+        assert target.read_text() == "# template\n"
+        # The editor was launched with the path as the last arg.
+        assert calls and str(target) == calls[0][-1]
+
+    def test_existing_file_not_overwritten(self, tmp_path):
+        from claude_on_the_fly.tui.env_editor import open_in_editor
+
+        target = tmp_path / "symphony.yaml"
+        target.write_text("existing: yes\n")
+        created = open_in_editor(
+            target, seed="# template\n", runner=lambda cmd, **k: None
+        )
+        assert created is False
+        assert target.read_text() == "existing: yes\n"
+
+
+def test_example_yaml_parses_and_validates(tmp_path, monkeypatch):
+    """The embedded template (seeded on first edit) must be a valid config."""
+    from claude_on_the_fly.symphony.config import EXAMPLE_YAML, load_config
+
+    cfg_path = tmp_path / "symphony.yaml"
+    cfg_path.write_text(EXAMPLE_YAML)
+    from claude_on_the_fly.symphony.config import JiraTrackerConfig
+
+    cfg = load_config(cfg_path)
+    cfg.validate()
+    assert set(cfg.trackers) == {"jira", "github"}
+    jira = cfg.trackers["jira"]
+    assert isinstance(jira, JiraTrackerConfig)  # narrows for project_key
+    assert jira.project_key == "PROJ"
+    assert jira.instruction == "_default"

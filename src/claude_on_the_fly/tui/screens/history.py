@@ -265,6 +265,7 @@ class HistoryScreen(Screen):
         ("r", "refresh_now", "Refresh"),
         ("s", "cycle_source", "Filter source"),
         ("a", "toggle_view", "Aggregated/Events"),
+        ("o", "open_link", "Open PR/ticket"),
         ("t", "copy_takeover", "Copy takeover"),
         ("w", "toggle_watch", "Watch session"),
     ]
@@ -280,6 +281,8 @@ class HistoryScreen(Screen):
         # Cache the identifier → source map of *visible* rows so the takeover
         # binding can resolve the highlighted row without re-tailing the log.
         self._row_sources: dict[str, str] = {}
+        # Lazy cache: jira source name -> base_url, for building browse URLs.
+        self._jira_base_urls_cache: dict[str, str] | None = None
         # Cursor row key → resolved (workspace, session_uuid) for the watch
         # pane. Symphony rows derive deterministically; chat rows read from
         # the event row's session_uuid field.
@@ -315,7 +318,7 @@ class HistoryScreen(Screen):
         self.query_one("#hist-watch-wrap", Vertical).display = False
         self.query_one("#history-footer-hint", Static).update(
             "[dim]r refresh    s cycle source filter    a aggregated/events    "
-            "t copy takeover    w toggle watch    Esc back[/dim]"
+            "o open PR/ticket    t copy takeover    w toggle watch    Esc back[/dim]"
         )
         self._refresh()
         self.set_interval(2.0, self._refresh_if_changed)
@@ -448,6 +451,64 @@ class HistoryScreen(Screen):
             f"copied takeover cmd for {ident} (tracker={tracker})",
             "information",
         )
+
+    def _jira_base_urls(self) -> dict[str, str]:
+        """Lazy map of jira source name -> base_url, read from the resolved
+        config (cached). Used to build `<base_url>/browse/<KEY>` links."""
+        if self._jira_base_urls_cache is not None:
+            return self._jira_base_urls_cache
+        out: dict[str, str] = {}
+        try:
+            from claude_on_the_fly.symphony.config import (
+                JiraTrackerConfig,
+                load_config,
+            )
+
+            cfg = load_config(DATA_DIR / "symphony.yaml")
+            for src, tcfg in cfg.trackers.items():
+                if isinstance(tcfg, JiraTrackerConfig) and tcfg.base_url:
+                    out[src] = tcfg.base_url
+        except Exception:
+            pass  # no config / load failure → no jira links (github still works)
+        self._jira_base_urls_cache = out
+        return out
+
+    def _row_url(self, identifier: str, tracker: str | None) -> str | None:
+        """Reconstruct the browser URL for a row's PR/ticket.
+
+        GitHub PRs are detected by identifier shape (`owner/repo#N`), so they
+        work regardless of the tracker's name. Jira needs the tracker's
+        base_url from config.
+        """
+        if "/" in identifier and "#" in identifier:
+            head, _, num = identifier.partition("#")
+            if head.count("/") == 1 and num.isdigit():
+                return f"https://github.com/{head}/pull/{num}"
+        if tracker and "-" in identifier:
+            base = self._jira_base_urls().get(tracker)
+            if base:
+                return f"{base.rstrip('/')}/browse/{identifier}"
+        return None
+
+    def action_open_link(self) -> None:
+        """Open the highlighted row's PR / Jira ticket in the browser."""
+        import webbrowser
+
+        row_key = self._cursor_row_key()
+        if not isinstance(row_key, str):
+            self._notify("no row selected", "warning")
+            return
+        _, _, ident = row_key.rpartition(":")
+        url = self._row_url(ident, self._row_sources.get(ident))
+        if not url:
+            self._notify(f"no link for {ident}", "warning")
+            return
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            self._notify(f"open failed: {exc}", "error")
+            return
+        self._notify(f"opening {url}", "information")
 
     def _cursor_row_key(self) -> str | None:
         table = self.query_one("#history-table", DataTable)

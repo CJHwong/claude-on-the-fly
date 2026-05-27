@@ -57,6 +57,27 @@ def _resolve_editor() -> list[str]:
     return raw.split()
 
 
+def open_in_editor(
+    path: Path,
+    *,
+    seed: str | None = None,
+    runner=subprocess.run,
+) -> bool:
+    """Open `$EDITOR` on `path`. Returns True if the file was created from
+    `seed` (a template) because it didn't exist yet.
+
+    Used for editing config files (symphony.yaml) where we want a commented
+    template on first open rather than an empty buffer.
+    """
+    created = False
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(seed or "")
+        created = True
+    runner(_resolve_editor() + [str(path)], check=False)
+    return created
+
+
 def edit_and_diff(
     env_file: Path,
     *,

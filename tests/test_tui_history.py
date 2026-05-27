@@ -406,3 +406,41 @@ class TestAggregateByJob:
         rows = _aggregate_by_job(events)
         assert rows[0]["backend"] == "claude:native:sonnet"
         assert rows[0]["runs"] == 2
+
+
+class TestRowUrl:
+    def _screen(self):
+        from claude_on_the_fly.tui.screens.history import HistoryScreen
+
+        s = HistoryScreen()
+        s._jira_base_urls_cache = {"jira": "https://hardcoretech.atlassian.net"}
+        return s
+
+    def test_github_pr_url(self) -> None:
+        s = self._screen()
+        assert (
+            s._row_url("hardcoretech/fms#42", "github")
+            == "https://github.com/hardcoretech/fms/pull/42"
+        )
+
+    def test_github_detected_by_shape_regardless_of_tracker_name(self) -> None:
+        s = self._screen()
+        assert (
+            s._row_url("owner/repo#7", "github-fms")
+            == "https://github.com/owner/repo/pull/7"
+        )
+
+    def test_jira_browse_url(self) -> None:
+        s = self._screen()
+        assert (
+            s._row_url("ACES-123", "jira")
+            == "https://hardcoretech.atlassian.net/browse/ACES-123"
+        )
+
+    def test_no_url_for_unknown_shape(self) -> None:
+        s = self._screen()
+        assert s._row_url("owner/repo", "github") is None  # no #N
+        assert s._row_url("bare", "jira") is None  # no -KEY
+        assert (
+            s._row_url("ACES-1", "github") is None
+        )  # github tracker, no base_url path
