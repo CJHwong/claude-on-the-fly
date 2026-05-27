@@ -13,11 +13,21 @@ import yaml
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.scheduler import (
+    EXAMPLE_YAML,
     JobSpec,
     SchedulerFrontend,
     load_config,
     next_fire,
 )
+
+
+def test_example_yaml_is_valid_yaml_with_jobs_key() -> None:
+    """The seeded template must be parseable YAML shaped like a real config.
+    `jobs` is empty by design (the loader nudges you to add one), so we don't
+    assert load_config succeeds — only that the seed isn't malformed."""
+    parsed = yaml.safe_load(EXAMPLE_YAML)
+    assert isinstance(parsed, dict)
+    assert parsed.get("jobs") == []
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,37 @@ DEFAULT_TIMEOUT = 1800
 MAX_TIMEOUT = 86400
 NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 
+# Commented reference config. Seeded into a missing schedule.yaml and reused as
+# the header when documenting an existing one. Lives here, next to JobSpec and
+# load_config, so the example and the schema can't drift apart.
+EXAMPLE_YAML = """\
+# Scheduler jobs. Each fires on a cron schedule; output is appended to
+# logs/schedule-<name>.log. The file auto-reloads when you save it.
+#
+# Every job needs:
+#   name     letters, digits, '-' and '_' only
+#   cron     standard 5-field cron expression
+#   prompt | script   exactly one:
+#     prompt  text run through the agent (a fresh session per fire)
+#     script  absolute path to an executable run as a subprocess
+# Optional:
+#   args     list of string args (script jobs only)
+#   timeout  seconds; default 1800, max 86400
+#
+# Example:
+#   jobs:
+#     - name: morning-digest
+#       cron: "0 9 * * *"
+#       prompt: "Summarise overnight PRs and post the highlights."
+#       timeout: 1800
+#     - name: cleanup
+#       cron: "*/30 * * * *"
+#       script: /absolute/path/to/cleanup.sh
+#       args: ["--verbose"]
+
+jobs: []  # add at least one job — an empty list won't load
+"""
+
 
 # ---------------------------------------------------------------------------
 # Config
