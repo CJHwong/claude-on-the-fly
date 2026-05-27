@@ -31,18 +31,14 @@ def _config(**overrides: object) -> SymphonyConfig:
     tracker = JiraTrackerConfig(
         kind="jira",
         base_url="https://x.atlassian.net",
-        email="me@x.com",
-        api_token="tok",
         project_key="PROJ",
-        gate_label="exit_label",
-        prompt_path=Path("/tmp/symphony-prompt.md"),
+        instruction="_default",
     )
     global_defaults = {
         "turn_timeout_ms": 60_000,
         "max_turns": 10,
         "stall_timeout_ms": 300_000,
         "polling_ms": 30_000,
-        "max_concurrent": 3,
         "max_retry_backoff_ms": 3600_000,
     }
     return SymphonyConfig(
@@ -138,7 +134,6 @@ async def test_run_turn_calls_agent_run_with_correct_args() -> None:
             issue=issue,
             attempt=3,
             workspace_path=Path("/tmp/ws"),
-            gate_label="exit_label",
         )
         mock_agent_run.assert_awaited_once_with(
             workspace=Path("/tmp/ws"),

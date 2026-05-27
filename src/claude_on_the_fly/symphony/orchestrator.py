@@ -4,14 +4,14 @@ continuation turns.
 Multi-source: each tick reconciles running workers' state per source (catching
 mid-turn terminal/inactive transitions and stall timeouts), processes due
 retries per source, then fetches and dispatches new candidates from each
-source. Global `max_concurrent` is shared across sources; per-state caps live
-on each tracker config.
+source. Concurrency is per-tracker (`max_concurrent`); no global cap.
 
 Source-vs-tracker terminology:
-- `trackers: dict[str, Tracker]` keys are source names (`"jira"`, `"github"`).
+- `trackers: dict[str, Tracker]` keys are source names (the tracker's key in
+  the config; defaults to the kind, `"jira"` / `"github"`).
 - `config.trackers: dict[str, TrackerCommonConfig]` mirrors that keying.
-- `prompt_sources: dict[str, str]` holds the rendered prompt template per
-  source so workers from different sources can use different prompts.
+- prompt resolution: one `InstructionResolver` per source resolves each
+  issue's instruction file (default stem or per-repo override) at dispatch.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import logging
 import time
 from itertools import count
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
 from claude_on_the_fly.heartbeat import HeartbeatWriter
@@ -35,7 +35,8 @@ from claude_on_the_fly.events import (
     EVENT_WORKER_FAILED,
     EventLog,
 )
-from .prompt import PromptStore
+from .cursor import CursorStore, is_claimable
+from .prompt import InstructionResolver
 from .retry import RetryQueue
 from .state import OrchestratorState, RunningEntry
 from .tracker import Tracker, make_trackers
@@ -50,11 +51,34 @@ from .workspace import (
 logger = logging.getLogger(__name__)
 
 
+def _prompt_source_for(
+    prompt_sources: Mapping[str, object], source: str, identifier: str
+) -> str:
+    """Return the prompt template string for a specific issue.
+
+    `prompt_sources[source]` is either:
+    - an `InstructionResolver` (production): resolves the issue's instruction
+      stem (per-repo override or the tracker default) and hot-reloads the file.
+    - a `str` (test-only): the literal template source.
+    """
+    entry = prompt_sources.get(source)
+    if entry is None:
+        return ""
+    if isinstance(entry, InstructionResolver):
+        return entry.resolve_for(identifier)
+    if isinstance(entry, str):
+        return entry
+    raise TypeError(
+        f"prompt_sources[{source!r}] has unexpected type {type(entry).__name__}"
+    )
+
+
 def _eligible(
     issue: Issue,
     state: OrchestratorState,
     retry_queue: RetryQueue,
     tracker_cfg: TrackerCommonConfig,
+    cursor_store: CursorStore | None = None,
 ) -> bool:
     if state.is_claimed(issue.key):
         return False
@@ -62,15 +86,16 @@ def _eligible(
         return False
     if not issue.id or not issue.identifier or not issue.title or not issue.state:
         return False
-    if issue.state not in tracker_cfg.active_states:
-        return False
-    if issue.state in tracker_cfg.terminal_states:
-        return False
-    if issue.state.lower() == "to do":
-        terminal = set(tracker_cfg.terminal_states)
-        for blocker in issue.blocked_by:
-            if blocker.state and blocker.state not in terminal:
-                return False
+    # No active/terminal-state checks: the candidate fetch is authoritative
+    # (Jira's `jql`, GitHub's `search_query` + reviewed-at-head filter). If a
+    # ticket came back as a candidate, it qualifies.
+    # Cursor gating (replaces gate_label for Jira). For trackers without a
+    # CursorStore (e.g. GitHub uses review-removal as its done signal), this
+    # check is skipped.
+    if cursor_store is not None:
+        cursor = cursor_store.load(issue.identifier)
+        if not is_claimable(ticket_updated=issue.updated_at, cursor=cursor):
+            return False
     return True
 
 
@@ -86,9 +111,14 @@ def _select_candidates(
     state: OrchestratorState,
     retry_queue: RetryQueue,
     tracker_cfg: TrackerCommonConfig,
+    cursor_store: CursorStore | None = None,
 ) -> list[Issue]:
     return sorted(
-        [i for i in fetched if _eligible(i, state, retry_queue, tracker_cfg)],
+        [
+            i
+            for i in fetched
+            if _eligible(i, state, retry_queue, tracker_cfg, cursor_store)
+        ],
         key=_sort_key,
     )
 
@@ -103,10 +133,12 @@ async def _run_worker(
     retry_queue: RetryQueue,
     event_log: EventLog,
     starting_failure_attempt: int = 0,
+    cursor_store: CursorStore | None = None,
 ) -> None:
     identifier = issue.identifier
     key = issue.key
     source = issue.source
+    outcome = "unknown"
     try:
         workspace = ensure_workspace(identifier, source=source)
     except Exception:
@@ -145,6 +177,7 @@ async def _run_worker(
     )
 
     try:
+        no_progress = 0  # consecutive turns that completed with zero tool use
         turn_iter = count() if config.max_turns < 0 else range(config.max_turns)
         for attempt in turn_iter:
             try:
@@ -181,13 +214,55 @@ async def _run_worker(
                 response.format_tools() or "-",
             )
 
+            # No-progress guard: a turn that completes without invoking any
+            # tool produced nothing actionable (e.g. an empty/synthetic backend
+            # reply). The wall-clock stall_timeout can't catch this because each
+            # turn resets the idle timer. Bail after N in a row instead of
+            # churning to max_turns.
+            if config.max_no_progress_turns > 0:
+                no_progress = 0 if response.has_tools else no_progress + 1
+                if no_progress >= config.max_no_progress_turns:
+                    outcome = "no_progress"
+                    logger.warning(
+                        "[%s] %d consecutive turns with no tool use (model=%s); "
+                        "agent making no progress, stopping",
+                        identifier,
+                        no_progress,
+                        response.model or "?",
+                    )
+                    event_log.append(
+                        EVENT_WORKER_FAILED,
+                        source="symphony",
+                        tracker=source,
+                        backend=current_backend_key(),
+                        identifier=identifier,
+                        workspace=workspace,
+                        session_uuid=sid,
+                        error=f"no progress: {no_progress} turns with no tool use",
+                    )
+                    retry_queue.schedule_failure(
+                        issue.id,
+                        identifier,
+                        config.max_retry_backoff_ms,
+                        attempt=starting_failure_attempt + 1,
+                        error="no tool use",
+                        source=source,
+                    )
+                    return
+
+            # Decide stop / park / continue via the same summary path the
+            # daemon reconciler uses, so worker and daemon never disagree.
+            # For Jira this re-runs the candidate JQL membership (needs cfg);
+            # for GitHub it re-checks PR state + reviewed-at-head.
             try:
-                refreshed = await tracker.fetch_one(identifier)
+                summaries = await tracker.fetch_summaries_by_keys(
+                    [identifier], tracker_cfg
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
-                    "[%s] failed to refresh issue after turn; scheduling failure retry",
+                    "[%s] failed to refresh state after turn; scheduling failure retry",
                     identifier,
                 )
                 retry_queue.schedule_failure(
@@ -200,14 +275,28 @@ async def _run_worker(
                 )
                 return
 
-            # Apply the tracker's predicates against the refreshed issue so the
-            # decision logic for "stop / park / continue" lives in the adapter.
-            refreshed_summary = tracker.issue_to_summary(refreshed)
-            if tracker.is_terminal(refreshed_summary, tracker_cfg):
-                logger.info(
-                    "[%s] terminal state %s; removing workspace",
+            summary = summaries.get(identifier)
+            if summary is None:
+                # Per the tracker Protocol a missing key is a TRANSIENT fetch
+                # gap (e.g. a `gh pr view` blip), NOT terminal — do not remove
+                # the workspace. Reschedule and let the next attempt re-fetch.
+                logger.warning(
+                    "[%s] state missing after turn (transient); scheduling retry",
                     identifier,
-                    refreshed.state,
+                )
+                retry_queue.schedule_failure(
+                    issue.id,
+                    identifier,
+                    config.max_retry_backoff_ms,
+                    attempt=starting_failure_attempt + 1,
+                    error="state missing post-turn",
+                    source=source,
+                )
+                return
+            if tracker.is_terminal(summary, tracker_cfg):
+                outcome = "terminal"
+                logger.info(
+                    "[%s] terminal/gone after turn; removing workspace", identifier
                 )
                 remove_workspace(workspace)
                 event_log.append(
@@ -218,15 +307,16 @@ async def _run_worker(
                     identifier=identifier,
                     workspace=workspace,
                     session_uuid=sid,
-                    state=refreshed.state,
+                    state=summary.state,
                     reason="terminal",
                 )
                 return
-            if not tracker.is_active(refreshed_summary, tracker_cfg):
+            if not tracker.is_active(summary, tracker_cfg):
+                outcome = "inactive"
                 logger.info(
                     "[%s] inactive after turn (state=%s); leaving workspace",
                     identifier,
-                    refreshed.state,
+                    summary.state,
                 )
                 event_log.append(
                     EVENT_WORKER_DONE,
@@ -236,15 +326,35 @@ async def _run_worker(
                     identifier=identifier,
                     workspace=workspace,
                     session_uuid=sid,
-                    state=refreshed.state,
+                    state=summary.state,
                     reason="inactive",
                 )
                 return
 
+            # Continuing: refresh the full issue for the next turn's prompt.
+            try:
+                refreshed = await tracker.fetch_one(identifier)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "[%s] failed to refresh issue for next turn; scheduling retry",
+                    identifier,
+                )
+                retry_queue.schedule_failure(
+                    issue.id,
+                    identifier,
+                    config.max_retry_backoff_ms,
+                    attempt=starting_failure_attempt + 1,
+                    error="post-turn refresh failed",
+                    source=source,
+                )
+                return
             runner.issue = refreshed
             state.update_running_state(key, refreshed.state)
 
         # Only reachable when max_turns is a finite positive value.
+        outcome = "max_turns"
         logger.info(
             "[%s] max_turns=%d reached; scheduling continuation retry",
             identifier,
@@ -252,8 +362,10 @@ async def _run_worker(
         )
         retry_queue.schedule_continuation(issue.id, identifier, source=source)
     except asyncio.CancelledError:
+        outcome = "cancelled"
         raise
     except Exception as exc:
+        outcome = "crash"
         logger.exception(
             "[%s] worker crashed; scheduling failure retry",
             identifier,
@@ -278,6 +390,22 @@ async def _run_worker(
         )
     finally:
         state.release(key)
+        # Persist the cursor on every completion path. Skipped when no
+        # store is configured for this tracker (e.g. GitHub, which uses
+        # review-removal as its done signal).
+        if cursor_store is not None:
+            try:
+                cursor_store.record_run_end(
+                    identifier,
+                    outcome=outcome,
+                    ticket_updated=runner.issue.updated_at,
+                )
+            except Exception:
+                logger.exception(
+                    "[%s] cursor record_run_end failed (outcome=%s)",
+                    identifier,
+                    outcome,
+                )
 
 
 def _dispatch(
@@ -291,6 +419,7 @@ def _dispatch(
     event_log: EventLog,
     pending_tasks: set[asyncio.Task[None]],
     starting_failure_attempt: int = 0,
+    cursor_store: CursorStore | None = None,
 ) -> None:
     """Claim, spawn worker task, register lifecycle. Caller checks capacity first."""
     try:
@@ -308,6 +437,7 @@ def _dispatch(
             retry_queue,
             event_log,
             starting_failure_attempt=starting_failure_attempt,
+            cursor_store=cursor_store,
         ),
         name=f"symphony-worker-{issue.identifier}",
     )
@@ -383,19 +513,21 @@ def _check_and_cancel_stall(
 
 def _has_per_state_capacity(
     state: OrchestratorState,
+    source: str,
     issue_state: str,
     tracker_cfg: TrackerCommonConfig,
-    global_max_concurrent: int,
 ) -> bool:
     """True if a new worker for issue_state can fit under the per-state cap.
 
-    The cap lives on the tracker config (per-source); fall back to global
-    `max_concurrent` when the state isn't explicitly limited.
+    The cap lives on the tracker config (per-source). When the state is not
+    explicitly limited, fall back to the tracker's own `max_concurrent`.
+    The per-state count is scoped to this tracker only — sibling trackers
+    do not contribute to the cap.
     """
     per_state_limit = tracker_cfg.max_concurrent_by_state.get(
-        issue_state.lower(), global_max_concurrent
+        issue_state.lower(), tracker_cfg.max_concurrent
     )
-    return state.running_by_state(issue_state) < per_state_limit
+    return state.running_by_source_and_state(source, issue_state) < per_state_limit
 
 
 async def reconcile(
@@ -438,8 +570,8 @@ async def reconcile(
 
     fetch_results = await asyncio.gather(
         *(
-            tracker.fetch_summaries_by_keys([e.issue_identifier for e in entries])
-            for _source, tracker, _cfg, entries in runnable
+            tracker.fetch_summaries_by_keys([e.issue_identifier for e in entries], cfg)
+            for _source, tracker, cfg, entries in runnable
         ),
         return_exceptions=True,
     )
@@ -544,13 +676,15 @@ async def startup_cleanup(
 
     fetch_results = await asyncio.gather(
         *(
-            tracker.fetch_summaries_by_keys(list(dir_to_ident.values()))
-            for _source, tracker, dir_to_ident in plans
+            tracker.fetch_summaries_by_keys(
+                list(dir_to_ident.values()), config.trackers[source]
+            )
+            for source, tracker, dir_to_ident in plans
         ),
         return_exceptions=True,
     )
 
-    for (source, _tracker, dir_to_ident), summaries in zip(plans, fetch_results):
+    for (source, tracker, dir_to_ident), summaries in zip(plans, fetch_results):
         if isinstance(summaries, BaseException):
             logger.warning(
                 "startup_cleanup[%s]: state fetch failed; skipping (%s)",
@@ -558,10 +692,18 @@ async def startup_cleanup(
                 summaries,
             )
             continue
-        terminal = set(config.trackers[source].terminal_states)
+        tracker_cfg = config.trackers[source]
         for d, ident in dir_to_ident.items():
             summary = summaries.get(ident)
-            if summary and summary.state in terminal:
+            # GC a leftover workspace when its ticket is done (terminal) or
+            # no longer active (Jira: left the JQL; GitHub: closed/merged or
+            # already reviewed-at-head). Missing summary → leave it; a
+            # transient fetch gap shouldn't delete a live ticket's scratch.
+            if summary is None:
+                continue
+            if tracker.is_terminal(summary, tracker_cfg) or not tracker.is_active(
+                summary, tracker_cfg
+            ):
                 logger.info(
                     "startup_cleanup[%s]: %s status=%s", source, d, summary.state
                 )
@@ -572,10 +714,14 @@ async def _process_due_retries(
     state: OrchestratorState,
     trackers: dict[str, Tracker],
     config: SymphonyConfig,
-    prompt_sources: dict[str, str],
+    # InstructionResolver in production, plain str in tests — see
+    # _prompt_source_for. Mapping (covariant) so dict[str, InstructionResolver]
+    # and dict[str, str] both satisfy it.
+    prompt_sources: Mapping[str, object],
     retry_queue: RetryQueue,
     event_log: EventLog,
     pending_tasks: set[asyncio.Task[None]],
+    cursor_stores: dict[str, CursorStore] | None = None,
 ) -> None:
     due = retry_queue.due_now()
     if not due:
@@ -611,8 +757,8 @@ async def _process_due_retries(
 
     fetch_results = await asyncio.gather(
         *(
-            tracker.fetch_summaries_by_keys([e.identifier for e in entries])
-            for _source, tracker, _cfg, entries in runnable
+            tracker.fetch_summaries_by_keys([e.identifier for e in entries], cfg)
+            for _source, tracker, cfg, entries in runnable
         ),
         return_exceptions=True,
     )
@@ -632,7 +778,6 @@ async def _process_due_retries(
                 )
             continue
 
-        prompt_source = prompt_sources.get(source, "")
         for entry in entries:
             summary = summaries.get(entry.identifier)
             if summary is None:
@@ -650,15 +795,19 @@ async def _process_due_retries(
                     summary.state,
                 )
                 continue
-            if state.running_count() >= config.max_concurrent:
+            if state.running_by_source(source) >= tracker_cfg.max_concurrent:
                 logger.debug(
-                    "[%s] retry: no global slot, requeueing (1s)", entry.identifier
+                    "[%s] retry: tracker %s at capacity, requeueing (1s)",
+                    entry.identifier,
+                    source,
                 )
-                retry_queue.requeue(entry, delay_ms=1000, error="no global slots")
+                retry_queue.requeue(
+                    entry,
+                    delay_ms=1000,
+                    error=f"no {source} slots",
+                )
                 continue
-            if not _has_per_state_capacity(
-                state, summary.state, tracker_cfg, config.max_concurrent
-            ):
+            if not _has_per_state_capacity(state, source, summary.state, tracker_cfg):
                 logger.debug(
                     "[%s] retry: per-state cap hit for %s, requeueing (1s)",
                     entry.identifier,
@@ -683,41 +832,42 @@ async def _process_due_retries(
                 )
                 continue
 
-            # Race window: state changed between summary check and fetch_one.
-            fresh_summary = tracker.issue_to_summary(issue)
-            if not tracker.is_active(fresh_summary, tracker_cfg):
-                logger.info(
-                    "[%s] retry: became inactive between summary and fetch, dropping",
-                    entry.identifier,
-                )
-                continue
-
+            # The is_active gate above already used the authoritative summary
+            # from fetch_summaries_by_keys (which sets the kind-specific signal,
+            # e.g. Jira's matches_jql). Don't re-derive activeness from
+            # issue_to_summary here — for Jira that projection can't know
+            # matches_jql and would drop every retry. Any state drift in the
+            # sub-second window before dispatch is caught by the worker's first
+            # post-turn reconcile.
             _dispatch(
                 issue,
                 state,
                 tracker,
                 tracker_cfg,
                 config,
-                prompt_source,
+                _prompt_source_for(prompt_sources, source, issue.identifier),
                 retry_queue,
                 event_log,
                 pending_tasks,
                 starting_failure_attempt=entry.attempt,
+                cursor_store=(cursor_stores or {}).get(source),
             )
 
 
 async def tick(
     state: OrchestratorState,
     config: SymphonyConfig,
-    prompt_sources: dict[str, str],
+    # InstructionResolver in production, plain str in tests (see
+    # _prompt_source_for); Mapping is covariant so both dict shapes satisfy it.
+    prompt_sources: Mapping[str, object],
     trackers: dict[str, Tracker],
     retry_queue: RetryQueue,
     event_log: EventLog,
     pending_tasks: set[asyncio.Task[None]],
+    cursor_stores: dict[str, CursorStore] | None = None,
 ) -> None:
     """One scheduling pass: reconcile -> process retries -> fetch and dispatch
-    new candidates from every source. Global `max_concurrent` is shared
-    across sources."""
+    new candidates from every source. Per-tracker concurrency caps."""
     await reconcile(state, trackers, config, retry_queue, event_log)
     await _process_due_retries(
         state,
@@ -727,15 +877,25 @@ async def tick(
         retry_queue,
         event_log,
         pending_tasks,
+        cursor_stores=cursor_stores,
     )
 
-    if state.running_count() >= config.max_concurrent:
+    # Per-tracker capacity check — skip the global short-circuit. Each
+    # tracker has its own budget and the fan-out below also enforces.
+    if all(
+        state.running_by_source(source) >= cfg.max_concurrent
+        for source, cfg in config.trackers.items()
+    ):
         return
 
     # Fetch from each source in parallel — independent network calls
-    # shouldn't serialize the tick. Then filter to eligible, merge, sort,
-    # and dispatch under the global capacity ceiling.
-    sources = list(trackers.items())
+    # shouldn't serialize the tick. Skip trackers already at capacity to
+    # save a poll.
+    sources = [
+        (source, tracker)
+        for source, tracker in trackers.items()
+        if state.running_by_source(source) < config.trackers[source].max_concurrent
+    ]
     fetch_results = await asyncio.gather(
         *(
             tracker.fetch_candidates(config.trackers[source])
@@ -754,7 +914,10 @@ async def tick(
             )
             continue
         tracker_cfg = config.trackers[source]
-        for issue in _select_candidates(fetched, state, retry_queue, tracker_cfg):
+        cursor_store = (cursor_stores or {}).get(source)
+        for issue in _select_candidates(
+            fetched, state, retry_queue, tracker_cfg, cursor_store
+        ):
             candidates.append((issue, source))
 
     if not candidates:
@@ -762,21 +925,23 @@ async def tick(
 
     candidates.sort(key=lambda pair: _sort_key(pair[0]))
 
+    total_capacity = sum(
+        max(0, cfg.max_concurrent - state.running_by_source(source))
+        for source, cfg in config.trackers.items()
+    )
     logger.debug(
         "tick: %d eligible candidates (across %d source(s)), capacity=%d",
         len(candidates),
         len(trackers),
-        config.max_concurrent - state.running_count(),
+        total_capacity,
     )
 
     for issue, source in candidates:
-        if state.running_count() >= config.max_concurrent:
-            break
         tracker = trackers[source]
         tracker_cfg = config.trackers[source]
-        if not _has_per_state_capacity(
-            state, issue.state, tracker_cfg, config.max_concurrent
-        ):
+        if state.running_by_source(source) >= tracker_cfg.max_concurrent:
+            continue
+        if not _has_per_state_capacity(state, source, issue.state, tracker_cfg):
             continue
         _dispatch(
             issue,
@@ -784,53 +949,46 @@ async def tick(
             tracker,
             tracker_cfg,
             config,
-            prompt_sources.get(source, ""),
+            _prompt_source_for(prompt_sources, source, issue.identifier),
             retry_queue,
             event_log,
             pending_tasks,
             starting_failure_attempt=0,
+            cursor_store=(cursor_stores or {}).get(source),
         )
 
 
-def _redact_token(token: str) -> str:
-    if not token:
-        return "<unset>"
-    if len(token) <= 4:
-        return "***"
-    return f"{token[:2]}***{token[-2:]}"
-
-
 def _log_config_summary(config: SymphonyConfig) -> None:
-    """Dump the resolved config to the log at startup. Redacts the api token."""
+    """Dump the resolved config to the log at startup. No secrets to redact —
+    Jira auth lives in `acli`, GitHub auth lives in `gh`."""
     from .config import JiraTrackerConfig
 
     logger.info("symphony config:")
     logger.info("  trackers: %d configured", len(config.trackers))
+    from .config import GitHubTrackerConfig
+
     for source, t in config.trackers.items():
         logger.info("  [%s] kind            = %s", source, t.kind)
         if isinstance(t, JiraTrackerConfig):
             logger.info("  [%s] base_url        = %s", source, t.base_url)
-            logger.info("  [%s] email           = %s", source, t.email)
             logger.info("  [%s] project_key     = %s", source, t.project_key)
-            if t.jql_extra:
-                logger.info("  [%s] jql_extra       = %s", source, t.jql_extra)
-            logger.info(
-                "  [%s] api_token       = %s", source, _redact_token(t.api_token)
-            )
-        logger.info("  [%s] active_states   = %s", source, list(t.active_states))
-        logger.info("  [%s] terminal_states = %s", source, list(t.terminal_states))
-        logger.info("  [%s] gate_label      = %s", source, t.gate_label or "<none>")
-        logger.info("  [%s] prompt_path     = %s", source, t.prompt_path)
+            logger.info("  [%s] jql             = %s", source, t.jql or "<none>")
+            logger.info("  [%s] auth            = acli", source)
+        if isinstance(t, GitHubTrackerConfig):
+            logger.info("  [%s] search_query    = %s", source, t.search_query)
+            logger.info("  [%s] auth            = gh", source)
+        logger.info("  [%s] max_concurrent  = %d", source, t.max_concurrent)
+        logger.info("  [%s] instruction     = %s", source, t.instruction)
         logger.info(
             "  [%s] max_concurrent_by_state = %s",
             source,
             dict(t.max_concurrent_by_state) or "<none>",
         )
     logger.info("  polling_ms          = %d", config.polling_ms)
-    logger.info("  max_concurrent      = %d", config.max_concurrent)
     logger.info("  max_turns           = %d", config.max_turns)
     logger.info("  turn_timeout_ms     = %d", config.turn_timeout_ms)
     logger.info("  stall_timeout_ms    = %d", config.stall_timeout_ms)
+    logger.info("  max_no_progress_turns = %d", config.max_no_progress_turns)
     logger.info("  max_retry_backoff_ms = %d", config.max_retry_backoff_ms)
 
 
@@ -864,21 +1022,254 @@ def _heartbeat_extra(
     }
 
 
+def _instructions_root() -> Path:
+    """Local instructions dir: ~/.claude-on-the-fly/symphony/<kind>/<name>.md."""
+    from .. import agent as _agent_mod
+
+    return _agent_mod.DATA_DIR / "symphony"
+
+
+def _remote_prompts_root(config_path: Path) -> Path | None:
+    from .remote_config import remote_prompts_root
+
+    cache_root = (config_path.parent / ".config-cache").resolve()
+    return remote_prompts_root(config_path, cache_root=cache_root)
+
+
+def _build_prompt_resolvers(
+    config: SymphonyConfig, *, local_root: Path, remote_root: Path | None
+) -> dict[str, InstructionResolver]:
+    """One InstructionResolver per tracker. Resolves each issue's instruction
+    file from its default stem (or a per-repo override) at dispatch time."""
+    resolvers: dict[str, InstructionResolver] = {}
+    for source, tracker_cfg in config.trackers.items():
+        resolvers[source] = InstructionResolver(
+            kind=tracker_cfg.kind,
+            default_instruction=tracker_cfg.instruction,
+            instruction_by_repo=getattr(tracker_cfg, "instruction_by_repo", None),
+            local_root=local_root,
+            remote_root=remote_root,
+        )
+    return resolvers
+
+
+def _refresh_prompt_stores(
+    stores: dict[str, InstructionResolver],
+    config: SymphonyConfig,
+    *,
+    config_path: Path,
+) -> None:
+    """Rebuild the resolver map in place (instruction / per-repo map may have
+    changed, or a remote refresh added/changed files)."""
+    rebuilt = _build_prompt_resolvers(
+        config,
+        local_root=_instructions_root(),
+        remote_root=_remote_prompts_root(config_path),
+    )
+    stores.clear()
+    stores.update(rebuilt)
+
+
+def _build_cursor_stores(
+    config: SymphonyConfig, state_root: Path
+) -> dict[str, CursorStore]:
+    from .config import JiraTrackerConfig
+
+    return {
+        source: CursorStore(state_root, source)
+        for source, tracker_cfg in config.trackers.items()
+        if isinstance(tracker_cfg, JiraTrackerConfig)
+    }
+
+
+def _cancel_workers_for_sources(
+    state: OrchestratorState, sources: set[str], *, reason: str
+) -> int:
+    """Cancel every running worker whose source is in `sources`. Returns count."""
+    count_cancelled = 0
+    for entry in state.all_running():
+        if entry.source not in sources:
+            continue
+        if entry.task is not None and not entry.task.done():
+            logger.info(
+                "[%s] cancelling worker (%s, source=%s)",
+                entry.issue_identifier,
+                reason,
+                entry.source,
+            )
+            entry.task.cancel()
+            count_cancelled += 1
+    return count_cancelled
+
+
+def _trim_workers_to_budget(
+    state: OrchestratorState, source: str, new_budget: int
+) -> int:
+    """Cancel newest workers for `source` until `running_by_source(source) <= new_budget`.
+
+    Returns the number cancelled. Newest = highest `started_at`, on the
+    theory that they have the least sunk work.
+    """
+    running = sorted(
+        (e for e in state.all_running() if e.source == source),
+        key=lambda e: e.started_at,
+        reverse=True,
+    )
+    excess = max(0, len(running) - new_budget)
+    cancelled = 0
+    for entry in running[:excess]:
+        if entry.task is not None and not entry.task.done():
+            logger.info(
+                "[%s] cancelling newest worker (concurrency reduced to %d)",
+                entry.issue_identifier,
+                new_budget,
+            )
+            entry.task.cancel()
+            cancelled += 1
+    return cancelled
+
+
+def _read_config_refresh_ms(config_path: Path) -> int | None:
+    """Read the local `config_refresh_ms` (a local-only key, stripped from the
+    merged config). Returns None when there's no `config_source` to refresh."""
+    try:
+        import yaml as _yaml
+
+        raw = _yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        logger.warning(
+            "could not read %s for config_refresh_ms; periodic remote refresh "
+            "disabled for this run",
+            config_path,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(raw, dict) or not raw.get("config_source"):
+        return None
+    try:
+        value = int(raw.get("config_refresh_ms", 300000))
+    except (TypeError, ValueError):
+        return 300000
+    return max(value, 30000)  # floor at 30s, matching the spec
+
+
+def _maybe_reload_config(
+    *,
+    config_path: Path,
+    config: SymphonyConfig,
+    last_mtime: float | None,
+    state: OrchestratorState,
+    trackers: dict[str, Tracker],
+    prompt_stores: dict[str, InstructionResolver],
+    cursor_stores: dict[str, CursorStore],
+    state_root: Path,
+    force: bool = False,
+) -> tuple[SymphonyConfig, float | None]:
+    """Check the config file's mtime; reload + apply changes when it bumps.
+
+    `force=True` bypasses the mtime short-circuit — used by the periodic
+    remote-config refresh, where the local file is unchanged but the remote
+    git cache may have moved.
+
+    Returns the (possibly updated) config and the new mtime. On any reload
+    failure, logs and keeps the current config (last-known-good).
+    """
+    try:
+        mtime = config_path.stat().st_mtime
+    except FileNotFoundError:
+        logger.warning(
+            "config file vanished at %s; keeping last-known-good", config_path
+        )
+        return config, last_mtime
+    if not force and last_mtime is not None and mtime == last_mtime:
+        return config, last_mtime
+    if not force and last_mtime is None:
+        return config, mtime
+    try:
+        new_config = load_config(config_path)
+        new_config.validate()
+    except Exception:
+        logger.exception(
+            "config reload failed; keeping last-known-good (%s)", config_path
+        )
+        return config, mtime
+
+    logger.info("config reload: %s", config_path)
+
+    old_sources = set(config.trackers)
+    new_sources = set(new_config.trackers)
+    removed = old_sources - new_sources
+    added = new_sources - old_sources
+
+    if removed:
+        n = _cancel_workers_for_sources(state, removed, reason="tracker removed")
+        for source in removed:
+            trackers.pop(source, None)
+            cursor_stores.pop(source, None)
+        logger.info(
+            "config reload: dropped tracker(s) %s (cancelled %d worker(s))",
+            sorted(removed),
+            n,
+        )
+
+    if added:
+        from .tracker import make_tracker
+        from .config import JiraTrackerConfig
+
+        for source in added:
+            tcfg = new_config.trackers[source]
+            trackers[source] = make_tracker(tcfg)
+            if isinstance(tcfg, JiraTrackerConfig):
+                cursor_stores[source] = CursorStore(state_root, source)
+        logger.info("config reload: added tracker(s) %s", sorted(added))
+
+    # Concurrency reductions: cancel newest workers per source if the new
+    # cap is lower than the current running count.
+    for source in new_sources & old_sources:
+        new_cap = new_config.trackers[source].max_concurrent
+        running = state.running_by_source(source)
+        if running > new_cap:
+            n = _trim_workers_to_budget(state, source, new_cap)
+            logger.info(
+                "config reload: %s max_concurrent reduced %d→%d, cancelled %d",
+                source,
+                running,
+                new_cap,
+                n,
+            )
+
+    # Rebuild prompt stores in place — covers added/removed trackers, a
+    # changed `instruction` selection, and remote files added on refresh.
+    _refresh_prompt_stores(prompt_stores, new_config, config_path=config_path)
+
+    return new_config, mtime
+
+
 async def run_loop(config_path, stop_event: asyncio.Event) -> None:
-    """Main daemon loop. Hot-reloads prompts; ticks at configured cadence."""
+    """Main daemon loop. Hot-reloads symphony.yaml + prompts; ticks at configured cadence."""
+    config_path = Path(config_path)
     config = load_config(config_path)
     config.validate()
     _log_config_summary(config)
 
-    # One PromptStore per source; mtime-based hot-reload kicks in on
-    # `maybe_reload()` each tick.
-    prompt_stores: dict[str, PromptStore] = {
-        source: PromptStore(tracker_cfg.prompt_path)
-        for source, tracker_cfg in config.trackers.items()
-    }
-    prompt_sources: dict[str, str] = {
-        source: store.load() for source, store in prompt_stores.items()
-    }
+    prompt_stores: dict[str, InstructionResolver] = {}
+    _refresh_prompt_stores(prompt_stores, config, config_path=config_path)
+
+    from .. import agent as _agent_mod
+
+    state_root = _agent_mod.DATA_DIR / "symphony" / "state"
+    cursor_stores = _build_cursor_stores(config, state_root)
+
+    try:
+        last_config_mtime: float | None = config_path.stat().st_mtime
+    except FileNotFoundError:
+        last_config_mtime = None
+
+    # Periodic remote-config refresh. When the local file declares a
+    # `config_source`, re-fetch the git cache every `config_refresh_ms`
+    # even though the local file's mtime hasn't changed.
+    config_refresh_ms = _read_config_refresh_ms(config_path)
+    last_remote_refresh = time.monotonic()
 
     trackers = make_trackers(config)
     state = OrchestratorState()
@@ -902,18 +1293,41 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
         await startup_cleanup(WORKSPACES_ROOT, trackers, config)
 
         while not stop_event.is_set():
-            for source, store in prompt_stores.items():
-                prompt_sources[source] = store.maybe_reload()
+            # Periodic remote refresh: if config_refresh_ms has elapsed,
+            # force a reload so the git cache is re-fetched (the local file
+            # mtime gate wouldn't catch an upstream-only change).
+            force_reload = False
+            if config_refresh_ms is not None:
+                now = time.monotonic()
+                if (now - last_remote_refresh) * 1000 >= config_refresh_ms:
+                    last_remote_refresh = now
+                    force_reload = True
+
+            # Per-tick: check for config edits and apply structural changes
+            # (added/removed trackers, concurrency reductions, instruction
+            # changes). Prompt content reload is per-dispatch via mtime.
+            config, last_config_mtime = _maybe_reload_config(
+                config_path=config_path,
+                config=config,
+                last_mtime=last_config_mtime,
+                state=state,
+                trackers=trackers,
+                prompt_stores=prompt_stores,
+                cursor_stores=cursor_stores,
+                state_root=state_root,
+                force=force_reload,
+            )
 
             try:
                 await tick(
                     state,
                     config,
-                    prompt_sources,
+                    prompt_stores,
                     trackers,
                     retry_queue,
                     event_log,
                     pending_tasks,
+                    cursor_stores=cursor_stores,
                 )
             except Exception:
                 logger.exception("tick: unexpected failure (continuing)")

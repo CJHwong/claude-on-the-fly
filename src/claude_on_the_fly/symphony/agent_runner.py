@@ -56,7 +56,6 @@ class TicketRunner:
             issue=self.issue,
             attempt=attempt,
             workspace_path=self.workspace,
-            gate_label=self.tracker_cfg.gate_label,
         )
         logger.debug(
             "[%s] turn %d: prompt len=%d session=%s",

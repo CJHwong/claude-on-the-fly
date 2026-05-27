@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path.home() / ".claude-on-the-fly"
 DEFAULT_CONFIG = DATA_DIR / "symphony.yaml"
 
-SUBCOMMANDS = ("run", "takeover", "watch")
+SUBCOMMANDS = ("run", "takeover", "watch", "config", "doctor")
 
 # Auto-detect heuristics. Conservative — falls through to workspace scan if
 # neither matches.
@@ -135,7 +135,7 @@ async def _run(config_path: Path) -> None:
     await orchestrator.run_loop(config_path, stop)
 
 
-def _cmd_run(config_path: Path) -> int:
+def _cmd_run(config_path: Path, *, once: bool = False) -> int:
     if not config_path.exists():
         sys.stderr.write(f"config not found: {config_path}\n")
         sys.stderr.write(
@@ -145,12 +145,123 @@ def _cmd_run(config_path: Path) -> int:
         return 2
 
     _setup_logging()
-    logger.info("claude-symphony: config=%s", config_path)
+    logger.info("claude-symphony: config=%s once=%s", config_path, once)
+
+    if once:
+        return _cmd_run_once(config_path)
 
     try:
         asyncio.run(_run(config_path))
     except KeyboardInterrupt:
         pass
+    return 0
+
+
+def _cmd_run_once(config_path: Path) -> int:
+    """Single poll tick + exit. Useful for debugging config / tracker auth."""
+
+    async def _one_tick() -> int:
+        from .config import load_config
+        from .orchestrator import (
+            _build_cursor_stores,
+            _refresh_prompt_stores,
+            make_trackers,
+            tick as _tick,
+        )
+        from claude_on_the_fly.events import EventLog
+        from .retry import RetryQueue
+        from .state import OrchestratorState
+        from .. import agent as _agent_mod
+
+        cfg = load_config(config_path)
+        cfg.validate()
+        trackers = make_trackers(cfg)
+        state = OrchestratorState()
+        retry_queue = RetryQueue(event_log=EventLog())
+        prompts: dict = {}
+        _refresh_prompt_stores(prompts, cfg, config_path=config_path)
+        cursors = _build_cursor_stores(cfg, _agent_mod.DATA_DIR / "symphony" / "state")
+        await _tick(
+            state,
+            cfg,
+            prompts,
+            trackers,
+            retry_queue,
+            EventLog(),
+            set(),
+            cursor_stores=cursors,
+        )
+        sys.stdout.write(f"one tick complete. running={state.running_count()}\n")
+        return 0
+
+    try:
+        return asyncio.run(_one_tick())
+    except KeyboardInterrupt:
+        return 130
+
+
+def _cmd_config_show(config_path: Path) -> int:
+    """Print the merged effective config (remote + local) as YAML."""
+    from .config import dump_effective_config, load_config
+
+    try:
+        cfg = load_config(config_path)
+    except Exception as exc:
+        sys.stderr.write(f"config load failed: {exc}\n")
+        return 2
+    sys.stdout.write(dump_effective_config(cfg))
+    return 0
+
+
+def _cmd_config_refresh(config_path: Path) -> int:
+    """Force a remote git fetch + merge right now. Useful before `run`."""
+    import yaml as _yaml
+
+    from .remote_config import RemoteConfigError, load_remote_config
+
+    try:
+        raw_local = _yaml.safe_load(config_path.read_text()) or {}
+    except Exception as exc:
+        sys.stderr.write(f"cannot read {config_path}: {exc}\n")
+        return 2
+    if not isinstance(raw_local, dict) or not raw_local.get("config_source"):
+        sys.stdout.write("no `config_source` in local config — nothing to refresh.\n")
+        return 0
+    cache_root = (config_path.parent / ".config-cache").resolve()
+    try:
+        working, merged, source = load_remote_config(config_path, cache_root=cache_root)
+    except RemoteConfigError as exc:
+        sys.stderr.write(f"remote refresh failed: {exc}\n")
+        return 2
+    if source is None or working is None or merged is None:
+        sys.stdout.write("no remote config to refresh.\n")
+        return 0
+    sys.stdout.write(
+        f"refreshed {source.url}@{source.ref}\n"
+        f"  cache:   {working}\n"
+        f"  trackers: {sorted(merged.get('trackers') or [])}\n"
+    )
+    return 0
+
+
+def _cmd_doctor() -> int:
+    """Run preflight checks for symphony's tool dependencies."""
+    from claude_on_the_fly.checks import check_all
+
+    groups = check_all()
+    failed = 0
+    for name, results in groups.items():
+        sys.stdout.write(f"\n[{name}]\n")
+        for r in results:
+            sys.stdout.write(f"  {r.name:30s} {r.status:8s} {r.detail}\n")
+            if r.status != "ok":
+                if r.fix_hint:
+                    sys.stdout.write(f"    hint: {r.fix_hint}\n")
+                failed += 1
+    if failed:
+        sys.stdout.write(f"\n{failed} check(s) failed\n")
+        return 1
+    sys.stdout.write("\nall checks passed\n")
     return 0
 
 
@@ -254,6 +365,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_CONFIG),
         help=f"Path to symphony.yaml (default: {DEFAULT_CONFIG})",
     )
+    run_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one poll tick then exit (debug).",
+    )
+
+    config_parser = sub.add_parser(
+        "config", help="Inspect or refresh the resolved (remote + local) config"
+    )
+    config_sub = config_parser.add_subparsers(dest="config_cmd", required=True)
+    show_parser = config_sub.add_parser(
+        "show", help="Dump the merged effective config to stdout (YAML)"
+    )
+    show_parser.add_argument("config", nargs="?", default=str(DEFAULT_CONFIG))
+    refresh_parser = config_sub.add_parser(
+        "refresh", help="Force a remote git fetch + merge right now"
+    )
+    refresh_parser.add_argument("config", nargs="?", default=str(DEFAULT_CONFIG))
+
+    sub.add_parser(
+        "doctor",
+        help="Run symphony's preflight checks (acli/gh/config/binaries)",
+    )
 
     takeover_parser = sub.add_parser(
         "takeover",
@@ -304,7 +438,18 @@ def main() -> int:
     if args.cmd == "watch":
         return _cmd_watch(args.ticket, source=args.source)
 
-    return _cmd_run(Path(args.config).expanduser())
+    if args.cmd == "config":
+        path = Path(args.config).expanduser()
+        if args.config_cmd == "show":
+            return _cmd_config_show(path)
+        if args.config_cmd == "refresh":
+            return _cmd_config_refresh(path)
+        return 2
+
+    if args.cmd == "doctor":
+        return _cmd_doctor()
+
+    return _cmd_run(Path(args.config).expanduser(), once=getattr(args, "once", False))
 
 
 if __name__ == "__main__":  # pragma: no cover

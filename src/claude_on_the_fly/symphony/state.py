@@ -71,8 +71,23 @@ class OrchestratorState:
     def running_count(self) -> int:
         return len(self._running)
 
+    def running_by_source(self, source: str) -> int:
+        """Count running workers for a specific tracker source.
+
+        Used by per-tracker concurrency accounting — each tracker has its
+        own budget, no shared global cap.
+        """
+        return sum(1 for e in self._running.values() if e.source == source)
+
     def running_by_state(self, state: str) -> int:
         return sum(1 for e in self._running.values() if e.issue_state == state)
+
+    def running_by_source_and_state(self, source: str, state: str) -> int:
+        return sum(
+            1
+            for e in self._running.values()
+            if e.source == source and e.issue_state == state
+        )
 
     def all_running(self) -> list[RunningEntry]:
         return list(self._running.values())

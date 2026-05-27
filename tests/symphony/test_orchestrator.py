@@ -18,7 +18,6 @@ from claude_on_the_fly.symphony.orchestrator import (
     _heartbeat_extra,
     _log_config_summary,
     _process_due_retries,
-    _redact_token,
     _run_worker,
     _select_candidates,
     _sort_key,
@@ -39,13 +38,18 @@ from claude_on_the_fly.symphony.tracker.issue import (
 
 
 def _summaries(
-    d: dict[str, str], *, label: str = "symphony-active"
+    d: dict[str, str], *, matches_jql: bool = True, terminal: bool = False
 ) -> dict[str, IssueSummary]:
-    """Helper: turn `{key: state}` into `{key: IssueSummary(state, {"labels": (label,)})}`.
-
-    Default label matches `_config()`'s gate_label so existing tests that
-    don't care about labels keep working with the new label check."""
-    return {k: IssueSummary(state=v, extra={"labels": (label,)}) for k, v in d.items()}
+    """Helper: turn `{key: state}` into reconcile summaries under the new
+    JQL-membership model. `matches_jql=True` (default) → active (keep
+    running); `matches_jql=False` → left the queue (park). `terminal=True`
+    simulates GitHub's closed/merged (worker cancelled + workspace removed)."""
+    return {
+        k: IssueSummary(
+            state=v, extra={"matches_jql": matches_jql, "terminal": terminal}
+        )
+        for k, v in d.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +65,7 @@ def _issue(**overrides: object) -> Issue:
         "state": "In Progress",
         "description_raw": None,
         "priority": 3,
-        # Default carries the gate_label that _config() uses, so the orchestrator's
-        # post-turn "label removed → exit" check doesn't fire spuriously. Tests
-        # that exercise parking-by-label pass labels=() explicitly.
-        "labels": ("symphony-active",),
+        "labels": (),
         "blocked_by": (),
         "parent_key": None,
         "url": "https://jira.example.com/browse/PROJ-1",
@@ -79,14 +80,10 @@ def _issue(**overrides: object) -> Issue:
 _TRACKER_FIELDS = {
     "kind",
     "base_url",
-    "email",
-    "api_token",
     "project_key",
-    "jql_extra",
-    "active_states",
-    "terminal_states",
-    "gate_label",
-    "prompt_path",
+    "jql",
+    "max_concurrent",
+    "instruction",
     "max_concurrent_by_state",
 }
 
@@ -95,14 +92,9 @@ def _tracker_cfg(**overrides: object) -> TrackerConfig:
     defaults = {
         "kind": "jira",
         "base_url": "https://jira.example.com",
-        "email": "bot@example.com",
-        "api_token": "secret",
         "project_key": "PROJ",
-        "jql_extra": 'AND status != "Done"',
-        "active_states": ("In Progress", "To Do", "In Review"),
-        "terminal_states": ("Done", "Cancelled"),
-        "gate_label": "symphony-active",
-        "prompt_path": Path("/tmp/symphony-prompt.md"),
+        "jql": 'status != "Done" AND assignee = currentUser()',
+        "instruction": "_default",
         "max_concurrent_by_state": {},
     }
     kwargs = defaults | {k: v for k, v in overrides.items() if k in _TRACKER_FIELDS}
@@ -116,6 +108,10 @@ def _config(**overrides: object) -> SymphonyConfig:
     from dataclasses import replace as _dc_replace
 
     tracker_overrides = {k: v for k, v in overrides.items() if k in _TRACKER_FIELDS}
+    # `max_concurrent` moved to the tracker config; tests still expect to
+    # pass it as a global-shape kwarg, so route it to the tracker.
+    if "max_concurrent" in overrides:
+        tracker_overrides["max_concurrent"] = overrides["max_concurrent"]
     if "tracker" in overrides:
         tracker = overrides["tracker"]
         if tracker_overrides:
@@ -127,8 +123,8 @@ def _config(**overrides: object) -> SymphonyConfig:
         "turn_timeout_ms": 60_000,
         "max_turns": 10,
         "stall_timeout_ms": 300_000,
+        "max_no_progress_turns": 3,
         "polling_ms": 30_000,
-        "max_concurrent": 3,
         "max_retry_backoff_ms": 3600_000,
     }
     global_overrides = {k: v for k, v in overrides.items() if k in global_defaults}
@@ -138,10 +134,10 @@ def _config(**overrides: object) -> SymphonyConfig:
     )
 
 
-def _mock_tracker(*, gate_label: str = "symphony-active") -> MagicMock:
-    """Mock tracker that behaves like Jira: predicates check state list +
-    optional gate label. Tests override `is_terminal` / `is_active` /
-    `issue_to_summary` when they need different semantics."""
+def _mock_tracker() -> MagicMock:
+    """Mock tracker behaving like Jira: is_active reads the `matches_jql`
+    membership flag, is_terminal reads an explicit `terminal` flag. Tests
+    override `is_terminal` / `is_active` / `issue_to_summary` as needed."""
     t = MagicMock()
     t.fetch_one = AsyncMock()
     t.fetch_summaries_by_keys = AsyncMock()
@@ -149,20 +145,19 @@ def _mock_tracker(*, gate_label: str = "symphony-active") -> MagicMock:
     t.aclose = AsyncMock()
 
     def _is_terminal(summary, cfg):
-        return summary.state in cfg.terminal_states
+        # New model: Jira is never terminal; GitHub-style terminal is flagged
+        # explicitly via summary.extra["terminal"].
+        return bool(summary.extra.get("terminal", False))
 
     def _is_active(summary, cfg):
-        if summary.state not in cfg.active_states:
-            return False
-        if cfg.gate_label is None:
-            return True
-        labels = summary.extra.get("labels") or ()
-        return cfg.gate_label.lower() in labels
+        # Active = still matches the candidate JQL (membership flag set by
+        # fetch_summaries_by_keys). Defaults active when unspecified.
+        return bool(summary.extra.get("matches_jql", True))
 
     def _issue_to_summary(issue):
         from claude_on_the_fly.symphony.tracker.issue import IssueSummary
 
-        return IssueSummary(state=issue.state, extra={"labels": issue.labels})
+        return IssueSummary(state=issue.state, extra={"matches_jql": True})
 
     t.is_terminal = MagicMock(side_effect=_is_terminal)
     t.is_active = MagicMock(side_effect=_is_active)
@@ -192,23 +187,12 @@ def _real_event_log(tmp_path: Path) -> EventLog:
 
 
 # ---------------------------------------------------------------------------
-# _redact_token / _log_config_summary
+# _log_config_summary (no secrets — auth lives in acli)
 # ---------------------------------------------------------------------------
 
 
-class TestRedactToken:
-    def test_empty_returns_unset(self) -> None:
-        assert _redact_token("") == "<unset>"
-
-    def test_short_token_masked(self) -> None:
-        assert _redact_token("abcd") == "***"
-
-    def test_long_token_partial(self) -> None:
-        assert _redact_token("abcdef12345") == "ab***45"
-
-
 class TestLogConfigSummary:
-    def test_dumps_fields_and_redacts_token(
+    def test_dumps_fields_and_notes_acli_auth(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         import logging as _logging
@@ -216,13 +200,11 @@ class TestLogConfigSummary:
         cfg = _config(
             tracker=_tracker_cfg(
                 base_url="https://j.example.com",
-                email="bot@example.com",
-                api_token="supersecrettoken",
                 project_key="PROJ",
+                instruction="rnd",
             ),
             polling_ms=15000,
             max_concurrent=3,
-            gate_label="ready_for_ai",
         )
         with caplog.at_level(
             _logging.INFO, logger="claude_on_the_fly.symphony.orchestrator"
@@ -233,14 +215,12 @@ class TestLogConfigSummary:
         assert "symphony config:" in text
         assert "[jira]" in text
         assert "https://j.example.com" in text
-        assert "bot@example.com" in text
         assert "polling_ms          = 15000" in text
-        assert "max_concurrent      = 3" in text
-        assert "ready_for_ai" in text  # gate_label
+        # max_concurrent is now per-tracker, surfaced under the [jira] block.
+        assert "[jira] max_concurrent  = 3" in text
+        assert "instruction     = rnd" in text
         assert "PROJ" in text
-        # Redaction: real token never appears, masked form does.
-        assert "supersecrettoken" not in text
-        assert "su***en" in text
+        assert "auth            = acli" in text
 
 
 # ---------------------------------------------------------------------------
@@ -327,27 +307,21 @@ class TestEligible:
             _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg()) is False
         )
 
-    def test_state_not_active(self) -> None:
-        issue = _issue(state="Unknown")
-        assert (
-            _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg()) is False
-        )
+    def test_state_no_longer_filtered(self) -> None:
+        """_eligible no longer filters by state — the candidate fetch (Jira's
+        JQL, GitHub's search) is authoritative. Any state that came back as a
+        candidate qualifies; blocker-state gating was dropped too."""
+        for state in ("Unknown", "Done", "To Do", "In Progress"):
+            issue = _issue(state=state)
+            assert (
+                _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg())
+                is True
+            ), state
 
-    def test_terminal_state(self) -> None:
-        issue = _issue(state="Done")
-        assert (
-            _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg()) is False
-        )
-
-    def test_blocked_by_non_terminal(self) -> None:
+    def test_blocked_by_no_longer_gates(self) -> None:
+        """The To-Do-with-unresolved-blockers heuristic was removed with the
+        state lists — a blocked ticket is now eligible if the JQL returned it."""
         blocker = BlockerRef(key="PROJ-2", state="In Progress")
-        issue = _issue(state="To Do", blocked_by=(blocker,))
-        assert (
-            _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg()) is False
-        )
-
-    def test_blocked_by_terminal_ok(self) -> None:
-        blocker = BlockerRef(key="PROJ-2", state="Done")
         issue = _issue(state="To Do", blocked_by=(blocker,))
         assert (
             _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg()) is True
@@ -357,6 +331,81 @@ class TestEligible:
         issue = _issue(state="In Progress")
         assert (
             _eligible(issue, OrchestratorState(), RetryQueue(), _tracker_cfg()) is True
+        )
+
+    def test_cursor_blocks_unchanged_ticket(self, tmp_path) -> None:
+        """Phase 4: cursor-based gating. When cursor is newer than the
+        ticket's updated_at, _eligible returns False so the daemon does
+        not re-claim a ticket that hasn't been touched."""
+        from claude_on_the_fly.symphony.cursor import CursorStore, TicketCursor
+
+        store = CursorStore(tmp_path, "jira")
+        store.save(
+            TicketCursor(
+                identifier="PROJ-1",
+                last_job_done_time="2026-05-27T10:00:00+00:00",
+            )
+        )
+        issue = _issue(
+            identifier="PROJ-1",
+            state="In Progress",
+            updated_at="2026-05-27T09:00:00+00:00",  # older than cursor
+        )
+        assert (
+            _eligible(
+                issue,
+                OrchestratorState(),
+                RetryQueue(),
+                _tracker_cfg(),
+                cursor_store=store,
+            )
+            is False
+        )
+
+    def test_cursor_allows_newer_ticket(self, tmp_path) -> None:
+        from claude_on_the_fly.symphony.cursor import CursorStore, TicketCursor
+
+        store = CursorStore(tmp_path, "jira")
+        store.save(
+            TicketCursor(
+                identifier="PROJ-1",
+                last_job_done_time="2026-05-27T10:00:00+00:00",
+            )
+        )
+        issue = _issue(
+            identifier="PROJ-1",
+            state="In Progress",
+            updated_at="2026-05-27T11:00:00+00:00",  # newer than cursor
+        )
+        assert (
+            _eligible(
+                issue,
+                OrchestratorState(),
+                RetryQueue(),
+                _tracker_cfg(),
+                cursor_store=store,
+            )
+            is True
+        )
+
+    def test_cursor_first_run_allows_when_no_history(self, tmp_path) -> None:
+        from claude_on_the_fly.symphony.cursor import CursorStore
+
+        store = CursorStore(tmp_path, "jira")  # empty store
+        issue = _issue(
+            identifier="PROJ-1",
+            state="In Progress",
+            updated_at="2026-05-27T11:00:00+00:00",
+        )
+        assert (
+            _eligible(
+                issue,
+                OrchestratorState(),
+                RetryQueue(),
+                _tracker_cfg(),
+                cursor_store=store,
+            )
+            is True
         )
 
 
@@ -399,14 +448,16 @@ class TestSortKey:
 
 
 class TestSelectCandidates:
-    def test_filters_and_sorts(self) -> None:
+    def test_sorts_by_priority_no_state_filter(self) -> None:
+        """No state filtering anymore (the candidate fetch is authoritative),
+        so all three sort purely by priority asc."""
         cfg = _tracker_cfg()
         a = _issue(id="1", identifier="A", priority=5, state="In Progress")
         b = _issue(id="2", identifier="B", priority=1, state="In Progress")
         c = _issue(id="3", identifier="C", priority=3, state="Done")
 
         result = _select_candidates([a, b, c], OrchestratorState(), RetryQueue(), cfg)
-        assert [i.identifier for i in result] == ["B", "A"]
+        assert [i.identifier for i in result] == ["B", "C", "A"]
 
     def test_empty_returns_empty(self) -> None:
         result = _select_candidates(
@@ -421,14 +472,11 @@ class TestSelectCandidates:
 
 
 class TestHasPerStateCapacity:
-    def test_under_global_cap_when_no_per_state_cap(self) -> None:
+    def test_under_tracker_cap_when_no_per_state_cap(self) -> None:
         state = OrchestratorState()
-        cfg = _config()
+        cfg = _config(max_concurrent=3)
         assert (
-            _has_per_state_capacity(
-                state, "In Progress", cfg.tracker, cfg.max_concurrent
-            )
-            is True
+            _has_per_state_capacity(state, "jira", "In Progress", cfg.tracker) is True
         )
 
     def test_at_per_state_cap(self) -> None:
@@ -437,9 +485,7 @@ class TestHasPerStateCapacity:
         issue = _issue(state="In Progress")
         state.claim(issue)
         assert (
-            _has_per_state_capacity(
-                state, "In Progress", config.tracker, config.max_concurrent
-            )
+            _has_per_state_capacity(state, "jira", "In Progress", config.tracker)
             is False
         )
 
@@ -449,23 +495,35 @@ class TestHasPerStateCapacity:
         issue = _issue(state="In Progress")
         state.claim(issue)
         assert (
-            _has_per_state_capacity(
-                state, "In Progress", config.tracker, config.max_concurrent
-            )
+            _has_per_state_capacity(state, "jira", "In Progress", config.tracker)
             is True
         )
 
-    def test_falls_back_to_global_concurrent(self) -> None:
-        config = _config(max_concurrent_by_state={})
+    def test_falls_back_to_tracker_max_concurrent(self) -> None:
+        config = _config(max_concurrent=3, max_concurrent_by_state={})
         state = OrchestratorState()
-        # Claim until full under global cap
-        for i in range(config.max_concurrent):
+        # Claim until tracker budget is full.
+        for i in range(config.tracker.max_concurrent):
             state.claim(_issue(id=str(i), state="In Progress"))
         assert (
-            _has_per_state_capacity(
-                state, "In Progress", config.tracker, config.max_concurrent
-            )
+            _has_per_state_capacity(state, "jira", "In Progress", config.tracker)
             is False
+        )
+
+    def test_per_state_count_is_source_scoped(self) -> None:
+        """A claim under tracker B's source does not exhaust tracker A's
+        per-state cap."""
+        config = _config(max_concurrent_by_state={"in progress": 1})
+        state = OrchestratorState()
+        # Claim once under a *different* source; jira's cap should still be open.
+        gh_issue = _issue(id="g-1", state="In Progress")
+        # _issue() defaults to source="jira"; build a github-source issue via replace.
+        from dataclasses import replace as _replace
+
+        state.claim(_replace(gh_issue, source="github"))
+        assert (
+            _has_per_state_capacity(state, "jira", "In Progress", config.tracker)
+            is True
         )
 
 
@@ -716,6 +774,55 @@ class TestRunWorker:
 
         assert rq.has(issue.key) is True
 
+    async def test_no_progress_turns_stop_worker(self) -> None:
+        """Turns that complete with zero tool use trip the no-progress guard
+        after max_no_progress_turns in a row — the worker bails instead of
+        churning to max_turns, and schedules a backoff retry."""
+        issue = _issue()
+        state = OrchestratorState()
+        state.claim(issue)
+        tracker = _mock_tracker()
+        config = _config(max_turns=20, max_no_progress_turns=3)
+        rq = RetryQueue()
+
+        # Real Response (not a MagicMock) so the guard exercises the actual
+        # `has_tools` property — a MagicMock makes it callable and would mask a
+        # `has_tools()` vs `has_tools` mistake. Empty tool_counts → has_tools False.
+        from claude_on_the_fly.agent import Response
+
+        no_tool = Response(body="", model="<synthetic>")
+
+        with (
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.ensure_workspace"
+            ) as mock_ew,
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.TicketRunner"
+            ) as mock_runner_cls,
+        ):
+            mock_ew.return_value = Path("/tmp/ws")
+            mock_runner = MagicMock()
+            mock_runner.run_turn = AsyncMock(return_value=no_tool)
+            mock_runner_cls.return_value = mock_runner
+            # Stay active so absent the guard the worker would run to max_turns.
+            tracker.fetch_summaries_by_keys.return_value = _summaries(
+                {issue.identifier: "In Progress"}
+            )
+            tracker.fetch_one.return_value = _issue(state="In Progress")
+            await _run_worker(
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
+            )
+
+        assert mock_runner.run_turn.await_count == 3
+        assert rq.has(issue.key) is True
+
     async def test_terminal_state_after_turn(self) -> None:
         issue = _issue()
         state = OrchestratorState()
@@ -740,7 +847,11 @@ class TestRunWorker:
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
 
-            tracker.fetch_one.return_value = _issue(state="Done")
+            # Post-turn decision now comes from fetch_summaries_by_keys.
+            # terminal=True simulates a GitHub-style closed/merged PR.
+            tracker.fetch_summaries_by_keys.return_value = _summaries(
+                {"PROJ-1": "Done"}, terminal=True
+            )
             await _run_worker(
                 issue,
                 state,
@@ -753,6 +864,48 @@ class TestRunWorker:
             )
 
         mock_rm.assert_called_once()
+
+    async def test_missing_summary_after_turn_reschedules_keeps_workspace(self) -> None:
+        """A post-turn state gap (key omitted, e.g. a transient `gh pr view`
+        blip) is NOT terminal per the tracker Protocol: keep the workspace and
+        schedule a retry rather than deleting work over a transient failure."""
+        issue = _issue()
+        state = OrchestratorState()
+        state.claim(issue)
+        tracker = _mock_tracker()
+        config = _config(max_turns=10)
+        rq = RetryQueue()
+
+        with (
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.ensure_workspace"
+            ) as mock_ew,
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.TicketRunner"
+            ) as mock_runner_cls,
+            patch(
+                "claude_on_the_fly.symphony.orchestrator.remove_workspace"
+            ) as mock_rm,
+        ):
+            mock_ew.return_value = Path("/tmp/ws")
+            mock_runner = MagicMock()
+            mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
+            mock_runner_cls.return_value = mock_runner
+            # Key omitted from the post-turn snapshot → summary is None.
+            tracker.fetch_summaries_by_keys.return_value = {}
+            await _run_worker(
+                issue,
+                state,
+                tracker,
+                config.tracker,
+                config,
+                "prompt",
+                rq,
+                _stub_event_log(),
+            )
+
+        mock_rm.assert_not_called()  # workspace kept (transient, not terminal)
+        assert rq.has(issue.key) is True  # rescheduled
 
     async def test_inactive_state_after_turn(self) -> None:
         issue = _issue()
@@ -775,7 +928,10 @@ class TestRunWorker:
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
 
-            tracker.fetch_one.return_value = _issue(state="Backlog")
+            # Ticket left the JQL after the turn → parked (inactive).
+            tracker.fetch_summaries_by_keys.return_value = _summaries(
+                {"PROJ-1": "Backlog"}, matches_jql=False
+            )
             await _run_worker(
                 issue,
                 state,
@@ -815,9 +971,10 @@ class TestRunWorker:
 
         assert rq.has(issue.key) is True
 
-    async def test_gate_label_removed_between_turns_exits(self) -> None:
-        """Agent parks itself by removing the gate label — worker must stop."""
-        issue = _issue()  # labels=("symphony-active",) by default
+    async def test_leaves_jql_between_turns_exits(self) -> None:
+        """Agent parks itself by moving the ticket out of the candidate JQL
+        (e.g. transitioning to a human-review status) — worker must stop."""
+        issue = _issue()
         state = OrchestratorState()
         state.claim(issue)
         tracker = _mock_tracker()
@@ -836,8 +993,10 @@ class TestRunWorker:
             mock_runner = MagicMock()
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
-            # Post-turn refresh shows state still active BUT gate label gone.
-            tracker.fetch_one.return_value = _issue(state="In Progress", labels=())
+            # Post-turn membership check shows the ticket left the JQL.
+            tracker.fetch_summaries_by_keys.return_value = _summaries(
+                {"PROJ-1": "In Review"}, matches_jql=False
+            )
             await _run_worker(
                 issue,
                 state,
@@ -886,10 +1045,17 @@ class TestReconcile:
     async def test_terminal_mid_run_cancels_and_removes_workspace(self) -> None:
         state = OrchestratorState()
         issue = _issue()
-        state.claim(issue)
+        entry = state.claim(issue)
+        entry.workspace = Path("/tmp/ws-PROJ-1")
+        task = MagicMock()
+        task.done.return_value = False
+        entry.task = task
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Done"})
+        # terminal=True simulates a GitHub closed/merged PR.
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "Done"}, terminal=True
+        )
 
         with patch(
             "claude_on_the_fly.symphony.orchestrator.remove_workspace"
@@ -898,7 +1064,8 @@ class TestReconcile:
                 state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log()
             )
 
-        mock_rm.assert_not_called()  # workspace path is None, so it won't be called
+        mock_rm.assert_called_once()
+        task.cancel.assert_called_once()
 
     async def test_inactive_mid_run_cancels(self) -> None:
         state = OrchestratorState()
@@ -909,7 +1076,10 @@ class TestReconcile:
         entry.task = task
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Backlog"})
+        # Ticket left the JQL mid-run → park (cancel, keep workspace).
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "Backlog"}, matches_jql=False
+        )
 
         await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         task.cancel.assert_called_once()
@@ -927,28 +1097,27 @@ class TestReconcile:
         await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         assert entry.issue_state == "In Progress"
 
-    async def test_gate_label_removed_mid_run_cancels(self) -> None:
-        """Mid-run label removal cancels the worker even when state stays active."""
+    async def test_left_jql_mid_run_cancels(self) -> None:
+        """Ticket still has a live status but no longer matches the candidate
+        JQL (e.g. reassigned, or moved to a status the JQL excludes) — worker
+        is cancelled, workspace kept."""
         state = OrchestratorState()
-        issue = _issue()  # state="In Progress" (active), labels=("symphony-active",)
+        issue = _issue()
         entry = state.claim(issue)
         task = MagicMock()
         task.done.return_value = False
         entry.task = task
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        # Active state, but label gone.
-        tracker.fetch_summaries_by_keys.return_value = {
-            "PROJ-1": IssueSummary(
-                state="In Progress", extra={"labels": ("other-label",)}
-            ),
-        }
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}, matches_jql=False
+        )
 
         await reconcile(state, _trackers(tracker), cfg, RetryQueue(), _stub_event_log())
         task.cancel.assert_called_once()
 
-    async def test_gate_label_present_does_not_cancel(self) -> None:
-        """Sanity check the new branch doesn't fire when the label is still there."""
+    async def test_still_matching_jql_does_not_cancel(self) -> None:
+        """Sanity check: a ticket still matching the JQL keeps running."""
         state = OrchestratorState()
         issue = _issue()
         entry = state.claim(issue)
@@ -1001,7 +1170,10 @@ class TestStartupCleanup:
         (root / "jira").mkdir(parents=True)
         d = root / "jira" / "PROJ-1"
         d.mkdir()
-        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-1": "Done"})
+        # Ticket no longer matches the JQL (done / reassigned) → GC the dir.
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "Done"}, matches_jql=False
+        )
 
         async def _run() -> None:
             await startup_cleanup(root, _trackers(tracker), _config())
@@ -1186,19 +1358,18 @@ class TestProcessDueRetries:
         )
         assert rq.has(make_key("jira", "1")) is True  # requeued
 
-    async def test_gate_label_missing_drops(self) -> None:
-        # Agent removed the gate label to park the ticket. Retry path must drop it
-        # rather than re-dispatch, so the daemon honors the agent's pause signal.
-        cfg = _config()  # gate_label="symphony-active"
+    async def test_left_jql_drops(self) -> None:
+        # Agent parked the ticket by moving it out of the candidate JQL. The
+        # retry path must drop it rather than re-dispatch, honoring the pause.
+        cfg = _config()
         rq = RetryQueue()
         rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.return_value = _summaries(
-            {"PROJ-1": "In Progress"}
+            {"PROJ-1": "In Progress"}, matches_jql=False
         )
-        tracker.fetch_one.return_value = _issue(labels=("other-label",))
         pending: set[asyncio.Task[None]] = set()
 
         with patch(
@@ -1218,17 +1389,18 @@ class TestProcessDueRetries:
         # _dispatch was NOT called: no worker task was created
         assert len(pending) == 0
 
-    async def test_gate_label_present_dispatches(self) -> None:
-        cfg = _config()  # gate_label="symphony-active"
+    async def test_matching_retry_dispatches(self) -> None:
+        cfg = _config()
         rq = RetryQueue()
         rq._entries[make_key("jira", "1")] = RetryEntry(
             issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
         )
         tracker = _mock_tracker()
+        # Still matches the jql → eligible for re-dispatch.
         tracker.fetch_summaries_by_keys.return_value = _summaries(
             {"PROJ-1": "In Progress"}
         )
-        tracker.fetch_one.return_value = _issue(labels=("symphony-active",))
+        tracker.fetch_one.return_value = _issue()
         pending: set[asyncio.Task[None]] = set()
 
         with patch(
@@ -1245,6 +1417,43 @@ class TestProcessDueRetries:
             )
 
         tracker.fetch_one.assert_awaited_once_with("PROJ-1")
+
+    async def test_retry_dispatches_even_when_issue_to_summary_inactive(self) -> None:
+        """Regression: the retry path must NOT re-derive activeness from
+        issue_to_summary. Real Jira's issue_to_summary omits matches_jql, so
+        is_active(issue_to_summary(issue)) is always False — which used to drop
+        every Jira retry. The authoritative fetch_summaries_by_keys gate above
+        already validated it, so the dispatch must still happen."""
+        cfg = _config()
+        rq = RetryQueue()
+        rq._entries[make_key("jira", "1")] = RetryEntry(
+            issue_id="1", identifier="PROJ-1", attempt=1, due_at_ms=0, error="test"
+        )
+        tracker = _mock_tracker()
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-1": "In Progress"}
+        )
+        tracker.fetch_one.return_value = _issue()
+        # Mimic real Jira: projection carries no matches_jql → is_active False.
+        tracker.issue_to_summary.side_effect = lambda issue: IssueSummary(
+            state=issue.state, extra={}
+        )
+        pending: set[asyncio.Task[None]] = set()
+
+        with patch(
+            "claude_on_the_fly.symphony.orchestrator._run_worker", return_value=None
+        ) as mock_rw:
+            await _process_due_retries(
+                OrchestratorState(),
+                _trackers(tracker),
+                cfg,
+                {"jira": "prompt"},
+                rq,
+                _stub_event_log(),
+                pending,
+            )
+
+        mock_rw.assert_called_once()  # dispatched, not dropped by a broken re-check
 
 
 # ---------------------------------------------------------------------------
@@ -1316,24 +1525,25 @@ class TestTick:
             pending,
         )
 
-    async def test_multi_source_dispatch_honors_global_cap(self) -> None:
-        """Two trackers both have candidates; orchestrator merges them, sorts
-        globally, and honors a global cap of 2 across sources."""
+    async def test_multi_source_dispatch_honors_per_tracker_caps(self) -> None:
+        """Two trackers each with their own concurrency budget. Orchestrator
+        merges candidates, sorts globally, and respects each tracker's cap
+        independently. With jira.max_concurrent=1 + github.max_concurrent=1
+        we can dispatch 2 total, one per source."""
         from dataclasses import replace as _dc_replace
 
-        # Build a two-source config (jira + github).
-        jira_cfg = _tracker_cfg(kind="jira", gate_label=None)
+        # Build a two-source config (jira + github), each capped at 1.
+        jira_cfg = _tracker_cfg(kind="jira", max_concurrent=1)
         gh_cfg = _tracker_cfg(
             kind="github",
             active_states=("open",),
             terminal_states=("closed", "merged"),
-            gate_label=None,
+            max_concurrent=1,
         )
         # SymphonyConfig: pass `trackers` directly via dataclasses.replace to
         # bypass the test helper's single-source default.
         base_cfg = _config()
         cfg = _dc_replace(base_cfg, trackers={"jira": jira_cfg, "github": gh_cfg})
-        cfg = _dc_replace(cfg, max_concurrent=2)
 
         jira_tracker = _mock_tracker()
         gh_tracker = _mock_tracker()
@@ -1387,10 +1597,12 @@ class TestTick:
         # Both trackers were polled.
         jira_tracker.fetch_candidates.assert_awaited_once()
         gh_tracker.fetch_candidates.assert_awaited_once()
-        # Global cap of 2 honored.
+        # Per-tracker caps of 1 each — total 2 running.
         assert state.running_count() == 2
-        # Lowest-priority issue (PROJ-1 prio=1) dispatched first, then
-        # owner/repo#100 (prio=2); PROJ-2 (prio=3) skipped due to cap.
+        assert state.running_by_source("jira") == 1
+        assert state.running_by_source("github") == 1
+        # PROJ-1 (jira, prio=1) wins jira's slot over PROJ-2 (prio=3).
+        # owner/repo#100 takes github's slot.
         running_ids = {e.issue_identifier for e in state.all_running()}
         assert "PROJ-1" in running_ids
         assert "owner/repo#100" in running_ids
@@ -1409,22 +1621,19 @@ class TestMultiSourceReconcile:
         is_terminal/is_active predicates — the orchestrator stays agnostic."""
         from dataclasses import replace as _dc_replace
 
-        jira_cfg = _tracker_cfg(kind="jira", gate_label=None)
-        gh_cfg = _tracker_cfg(
-            kind="github",
-            active_states=("open",),
-            terminal_states=("closed", "merged"),
-            gate_label=None,
-        )
+        jira_cfg = _tracker_cfg(kind="jira")
+        gh_cfg = _tracker_cfg(kind="github")
         base_cfg = _config()
         cfg = _dc_replace(base_cfg, trackers={"jira": jira_cfg, "github": gh_cfg})
 
         jira_tracker = _mock_tracker()
         gh_tracker = _mock_tracker()
 
-        # GitHub-specific predicates: open AND user hasn't reviewed yet.
+        # GitHub-specific predicates use hardcoded lifecycle constants — no
+        # config state lists. terminal = closed/merged; active = open AND not
+        # already reviewed at head.
         def gh_is_terminal(summary, c):
-            return summary.state in c.terminal_states
+            return summary.state in ("closed", "merged")
 
         def gh_is_active(summary, c):
             return summary.state == "open" and not bool(
@@ -1453,9 +1662,7 @@ class TestMultiSourceReconcile:
         # contains @me, so its predicate returns False — worker should be
         # cancelled but workspace left.
         jira_tracker.fetch_summaries_by_keys.return_value = {
-            "PROJ-1": IssueSummary(
-                state="In Progress", extra={"labels": ("symphony-active",)}
-            ),
+            "PROJ-1": IssueSummary(state="In Progress", extra={"matches_jql": True}),
         }
         gh_tracker.fetch_summaries_by_keys.return_value = {
             "owner/repo#200": IssueSummary(
@@ -1485,9 +1692,14 @@ class TestMultiSourceReconcile:
         # Jira stayed running, GitHub got cancelled.
         jira_task.cancel.assert_not_called()
         gh_task.cancel.assert_called_once()
-        # Each tracker's summaries fetch was called exactly once, with its own keys.
-        jira_tracker.fetch_summaries_by_keys.assert_awaited_once_with(["PROJ-1"])
-        gh_tracker.fetch_summaries_by_keys.assert_awaited_once_with(["owner/repo#200"])
+        # Each tracker's summaries fetch was called exactly once, with its own
+        # keys and its own config (cfg is now passed for jql membership).
+        jira_tracker.fetch_summaries_by_keys.assert_awaited_once_with(
+            ["PROJ-1"], jira_cfg
+        )
+        gh_tracker.fetch_summaries_by_keys.assert_awaited_once_with(
+            ["owner/repo#200"], gh_cfg
+        )
 
 
 class TestHeartbeatSource:
@@ -1525,8 +1737,6 @@ class TestHeartbeatSource:
 class TestRunLoop:
     async def test_runs_one_tick_then_stops(self, tmp_path: Path) -> None:
         config_path = tmp_path / "symphony.yaml"
-        prompt_path = tmp_path / "prompt.md"
-        prompt_path.write_text("# Prompt")
 
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.return_value = {}
@@ -1540,14 +1750,13 @@ class TestRunLoop:
                 "claude_on_the_fly.symphony.orchestrator.make_trackers",
                 return_value={"jira": tracker},
             ),
-            patch("claude_on_the_fly.symphony.orchestrator.PromptStore") as mock_ps,
+            patch(
+                "claude_on_the_fly.symphony.orchestrator._refresh_prompt_stores"
+            ) as mock_rps,
             patch("claude_on_the_fly.symphony.orchestrator.startup_cleanup") as mock_sc,
         ):
-            mock_load.return_value = _config(prompt_path=prompt_path)
-            mock_ps_instance = MagicMock()
-            mock_ps_instance.load.return_value = "prompt source"
-            mock_ps_instance.maybe_reload.return_value = "prompt source"
-            mock_ps.return_value = mock_ps_instance
+            mock_load.return_value = _config()
+            mock_rps.return_value = None  # leave prompt_stores empty
             mock_sc.return_value = None
 
             async def _stop_soon() -> None:
@@ -1627,7 +1836,9 @@ class TestEventEmission:
         state.claim(issue)
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
-        tracker.fetch_summaries_by_keys.return_value = _summaries({"PROJ-EV3": "Done"})
+        tracker.fetch_summaries_by_keys.return_value = _summaries(
+            {"PROJ-EV3": "Done"}, terminal=True
+        )
 
         await reconcile(state, _trackers(tracker), cfg, RetryQueue(), event_log)
 
@@ -1644,7 +1855,7 @@ class TestEventEmission:
         cfg = _config(stall_timeout_ms=0)
         tracker = _mock_tracker()
         tracker.fetch_summaries_by_keys.return_value = _summaries(
-            {"PROJ-EV4": "Backlog"}
+            {"PROJ-EV4": "Backlog"}, matches_jql=False
         )
 
         await reconcile(state, _trackers(tracker), cfg, RetryQueue(), event_log)
@@ -1675,7 +1886,9 @@ class TestEventEmission:
             mock_runner = MagicMock()
             mock_runner.run_turn = AsyncMock(return_value=MagicMock(body="ok"))
             mock_runner_cls.return_value = mock_runner
-            tracker.fetch_one.return_value = _issue(identifier="PROJ-EV5", state="Done")
+            tracker.fetch_summaries_by_keys.return_value = _summaries(
+                {"PROJ-EV5": "Done"}, terminal=True
+            )
             await _run_worker(
                 issue,
                 state,
