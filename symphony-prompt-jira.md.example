@@ -37,5 +37,6 @@ above is just for ticket-level notes and intermediate files.
 You own branch hygiene: clean up the branch and run `git worktree prune` in
 each source repo before you finish.
 
-When the task is complete, remove the `{{ gate_label }}` label from the
-ticket via your Jira tool (acli or MCP) so the daemon stops considering it.
+When the task is complete, transition the ticket out of the states your
+`jql` matches (or remove whatever label your `jql` requires) via your Jira
+tool (acli or MCP) so the daemon stops considering it.
