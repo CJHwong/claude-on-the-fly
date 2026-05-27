@@ -53,6 +53,13 @@ def _events_since(records: list[dict[str, Any]], last_sig: tuple | None) -> list
 
 
 class ClaudeTuiApp(App):
+    # Shown in the Header bar.
+    TITLE = "Claude On The Fly"
+
+    # No ctrl+p command palette — this is a fixed-purpose supervisor, not a
+    # general app; the footer already lists every action.
+    ENABLE_COMMAND_PALETTE = False
+
     CSS = """
     #dashboard-body {
         padding: 1 2;
@@ -60,33 +67,6 @@ class ClaudeTuiApp(App):
     #dashboard-body #stale-banner {
         height: auto;
         padding: 0 0 1 0;
-    }
-    #dashboard-body #frontends {
-        height: auto;
-    }
-    #dashboard-body #jobs-row {
-        height: auto;
-    }
-    #dashboard-body #jobs-pane {
-        width: 1fr;
-        height: auto;
-    }
-    #dashboard-body #symphony-pane {
-        width: 1fr;
-        height: auto;
-        padding: 0 0 0 2;
-    }
-    #dashboard-body #jobs-header,
-    #dashboard-body #symphony-header {
-        height: auto;
-        padding: 0 0 0 1;
-    }
-    #dashboard-body #jobs-content,
-    #dashboard-body #symphony-tickets {
-        height: auto;
-    }
-    #dashboard-body #symphony-tickets-hint {
-        height: auto;
     }
     #dashboard-body #log-row {
         height: 1fr;

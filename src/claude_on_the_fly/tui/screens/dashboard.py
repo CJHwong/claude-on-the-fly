@@ -1,12 +1,17 @@
-"""Dashboard screen — selectable frontends table + scheduler jobs + log tail.
+"""Dashboard screen — two hero panels (symphony / scheduler) + a compact chat
+strip + log tail.
 
-Refresh model:
-- The DataTable is rebuilt every second from a fresh state.snapshot().
-- Cursor position is preserved across rebuilds by frontend name.
-- Action keys (s/k/r) read the currently highlighted row and call the
-  supervisor synchronously; refresh runs again immediately after.
-- The log pane at the bottom tails the highlighted frontend's logfile,
-  re-reading on the same 1s tick and on row-highlight events.
+Layout (top → bottom):
+- SYMPHONY panel: bordered, rich header (running/cap + tracker labels), inner
+  tickets table.
+- SCHEDULER panel: bordered, rich header (state + next fire), inner jobs table.
+- Chat strip: compact one-row-per-daemon table (telegram / slack / gmail).
+- Log row: daemon log (left) + per-ticket / per-job watch (right).
+
+Selection model: Tab cycles the three inner tables. `_active_daemon()` reads
+whichever table is focused; the supervisor keys (s/k/r) act on that daemon, and
+the log/watch panes follow it. Refresh runs at 1Hz, rebuilding tables from a
+fresh state.snapshot() while preserving each table's cursor by row key.
 """
 
 from __future__ import annotations
@@ -17,69 +22,112 @@ from typing import Callable, Literal
 
 from rich.text import Text
 
+from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
 from claude_on_the_fly.agent import DATA_DIR, current_backend_key, get_backend
-from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
 from claude_on_the_fly.tui import env_editor, render, state, supervisor
+from claude_on_the_fly.tui.screens.config_picker import ConfigPickerScreen
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
 
 LOG_DIR = DATA_DIR / "logs"
+SYMPHONY_CONFIG = DATA_DIR / "symphony.yaml"
+SCHEDULE_CONFIG = DATA_DIR / "schedule.yaml"
 TAIL_LINES = 200
 # When showing a symphony ticket watch, tail this many raw JSONL events; each
 # formats to 1–4 visible lines so the rendered pane stays manageable.
 WATCH_EVENTS = 80
 # Cap on RichLog growth so a 24/7 dashboard doesn't accumulate unbounded memory.
 LOG_PANE_MAX_LINES = 10_000
-SYMPHONY_HINT = (
-    "[dim]Press h to open the history view (takeover copy lives there).[/dim]"
-)
 
-# Single-letter badge shown in the source column of the Active AI jobs pane.
-# Symphony rows render `S`, chat sources render the first letter of their name.
-_SOURCE_BADGES: dict[str, str] = {
-    "symphony": "S",
-    "telegram": "T",
-    "slack": "L",
-    "gmail": "G",
-}
+# Reactive, user-driven daemons. Demoted to the compact strip so the two
+# autonomous engines (symphony, scheduler) own the top of the dashboard.
+CHAT_FRONTENDS: tuple[str, ...] = ("telegram", "slack", "gmail")
+
+# Memoize parsed symphony config by (path, mtime) so the 1Hz header refresh
+# doesn't reparse YAML every tick. Mirrors state._load_schedule_cached.
+_symphony_cfg_cache: tuple[Path, float, tuple] | None = None
+
+
+def _load_symphony_cached(path: Path) -> tuple[object | None, str | None]:
+    """Return (config, error). Missing file → (None, None); parse failure →
+    (None, message). Cached by mtime so a broken file isn't reparsed each tick.
+    """
+    global _symphony_cfg_cache
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, None
+    if (
+        _symphony_cfg_cache
+        and _symphony_cfg_cache[0] == path
+        and _symphony_cfg_cache[1] == mtime
+    ):
+        return _symphony_cfg_cache[2]
+
+    from claude_on_the_fly.symphony.config import load_config
+
+    try:
+        result: tuple = (load_config(path), None)
+    except Exception as exc:
+        result = (None, str(exc))
+    _symphony_cfg_cache = (path, mtime, result)
+    return result
 
 
 class DashboardScreen(Screen):
-    # Section spacing — the three logical zones (services / jobs+symphony /
-    # logs) read better with a row of breathing room between them than they
-    # do crammed together.
     DEFAULT_CSS = """
-    #jobs-row {
-        margin-top: 1;
+    #symphony-panel, #scheduler-panel {
+        border: round grey;
+        height: auto;
+        margin-bottom: 1;
+        padding: 0 1;
+    }
+    #symphony-panel:focus-within, #scheduler-panel:focus-within {
+        border: round $accent;
+    }
+    #symphony-header, #scheduler-header, #chat-strip-header {
+        height: auto;
+        padding: 0 0 0 1;
+    }
+    #symphony-tickets, #jobs-content, #chat-strip {
+        height: auto;
+    }
+    #chat-strip:focus {
+        border-left: thick $accent;
+    }
+    #action-cue {
+        height: auto;
+        padding: 0 0 0 1;
     }
     """
 
+    # Every key is shown in the footer, ordered by how often it's reached for:
+    # daemon lifecycle, then views, then config/diagnostics, then utilities,
+    # then the rare/destructive Stop-all, then Quit. Lifecycle keys act on the
+    # focused panel (see the action cue). `c` copies the highlighted log tail
+    # via OSC 52 (iTerm2/kitty/WezTerm/Alacritty); hold Option (macOS) or Shift
+    # while click-dragging for the terminal's own partial-selection copy.
     BINDINGS = [
-        ("l", "app.push_screen('logs')", "Logs"),
-        ("d", "app.push_screen('doctor')", "Doctor"),
-        ("g", "app.push_screen('config')", "Config"),
-        # `h` opens the symphony event history full-screen — separate from
-        # the live tickets pane so the dashboard stays focused on now.
-        ("h", "app.push_screen('history')", "History"),
         ("s", "start", "Start"),
         ("k", "stop", "Stop"),
         ("r", "restart", "Restart"),
-        ("K", "stop_all", "Stop all"),
         ("u", "resume", "Resume"),
-        ("e", "edit_env", "Edit .env"),
-        ("R", "refresh_now", "Refresh"),
-        # `c` copies the tail of the highlighted log to the clipboard via
-        # OSC 52 so you can share errors quickly. For partial selections,
-        # hold Option (macOS) or Shift while click-dragging to bypass
-        # Textual's mouse capture and use the terminal's native selection.
+        ("l", "app.push_screen('logs')", "Logs"),
+        ("h", "app.push_screen('history')", "History"),
+        # `g` edits the focused panel's config: symphony → symphony.yaml
+        # (preview), scheduler → schedule.yaml, chat → .env.
+        ("g", "open_config", "Config"),
+        ("d", "app.push_screen('doctor')", "Doctor"),
         ("c", "copy_log", "Copy tail"),
+        ("R", "refresh_now", "Refresh"),
+        ("K", "stop_all", "Stop all"),
         ("q", "app.quit", "Quit"),
     ]
 
@@ -90,19 +138,19 @@ class DashboardScreen(Screen):
         self._log_mtime: float | None = None
         # Watch pane state, tracked separately so the two panes refresh
         # independently. _watch_target encodes what's being watched, e.g.
-        # "symphony:jira:PROJ-1" or "schedule:cleanup-job", so we know to
+        # "session:symphony:PROJ-1" or "schedule:cleanup-job", so we know to
         # force a reload when the user navigates to a different item.
         self._watch_path: Path | None = None
         self._watch_mtime: float | None = None
         self._watch_target: str | None = None
-        # Heartbeat publishes `source` per running ticket; cache the
-        # ticket → source mapping so the watch pane knows which per-source
-        # workspace dir to read from when the user highlights a row.
+        # ticket identifier → tracker source (jira | github), so the watch pane
+        # resolves the per-tracker workspace dir.
         self._ticket_sources: dict[str, str] = {}
-        # Active-AI-jobs row key ("<frontend>:<identifier>") → session_uuid.
-        # Symphony uses a deterministic UUID computed from the ticket, chat
-        # frontends publish the UUID directly in heartbeat.running_jobs.
+        # "<frontend>:<identifier>" → session_uuid for the watch pane.
         self._job_sessions: dict[str, str] = {}
+        # chat daemon name → list of (identifier, session_uuid) running jobs,
+        # so selecting a chat daemon can still drill into its live session.
+        self._chat_jobs: dict[str, list[tuple[str, str]]] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
 
@@ -110,23 +158,18 @@ class DashboardScreen(Screen):
         yield Header(show_clock=True)
         with Vertical(id="dashboard-body"):
             yield Static(id="stale-banner", markup=True)
-            yield DataTable(id="frontends", cursor_type="row", zebra_stripes=True)
-            with Horizontal(id="jobs-row"):
-                with Vertical(id="jobs-pane"):
-                    yield Static(id="jobs-header", markup=True)
-                    yield DataTable(
-                        id="jobs-content",
-                        cursor_type="row",
-                        zebra_stripes=True,
-                    )
-                with Vertical(id="symphony-pane"):
-                    yield Static(id="symphony-header", markup=True)
-                    yield DataTable(
-                        id="symphony-tickets",
-                        cursor_type="row",
-                        zebra_stripes=True,
-                    )
-                    yield Static(id="symphony-tickets-hint", markup=True)
+            with Vertical(id="symphony-panel"):
+                yield Static(id="symphony-header", markup=True)
+                yield DataTable(
+                    id="symphony-tickets", cursor_type="row", zebra_stripes=True
+                )
+            with Vertical(id="scheduler-panel"):
+                yield Static(id="scheduler-header", markup=True)
+                yield DataTable(
+                    id="jobs-content", cursor_type="row", zebra_stripes=True
+                )
+            yield Static(id="chat-strip-header", markup=True)
+            yield DataTable(id="chat-strip", cursor_type="row", zebra_stripes=True)
             with Horizontal(id="log-row"):
                 with Vertical(id="log-daemon-col"):
                     yield Static(id="log-header", markup=True)
@@ -148,102 +191,61 @@ class DashboardScreen(Screen):
                         max_lines=LOG_PANE_MAX_LINES,
                     )
             yield Static(id="status-line", markup=True)
+            yield Static(id="action-cue", markup=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#frontends", DataTable)
-        table.add_column("name", width=10)
-        table.add_column("state", width=10)
-        table.add_column("pid", width=8)
-        table.add_column("uptime", width=8)
-        table.add_column("heartbeat", width=10)
-        table.add_column("notes", width=40)
-        jobs = self.query_one("#jobs-content", DataTable)
-        jobs.add_column("name", width=12)
-        jobs.add_column("cron", width=14)
-        jobs.add_column("kind", width=10)
-        jobs.add_column("next fire", width=24)
         tickets = self.query_one("#symphony-tickets", DataTable)
-        # Explicit widths so column headers stay readable when rows are sparse.
-        tickets.add_column("src", width=4)
         tickets.add_column("job", width=24)
         tickets.add_column("state", width=14)
         tickets.add_column("uptime", width=8)
         tickets.add_column("last turn", width=10)
         tickets.add_column("retries", width=8)
-        self.query_one("#jobs-header", Static).update("[bold]Scheduled jobs[/bold]")
-        self.query_one("#symphony-header", Static).update("[bold]Active AI jobs[/bold]")
-        self.query_one("#symphony-tickets-hint", Static).update(SYMPHONY_HINT)
+        jobs = self.query_one("#jobs-content", DataTable)
+        jobs.add_column("name", width=14)
+        jobs.add_column("cron", width=16)
+        jobs.add_column("kind", width=8)
+        jobs.add_column("next fire", width=24)
+        chat = self.query_one("#chat-strip", DataTable)
+        chat.add_column("daemon", width=10)
+        chat.add_column("state", width=12)
+        chat.add_column("heartbeat", width=10)
+        chat.add_column("active", width=8)
+        self.query_one("#chat-strip-header", Static).update(
+            "[bold]Chat frontends[/bold] [dim](Tab to cycle panels)[/dim]"
+        )
+        # The log panes shouldn't grab Tab focus — Tab cycles the three zones
+        # (symphony tickets / scheduler jobs / chat strip) only.
+        self.query_one("#log-pane", RichLog).can_focus = False
+        self.query_one("#watch-pane", RichLog).can_focus = False
         self._refresh()
         self.set_interval(1.0, self._refresh)
         self.set_interval(1.0, self._refresh_log)
         self.set_interval(0.1, self._tick_busy)
+        # Land focus on the symphony tickets table so the hero engine is the
+        # default supervisor target and Tab cycles from there.
+        self.query_one("#symphony-tickets", DataTable).focus()
+        self._update_action_cue()
 
-    def _tick_busy(self) -> None:
-        if self._busy_msg is None:
-            return
-        self._busy_ticks += 1
-        self._render_busy_line()
+    # ------------------------------------------------------------------
+    # Selection / focus
+    # ------------------------------------------------------------------
 
-    def action_refresh_now(self) -> None:
-        self._refresh()
-        self._refresh_log(force_reload=True)
-
-    def _current_log_path(self) -> Path | None:
-        """Whichever log pane is more specific takes precedence: the watch
-        pane (per-ticket session log) when something's highlighted there,
-        otherwise the daemon log for the highlighted frontend."""
-        return self._watch_path if self._watch_path else self._log_path
-
-    def action_copy_log(self) -> None:
-        """Copy the tail of the currently-relevant log to the clipboard.
-
-        For "share the whole error context with someone". For partial
-        selections, hold Option (macOS) or Shift while click-dragging to
-        bypass Textual's mouse capture and use the terminal's native
-        selection + ⌘C.
-        """
-        path = self._current_log_path()
-        if path is None:
-            self._notify("no log selected to copy", "warning")
-            return
-        try:
-            content = path.read_text(errors="replace")
-        except Exception as exc:
-            self._notify(f"copy failed: {exc}", "error")
-            return
-        lines = content.splitlines()
-        tail_n = 500
-        tail = "\n".join(lines[-tail_n:])
-        try:
-            # Textual's clipboard uses OSC 52 — works in iTerm2, kitty,
-            # WezTerm, Alacritty out of the box.
-            self.app.copy_to_clipboard(tail)
-        except Exception as exc:
-            self._notify(f"clipboard write failed: {exc}", "error")
-            return
-        shown = min(len(lines), tail_n)
-        self._notify(
-            f"copied last {shown} line(s) of {path.name} to clipboard",
-            "information",
-        )
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        # Reload the log pane immediately when the cursor moves.
-        self._refresh_log(force_reload=True)
-
-    def _selected_frontend(self) -> str | None:
-        table = self.query_one("#frontends", DataTable)
-        if table.row_count == 0:
-            return None
-        try:
-            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
-        except Exception:
-            return None
-        return str(row_key.value) if row_key.value is not None else None
+    def _active_daemon(self) -> str | None:
+        """Which daemon the supervisor keys act on — the one whose table has
+        focus. Chat strip resolves to the highlighted chat daemon row."""
+        focused = self.app.focused
+        wid = getattr(focused, "id", None)
+        if wid == "symphony-tickets":
+            return "symphony"
+        if wid == "jobs-content":
+            return "schedule"
+        if wid == "chat-strip":
+            return self._datatable_cursor_key("#chat-strip")
+        return None
 
     def _selected_ticket(self) -> str | None:
-        """Highlighted ticket identifier in the symphony tickets DataTable, or None."""
+        """Highlighted symphony ticket key ("symphony:<identifier>"), or None."""
         return self._datatable_cursor_key("#symphony-tickets")
 
     def _selected_job(self) -> str | None:
@@ -263,13 +265,59 @@ class DashboardScreen(Screen):
             return None
         return str(row_key.value) if row_key.value is not None else None
 
+    @staticmethod
+    def _restore_cursor(
+        table: DataTable, keys: list[str], previously: str | None
+    ) -> None:
+        if previously is None:
+            return
+        for i, key in enumerate(keys):
+            if key == previously:
+                try:
+                    table.move_cursor(row=i)
+                except Exception:
+                    pass
+                return
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # Reload the log pane immediately when the cursor moves. Moving within
+        # the chat strip also changes which daemon the lifecycle keys target.
+        self._refresh_log(force_reload=True)
+        self._update_action_cue()
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        # Tabbing between zones changes which daemon the lifecycle keys target.
+        self._update_action_cue()
+
+    def _update_action_cue(self) -> None:
+        target = self._active_daemon()
+        try:
+            cue = self.query_one("#action-cue", Static)
+        except Exception:
+            return  # focus event fired before the cue mounted
+        if target:
+            cue.update(f"[dim]acting on:[/dim] [bold]{target}[/bold]")
+        else:
+            cue.update("[dim]acting on: (Tab to a panel)[/dim]")
+
+    def action_refresh_now(self) -> None:
+        self._refresh()
+        self._refresh_log(force_reload=True)
+
+    # ------------------------------------------------------------------
+    # Supervisor actions
+    # ------------------------------------------------------------------
+
     async def _run_supervisor_action(
         self,
         verb: str,  # "start" | "stop" | "restart"
         op: Callable[[str], int],
     ) -> None:
-        name = self._selected_frontend()
-        if name is None or self._busy_msg:
+        name = self._active_daemon()
+        if self._busy_msg:
+            return
+        if name is None:
+            self._notify("no daemon selected (Tab to a panel first)", "warning")
             return
         present = {"start": "starting", "stop": "stopping", "restart": "restarting"}[
             verb
@@ -354,6 +402,48 @@ class DashboardScreen(Screen):
             self._clear_busy()
             self._refresh()
 
+    def action_open_config(self) -> None:
+        """Pick a config to edit via a modal. Decoupled from focus on purpose —
+        config edits are rare and deliberate, so an explicit pick beats a key
+        whose meaning shifts with whatever panel is focused."""
+        self.app.push_screen(ConfigPickerScreen(), self._open_config_target)
+
+    def _open_config_target(self, choice: str | None) -> None:
+        if choice == "symphony":
+            self.app.push_screen("config")
+        elif choice == "schedule":
+            self._edit_schedule_config()
+        elif choice == "env":
+            self._edit_env()
+
+    def _edit_schedule_config(self) -> None:
+        from claude_on_the_fly.scheduler import EXAMPLE_YAML
+
+        with self.app.suspend():
+            env_editor.open_in_editor(SCHEDULE_CONFIG, seed=EXAMPLE_YAML)
+        self._refresh()
+        self._notify(f"edited {SCHEDULE_CONFIG.name}", "information")
+
+    def _edit_env(self) -> None:
+        env_file = supervisor.DEFAULT_ENV_FILE
+        with self.app.suspend():
+            diff = env_editor.edit_and_diff(env_file)
+        if diff.is_empty():
+            self._notify("no env changes", "information")
+            return
+        self.app.push_screen(EnvDiffScreen(diff))
+        self._refresh()
+
+    # ------------------------------------------------------------------
+    # Busy spinner
+    # ------------------------------------------------------------------
+
+    def _tick_busy(self) -> None:
+        if self._busy_msg is None:
+            return
+        self._busy_ticks += 1
+        self._render_busy_line()
+
     def _set_busy(self, msg: str) -> None:
         self._busy_msg = msg
         self._busy_ticks = 0
@@ -369,34 +459,58 @@ class DashboardScreen(Screen):
         line = self.query_one("#status-line", Static)
         line.update(f"[yellow]{spinner} {self._busy_msg}…[/yellow]")
 
-    def action_edit_env(self) -> None:
-        env_file = supervisor.DEFAULT_ENV_FILE
-        with self.app.suspend():
-            diff = env_editor.edit_and_diff(env_file)
-        if diff.is_empty():
-            self._notify("no env changes", "information")
+    # ------------------------------------------------------------------
+    # Log + watch panes
+    # ------------------------------------------------------------------
+
+    def _current_log_path(self) -> Path | None:
+        """Whichever log pane is more specific takes precedence: the watch
+        pane (per-ticket session log) when something's highlighted there,
+        otherwise the daemon log for the active daemon."""
+        return self._watch_path if self._watch_path else self._log_path
+
+    def action_copy_log(self) -> None:
+        """Copy the tail of the currently-relevant log to the clipboard.
+
+        For "share the whole error context with someone". For partial
+        selections, hold Option (macOS) or Shift while click-dragging to
+        bypass Textual's mouse capture and use the terminal's native
+        selection + ⌘C.
+        """
+        path = self._current_log_path()
+        if path is None:
+            self._notify("no log selected to copy", "warning")
             return
-        self.app.push_screen(EnvDiffScreen(diff))
-        self._refresh()
+        try:
+            content = path.read_text(errors="replace")
+        except Exception as exc:
+            self._notify(f"copy failed: {exc}", "error")
+            return
+        lines = content.splitlines()
+        tail_n = 500
+        tail = "\n".join(lines[-tail_n:])
+        try:
+            # Textual's clipboard uses OSC 52 — works in iTerm2, kitty,
+            # WezTerm, Alacritty out of the box.
+            self.app.copy_to_clipboard(tail)
+        except Exception as exc:
+            self._notify(f"clipboard write failed: {exc}", "error")
+            return
+        shown = min(len(lines), tail_n)
+        self._notify(
+            f"copied last {shown} line(s) of {path.name} to clipboard",
+            "information",
+        )
 
     def _refresh_log(self, *, force_reload: bool = False) -> None:
-        """Refresh both panes: daemon log on the left, ticket watch on the right.
-
-        The right column is hidden unless symphony is the selected frontend AND
-        a ticket is highlighted in the tickets table — then the daemon log
-        column gives up its space to the watch.
-        """
+        """Refresh both panes: daemon log on the left, ticket watch on the right."""
         self._refresh_daemon_log(force_reload=force_reload)
         self._refresh_watch_pane(force_reload=force_reload)
 
     def _refresh_daemon_log(self, *, force_reload: bool) -> None:
-        name = self._selected_frontend()
+        name = self._active_daemon() or "symphony"
         header = self.query_one("#log-header", Static)
         pane = self.query_one("#log-pane", RichLog)
-
-        if name is None:
-            header.update("[dim]log: (no selection)[/dim]")
-            return
 
         path = LOG_DIR / f"{name}.log"
         if not path.is_file():
@@ -429,26 +543,29 @@ class DashboardScreen(Screen):
             pane.write(line.rstrip("\n"))
 
     def _refresh_watch_pane(self, *, force_reload: bool) -> None:
-        """Show the watch column when the selected frontend matches a row
-        highlighted in the Active AI jobs pane (symphony / telegram / slack /
-        gmail) or when the schedule frontend has a job highlighted. Otherwise
-        the column is hidden so the daemon log gets full width.
+        """Show the watch column when the active daemon has something to drill
+        into: a highlighted symphony ticket, a highlighted scheduler job, or a
+        chat daemon with a running job. Otherwise the column is hidden so the
+        daemon log gets full width.
         """
         col = self.query_one("#log-watch-col", Vertical)
-        name = self._selected_frontend()
+        name = self._active_daemon()
 
+        # "session:<frontend>:<identifier>" for an AI job, "schedule:<name>"
+        # for a cron job tail.
         target: str | None = None
-        # "session:<frontend>:<identifier>" for any AI job row,
-        # "schedule:<name>" for a cron job tail.
-        if name in ("symphony", "telegram", "slack", "gmail"):
+        if name == "symphony":
             cursor = self._selected_ticket()
-            if cursor is not None and cursor.startswith(f"{name}:"):
-                identifier = cursor.split(":", 1)[1]
-                target = f"session:{name}:{identifier}"
+            if cursor is not None and cursor.startswith("symphony:"):
+                target = f"session:{cursor}"
         elif name == "schedule":
             job = self._selected_job()
-            if job is not None:
+            if job is not None and job != "__empty__":
                 target = f"schedule:{job}"
+        elif name in CHAT_FRONTENDS:
+            jobs = self._chat_jobs.get(name) or []
+            if jobs:
+                target = f"session:{name}:{jobs[0][0]}"
 
         if target is None:
             if col.display:
@@ -614,156 +731,137 @@ class DashboardScreen(Screen):
         line = self.query_one("#status-line", Static)
         line.update(f"[dim]{msg}[/dim]")
 
+    # ------------------------------------------------------------------
+    # Refresh
+    # ------------------------------------------------------------------
+
     def _refresh(self) -> None:
         snap = state.snapshot()
-
-        table = self.query_one("#frontends", DataTable)
-        # Preserve cursor position by remembered frontend name.
-        previously_selected = self._selected_frontend() or SUPERVISABLE_FRONTENDS[0]
-
-        table.clear()
-        for f in snap.frontends:
-            notes = f.error or ""
-            if not notes and f.extra:
-                notes = render._format_extra_notes(f.extra)
-            table.add_row(
-                f.name,
-                render.state_cell(f.state),
-                str(f.pid) if f.pid else "-",
-                render.fmt_age(
-                    (snap.timestamp - state.parse_iso_utc(f.started_at)).total_seconds()
-                    if f.started_at
-                    else None
-                ),
-                render.fmt_age(f.last_heartbeat_age_s),
-                notes,
-                key=f.name,
-            )
-
-        # Restore cursor row.
-        for i, f in enumerate(snap.frontends):
-            if f.name == previously_selected:
-                try:
-                    table.move_cursor(row=i)
-                except Exception:
-                    pass
-                break
-
-        jobs_table = self.query_one("#jobs-content", DataTable)
-        jobs_header = self.query_one("#jobs-header", Static)
-        previously_selected_job = self._selected_job()
-        jobs_table.clear()
-        # The scheduler frontend is what actually fires cron jobs; if it
-        # isn't running, the cron-derived "next fire" is misleading because
-        # nothing will execute it. Show `-` in that case.
-        schedule_running = any(
-            f.name == "schedule" and f.state == "running" for f in snap.frontends
-        )
-        if snap.schedule_error:
-            jobs_header.update(
-                f"[bold]Scheduled jobs[/bold] [red]({snap.schedule_error})[/red]"
-            )
-        elif not schedule_running:
-            jobs_header.update(
-                "[bold]Scheduled jobs[/bold] [dim](scheduler stopped)[/dim]"
-            )
-        else:
-            jobs_header.update("[bold]Scheduled jobs[/bold]")
-        for j in snap.jobs:
-            next_fire_str = (
-                render._fmt_next_fire(j.next_fire, snap.timestamp)
-                if schedule_running
-                else "-"
-            )
-            jobs_table.add_row(
-                j.name,
-                j.cron,
-                j.kind,
-                next_fire_str,
-                key=j.name,
-            )
-        for i, j in enumerate(snap.jobs):
-            if j.name == previously_selected_job:
-                try:
-                    jobs_table.move_cursor(row=i)
-                except Exception:
-                    pass
-                break
-
-        tickets_table = self.query_one("#symphony-tickets", DataTable)
-        # Merge in-flight jobs across every frontend that publishes them.
-        # Symphony uses `running_tickets`; chat orchestrators use `running_jobs`.
-        # Rows are normalized into a single shape (source + identifier + display
-        # cells), and the symphony tracker (jira | github) is stashed in
-        # `_ticket_sources` so the watch pane keeps resolving per-tracker
-        # workspace dirs the same way it did before.
-        rows: list[tuple[str, str, str, str, str, str]] = []
+        by_name = {f.name: f for f in snap.frontends}
+        # Rebuilt every tick from the heartbeat; reset before repopulating.
         self._ticket_sources = {}
         self._job_sessions = {}
-        for f in snap.frontends:
-            extra = f.extra or {}
-            if f.name == "symphony":
-                for t in extra.get("running_tickets") or []:
-                    identifier = str(t.get("identifier", "?"))
-                    tracker = str(t.get("source") or "jira")
-                    self._ticket_sources[identifier] = tracker
-                    # Heartbeats reflect what symphony is running NOW, so the
-                    # session uuid must be derived with the daemon's current
-                    # backend_key — not the session_uuid_for default. Mirrors
-                    # what the orchestrator itself does when dispatching.
-                    self._job_sessions[f"symphony:{identifier}"] = session_uuid_for(
-                        identifier, source=tracker, backend_key=current_backend_key()
-                    )
-                    rows.append(
-                        (
-                            "symphony",
-                            identifier,
-                            str(t.get("state", "?")),
-                            render.fmt_age(t.get("uptime_s")),
-                            render.fmt_age(t.get("last_turn_end_age_s")),
-                            str(t.get("failure_attempt", 0)),
-                        )
-                    )
-            elif f.name in ("telegram", "slack", "gmail"):
-                for j in extra.get("running_jobs") or []:
-                    identifier = str(j.get("identifier", "?"))
-                    session = j.get("session_uuid")
-                    if session:
-                        self._job_sessions[f"{f.name}:{identifier}"] = str(session)
-                    rows.append(
-                        (
-                            f.name,
-                            identifier,
-                            "—",
-                            render.fmt_age(j.get("uptime_s")),
-                            "—",
-                            "—",
-                        )
-                    )
+        self._chat_jobs = {}
 
-        # Compound cursor key keeps two sources from colliding when they
-        # happen to share an identifier (rare today; cheap insurance).
-        previously_selected = self._selected_ticket()
-        tickets_table.clear()
-        for source, identifier, state_label, uptime, last_turn, retries in rows:
-            badge = _SOURCE_BADGES.get(source, source[:1].upper() if source else "?")
-            tickets_table.add_row(
-                badge,
-                identifier,
-                state_label,
-                uptime,
-                last_turn,
-                retries,
-                key=f"{source}:{identifier}",
+        self._refresh_symphony(by_name.get("symphony"))
+        self._refresh_scheduler(snap, by_name.get("schedule"))
+        self._refresh_chat_strip(by_name)
+        self._refresh_stale_banner(snap)
+
+    def _refresh_symphony(self, sym: state.FrontendStatus | None) -> None:
+        cfg, cfg_error = _load_symphony_cached(SYMPHONY_CONFIG)
+        labels = render.tracker_labels(cfg) if cfg else []
+        cap = render.symphony_cap(cfg) if cfg else 0
+        extra = (sym.extra or {}) if sym else {}
+        running = int(extra.get("running", 0) or 0)
+        self.query_one("#symphony-header", Static).update(
+            render.symphony_header(
+                state=sym.state if sym else "stopped",
+                running=running,
+                cap=cap,
+                labels=labels,
+                hb_age_s=sym.last_heartbeat_age_s if sym else None,
+                error=(sym.error if sym and sym.error else cfg_error),
+                stale=bool(sym.stale) if sym else False,
             )
-        for i, row in enumerate(rows):
-            if f"{row[0]}:{row[1]}" == previously_selected:
-                try:
-                    tickets_table.move_cursor(row=i)
-                except Exception:
-                    pass
-                break
+        )
 
+        table = self.query_one("#symphony-tickets", DataTable)
+        previously = self._selected_ticket()
+        table.clear()
+        keys: list[str] = []
+        for ticket in extra.get("running_tickets") or []:
+            identifier = str(ticket.get("identifier", "?"))
+            tracker = str(ticket.get("source") or "jira")
+            self._ticket_sources[identifier] = tracker
+            # Derive the session uuid with the daemon's current backend_key —
+            # mirrors what the orchestrator does when dispatching.
+            self._job_sessions[f"symphony:{identifier}"] = session_uuid_for(
+                identifier, source=tracker, backend_key=current_backend_key()
+            )
+            key = f"symphony:{identifier}"
+            keys.append(key)
+            table.add_row(
+                identifier,
+                str(ticket.get("state", "?")),
+                render.fmt_age(ticket.get("uptime_s")),
+                render.fmt_age(ticket.get("last_turn_end_age_s")),
+                str(ticket.get("failure_attempt", 0)),
+                key=key,
+            )
+        if not keys:
+            # Keep one row so the table still reads as "here, but empty" rather
+            # than a bare header. A placeholder row also keeps the table
+            # focusable for Tab / lifecycle keys.
+            table.add_row(
+                Text("no active jobs", style="dim"), "", "", "", "", key="__empty__"
+            )
+        else:
+            self._restore_cursor(table, keys, previously)
+
+    def _refresh_scheduler(
+        self, snap: state.Snapshot, sched: state.FrontendStatus | None
+    ) -> None:
+        sched_running = bool(sched and sched.state == "running")
+        next_fire_str: str | None = None
+        if snap.jobs and sched_running:
+            nxt = min(snap.jobs, key=lambda j: j.next_fire)
+            next_fire_str = render._fmt_next_fire(nxt.next_fire, snap.timestamp)
+        self.query_one("#scheduler-header", Static).update(
+            render.scheduler_header(
+                state=sched.state if sched else "stopped",
+                next_fire_str=next_fire_str,
+                schedule_error=snap.schedule_error,
+            )
+        )
+
+        table = self.query_one("#jobs-content", DataTable)
+        previously = self._selected_job()
+        table.clear()
+        keys: list[str] = []
+        for job in snap.jobs:
+            next_str = (
+                render._fmt_next_fire(job.next_fire, snap.timestamp)
+                if sched_running
+                else "-"
+            )
+            table.add_row(job.name, job.cron, job.kind, next_str, key=job.name)
+            keys.append(job.name)
+        if not keys:
+            # Short enough to fit the 14-wide name column; `g` opens the config.
+            table.add_row(Text("no jobs (g)", style="dim"), "", "", "", key="__empty__")
+        else:
+            self._restore_cursor(table, keys, previously)
+
+    def _refresh_chat_strip(self, by_name: dict[str, state.FrontendStatus]) -> None:
+        table = self.query_one("#chat-strip", DataTable)
+        previously = self._datatable_cursor_key("#chat-strip")
+        table.clear()
+        keys: list[str] = []
+        for name in CHAT_FRONTENDS:
+            frontend = by_name.get(name)
+            if frontend is None:
+                continue
+            extra = frontend.extra or {}
+            jobs: list[tuple[str, str]] = []
+            for job in extra.get("running_jobs") or []:
+                identifier = str(job.get("identifier", "?"))
+                session = job.get("session_uuid")
+                if session:
+                    self._job_sessions[f"{name}:{identifier}"] = str(session)
+                jobs.append((identifier, str(session) if session else ""))
+            self._chat_jobs[name] = jobs
+            table.add_row(
+                name,
+                render.state_cell(frontend.state),
+                render.fmt_age(frontend.last_heartbeat_age_s),
+                str(len(jobs)) if jobs else "-",
+                key=name,
+            )
+            keys.append(name)
+        self._restore_cursor(table, keys, previously)
+
+    def _refresh_stale_banner(self, snap: state.Snapshot) -> None:
         stale = [f.name for f in snap.frontends if f.stale]
         banner = self.query_one("#stale-banner", Static)
         if stale:
