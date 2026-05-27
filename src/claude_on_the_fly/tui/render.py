@@ -116,6 +116,82 @@ def _format_extra_notes(extra: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in sorted(scalars.items()))
 
 
+# ---------------------------------------------------------------------------
+# Hero-panel headers (dashboard). Pure markup builders so they're testable
+# without booting Textual.
+# ---------------------------------------------------------------------------
+
+
+def _state_markup(state: str) -> str:
+    glyph = _STATE_GLYPH.get(state, "?")
+    style = _STATE_STYLES.get(state, "")
+    return f"[{style}]{glyph} {state}[/]" if style else f"{glyph} {state}"
+
+
+def tracker_labels(config) -> list[str]:
+    """Short per-tracker labels for the symphony header, e.g. `jira:ACES`.
+
+    Duck-typed on purpose: only `.trackers` (name -> tracker) and an optional
+    `project_key` on each tracker are touched, so a SimpleNamespace stands in
+    for a real SymphonyConfig in tests.
+    """
+    labels = []
+    for name, tracker in config.trackers.items():
+        key = getattr(tracker, "project_key", "") or ""
+        labels.append(f"{name}:{key}" if key else str(name))
+    return labels
+
+
+def symphony_cap(config) -> int:
+    """Sum of per-tracker `max_concurrent`. There is no global cap, so the
+    effective parallelism ceiling is the sum across trackers."""
+    return sum(
+        int(getattr(t, "max_concurrent", 0) or 0) for t in config.trackers.values()
+    )
+
+
+def symphony_header(
+    *,
+    state: str,
+    running: int,
+    cap: int,
+    labels: list[str],
+    hb_age_s: float | None,
+    error: str | None = None,
+    stale: bool = False,
+) -> str:
+    """Markup line for the SYMPHONY panel border-title."""
+    line = f"[bold]SYMPHONY[/bold]  {_state_markup(state)}"
+    rest = [f"{running}/{cap}" if cap else f"{running} running"]
+    if labels:
+        rest.append(f"[dim]{', '.join(labels)}[/dim]")
+    if hb_age_s is not None:
+        rest.append(f"[dim]hb {fmt_age(hb_age_s)}[/dim]")
+    line += "  ·  " + "  ·  ".join(rest)
+    if stale:
+        line += "  [yellow]⚠ stale[/yellow]"
+    if error:
+        line += f"  [red]({error})[/red]"
+    return line
+
+
+def scheduler_header(
+    *,
+    state: str,
+    next_fire_str: str | None,
+    schedule_error: str | None = None,
+) -> str:
+    """Markup line for the SCHEDULER panel border-title."""
+    line = f"[bold]SCHEDULER[/bold]  {_state_markup(state)}"
+    if schedule_error:
+        return line + f"  [red]({schedule_error})[/red]"
+    if state != "running":
+        return line
+    if next_fire_str:
+        return line + f"  ·  next fire {next_fire_str}"
+    return line + "  ·  [dim]no jobs[/dim]"
+
+
 def frontends_table(frontends: list[FrontendStatus], now: datetime) -> Table:
     table = Table(title="Frontends", show_header=True, header_style="bold")
     table.add_column("name")
