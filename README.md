@@ -285,6 +285,7 @@ Or use a `.env` file with all vars and a process manager.
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-...`) for Socket Mode |
 | `SLACK_USER_TOKEN` | yes | User OAuth token (`xoxp-...`) to post as you |
 | `SLACK_ALLOWED_USER_IDS` | no | Extra allowed user IDs (comma-separated). Your own ID is resolved from the user token. Use `*` to allow any sender (applies to channels and DMs) |
+| `SLACK_BLOCKED_USER_IDS` | no | User IDs to deny (comma-separated). Takes priority over the allowlist, so `*` can allow everyone except these |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
 ### Gmail
