@@ -204,7 +204,7 @@ def test_prompt_store_maybe_reload_read_failure(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# instruction_path / list_instructions — per-tracker pick from local + remote
+# instruction_path / list_instructions — per-tracker pick from the local dir
 # ---------------------------------------------------------------------------
 
 
@@ -219,35 +219,8 @@ class TestInstructionResolution:
             source="github",
             instruction="_default",
             local_root=local,
-            remote_root=None,
         )
         assert path == local / "github" / "_default.md"
-
-    def test_local_wins_over_remote(self, tmp_path: Path) -> None:
-        from claude_on_the_fly.symphony.prompt import instruction_path
-
-        local = tmp_path / "local"
-        remote = tmp_path / "remote"
-        (local / "github").mkdir(parents=True)
-        (remote / "github").mkdir(parents=True)
-        (local / "github" / "pm.md").write_text("local pm")
-        (remote / "github" / "pm.md").write_text("remote pm")
-        path = instruction_path(
-            source="github", instruction="pm", local_root=local, remote_root=remote
-        )
-        assert path == local / "github" / "pm.md"
-
-    def test_falls_to_remote_when_not_local(self, tmp_path: Path) -> None:
-        from claude_on_the_fly.symphony.prompt import instruction_path
-
-        local = tmp_path / "local"
-        remote = tmp_path / "remote"
-        (remote / "github").mkdir(parents=True)
-        (remote / "github" / "qa.md").write_text("remote qa")
-        path = instruction_path(
-            source="github", instruction="qa", local_root=local, remote_root=remote
-        )
-        assert path == remote / "github" / "qa.md"
 
     def test_returns_none_when_missing(self, tmp_path: Path) -> None:
         from claude_on_the_fly.symphony.prompt import instruction_path
@@ -256,30 +229,24 @@ class TestInstructionResolution:
             source="github",
             instruction="nope",
             local_root=tmp_path,
-            remote_root=None,
         )
         assert path is None
 
-    def test_list_unions_local_and_remote(self, tmp_path: Path) -> None:
+    def test_list_discovers_local_stems(self, tmp_path: Path) -> None:
         from claude_on_the_fly.symphony.prompt import list_instructions
 
         local = tmp_path / "local"
-        remote = tmp_path / "remote"
         (local / "github").mkdir(parents=True)
-        (remote / "github").mkdir(parents=True)
         (local / "github" / "_default.md").write_text("x")
         (local / "github" / "rnd.md").write_text("x")
-        (remote / "github" / "pm.md").write_text("x")
-        (remote / "github" / "qa.md").write_text("x")
-        names = list_instructions(source="github", local_root=local, remote_root=remote)
-        assert names == ["_default", "pm", "qa", "rnd"]
+        (local / "github" / "pm.md").write_text("x")
+        names = list_instructions(source="github", local_root=local)
+        assert names == ["_default", "pm", "rnd"]
 
     def test_list_always_includes_default(self, tmp_path: Path) -> None:
         from claude_on_the_fly.symphony.prompt import list_instructions
 
-        names = list_instructions(
-            source="github", local_root=tmp_path, remote_root=None
-        )
+        names = list_instructions(source="github", local_root=tmp_path)
         assert names == ["_default"]
 
 
@@ -298,7 +265,6 @@ class TestInstructionResolverPerRepo:
             default_instruction="_default",
             instruction_by_repo={},
             local_root=tmp_path / "local",
-            remote_root=None,
         )
         assert r.resolve_for("hardcoretech/fms#42") == "default body"
 
@@ -312,7 +278,6 @@ class TestInstructionResolverPerRepo:
             default_instruction="_default",
             instruction_by_repo={"hardcoretech/fms": "fms-review"},
             local_root=tmp_path / "local",
-            remote_root=None,
         )
         # Mapped repo → override; unmapped repo → default.
         assert r.resolve_for("hardcoretech/fms#42") == "fms body"
@@ -327,7 +292,6 @@ class TestInstructionResolverPerRepo:
             default_instruction="_default",
             instruction_by_repo={},  # jira never has a per-repo map
             local_root=tmp_path / "local",
-            remote_root=None,
         )
         assert r.resolve_for("FIS-123") == "jira body"
 
@@ -339,7 +303,6 @@ class TestInstructionResolverPerRepo:
             default_instruction="_default",
             instruction_by_repo={},
             local_root=tmp_path / "local",  # nothing seeded
-            remote_root=None,
         )
         assert r.resolve_for("owner/repo#1") == ""
 

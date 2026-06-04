@@ -8,9 +8,8 @@
 #
 # ── Instruction files (the agent's prompt) ──────────────────────────────────
 #   Each tracker picks ONE instruction file by stem via `instruction:`.
-#   Resolved from, local winning over remote:
+#   Resolved from:
 #     ~/.claude-on-the-fly/symphony/<kind>/<stem>.md          (local)
-#     <remote config cache>/prompts/<kind>/<stem>.md           (if config_source)
 #   So jira's default is ~/.claude-on-the-fly/symphony/jira/_default.md.
 #   Drop pm.md / qa.md / rnd.md next to it and set `instruction:` to pick one.
 
@@ -60,11 +59,3 @@ stall_timeout_ms: 1800000  # cancel a worker idle this long (0 disables)
 max_no_progress_turns: 3   # stop after this many consecutive turns with zero
                            # tool use (the agent is producing nothing; 0 disables)
 max_retry_backoff_ms: 300000   # cap on exponential backoff after failures
-
-# ── Online config (optional) ─────────────────────────────────────────────────
-# Pull structural config + instruction files from a git repo. The local file
-# then holds only the source pointer + any scalar overrides of remote keys.
-# Auth is git's own (HTTPS credential helper / SSH). Private + public both work.
-# config_source: git+https://github.com/<your-org>/symphony-config@main
-# config_path: pm/                 # optional subdir within the repo
-# config_refresh_ms: 300000        # re-fetch cadence (min 30s)

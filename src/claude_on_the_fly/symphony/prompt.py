@@ -79,43 +79,31 @@ def instruction_path(
     source: str,
     instruction: str,
     local_root: Path,
-    remote_root: Path | None,
 ) -> Path | None:
-    """Resolve `<instruction>.md` for a tracker. Local wins over remote.
+    """Resolve `<instruction>.md` for a tracker.
 
     Looks at:
         local_root/<source>/<instruction>.md         (e.g. ~/.claude-on-the-fly/symphony/github/pm.md)
-        remote_root/<source>/<instruction>.md         (pulled config: <cache>/prompts/github/pm.md)
 
-    Returns the first existing path, or None (caller falls back to the
+    Returns the path if it exists, or None (caller falls back to the
     built-in prompt).
     """
     name = (instruction or "_default").strip()
-    candidates = [local_root / source / f"{name}.md"]
-    if remote_root is not None:
-        candidates.append(remote_root / source / f"{name}.md")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
+    candidate = local_root / source / f"{name}.md"
+    return candidate if candidate.is_file() else None
 
 
-def list_instructions(
-    *, source: str, local_root: Path, remote_root: Path | None
-) -> list[str]:
-    """Discover available instruction stems for a tracker (local + remote union).
+def list_instructions(*, source: str, local_root: Path) -> list[str]:
+    """Discover available instruction stems for a tracker.
 
     Returns sorted unique filename stems (without `.md`). `_default` is always
     included so the dropdown never renders empty even before any file exists.
     """
     names: set[str] = {"_default"}
-    for root in (local_root, remote_root):
-        if root is None:
-            continue
-        directory = root / source
-        if directory.is_dir():
-            for path in directory.glob("*.md"):
-                names.add(path.stem)
+    directory = local_root / source
+    if directory.is_dir():
+        for path in directory.glob("*.md"):
+            names.add(path.stem)
     return sorted(names)
 
 
@@ -147,13 +135,11 @@ class InstructionResolver:
         default_instruction: str,
         instruction_by_repo: dict[str, str] | None,
         local_root: Path,
-        remote_root: Path | None,
     ) -> None:
         self._kind = kind
         self._default = default_instruction or "_default"
         self._by_repo = dict(instruction_by_repo or {})
         self._local = local_root
-        self._remote = remote_root
         self._stores: dict[str, PromptStore | None] = {}
 
     def _stem_for(self, identifier: str) -> str:
@@ -169,15 +155,14 @@ class InstructionResolver:
                 source=self._kind,
                 instruction=stem,
                 local_root=self._local,
-                remote_root=self._remote,
             )
             if path is None:
-                # A missing `_default` is expected (rely on remote/built-in); a
+                # A missing `_default` is expected (rely on the built-in); a
                 # missing NON-default stem is almost always a config typo in
                 # `instruction:` / `instruction_by_repo:`, so surface it louder.
                 log = logger.warning if stem == "_default" else logger.error
                 log(
-                    "[%s] instruction '%s' not found under %s (or remote); "
+                    "[%s] instruction '%s' not found under %s; "
                     "using built-in fallback prompt",
                     self._kind,
                     stem,

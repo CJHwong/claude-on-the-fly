@@ -57,9 +57,8 @@ EXAMPLE_YAML = """\
 #
 # ── Instruction files (the agent's prompt) ──────────────────────────────────
 #   Each tracker picks ONE instruction file by stem via `instruction:`.
-#   Resolved from, local winning over remote:
+#   Resolved from:
 #     ~/.claude-on-the-fly/symphony/<kind>/<stem>.md          (local)
-#     <remote config cache>/prompts/<kind>/<stem>.md           (if config_source)
 #   So jira's default is ~/.claude-on-the-fly/symphony/jira/_default.md.
 #   Drop pm.md / qa.md / rnd.md next to it and set `instruction:` to pick one.
 
@@ -109,14 +108,6 @@ stall_timeout_ms: 1800000  # cancel a worker idle this long (0 disables)
 max_no_progress_turns: 3   # stop after this many consecutive turns with zero
                            # tool use (the agent is producing nothing; 0 disables)
 max_retry_backoff_ms: 300000   # cap on exponential backoff after failures
-
-# ── Online config (optional) ─────────────────────────────────────────────────
-# Pull structural config + instruction files from a git repo. The local file
-# then holds only the source pointer + any scalar overrides of remote keys.
-# Auth is git's own (HTTPS credential helper / SSH). Private + public both work.
-# config_source: git+https://github.com/<your-org>/symphony-config@main
-# config_path: pm/                 # optional subdir within the repo
-# config_refresh_ms: 300000        # re-fetch cadence (min 30s)
 """
 
 
@@ -154,7 +145,7 @@ def _reject_removed_keys(raw: dict) -> None:
         raise ValueError(
             "tracker.prompt / tracker.prompts_dir are no longer supported. "
             "Put instruction files at ~/.claude-on-the-fly/symphony/<source>/"
-            "<name>.md (or in the remote config) and select one with "
+            "<name>.md and select one with "
             "`instruction: <name>` (default: _default)."
         )
     if raw.get("gate_label"):
@@ -205,8 +196,7 @@ class TrackerCommonConfig:
 
     `instruction` selects which instruction file the tracker uses, by stem.
     The file is resolved at runtime from the local instructions dir
-    (`~/.claude-on-the-fly/symphony/<source>/<instruction>.md`) or the pulled
-    remote config (`<cache>/prompts/<source>/<instruction>.md`), local first.
+    (`~/.claude-on-the-fly/symphony/<source>/<instruction>.md`).
     Defaults to `_default`. The Settings page lists the discovered stems as a
     dropdown. Resolution is the same file for every item the tracker handles
     — there is no per-repo / per-project auto-resolution.
@@ -494,10 +484,6 @@ class SymphonyConfig:
 def load_config(path: Path) -> SymphonyConfig:
     if not path.exists():
         raise FileNotFoundError(f"config not found: {path}")
-    # If the local file declares `config_source:`, fetch the remote repo
-    # and shallow-merge. Otherwise read the local file directly.
-    from .remote_config import RemoteConfigError, load_remote_config
-
     try:
         local_text = path.read_text()
     except OSError as exc:
@@ -510,16 +496,6 @@ def load_config(path: Path) -> SymphonyConfig:
         raise ValueError(
             f"{path}: config must decode to a mapping, got {type(raw_local).__name__}"
         )
-
-    if raw_local.get("config_source"):
-        cache_root = (path.parent / ".config-cache").resolve()
-        try:
-            working, merged, _source = load_remote_config(path, cache_root=cache_root)
-        except RemoteConfigError as exc:
-            raise ValueError(f"{path}: remote config failed: {exc}") from exc
-        if merged is not None and working is not None:
-            return SymphonyConfig.from_dict(merged, base=working)
-
     return SymphonyConfig.from_dict(raw_local, base=path.parent)
 
 

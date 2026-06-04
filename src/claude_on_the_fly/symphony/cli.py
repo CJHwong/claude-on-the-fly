@@ -179,7 +179,7 @@ def _cmd_run_once(config_path: Path) -> int:
         state = OrchestratorState()
         retry_queue = RetryQueue(event_log=EventLog())
         prompts: dict = {}
-        _refresh_prompt_stores(prompts, cfg, config_path=config_path)
+        _refresh_prompt_stores(prompts, cfg)
         cursors = _build_cursor_stores(cfg, _agent_mod.DATA_DIR / "symphony" / "state")
         await _tick(
             state,
@@ -201,7 +201,7 @@ def _cmd_run_once(config_path: Path) -> int:
 
 
 def _cmd_config_show(config_path: Path) -> int:
-    """Print the merged effective config (remote + local) as YAML."""
+    """Print the effective config as YAML."""
     from .config import dump_effective_config, load_config
 
     try:
@@ -210,37 +210,6 @@ def _cmd_config_show(config_path: Path) -> int:
         sys.stderr.write(f"config load failed: {exc}\n")
         return 2
     sys.stdout.write(dump_effective_config(cfg))
-    return 0
-
-
-def _cmd_config_refresh(config_path: Path) -> int:
-    """Force a remote git fetch + merge right now. Useful before `run`."""
-    import yaml as _yaml
-
-    from .remote_config import RemoteConfigError, load_remote_config
-
-    try:
-        raw_local = _yaml.safe_load(config_path.read_text()) or {}
-    except Exception as exc:
-        sys.stderr.write(f"cannot read {config_path}: {exc}\n")
-        return 2
-    if not isinstance(raw_local, dict) or not raw_local.get("config_source"):
-        sys.stdout.write("no `config_source` in local config — nothing to refresh.\n")
-        return 0
-    cache_root = (config_path.parent / ".config-cache").resolve()
-    try:
-        working, merged, source = load_remote_config(config_path, cache_root=cache_root)
-    except RemoteConfigError as exc:
-        sys.stderr.write(f"remote refresh failed: {exc}\n")
-        return 2
-    if source is None or working is None or merged is None:
-        sys.stdout.write("no remote config to refresh.\n")
-        return 0
-    sys.stdout.write(
-        f"refreshed {source.url}@{source.ref}\n"
-        f"  cache:   {working}\n"
-        f"  trackers: {sorted(merged.get('trackers') or [])}\n"
-    )
     return 0
 
 
@@ -371,18 +340,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run one poll tick then exit (debug).",
     )
 
-    config_parser = sub.add_parser(
-        "config", help="Inspect or refresh the resolved (remote + local) config"
-    )
+    config_parser = sub.add_parser("config", help="Inspect the effective config")
     config_sub = config_parser.add_subparsers(dest="config_cmd", required=True)
     show_parser = config_sub.add_parser(
-        "show", help="Dump the merged effective config to stdout (YAML)"
+        "show", help="Dump the effective config to stdout (YAML)"
     )
     show_parser.add_argument("config", nargs="?", default=str(DEFAULT_CONFIG))
-    refresh_parser = config_sub.add_parser(
-        "refresh", help="Force a remote git fetch + merge right now"
-    )
-    refresh_parser.add_argument("config", nargs="?", default=str(DEFAULT_CONFIG))
 
     sub.add_parser(
         "doctor",
@@ -442,8 +405,6 @@ def main() -> int:
         path = Path(args.config).expanduser()
         if args.config_cmd == "show":
             return _cmd_config_show(path)
-        if args.config_cmd == "refresh":
-            return _cmd_config_refresh(path)
         return 2
 
     if args.cmd == "doctor":

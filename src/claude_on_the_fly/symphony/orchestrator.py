@@ -1029,15 +1029,8 @@ def _instructions_root() -> Path:
     return _agent_mod.DATA_DIR / "symphony"
 
 
-def _remote_prompts_root(config_path: Path) -> Path | None:
-    from .remote_config import remote_prompts_root
-
-    cache_root = (config_path.parent / ".config-cache").resolve()
-    return remote_prompts_root(config_path, cache_root=cache_root)
-
-
 def _build_prompt_resolvers(
-    config: SymphonyConfig, *, local_root: Path, remote_root: Path | None
+    config: SymphonyConfig, *, local_root: Path
 ) -> dict[str, InstructionResolver]:
     """One InstructionResolver per tracker. Resolves each issue's instruction
     file from its default stem (or a per-repo override) at dispatch time."""
@@ -1048,7 +1041,6 @@ def _build_prompt_resolvers(
             default_instruction=tracker_cfg.instruction,
             instruction_by_repo=getattr(tracker_cfg, "instruction_by_repo", None),
             local_root=local_root,
-            remote_root=remote_root,
         )
     return resolvers
 
@@ -1056,16 +1048,10 @@ def _build_prompt_resolvers(
 def _refresh_prompt_stores(
     stores: dict[str, InstructionResolver],
     config: SymphonyConfig,
-    *,
-    config_path: Path,
 ) -> None:
     """Rebuild the resolver map in place (instruction / per-repo map may have
-    changed, or a remote refresh added/changed files)."""
-    rebuilt = _build_prompt_resolvers(
-        config,
-        local_root=_instructions_root(),
-        remote_root=_remote_prompts_root(config_path),
-    )
+    changed)."""
+    rebuilt = _build_prompt_resolvers(config, local_root=_instructions_root())
     stores.clear()
     stores.update(rebuilt)
 
@@ -1129,30 +1115,6 @@ def _trim_workers_to_budget(
     return cancelled
 
 
-def _read_config_refresh_ms(config_path: Path) -> int | None:
-    """Read the local `config_refresh_ms` (a local-only key, stripped from the
-    merged config). Returns None when there's no `config_source` to refresh."""
-    try:
-        import yaml as _yaml
-
-        raw = _yaml.safe_load(config_path.read_text()) or {}
-    except Exception:
-        logger.warning(
-            "could not read %s for config_refresh_ms; periodic remote refresh "
-            "disabled for this run",
-            config_path,
-            exc_info=True,
-        )
-        return None
-    if not isinstance(raw, dict) or not raw.get("config_source"):
-        return None
-    try:
-        value = int(raw.get("config_refresh_ms", 300000))
-    except (TypeError, ValueError):
-        return 300000
-    return max(value, 30000)  # floor at 30s, matching the spec
-
-
 def _maybe_reload_config(
     *,
     config_path: Path,
@@ -1163,13 +1125,8 @@ def _maybe_reload_config(
     prompt_stores: dict[str, InstructionResolver],
     cursor_stores: dict[str, CursorStore],
     state_root: Path,
-    force: bool = False,
 ) -> tuple[SymphonyConfig, float | None]:
     """Check the config file's mtime; reload + apply changes when it bumps.
-
-    `force=True` bypasses the mtime short-circuit — used by the periodic
-    remote-config refresh, where the local file is unchanged but the remote
-    git cache may have moved.
 
     Returns the (possibly updated) config and the new mtime. On any reload
     failure, logs and keeps the current config (last-known-good).
@@ -1181,9 +1138,9 @@ def _maybe_reload_config(
             "config file vanished at %s; keeping last-known-good", config_path
         )
         return config, last_mtime
-    if not force and last_mtime is not None and mtime == last_mtime:
+    if last_mtime is not None and mtime == last_mtime:
         return config, last_mtime
-    if not force and last_mtime is None:
+    if last_mtime is None:
         return config, mtime
     try:
         new_config = load_config(config_path)
@@ -1238,9 +1195,9 @@ def _maybe_reload_config(
                 n,
             )
 
-    # Rebuild prompt stores in place — covers added/removed trackers, a
-    # changed `instruction` selection, and remote files added on refresh.
-    _refresh_prompt_stores(prompt_stores, new_config, config_path=config_path)
+    # Rebuild prompt stores in place — covers added/removed trackers and a
+    # changed `instruction` selection.
+    _refresh_prompt_stores(prompt_stores, new_config)
 
     return new_config, mtime
 
@@ -1253,7 +1210,7 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     _log_config_summary(config)
 
     prompt_stores: dict[str, InstructionResolver] = {}
-    _refresh_prompt_stores(prompt_stores, config, config_path=config_path)
+    _refresh_prompt_stores(prompt_stores, config)
 
     from .. import agent as _agent_mod
 
@@ -1264,12 +1221,6 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
         last_config_mtime: float | None = config_path.stat().st_mtime
     except FileNotFoundError:
         last_config_mtime = None
-
-    # Periodic remote-config refresh. When the local file declares a
-    # `config_source`, re-fetch the git cache every `config_refresh_ms`
-    # even though the local file's mtime hasn't changed.
-    config_refresh_ms = _read_config_refresh_ms(config_path)
-    last_remote_refresh = time.monotonic()
 
     trackers = make_trackers(config)
     state = OrchestratorState()
@@ -1293,16 +1244,6 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
         await startup_cleanup(WORKSPACES_ROOT, trackers, config)
 
         while not stop_event.is_set():
-            # Periodic remote refresh: if config_refresh_ms has elapsed,
-            # force a reload so the git cache is re-fetched (the local file
-            # mtime gate wouldn't catch an upstream-only change).
-            force_reload = False
-            if config_refresh_ms is not None:
-                now = time.monotonic()
-                if (now - last_remote_refresh) * 1000 >= config_refresh_ms:
-                    last_remote_refresh = now
-                    force_reload = True
-
             # Per-tick: check for config edits and apply structural changes
             # (added/removed trackers, concurrency reductions, instruction
             # changes). Prompt content reload is per-dispatch via mtime.
@@ -1315,7 +1256,6 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
                 prompt_stores=prompt_stores,
                 cursor_stores=cursor_stores,
                 state_root=state_root,
-                force=force_reload,
             )
 
             try:
