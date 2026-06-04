@@ -12,11 +12,11 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import Screen
-from textual.widgets import Footer, Header, ListItem, ListView, RichLog, Static
+from textual.widgets import Footer, ListItem, ListView, RichLog, Static
 
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.tui.render import tail_lines
+from claude_on_the_fly.tui.screens.overlay import OverlayScreen
 
 LOG_DIR = DATA_DIR / "logs"
 TAIL_LINES = 500
@@ -32,7 +32,7 @@ def _available_logs() -> list[Path]:
     )
 
 
-class LogsScreen(Screen):
+class LogsScreen(OverlayScreen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
         ("q", "app.pop_screen", "Back"),
@@ -46,8 +46,7 @@ class LogsScreen(Screen):
         self._rendered_mtime: float | None = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        with Horizontal():
+        with Horizontal(id="overlay-box"):
             with Vertical(id="logs-sidebar"):
                 yield Static("Logs", id="logs-title")
                 yield ListView(id="logs-list")

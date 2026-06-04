@@ -8,10 +8,10 @@ from rich.text import Text
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
+from textual.widgets import Footer, Static
 
 from claude_on_the_fly import checks
+from claude_on_the_fly.tui.screens.overlay import OverlayScreen
 
 
 _STATUS_STYLES = {
@@ -36,7 +36,7 @@ def _group_table(group_name: str, results: list[checks.CheckResult]) -> Table:
     return table
 
 
-class DoctorScreen(Screen):
+class DoctorScreen(OverlayScreen):
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
         ("q", "app.pop_screen", "Back"),
@@ -44,8 +44,7 @@ class DoctorScreen(Screen):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        with VerticalScroll():
+        with VerticalScroll(id="overlay-box"):
             yield Static(id="doctor-content")
         yield Footer()
 

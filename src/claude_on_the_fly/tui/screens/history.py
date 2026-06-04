@@ -23,8 +23,7 @@ from typing import Literal
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, RichLog, Static
+from textual.widgets import DataTable, Footer, RichLog, Static
 
 from claude_on_the_fly.agent import DATA_DIR, current_backend_key, get_backend
 from claude_on_the_fly.events import EventLog
@@ -32,6 +31,7 @@ from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
 from claude_on_the_fly.tui import render
+from claude_on_the_fly.tui.screens.overlay import OverlayScreen
 
 # Cap on rows we hydrate into the table. Older entries stay on disk in
 # events.jsonl and can be queried with jq. 1000 rows ~= weeks of activity.
@@ -246,8 +246,8 @@ def _format_detail(e: dict) -> str:
     return ""
 
 
-class HistoryScreen(Screen):
-    # When the watch pane is open it takes the bottom half, so the screen
+class HistoryScreen(OverlayScreen):
+    # When the watch pane is open it takes the bottom half, so the box
     # splits 50/50 vertically. Closed, the table fills the available space.
     DEFAULT_CSS = """
     #hist-watch-wrap {
@@ -294,21 +294,23 @@ class HistoryScreen(Screen):
         self._watch_mtime: float | None = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static(id="history-header", markup=True)
-        with Vertical(id="hist-table-wrap"):
-            yield DataTable(id="history-table", cursor_type="row", zebra_stripes=True)
-        with Vertical(id="hist-watch-wrap"):
-            yield Static(id="hist-watch-header", markup=True)
-            yield RichLog(
-                id="hist-watch-pane",
-                wrap=False,
-                highlight=False,
-                markup=True,
-                auto_scroll=True,
-                max_lines=10_000,
-            )
-        yield Static(id="history-footer-hint", markup=True)
+        with Vertical(id="overlay-box"):
+            yield Static(id="history-header", markup=True)
+            with Vertical(id="hist-table-wrap"):
+                yield DataTable(
+                    id="history-table", cursor_type="row", zebra_stripes=True
+                )
+            with Vertical(id="hist-watch-wrap"):
+                yield Static(id="hist-watch-header", markup=True)
+                yield RichLog(
+                    id="hist-watch-pane",
+                    wrap=False,
+                    highlight=False,
+                    markup=True,
+                    auto_scroll=True,
+                    max_lines=10_000,
+                )
+            yield Static(id="history-footer-hint", markup=True)
         yield Footer()
 
     def on_mount(self) -> None:
