@@ -44,6 +44,7 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_APP_TOKEN",
     "SLACK_USER_TOKEN",
     "SLACK_ALLOWED_USER_IDS",
+    "SLACK_BLOCKED_USER_IDS",
     "SLACK_STATS_MODE",
 )
 GMAIL_ENV_VARS: tuple[str, ...] = (

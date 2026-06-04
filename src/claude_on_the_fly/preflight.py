@@ -290,9 +290,10 @@ def run_telegram() -> tuple[str, int]:
     return token, allowed_user_id
 
 
-def run_slack() -> tuple[str, str, str, set[str]]:
-    """Validate env vars and tokens. Returns (app_token, user_token, user_id, allowed_user_ids).
+def run_slack() -> tuple[str, str, str, set[str], set[str]]:
+    """Validate env vars and tokens.
 
+    Returns (app_token, user_token, user_id, allowed_user_ids, blocked_user_ids).
     user_id is resolved from Slack auth.test — no need to pass it via env.
     """
     _setup_logging()
@@ -301,10 +302,17 @@ def run_slack() -> tuple[str, str, str, set[str]]:
     user_token = os.environ["SLACK_USER_TOKEN"]
     allowed_raw = os.environ.get("SLACK_ALLOWED_USER_IDS", "")
     allowed_user_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
+    blocked_raw = os.environ.get("SLACK_BLOCKED_USER_IDS", "")
+    blocked_user_ids = {uid.strip() for uid in blocked_raw.split(",") if uid.strip()}
     check_backend()
     user_id = asyncio.run(check_slack(app_token, user_token))
-    logger.debug("preflight: user_id=%s allowed_user_ids=%s", user_id, allowed_user_ids)
-    return app_token, user_token, user_id, allowed_user_ids
+    logger.debug(
+        "preflight: user_id=%s allowed_user_ids=%s blocked_user_ids=%s",
+        user_id,
+        allowed_user_ids,
+        blocked_user_ids,
+    )
+    return app_token, user_token, user_id, allowed_user_ids, blocked_user_ids
 
 
 def run_gmail() -> tuple[str, set[str]]:

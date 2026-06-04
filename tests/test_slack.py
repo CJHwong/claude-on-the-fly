@@ -281,6 +281,19 @@ class TestIngestEvent:
         await frontend._ingest_event(event)
         frontend._on_message.assert_awaited_once()
 
+    async def test_blocklist_wins_over_wildcard(self, frontend):
+        frontend._allow_all_senders = True
+        frontend._blocked_user_ids = {"U_BANNED"}
+        event = {
+            "ts": "4.2",
+            "text": "<@U_SELF> hello",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_BANNED",
+        }
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_not_awaited()
+
     async def test_channel_skips_no_mention(self, frontend):
         event = {
             "ts": "5.0",

@@ -265,17 +265,20 @@ class SlackFrontend(Frontend):
         user_token: str,
         user_id: str,
         allowed_user_ids: set[str] | None = None,
+        blocked_user_ids: set[str] | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
         self._allow_all_senders = "*" in self._allowed_user_ids
+        self._blocked_user_ids = blocked_user_ids or set()
         logger.debug(
-            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s",
+            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s",
             user_id,
             self._allowed_user_ids,
             self._allow_all_senders,
+            self._blocked_user_ids,
         )
         self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
         self._handler: AsyncSocketModeHandler | None = None
@@ -320,6 +323,7 @@ class SlackFrontend(Frontend):
             "app_token": _redact_token(self._app_token),
             "user_id": self._user_id,
             "allowed_users": allowed or "<none>",
+            "blocked_users": ",".join(sorted(self._blocked_user_ids)) or "<none>",
         }
 
     # --- Lifecycle ---
@@ -383,6 +387,11 @@ class SlackFrontend(Frontend):
             len(forwards),
             fwd_refs,
         )
+
+        # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
+        if sender_id in self._blocked_user_ids:
+            logger.debug("skipped: sender %s in blocked_user_ids", sender_id)
+            return
 
         # Allowlist applies to all channel types, including DMs and group DMs.
         if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
@@ -821,12 +830,13 @@ def main() -> None:  # pragma: no cover
     from claude_on_the_fly.preflight import run_slack
 
     load_dotenv()
-    app_token, user_token, user_id, allowed_user_ids = run_slack()
+    app_token, user_token, user_id, allowed_user_ids, blocked_user_ids = run_slack()
     frontend = SlackFrontend(
         app_token=app_token,
         user_token=user_token,
         user_id=user_id,
         allowed_user_ids=allowed_user_ids,
+        blocked_user_ids=blocked_user_ids,
     )
     asyncio.run(run(frontend, platform="slack"))
 
