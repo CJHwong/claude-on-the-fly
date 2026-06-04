@@ -45,6 +45,21 @@ def state_cell(state_str: str) -> Text:
     )
 
 
+def tab_label(index: int, title: str, state: str) -> Text:
+    """Tab title for the dashboard's TabbedContent: "[N] <glyph> <title>".
+
+    The bracketed number is the switch key (kept off the footer — the tab bar
+    is its own affordance); the glyph is the daemon-health badge so both tabs
+    surface their state regardless of which one is active. Reuses the same
+    glyph/style table as state_cell, so the tab badge and the panel header
+    can't drift apart.
+    """
+    label = Text(f"[{index}] ", style="dim")
+    label.append(_STATE_GLYPH.get(state, "?"), style=_STATE_STYLES.get(state, ""))
+    label.append(f" {title}")
+    return label
+
+
 def tail_lines(path: Path, n: int) -> list[str]:
     """Return the last n lines of a text file. Empty list on read error.
 

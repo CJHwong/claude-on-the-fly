@@ -15,6 +15,7 @@ from claude_on_the_fly.tui.render import (
     frontends_table,
     render_snapshot_json,
     render_snapshot_rich,
+    tab_label,
     tail_lines,
 )
 from claude_on_the_fly.tui.state import FrontendStatus, JobInfo, Snapshot
@@ -71,6 +72,19 @@ class TestFmtHelpers:
         now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=timezone.utc)
         assert _fmt_uptime(None, now) == "-"
         assert _fmt_uptime("garbage", now) == "-"
+
+
+class TestTabLabel:
+    def test_carries_index_and_health_glyph(self):
+        assert tab_label(1, "symphony", "running").plain == "[1] ● symphony"
+        assert tab_label(2, "scheduler", "stopped").plain == "[2] ○ scheduler"
+        assert tab_label(1, "symphony", "broken").plain == "[1] ⚠ symphony"
+
+    def test_styles_glyph_by_state(self):
+        # The glyph reuses state_cell's style table, keyed by state.
+        label = tab_label(1, "symphony", "running")
+        glyph_span = next(s for s in label.spans if s.start == 4)
+        assert glyph_span.style == "bold green"
 
 
 class TestRichRender:

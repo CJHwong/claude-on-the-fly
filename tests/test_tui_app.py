@@ -124,7 +124,7 @@ def _dashboard(app):
 
 
 class TestDashboardLayout:
-    """The redesigned dashboard: hero panels + Tab-cycled focus + retargeting."""
+    """The tabbed dashboard: daemon tabs + chat-strip override + retargeting."""
 
     @pytest.mark.asyncio
     async def test_hero_panels_render_with_headers(self):
@@ -151,53 +151,68 @@ class TestDashboardLayout:
             assert strip.row_count == 3  # telegram / slack / gmail
 
     @pytest.mark.asyncio
-    async def test_boot_focuses_symphony_then_tab_cycles_zones(self):
+    async def test_tab_keys_switch_active_daemon(self):
+        """[1]/[2]/[3] switch tabs, which is how the supervisor keys + log row
+        pick a daemon now (tab, not focus). Switching also lands focus on the
+        new tab's table. Tab order: chat / scheduler / symphony."""
+        from textual.widgets import TabbedContent
+
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             screen = _dashboard(app)
-            assert app.focused is not None and app.focused.id == "symphony-tickets"
-            assert screen._active_daemon() == "symphony"
-
-            await pilot.press("tab")
-            await pilot.pause()
-            assert app.focused is not None and app.focused.id == "jobs-content"
-            assert screen._active_daemon() == "schedule"
-
-            await pilot.press("tab")
-            await pilot.pause()
+            tabs = screen.query_one("#daemon-tabs", TabbedContent)
+            # Opens on chat; the highlighted row (first = telegram) is the target.
+            assert tabs.active == "tab-chat"
             assert app.focused is not None and app.focused.id == "chat-strip"
-            # Resolves to the highlighted chat daemon row (first = telegram).
             assert screen._active_daemon() == "telegram"
 
-    def test_footer_shows_every_key_ordered_by_usability(self):
+            await pilot.press("2")
+            await pilot.pause()
+            assert tabs.active == "tab-scheduler"
+            assert screen._active_daemon() == "schedule"
+            assert getattr(app.focused, "id", None) == "jobs-content"
+
+            await pilot.press("3")
+            await pilot.pause()
+            assert tabs.active == "tab-symphony"
+            assert screen._active_daemon() == "symphony"
+            assert getattr(app.focused, "id", None) == "symphony-tickets"
+
+            await pilot.press("1")
+            await pilot.pause()
+            assert tabs.active == "tab-chat"
+            assert screen._active_daemon() == "telegram"
+            assert getattr(app.focused, "id", None) == "chat-strip"
+
+    def test_footer_keeps_core_keys_visible_hides_rest_in_modal(self):
         from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 
-        keys = [
-            (b[0] if isinstance(b, tuple) else b.key) for b in DashboardScreen.BINDINGS
-        ]
-        # Nothing is hidden — every action is reachable from the footer.
-        # `e` is gone: config editing folded into the contextual `g`.
-        assert set(keys) == {
-            "s",
-            "k",
-            "r",
-            "u",
-            "l",
-            "h",
-            "g",
-            "d",
-            "c",
-            "R",
-            "K",
-            "q",
-        }
-        # Daemon lifecycle leads; Quit trails.
-        assert keys[:4] == ["s", "k", "r", "u"]
-        assert keys[-1] == "q"
-        # The `?` help panel and the standalone `e` Edit-.env were removed.
-        assert "question_mark" not in keys
-        assert "e" not in keys
+        visible = {b.key for b in DashboardScreen.BINDINGS if b.show}
+        hidden = {b.key for b in DashboardScreen.BINDINGS if not b.show}
+        # Slim footer: lifecycle (k/r), help, quit.
+        assert visible == {"k", "r", "question_mark", "q"}
+        # Everything else stays bound but lives in the `?` help modal.
+        assert hidden == {"l", "h", "g", "u", "d", "c", "R", "K", "1", "2", "3"}
+
+    @pytest.mark.asyncio
+    async def test_help_modal_lists_keys_hidden_from_footer(self):
+        from textual.widgets import Static
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "HelpScreen"
+            keymap = str(app.screen.query_one("#help-keys", Static).render())
+            # The keys pulled off the footer must be discoverable here.
+            for label in ("Logs", "History", "Config", "Stop all", "Refresh"):
+                assert label in keymap
+            # esc closes it.
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "DashboardScreen"
 
     @pytest.mark.asyncio
     async def test_g_opens_config_picker_dialog(self):
@@ -246,59 +261,75 @@ class TestDashboardLayout:
             assert "no active jobs" in str(table.get_row_at(0)[0])
 
     @pytest.mark.asyncio
-    async def test_action_cue_follows_focus(self):
+    async def test_action_cue_follows_active_tab(self):
         from textual.widgets import Static
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             cue = app.screen.query_one("#action-cue", Static)
+            # Opens on chat → first chat daemon (telegram) is the target.
+            assert "telegram" in str(cue.render())
+
+            await pilot.press("3")
+            await pilot.pause()
             assert "symphony" in str(cue.render())
 
-            await pilot.press("tab")
+    @pytest.mark.asyncio
+    async def test_tab_labels_reflect_daemon_health(self):
+        """Each tab title carries its daemon's health glyph, so the tab bar
+        shows every zone's liveness regardless of which tab is active. With no
+        daemons running in tests, all three read stopped (○)."""
+        from textual.widgets import TabbedContent
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
             await pilot.pause()
-            assert "schedule" in str(cue.render())
+            tabs = app.screen.query_one("#daemon-tabs", TabbedContent)
+            assert str(tabs.get_tab("tab-chat").label) == "[1] ○ chat"
+            assert str(tabs.get_tab("tab-scheduler").label) == "[2] ○ scheduler"
+            assert str(tabs.get_tab("tab-symphony").label) == "[3] ○ symphony"
 
     @pytest.mark.asyncio
-    async def test_supervisor_action_targets_focused_daemon(self, monkeypatch):
-        from textual.widgets import DataTable
-
+    async def test_supervisor_action_targets_active_tab_daemon(self, monkeypatch):
         from claude_on_the_fly.tui import supervisor
 
         captured: list[str] = []
 
-        def fake_spawn(name):
+        def fake_restart(name):
             captured.append(name)
             return 4242
 
-        monkeypatch.setattr(supervisor, "spawn", fake_spawn)
+        monkeypatch.setattr(supervisor, "restart", fake_restart)
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             screen = _dashboard(app)
-            # Move focus to the scheduler panel, then trigger start.
-            screen.query_one("#jobs-content", DataTable).focus()
+            # Switch to the scheduler tab, then trigger restart.
+            await pilot.press("2")
             await pilot.pause()
-            await screen._run_supervisor_action("start", supervisor.spawn)
+            await screen._run_supervisor_action("restart", supervisor.restart)
             assert captured == ["schedule"]
 
     @pytest.mark.asyncio
-    async def test_start_with_no_active_daemon_warns_instead_of_acting(
+    async def test_action_with_no_active_daemon_warns_instead_of_acting(
         self, monkeypatch
     ):
         from claude_on_the_fly.tui import supervisor
 
         called: list[str] = []
-        monkeypatch.setattr(supervisor, "spawn", lambda name: called.append(name) or 1)
+        monkeypatch.setattr(
+            supervisor, "restart", lambda name: called.append(name) or 1
+        )
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             screen = _dashboard(app)
-            # No recognized zone focused → the guard must warn, not spawn.
+            # No recognized zone focused → the guard must warn, not act.
             monkeypatch.setattr(screen, "_active_daemon", lambda: None)
-            await screen._run_supervisor_action("start", supervisor.spawn)
+            await screen._run_supervisor_action("restart", supervisor.restart)
             assert called == []
 
 

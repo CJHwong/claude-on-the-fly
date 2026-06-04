@@ -1,32 +1,43 @@
-"""Dashboard screen — two hero panels (symphony / scheduler) + a compact chat
-strip + log tail.
+"""Dashboard screen — one tab per daemon zone (chat / scheduler / symphony) +
+log tail.
 
 Layout (top → bottom):
-- SYMPHONY panel: bordered, rich header (running/cap + tracker labels), inner
-  tickets table.
-- SCHEDULER panel: bordered, rich header (state + next fire), inner jobs table.
-- Chat strip: compact one-row-per-daemon table (telegram / slack / gmail).
+- Daemon tabs: CHAT, SCHEDULER, and SYMPHONY each get a tab; the tab title
+  carries a health badge ([1]/[2]/[3] switch key + state glyph) so switching to
+  one zone never blinds the operator to the others' state. The chat tab's badge
+  aggregates its three daemons (broken > running > stopped). The active tab owns
+  the shared log/watch row below.
 - Log row: daemon log (left) + per-ticket / per-job watch (right).
 
-Selection model: Tab cycles the three inner tables. `_active_daemon()` reads
-whichever table is focused; the supervisor keys (s/k/r) act on that daemon, and
-the log/watch panes follow it. Refresh runs at 1Hz, rebuilding tables from a
-fresh state.snapshot() while preserving each table's cursor by row key.
+Selection model: the active tab decides which daemon the supervisor keys
+(k/r) and the log/watch row act on; tab state is stable across window blur,
+unlike focus. On the chat tab the highlighted row (telegram / slack / gmail)
+picks the specific daemon. Refresh runs at 1Hz, rebuilding tables from a fresh
+state.snapshot() while preserving each table's cursor by row key.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, ClassVar, Literal
 
 from rich.text import Text
 
 from textual import events
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, RichLog, Static
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    RichLog,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 from claude_on_the_fly.agent import DATA_DIR, current_backend_key, get_backend
 from claude_on_the_fly.symphony import watch
@@ -35,6 +46,7 @@ from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
 from claude_on_the_fly.tui import env_editor, render, state, supervisor
 from claude_on_the_fly.tui.screens.config_picker import ConfigPickerScreen
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
+from claude_on_the_fly.tui.screens.help import HelpScreen
 
 LOG_DIR = DATA_DIR / "logs"
 SYMPHONY_CONFIG = DATA_DIR / "symphony.yaml"
@@ -83,14 +95,11 @@ def _load_symphony_cached(path: Path) -> tuple[object | None, str | None]:
 
 class DashboardScreen(Screen):
     DEFAULT_CSS = """
-    #symphony-panel, #scheduler-panel {
-        border: round grey;
+    #daemon-tabs {
         height: auto;
-        margin-bottom: 1;
-        padding: 0 1;
     }
-    #symphony-panel:focus-within, #scheduler-panel:focus-within {
-        border: round $accent;
+    #chat-panel, #symphony-panel, #scheduler-panel {
+        height: auto;
     }
     #symphony-header, #scheduler-header, #chat-strip-header {
         height: auto;
@@ -99,37 +108,59 @@ class DashboardScreen(Screen):
     #symphony-tickets, #jobs-content, #chat-strip {
         height: auto;
     }
-    #chat-strip:focus {
-        border-left: thick $accent;
-    }
     #action-cue {
         height: auto;
         padding: 0 0 0 1;
     }
     """
 
-    # Every key is shown in the footer, ordered by how often it's reached for:
-    # daemon lifecycle, then views, then config/diagnostics, then utilities,
-    # then the rare/destructive Stop-all, then Quit. Lifecycle keys act on the
-    # focused panel (see the action cue). `c` copies the highlighted log tail
-    # via OSC 52 (iTerm2/kitty/WezTerm/Alacritty); hold Option (macOS) or Shift
-    # while click-dragging for the terminal's own partial-selection copy.
-    BINDINGS = [
-        ("s", "start", "Start"),
-        ("k", "stop", "Stop"),
-        ("r", "restart", "Restart"),
-        ("u", "resume", "Resume"),
-        ("l", "app.push_screen('logs')", "Logs"),
-        ("h", "app.push_screen('history')", "History"),
-        # `g` edits the focused panel's config: symphony → symphony.yaml
-        # (preview), scheduler → schedule.yaml, chat → .env.
-        ("g", "open_config", "Config"),
-        ("d", "app.push_screen('doctor')", "Doctor"),
-        ("c", "copy_log", "Copy tail"),
-        ("R", "refresh_now", "Refresh"),
-        ("K", "stop_all", "Stop all"),
-        ("q", "app.quit", "Quit"),
+    # The footer carries only the keys reached for constantly: daemon lifecycle
+    # (acting on the active tab / focused chat row — see the action cue), help,
+    # and quit. Everything else — the views (logs / history), config, and the
+    # utility tail (resume, doctor, copy-tail, refresh, stop-all) — stays bound
+    # but `show=False`, surfaced on demand in the `?` help modal. The tab-switch
+    # keys [1]/[2]/[3] ride on the tab titles themselves, so they're hidden too.
+    # Keeping one BINDINGS list as the single source means the modal can't drift.
+    # `c` copies the highlighted log tail via OSC 52 (iTerm2/kitty/WezTerm/
+    # Alacritty); hold Option (macOS) or Shift while click-dragging for the
+    # terminal's own partial-selection copy.
+    BINDINGS: ClassVar = [
+        Binding("k", "stop", "Stop"),
+        Binding("r", "restart", "Restart"),
+        Binding("question_mark", "help", "Help", key_display="?"),
+        Binding("q", "app.quit", "Quit"),
+        Binding("l", "app.push_screen('logs')", "Logs", show=False),
+        Binding("h", "app.push_screen('history')", "History", show=False),
+        Binding("g", "open_config", "Config", show=False),
+        Binding("u", "resume", "Resume", show=False),
+        Binding("d", "app.push_screen('doctor')", "Doctor", show=False),
+        Binding("c", "copy_log", "Copy tail", show=False),
+        Binding("R", "refresh_now", "Refresh", show=False),
+        Binding("K", "stop_all", "Stop all", show=False),
+        Binding("1", "show_tab('tab-chat')", "chat tab", show=False),
+        Binding("2", "show_tab('tab-scheduler')", "scheduler tab", show=False),
+        Binding("3", "show_tab('tab-symphony')", "symphony tab", show=False),
     ]
+
+    # Longer help text per action label (shown in the `?` modal; the footer
+    # uses the short Binding.description above).
+    _ACTION_HELP: ClassVar[dict[str, str]] = {
+        "Stop": "stop (kill) the daemon for the active tab",
+        "Restart": "restart the active daemon (also starts it if stopped)",
+        "Help": "show this keymap",
+        "Quit": "quit the TUI",
+        "Logs": "browse every log file",
+        "History": "the full job audit trail",
+        "Config": "edit the symphony / schedule / .env config",
+        "Resume": "restart the daemons stopped by the last Stop-all",
+        "Doctor": "run environment checks",
+        "Copy tail": "copy the highlighted log's tail to the clipboard",
+        "Refresh": "refresh now",
+        "Stop all": "stop every running daemon",
+        "chat tab": "switch to the chat tab",
+        "scheduler tab": "switch to the scheduler tab",
+        "symphony tab": "switch to the symphony tab",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -153,23 +184,46 @@ class DashboardScreen(Screen):
         self._chat_jobs: dict[str, list[tuple[str, str]]] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
+        # Which daemon the lifecycle keys + log row follow for the scheduler /
+        # symphony tabs — derived from the active tab. Kept as a fallback for the
+        # brief pre-mount window before TabbedContent.active is set (chat is the
+        # default tab, so a chat daemon is the natural seed).
+        self._last_active_daemon: str = CHAT_FRONTENDS[0]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="dashboard-body"):
             yield Static(id="stale-banner", markup=True)
-            with Vertical(id="symphony-panel"):
-                yield Static(id="symphony-header", markup=True)
-                yield DataTable(
-                    id="symphony-tickets", cursor_type="row", zebra_stripes=True
-                )
-            with Vertical(id="scheduler-panel"):
-                yield Static(id="scheduler-header", markup=True)
-                yield DataTable(
-                    id="jobs-content", cursor_type="row", zebra_stripes=True
-                )
-            yield Static(id="chat-strip-header", markup=True)
-            yield DataTable(id="chat-strip", cursor_type="row", zebra_stripes=True)
+            # One tab per daemon zone — chat first, then the two autonomous
+            # engines. The tab title carries the at-a-glance health (badge set
+            # in _refresh_tab_badges) so switching to one daemon never blinds
+            # the operator to the others' state. The shared log/watch row below
+            # follows the active tab.
+            with TabbedContent(id="daemon-tabs"):
+                with (
+                    TabPane("chat", id="tab-chat"),
+                    Vertical(id="chat-panel"),
+                ):
+                    yield Static(id="chat-strip-header", markup=True)
+                    yield DataTable(
+                        id="chat-strip", cursor_type="row", zebra_stripes=True
+                    )
+                with (
+                    TabPane("scheduler", id="tab-scheduler"),
+                    Vertical(id="scheduler-panel"),
+                ):
+                    yield Static(id="scheduler-header", markup=True)
+                    yield DataTable(
+                        id="jobs-content", cursor_type="row", zebra_stripes=True
+                    )
+                with (
+                    TabPane("symphony", id="tab-symphony"),
+                    Vertical(id="symphony-panel"),
+                ):
+                    yield Static(id="symphony-header", markup=True)
+                    yield DataTable(
+                        id="symphony-tickets", cursor_type="row", zebra_stripes=True
+                    )
             with Horizontal(id="log-row"):
                 with Vertical(id="log-daemon-col"):
                     yield Static(id="log-header", markup=True)
@@ -212,37 +266,70 @@ class DashboardScreen(Screen):
         chat.add_column("heartbeat", width=10)
         chat.add_column("active", width=8)
         self.query_one("#chat-strip-header", Static).update(
-            "[bold]Chat frontends[/bold] [dim](Tab to cycle panels)[/dim]"
+            "[bold]Chat frontends[/bold] [dim]([1]/[2]/[3] switch daemon tabs)[/dim]"
         )
-        # The log panes shouldn't grab Tab focus — Tab cycles the three zones
-        # (symphony tickets / scheduler jobs / chat strip) only.
+        # The log panes shouldn't grab Tab focus — within a tab, Tab cycles only
+        # that tab's table.
         self.query_one("#log-pane", RichLog).can_focus = False
         self.query_one("#watch-pane", RichLog).can_focus = False
         self._refresh()
         self.set_interval(1.0, self._refresh)
         self.set_interval(1.0, self._refresh_log)
         self.set_interval(0.1, self._tick_busy)
-        # Land focus on the symphony tickets table so the hero engine is the
-        # default supervisor target and Tab cycles from there.
-        self.query_one("#symphony-tickets", DataTable).focus()
+        # Land focus on the chat strip (the chat tab is active first), so the
+        # highlighted chat daemon is the default supervisor target.
+        self.query_one("#chat-strip", DataTable).focus()
         self._update_action_cue()
 
     # ------------------------------------------------------------------
     # Selection / focus
     # ------------------------------------------------------------------
 
+    # Active tab id → the table to focus when that tab opens.
+    _TAB_TABLES: dict[str, str] = {
+        "tab-chat": "chat-strip",
+        "tab-scheduler": "jobs-content",
+        "tab-symphony": "symphony-tickets",
+    }
+
     def _active_daemon(self) -> str | None:
-        """Which daemon the supervisor keys act on — the one whose table has
-        focus. Chat strip resolves to the highlighted chat daemon row."""
-        focused = self.app.focused
-        wid = getattr(focused, "id", None)
-        if wid == "symphony-tickets":
-            return "symphony"
-        if wid == "jobs-content":
-            return "schedule"
-        if wid == "chat-strip":
+        """Which daemon the supervisor keys + log row act on — decided by the
+        active tab (stable across window blur, unlike focus). On the chat tab the
+        highlighted row picks the specific daemon (telegram / slack / gmail)."""
+        try:
+            active = self.query_one("#daemon-tabs", TabbedContent).active
+        except Exception:
+            return self._last_active_daemon  # pre-mount fallback
+        if active == "tab-chat":
             return self._datatable_cursor_key("#chat-strip")
-        return None
+        if active == "tab-scheduler":
+            self._last_active_daemon = "schedule"
+        elif active == "tab-symphony":
+            self._last_active_daemon = "symphony"
+        return self._last_active_daemon
+
+    def action_show_tab(self, tab_id: str) -> None:
+        """Activate a daemon tab by id (bound to [1]/[2]/[3]). The TabActivated
+        handler lands focus on the tab's table, so the lifecycle keys and the
+        log row follow."""
+        try:
+            self.query_one("#daemon-tabs", TabbedContent).active = tab_id
+        except Exception:
+            pass
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        """Switching tabs changes the active daemon: land focus on the new tab's
+        table and repoint the shared log/watch row + action cue."""
+        active = event.tabbed_content.active
+        table_id = self._TAB_TABLES.get(active, "chat-strip")
+        try:
+            self.query_one(f"#{table_id}", DataTable).focus()
+        except Exception:
+            pass
+        self._refresh_log(force_reload=True)
+        self._update_action_cue()
 
     def _selected_ticket(self) -> str | None:
         """Highlighted symphony ticket key ("symphony:<identifier>"), or None."""
@@ -304,13 +391,27 @@ class DashboardScreen(Screen):
         self._refresh()
         self._refresh_log(force_reload=True)
 
+    def action_help(self) -> None:
+        """Show the full keymap — every binding, including the ones hidden from
+        the slim footer. Built from BINDINGS so it never drifts."""
+        rows = [
+            (
+                b.key_display or b.key,
+                b.description,
+                self._ACTION_HELP.get(b.description, ""),
+            )
+            for b in self.BINDINGS
+            if isinstance(b, Binding) and b.description
+        ]
+        self.app.push_screen(HelpScreen(rows))
+
     # ------------------------------------------------------------------
     # Supervisor actions
     # ------------------------------------------------------------------
 
     async def _run_supervisor_action(
         self,
-        verb: str,  # "start" | "stop" | "restart"
+        verb: str,  # "stop" | "restart"
         op: Callable[[str], int],
     ) -> None:
         name = self._active_daemon()
@@ -319,10 +420,8 @@ class DashboardScreen(Screen):
         if name is None:
             self._notify("no daemon selected (Tab to a panel first)", "warning")
             return
-        present = {"start": "starting", "stop": "stopping", "restart": "restarting"}[
-            verb
-        ]
-        past = {"start": "started", "stop": "stopped", "restart": "restarted"}[verb]
+        present = {"stop": "stopping", "restart": "restarting"}[verb]
+        past = {"stop": "stopped", "restart": "restarted"}[verb]
         self._set_busy(f"{present} {name}")
         try:
             try:
@@ -351,9 +450,6 @@ class DashboardScreen(Screen):
         finally:
             self._clear_busy()
             self._refresh()
-
-    async def action_start(self) -> None:
-        await self._run_supervisor_action("start", supervisor.spawn)
 
     async def action_stop(self) -> None:
         await self._run_supervisor_action("stop", supervisor.stop)
@@ -746,7 +842,40 @@ class DashboardScreen(Screen):
         self._refresh_symphony(by_name.get("symphony"))
         self._refresh_scheduler(snap, by_name.get("schedule"))
         self._refresh_chat_strip(by_name)
+        self._refresh_tab_badges(by_name)
         self._refresh_stale_banner(snap)
+
+    @staticmethod
+    def _chat_aggregate_state(by_name: dict[str, state.FrontendStatus]) -> str:
+        """One health glyph for the chat tab, which fronts three daemons. Worst
+        state wins so the badge draws the eye when any chat daemon is broken;
+        a single running daemon reads as running, else stopped."""
+        states = [by_name[name].state for name in CHAT_FRONTENDS if name in by_name]
+        if "broken" in states:
+            return "broken"
+        if "running" in states:
+            return "running"
+        return "stopped"
+
+    def _refresh_tab_badges(self, by_name: dict[str, state.FrontendStatus]) -> None:
+        """Stamp each tab title with its daemon's health glyph, so the tab bar
+        carries the at-a-glance liveness the stacked-panel layout used to."""
+        sym = by_name.get("symphony")
+        sched = by_name.get("schedule")
+        chat_state = self._chat_aggregate_state(by_name)
+        sched_state = sched.state if sched else "stopped"
+        sym_state = sym.state if sym else "stopped"
+        try:
+            tabs = self.query_one("#daemon-tabs", TabbedContent)
+            tabs.get_tab("tab-chat").label = render.tab_label(1, "chat", chat_state)
+            tabs.get_tab("tab-scheduler").label = render.tab_label(
+                2, "scheduler", sched_state
+            )
+            tabs.get_tab("tab-symphony").label = render.tab_label(
+                3, "symphony", sym_state
+            )
+        except Exception:
+            pass
 
     def _refresh_symphony(self, sym: state.FrontendStatus | None) -> None:
         cfg, cfg_error = _load_symphony_cached(SYMPHONY_CONFIG)
