@@ -90,11 +90,11 @@ def check_backend() -> None:
         if mode == "ollama":
             check_ollama_mode("claude")
             return
-        if mode == "snap":
-            check_snap_mode()
+        if mode == "pty":
+            check_pty_mode()
             return
         raise SystemExit(
-            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)"
+            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)"
         )
     if backend_name == "codex":
         mode = os.environ.get("CODEX_MODE", "native").lower()
@@ -152,25 +152,25 @@ def check_ollama_mode(agent_name: str = "claude") -> None:
     logger.info("ollama launch mode: ok (agent=%s model=%s)", agent_name, model)
 
 
-def check_snap_mode() -> None:
-    """Validate `CLAUDE_MODE=snap`: binary resolves, jq present, hooks wired.
+def check_pty_mode() -> None:
+    """Validate `CLAUDE_MODE=pty`: binary resolves, jq present, hooks wired.
 
-    Reuses the structured `checks.check_snap_setup` so doctor view and
+    Reuses the structured `checks.check_pty_setup` so doctor view and
     preflight see the same failures. If the binary is missing on an
     interactive TTY, offer to install it via the canonical curl script.
     """
     from claude_on_the_fly import checks as _checks
-    from claude_on_the_fly import snap_install
+    from claude_on_the_fly import pty_install
 
-    if not snap_install.is_snap_installed():
-        outcome = snap_install.ensure_snap_installed()
+    if not pty_install.is_pty_installed():
+        outcome = pty_install.ensure_pty_installed()
         if not outcome.installed:
             raise SystemExit(outcome.message)
-        logger.info("claude-snap: %s", outcome.message)
+        logger.info("claude-pty: %s", outcome.message)
 
-    results = _checks.check_snap_setup()
+    results = _checks.check_pty_setup()
     _raise_on_failures(results)
-    logger.info("claude-snap mode: ok")
+    logger.info("claude-pty mode: ok")
 
 
 def check_claude_cli() -> None:

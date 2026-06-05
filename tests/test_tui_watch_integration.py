@@ -170,18 +170,18 @@ async def test_dashboard_session_uuid_uses_current_backend_key(
     the JSONL at the wrong UUID and the pane gets stuck on
     "agent hasn't run a turn".
     """
-    monkeypatch.setenv("CLAUDE_MODE", "snap")
+    monkeypatch.setenv("CLAUDE_MODE", "pty")
     monkeypatch.delenv("CODEX_MODE", raising=False)
     monkeypatch.delenv("OLLAMA_MODEL", raising=False)
-    # Snap backend resolution checks for the binary at construct time;
+    # claude-pty backend resolution checks for the binary at construct time;
     # point CLAUDE_INTERACTIVE_P_HOME at a fake one so get_backend() works
     # without touching the real install.
-    fake_snap = tmp_path / "snap-home"
-    (fake_snap / "bin").mkdir(parents=True)
-    fake_bin = fake_snap / "bin" / "claude-snap"
+    fake_pty = tmp_path / "pty-home"
+    (fake_pty / "bin").mkdir(parents=True)
+    fake_bin = fake_pty / "bin" / "claude-pty"
     fake_bin.write_text("#!/bin/sh\nexit 0\n")
     fake_bin.chmod(0o755)
-    monkeypatch.setenv("CLAUDE_INTERACTIVE_P_HOME", str(fake_snap))
+    monkeypatch.setenv("CLAUDE_INTERACTIVE_P_HOME", str(fake_pty))
 
     # Force the dashboard's snapshot to report one running symphony ticket
     # so _refresh populates _job_sessions with our identifier.

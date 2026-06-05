@@ -694,9 +694,9 @@ def _cli_output(
 class TestRun:
     @pytest.fixture(autouse=True)
     def _reset_backend_env(self, clear_backend_env):
-        """Auto-apply env reset so a dev's `CLAUDE_MODE=snap` (or similar)
-        doesn't route these mocked tests through `_exec_snap` and spawn the
-        real claude-snap binary."""
+        """Auto-apply env reset so a dev's `CLAUDE_MODE=pty` (or similar)
+        doesn't route these mocked tests through `_exec_pty` and spawn the
+        real claude-pty binary."""
 
     async def test_happy_path_resume(self):
         output = _cli_output()
@@ -1258,10 +1258,10 @@ class TestCurrentBackendKey:
         monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
         assert current_backend_key() == "claude:ollama:qwen2.5-coder:32b"
 
-    def test_claude_snap_includes_model(self, clear_backend_env, monkeypatch):
-        monkeypatch.setenv("CLAUDE_MODE", "snap")
+    def test_claude_pty_includes_model(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "pty")
         monkeypatch.setenv("CLAUDE_MODEL", "sonnet")
-        assert current_backend_key() == "claude:snap:sonnet"
+        assert current_backend_key() == "claude:pty:sonnet"
 
     def test_codex_native_includes_model(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "codex")
@@ -1483,8 +1483,8 @@ class TestClaudeBackendHandoff:
     def _reset_backend_env(
         self, clear_backend_env, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
-        """Force native backend selection so `CLAUDE_MODE=snap` in the dev's
-        shell can't reroute these tests to the real `claude-snap` binary.
+        """Force native backend selection so `CLAUDE_MODE=pty` in the dev's
+        shell can't reroute these tests to the real `claude-pty` binary.
         Also redirect the projects dir so the new "session JSONL exists?"
         check finds nothing and routes to the new-session branch."""
         self._workspace = tmp_path / "ws"
@@ -1656,12 +1656,12 @@ class TestClaudeBackendSessionLogPath:
 
 
 # ---------------------------------------------------------------------------
-# ClaudeBackend snap mode
+# ClaudeBackend pty mode
 # ---------------------------------------------------------------------------
 
 
-def _snap_envelope(
-    result: str = "snap reply",
+def _pty_envelope(
+    result: str = "pty reply",
     cost: float = 0.05,
     duration_ms: int = 3000,
     model: str = "claude-haiku-4-5-20251001",
@@ -1677,7 +1677,7 @@ def _snap_envelope(
     exceeds_200k: bool = False,
     fast_mode: bool = False,
 ) -> dict:
-    """Mirrors the live claude-snap envelope shape we captured during planning."""
+    """Mirrors the live claude-pty envelope shape we captured during planning."""
     return {
         "type": "result",
         "subtype": "success",
@@ -1718,8 +1718,8 @@ def _snap_envelope(
     }
 
 
-class TestClaudeBackendSnap:
-    async def test_argv_uses_snap_binary_and_drops_p_flags(
+class TestClaudeBackendPty:
+    async def test_argv_uses_pty_binary_and_drops_p_flags(
         self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
     ):
         from claude_on_the_fly.transcript import _workspace_to_claude_hash
@@ -1736,19 +1736,19 @@ class TestClaudeBackendSnap:
 
         with (
             patch(
-                "claude_on_the_fly.backends.claude.resolve_snap_binary",
-                return_value="/fake/bin/claude-snap",
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
             ),
             patch(
-                "claude_on_the_fly.backends.claude._exec_snap",
+                "claude_on_the_fly.backends.claude._exec_pty",
                 new_callable=AsyncMock,
-                return_value=_snap_envelope(),
+                return_value=_pty_envelope(),
             ) as mock,
         ):
-            await ClaudeBackend(snap=True).run(workspace, "sess-1", "hi", "telegram")
+            await ClaudeBackend(pty=True).run(workspace, "sess-1", "hi", "telegram")
 
         cmd = mock.call_args[0][1]
-        assert cmd[0] == "/fake/bin/claude-snap"
+        assert cmd[0] == "/fake/bin/claude-pty"
         assert "-p" not in cmd
         assert "--output-format" not in cmd
         assert "--verbose" not in cmd
@@ -1762,7 +1762,7 @@ class TestClaudeBackendSnap:
         assert cmd[-1] == "hi"
 
     async def test_response_carries_rate_limits_and_context_window(self):
-        envelope = _snap_envelope(
+        envelope = _pty_envelope(
             rate_5h_pct=73,
             rate_5h_resets_at=1779429600,
             context_pct=42,
@@ -1770,16 +1770,16 @@ class TestClaudeBackendSnap:
         )
         with (
             patch(
-                "claude_on_the_fly.backends.claude.resolve_snap_binary",
-                return_value="/fake/bin/claude-snap",
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
             ),
             patch(
-                "claude_on_the_fly.backends.claude._exec_snap",
+                "claude_on_the_fly.backends.claude._exec_pty",
                 new_callable=AsyncMock,
                 return_value=envelope,
             ),
         ):
-            resp = await ClaudeBackend(snap=True).run(
+            resp = await ClaudeBackend(pty=True).run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
 
@@ -1796,7 +1796,7 @@ class TestClaudeBackendSnap:
         We sum modelUsage entries — using `usage` would undercount on
         multi-step turns.
         """
-        envelope = _snap_envelope(
+        envelope = _pty_envelope(
             input_tokens=10,  # `usage` shows last message only
             output_tokens=51,
             cache_read_input_tokens=0,
@@ -1811,16 +1811,16 @@ class TestClaudeBackendSnap:
         }
         with (
             patch(
-                "claude_on_the_fly.backends.claude.resolve_snap_binary",
-                return_value="/fake/bin/claude-snap",
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
             ),
             patch(
-                "claude_on_the_fly.backends.claude._exec_snap",
+                "claude_on_the_fly.backends.claude._exec_pty",
                 new_callable=AsyncMock,
                 return_value=envelope,
             ),
         ):
-            resp = await ClaudeBackend(snap=True).run(
+            resp = await ClaudeBackend(pty=True).run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
 
@@ -1829,18 +1829,18 @@ class TestClaudeBackendSnap:
         assert resp.tokens_out == 500
 
     async def test_empty_body_retry_takes_second_envelope_wholesale(self):
-        """Snap empty-body retry skips _merge_cli_output: snap envelopes have
+        """claude-pty empty-body retry skips _merge_cli_output: pty envelopes have
         no per-tool counts to merge and `usage` is last-message-only."""
-        first = _snap_envelope(result="", cost=0.10, duration_ms=1000)
-        second = _snap_envelope(result="recovered", cost=0.05, duration_ms=500)
+        first = _pty_envelope(result="", cost=0.10, duration_ms=1000)
+        second = _pty_envelope(result="recovered", cost=0.05, duration_ms=500)
 
         with (
             patch(
-                "claude_on_the_fly.backends.claude.resolve_snap_binary",
-                return_value="/fake/bin/claude-snap",
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
             ),
             patch(
-                "claude_on_the_fly.backends.claude._exec_snap",
+                "claude_on_the_fly.backends.claude._exec_pty",
                 new_callable=AsyncMock,
                 side_effect=[first, second],
             ),
@@ -1848,7 +1848,7 @@ class TestClaudeBackendSnap:
                 "claude_on_the_fly.agent._merge_cli_output",
             ) as mock_merge,
         ):
-            resp = await ClaudeBackend(snap=True).run(
+            resp = await ClaudeBackend(pty=True).run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
 
@@ -1859,7 +1859,7 @@ class TestClaudeBackendSnap:
         assert resp.duration == 0.5
 
     async def test_native_response_has_no_rate_limits(self):
-        """Regression: native (non-snap) backend leaves snap-only fields as None/False."""
+        """Regression: native (non-pty) backend leaves pty-only fields as None/False."""
         output = _cli_output()
         with patch(
             "claude_on_the_fly.agent._exec",
@@ -1874,9 +1874,9 @@ class TestClaudeBackendSnap:
         assert resp.fast_mode is False
         assert resp.exceeds_200k is False
 
-    def test_launcher_and_snap_mutually_exclusive(self):
+    def test_launcher_and_pty_mutually_exclusive(self):
         with pytest.raises(ValueError, match="mutually exclusive"):
-            ClaudeBackend(launcher=OllamaLauncher(model="qwen"), snap=True)
+            ClaudeBackend(launcher=OllamaLauncher(model="qwen"), pty=True)
 
 
 class TestResumeSystemPrompt:
@@ -1948,53 +1948,51 @@ class TestResumeSystemPrompt:
 
 
 # ---------------------------------------------------------------------------
-# resolve_snap_binary
+# resolve_pty_binary
 # ---------------------------------------------------------------------------
 
 
-class TestResolveSnapBinary:
+class TestResolvePtyBinary:
     def test_prefers_path_when_present(self, monkeypatch):
-        from claude_on_the_fly.backends.claude import resolve_snap_binary
+        from claude_on_the_fly.backends.claude import resolve_pty_binary
 
         monkeypatch.setattr(
             "claude_on_the_fly.backends.claude.shutil.which",
-            lambda name: (
-                "/usr/local/bin/claude-snap" if name == "claude-snap" else None
-            ),
+            lambda name: "/usr/local/bin/claude-pty" if name == "claude-pty" else None,
         )
-        assert resolve_snap_binary() == "/usr/local/bin/claude-snap"
+        assert resolve_pty_binary() == "/usr/local/bin/claude-pty"
 
     def test_falls_back_to_install_home(self, tmp_path, monkeypatch):
-        from claude_on_the_fly.backends.claude import resolve_snap_binary
+        from claude_on_the_fly.backends.claude import resolve_pty_binary
 
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
-        snap = bin_dir / "claude-snap"
-        snap.write_text("#!/bin/sh\n")
-        snap.chmod(0o755)
+        pty = bin_dir / "claude-pty"
+        pty.write_text("#!/bin/sh\n")
+        pty.chmod(0o755)
 
         monkeypatch.setattr(
             "claude_on_the_fly.backends.claude.shutil.which", lambda _: None
         )
         monkeypatch.setenv("CLAUDE_INTERACTIVE_P_HOME", str(tmp_path))
-        assert resolve_snap_binary() == str(snap)
+        assert resolve_pty_binary() == str(pty)
 
     def test_returns_none_when_missing(self, monkeypatch, tmp_path):
-        from claude_on_the_fly.backends.claude import resolve_snap_binary
+        from claude_on_the_fly.backends.claude import resolve_pty_binary
 
         monkeypatch.setattr(
             "claude_on_the_fly.backends.claude.shutil.which", lambda _: None
         )
         monkeypatch.setenv("CLAUDE_INTERACTIVE_P_HOME", str(tmp_path / "nowhere"))
-        assert resolve_snap_binary() is None
+        assert resolve_pty_binary() is None
 
 
 # ---------------------------------------------------------------------------
-# Response snap-derived footer formatting
+# Response pty-derived footer formatting
 # ---------------------------------------------------------------------------
 
 
-class TestResponseSnapFooter:
+class TestResponsePtyFooter:
     def test_appends_context_window_pct(self):
         r = Response(body="x", cost=0.01, model="haiku", context_window_pct=42)
         stats = r.format_stats()
@@ -2025,33 +2023,33 @@ class TestResponseSnapFooter:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE_MODE=snap factory wiring
+# CLAUDE_MODE=pty factory wiring
 # ---------------------------------------------------------------------------
 
 
-class TestSnapModeFactory:
-    def test_claude_snap_mode(self, clear_backend_env, monkeypatch):
-        monkeypatch.setenv("CLAUDE_MODE", "snap")
+class TestPtyModeFactory:
+    def test_claude_pty_mode(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "pty")
         with patch(
-            "claude_on_the_fly.backends.claude.resolve_snap_binary",
-            return_value="/fake/bin/claude-snap",
+            "claude_on_the_fly.backends.claude.resolve_pty_binary",
+            return_value="/fake/bin/claude-pty",
         ):
             backend = get_backend()
         assert isinstance(backend, ClaudeBackend)
-        assert backend.snap is True
+        assert backend.pty is True
         assert backend.launcher is None
 
-    def test_snap_mode_missing_binary_raises(self, clear_backend_env, monkeypatch):
+    def test_pty_mode_missing_binary_raises(self, clear_backend_env, monkeypatch):
         """Defense in depth: ctor raises if the binary vanished after preflight."""
-        monkeypatch.setenv("CLAUDE_MODE", "snap")
+        monkeypatch.setenv("CLAUDE_MODE", "pty")
         with patch(
-            "claude_on_the_fly.backends.claude.resolve_snap_binary",
+            "claude_on_the_fly.backends.claude.resolve_pty_binary",
             return_value=None,
         ):
-            with pytest.raises(RuntimeError, match="claude-snap binary not found"):
+            with pytest.raises(RuntimeError, match="claude-pty binary not found"):
                 get_backend()
 
-    def test_unknown_mode_message_lists_snap(self, clear_backend_env, monkeypatch):
+    def test_unknown_mode_message_lists_pty(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("CLAUDE_MODE", "garbage")
-        with pytest.raises(ValueError, match="snap"):
+        with pytest.raises(ValueError, match="pty"):
             get_backend()

@@ -1,4 +1,4 @@
-"""Phase 8 — snap auto-install consent flow."""
+"""Phase 8 — pty auto-install consent flow."""
 
 from __future__ import annotations
 
@@ -6,26 +6,26 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
-from claude_on_the_fly import snap_install
+from claude_on_the_fly import pty_install
 
 
 def test_already_installed_short_circuits() -> None:
-    with patch.object(snap_install, "is_snap_installed", return_value=True):
-        out = snap_install.ensure_snap_installed()
+    with patch.object(pty_install, "is_pty_installed", return_value=True):
+        out = pty_install.ensure_pty_installed()
     assert out.installed is True
 
 
 def test_non_tty_without_auto_yes_declines() -> None:
-    with patch.object(snap_install, "is_snap_installed", return_value=False):
-        out = snap_install.ensure_snap_installed(auto_yes=False, is_tty=False)
+    with patch.object(pty_install, "is_pty_installed", return_value=False):
+        out = pty_install.ensure_pty_installed(auto_yes=False, is_tty=False)
     assert out.installed is False
     assert "consent declined" in out.message
     assert "curl" in out.message
 
 
 def test_tty_user_says_no_declines() -> None:
-    with patch.object(snap_install, "is_snap_installed", return_value=False):
-        out = snap_install.ensure_snap_installed(is_tty=True, input_fn=lambda: "n")
+    with patch.object(pty_install, "is_pty_installed", return_value=False):
+        out = pty_install.ensure_pty_installed(is_tty=True, input_fn=lambda: "n")
     assert out.installed is False
     assert "consent declined" in out.message
 
@@ -44,10 +44,10 @@ def test_tty_user_says_yes_installs_successfully() -> None:
         return fake_proc
 
     with (
-        patch.object(snap_install, "is_snap_installed", side_effect=fake_is_installed),
-        patch.object(snap_install.shutil, "which", return_value="/usr/bin/x"),
+        patch.object(pty_install, "is_pty_installed", side_effect=fake_is_installed),
+        patch.object(pty_install.shutil, "which", return_value="/usr/bin/x"),
     ):
-        out = snap_install.ensure_snap_installed(
+        out = pty_install.ensure_pty_installed(
             is_tty=True,
             input_fn=lambda: "y",
             runner=fake_runner,
@@ -62,10 +62,10 @@ def test_installer_failure_surfaces_message() -> None:
         return fake_proc
 
     with (
-        patch.object(snap_install, "is_snap_installed", return_value=False),
-        patch.object(snap_install.shutil, "which", return_value="/usr/bin/x"),
+        patch.object(pty_install, "is_pty_installed", return_value=False),
+        patch.object(pty_install.shutil, "which", return_value="/usr/bin/x"),
     ):
-        out = snap_install.ensure_snap_installed(
+        out = pty_install.ensure_pty_installed(
             is_tty=True,
             input_fn=lambda: "y",
             runner=fake_runner,
@@ -83,10 +83,10 @@ def test_installer_success_but_binary_still_missing_fails() -> None:
 
     # Always missing — installer "succeeded" but binary not on PATH.
     with (
-        patch.object(snap_install, "is_snap_installed", return_value=False),
-        patch.object(snap_install.shutil, "which", return_value="/usr/bin/x"),
+        patch.object(pty_install, "is_pty_installed", return_value=False),
+        patch.object(pty_install.shutil, "which", return_value="/usr/bin/x"),
     ):
-        out = snap_install.ensure_snap_installed(
+        out = pty_install.ensure_pty_installed(
             is_tty=True,
             input_fn=lambda: "y",
             runner=fake_runner,
@@ -96,7 +96,7 @@ def test_installer_success_but_binary_still_missing_fails() -> None:
 
 
 def test_auto_yes_env_var_skips_prompt() -> None:
-    """SYMPHONY_AUTO_INSTALL_SNAP=1 bypasses consent (useful for CI)."""
+    """SYMPHONY_AUTO_INSTALL_PTY=1 bypasses consent (useful for CI)."""
     call_count = {"i": 0}
 
     def fake_is_installed() -> bool:
@@ -105,9 +105,9 @@ def test_auto_yes_env_var_skips_prompt() -> None:
 
     fake_proc = SimpleNamespace(returncode=0, stdout="", stderr="")
     with (
-        patch.dict("os.environ", {"SYMPHONY_AUTO_INSTALL_SNAP": "1"}, clear=False),
-        patch.object(snap_install, "is_snap_installed", side_effect=fake_is_installed),
-        patch.object(snap_install.shutil, "which", return_value="/usr/bin/x"),
+        patch.dict("os.environ", {"SYMPHONY_AUTO_INSTALL_PTY": "1"}, clear=False),
+        patch.object(pty_install, "is_pty_installed", side_effect=fake_is_installed),
+        patch.object(pty_install.shutil, "which", return_value="/usr/bin/x"),
     ):
         # input_fn must not be called (auto_yes resolves true from env)
         called = {"prompted": False}
@@ -116,7 +116,7 @@ def test_auto_yes_env_var_skips_prompt() -> None:
             called["prompted"] = True
             return "n"
 
-        out = snap_install.ensure_snap_installed(
+        out = pty_install.ensure_pty_installed(
             is_tty=False,
             input_fn=fail_input,
             runner=lambda *_a, **_k: fake_proc,
@@ -126,8 +126,8 @@ def test_auto_yes_env_var_skips_prompt() -> None:
 
 
 def test_run_installer_requires_curl() -> None:
-    with patch.object(snap_install.shutil, "which", side_effect=lambda b: None):
-        ok, msg = snap_install.run_installer()
+    with patch.object(pty_install.shutil, "which", side_effect=lambda b: None):
+        ok, msg = pty_install.run_installer()
     assert ok is False
     assert "curl" in msg
 
@@ -136,4 +136,4 @@ def test_prompt_consent_returns_false_on_eof() -> None:
     def boom() -> str:
         raise EOFError
 
-    assert snap_install.prompt_consent(is_tty=True, input_fn=boom) is False
+    assert pty_install.prompt_consent(is_tty=True, input_fn=boom) is False

@@ -181,9 +181,9 @@ class TestCheckBackend:
         check_backend()
         mock_check.assert_called_once()
 
-    @patch("claude_on_the_fly.preflight.check_snap_mode")
-    def test_snap_mode_dispatches(self, mock_check, clear_backend_env, monkeypatch):
-        monkeypatch.setenv("CLAUDE_MODE", "snap")
+    @patch("claude_on_the_fly.preflight.check_pty_mode")
+    def test_pty_mode_dispatches(self, mock_check, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODE", "pty")
         check_backend()
         mock_check.assert_called_once()
 
@@ -497,8 +497,8 @@ class TestCheckGwsCli:
 class TestRunTelegram:
     @pytest.fixture(autouse=True)
     def _reset_backend_env(self, clear_backend_env):
-        """Force native backend dispatch so a dev's `CLAUDE_MODE=snap` doesn't
-        route check_backend() through check_snap_mode() and skip the patched
+        """Force native backend dispatch so a dev's `CLAUDE_MODE=pty` doesn't
+        route check_backend() through check_pty_mode() and skip the patched
         check_claude_cli."""
 
     @patch("claude_on_the_fly.preflight.asyncio.run")
@@ -535,7 +535,7 @@ class TestRunTelegram:
 class TestRunSlack:
     @pytest.fixture(autouse=True)
     def _reset_backend_env(self, clear_backend_env):
-        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=snap` from
+        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=pty` from
         the dev's shell from rerouting backend dispatch in run_slack()."""
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
@@ -594,7 +594,7 @@ class TestRunSlack:
 class TestRunGmail:
     @pytest.fixture(autouse=True)
     def _reset_backend_env(self, clear_backend_env):
-        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=snap` from
+        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=pty` from
         the dev's shell from rerouting backend dispatch in run_gmail()."""
 
     @patch("claude_on_the_fly.preflight.check_gws_cli")

@@ -23,10 +23,10 @@ from claude_on_the_fly.transcript import (
 logger = logging.getLogger(__name__)
 
 
-SNAP_PROJECT_SLUG = "claude-interactive-p"
-SNAP_INSTALL_HINT = (
+PTY_PROJECT_SLUG = "claude-interactive-p"
+PTY_INSTALL_HINT = (
     f"curl -fsSL https://raw.githubusercontent.com/CJHwong/"
-    f"{SNAP_PROJECT_SLUG}/main/install.sh | bash"
+    f"{PTY_PROJECT_SLUG}/main/install.sh | bash"
 )
 
 
@@ -46,20 +46,20 @@ def _session_has_content(path: Path) -> bool:
         return False
 
 
-def resolve_snap_binary() -> str | None:
-    """Find the `claude-snap` binary.
+def resolve_pty_binary() -> str | None:
+    """Find the `claude-pty` binary.
 
-    Order: PATH → `$CLAUDE_INTERACTIVE_P_HOME/bin/claude-snap` →
-    `~/.local/share/{SNAP_PROJECT_SLUG}/bin/claude-snap`. Returns the absolute
+    Order: PATH → `$CLAUDE_INTERACTIVE_P_HOME/bin/claude-pty` →
+    `~/.local/share/{PTY_PROJECT_SLUG}/bin/claude-pty`. Returns the absolute
     path or None.
     """
-    on_path = shutil.which("claude-snap")
+    on_path = shutil.which("claude-pty")
     if on_path:
         return on_path
     home = os.environ.get("CLAUDE_INTERACTIVE_P_HOME") or str(
-        Path.home() / ".local/share" / SNAP_PROJECT_SLUG
+        Path.home() / ".local/share" / PTY_PROJECT_SLUG
     )
-    candidate = Path(home) / "bin" / "claude-snap"
+    candidate = Path(home) / "bin" / "claude-pty"
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
@@ -71,7 +71,7 @@ class ClaudeBackend:
     Three modes, mutually exclusive:
     - native (default): `claude -p --output-format stream-json …`
     - ollama (`launcher` set): wraps with `ollama launch claude --model X --yes --`
-    - snap (`snap=True`): drives `claude-snap` (interactive PTY wrapper from
+    - pty (`pty=True`): drives `claude-pty` (interactive PTY wrapper from
       claude-interactive-p) so we get statusline-only fields like rate_limits
       and context_window. Argv drops `-p`, `--output-format`, `--verbose`.
     """
@@ -79,22 +79,22 @@ class ClaudeBackend:
     def __init__(
         self,
         launcher: OllamaLauncher | None = None,
-        snap: bool = False,
+        pty: bool = False,
     ) -> None:
-        if launcher is not None and snap:
-            raise ValueError("ClaudeBackend: launcher and snap are mutually exclusive")
+        if launcher is not None and pty:
+            raise ValueError("ClaudeBackend: launcher and pty are mutually exclusive")
         self.launcher = launcher
-        self.snap = snap
+        self.pty = pty
         # Resolve once at construction so per-message hot path skips the
         # `shutil.which` + `os.access` syscalls. Missing binary fails fast
         # here rather than on the first message — preflight already guarantees
         # it, this is defense in depth for misconfigured callers.
-        self._snap_path: str | None = None
-        if snap:
-            self._snap_path = resolve_snap_binary()
-            if self._snap_path is None:
+        self._pty_path: str | None = None
+        if pty:
+            self._pty_path = resolve_pty_binary()
+            if self._pty_path is None:
                 raise RuntimeError(
-                    "claude-snap binary not found. Install with: " + SNAP_INSTALL_HINT
+                    "claude-pty binary not found. Install with: " + PTY_INSTALL_HINT
                 )
 
     async def run(
@@ -120,9 +120,9 @@ class ClaudeBackend:
         # healthy --resume reuses the prompt already persisted in the session.
         sysprompt_args = ["--system-prompt", system_prompt]
 
-        if self.snap:
-            base = self._snap_base_argv()
-            executor = _exec_snap
+        if self.pty:
+            base = self._pty_base_argv()
+            executor = _exec_pty
         else:
             # `ollama launch claude` already invokes the claude binary; repeating
             # "claude" after `--` would make it argv[1], which -p mode parses as
@@ -149,8 +149,8 @@ class ClaudeBackend:
         # Pick --resume vs --session-id deterministically by checking whether
         # the session JSONL exists on disk. Old code sniffed claude's error
         # message ("No conversation found") on a failed --resume, but:
-        #   1) Snap mode wraps stderr behind "no envelope produced (claude
-        #      rc=1)", so the sniff never matched in snap mode.
+        #   1) claude-pty mode wraps stderr behind "no envelope produced (claude
+        #      rc=1)", so the sniff never matched in pty mode.
         #   2) claude 2.1.150 changed the message to "--resume requires a
         #      valid session ID...", so the sniff stopped matching in native
         #      mode too.
@@ -202,8 +202,8 @@ class ClaudeBackend:
                 [*base, "--resume", session_uuid, agent.NUDGE_PROMPT],
                 timeout=timeout,
             )
-            if self.snap:
-                # Snap envelopes have no per-tool counts to merge and snap's
+            if self.pty:
+                # claude-pty envelopes have no per-tool counts to merge and pty's
                 # `usage` is just the last assistant message — simpler to
                 # take the retry envelope wholesale.
                 cli_output = retry_output
@@ -218,7 +218,7 @@ class ClaudeBackend:
         # Anthropic's price table, which is meaningless when ollama is
         # actually serving the model. Look up the routed model's price in
         # the OpenRouter registry instead, matching how the codex backend
-        # handles its own cost. Native and snap modes keep the CLI's value,
+        # handles its own cost. Native and pty modes keep the CLI's value,
         # which reflects Anthropic's real billing.
         if self.launcher is not None:
             cost = (
@@ -242,14 +242,14 @@ class ClaudeBackend:
             **_statusline_response_fields(statusline),
         )
 
-    def _snap_base_argv(self) -> list[str]:
-        """Snap argv minus the prompt and --system-prompt; the caller appends
+    def _pty_base_argv(self) -> list[str]:
+        """claude-pty argv minus the prompt and --system-prompt; the caller appends
         --system-prompt only when (re-)establishing a session."""
-        assert self._snap_path is not None  # set in __init__ when snap=True
+        assert self._pty_path is not None  # set in __init__ when pty=True
         model = os.environ.get("CLAUDE_MODEL", "").strip()
         model_args = ["--model", model] if model else []
         return [
-            self._snap_path,
+            self._pty_path,
             "--permission-mode",
             "bypassPermissions",
             *model_args,
@@ -258,15 +258,15 @@ class ClaudeBackend:
     def _extract_tokens(self, cli_output: dict) -> tuple[int, int]:
         """Return (tokens_in, tokens_out).
 
-        Snap's top-level `usage` is the last assistant message only, so for
-        multi-turn snap calls we'd undercount. `modelUsage` is aggregated
-        across every assistant record by snap's transcript pass, so it's the
+        claude-pty's top-level `usage` is the last assistant message only, so for
+        multi-turn pty calls we'd undercount. `modelUsage` is aggregated
+        across every assistant record by pty's transcript pass, so it's the
         truthful cross-turn total.
 
         Native/ollama stay on `usage` because that's how stream-json folds
         already work, and we want zero behavior change there.
         """
-        if self.snap:
+        if self.pty:
             mu = cli_output.get("modelUsage") or {}
             tokens_in = sum(
                 int(v.get("inputTokens", 0)) + int(v.get("cacheReadInputTokens", 0))
@@ -306,7 +306,7 @@ class ClaudeBackend:
 
 
 def _statusline_response_fields(statusline: dict) -> dict:
-    """Pull the Response-friendly subset of fields out of a snap statusline.
+    """Pull the Response-friendly subset of fields out of a pty statusline.
 
     Returns kwargs ready to splat into `Response(...)`. Empty dict when the
     statusline is empty (native/ollama paths — Response defaults stand in).
@@ -335,18 +335,18 @@ def _statusline_response_fields(statusline: dict) -> dict:
     return out
 
 
-async def _exec_snap(
+async def _exec_pty(
     workspace: Path, cmd: list[str], timeout: float | None = None
 ) -> dict:
-    """Run `claude-snap` and parse its single-JSON envelope on stdout.
+    """Run `claude-pty` and parse its single-JSON envelope on stdout.
 
     Returns a dict shaped to match what the native stream-json parser yields,
-    plus a `statusline` key carrying the snap-only subtree. tool_counts and
-    skill_counts are always empty in snap mode (snap doesn't surface per-turn
+    plus a `statusline` key carrying the pty-only subtree. tool_counts and
+    skill_counts are always empty in pty mode (pty doesn't surface per-turn
     tool_use events).
     """
     logger.debug(
-        "exec_snap: cwd=%s cmd=%s timeout=%s",
+        "exec_pty: cwd=%s cmd=%s timeout=%s",
         workspace,
         " ".join(cmd[:4]) + "...",
         timeout,
@@ -369,38 +369,38 @@ async def _exec_snap(
         else:
             stdout, stderr, rc = await _wait()
     except asyncio.TimeoutError:
-        logger.warning("exec_snap: timed out after %ss", timeout)
+        logger.warning("exec_pty: timed out after %ss", timeout)
         if proc.returncode is None:
             try:
                 proc.kill()
                 await proc.wait()
             except ProcessLookupError:
                 pass
-        raise RuntimeError(f"claude-snap timed out after {timeout}s")
+        raise RuntimeError(f"claude-pty timed out after {timeout}s")
 
     stdout_text = stdout.decode(errors="replace").strip()
     stderr_text = stderr.decode(errors="replace").strip()
 
     if rc != 0 and not stdout_text:
-        raise agent._classify(stderr_text or f"claude-snap exit {rc}")
+        raise agent._classify(stderr_text or f"claude-pty exit {rc}")
 
     if not stdout_text:
         raise RuntimeError(
-            "claude-snap produced no envelope. See snap's troubleshooting "
+            "claude-pty produced no envelope. See pty's troubleshooting "
             "section — likely a Claude Code upgrade broke the Stop hook. "
-            "Fall back with CLAUDE_MODE=native or reinstall snap: " + SNAP_INSTALL_HINT
+            "Fall back with CLAUDE_MODE=native or reinstall pty: " + PTY_INSTALL_HINT
         )
 
     try:
         envelope = json.loads(stdout_text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"claude-snap returned malformed JSON: {exc}; first 200 chars: "
+            f"claude-pty returned malformed JSON: {exc}; first 200 chars: "
             + stdout_text[:200]
         ) from exc
 
     if envelope.get("is_error") or str(envelope.get("subtype", "")).startswith("error"):
-        raise agent._classify(envelope.get("result") or stderr_text or "snap error")
+        raise agent._classify(envelope.get("result") or stderr_text or "pty error")
 
     envelope.setdefault("tool_counts", {})
     envelope.setdefault("skill_counts", {})

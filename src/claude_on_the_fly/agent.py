@@ -124,7 +124,7 @@ class Response:
     model: str = ""
     tool_counts: dict[str, int] = field(default_factory=dict)
     skill_counts: dict[str, int] = field(default_factory=dict)
-    # Optional statusline-derived fields, only populated in CLAUDE_MODE=snap.
+    # Optional statusline-derived fields, only populated in CLAUDE_MODE=pty.
     rate_limits_5h_pct: int | None = None
     rate_limits_5h_resets_at: int | None = None
     rate_limits_7d_pct: int | None = None
@@ -152,7 +152,7 @@ class Response:
         if self.context_window_pct is not None:
             parts.append(f"ctx {self.context_window_pct}%")
         # Only surface the 5h budget when it's actually loud; the 7d window
-        # rarely matters in chat. resets_at is a Unix timestamp from snap.
+        # rarely matters in chat. resets_at is a Unix timestamp from pty.
         if (
             self.rate_limits_5h_pct is not None
             and self.rate_limits_5h_pct >= 50
@@ -454,10 +454,10 @@ def current_backend_key() -> str:
             if not model:
                 raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"claude:ollama:{model}"
-        if mode == "snap":
-            return f"claude:snap:{os.environ.get('CLAUDE_MODEL', '').strip()}"
+        if mode == "pty":
+            return f"claude:pty:{os.environ.get('CLAUDE_MODEL', '').strip()}"
         raise ValueError(
-            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)"
+            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)"
         )
     if name == "codex":
         mode = os.environ.get("CODEX_MODE", "native").lower()
@@ -485,9 +485,9 @@ def _build_claude_backend() -> AgentBackend:
         if not model:
             raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
         return ClaudeBackend(launcher=OllamaLauncher(model=model))
-    if mode == "snap":
-        return ClaudeBackend(snap=True)
-    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, snap)")
+    if mode == "pty":
+        return ClaudeBackend(pty=True)
+    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")
 
 
 def _build_codex_backend() -> AgentBackend:

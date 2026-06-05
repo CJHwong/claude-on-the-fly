@@ -178,15 +178,15 @@ class TestCheckBackend:
         bad = [r for r in results if r.status == "invalid"]
         assert any(r.name == "CODEX_MODE" for r in bad)
 
-    def test_claude_snap_mode_accepted(self):
-        """`snap` is a valid CLAUDE_MODE (claude-only); env validation passes."""
-        results = check_backend({"CLAUDE_MODE": "snap"})
+    def test_claude_pty_mode_accepted(self):
+        """`pty` is a valid CLAUDE_MODE (claude-only); env validation passes."""
+        results = check_backend({"CLAUDE_MODE": "pty"})
         bad = [r for r in results if r.name == "CLAUDE_MODE" and r.status == "invalid"]
         assert not bad
 
-    def test_codex_snap_mode_rejected(self):
-        """snap is claude-only; codex should not accept it."""
-        results = check_backend({"AGENT_BACKEND": "codex", "CODEX_MODE": "snap"})
+    def test_codex_pty_mode_rejected(self):
+        """pty is claude-only; codex should not accept it."""
+        results = check_backend({"AGENT_BACKEND": "codex", "CODEX_MODE": "pty"})
         bad = [r for r in results if r.status == "invalid"]
         assert any(r.name == "CODEX_MODE" for r in bad)
 
