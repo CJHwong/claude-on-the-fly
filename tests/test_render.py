@@ -2,123 +2,49 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from claude_on_the_fly.tui.render import (
     scheduler_header,
-    symphony_cap,
-    symphony_header,
-    tracker_labels,
+    symphony_strip_header,
 )
 
 
-def _cfg(**trackers):
-    return SimpleNamespace(trackers=dict(trackers))
-
-
 # ---------------------------------------------------------------------------
-# tracker_labels / symphony_cap
+# symphony_strip_header
 # ---------------------------------------------------------------------------
 
 
-class TestTrackerLabels:
-    def test_jira_gets_project_key_suffix(self):
-        cfg = _cfg(jira=SimpleNamespace(project_key="ACES", max_concurrent=3))
-        assert tracker_labels(cfg) == ["jira:ACES"]
-
-    def test_github_without_project_key_is_bare_name(self):
-        cfg = _cfg(github=SimpleNamespace(max_concurrent=15))
-        assert tracker_labels(cfg) == ["github"]
-
-    def test_blank_project_key_falls_back_to_name(self):
-        cfg = _cfg(jira=SimpleNamespace(project_key="", max_concurrent=1))
-        assert tracker_labels(cfg) == ["jira"]
-
-    def test_order_follows_insertion(self):
-        cfg = _cfg(
-            jira=SimpleNamespace(project_key="ACES", max_concurrent=3),
-            github=SimpleNamespace(max_concurrent=15),
-        )
-        assert tracker_labels(cfg) == ["jira:ACES", "github"]
-
-
-class TestSymphonyCap:
-    def test_sums_per_tracker(self):
-        cfg = _cfg(
-            jira=SimpleNamespace(max_concurrent=3),
-            github=SimpleNamespace(max_concurrent=15),
-        )
-        assert symphony_cap(cfg) == 18
-
-    def test_missing_field_counts_zero(self):
-        cfg = _cfg(jira=SimpleNamespace())
-        assert symphony_cap(cfg) == 0
-
-
-def test_helpers_agree_with_real_example_config(tmp_path):
-    """Integration: the shipped EXAMPLE_YAML must drive the helpers, not just a
-    SimpleNamespace fake."""
-    from claude_on_the_fly.symphony.config import EXAMPLE_YAML, load_config
-
-    cfg_path = tmp_path / "symphony.yaml"
-    cfg_path.write_text(EXAMPLE_YAML)
-    cfg = load_config(cfg_path)
-
-    assert tracker_labels(cfg) == ["jira:PROJ", "github"]
-    expected = (
-        cfg.trackers["jira"].max_concurrent + cfg.trackers["github"].max_concurrent
-    )
-    assert symphony_cap(cfg) == expected
-
-
-# ---------------------------------------------------------------------------
-# symphony_header
-# ---------------------------------------------------------------------------
-
-
-class TestSymphonyHeader:
-    def test_running_shows_cap_and_labels(self):
-        line = symphony_header(
-            state="running",
-            running=2,
-            cap=15,
-            labels=["jira:ACES", "github"],
-            hb_age_s=3.0,
+class TestSymphonyStripHeader:
+    def test_multi_tracker_reverse_videos_selected(self):
+        line = symphony_strip_header(
+            [("jira", "running"), ("github", "running")], selected=0, active=2
         )
         assert "SYMPHONY" in line
-        assert "2/15" in line
-        assert "jira:ACES" in line
+        assert "jira" in line
         assert "github" in line
-        assert "hb 3s" in line
-        assert "green" in line  # running is bold green
+        assert "reverse" in line  # the selected tracker is highlighted
+        assert "2 active" in line
 
-    def test_stopped_dims_state_and_keeps_cap(self):
-        line = symphony_header(
-            state="stopped", running=0, cap=15, labels=[], hb_age_s=None
+    def test_disabled_tracker_shows_disabled_suffix(self):
+        line = symphony_strip_header(
+            [("jira", "running"), ("github", "disabled")], selected=0, active=0
         )
-        assert "0/15" in line
-        assert "dim" in line  # stopped state style
-        assert "hb" not in line  # no heartbeat age when None
+        assert "disabled" in line
+        assert "idle" in line  # selected (jira) has no active jobs
 
-    def test_zero_cap_falls_back_to_running_count(self):
-        line = symphony_header(
-            state="running", running=1, cap=0, labels=[], hb_age_s=None
-        )
-        assert "1 running" in line
-        assert "1/0" not in line
+    def test_single_tracker_collapses_to_one_line(self):
+        line = symphony_strip_header([("jira", "running")], selected=0, active=1)
+        assert "jira" in line
+        assert "1 active" in line
+        assert "reverse" not in line  # nothing to switch between
 
-    def test_stale_and_error_annotations(self):
-        line = symphony_header(
-            state="broken",
-            running=1,
-            cap=2,
-            labels=[],
-            hb_age_s=90.0,
-            error="config error",
-            stale=True,
-        )
-        assert "stale" in line
-        assert "config error" in line
+    def test_no_trackers_reads_as_unconfigured(self):
+        line = symphony_strip_header([], selected=0, active=0)
+        assert "no trackers configured" in line
+
+    def test_config_error_is_surfaced(self):
+        line = symphony_strip_header([], selected=0, active=0, error="bad yaml")
+        assert "no trackers configured" in line
+        assert "bad yaml" in line
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,28 @@ def _ev(ts, type_, ident, uuid="u", **extra):
     return {"ts": ts, "type": type_, "identifier": ident, "session_uuid": uuid, **extra}
 
 
+def _isolate_symphony_config(tmp_path, monkeypatch, *, jira=True, github=True):
+    """Point the dashboard at a tmp symphony.yaml so tracker tabs don't read the
+    dev machine's real config. Both trackers enabled by default."""
+    import claude_on_the_fly.tui.screens.dashboard as dash
+
+    cfg = tmp_path / "symphony.yaml"
+    cfg.write_text(
+        f"""
+trackers:
+  jira:
+    base_url: https://x.atlassian.net
+    project_key: PROJ
+    enabled: {str(jira).lower()}
+  github:
+    enabled: {str(github).lower()}
+"""
+    )
+    monkeypatch.setattr(dash, "SYMPHONY_CONFIG", cfg)
+    monkeypatch.setattr(dash, "_symphony_cfg_cache", None)
+    return cfg
+
+
 def _write_heartbeat(state_dir, name, running_jobs=()):
     """Write a heartbeat JSON that reads as a running daemon with the given
     in-flight jobs. Uses the live pid so state.snapshot() sees it alive."""
@@ -149,16 +171,22 @@ class TestDashboardLayout:
     """The tabbed dashboard: daemon tabs + chat-strip override + retargeting."""
 
     @pytest.mark.asyncio
-    async def test_hero_panels_render_with_headers(self):
+    async def test_hero_panels_render_with_headers(self, tmp_path, monkeypatch):
         from textual.widgets import Static
+
+        _isolate_symphony_config(tmp_path, monkeypatch)
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            sym = str(app.screen.query_one("#symphony-header", Static).render())
+            sym = str(app.screen.query_one("#symphony-strip-header", Static).render())
             sched = str(app.screen.query_one("#scheduler-header", Static).render())
-            # Panels render even with nothing running (daemons stopped in tests).
+            # The symphony strip lists every configured tracker; both render even
+            # with nothing running (daemon stopped in tests).
             assert "SYMPHONY" in sym
+            assert "jira" in sym
+            assert "github" in sym
             assert "stopped" in sym
             assert "SCHEDULER" in sched
 
@@ -425,17 +453,44 @@ class TestDashboardLayout:
             assert calls == [("screen", "config"), "schedule", "env"]
 
     @pytest.mark.asyncio
-    async def test_empty_symphony_table_shows_placeholder_row(self):
+    async def test_empty_tracker_table_shows_placeholder_row(
+        self, tmp_path, monkeypatch
+    ):
         from textual.widgets import DataTable
+
+        _isolate_symphony_config(tmp_path, monkeypatch)
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            # No symphony daemon in tests → no tickets → one placeholder row,
-            # not a bare header (and the table stays focusable for Tab).
+            # No symphony daemon in tests → no tickets for the selected tracker
+            # (jira, the default) → one placeholder row, not a bare header (and
+            # the table stays focusable for Tab).
             table = app.screen.query_one("#symphony-tickets", DataTable)
             assert table.row_count == 1
             assert "no active jobs" in str(table.get_row_at(0)[0])
+
+    @pytest.mark.asyncio
+    async def test_disabled_tracker_shows_disabled_placeholder_when_selected(
+        self, tmp_path, monkeypatch
+    ):
+        from textual.widgets import DataTable
+
+        _isolate_symphony_config(tmp_path, monkeypatch, github=False)
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Select the parked github tracker (jira is selected first) and the
+            # scoped table reports it disabled, not "no active jobs".
+            await pilot.press("3")  # symphony tab
+            await pilot.press("right")  # jira → github
+            await pilot.pause()
+            table = app.screen.query_one("#symphony-tickets", DataTable)
+            assert table.row_count == 1
+            assert "disabled" in str(table.get_row_at(0)[0])
 
     @pytest.mark.asyncio
     async def test_action_cue_follows_active_tab(self):
@@ -469,6 +524,25 @@ class TestDashboardLayout:
             assert str(tabs.get_tab("tab-chat").label) == "[1] ○ chat"
             assert str(tabs.get_tab("tab-scheduler").label) == "[2] ○ scheduler"
             assert str(tabs.get_tab("tab-symphony").label) == "[3] ○ symphony"
+
+    @pytest.mark.asyncio
+    async def test_disabled_tracker_reads_disabled_in_strip(
+        self, tmp_path, monkeypatch
+    ):
+        """A parked tracker shows the `disabled` glyph (⊘) in the symphony
+        header strip, while the enabled one carries the process state."""
+        from textual.widgets import Static
+
+        _isolate_symphony_config(tmp_path, monkeypatch, github=False)
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            strip = str(app.screen.query_one("#symphony-strip-header", Static).render())
+            assert "jira" in strip
+            assert "github" in strip
+            assert "disabled" in strip  # github is parked
 
     @pytest.mark.asyncio
     async def test_supervisor_action_targets_active_tab_daemon(self, monkeypatch):

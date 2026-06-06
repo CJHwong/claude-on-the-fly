@@ -9,6 +9,12 @@ Layout (top → bottom):
   the shared log/watch row below.
 - Log row: daemon log (left) + per-ticket / per-job watch (right).
 
+The symphony tab mirrors the chat tab's selector model: its header shows every
+configured tracker (jira / github / ...) with the ←/→-selected one
+reverse-video'd, and the ticket table is scoped to that tracker. A tracker
+parked via `enabled: false` reads as disabled in the strip even while the one
+symphony process runs — k/r act on that single process, not a tracker.
+
 The chat tab is a live activity monitor, not a daemon roster: the header shows
 every chat frontend's health (the ←/→-selected one reverse-video'd), and the
 table lists that frontend's currently-running jobs (from the heartbeat) with
@@ -27,7 +33,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Callable, ClassVar, Literal
+from typing import TYPE_CHECKING, Callable, ClassVar, Literal
 
 from rich.text import Text
 
@@ -54,6 +60,9 @@ from claude_on_the_fly.agent import (
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
+
+if TYPE_CHECKING:
+    from claude_on_the_fly.symphony.config import SymphonyConfig
 from claude_on_the_fly.tui import env_editor, render, state, supervisor
 from claude_on_the_fly.tui.screens.config_picker import ConfigPickerScreen
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
@@ -78,7 +87,7 @@ CHAT_FRONTENDS: tuple[str, ...] = ("telegram", "slack", "gmail")
 _symphony_cfg_cache: tuple[Path, float, tuple] | None = None
 
 
-def _load_symphony_cached(path: Path) -> tuple[object | None, str | None]:
+def _load_symphony_cached(path: Path) -> tuple[SymphonyConfig | None, str | None]:
     """Return (config, error). Missing file → (None, None); parse failure →
     (None, message). Cached by mtime so a broken file isn't reparsed each tick.
     """
@@ -112,7 +121,7 @@ class DashboardScreen(Screen):
     #chat-panel, #symphony-panel, #scheduler-panel {
         height: auto;
     }
-    #symphony-header, #scheduler-header, #chat-strip-header {
+    #symphony-strip-header, #scheduler-header, #chat-strip-header {
         height: auto;
         padding: 0 0 0 1;
     }
@@ -152,10 +161,10 @@ class DashboardScreen(Screen):
         Binding("2", "show_tab('tab-scheduler')", "scheduler tab", show=False),
         Binding("3", "show_tab('tab-symphony')", "symphony tab", show=False),
         # priority so the screen sees ←/→ before the focused DataTable swallows
-        # them for its (row-mode no-op) horizontal cursor. The action itself
-        # no-ops off the chat tab, so this doesn't strand arrow keys elsewhere.
-        Binding("left", "chat_select(-1)", "Prev frontend", show=False, priority=True),
-        Binding("right", "chat_select(1)", "Next frontend", show=False, priority=True),
+        # them for its (row-mode no-op) horizontal cursor. The action no-ops off
+        # the chat / symphony tabs, so this doesn't strand arrow keys elsewhere.
+        Binding("left", "strip_select(-1)", "Prev", show=False, priority=True),
+        Binding("right", "strip_select(1)", "Next", show=False, priority=True),
     ]
 
     # Longer help text per action label (shown in the `?` modal; the footer
@@ -176,8 +185,8 @@ class DashboardScreen(Screen):
         "chat tab": "switch to the chat tab",
         "scheduler tab": "switch to the scheduler tab",
         "symphony tab": "switch to the symphony tab",
-        "Prev frontend": "select the previous chat frontend (←)",
-        "Next frontend": "select the next chat frontend (→)",
+        "Prev": "select the previous chat frontend / symphony tracker (←)",
+        "Next": "select the next chat frontend / symphony tracker (→)",
     }
 
     def __init__(self) -> None:
@@ -194,6 +203,13 @@ class DashboardScreen(Screen):
         # table shows only this frontend's requests and k/r act on it. Kept
         # stable by name across refreshes (see _refresh_chat_strip).
         self._chat_selected_idx: int = 0
+        # Symphony's configured trackers (jira / github / ...) in display order,
+        # and the ←/→-selected one. Mirrors the chat strip: the symphony tab
+        # shows ALL trackers in its header and scopes the table to the selected
+        # one. Unlike chat, k/r still act on the single symphony process — a
+        # tracker is enabled/disabled via its config flag, not the selection.
+        self._symphony_tracker_names: list[str] = []
+        self._symphony_selected_idx: int = 0
         # Watch pane state, tracked separately so the two panes refresh
         # independently. _watch_target encodes what's being watched, e.g.
         # "session:symphony:PROJ-1" or "schedule:cleanup-job", so we know to
@@ -244,7 +260,7 @@ class DashboardScreen(Screen):
                     TabPane("symphony", id="tab-symphony"),
                     Vertical(id="symphony-panel"),
                 ):
-                    yield Static(id="symphony-header", markup=True)
+                    yield Static(id="symphony-strip-header", markup=True)
                     yield DataTable(
                         id="symphony-tickets", cursor_type="row", zebra_stripes=True
                     )
@@ -341,19 +357,26 @@ class DashboardScreen(Screen):
         idx = min(self._chat_selected_idx, len(names) - 1)
         return names[idx]
 
-    def action_chat_select(self, delta: int) -> None:
-        """←/→ move the selected chat frontend. No-op off the chat tab or when
-        only one frontend is relevant (nothing to switch to)."""
+    def action_strip_select(self, delta: int) -> None:
+        """←/→ move the selected item in the active tab's header strip: a chat
+        frontend on the chat tab, a tracker on the symphony tab. No-op on other
+        tabs or when there's nothing to switch to."""
         try:
             active = self.query_one("#daemon-tabs", TabbedContent).active
         except Exception:
             return
-        if active != "tab-chat":
+        if active == "tab-chat":
+            count = len(self._chat_frontend_names)
+            if count <= 1:
+                return
+            self._chat_selected_idx = (self._chat_selected_idx + delta) % count
+        elif active == "tab-symphony":
+            count = len(self._symphony_tracker_names)
+            if count <= 1:
+                return
+            self._symphony_selected_idx = (self._symphony_selected_idx + delta) % count
+        else:
             return
-        count = len(self._chat_frontend_names)
-        if count <= 1:
-            return
-        self._chat_selected_idx = (self._chat_selected_idx + delta) % count
         self._refresh()
         self._refresh_log(force_reload=True)
         self._update_action_cue()
@@ -942,36 +965,71 @@ class DashboardScreen(Screen):
             pass
 
     def _refresh_symphony(self, sym: state.FrontendStatus | None) -> None:
+        """Render the symphony tab the way the chat tab works: a strip of every
+        configured tracker in the header (←/→-selected one reverse-video'd), and
+        the ticket table scoped to the selected tracker. A parked tracker
+        (`enabled: false`) reads as disabled in the strip; the lone symphony
+        process state drives the rest."""
         cfg, cfg_error = _load_symphony_cached(SYMPHONY_CONFIG)
-        labels = render.tracker_labels(cfg) if cfg else []
-        cap = render.symphony_cap(cfg) if cfg else 0
         extra = (sym.extra or {}) if sym else {}
-        running = int(extra.get("running", 0) or 0)
-        self.query_one("#symphony-header", Static).update(
-            render.symphony_header(
-                state=sym.state if sym else "stopped",
-                running=running,
-                cap=cap,
-                labels=labels,
-                hb_age_s=sym.last_heartbeat_age_s if sym else None,
-                error=(sym.error if sym and sym.error else cfg_error),
-                stale=bool(sym.stale) if sym else False,
+        sym_state = sym.state if sym else "stopped"
+        error = sym.error if sym and sym.error else cfg_error
+
+        # Bind the trackers mapping once behind the None-guard so later lookups
+        # don't re-trip the type checker on `cfg` possibly being None.
+        trackers_cfg = cfg.trackers if cfg else {}
+
+        # Keep the selection pinned to the same tracker across refreshes even if
+        # the configured set shifts; clamp into range otherwise (mirrors chat).
+        names = list(trackers_cfg)
+        prev = self._symphony_tracker_names
+        if prev and 0 <= self._symphony_selected_idx < len(prev):
+            pinned = prev[self._symphony_selected_idx]
+            if pinned in names:
+                self._symphony_selected_idx = names.index(pinned)
+        self._symphony_selected_idx = min(
+            self._symphony_selected_idx, max(0, len(names) - 1)
+        )
+        self._symphony_tracker_names = names
+        selected = names[self._symphony_selected_idx] if names else None
+
+        # Group running tickets by source (the config key from the heartbeat),
+        # and track EVERY ticket's source + session uuid — the watch pane must
+        # resolve any running ticket, not just the selected tracker's (the table
+        # is scoped to the selection, these maps are not).
+        by_source: dict[str, list[dict]] = {}
+        for ticket in extra.get("running_tickets") or []:
+            identifier = str(ticket.get("identifier", "?"))
+            source = str(ticket.get("source") or "jira")
+            by_source.setdefault(source, []).append(ticket)
+            self._ticket_sources[identifier] = source
+            # Derive the session uuid with the daemon's current backend_key —
+            # mirrors what the orchestrator does when dispatching.
+            self._job_sessions[f"symphony:{identifier}"] = session_uuid_for(
+                identifier, source=source, backend_key=current_backend_key()
+            )
+
+        # Strip cells: (name, state). A disabled tracker shows its own glyph;
+        # the rest share the process state.
+        strip: list[tuple[str, str]] = []
+        for name in names:
+            tcfg = trackers_cfg[name]
+            cell_state = "disabled" if not getattr(tcfg, "enabled", True) else sym_state
+            strip.append((name, cell_state))
+
+        sel_tickets = by_source.get(selected, []) if selected else []
+        self.query_one("#symphony-strip-header", Static).update(
+            render.symphony_strip_header(
+                strip, self._symphony_selected_idx, len(sel_tickets), error=error
             )
         )
 
         table = self.query_one("#symphony-tickets", DataTable)
-        previously = self._selected_ticket()
+        previously = self._datatable_cursor_key("#symphony-tickets")
         table.clear()
         keys: list[str] = []
-        for ticket in extra.get("running_tickets") or []:
+        for ticket in sel_tickets:
             identifier = str(ticket.get("identifier", "?"))
-            tracker = str(ticket.get("source") or "jira")
-            self._ticket_sources[identifier] = tracker
-            # Derive the session uuid with the daemon's current backend_key —
-            # mirrors what the orchestrator does when dispatching.
-            self._job_sessions[f"symphony:{identifier}"] = session_uuid_for(
-                identifier, source=tracker, backend_key=current_backend_key()
-            )
             key = f"symphony:{identifier}"
             keys.append(key)
             table.add_row(
@@ -984,11 +1042,17 @@ class DashboardScreen(Screen):
             )
         if not keys:
             # Keep one row so the table still reads as "here, but empty" rather
-            # than a bare header. A placeholder row also keeps the table
-            # focusable for Tab / lifecycle keys.
-            table.add_row(
-                Text("no active jobs", style="dim"), "", "", "", "", key="__empty__"
-            )
+            # than a bare header, and stays focusable for Tab / lifecycle keys.
+            selected_cfg = trackers_cfg.get(selected) if selected else None
+            if selected is None:
+                msg = "no trackers configured"
+            elif selected_cfg is not None and not getattr(
+                selected_cfg, "enabled", True
+            ):
+                msg = "disabled (set enabled: true)"
+            else:
+                msg = "no active jobs"
+            table.add_row(Text(msg, style="dim"), "", "", "", "", key="__empty__")
         else:
             self._restore_cursor(table, keys, previously)
 

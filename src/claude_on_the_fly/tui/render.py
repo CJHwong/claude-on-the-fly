@@ -19,8 +19,9 @@ _STATE_STYLES = {
     "running": "bold green",
     "stopped": "dim",
     "broken": "bold yellow",
+    "disabled": "dim",
 }
-_STATE_GLYPH = {"running": "●", "stopped": "○", "broken": "⚠"}
+_STATE_GLYPH = {"running": "●", "stopped": "○", "broken": "⚠", "disabled": "⊘"}
 
 
 def fmt_age(seconds: float | None) -> str:
@@ -168,51 +169,49 @@ def _state_markup(state: str) -> str:
     return f"[{style}]{glyph} {state}[/]" if style else f"{glyph} {state}"
 
 
-def tracker_labels(config) -> list[str]:
-    """Short per-tracker labels for the symphony header, e.g. `jira:ACES`.
-
-    Duck-typed on purpose: only `.trackers` (name -> tracker) and an optional
-    `project_key` on each tracker are touched, so a SimpleNamespace stands in
-    for a real SymphonyConfig in tests.
-    """
-    labels = []
-    for name, tracker in config.trackers.items():
-        key = getattr(tracker, "project_key", "") or ""
-        labels.append(f"{name}:{key}" if key else str(name))
-    return labels
-
-
-def symphony_cap(config) -> int:
-    """Sum of per-tracker `max_concurrent`. There is no global cap, so the
-    effective parallelism ceiling is the sum across trackers."""
-    return sum(
-        int(getattr(t, "max_concurrent", 0) or 0) for t in config.trackers.values()
-    )
-
-
-def symphony_header(
+def symphony_strip_header(
+    trackers: list[tuple[str, str]],
+    selected: int,
+    active: int,
     *,
-    state: str,
-    running: int,
-    cap: int,
-    labels: list[str],
-    hb_age_s: float | None,
     error: str | None = None,
-    stale: bool = False,
 ) -> str:
-    """Markup line for the SYMPHONY panel border-title."""
-    line = f"[bold]SYMPHONY[/bold]  {_state_markup(state)}"
-    rest = [f"{running}/{cap}" if cap else f"{running} running"]
-    if labels:
-        rest.append(f"[dim]{', '.join(labels)}[/dim]")
-    if hb_age_s is not None:
-        rest.append(f"[dim]hb {fmt_age(hb_age_s)}[/dim]")
-    line += "  ·  " + "  ·  ".join(rest)
-    if stale:
-        line += "  [yellow]⚠ stale[/yellow]"
-    if error:
-        line += f"  [red]({error})[/red]"
-    return line
+    """Markup for the symphony tab, mirroring `chat_header`: a glyph strip of
+    every configured tracker with the ←/→-selected one reverse-video'd, so
+    which tracker the table is scoped to is always visible. Each entry is a
+    (name, state) pair — state is already resolved ('disabled' for a parked
+    tracker, else the shared symphony process state). `active` is the selected
+    tracker's in-flight ticket count. `error` (config parse / daemon error) is
+    appended so a broken symphony.yaml doesn't silently read as 'no trackers'."""
+
+    def _with_error(line: str) -> str:
+        return f"{line}  [red]({error})[/red]" if error else line
+
+    if not trackers:
+        return _with_error("[bold]SYMPHONY[/bold]  [dim]no trackers configured[/dim]")
+    if len(trackers) == 1:
+        name, st = trackers[0]
+        tail = f"{active} active" if active else "[dim]idle[/dim]"
+        return _with_error(
+            f"[bold]SYMPHONY[/bold]  [bold]{name}[/bold]  {_state_markup(st)}  ·  {tail}"
+        )
+
+    cells = []
+    for i, (name, st) in enumerate(trackers):
+        glyph = _STATE_GLYPH.get(st, "?")
+        suffix = "" if st == "running" else st
+        if i == selected:
+            body = f"{name} {glyph}" + (f" {suffix}" if suffix else "")
+            cells.append(f"[reverse] {body} [/reverse]")
+        else:
+            style = _STATE_STYLES.get(st, "")
+            cell = f"{name} [{style}]{glyph}[/]" if style else f"{name} {glyph}"
+            if suffix:
+                cell += f" [dim]{suffix}[/dim]"
+            cells.append(cell)
+    line = "[bold]SYMPHONY[/bold]  " + "  ·  ".join(cells)
+    line += f"  ·  {active} active" if active else "  ·  [dim]idle[/dim]"
+    return _with_error(line)
 
 
 def scheduler_header(
