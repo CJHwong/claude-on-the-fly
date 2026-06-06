@@ -57,8 +57,12 @@ BACKEND_ENV_VARS: tuple[str, ...] = (
     "AGENT_BACKEND",
     "CLAUDE_MODE",
     "CODEX_MODE",
+    "PI_MODE",
     "OLLAMA_MODEL",
     "CLAUDE_MODEL",
+    "CODEX_MODEL",
+    "PI_MODEL",
+    "PI_PROVIDER",
 )
 
 FRONTEND_ENV_VARS: dict[str, tuple[str, ...]] = {
@@ -225,7 +229,7 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
 # Backend (CLI selection) env checks
 # ---------------------------------------------------------------------------
 
-_VALID_BACKENDS = ("claude", "codex")
+_VALID_BACKENDS = ("claude", "codex", "pi")
 _VALID_MODES = ("native", "ollama")
 # claude-pty is claude-only; codex has no equivalent wrapper.
 _VALID_CLAUDE_MODES = ("native", "ollama", "pty")
@@ -310,6 +314,10 @@ def check_binaries(env: Mapping[str, str]) -> list[CheckResult]:
         )
     elif backend == "codex":
         results.append(_which("codex", "Install: https://github.com/openai/codex"))
+    elif backend == "pi":
+        results.append(
+            _which("pi", "Install: https://github.com/earendil-works/pi-coding-agent")
+        )
 
     mode = env.get(f"{backend.upper()}_MODE", "native").lower()
     if mode == "ollama":

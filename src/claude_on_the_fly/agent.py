@@ -429,7 +429,9 @@ def get_backend() -> AgentBackend:
         return _build_claude_backend()
     if name == "codex":
         return _build_codex_backend()
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+    if name == "pi":
+        return _build_pi_backend()
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi)")
 
 
 def current_backend_key() -> str:
@@ -471,7 +473,17 @@ def current_backend_key() -> str:
                 raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"codex:ollama:{model}"
         raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+    if name == "pi":
+        mode = os.environ.get("PI_MODE", "native").lower()
+        if mode == "native":
+            return f"pi:native:{os.environ.get('PI_MODEL', '').strip() or 'default'}"
+        if mode == "ollama":
+            model = os.environ.get("OLLAMA_MODEL", "").strip()
+            if not model:
+                raise ValueError("PI_MODE=ollama requires OLLAMA_MODEL to be set")
+            return f"pi:ollama:{model}"
+        raise ValueError(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi)")
 
 
 def _build_claude_backend() -> AgentBackend:
@@ -502,6 +514,20 @@ def _build_codex_backend() -> AgentBackend:
             raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
         return CodexBackend(launcher=OllamaLauncher(model=model))
     raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+
+
+def _build_pi_backend() -> AgentBackend:
+    from claude_on_the_fly.backends.pi import PiBackend
+
+    mode = os.environ.get("PI_MODE", "native").lower()
+    if mode == "native":
+        return PiBackend()
+    if mode == "ollama":
+        model = os.environ.get("OLLAMA_MODEL", "").strip()
+        if not model:
+            raise ValueError("PI_MODE=ollama requires OLLAMA_MODEL to be set")
+        return PiBackend(launcher=OllamaLauncher(model=model))
+    raise ValueError(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
 
 
 async def run(

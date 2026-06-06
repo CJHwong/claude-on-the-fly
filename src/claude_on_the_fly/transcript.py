@@ -30,7 +30,7 @@ from typing import Callable, Literal
 
 logger = logging.getLogger(__name__)
 
-BackendName = Literal["claude", "codex"]
+BackendName = Literal["claude", "codex", "pi"]
 
 # Same separator CodexBackend uses to fence the system prompt off from the user
 # prompt. We rsplit on it to recover the raw user text from a codex transcript.
@@ -38,6 +38,7 @@ _CODEX_PROMPT_SEPARATOR = "\n\n---\n\n"
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,18 @@ def _workspace_to_claude_hash(workspace: Path) -> str:
     return (
         str(workspace.resolve()).replace("/", "-").replace(".", "-").replace("_", "-")
     )
+
+
+def _workspace_to_pi_hash(workspace: Path) -> str:
+    """`/Users/me/Workspace` -> `--Users-me-Workspace--`.
+
+    pi's session directory naming: `--` prefix + path[1:] with `/` → `-` + `--` suffix.
+    e.g. `/Users/hoss/ws` → `--Users-hoss-ws--`.
+
+    Resolves symlinks first (macOS `/tmp` → `/private/tmp`).
+    """
+    resolved = str(workspace.resolve())
+    return "--" + resolved[1:].replace("/", "-") + "--"
 
 
 def _iter_jsonl(path: Path):
@@ -202,6 +215,88 @@ def extract_codex_cumulative_tokens(thread_id: str) -> dict | None:
     return latest
 
 
+# ---------------------------------------------------------------------------
+# pi session extraction
+# ---------------------------------------------------------------------------
+
+
+def _find_pi_session_file(workspace: Path, session_uuid: str) -> Path | None:
+    """Locate the pi session JSONL for a workspace+uuid combination.
+
+    pi names session files as `<ISO-timestamp>_<uuid>.jsonl`.
+    """
+    session_dir = PI_SESSIONS_DIR / _workspace_to_pi_hash(workspace)
+    if not session_dir.is_dir():
+        return None
+    candidates = sorted(
+        session_dir.glob(f"*_{session_uuid}.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def extract_pi(workspace: Path, session_uuid: str) -> list[Turn] | None:
+    """Return the user/assistant turns from pi's session JSONL, or None."""
+    session_path = _find_pi_session_file(workspace, session_uuid)
+    if session_path is None:
+        return None
+    turns: list[Turn] = []
+    for msg in _iter_jsonl(session_path):
+        kind = msg.get("type")
+        if kind != "message":
+            continue
+        message = msg.get("message") or {}
+        role = message.get("role")
+        if role == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                text_blocks = [
+                    c.get("text", "")
+                    for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                ]
+                text = " ".join(text_blocks).strip()
+            elif isinstance(content, str):
+                text = content.strip()
+            else:
+                text = ""
+            if text:
+                turns.append(Turn("user", text))
+        elif role == "assistant":
+            content = message.get("content") or []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = (c.get("text") or "").strip()
+                    if text:
+                        turns.append(Turn("assistant", text))
+                    break
+    return turns or None
+
+
+def _list_pi_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
+    """Return (path, uuid, mtime) for every pi JSONL under the workspace's
+    session dir. Missing dir → []."""
+    session_dir = PI_SESSIONS_DIR / _workspace_to_pi_hash(workspace)
+    if not session_dir.is_dir():
+        return []
+    out: list[tuple[Path, str, float]] = []
+    for path in session_dir.glob("*.jsonl"):
+        # Filename format: <timestamp>_<uuid>.jsonl
+        name = path.stem
+        # UUID is the part after the last underscore.
+        uuid = name.rsplit("_", 1)[-1]
+        # Validate that it looks like a UUID.
+        if "-" not in uuid or len(uuid) < 20:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        out.append((path, uuid, mtime))
+    return out
+
+
 def _render_line(turn: Turn) -> str:
     return f"{turn.role.capitalize()}: {turn.text}"
 
@@ -286,13 +381,13 @@ def find_latest_prior_transcript(
 ) -> tuple[list[Turn], BackendName] | None:
     """Newest prior transcript for this workspace, across all backend_keys.
 
-    Scans both claude's per-workspace project dir and codex's per-workspace
-    sessions dir, picks the file with the newest mtime (excluding
-    `exclude_uuid` so the current session never matches itself), runs the
-    matching extractor, and returns (turns, from_backend).
+    Scans claude's per-workspace project dir, codex's per-workspace sessions
+    dir, and pi's per-workspace sessions dir, picks the file with the newest
+    mtime (excluding `exclude_uuid` so the current session never matches
+    itself), runs the matching extractor, and returns (turns, from_backend).
 
     Returns None when no prior session exists, or the newest one yields no
-    extractable turns. Used by both backends to seed a handoff preamble when
+    extractable turns. Used by all backends to seed a handoff preamble when
     a new (source, backend_key, ticket) combo starts fresh — typically right
     after a model switch.
     """
@@ -305,12 +400,17 @@ def find_latest_prior_transcript(
         if uuid == exclude_uuid:
             continue
         candidates.append((mtime, uuid, "codex", uuid))
+    for _path, uuid, mtime in _list_pi_session_files(workspace):
+        if uuid == exclude_uuid:
+            continue
+        candidates.append((mtime, uuid, "pi", uuid))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0], reverse=True)
     extractors: dict[BackendName, Callable[[Path, str], list[Turn] | None]] = {
         "claude": extract_claude,
         "codex": extract_codex,
+        "pi": extract_pi,
     }
     for _mtime, _uuid, backend, lookup_uuid in candidates:
         try:

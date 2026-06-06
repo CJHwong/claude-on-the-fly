@@ -301,12 +301,15 @@ Or use a `.env` file with all vars and a process manager.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default) or `codex` |
+| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default), `codex`, or `pi` |
 | `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude`; `pty` drives `claude-pty` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) to surface rate-limit and context-window stats (default: `native`) |
 | `CODEX_MODE` | no | `native` runs `codex` directly; `ollama` wraps it in `ollama launch codex` (default: `native`) |
-| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama` or `CODEX_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
+| `PI_MODE` | no | `native` runs `pi` directly; `ollama` wraps it in `ollama launch pi` (default: `native`) |
+| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama`, `CODEX_MODE=ollama`, or `PI_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
 | `CLAUDE_MODEL` | no | Model passed to `claude --model` in native/pty mode. Unset (default) omits `--model` so the claude CLI uses its own default. Ignored in ollama mode |
 | `CODEX_MODEL` | no | Model passed to `codex exec -m` in native mode (e.g. `o3`, `gpt-4.1`). Ignored in ollama mode |
+| `PI_MODEL` | no | Model passed to `pi --model` in native mode (e.g. `deepseek-v4-flash:cloud`). Ignored in ollama mode |
+| `PI_PROVIDER` | no | Provider passed to `pi --provider` (default: `google`). Set to `ollama` for local/cloud ollama models, or use `PI_MODE=ollama` |
 | `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 
 #### ollama launch mode
@@ -322,6 +325,12 @@ uv run claude-telegram
 # Codex via ollama
 export AGENT_BACKEND=codex
 export CODEX_MODE=ollama
+export OLLAMA_MODEL=deepseek-v4-flash:cloud
+uv run claude-telegram
+
+# Pi via ollama
+export AGENT_BACKEND=pi
+export PI_MODE=ollama
 export OLLAMA_MODEL=deepseek-v4-flash:cloud
 uv run claude-telegram
 ```
@@ -347,7 +356,31 @@ uv run claude-telegram
 
 The doctor surfaces three failure modes if the install is stale: missing `claude-pty` binary, missing `jq`, or missing Stop-hook / statusline-shim wiring in `~/.claude/settings.json`. Tool/skill counts are not surfaced in pty mode.
 
-#### codex backend notes
+#### pi backend notes
+
+Pi differs from claude in a few ways:
+
+- **Provider-native multi-backend.** Pi supports many providers (google, openai, anthropic, ollama, and more) via its `--provider` flag and corresponding API key env vars. Use `PI_PROVIDER=ollama` for local models or `PI_MODE=ollama` to wrap with `ollama launch pi`.
+- **Cost is computed locally.** Pi doesn't emit cost in its output, so we look the model up in [OpenRouter's public model registry](https://openrouter.ai/api/v1/models) — same as the codex backend.
+- **Session model.** Pi stores sessions under `~/.pi/agent/sessions/<workspace-hash>/` as `<timestamp>_<uuid>.jsonl`. We use `pi --session-id <uuid>` for both creation and resume — pi auto-detects existing sessions and resumes them.
+- **System prompt.** Pi has both `--system-prompt` (base prompt) and `--append-system-prompt` (additional instructions). We use `--system-prompt` for the full system prompt including format hints.
+- **Built-in tools.** Pi has `read`, `bash`, `edit`, `write` built-in (plus optional `grep`, `find`, `ls`). No `--permission-mode` flag needed — all are enabled by default.
+- **No skill tracking.** Pi has no skill concept; `skill_counts` is always empty. Tool counts come from `toolCall` content blocks in the JSON output.
+- **Image support.** Same model as the codex backend — images saved to workspace, pi reads them through its own file-read tooling.
+
+```bash
+# Pi native mode with ollama provider
+export AGENT_BACKEND=pi
+export PI_PROVIDER=ollama
+export PI_MODEL=deepseek-v4-flash:cloud
+uv run claude-telegram
+
+# Pi via ollama launch wrapper
+export AGENT_BACKEND=pi
+export PI_MODE=ollama
+export OLLAMA_MODEL=deepseek-v4-flash:cloud
+uv run claude-telegram
+```
 
 Codex differs from claude in a few ways:
 
@@ -385,6 +418,7 @@ src/claude_on_the_fly/
   backends/
     claude.py     # Drives `claude -p` directly; optional ollama-launch prefix
     codex.py      # Drives `codex exec --json`; tracks codex thread_ids per session
+    pi.py         # Drives `pi -p --mode json`; session-id based resume, multi-provider
   transcript.py   # Cross-backend conversation handoff: parses prior backend's session JSONL when daemon switches
   pricing.py      # OpenRouter-backed price-table lookup for codex (claude reports its own cost)
   orchestrator.py # Session management, queuing, typing indicators (chat frontends)

@@ -26,19 +26,30 @@ def require_env(name: str) -> str:
     """Read a required env var or exit with a clear message."""
     value = os.environ.get(name)
     if not value:
-        raise SystemExit(f"Missing required environment variable: {name}")
+        raise _exit(f"Missing required environment variable: {name}")
     return value
 
 
 def _raise_on_failures(results: list[CheckResult]) -> None:
-    """Raise SystemExit on the first non-ok result, preserving its detail."""
+    """Raise SystemExit on the first non-ok result, logging the failure."""
     fail = checks.first_failure(results)
     if fail is None:
         return
     msg = f"{fail.name}: {fail.detail}"
     if fail.fix_hint:
         msg += f" — {fail.fix_hint}"
-    raise SystemExit(msg)
+    raise _exit(msg)
+
+
+def _exit(message: str) -> SystemExit:
+    """Log an error then return a SystemExit. Use as `raise _exit(msg)`.
+
+    Preflight runs before the orchestator's file-logging handler is wired,
+    so stderr-only SystemExit errors are invisible when the process is
+    daemonized. Logging here ensures they survive in the console stream.
+    """
+    logger.error(message)
+    return SystemExit(message)
 
 
 def _extract_cli_result(stdout: str) -> str:
@@ -71,6 +82,7 @@ def _extract_cli_result(stdout: str) -> str:
 _AGENT_INSTALL_HINTS = {
     "claude": "https://docs.anthropic.com/en/docs/claude-code",
     "codex": "https://github.com/openai/codex",
+    "pi": "https://github.com/earendil-works/pi-coding-agent",
 }
 
 
@@ -93,9 +105,7 @@ def check_backend() -> None:
         if mode == "pty":
             check_pty_mode()
             return
-        raise SystemExit(
-            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)"
-        )
+        raise _exit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")
     if backend_name == "codex":
         mode = os.environ.get("CODEX_MODE", "native").lower()
         if mode == "native":
@@ -104,33 +114,47 @@ def check_backend() -> None:
         if mode == "ollama":
             check_ollama_mode("codex")
             return
-        raise SystemExit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
-    raise SystemExit(
-        f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex)"
+        raise _exit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+    if backend_name == "pi":
+        mode = os.environ.get("PI_MODE", "native").lower()
+        if mode == "native":
+            check_pi_cli()
+            return
+        if mode == "ollama":
+            check_ollama_mode("pi")
+            return
+        raise _exit(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
+    raise _exit(
+        f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex, pi)"
     )
 
 
 def check_codex_cli() -> None:
     """Verify codex CLI is installed. Auth is checked at first use."""
     if not shutil.which("codex"):
-        raise SystemExit(
-            f"codex CLI not found. Install it: {_AGENT_INSTALL_HINTS['codex']}"
-        )
+        raise _exit(f"codex CLI not found. Install it: {_AGENT_INSTALL_HINTS['codex']}")
     logger.info("codex CLI: ok")
+
+
+def check_pi_cli() -> None:
+    """Verify pi CLI is installed. Auth is checked at first use."""
+    if not shutil.which("pi"):
+        raise _exit(f"pi CLI not found. Install it: {_AGENT_INSTALL_HINTS['pi']}")
+    logger.info("pi CLI: ok")
 
 
 def check_ollama_mode(agent_name: str = "claude") -> None:
     """Validate `ollama launch <agent>` mode: both CLIs present, model available."""
     if not shutil.which(agent_name):
-        raise SystemExit(
+        raise _exit(
             f"{agent_name} CLI not found. Install it: {_AGENT_INSTALL_HINTS[agent_name]}"
         )
     if not shutil.which("ollama"):
-        raise SystemExit("ollama CLI not found. Install it: https://ollama.com")
+        raise _exit("ollama CLI not found. Install it: https://ollama.com")
     model = os.environ.get("OLLAMA_MODEL", "").strip()
     if not model:
         env_var = f"{agent_name.upper()}_MODE"
-        raise SystemExit(f"{env_var}=ollama requires OLLAMA_MODEL to be set")
+        raise _exit(f"{env_var}=ollama requires OLLAMA_MODEL to be set")
     result = subprocess.run(
         ["ollama", "list"],
         capture_output=True,
@@ -139,16 +163,25 @@ def check_ollama_mode(agent_name: str = "claude") -> None:
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or f"exit {result.returncode}"
-        raise SystemExit(f"ollama list failed: {detail}")
+        raise _exit(f"ollama list failed: {detail}")
     # First column of each non-header line is the model name.
     available = {
         line.split()[0] for line in result.stdout.splitlines()[1:] if line.strip()
     }
     if model not in available:
-        raise SystemExit(
-            f"OLLAMA_MODEL={model!r} not found in `ollama list`. "
-            f"Pull it first: ollama pull {model}"
-        )
+        # `:cloud` models (e.g. deepseek-v4-flash:cloud) are API-only and
+        # won't appear in `ollama list`. Skip the model-availability check
+        # for them. Non-cloud models not found still cause a hard exit.
+        if model.endswith(":cloud"):
+            logger.info(
+                "ollama launch: cloud model %s (not in ollama list, relying on remote API)",
+                model,
+            )
+        else:
+            raise _exit(
+                f"OLLAMA_MODEL={model!r} not found in `ollama list`. "
+                f"Pull it first: ollama pull {model}"
+            )
     logger.info("ollama launch mode: ok (agent=%s model=%s)", agent_name, model)
 
 
@@ -165,7 +198,7 @@ def check_pty_mode() -> None:
     if not pty_install.is_pty_installed():
         outcome = pty_install.ensure_pty_installed()
         if not outcome.installed:
-            raise SystemExit(outcome.message)
+            raise _exit(outcome.message)
         logger.info("claude-pty: %s", outcome.message)
 
     results = _checks.check_pty_setup()
@@ -181,7 +214,7 @@ def check_claude_cli() -> None:
     when someone actually tries to use it.
     """
     if not shutil.which("claude"):
-        raise SystemExit(
+        raise _exit(
             f"claude CLI not found. Install it: {_AGENT_INSTALL_HINTS['claude']}"
         )
     result = subprocess.run(
@@ -195,7 +228,7 @@ def check_claude_cli() -> None:
         return
 
     if "auth" in result.stderr.lower():
-        raise SystemExit("claude CLI not authenticated. Run: claude auth login")
+        raise _exit("claude CLI not authenticated. Run: claude auth login")
 
     message = _extract_cli_result(result.stdout) or result.stderr.strip()
 
@@ -205,7 +238,7 @@ def check_claude_cli() -> None:
         logger.warning("claude CLI unavailable (server starting anyway): %s", message)
         return
 
-    raise SystemExit(f"claude CLI check failed (exit {result.returncode}): {message}")
+    raise _exit(f"claude CLI check failed (exit {result.returncode}): {message}")
 
 
 async def check_telegram(token: str) -> None:
@@ -214,7 +247,7 @@ async def check_telegram(token: str) -> None:
         resp = await client.get(f"https://api.telegram.org/bot{token}/getMe")
         data = resp.json()
         if not data.get("ok"):
-            raise SystemExit(
+            raise _exit(
                 f"Invalid Telegram bot token: {data.get('description', 'unknown error')}"
             )
         bot_name = data["result"]["username"]
@@ -230,12 +263,10 @@ async def check_slack(app_token: str, user_token: str) -> str:
         )
         data = resp.json()
         if not data.get("ok"):
-            raise SystemExit(
-                f"Invalid Slack user token: {data.get('error', 'unknown')}"
-            )
+            raise _exit(f"Invalid Slack user token: {data.get('error', 'unknown')}")
         user_id = data.get("user_id")
         if not user_id:
-            raise SystemExit("Slack auth.test returned no user_id")
+            raise _exit("Slack auth.test returned no user_id")
         logger.info(
             "Slack user token: %s (%s, %s)",
             data.get("user"),
@@ -244,7 +275,7 @@ async def check_slack(app_token: str, user_token: str) -> str:
         )
 
         if not app_token.startswith("xapp-"):
-            raise SystemExit("SLACK_APP_TOKEN must start with 'xapp-'")
+            raise _exit("SLACK_APP_TOKEN must start with 'xapp-'")
         logger.info("Slack app token: format ok")
         return user_id
 
@@ -252,7 +283,7 @@ async def check_slack(app_token: str, user_token: str) -> str:
 def check_gws_cli() -> None:
     """Verify gws CLI is installed and authenticated with Gmail scope."""
     if not shutil.which("gws"):
-        raise SystemExit(
+        raise _exit(
             "gws CLI not found. Install it: npm install -g @googleworkspace/cli"
         )
     result = subprocess.run(
@@ -262,12 +293,12 @@ def check_gws_cli() -> None:
         timeout=10,
     )
     if result.returncode != 0:
-        raise SystemExit(f"gws auth check failed: {result.stderr.strip()}")
+        raise _exit(f"gws auth check failed: {result.stderr.strip()}")
     status = json.loads(result.stdout)
     if not status.get("token_valid"):
-        raise SystemExit("gws token invalid. Run: gws auth login")
+        raise _exit("gws token invalid. Run: gws auth login")
     if "gmail.googleapis.com" not in status.get("enabled_apis", []):
-        raise SystemExit("Gmail API not enabled in GCP project. Enable it first.")
+        raise _exit("Gmail API not enabled in GCP project. Enable it first.")
     logger.info("gws CLI: ok (user: %s)", status.get("user", "unknown"))
 
 
