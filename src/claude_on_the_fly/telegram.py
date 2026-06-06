@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -17,7 +19,7 @@ from telegram.ext import (
     filters,
 )
 
-from claude_on_the_fly.agent import Response, footer_parts
+from claude_on_the_fly.agent import DATA_DIR, Response, footer_parts
 from claude_on_the_fly.protocol import Frontend
 
 if TYPE_CHECKING:
@@ -27,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4096
 MEDIA_GROUP_WAIT = 0.5
+# Persists the current /new session token per chat so a restart resumes the
+# session the user was last on, instead of snapping back to the base session.
+# Base sessions (no token) need no entry — their UUID is deterministic.
+SESSIONS_FILE = DATA_DIR / "state" / "telegram-sessions.json"
 
 
 class TelegramFrontend(Frontend):
@@ -38,7 +44,10 @@ class TelegramFrontend(Frontend):
         self._orchestrator: Orchestrator | None = None
         self._media_groups: dict[str, dict] = {}
         self._chat_names: dict[int, str] = {}
-        self._session_counters: dict[int, int] = {}
+        # chat_id -> current session token (a /new timestamp). Absent = the base
+        # session (no suffix). Tokens are unique and never recycle, so pruning
+        # old workspaces can't make a future session collide with a stale one.
+        self._session_tokens: dict[int, str] = {}
 
     def set_orchestrator(self, orchestrator: object) -> None:
         from claude_on_the_fly.orchestrator import Orchestrator
@@ -49,8 +58,8 @@ class TelegramFrontend(Frontend):
 
     def workspace_name(self, chat_id: int) -> str:
         name = self._chat_names.get(chat_id, str(chat_id))
-        counter = self._session_counters.get(chat_id, 0)
-        folder = name if counter == 0 else f"{name}-{counter}"
+        token = self._session_tokens.get(chat_id)
+        folder = f"{name}-{token}" if token else name
         return f"telegram/{folder}"
 
     def sender_name(self, chat_id: int) -> str:
@@ -67,10 +76,38 @@ class TelegramFrontend(Frontend):
             "allowed_user_id": str(self._allowed_user_id),
         }
 
+    # --- Session persistence ---
+
+    def _load_sessions(self) -> None:
+        """Seed _session_tokens from disk and push each onto the orchestrator so
+        the workspace suffix and session UUID resume in step after a restart."""
+        try:
+            data = json.loads(SESSIONS_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        self._session_tokens = {int(k): str(v) for k, v in data.items()}
+        for chat_id, token in self._session_tokens.items():
+            if self._orchestrator:
+                self._orchestrator.set_session_token(chat_id, token)
+
+    def _save_sessions(self) -> None:
+        try:
+            SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SESSIONS_FILE.write_text(
+                json.dumps({str(k): v for k, v in self._session_tokens.items()})
+            )
+        except OSError:
+            logger.exception(
+                "telegram: failed to persist sessions to %s", SESSIONS_FILE
+            )
+
     # --- Lifecycle ---
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         self._on_message = on_message
+        self._load_sessions()
         self._app = Application.builder().token(self._token).build()
         self._app.add_handler(CommandHandler("new", self._cmd_new))
         self._app.add_handler(CommandHandler("status", self._cmd_status))
@@ -190,16 +227,25 @@ class TelegramFrontend(Frontend):
 
     # --- Commands ---
 
+    @staticmethod
+    def _mint_session_token() -> str:
+        """A unique, sortable token for a /new session. Timestamp-based, so it
+        never recycles an old workspace (no disk scan, no counter that resets on
+        restart) and survives pruning — deleting a workspace can't make a future
+        token collide with a stale one."""
+        return datetime.now().strftime("%Y%m%d-%H%M%S")
+
     async def _cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:
             return
         chat_id = update.effective_chat.id
-        self._session_counters[chat_id] = self._session_counters.get(chat_id, 0) + 1
+        token = self._mint_session_token()
+        self._session_tokens[chat_id] = token
+        self._save_sessions()  # survive restart — resume this session, not base
         if self._orchestrator:
-            self._orchestrator.reset_session(chat_id)
-        await update.message.reply_text(
-            f"New session (#{self._session_counters[chat_id]})."
-        )
+            # Keep the session UUID in step with the workspace suffix.
+            self._orchestrator.set_session_token(chat_id, token)
+        await update.message.reply_text(f"New session ({token}).")
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:

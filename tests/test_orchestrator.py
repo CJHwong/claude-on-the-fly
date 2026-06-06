@@ -124,6 +124,24 @@ class TestResetSession:
         assert orch._session_counters[1] == 5
 
 
+class TestSetSessionToken:
+    def test_pins_token(self, orch: Orchestrator) -> None:
+        orch.set_session_token(1, "20260606-120000")
+        assert orch._session_counters[1] == "20260606-120000"
+        # Stable: same chat + token -> same UUID, so resume works.
+        assert orch.session_uuid(1) == orch.session_uuid(1)
+
+    def test_token_changes_uuid_from_base(self, orch: Orchestrator) -> None:
+        base = orch.session_uuid(1)
+        orch.set_session_token(1, "20260606-120000")
+        assert orch.session_uuid(1) != base
+
+    def test_overwrites_scheduler_counter(self, orch: Orchestrator) -> None:
+        orch.reset_session(1)  # scheduler-style int bump -> 1
+        orch.set_session_token(1, "20260606-120000")
+        assert orch._session_counters[1] == "20260606-120000"
+
+
 # ---------------------------------------------------------------------------
 # is_busy
 # ---------------------------------------------------------------------------

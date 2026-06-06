@@ -38,7 +38,10 @@ class Orchestrator:
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
-        self._session_counters: dict[int, int] = {}
+        # Session discriminator per chat: the scheduler bumps an int via
+        # reset_session; telegram /new pins a string token via set_session_token.
+        # Either feeds session_uuid's `{chat_id}-{value}` tag.
+        self._session_counters: dict[int, int | str] = {}
         self._queues: dict[int, asyncio.Queue] = {}
         self._event_log = event_log if event_log is not None else EventLog()
         # chat_id -> {identifier, started_at_monotonic, session_uuid}.
@@ -52,7 +55,21 @@ class Orchestrator:
         return str(uuid5(NAMESPACE_URL, tag))
 
     def reset_session(self, chat_id: int) -> None:
-        self._session_counters[chat_id] = self._session_counters.get(chat_id, 0) + 1
+        # The scheduler uses an int counter here; telegram pins a str token via
+        # set_session_token. Only the int form is bumped (different chat_id
+        # spaces), so coerce defensively to keep the +1 well-typed.
+        current = self._session_counters.get(chat_id, 0)
+        self._session_counters[chat_id] = (
+            current if isinstance(current, int) else 0
+        ) + 1
+
+    def set_session_token(self, chat_id: int, token: str) -> None:
+        """Pin the session discriminator to a token the frontend minted, so the
+        session UUID matches the frontend's workspace suffix (telegram's /new
+        uses a unique timestamp token). The tag formatting in session_uuid
+        accepts a string just as it does the scheduler's integer counter, which
+        reset_session still bumps."""
+        self._session_counters[chat_id] = token
 
     def is_busy(self, chat_id: int) -> bool:
         return chat_id in self._running and not self._running[chat_id].done()

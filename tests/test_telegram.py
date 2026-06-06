@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,7 +14,12 @@ from claude_on_the_fly.telegram import MAX_MESSAGE_LENGTH, TelegramFrontend
 
 
 @pytest.fixture
-def frontend() -> TelegramFrontend:
+def frontend(tmp_path, monkeypatch) -> TelegramFrontend:
+    # Isolate the session-persistence file so /new doesn't write real state.
+    monkeypatch.setattr(
+        "claude_on_the_fly.telegram.SESSIONS_FILE",
+        tmp_path / "telegram-sessions.json",
+    )
     return TelegramFrontend(token="fake-token", allowed_user_id=123)
 
 
@@ -82,21 +89,18 @@ class TestWorkspaceName:
     def test_unknown_chat_uses_id(self, frontend: TelegramFrontend) -> None:
         assert frontend.workspace_name(999) == "telegram/999"
 
-    def test_session_counter_zero_no_suffix(self, frontend: TelegramFrontend) -> None:
+    def test_no_session_token_no_suffix(self, frontend: TelegramFrontend) -> None:
         frontend._chat_names[1] = "hoss"
-        frontend._session_counters[1] = 0
         assert frontend.workspace_name(1) == "telegram/hoss"
 
-    def test_session_counter_positive_adds_suffix(
-        self, frontend: TelegramFrontend
-    ) -> None:
+    def test_session_token_adds_suffix(self, frontend: TelegramFrontend) -> None:
         frontend._chat_names[1] = "hoss"
-        frontend._session_counters[1] = 3
-        assert frontend.workspace_name(1) == "telegram/hoss-3"
+        frontend._session_tokens[1] = "20260606-123412"
+        assert frontend.workspace_name(1) == "telegram/hoss-20260606-123412"
 
-    def test_unknown_chat_with_counter(self, frontend: TelegramFrontend) -> None:
-        frontend._session_counters[5] = 2
-        assert frontend.workspace_name(5) == "telegram/5-2"
+    def test_unknown_chat_with_token(self, frontend: TelegramFrontend) -> None:
+        frontend._session_tokens[5] = "20260606-090000"
+        assert frontend.workspace_name(5) == "telegram/5-20260606-090000"
 
 
 # ============================================================
@@ -371,39 +375,51 @@ class TestTrackName:
 
 
 class TestCmdNew:
-    async def test_increments_session_counter(self, frontend: TelegramFrontend) -> None:
-        update = make_update(chat_id=1)
-        ctx = MagicMock()
-
-        await frontend._cmd_new(update, ctx)
-
-        assert frontend._session_counters[1] == 1
-
-        await frontend._cmd_new(update, ctx)
-
-        assert frontend._session_counters[1] == 2
-
-    async def test_calls_orchestrator_reset(self, frontend: TelegramFrontend) -> None:
-        orch = MagicMock()
-        orch.reset_session = MagicMock()
-        frontend._orchestrator = orch
-
-        update = make_update(chat_id=5)
-        ctx = MagicMock()
-
-        await frontend._cmd_new(update, ctx)
-
-        orch.reset_session.assert_called_once_with(5)
-
-    async def test_replies_with_session_number(
+    async def test_mints_unique_timestamp_token(
         self, frontend: TelegramFrontend
     ) -> None:
         update = make_update(chat_id=1)
-        ctx = MagicMock()
+        await frontend._cmd_new(update, MagicMock())
 
-        await frontend._cmd_new(update, ctx)
+        token = frontend._session_tokens[1]
+        # YYYYMMDD-HHMMSS — unique and sortable, no disk scan or counter.
+        assert re.fullmatch(r"\d{8}-\d{6}", token)
+        # The workspace suffix is the token, so it never recycles an old dir.
+        frontend._chat_names[1] = "hoss"
+        assert frontend.workspace_name(1) == f"telegram/hoss-{token}"
 
-        update.message.reply_text.assert_called_once_with("New session (#1).")
+    async def test_pushes_token_to_orchestrator_in_step(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.set_session_token = MagicMock()
+        frontend._orchestrator = orch
+
+        await frontend._cmd_new(make_update(chat_id=5), MagicMock())
+
+        # The session UUID must use the same token as the workspace suffix.
+        orch.set_session_token.assert_called_once_with(5, frontend._session_tokens[5])
+
+    async def test_token_does_not_depend_on_disk(
+        self, frontend: TelegramFrontend, monkeypatch
+    ) -> None:
+        # Pruning workspaces can't make /new collide: the token is time-based,
+        # not max-of-disk+1. Freeze the minter and confirm the suffix is the
+        # token regardless of what's on disk.
+        monkeypatch.setattr(frontend, "_mint_session_token", lambda: "20260606-120000")
+        frontend._chat_names[9] = "hoss"
+
+        await frontend._cmd_new(make_update(chat_id=9), MagicMock())
+
+        assert frontend._session_tokens[9] == "20260606-120000"
+        assert frontend.workspace_name(9) == "telegram/hoss-20260606-120000"
+
+    async def test_replies_with_session_token(self, frontend: TelegramFrontend) -> None:
+        update = make_update(chat_id=1)
+        await frontend._cmd_new(update, MagicMock())
+
+        token = frontend._session_tokens[1]
+        update.message.reply_text.assert_called_once_with(f"New session ({token}).")
 
     async def test_ignores_unauthorized_user(self, frontend: TelegramFrontend) -> None:
         update = make_update(user_id=999, chat_id=1)
@@ -412,6 +428,40 @@ class TestCmdNew:
         await frontend._cmd_new(update, ctx)
 
         update.message.reply_text.assert_not_called()
+
+
+class TestSessionPersistence:
+    """A /new session survives a daemon restart instead of snapping back to
+    the base session."""
+
+    async def test_new_persists_token_to_disk(
+        self, frontend: TelegramFrontend, tmp_path
+    ) -> None:
+        await frontend._cmd_new(make_update(chat_id=7), MagicMock())
+
+        saved = json.loads((tmp_path / "telegram-sessions.json").read_text())
+        assert saved == {"7": frontend._session_tokens[7]}
+
+    def test_load_restores_token_and_pushes_to_orchestrator(
+        self, frontend: TelegramFrontend, tmp_path
+    ) -> None:
+        (tmp_path / "telegram-sessions.json").write_text('{"7": "20260606-120000"}')
+        orch = MagicMock()
+        orch.set_session_token = MagicMock()
+        frontend._orchestrator = orch
+
+        frontend._load_sessions()
+
+        # Resumes the previous session, not base; UUID kept in step via orch.
+        assert frontend._session_tokens[7] == "20260606-120000"
+        orch.set_session_token.assert_called_once_with(7, "20260606-120000")
+        frontend._chat_names[7] = "hoss"
+        assert frontend.workspace_name(7) == "telegram/hoss-20260606-120000"
+
+    def test_load_missing_file_is_noop(self, frontend: TelegramFrontend) -> None:
+        # Fresh install: no file yet, no crash, no tokens (base session).
+        frontend._load_sessions()
+        assert frontend._session_tokens == {}
 
 
 # ============================================================
