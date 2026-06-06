@@ -106,6 +106,51 @@ def test_load_config_defaults(tmp_path, env_creds):
     assert tracker.max_concurrent == 1  # default per-tracker budget
     assert cfg.max_turns == 20
     assert tracker.instruction == "_default"  # default instruction selection
+    assert tracker.enabled is True  # trackers run unless explicitly parked
+
+
+def test_tracker_enabled_defaults_true():
+    cfg = TrackerConfig.from_dict(
+        {"base_url": "https://x.atlassian.net", "project_key": "PROJ"}
+    )
+    assert cfg.enabled is True
+
+
+def test_tracker_enabled_parsed_false():
+    cfg = TrackerConfig.from_dict(
+        {"base_url": "https://x.atlassian.net", "project_key": "PROJ", "enabled": False}
+    )
+    assert cfg.enabled is False
+
+
+def test_tracker_enabled_string_false_is_falsey():
+    # A hand-edit leaving a quoted YAML scalar must not read as truthy.
+    cfg = TrackerConfig.from_dict(
+        {
+            "base_url": "https://x.atlassian.net",
+            "project_key": "PROJ",
+            "enabled": "false",
+        }
+    )
+    assert cfg.enabled is False
+
+
+def test_tracker_enabled_garbage_rejected():
+    with pytest.raises(ValueError, match="enabled must be a boolean"):
+        TrackerConfig.from_dict(
+            {
+                "base_url": "https://x.atlassian.net",
+                "project_key": "PROJ",
+                "enabled": "maybe",
+            }
+        )
+
+
+def test_github_tracker_enabled_parsed():
+    from claude_on_the_fly.symphony.config import GitHubTrackerConfig
+
+    cfg = GitHubTrackerConfig.from_dict({"enabled": False})
+    assert cfg.enabled is False
 
 
 def test_load_config_overrides(tmp_path, env_creds):

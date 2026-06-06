@@ -262,6 +262,117 @@ trackers:
     j_entry.task.cancel.assert_not_called()
 
 
+def test_reload_disabling_tracker_cancels_its_workers(tmp_path: Path) -> None:
+    # Disabling a tracker must behave exactly like deleting its stanza: cancel
+    # its in-flight workers and drop it from the live trackers dict.
+    cfg_path = _write_config(
+        tmp_path,
+        """
+trackers:
+  jira:
+    kind: jira
+    base_url: https://x.atlassian.net
+    project_key: PROJ
+  github:
+    kind: github
+""",
+    )
+    cfg = load_config(cfg_path)
+    cfg.validate()
+
+    state = OrchestratorState()
+    j_entry = state.claim(_issue(id="1", identifier="J-1", source="jira"))
+    j_entry.task = MagicMock()
+    j_entry.task.done.return_value = False
+    g_entry = state.claim(_issue(id="2", identifier="owner/repo#1", source="github"))
+    g_entry.task = MagicMock()
+    g_entry.task.done.return_value = False
+
+    # Park github via the flag — stanza stays, enabled flips to false.
+    time.sleep(0.01)
+    cfg_path.write_text(
+        """
+trackers:
+  jira:
+    kind: jira
+    base_url: https://x.atlassian.net
+    project_key: PROJ
+  github:
+    kind: github
+    enabled: false
+""",
+    )
+
+    trackers = {"jira": MagicMock(), "github": MagicMock()}
+    prompt_stores: dict = {"jira": None, "github": None}
+    cursors = {"jira": CursorStore(tmp_path / "state", "jira")}
+
+    new_cfg, _ = _maybe_reload_config(
+        config_path=cfg_path,
+        config=cfg,
+        last_mtime=0,
+        state=state,
+        trackers=trackers,
+        prompt_stores=prompt_stores,
+        cursor_stores=cursors,
+        state_root=tmp_path / "state",
+    )
+
+    # github stanza still parsed, but disabled and dropped from the live set.
+    assert new_cfg.trackers["github"].enabled is False
+    assert "github" not in trackers
+    g_entry.task.cancel.assert_called_once()
+    j_entry.task.cancel.assert_not_called()
+
+
+def test_reload_enabling_tracker_builds_it(tmp_path: Path) -> None:
+    # A tracker that starts disabled isn't in the live trackers dict; flipping
+    # it on must build it (here: jira, no external preflight).
+    cfg_path = _write_config(
+        tmp_path,
+        """
+trackers:
+  jira:
+    kind: jira
+    base_url: https://x.atlassian.net
+    project_key: PROJ
+    enabled: false
+""",
+    )
+    cfg = load_config(cfg_path)
+    cfg.validate()
+
+    time.sleep(0.01)
+    cfg_path.write_text(
+        """
+trackers:
+  jira:
+    kind: jira
+    base_url: https://x.atlassian.net
+    project_key: PROJ
+    enabled: true
+""",
+    )
+
+    trackers: dict = {}  # nothing built while disabled
+    prompt_stores: dict = {}
+    cursors: dict = {}
+
+    new_cfg, _ = _maybe_reload_config(
+        config_path=cfg_path,
+        config=cfg,
+        last_mtime=0,
+        state=OrchestratorState(),
+        trackers=trackers,
+        prompt_stores=prompt_stores,
+        cursor_stores=cursors,
+        state_root=tmp_path / "state",
+    )
+
+    assert new_cfg.trackers["jira"].enabled is True
+    assert "jira" in trackers  # built on enable
+
+
 def test_reload_keeps_last_known_good_on_broken_yaml(tmp_path: Path) -> None:
     cfg_path, cfg = _initial_config(tmp_path)
     state = OrchestratorState()

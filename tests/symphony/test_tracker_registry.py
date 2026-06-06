@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from claude_on_the_fly.symphony.config import TrackerConfig
+from claude_on_the_fly.symphony.config import SymphonyConfig, TrackerConfig
 from claude_on_the_fly.symphony.tracker import (
     SUPPORTED_TRACKERS,
     GitHubTracker,
     JiraTracker,
     Tracker,
     make_tracker,
+    make_trackers,
 )
 
 
@@ -65,3 +68,23 @@ def test_github_tracker_satisfies_protocol():
         t = make_tracker(GitHubTrackerConfig(kind="github"))
     assert isinstance(t, Tracker)
     assert isinstance(t, GitHubTracker)
+
+
+def test_make_trackers_skips_disabled():
+    # github is disabled, so it must never be built — which also means its `gh`
+    # preflight (shutil.which) never runs. Only the enabled jira survives.
+    cfg = SymphonyConfig.from_dict(
+        {
+            "trackers": {
+                "jira": {
+                    "base_url": "https://x.atlassian.net",
+                    "project_key": "PROJ",
+                },
+                "github": {"enabled": False},
+            }
+        },
+        base=Path("/tmp"),
+    )
+    built = make_trackers(cfg)
+    assert set(built) == {"jira"}
+    assert isinstance(built["jira"], JiraTracker)

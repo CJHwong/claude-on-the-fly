@@ -26,8 +26,8 @@ stanza something other than its kind. Concurrency is per-tracker
 (`trackers.<src>.max_concurrent`); no global cap. Jira uses a single `jql`
 candidate filter — no active/terminal lists, no gate_label. GitHub hardcodes
 PR lifecycle states. Each tracker selects one instruction file by stem
-(`instruction`), resolved from the local instructions dir or the remote
-config. The legacy singular `tracker:` form is auto-wrapped.
+(`instruction`), resolved from the local instructions dir. The legacy
+singular `tracker:` form is auto-wrapped.
 """
 
 from __future__ import annotations
@@ -77,6 +77,10 @@ trackers:
     jql: 'status not in ("Done") AND assignee = currentUser()'
     # Max tickets worked at once for THIS tracker (no global cap across trackers).
     max_concurrent: 1
+    # Set false to park this tracker without deleting its config — the daemon
+    # stops polling it (and cancels in-flight workers) on the next tick; its TUI
+    # tab stays visible, marked disabled. Default: true.
+    enabled: true
     # Which instruction file to use (stem, no .md). Default: _default.
     instruction: _default
     # Optional per-status sub-caps under max_concurrent (lowercased status names):
@@ -90,6 +94,7 @@ trackers:
     # Add org:/repo:/label:/updated: to scope. Drop -is:draft to include drafts.
     search_query: "is:pr is:open -is:draft user-review-requested:@me"
     max_concurrent: 1
+    enabled: true               # set false to park this tracker (see jira above)
     instruction: _default
     # Per-repo instruction overrides (owner/repo -> stem). Repos not listed
     # use `instruction` above. Files live at symphony/github/<stem>.md.
@@ -186,6 +191,22 @@ def _coerce_int(value: Any, *, field: str, default: int) -> int:
         raise ValueError(f"tracker.{field} must be an integer (got {value!r})")
 
 
+def _coerce_bool(value: Any, *, field: str, default: bool) -> bool:
+    """Parse a bool config value. YAML already yields real bools for
+    `true`/`false`; this also accepts the string forms a hand-edit might leave
+    (`"false"`, `"no"`, `"0"`) instead of silently treating them as truthy."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0"):
+        return False
+    raise ValueError(f"tracker.{field} must be a boolean (got {value!r})")
+
+
 @dataclass(frozen=True, kw_only=True)
 class TrackerCommonConfig:
     """Shared fields every tracker config carries. Subclassed per adapter.
@@ -205,6 +226,11 @@ class TrackerCommonConfig:
     kind: str
     max_concurrent: int = 1
     instruction: str = DEFAULT_INSTRUCTION
+    # When False, the daemon doesn't build or poll this tracker — its TUI tab
+    # still shows, marked disabled. Toggle it in the config and save; the
+    # running daemon picks it up on the next poll (hot-reload), cancelling any
+    # in-flight workers for the source, the same way removing the stanza would.
+    enabled: bool = True
     max_concurrent_by_state: dict[str, int] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -212,10 +238,10 @@ class TrackerCommonConfig:
             raise ValueError(
                 f"tracker.max_concurrent must be >= 1 (got {self.max_concurrent})"
             )
-        # The instruction file is resolved at runtime against the local + remote
-        # dirs (which may not exist yet at parse time), so we don't check
-        # existence here. A missing file falls back to the built-in prompt and
-        # logs a warning when the daemon resolves it.
+        # The instruction file is resolved at runtime against the local
+        # instructions dir (which may not exist yet at parse time), so we don't
+        # check existence here. A missing file falls back to the built-in prompt
+        # and logs a warning when the daemon resolves it.
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -280,6 +306,7 @@ class JiraTrackerConfig(TrackerCommonConfig):
                 raw.get("max_concurrent"), field="max_concurrent", default=1
             ),
             instruction=str(raw.get("instruction") or DEFAULT_INSTRUCTION).strip(),
+            enabled=_coerce_bool(raw.get("enabled"), field="enabled", default=True),
             max_concurrent_by_state=per_state,
         )
 
@@ -348,6 +375,7 @@ class GitHubTrackerConfig(TrackerCommonConfig):
                 raw.get("max_concurrent"), field="max_concurrent", default=1
             ),
             instruction=str(raw.get("instruction") or DEFAULT_INSTRUCTION).strip(),
+            enabled=_coerce_bool(raw.get("enabled"), field="enabled", default=True),
             max_concurrent_by_state=per_state,
             search_query=search_query
             if search_query

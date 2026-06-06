@@ -29,12 +29,14 @@ def make_tracker(cfg) -> Tracker:
 
 
 def make_trackers(config) -> dict[str, Tracker]:
-    """Construct one tracker per entry in `config.trackers`. Keys preserve
-    the user's source naming (`jira`, `github`, ...). Raises if any
-    configured kind has no registered adapter."""
+    """Construct one tracker per ENABLED entry in `config.trackers`. Keys
+    preserve the user's source naming (`jira`, `github`, ...). Disabled
+    trackers are skipped — they never get built, so they're never polled or
+    dispatched. Raises if any configured kind has no registered adapter."""
     return {
         source: make_tracker(tracker_cfg)
         for source, tracker_cfg in config.trackers.items()
+        if getattr(tracker_cfg, "enabled", True)
     }
 
 

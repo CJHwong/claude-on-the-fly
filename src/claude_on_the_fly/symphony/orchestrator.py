@@ -885,6 +885,7 @@ async def tick(
     if all(
         state.running_by_source(source) >= cfg.max_concurrent
         for source, cfg in config.trackers.items()
+        if cfg.enabled
     ):
         return
 
@@ -928,6 +929,7 @@ async def tick(
     total_capacity = sum(
         max(0, cfg.max_concurrent - state.running_by_source(source))
         for source, cfg in config.trackers.items()
+        if cfg.enabled
     )
     logger.debug(
         "tick: %d eligible candidates (across %d source(s)), capacity=%d",
@@ -1153,8 +1155,13 @@ def _maybe_reload_config(
 
     logger.info("config reload: %s", config_path)
 
-    old_sources = set(config.trackers)
-    new_sources = set(new_config.trackers)
+    # Diff on the ENABLED source set, not raw config keys: flipping a tracker's
+    # `enabled` flag must behave exactly like adding/removing its stanza —
+    # toggling off cancels its in-flight workers and stops polling; toggling on
+    # builds the tracker. `make_trackers` only builds enabled ones, so the live
+    # `trackers` dict already tracks this set.
+    old_sources = {s for s, c in config.trackers.items() if c.enabled}
+    new_sources = {s for s, c in new_config.trackers.items() if c.enabled}
     removed = old_sources - new_sources
     added = new_sources - old_sources
 

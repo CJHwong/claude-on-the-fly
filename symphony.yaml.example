@@ -28,6 +28,10 @@ trackers:
     jql: 'status not in ("Done") AND assignee = currentUser()'
     # Max tickets worked at once for THIS tracker (no global cap across trackers).
     max_concurrent: 1
+    # Set false to park this tracker without deleting its config — the daemon
+    # stops polling it (and cancels in-flight workers) on the next tick; its TUI
+    # tab stays visible, marked disabled. Default: true.
+    enabled: true
     # Which instruction file to use (stem, no .md). Default: _default.
     instruction: _default
     # Optional per-status sub-caps under max_concurrent (lowercased status names):
@@ -41,6 +45,7 @@ trackers:
     # Add org:/repo:/label:/updated: to scope. Drop -is:draft to include drafts.
     search_query: "is:pr is:open -is:draft user-review-requested:@me"
     max_concurrent: 1
+    enabled: true               # set false to park this tracker (see jira above)
     instruction: _default
     # Per-repo instruction overrides (owner/repo -> stem). Repos not listed
     # use `instruction` above. Files live at symphony/github/<stem>.md.
