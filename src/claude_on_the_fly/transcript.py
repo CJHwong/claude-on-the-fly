@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -128,6 +129,55 @@ def _find_codex_rollout(thread_id: str) -> Path | None:
         reverse=True,
     )
     return matches[0] if matches else None
+
+
+def _read_first_jsonl(path: Path) -> dict | None:
+    """Parse just the first JSONL record (codex's session_meta) without reading
+    the whole file — the rollout can be large and we only need its cwd."""
+    try:
+        with path.open("rb") as f:
+            line = f.readline()
+    except OSError:
+        return None
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | None:
+    """Locate the rollout codex is actively writing for a workspace, by the cwd
+    in its session_meta. Needed for *live* tailing: codex only reveals its
+    thread id (and we only persist the uuid->thread mapping) after the first
+    turn finishes, so a fresh session has no mapping to look up yet.
+
+    Bounded for a 1Hz caller: cheap stat-filter to recently-written rollouts (a
+    live run keeps its mtime current), then read only the freshest candidate's
+    first line. Old rollouts are skipped without being opened."""
+    if not cwd:
+        return None
+    cutoff = time.time() - max_age_s
+    freshest: tuple[float, Path] | None = None
+    for path in CODEX_SESSIONS_DIR.glob("**/rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        if freshest is None or mtime > freshest[0]:
+            freshest = (mtime, path)
+    if freshest is None:
+        return None
+    meta = _read_first_jsonl(freshest[1])
+    if (
+        meta is not None
+        and meta.get("type") == "session_meta"
+        and (meta.get("payload") or {}).get("cwd") == cwd
+    ):
+        return freshest[1]
+    return None
 
 
 def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:

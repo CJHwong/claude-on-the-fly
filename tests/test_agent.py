@@ -2053,3 +2053,36 @@ class TestPtyModeFactory:
         monkeypatch.setenv("CLAUDE_MODE", "garbage")
         with pytest.raises(ValueError, match="pty"):
             get_backend()
+
+
+class TestResolveSessionLog:
+    """resolve_session_log finds a job's log in whichever backend wrote it,
+    independent of the current env backend (daemon may run pi, TUI claude)."""
+
+    def test_returns_none_when_no_backend_has_it(
+        self, claude_projects_dir, codex_sessions_dir, pi_sessions_dir, tmp_path
+    ) -> None:
+        from claude_on_the_fly.agent import resolve_session_log
+
+        assert resolve_session_log(tmp_path / "ws", "missing-uuid") is None
+
+    def test_finds_claude_session_even_when_env_is_pi(
+        self,
+        claude_projects_dir,
+        codex_sessions_dir,
+        pi_sessions_dir,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        from claude_on_the_fly.agent import resolve_session_log
+        from claude_on_the_fly.backends.claude import _workspace_to_claude_hash
+
+        ws = tmp_path / "ws"
+        proj = claude_projects_dir / _workspace_to_claude_hash(ws)
+        proj.mkdir(parents=True)
+        log = proj / "uuid-x.jsonl"
+        log.write_text('{"type":"x"}\n')
+
+        # Env points at pi, but the session was written by claude — still found.
+        monkeypatch.setenv("AGENT_BACKEND", "pi")
+        assert resolve_session_log(ws, "uuid-x") == log

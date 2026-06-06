@@ -303,3 +303,145 @@ class TestTail:
 
 def _write_jsonl(path: Path, events: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+
+class TestFormatMessageEvent:
+    """pi/codex emit a single `message` type rather than claude's separate
+    user/assistant top-level types; format_event renders both shapes."""
+
+    def test_pi_user_message(self) -> None:
+        out = format_event(
+            {
+                "type": "message",
+                "timestamp": "2026-06-06T13:32:54.402Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello there"}],
+                },
+            }
+        )
+        assert out is not None and "USER" in out and "hello there" in out
+
+    def test_pi_assistant_message(self) -> None:
+        out = format_event(
+            {
+                "type": "message",
+                "timestamp": "2026-06-06T13:32:55.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "the answer is 42"}],
+                },
+            }
+        )
+        assert out is not None and "ASSISTANT" in out and "the answer is 42" in out
+
+    def test_codex_top_level_role_and_typed_text_blocks(self) -> None:
+        # codex puts role/content at the top level; blocks are input/output_text.
+        u = format_event(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "/help please"}],
+            }
+        )
+        a = format_event(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "here you go"}],
+            }
+        )
+        assert u is not None and "USER" in u and "/help please" in u
+        assert a is not None and "ASSISTANT" in a and "here you go" in a
+
+    def test_control_and_textless_events_skipped(self) -> None:
+        # pi control events, tool-only turns, and non-user/assistant roles skip.
+        assert format_event({"type": "model_change", "provider": "ollama"}) is None
+        assert (
+            format_event(
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "name": "bash"}],
+                    },
+                }
+            )
+            is None
+        )
+        assert (
+            format_event(
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "x"}],
+                    },
+                }
+            )
+            is None
+        )
+
+    def test_codex_response_item_unwraps_payload_message(self) -> None:
+        # codex_exec wraps the turn item: response_item -> payload(message).
+        asst = format_event(
+            {
+                "type": "response_item",
+                "timestamp": "2026-06-06T13:58:58.000Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "yo"}],
+                },
+            }
+        )
+        user = format_event(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "say yo"}],
+                },
+            }
+        )
+        assert asst is not None and "ASSISTANT" in asst and "yo" in asst
+        assert user is not None and "USER" in user and "say yo" in user
+
+    def test_codex_non_message_response_items_skipped(self) -> None:
+        # reasoning / function_call / developer-role items carry nothing to show.
+        assert (
+            format_event(
+                {
+                    "type": "response_item",
+                    "payload": {"type": "reasoning", "summary": []},
+                }
+            )
+            is None
+        )
+        assert (
+            format_event(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": "{}",
+                    },
+                }
+            )
+            is None
+        )
+        assert (
+            format_event(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "perms"}],
+                    },
+                }
+            )
+            is None
+        )

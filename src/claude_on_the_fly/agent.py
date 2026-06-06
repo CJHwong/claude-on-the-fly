@@ -434,6 +434,35 @@ def get_backend() -> AgentBackend:
     raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi)")
 
 
+def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
+    """Locate a job's session JSONL across every backend, not just the current
+    one.
+
+    The process viewing the log (the TUI) isn't necessarily configured for the
+    backend that ran the job: the daemon may run pi while the dashboard's shell
+    is claude:native. Each backend stores logs in its own tree, and session
+    UUIDs are seeded per backend, so a given (workspace, uuid) exists in exactly
+    one store — the first hit is unambiguous. Each backend's session_log_path
+    only depends on its store location, so the bare constructor is enough.
+
+    Codex is tried last on purpose: claude and pi resolve with a single path
+    stat, but codex's no-mapping fallback scans the rollout tree, so we only
+    pay for it when the cheap backends miss (a real codex session, or none yet).
+    """
+    from claude_on_the_fly.backends.claude import ClaudeBackend
+    from claude_on_the_fly.backends.codex import CodexBackend
+    from claude_on_the_fly.backends.pi import PiBackend
+
+    for build in (ClaudeBackend, PiBackend, CodexBackend):
+        try:
+            path = build().session_log_path(workspace, session_uuid)
+        except Exception:
+            continue
+        if path is not None:
+            return path
+    return None
+
+
 def current_backend_key() -> str:
     """Canonical `backend:mode:model` string for the currently-configured agent.
 

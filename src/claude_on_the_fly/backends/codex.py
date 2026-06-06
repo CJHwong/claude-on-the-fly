@@ -313,7 +313,21 @@ class CodexBackend:
         return f"codex resume {thread_id}"
 
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
-        """Codex's rollout schema differs from claude's stream-json; live watching
-        isn't wired through the symphony watch formatter yet. Returning None
-        keeps the CLI's unsupported-backend branch clean."""
-        return None
+        """The rollout JSONL codex appends to, resolved via our session mapping.
+
+        Codex names rollouts by its own thread id, not our session_uuid, so we
+        read the thread id from `workspace/.codex_sessions/<uuid>` and let the
+        transcript helper locate the dated rollout file. The watch formatter
+        understands codex's message events (role + input_text/output_text)."""
+        session_file = workspace / ".codex_sessions" / session_uuid
+        if session_file.is_file():
+            thread_id = session_file.read_text().strip()
+            if thread_id:
+                rollout = transcript._find_codex_rollout(thread_id)
+                if rollout is not None:
+                    return rollout
+        # No mapping yet (first turn, still running): codex only reveals its
+        # thread id at the end, so match the rollout it's actively writing by
+        # the workspace cwd. Lets the watch pane tail live instead of staying
+        # blank until the turn completes.
+        return transcript._find_codex_rollout_by_cwd(str(workspace))

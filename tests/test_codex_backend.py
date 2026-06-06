@@ -859,3 +859,57 @@ class TestCodexBackendSessionLogPath:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         assert CodexBackend().session_log_path(workspace, "any-uuid") is None
+
+
+class TestCodexSessionLogPath:
+    """session_log_path maps our session_uuid -> codex thread id -> rollout."""
+
+    def test_resolves_via_thread_mapping(self, codex_sessions_dir, tmp_path) -> None:
+        ws = tmp_path / "ws"
+        (ws / ".codex_sessions").mkdir(parents=True)
+        (ws / ".codex_sessions" / "our-uuid").write_text("threadabc\n")
+        rollout = codex_sessions_dir / "rollout-2026-06-06T10-00-00-threadabc.jsonl"
+        rollout.write_text('{"id":"threadabc"}\n')
+
+        assert CodexBackend().session_log_path(ws, "our-uuid") == rollout
+
+    def test_none_without_mapping(self, codex_sessions_dir, tmp_path) -> None:
+        assert CodexBackend().session_log_path(tmp_path / "ws", "missing") is None
+
+    def test_none_when_mapping_empty(self, codex_sessions_dir, tmp_path) -> None:
+        ws = tmp_path / "ws"
+        (ws / ".codex_sessions").mkdir(parents=True)
+        (ws / ".codex_sessions" / "our-uuid").write_text("")
+        assert CodexBackend().session_log_path(ws, "our-uuid") is None
+
+    def test_resolves_live_by_cwd_before_mapping_written(
+        self, codex_sessions_dir, tmp_path
+    ) -> None:
+        # First turn still running: no uuid->thread mapping yet, but codex is
+        # writing a rollout that records the workspace cwd. Resolve via that so
+        # the watch can tail live instead of waiting for the turn to finish.
+        ws = tmp_path / "ws"
+        day = codex_sessions_dir / "2026" / "06" / "06"
+        day.mkdir(parents=True)
+        rollout = day / "rollout-2026-06-06T10-00-00-threadlive.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(ws)}}) + "\n"
+        )
+        assert CodexBackend().session_log_path(ws, "uuid-no-mapping") == rollout
+
+    def test_ignores_stale_rollout_for_cwd(self, codex_sessions_dir, tmp_path) -> None:
+        # A rollout for this cwd but not recently written is a *past* session,
+        # not the live one — don't resurface it as the live target.
+        import os
+        import time
+
+        ws = tmp_path / "ws"
+        day = codex_sessions_dir / "2026" / "06" / "06"
+        day.mkdir(parents=True)
+        rollout = day / "rollout-old-threadstale.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(ws)}}) + "\n"
+        )
+        old = time.time() - 3600
+        os.utime(rollout, (old, old))
+        assert CodexBackend().session_log_path(ws, "uuid-no-mapping") is None

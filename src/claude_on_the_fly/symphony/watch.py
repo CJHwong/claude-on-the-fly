@@ -167,6 +167,49 @@ def format_event(raw: dict) -> str | None:
         return _format_assistant(raw, ts)
     if t == "result":
         return _format_result(raw, ts)
+    # pi (and legacy codex) emit a single top-level `message` type rather than
+    # claude's separate user/assistant types.
+    if t == "message":
+        return _format_message_event(raw, ts)
+    # codex_exec wraps each turn item: type=response_item with the real message
+    # under payload (payload.type=message, role, content). reasoning /
+    # function_call payloads carry no text and fall through to None.
+    if t == "response_item":
+        payload = raw.get("payload")
+        return _format_message_event(payload, ts) if isinstance(payload, dict) else None
+    return None
+
+
+def _extract_message_text(content: Any) -> str:
+    """Renderable text from a pi/codex message's content — a string, or a list
+    of blocks carrying a `text` field ({type: text | input_text | output_text}).
+    Tool / reasoning blocks without text are ignored."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        block["text"]
+        for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+    return "\n".join(parts).strip()
+
+
+def _format_message_event(raw: dict, ts: str) -> str | None:
+    """Render a pi/codex `type:"message"` event. pi nests role/content under
+    `message`; codex puts them at the top level. Both carry Anthropic-ish
+    content blocks with a `text` field, so one path handles both."""
+    message = raw.get("message")
+    msg = message if isinstance(message, dict) else raw
+    text = _extract_message_text(msg.get("content"))
+    if not text:
+        return None
+    role = msg.get("role")
+    if role == "user":
+        return f"\n{_rule('cyan', ts, 'USER')}\n{_indent_body(text)}"
+    if role == "assistant":
+        return f"\n{_rule('green', ts, 'ASSISTANT')}\n{_indent_body(text)}"
     return None
 
 
