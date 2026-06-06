@@ -94,6 +94,31 @@ def tail_lines(path: Path, n: int) -> list[str]:
         return []
 
 
+def capture_scroll(pane) -> tuple[bool, int]:
+    """Snapshot (at_bottom, scroll_y) of a RichLog before a clear()+rewrite, so
+    a live update can avoid yanking a reader who scrolled up. Duck-typed on the
+    RichLog/ScrollView attributes so render.py needn't import Textual."""
+    return pane.is_vertical_scroll_end, pane.scroll_y
+
+
+def begin_scroll_aware_rewrite(pane, *, stick_to_bottom: bool) -> None:
+    """Set a RichLog's auto_scroll for the rewrite about to happen, then clear
+    it. Sticking delegates the scroll to Textual's own deferred render, which
+    reaches the true new bottom (a manual scroll_end fires before the new
+    content's height is known and lands on the stale bottom). Not sticking
+    leaves auto_scroll off so the writes don't move the viewport — the caller
+    restores the reader's offset with restore_scroll afterward."""
+    pane.auto_scroll = stick_to_bottom
+    pane.clear()
+
+
+def restore_scroll(pane, *, prev_y: int) -> None:
+    """Put the viewport back to the reader's prior offset after a non-sticking
+    rewrite. Safe to call immediately: the rebuilt content only grows, so prev_y
+    stays within range even before layout settles the new max."""
+    pane.scroll_to(y=prev_y, animate=False)
+
+
 def _fmt_uptime(started_at: str | None, now: datetime) -> str:
     if not started_at:
         return "-"
@@ -205,6 +230,39 @@ def scheduler_header(
     if next_fire_str:
         return line + f"  ·  next fire {next_fire_str}"
     return line + "  ·  [dim]no jobs[/dim]"
+
+
+def chat_header(frontends: list[FrontendStatus], selected: int, active: int) -> str:
+    """Markup line for the chat tab — the daemon-health surface that replaced
+    the roster table. One frontend reads as that daemon's own line; several
+    collapse into a glyph strip with the ←/→-selected daemon reverse-video'd,
+    so which daemon k/r act on is always visible. `active` is the selected
+    frontend's in-flight job count.
+    """
+    if len(frontends) == 1:
+        f = frontends[0]
+        parts = [_state_markup(f.state)]
+        if f.last_heartbeat_age_s is not None:
+            parts.append(f"[dim]hb {fmt_age(f.last_heartbeat_age_s)}[/dim]")
+        parts.append(f"{active} active" if active else "[dim]idle[/dim]")
+        return f"[bold]{f.name}[/bold]  " + "  ·  ".join(parts)
+
+    cells = []
+    for i, f in enumerate(frontends):
+        glyph = _STATE_GLYPH.get(f.state, "?")
+        suffix = "" if f.state == "running" else f.state
+        if i == selected:
+            body = f"{f.name} {glyph}" + (f" {suffix}" if suffix else "")
+            cells.append(f"[reverse] {body} [/reverse]")
+        else:
+            style = _STATE_STYLES.get(f.state, "")
+            cell = f"{f.name} [{style}]{glyph}[/]" if style else f"{f.name} {glyph}"
+            if suffix:
+                cell += f" [dim]{suffix}[/dim]"
+            cells.append(cell)
+    line = "[bold]CHAT[/bold]  " + "  ·  ".join(cells)
+    line += f"  ·  {active} active" if active else "  ·  [dim]idle[/dim]"
+    return line
 
 
 def frontends_table(frontends: list[FrontendStatus], now: datetime) -> Table:

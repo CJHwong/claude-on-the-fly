@@ -12,6 +12,7 @@ from claude_on_the_fly.tui.render import (
     _fmt_age,
     _fmt_uptime,
     _format_extra_notes,
+    chat_header,
     frontends_table,
     render_snapshot_json,
     render_snapshot_rich,
@@ -85,6 +86,50 @@ class TestTabLabel:
         label = tab_label(1, "symphony", "running")
         glyph_span = next(s for s in label.spans if s.start == 4)
         assert glyph_span.style == "bold green"
+
+
+class TestChatHeader:
+    def _fe(self, name, state, age=2.0):
+        return FrontendStatus(name=name, state=state, last_heartbeat_age_s=age)
+
+    def test_single_frontend_reads_as_its_own_line(self):
+        line = chat_header([self._fe("telegram", "running")], selected=0, active=1)
+        assert "telegram" in line
+        assert "running" in line
+        assert "hb 2s" in line
+        assert "1 active" in line
+        # No roster prefix or selection highlight when there's only one.
+        assert "CHAT" not in line
+        assert "reverse" not in line
+
+    def test_single_frontend_idle_when_no_active_jobs(self):
+        line = chat_header([self._fe("slack", "running")], selected=0, active=0)
+        assert "idle" in line
+        assert "active" not in line.replace("idle", "")
+
+    def test_multiple_frontends_collapse_to_glyph_strip(self):
+        line = chat_header(
+            [
+                self._fe("telegram", "running"),
+                self._fe("slack", "running"),
+                self._fe("gmail", "stopped"),
+            ],
+            selected=1,
+            active=3,
+        )
+        assert "CHAT" in line
+        for name in ("telegram", "slack", "gmail"):
+            assert name in line
+        # Non-running frontends carry their state word so a down daemon shows.
+        assert "stopped" in line
+        assert "3 active" in line
+
+    def test_selected_frontend_is_reverse_highlighted(self):
+        frontends = [self._fe("telegram", "running"), self._fe("slack", "running")]
+        line = chat_header(frontends, selected=1, active=0)
+        # The selected cell is wrapped in reverse video; the other isn't.
+        assert "[reverse] slack" in line
+        assert "[reverse] telegram" not in line
 
 
 class TestRichRender:

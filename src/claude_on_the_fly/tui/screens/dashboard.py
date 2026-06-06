@@ -9,11 +9,18 @@ Layout (top → bottom):
   the shared log/watch row below.
 - Log row: daemon log (left) + per-ticket / per-job watch (right).
 
+The chat tab is a live activity monitor, not a daemon roster: the header shows
+every chat frontend's health (the ←/→-selected one reverse-video'd), and the
+table lists that frontend's currently-running jobs (from the heartbeat) with
+their uptime. Finished / failed requests aren't kept here — they live in the
+History overlay (h) and ping a notification when they happen.
+
 Selection model: the active tab decides which daemon the supervisor keys
 (k/r) and the log/watch row act on; tab state is stable across window blur,
-unlike focus. On the chat tab the highlighted row (telegram / slack / gmail)
-picks the specific daemon. Refresh runs at 1Hz, rebuilding tables from a fresh
-state.snapshot() while preserving each table's cursor by row key.
+unlike focus. On the chat tab ←/→ pick the frontend (header-owned, always
+visible so a stopped one can still be started), and the highlighted row points
+the watch pane at that job's session. Refresh runs at 1Hz, rebuilding tables
+from a fresh state.snapshot() while preserving each table's cursor by row key.
 """
 
 from __future__ import annotations
@@ -39,7 +46,11 @@ from textual.widgets import (
     TabPane,
 )
 
-from claude_on_the_fly.agent import DATA_DIR, current_backend_key, get_backend
+from claude_on_the_fly.agent import (
+    DATA_DIR,
+    current_backend_key,
+    resolve_session_log,
+)
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
@@ -140,6 +151,11 @@ class DashboardScreen(Screen):
         Binding("1", "show_tab('tab-chat')", "chat tab", show=False),
         Binding("2", "show_tab('tab-scheduler')", "scheduler tab", show=False),
         Binding("3", "show_tab('tab-symphony')", "symphony tab", show=False),
+        # priority so the screen sees ←/→ before the focused DataTable swallows
+        # them for its (row-mode no-op) horizontal cursor. The action itself
+        # no-ops off the chat tab, so this doesn't strand arrow keys elsewhere.
+        Binding("left", "chat_select(-1)", "Prev frontend", show=False, priority=True),
+        Binding("right", "chat_select(1)", "Next frontend", show=False, priority=True),
     ]
 
     # Longer help text per action label (shown in the `?` modal; the footer
@@ -160,6 +176,8 @@ class DashboardScreen(Screen):
         "chat tab": "switch to the chat tab",
         "scheduler tab": "switch to the scheduler tab",
         "symphony tab": "switch to the symphony tab",
+        "Prev frontend": "select the previous chat frontend (←)",
+        "Next frontend": "select the next chat frontend (→)",
     }
 
     def __init__(self) -> None:
@@ -167,6 +185,15 @@ class DashboardScreen(Screen):
         # Daemon log pane state.
         self._log_path: Path | None = None
         self._log_mtime: float | None = None
+        # Chat frontends currently worth showing (running / broken / ever-run),
+        # in display order. Drives the header, the request filter, and the
+        # supervisor target. Seeded with all chat frontends so the pre-mount
+        # target resolves to the first one (telegram).
+        self._chat_frontend_names: list[str] = list(CHAT_FRONTENDS)
+        # Which relevant frontend the chat tab is focused on. ←/→ move it; the
+        # table shows only this frontend's requests and k/r act on it. Kept
+        # stable by name across refreshes (see _refresh_chat_strip).
+        self._chat_selected_idx: int = 0
         # Watch pane state, tracked separately so the two panes refresh
         # independently. _watch_target encodes what's being watched, e.g.
         # "session:symphony:PROJ-1" or "schedule:cleanup-job", so we know to
@@ -179,9 +206,6 @@ class DashboardScreen(Screen):
         self._ticket_sources: dict[str, str] = {}
         # "<frontend>:<identifier>" → session_uuid for the watch pane.
         self._job_sessions: dict[str, str] = {}
-        # chat daemon name → list of (identifier, session_uuid) running jobs,
-        # so selecting a chat daemon can still drill into its live session.
-        self._chat_jobs: dict[str, list[tuple[str, str]]] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
         # Which daemon the lifecycle keys + log row follow for the scheduler /
@@ -231,7 +255,9 @@ class DashboardScreen(Screen):
                         id="log-pane",
                         wrap=False,
                         highlight=False,
-                        auto_scroll=True,
+                        # Scroll is driven explicitly per refresh (render.apply_scroll)
+                        # so a live update doesn't yank a reader who scrolled up.
+                        auto_scroll=False,
                         max_lines=LOG_PANE_MAX_LINES,
                     )
                 with Vertical(id="log-watch-col"):
@@ -241,7 +267,7 @@ class DashboardScreen(Screen):
                         wrap=False,
                         highlight=False,
                         markup=True,
-                        auto_scroll=True,
+                        auto_scroll=False,  # scroll driven via render.apply_scroll
                         max_lines=LOG_PANE_MAX_LINES,
                     )
             yield Static(id="status-line", markup=True)
@@ -260,14 +286,11 @@ class DashboardScreen(Screen):
         jobs.add_column("cron", width=16)
         jobs.add_column("kind", width=8)
         jobs.add_column("next fire", width=24)
+        # The chat strip shows the selected frontend's currently-running jobs:
+        # what's running and for how long. The header says which frontend.
         chat = self.query_one("#chat-strip", DataTable)
-        chat.add_column("daemon", width=10)
-        chat.add_column("state", width=12)
-        chat.add_column("heartbeat", width=10)
-        chat.add_column("active", width=8)
-        self.query_one("#chat-strip-header", Static).update(
-            "[bold]Chat frontends[/bold] [dim]([1]/[2]/[3] switch daemon tabs)[/dim]"
-        )
+        chat.add_column("running request", width=34)
+        chat.add_column("uptime", width=8)
         # The log panes shouldn't grab Tab focus — within a tab, Tab cycles only
         # that tab's table.
         self.query_one("#log-pane", RichLog).can_focus = False
@@ -301,12 +324,39 @@ class DashboardScreen(Screen):
         except Exception:
             return self._last_active_daemon  # pre-mount fallback
         if active == "tab-chat":
-            return self._datatable_cursor_key("#chat-strip")
+            return self._chat_supervisor_target()
         if active == "tab-scheduler":
             self._last_active_daemon = "schedule"
         elif active == "tab-symphony":
             self._last_active_daemon = "symphony"
         return self._last_active_daemon
+
+    def _chat_supervisor_target(self) -> str | None:
+        """Which chat daemon k/r act on: the ←/→-selected frontend, shown
+        reverse-video in the header. Works even with an empty request table, so
+        an idle frontend is still stop/restartable."""
+        names = self._chat_frontend_names
+        if not names:
+            return CHAT_FRONTENDS[0]
+        idx = min(self._chat_selected_idx, len(names) - 1)
+        return names[idx]
+
+    def action_chat_select(self, delta: int) -> None:
+        """←/→ move the selected chat frontend. No-op off the chat tab or when
+        only one frontend is relevant (nothing to switch to)."""
+        try:
+            active = self.query_one("#daemon-tabs", TabbedContent).active
+        except Exception:
+            return
+        if active != "tab-chat":
+            return
+        count = len(self._chat_frontend_names)
+        if count <= 1:
+            return
+        self._chat_selected_idx = (self._chat_selected_idx + delta) % count
+        self._refresh()
+        self._refresh_log(force_reload=True)
+        self._update_action_cue()
 
     def action_show_tab(self, tab_id: str) -> None:
         """Activate a daemon tab by id (bound to [1]/[2]/[3]). The TabActivated
@@ -631,12 +681,16 @@ class DashboardScreen(Screen):
         self._log_mtime = mtime
         header.update(f"[bold]log: {path.name}[/bold]")
         lines = render.tail_lines(path, TAIL_LINES)
-        pane.clear()
+        was_bottom, prev_y = render.capture_scroll(pane)
+        stick = switched or force_reload or was_bottom
+        render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
         if not lines:
             pane.write(f"[dim]({path.name} is empty or unreadable)[/dim]")
             return
         for line in lines:
             pane.write(line.rstrip("\n"))
+        if not stick:
+            render.restore_scroll(pane, prev_y=prev_y)
 
     def _refresh_watch_pane(self, *, force_reload: bool) -> None:
         """Show the watch column when the active daemon has something to drill
@@ -659,9 +713,13 @@ class DashboardScreen(Screen):
             if job is not None and job != "__empty__":
                 target = f"schedule:{job}"
         elif name in CHAT_FRONTENDS:
-            jobs = self._chat_jobs.get(name) or []
-            if jobs:
-                target = f"session:{name}:{jobs[0][0]}"
+            # Follow the highlighted request row (key = "<source>:<identifier>")
+            # so selecting any request tails its own session, not just the
+            # first in-flight job for the daemon.
+            key = self._datatable_cursor_key("#chat-strip")
+            if key and key != "__empty__" and ":" in key:
+                source, _, identifier = key.partition(":")
+                target = f"session:{source}:{identifier}"
 
         if target is None:
             if col.display:
@@ -722,10 +780,9 @@ class DashboardScreen(Screen):
                 header.update(f"[bold]watch: {identifier}[/bold] [dim](pending)[/dim]")
             return
 
-        try:
-            path = get_backend().session_log_path(workspace, session_uuid)
-        except Exception:
-            path = None
+        # Resolve across backends: the daemon may have run this job under a
+        # different backend than the TUI's env points at (e.g. pi vs native).
+        path = resolve_session_log(workspace, session_uuid)
 
         if path is None:
             if force_reload or self._watch_path is not None:
@@ -753,7 +810,9 @@ class DashboardScreen(Screen):
         self._watch_path = path
         self._watch_mtime = mtime
         header.update(f"[bold]watch: {identifier}[/bold] [dim]{path.name}[/dim]")
-        pane.clear()
+        was_bottom, prev_y = render.capture_scroll(pane)
+        stick = switched or force_reload or was_bottom
+        render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
         import json
 
         raw_lines = render.tail_lines(path, WATCH_EVENTS)
@@ -774,6 +833,8 @@ class DashboardScreen(Screen):
             any_rendered = True
         if not any_rendered:
             pane.write(f"[dim](no displayable events yet in {path.name})[/dim]")
+        if not stick:
+            render.restore_scroll(pane, prev_y=prev_y)
 
     def _refresh_watch_scheduler(
         self, job: str, header: Static, pane: RichLog, force_reload: bool
@@ -808,13 +869,17 @@ class DashboardScreen(Screen):
         self._watch_path = path
         self._watch_mtime = mtime
         header.update(f"[bold]job: {job}[/bold] [dim]{path.name}[/dim]")
-        pane.clear()
+        was_bottom, prev_y = render.capture_scroll(pane)
+        stick = switched or force_reload or was_bottom
+        render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
         lines = render.tail_lines(path, TAIL_LINES)
         if not lines:
             pane.write(f"[dim]({path.name} is empty)[/dim]")
             return
         for line in lines:
             pane.write(Text(line.rstrip("\n")))
+        if not stick:
+            render.restore_scroll(pane, prev_y=prev_y)
 
     def _notify(
         self, msg: str, severity: Literal["information", "warning", "error"]
@@ -837,7 +902,6 @@ class DashboardScreen(Screen):
         # Rebuilt every tick from the heartbeat; reset before repopulating.
         self._ticket_sources = {}
         self._job_sessions = {}
-        self._chat_jobs = {}
 
         self._refresh_symphony(by_name.get("symphony"))
         self._refresh_scheduler(snap, by_name.get("schedule"))
@@ -962,33 +1026,70 @@ class DashboardScreen(Screen):
         else:
             self._restore_cursor(table, keys, previously)
 
+    @staticmethod
+    def _chat_frontends(
+        by_name: dict[str, state.FrontendStatus],
+    ) -> list[state.FrontendStatus]:
+        """Every chat frontend, in display order — always shown, regardless of
+        state, so any of them can be ←/→-selected and started even when another
+        is already running. The table scopes to the selected one, so showing the
+        stopped ones in the header costs nothing."""
+        return [by_name[name] for name in CHAT_FRONTENDS if name in by_name]
+
     def _refresh_chat_strip(self, by_name: dict[str, state.FrontendStatus]) -> None:
+        frontends = self._chat_frontends(by_name)
+        names = [f.name for f in frontends]
+        # Keep the selection pinned to the same frontend across refreshes even
+        # if the set shifts; clamp into range otherwise.
+        prev = self._chat_frontend_names
+        if prev and 0 <= self._chat_selected_idx < len(prev):
+            pinned = prev[self._chat_selected_idx]
+            if pinned in names:
+                self._chat_selected_idx = names.index(pinned)
+        self._chat_selected_idx = min(self._chat_selected_idx, max(0, len(names) - 1))
+        self._chat_frontend_names = names
+        selected = names[self._chat_selected_idx] if names else None
+        selected_state = (
+            by_name[selected].state if selected and selected in by_name else "stopped"
+        )
+
+        # The chat tab is a live activity monitor: rows are the selected
+        # frontend's currently-running jobs, straight from the heartbeat (the
+        # source of truth for "now"). Done / failed requests live in the
+        # History overlay (h) and surface as notifications when they happen —
+        # the dashboard doesn't hoard them.
+        running: list = []
+        if selected and selected in by_name:
+            running = (by_name[selected].extra or {}).get("running_jobs") or []
+
+        self.query_one("#chat-strip-header", Static).update(
+            render.chat_header(frontends, self._chat_selected_idx, len(running))
+        )
+
         table = self.query_one("#chat-strip", DataTable)
         previously = self._datatable_cursor_key("#chat-strip")
         table.clear()
         keys: list[str] = []
-        for name in CHAT_FRONTENDS:
-            frontend = by_name.get(name)
-            if frontend is None:
-                continue
-            extra = frontend.extra or {}
-            jobs: list[tuple[str, str]] = []
-            for job in extra.get("running_jobs") or []:
-                identifier = str(job.get("identifier", "?"))
-                session = job.get("session_uuid")
-                if session:
-                    self._job_sessions[f"{name}:{identifier}"] = str(session)
-                jobs.append((identifier, str(session) if session else ""))
-            self._chat_jobs[name] = jobs
-            table.add_row(
-                name,
-                render.state_cell(frontend.state),
-                render.fmt_age(frontend.last_heartbeat_age_s),
-                str(len(jobs)) if jobs else "-",
-                key=name,
+        for job in running:
+            identifier = str(job.get("identifier", "?"))
+            session = job.get("session_uuid")
+            key = f"{selected}:{identifier}"
+            if session:
+                self._job_sessions[key] = str(session)
+            table.add_row(identifier, render.fmt_age(job.get("uptime_s")), key=key)
+            keys.append(key)
+
+        if not keys:
+            # A running daemon with no jobs is idle; a stopped one tells the
+            # user how to bring it up (k/r act on the selected frontend).
+            msg = (
+                "idle — nothing running"
+                if selected_state == "running"
+                else f"{selected_state} — press r to start"
             )
-            keys.append(name)
-        self._restore_cursor(table, keys, previously)
+            table.add_row(Text(msg, style="dim"), "", key="__empty__")
+        else:
+            self._restore_cursor(table, keys, previously)
 
     def _refresh_stale_banner(self, snap: state.Snapshot) -> None:
         stale = [f.name for f in snap.frontends if f.stale]

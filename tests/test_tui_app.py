@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from textual.coordinate import Coordinate
 
 from claude_on_the_fly.tui.tui_app import (
     ClaudeTuiApp,
@@ -15,6 +16,27 @@ from claude_on_the_fly.tui.tui_app import (
 
 def _ev(ts, type_, ident, uuid="u", **extra):
     return {"ts": ts, "type": type_, "identifier": ident, "session_uuid": uuid, **extra}
+
+
+def _write_heartbeat(state_dir, name, running_jobs=()):
+    """Write a heartbeat JSON that reads as a running daemon with the given
+    in-flight jobs. Uses the live pid so state.snapshot() sees it alive."""
+    import json
+    import os
+    from datetime import datetime, timezone
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (state_dir / f"{name}.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "last_heartbeat": now,
+                "started_at": now,
+                "extra": {"running_jobs": list(running_jobs)},
+            }
+        )
+    )
 
 
 class _FakeLog:
@@ -141,28 +163,169 @@ class TestDashboardLayout:
             assert "SCHEDULER" in sched
 
     @pytest.mark.asyncio
-    async def test_chat_strip_lists_the_three_chat_daemons(self):
+    async def test_chat_tab_shows_daemons_in_header_and_idle_table(
+        self, tmp_path, monkeypatch
+    ):
+        """The chat tab no longer rosters daemons as table rows. With nothing
+        running, the header carries the daemon health and the table is the live
+        activity monitor — idle, so a single placeholder row.
+
+        Isolate the heartbeat state dir the dashboard reads from real disk."""
+        from textual.widgets import DataTable, Static
+
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            header = str(app.screen.query_one("#chat-strip-header", Static).render())
+            # Cold start (no heartbeats): all chat daemons surface in the header.
+            for name in ("telegram", "slack", "gmail"):
+                assert name in header
+            strip = app.screen.query_one("#chat-strip", DataTable)
+            # Table is the live monitor, not a roster. Cold start → the selected
+            # frontend is stopped, so the empty row hints how to start it.
+            assert strip.row_count == 1
+            cell = strip.get_cell_at(Coordinate(0, 0))
+            assert "press r to start" in str(getattr(cell, "plain", cell))
+
+    @pytest.mark.asyncio
+    async def test_stopped_frontend_stays_selectable_when_another_runs(
+        self, tmp_path, monkeypatch
+    ):
+        """Starting one frontend must not hide the others: ←/→ can still land on
+        a stopped frontend (so k/r can start it), even while telegram runs."""
         from textual.widgets import DataTable
+
+        state_dir = tmp_path / "state"
+        _write_heartbeat(
+            state_dir,
+            "telegram",
+            running_jobs=[
+                {"identifier": "telegram/H", "uptime_s": 4, "session_uuid": "u1"}
+            ],
+        )
+        # slack + gmail never started (no heartbeat) — must still be reachable.
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", state_dir)
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = _dashboard(app)
+            strip = app.screen.query_one("#chat-strip", DataTable)
+
+            # telegram is selected and running.
+            assert screen._active_daemon() == "telegram"
+
+            # → reaches slack even though it never ran; the table shows the
+            # start hint and k/r now target slack.
+            await pilot.press("right")
+            await pilot.pause()
+            assert screen._active_daemon() == "slack"
+            assert "press r to start" in str(strip.get_cell_at(Coordinate(0, 0)))
+
+            # → again reaches gmail.
+            await pilot.press("right")
+            await pilot.pause()
+            assert screen._active_daemon() == "gmail"
+
+    @pytest.mark.asyncio
+    async def test_chat_tab_lists_running_jobs_from_heartbeat(
+        self, tmp_path, monkeypatch
+    ):
+        """The selected frontend's currently-running jobs (from the heartbeat)
+        render one row each with their uptime — no done/failed history."""
+        from textual.widgets import DataTable
+
+        state_dir = tmp_path / "state"
+        _write_heartbeat(
+            state_dir,
+            "telegram",
+            running_jobs=[
+                {"identifier": "telegram/H", "uptime_s": 14, "session_uuid": "u1"},
+                {"identifier": "telegram/Bob", "uptime_s": 5, "session_uuid": "u2"},
+            ],
+        )
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", state_dir)
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             strip = app.screen.query_one("#chat-strip", DataTable)
-            assert strip.row_count == 3  # telegram / slack / gmail
+            # Only telegram has a heartbeat → single relevant frontend, selected.
+            assert strip.row_count == 2
+            idents = [str(strip.get_cell_at(Coordinate(r, 0))) for r in range(2)]
+            assert idents == ["telegram/H", "telegram/Bob"]
+            uptimes = [str(strip.get_cell_at(Coordinate(r, 1))) for r in range(2)]
+            assert uptimes == ["14s", "5s"]
 
     @pytest.mark.asyncio
-    async def test_tab_keys_switch_active_daemon(self):
+    async def test_arrow_keys_switch_chat_frontend_and_scope_table(
+        self, tmp_path, monkeypatch
+    ):
+        """←/→ move the selected chat frontend: the table scopes to that
+        frontend's running jobs and k/r retarget to it."""
+        from textual.widgets import DataTable
+
+        state_dir = tmp_path / "state"
+        _write_heartbeat(
+            state_dir,
+            "telegram",
+            running_jobs=[
+                {"identifier": "telegram/H", "uptime_s": 9, "session_uuid": "u1"}
+            ],
+        )
+        _write_heartbeat(
+            state_dir,
+            "slack",
+            running_jobs=[
+                {"identifier": "slack/ops", "uptime_s": 3, "session_uuid": "u2"}
+            ],
+        )
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", state_dir)
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = _dashboard(app)
+            strip = app.screen.query_one("#chat-strip", DataTable)
+
+            # telegram + slack are both relevant; selection starts on telegram.
+            assert screen._active_daemon() == "telegram"
+            assert [
+                str(strip.get_cell_at(Coordinate(r, 0))) for r in range(strip.row_count)
+            ] == ["telegram/H"]
+
+            # Right → next frontend (slack): table scopes to slack, target flips.
+            await pilot.press("right")
+            await pilot.pause()
+            assert screen._active_daemon() == "slack"
+            assert [
+                str(strip.get_cell_at(Coordinate(r, 0))) for r in range(strip.row_count)
+            ] == ["slack/ops"]
+
+            # Left wraps back to telegram.
+            await pilot.press("left")
+            await pilot.pause()
+            assert screen._active_daemon() == "telegram"
+
+    @pytest.mark.asyncio
+    async def test_tab_keys_switch_active_daemon(self, tmp_path, monkeypatch):
         """[1]/[2]/[3] switch tabs, which is how the supervisor keys + log row
         pick a daemon now (tab, not focus). Switching also lands focus on the
         new tab's table. Tab order: chat / scheduler / symphony."""
         from textual.widgets import TabbedContent
+
+        # Isolate disk: cold start → chat target falls back to the first
+        # frontend (telegram) regardless of the dev machine's real state.
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             screen = _dashboard(app)
             tabs = screen.query_one("#daemon-tabs", TabbedContent)
-            # Opens on chat; the highlighted row (first = telegram) is the target.
+            # Opens on chat; cold start → target is the first chat daemon.
             assert tabs.active == "tab-chat"
             assert app.focused is not None and app.focused.id == "chat-strip"
             assert screen._active_daemon() == "telegram"
@@ -193,7 +356,21 @@ class TestDashboardLayout:
         # Slim footer: lifecycle (k/r), help, quit.
         assert visible == {"k", "r", "question_mark", "q"}
         # Everything else stays bound but lives in the `?` help modal.
-        assert hidden == {"l", "h", "g", "u", "d", "c", "R", "K", "1", "2", "3"}
+        assert hidden == {
+            "l",
+            "h",
+            "g",
+            "u",
+            "d",
+            "c",
+            "R",
+            "K",
+            "1",
+            "2",
+            "3",
+            "left",
+            "right",
+        }
 
     @pytest.mark.asyncio
     async def test_help_modal_lists_keys_hidden_from_footer(self):
@@ -276,11 +453,14 @@ class TestDashboardLayout:
             assert "symphony" in str(cue.render())
 
     @pytest.mark.asyncio
-    async def test_tab_labels_reflect_daemon_health(self):
+    async def test_tab_labels_reflect_daemon_health(self, tmp_path, monkeypatch):
         """Each tab title carries its daemon's health glyph, so the tab bar
-        shows every zone's liveness regardless of which tab is active. With no
-        daemons running in tests, all three read stopped (○)."""
+        shows every zone's liveness regardless of which tab is active. Isolate
+        the state dir so the dev machine's real daemons don't bleed in — empty
+        → all three read stopped (○)."""
         from textual.widgets import TabbedContent
+
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
@@ -395,3 +575,52 @@ async def test_g_picks_symphony_then_shows_config_preview(tmp_path, monkeypatch)
         await pilot.press("escape")
         await pilot.pause()
         assert app.screen.__class__.__name__ == "DashboardScreen"
+
+
+class TestLogScrollPreservation:
+    """A live log rewrite must not yank a reader who scrolled up, but should
+    still follow the tail when they're parked at the bottom."""
+
+    @pytest.mark.asyncio
+    async def test_preserves_scroll_up_then_sticks_at_bottom(self):
+        from textual.app import App, ComposeResult
+        from textual.widgets import RichLog
+
+        from claude_on_the_fly.tui import render
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield RichLog(id="log", auto_scroll=False, max_lines=10000)
+
+        app = _App()
+        async with app.run_test(size=(80, 10)) as pilot:
+            log = app.query_one("#log", RichLog)
+            for i in range(100):
+                log.write(f"line-{i:03d}")
+            await pilot.pause()
+
+            # Reader scrolls up; a live rewrite must keep their offset.
+            log.scroll_to(y=30, animate=False)
+            await pilot.pause()
+            was_bottom, prev_y = render.capture_scroll(log)
+            render.begin_scroll_aware_rewrite(log, stick_to_bottom=was_bottom)
+            for i in range(100):
+                log.write(f"line-{i:03d}")
+            if not was_bottom:
+                render.restore_scroll(log, prev_y=prev_y)
+            await pilot.pause()
+            assert log.scroll_y == 30
+
+            # Parked at the bottom: a rewrite with MORE content follows to the
+            # true new end, not the stale old one.
+            log.scroll_end(animate=False)
+            await pilot.pause()
+            was_bottom, prev_y = render.capture_scroll(log)
+            assert was_bottom is True
+            render.begin_scroll_aware_rewrite(log, stick_to_bottom=was_bottom)
+            for i in range(140):
+                log.write(f"line-{i:03d}")
+            if not was_bottom:
+                render.restore_scroll(log, prev_y=prev_y)
+            await pilot.pause()
+            assert log.scroll_y == log.max_scroll_y
