@@ -167,6 +167,8 @@ class TestStop:
         assert kills[0] == (1234, signal.SIGTERM)
         assert all(sig != signal.SIGKILL for _, sig in kills)
         assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+        # Heartbeat gone too, so the TUI reads it stopped right away.
+        assert not (supervisor.STATE_DIR / "telegram.json").exists()
 
     def test_escalates_to_sigkill_on_timeout(self, isolated_state, monkeypatch):
         _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1234)
@@ -182,6 +184,21 @@ class TestStop:
 
         assert (1234, signal.SIGTERM) in kills
         assert (1234, signal.SIGKILL) in kills
+
+    def test_force_kill_removes_stale_heartbeat(self, isolated_state, monkeypatch):
+        """A force-killed daemon never runs its own heartbeat cleanup. stop()
+        must delete it, else its pid reads alive (os.kill(pid, 0) is true for an
+        unreaped zombie) and the TUI shows the daemon running, then broken,
+        after it's been stopped."""
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1234)
+        # Process never dies on its own (drains past grace) → SIGKILL path.
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(supervisor, "KILL_POLL_INTERVAL_S", 0.01)
+
+        supervisor.stop("telegram", grace_s=0.05)
+
+        assert not (supervisor.STATE_DIR / "telegram.json").exists()
 
 
 # ---------------------------------------------------------------------------

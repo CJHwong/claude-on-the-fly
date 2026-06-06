@@ -185,6 +185,18 @@ def _remove_pid(frontend: str) -> None:
         pass
 
 
+def _remove_heartbeat(frontend: str) -> None:
+    """Delete the heartbeat file. A daemon unlinks its own on a clean exit, but
+    a force-killed one never runs that cleanup — leaving a stale heartbeat whose
+    pid reads as alive (os.kill(pid, 0) is true for an unreaped zombie), so the
+    TUI shows it running, then broken as the timestamp ages. Removing it here
+    makes a stopped daemon read as stopped immediately."""
+    try:
+        _heartbeat_file(frontend).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _load_env(env_file: Path | None) -> dict[str, str]:
     """Merge os.environ with the env file (if it exists). File wins on conflicts."""
     merged: dict[str, str] = dict(os.environ)
@@ -332,6 +344,7 @@ def stop(frontend: str, *, grace_s: float = DEFAULT_GRACE_S) -> int:
     pid = _resolve_pid(frontend)
     if pid is None or not _process_exists(pid):
         _remove_pid(frontend)
+        _remove_heartbeat(frontend)
         raise NotRunning(f"{frontend} is not running")
 
     try:
@@ -343,6 +356,7 @@ def stop(frontend: str, *, grace_s: float = DEFAULT_GRACE_S) -> int:
     while time.monotonic() < deadline:
         if not _process_exists(pid):
             _remove_pid(frontend)
+            _remove_heartbeat(frontend)
             logger.info("%s pid=%d exited cleanly", frontend, pid)
             return pid
         time.sleep(KILL_POLL_INTERVAL_S)
@@ -360,6 +374,7 @@ def stop(frontend: str, *, grace_s: float = DEFAULT_GRACE_S) -> int:
         time.sleep(KILL_POLL_INTERVAL_S)
 
     _remove_pid(frontend)
+    _remove_heartbeat(frontend)
     logger.info("%s pid=%d force-killed", frontend, pid)
     return pid
 
