@@ -7,7 +7,7 @@
 1. Go to https://api.slack.com/apps
 2. Click "Create New App" -> "From a manifest"
 3. Select your workspace
-4. Switch to JSON tab, paste the contents of `slack_manifest.json` from this repo
+4. Switch to JSON tab, paste the contents of [`slack_manifest.json`](slack_manifest.json)
 5. Click "Create"
 
 ### Get your tokens
