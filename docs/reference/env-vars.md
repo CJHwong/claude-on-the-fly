@@ -40,13 +40,15 @@ The `tracker.base_url`, `tracker.project_key`, and `tracker.jql_extra` live in `
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default), `codex`, or `pi` |
+| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default), `codex`, `pi`, or `opencode` |
 | `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude`; `pty` drives `claude-pty` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) to surface rate-limit and context-window stats (default: `native`) |
 | `CODEX_MODE` | no | `native` runs `codex` directly; `ollama` wraps it in `ollama launch codex` (default: `native`) |
 | `PI_MODE` | no | `native` runs `pi` directly; `ollama` wraps it in `ollama launch pi` (default: `native`) |
-| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama`, `CODEX_MODE=ollama`, or `PI_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
+| `OPENCODE_MODE` | no | `native` runs `opencode` directly; `ollama` wraps it in `ollama launch opencode` (default: `native`) |
+| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama`, `CODEX_MODE=ollama`, `PI_MODE=ollama`, or `OPENCODE_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
 | `CLAUDE_MODEL` | no | Model passed to `claude --model` in native/pty mode. Unset (default) omits `--model` so the claude CLI uses its own default. Ignored in ollama mode |
 | `CODEX_MODEL` | no | Model passed to `codex exec -m` in native mode (e.g. `o3`, `gpt-4.1`). Ignored in ollama mode |
 | `PI_MODEL` | no | Model passed to `pi --model` in native mode (e.g. `deepseek-v4-flash:cloud`). Ignored in ollama mode |
+| `OPENCODE_MODEL` | no | Model passed to `opencode run -m` in native mode, in `provider/model` form (e.g. `github-copilot/claude-haiku-4.5`). Unset omits `-m` so opencode uses its own default. Ignored in ollama mode |
 | `PI_PROVIDER` | no | Provider passed to `pi --provider` (default: `google`). Set to `ollama` for local/cloud ollama models, or use `PI_MODE=ollama` |
 | `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
