@@ -449,7 +449,7 @@ def main() -> None:  # pragma: no cover
     from dotenv import load_dotenv
 
     from claude_on_the_fly.orchestrator import run
-    from claude_on_the_fly.preflight import _setup_logging, check_claude_cli
+    from claude_on_the_fly.preflight import _setup_logging, check_backend
 
     parser = argparse.ArgumentParser(prog="claude-schedule")
     parser.add_argument(
@@ -472,7 +472,7 @@ def main() -> None:  # pragma: no cover
         raise SystemExit(f"config error: {exc}")
 
     if any(s.kind == "prompt" for s in specs):
-        check_claude_cli()
+        check_backend()
 
     frontend = SchedulerFrontend(config_path=ns.config)
     asyncio.run(run(frontend, platform="schedule"))
