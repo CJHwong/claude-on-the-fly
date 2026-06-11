@@ -431,7 +431,11 @@ def get_backend() -> AgentBackend:
         return _build_codex_backend()
     if name == "pi":
         return _build_pi_backend()
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi)")
+    if name == "opencode":
+        return _build_opencode_backend()
+    raise ValueError(
+        f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi, opencode)"
+    )
 
 
 def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
@@ -451,9 +455,12 @@ def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
     """
     from claude_on_the_fly.backends.claude import ClaudeBackend
     from claude_on_the_fly.backends.codex import CodexBackend
+    from claude_on_the_fly.backends.opencode import OpencodeBackend
     from claude_on_the_fly.backends.pi import PiBackend
 
-    for build in (ClaudeBackend, PiBackend, CodexBackend):
+    # OpencodeBackend.session_log_path is always None (no single tailable log),
+    # so it never wins the scan — listed for completeness.
+    for build in (ClaudeBackend, PiBackend, OpencodeBackend, CodexBackend):
         try:
             path = build().session_log_path(workspace, session_uuid)
         except Exception:
@@ -512,7 +519,22 @@ def current_backend_key() -> str:
                 raise ValueError("PI_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"pi:ollama:{model}"
         raise ValueError(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi)")
+    if name == "opencode":
+        mode = os.environ.get("OPENCODE_MODE", "native").lower()
+        if mode == "native":
+            return (
+                "opencode:native:"
+                f"{os.environ.get('OPENCODE_MODEL', '').strip() or 'default'}"
+            )
+        if mode == "ollama":
+            model = os.environ.get("OLLAMA_MODEL", "").strip()
+            if not model:
+                raise ValueError("OPENCODE_MODE=ollama requires OLLAMA_MODEL to be set")
+            return f"opencode:ollama:{model}"
+        raise ValueError(f"Unknown OPENCODE_MODE: {mode!r} (supported: native, ollama)")
+    raise ValueError(
+        f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi, opencode)"
+    )
 
 
 def _build_claude_backend() -> AgentBackend:
@@ -557,6 +579,20 @@ def _build_pi_backend() -> AgentBackend:
             raise ValueError("PI_MODE=ollama requires OLLAMA_MODEL to be set")
         return PiBackend(launcher=OllamaLauncher(model=model))
     raise ValueError(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
+
+
+def _build_opencode_backend() -> AgentBackend:
+    from claude_on_the_fly.backends.opencode import OpencodeBackend
+
+    mode = os.environ.get("OPENCODE_MODE", "native").lower()
+    if mode == "native":
+        return OpencodeBackend()
+    if mode == "ollama":
+        model = os.environ.get("OLLAMA_MODEL", "").strip()
+        if not model:
+            raise ValueError("OPENCODE_MODE=ollama requires OLLAMA_MODEL to be set")
+        return OpencodeBackend(launcher=OllamaLauncher(model=model))
+    raise ValueError(f"Unknown OPENCODE_MODE: {mode!r} (supported: native, ollama)")
 
 
 async def run(

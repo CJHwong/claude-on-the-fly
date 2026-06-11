@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+from unittest.mock import patch
+
 from claude_on_the_fly.transcript import (
     Turn,
     _workspace_to_claude_hash,
@@ -13,6 +15,7 @@ from claude_on_the_fly.transcript import (
     extract_codex,
     extract_codex_cumulative_tokens,
     extract_codex_model,
+    extract_opencode,
     format_handoff,
 )
 
@@ -783,3 +786,80 @@ class TestFindLatestPriorTranscript:
         turns, backend = result
         assert backend == "claude"
         assert any(t.text == "prior turn" for t in turns)
+
+
+# ---------------------------------------------------------------------------
+# extract_opencode — reads back via `opencode export`, strips system prefix
+# ---------------------------------------------------------------------------
+
+
+def _opencode_export_payload(*messages: tuple[str, str]) -> dict:
+    """Build a fake `opencode export` dict from (role, text) pairs."""
+    return {
+        "info": {"id": "ses_abc"},
+        "messages": [
+            {
+                "info": {"role": role},
+                "parts": [{"type": "text", "text": text}],
+            }
+            for role, text in messages
+        ],
+    }
+
+
+def _write_opencode_mapping(workspace: Path, uuid: str, ses_id: str) -> None:
+    sessions_dir = workspace / ".opencode_sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / uuid).write_text(ses_id)
+
+
+class TestExtractOpencode:
+    def test_no_mapping_returns_none(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        assert extract_opencode(workspace, "missing") is None
+
+    def test_export_failure_returns_none(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_opencode_mapping(workspace, "u1", "ses_abc")
+        with patch("claude_on_the_fly.transcript._opencode_export", return_value=None):
+            assert extract_opencode(workspace, "u1") is None
+
+    def test_happy_path_returns_turns(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_opencode_mapping(workspace, "u1", "ses_abc")
+        payload = _opencode_export_payload(
+            ("user", "question one"),
+            ("assistant", "answer one"),
+        )
+        with patch(
+            "claude_on_the_fly.transcript._opencode_export", return_value=payload
+        ):
+            turns = extract_opencode(workspace, "u1")
+        assert turns == [Turn("user", "question one"), Turn("assistant", "answer one")]
+
+    def test_strips_system_prompt_prefix_from_first_user_message(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_opencode_mapping(workspace, "u1", "ses_abc")
+        payload = _opencode_export_payload(
+            ("user", "SYSTEM PROMPT BLOCK\n\n---\n\nreal user text"),
+            ("assistant", "reply"),
+        )
+        with patch(
+            "claude_on_the_fly.transcript._opencode_export", return_value=payload
+        ):
+            turns = extract_opencode(workspace, "u1")
+        assert turns == [Turn("user", "real user text"), Turn("assistant", "reply")]
+
+    def test_no_messages_returns_none(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_opencode_mapping(workspace, "u1", "ses_abc")
+        with patch(
+            "claude_on_the_fly.transcript._opencode_export",
+            return_value={"info": {}, "messages": []},
+        ):
+            assert extract_opencode(workspace, "u1") is None

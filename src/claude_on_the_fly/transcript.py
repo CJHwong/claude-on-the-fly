@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,7 @@ from typing import Callable, Literal
 
 logger = logging.getLogger(__name__)
 
-BackendName = Literal["claude", "codex", "pi"]
+BackendName = Literal["claude", "codex", "pi", "opencode"]
 
 # Same separator CodexBackend uses to fence the system prompt off from the user
 # prompt. We rsplit on it to recover the raw user text from a codex transcript.
@@ -40,6 +41,10 @@ _CODEX_PROMPT_SEPARATOR = "\n\n---\n\n"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
+# opencode maps our session_uuid -> its ses_ id under this per-workspace dir;
+# the actual session content lives in opencode's global SQLite db, read back
+# via `opencode export <ses_id>`.
+OPENCODE_SESSIONS_DIRNAME = ".opencode_sessions"
 
 
 @dataclass(frozen=True)
@@ -347,6 +352,108 @@ def _list_pi_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# opencode session extraction
+# ---------------------------------------------------------------------------
+
+
+def _read_opencode_ses_id(workspace: Path, session_uuid: str) -> str | None:
+    """Read opencode's ses_ id from our per-workspace mapping file, or None."""
+    mapping = workspace / OPENCODE_SESSIONS_DIRNAME / session_uuid
+    if not mapping.is_file():
+        return None
+    try:
+        ses_id = mapping.read_text().strip()
+    except OSError:
+        return None
+    return ses_id or None
+
+
+def _opencode_export(ses_id: str) -> dict | None:
+    """Return the parsed `opencode export <ses_id>` JSON, or None on failure.
+
+    opencode stores sessions in a global SQLite db rather than a per-session
+    file, so we read them back through the CLI's stable export format instead
+    of poking at internal storage. Best-effort: any failure yields None and the
+    handoff is simply skipped.
+    """
+    try:
+        result = subprocess.run(
+            ["opencode", "export", ses_id],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("transcript: opencode export failed for ses=%s", ses_id)
+        return None
+    if result.returncode != 0:
+        logger.debug(
+            "transcript: opencode export exit=%s for ses=%s",
+            result.returncode,
+            ses_id,
+        )
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def extract_opencode(workspace: Path, session_uuid: str) -> list[Turn] | None:
+    """Return the user/assistant turns from an opencode session, or None.
+
+    Resolves our session_uuid to opencode's ses_ id via the mapping file, then
+    reads the conversation through `opencode export`. Strips the system-prompt
+    prefix we prepend to the first user message.
+    """
+    ses_id = _read_opencode_ses_id(workspace, session_uuid)
+    if ses_id is None:
+        return None
+    data = _opencode_export(ses_id)
+    if data is None:
+        return None
+    turns: list[Turn] = []
+    for message in data.get("messages") or []:
+        role = (message.get("info") or {}).get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text_blocks = [
+            (part.get("text") or "").strip()
+            for part in message.get("parts") or []
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        text = "\n".join(block for block in text_blocks if block).strip()
+        if not text:
+            continue
+        if role == "user":
+            # Strip our `<system_prompt>\n\n---\n\n<user_prompt>` prefix.
+            text = text.split(_CODEX_PROMPT_SEPARATOR, 1)[-1].strip()
+        if text:
+            turns.append(Turn(role, text))
+    return turns or None
+
+
+def _list_opencode_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
+    """Return (mapping_path, our_uuid, mtime) for every opencode mapping under
+    <workspace>/.opencode_sessions. The mapping is rewritten every turn, so its
+    mtime tracks the session's recency for handoff ordering."""
+    sessions_dir = workspace / OPENCODE_SESSIONS_DIRNAME
+    if not sessions_dir.is_dir():
+        return []
+    out: list[tuple[Path, str, float]] = []
+    for mapping in sessions_dir.iterdir():
+        if not mapping.is_file():
+            continue
+        try:
+            mtime = mapping.stat().st_mtime
+        except OSError:
+            continue
+        out.append((mapping, mapping.name, mtime))
+    return out
+
+
 def _render_line(turn: Turn) -> str:
     return f"{turn.role.capitalize()}: {turn.text}"
 
@@ -454,6 +561,10 @@ def find_latest_prior_transcript(
         if uuid == exclude_uuid:
             continue
         candidates.append((mtime, uuid, "pi", uuid))
+    for _path, uuid, mtime in _list_opencode_session_files(workspace):
+        if uuid == exclude_uuid:
+            continue
+        candidates.append((mtime, uuid, "opencode", uuid))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0], reverse=True)
@@ -461,6 +572,7 @@ def find_latest_prior_transcript(
         "claude": extract_claude,
         "codex": extract_codex,
         "pi": extract_pi,
+        "opencode": extract_opencode,
     }
     for _mtime, _uuid, backend, lookup_uuid in candidates:
         try:

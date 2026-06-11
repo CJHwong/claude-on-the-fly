@@ -83,6 +83,7 @@ _AGENT_INSTALL_HINTS = {
     "claude": "https://docs.anthropic.com/en/docs/claude-code",
     "codex": "https://github.com/openai/codex",
     "pi": "https://github.com/earendil-works/pi-coding-agent",
+    "opencode": "https://opencode.ai",
 }
 
 
@@ -124,8 +125,18 @@ def check_backend() -> None:
             check_ollama_mode("pi")
             return
         raise _exit(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
+    if backend_name == "opencode":
+        mode = os.environ.get("OPENCODE_MODE", "native").lower()
+        if mode == "native":
+            check_opencode_cli()
+            return
+        if mode == "ollama":
+            check_ollama_mode("opencode")
+            return
+        raise _exit(f"Unknown OPENCODE_MODE: {mode!r} (supported: native, ollama)")
     raise _exit(
-        f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex, pi)"
+        f"Unknown AGENT_BACKEND: {backend_name!r} "
+        "(supported: claude, codex, pi, opencode)"
     )
 
 
@@ -141,6 +152,15 @@ def check_pi_cli() -> None:
     if not shutil.which("pi"):
         raise _exit(f"pi CLI not found. Install it: {_AGENT_INSTALL_HINTS['pi']}")
     logger.info("pi CLI: ok")
+
+
+def check_opencode_cli() -> None:
+    """Verify opencode CLI is installed. Auth is checked at first use."""
+    if not shutil.which("opencode"):
+        raise _exit(
+            f"opencode CLI not found. Install it: {_AGENT_INSTALL_HINTS['opencode']}"
+        )
+    logger.info("opencode CLI: ok")
 
 
 def check_ollama_mode(agent_name: str = "claude") -> None:

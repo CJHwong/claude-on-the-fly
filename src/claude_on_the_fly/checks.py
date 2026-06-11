@@ -58,10 +58,12 @@ BACKEND_ENV_VARS: tuple[str, ...] = (
     "CLAUDE_MODE",
     "CODEX_MODE",
     "PI_MODE",
+    "OPENCODE_MODE",
     "OLLAMA_MODEL",
     "CLAUDE_MODEL",
     "CODEX_MODEL",
     "PI_MODEL",
+    "OPENCODE_MODEL",
     "PI_PROVIDER",
 )
 
@@ -229,7 +231,7 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
 # Backend (CLI selection) env checks
 # ---------------------------------------------------------------------------
 
-_VALID_BACKENDS = ("claude", "codex", "pi")
+_VALID_BACKENDS = ("claude", "codex", "pi", "opencode")
 _VALID_MODES = ("native", "ollama")
 # claude-pty is claude-only; codex has no equivalent wrapper.
 _VALID_CLAUDE_MODES = ("native", "ollama", "pty")
@@ -245,7 +247,7 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
                 name="AGENT_BACKEND",
                 status="invalid",
                 detail=f"{backend!r} (supported: {', '.join(_VALID_BACKENDS)})",
-                fix_hint="Set AGENT_BACKEND=claude or codex",
+                fix_hint=f"Set AGENT_BACKEND to one of: {', '.join(_VALID_BACKENDS)}",
             )
         )
         return results
@@ -318,6 +320,8 @@ def check_binaries(env: Mapping[str, str]) -> list[CheckResult]:
         results.append(
             _which("pi", "Install: https://github.com/earendil-works/pi-coding-agent")
         )
+    elif backend == "opencode":
+        results.append(_which("opencode", "Install: https://opencode.ai"))
 
     mode = env.get(f"{backend.upper()}_MODE", "native").lower()
     if mode == "ollama":

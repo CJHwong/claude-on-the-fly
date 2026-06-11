@@ -10,7 +10,15 @@ import pytest
 @pytest.fixture
 def clear_backend_env(monkeypatch):
     """Strip backend-selection env vars so tests start from a clean slate."""
-    for var in ("AGENT_BACKEND", "CLAUDE_MODE", "OLLAMA_MODEL", "CODEX_MODE"):
+    for var in (
+        "AGENT_BACKEND",
+        "CLAUDE_MODE",
+        "OLLAMA_MODEL",
+        "CODEX_MODE",
+        "PI_MODE",
+        "OPENCODE_MODE",
+        "OPENCODE_MODEL",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
