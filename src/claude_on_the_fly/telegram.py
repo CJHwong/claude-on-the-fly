@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -29,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4096
 MEDIA_GROUP_WAIT = 0.5
+# Telegram's sendPhoto only rasterizes these. SVG and everything else must go
+# as a document or it 400s with Image_process_failed.
+PHOTO_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 # Persists the current /new session token per chat so a restart resumes the
 # session the user was last on, instead of snapping back to the base session.
 # Base sessions (no token) need no entry — their UUID is deterministic.
@@ -140,9 +144,9 @@ class TelegramFrontend(Frontend):
 
     # --- Sending ---
 
-    async def send(self, chat_id: int, response: Response) -> None:
+    async def send(self, chat_id: int, response: Response) -> list[Path] | None:
         if not self._app:
-            return
+            return []
         text = response.body
         stats, tools = footer_parts(response, "telegram")
         if stats:
@@ -151,6 +155,47 @@ class TelegramFrontend(Frontend):
             text = f"{text}\n_{tools}_"
         logger.info("chat %s => %s", chat_id, text[:80])
         await self._send_chunked(chat_id, text)
+        await self._send_attachments(chat_id, response.attachments)
+        return response.attachments
+
+    async def _send_attachments(self, chat_id: int, attachments: list[Path]) -> None:
+        """Send outbox files: raster images as photos, everything else as
+        documents. Falls back to a document if a photo send is rejected (e.g.
+        Telegram can't rasterize the file). Reads each file off the event loop;
+        logs and continues per-file."""
+        if not self._app:
+            return
+        for path in attachments:
+            kind, _ = mimetypes.guess_type(path.name)
+            try:
+                data = await asyncio.to_thread(path.read_bytes)
+                if kind in PHOTO_MIME_TYPES and await self._try_send_photo(
+                    chat_id, path, data
+                ):
+                    logger.info("sent file %s to chat %s", path.name, chat_id)
+                    continue
+                await self._app.bot.send_document(
+                    chat_id=chat_id, document=data, filename=path.name
+                )
+                logger.info("sent file %s to chat %s", path.name, chat_id)
+            except Exception as exc:
+                logger.error("send: failed to send file %s: %s", path.name, exc)
+
+    async def _try_send_photo(self, chat_id: int, path: Path, data: bytes) -> bool:
+        """Attempt a photo send with the already-read bytes. Returns False (so
+        the caller falls back to a document) when Telegram rejects it."""
+        if not self._app:
+            return False
+        try:
+            await self._app.bot.send_photo(chat_id=chat_id, photo=data)
+            return True
+        except BadRequest as exc:
+            logger.warning(
+                "send: %s rejected as photo (%s), retrying as document",
+                path.name,
+                exc,
+            )
+            return False
 
     async def send_typing(self, chat_id: int) -> None:
         if self._app:

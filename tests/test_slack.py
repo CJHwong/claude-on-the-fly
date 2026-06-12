@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
@@ -578,6 +579,100 @@ class TestSend:
 
         blocks = frontend._app.client.chat_postMessage.call_args[1]["blocks"]
         assert not any(b["type"] == "context" for b in blocks)
+
+    async def test_no_upload_when_no_attachments(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        frontend._app.client.files_upload_v2 = AsyncMock()
+
+        await frontend.send(session_id, Response(body="hi"))
+        frontend._app.client.files_upload_v2.assert_not_awaited()
+
+    async def test_uploads_attachments_in_thread(self, frontend, tmp_path):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        frontend._app.client.files_upload_v2 = AsyncMock(return_value={"files": []})
+        report = tmp_path / "report.csv"
+        report.write_text("data")
+
+        await frontend.send(session_id, Response(body="hi", attachments=[report]))
+
+        call = frontend._app.client.files_upload_v2.call_args[1]
+        assert call["channel"] == "C1"
+        assert call["thread_ts"] == "t1"
+        # File bytes are read off the event loop and passed as content, not a path.
+        assert call["file"] == b"data"
+        assert call["filename"] == "report.csv"
+
+    async def test_returns_attachments_only_when_text_post_succeeds(
+        self, frontend, tmp_path
+    ):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.files_upload_v2 = AsyncMock(return_value={"files": []})
+        report = tmp_path / "report.csv"
+        report.write_text("data")
+
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        delivered = await frontend.send(
+            session_id, Response(body="hi", attachments=[report])
+        )
+        assert delivered == [report]
+
+    async def test_returns_empty_when_text_post_fails(self, frontend, tmp_path):
+        # The orchestrator archives whatever send() returns; a failed text post
+        # must report nothing so the un-uploaded file isn't archived/lost.
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=Exception("boom"))
+        frontend._app.client.files_upload_v2 = AsyncMock()
+        report = tmp_path / "report.csv"
+        report.write_text("data")
+
+        delivered = await frontend.send(
+            session_id, Response(body="hi", attachments=[report])
+        )
+        assert delivered == []
+        frontend._app.client.files_upload_v2.assert_not_awaited()
+
+    async def test_records_upload_share_ts_as_echo_guard(self, frontend, tmp_path):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        frontend._app.client.files_upload_v2 = AsyncMock(
+            return_value={"files": [{"shares": {"private": {"C1": [{"ts": "55.5"}]}}}]}
+        )
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+
+        await frontend.send(session_id, Response(body="hi", attachments=[f]))
+        assert "55.5" in frontend._our_sent_timestamps
+
+    async def test_upload_failure_posts_notice_and_does_not_raise(
+        self, frontend, tmp_path
+    ):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        frontend._app.client.files_upload_v2 = AsyncMock(
+            side_effect=SlackApiError(
+                "no scope", {"ok": False, "error": "missing_scope"}
+            )
+        )
+        report = tmp_path / "report.csv"
+        report.write_text("x")
+
+        await frontend.send(session_id, Response(body="hi", attachments=[report]))
+
+        notices = [
+            c
+            for c in frontend._app.client.chat_postMessage.call_args_list
+            if "missing_scope" in (c.kwargs.get("text") or "")
+        ]
+        assert len(notices) == 1
+        assert notices[0].kwargs["thread_ts"] == "t1"
 
 
 # ---------------------------------------------------------------------------

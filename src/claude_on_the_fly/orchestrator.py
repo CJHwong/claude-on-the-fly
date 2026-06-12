@@ -152,7 +152,11 @@ class Orchestrator:
                 response.tokens_in,
                 response.tokens_out,
             )
-            await self._frontend.send(chat_id, response)
+            if self._platform in agent.ATTACHMENT_PLATFORMS:
+                response.attachments = agent.collect_outbox(workspace)
+            delivered = await self._frontend.send(chat_id, response)
+            if delivered:
+                agent.archive_outbox(workspace, delivered)
             self._event_log.append(
                 EVENT_WORKER_DONE,
                 source=self._platform,

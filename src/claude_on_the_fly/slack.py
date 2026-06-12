@@ -13,6 +13,7 @@ import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from typing import Awaitable, Callable
 
@@ -504,11 +505,11 @@ class SlackFrontend(Frontend):
 
     # --- Sending ---
 
-    async def send(self, chat_id: int, response: Response) -> None:
+    async def send(self, chat_id: int, response: Response) -> list[Path] | None:
         route = self._sessions.get(chat_id)
         if not route:
             logger.error("No channel found for session %s", chat_id)
-            return
+            return []
         channel, thread_ts = route
         logger.info("slack %s/%s => %s", channel, thread_ts, response.body[:80])
 
@@ -525,20 +526,80 @@ class SlackFrontend(Frontend):
             error = exc.response.get("error", "unknown_error")
             logger.error("send: slack api error %s: %s", error, exc)
             if error in _FALLBACK_ERRORS:
-                await self._fallback_dm(chat_id, response, channel, error)
-            return
+                return await self._fallback_dm(chat_id, response, channel, error)
+            return []
         except Exception as exc:
             logger.error("send: failed to post message: %s", exc)
-            return
+            return []
 
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
             logger.debug("send: ok ts=%s", resp["ts"])
-            return
+            await self._upload_attachments(channel, thread_ts, response.attachments)
+            return response.attachments
         error = resp.get("error", "unknown_error")
         logger.warning("send: slack responded not ok: %s", resp)
         if error in _FALLBACK_ERRORS:
-            await self._fallback_dm(chat_id, response, channel, error)
+            return await self._fallback_dm(chat_id, response, channel, error)
+        return []
+
+    async def _upload_attachments(
+        self, channel: str, thread_ts: str | None, attachments: list[Path]
+    ) -> None:
+        """Upload outbox files into the same thread. On a per-file failure, log
+        and continue so one bad file doesn't drop the rest, then post one
+        in-thread heads-up so the user isn't left guessing. A missing files:write
+        scope surfaces here as `missing_scope` and is shown to the user."""
+        failures: list[str] = []
+        for path in attachments:
+            try:
+                data = await asyncio.to_thread(path.read_bytes)
+                resp = await self._app.client.files_upload_v2(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    file=data,
+                    filename=path.name,
+                )
+            except SlackApiError as exc:
+                code = exc.response.get("error", "unknown_error")
+                logger.error("upload: failed to send %s: %s", path.name, code)
+                failures.append(f"{path.name} (`{code}`)")
+                continue
+            except Exception as exc:
+                logger.error("upload: failed to send %s: %s", path.name, exc)
+                failures.append(path.name)
+                continue
+            self._record_upload_ts(resp)
+            logger.info("uploaded %s to %s", path.name, channel)
+        if failures:
+            await self._notify_upload_failure(channel, thread_ts, failures)
+
+    async def _notify_upload_failure(
+        self, channel: str, thread_ts: str | None, failures: list[str]
+    ) -> None:
+        """Tell the user in-thread which files couldn't be attached and why,
+        since they can't see the daemon log."""
+        note = "_(couldn't attach " + ", ".join(failures) + ")_"
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, text=note, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("upload: failed to post failure notice: %s", exc)
+            return
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+
+    def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
+        """Record the ts of file-share messages we just posted so our own upload
+        isn't re-ingested as an inbound message (we reply via the user token)."""
+        for f in resp.get("files") or []:
+            for visibility in (f.get("shares") or {}).values():
+                for share_list in visibility.values():
+                    for share in share_list:
+                        ts = share.get("ts")
+                        if ts:
+                            self._our_sent_timestamps.append(ts)
 
     async def send_typing(self, chat_id: int) -> None:
         pass
@@ -610,17 +671,18 @@ class SlackFrontend(Frontend):
 
     async def _fallback_dm(
         self, chat_id: int, response: Response, channel: str, error: str
-    ) -> None:
-        """Deliver a response via DM when the original channel post fails."""
+    ) -> list[Path]:
+        """Deliver a response via DM when the original channel post fails.
+        Returns the attachments actually handed off (empty if the DM failed)."""
         sender_id = self._session_sender_ids.get(chat_id)
         if not sender_id:
             logger.warning(
                 "fallback_dm: no sender_id for session %s, response lost", chat_id
             )
-            return
+            return []
         dm_channel = await self._open_dm_channel(sender_id)
         if not dm_channel:
-            return
+            return []
 
         prefix = (
             f"_(I couldn't post my reply in <#{channel}>: `{error}`. "
@@ -636,16 +698,18 @@ class SlackFrontend(Frontend):
             )
         except Exception as exc:
             logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
-            return
+            return []
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
+            await self._upload_attachments(dm_channel, None, response.attachments)
             logger.info(
                 "fallback_dm: delivered response to %s for session %s",
                 sender_id,
                 chat_id,
             )
-        else:
-            logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
+            return response.attachments
+        logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
+        return []
 
     def _workspace_path(self, session_id: int) -> Path:
         return DATA_DIR / "workspaces" / self.workspace_name(session_id)

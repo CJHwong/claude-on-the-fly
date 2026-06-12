@@ -234,6 +234,103 @@ class TestSendMsg:
 
 
 # ============================================================
+# _send_attachments
+# ============================================================
+
+
+class TestSendAttachments:
+    async def test_image_goes_to_send_photo(
+        self, frontend: TelegramFrontend, tmp_path: Path
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_photo = AsyncMock()
+        frontend._app.bot.send_document = AsyncMock()
+        img = tmp_path / "chart.png"
+        img.write_bytes(b"png")
+
+        await frontend._send_attachments(1, [img])
+
+        frontend._app.bot.send_photo.assert_awaited_once()
+        frontend._app.bot.send_document.assert_not_awaited()
+
+    async def test_svg_goes_to_send_document_not_photo(
+        self, frontend: TelegramFrontend, tmp_path: Path
+    ) -> None:
+        # image/svg+xml is an image MIME but Telegram can't rasterize it.
+        frontend._app = MagicMock()
+        frontend._app.bot.send_photo = AsyncMock()
+        frontend._app.bot.send_document = AsyncMock()
+        svg = tmp_path / "cat.svg"
+        svg.write_text("<svg/>")
+
+        await frontend._send_attachments(1, [svg])
+
+        frontend._app.bot.send_document.assert_awaited_once()
+        frontend._app.bot.send_photo.assert_not_awaited()
+
+    async def test_photo_rejection_falls_back_to_document(
+        self, frontend: TelegramFrontend, tmp_path: Path
+    ) -> None:
+        # Telegram rejects a raster as a photo (e.g. Image_process_failed);
+        # we must still deliver it as a document, not drop it.
+        frontend._app = MagicMock()
+        frontend._app.bot.send_photo = AsyncMock(
+            side_effect=BadRequest("Image_process_failed")
+        )
+        frontend._app.bot.send_document = AsyncMock()
+        img = tmp_path / "chart.png"
+        img.write_bytes(b"png")
+
+        await frontend._send_attachments(1, [img])
+
+        frontend._app.bot.send_photo.assert_awaited_once()
+        frontend._app.bot.send_document.assert_awaited_once()
+        assert (
+            frontend._app.bot.send_document.call_args.kwargs["filename"] == "chart.png"
+        )
+
+    async def test_non_image_goes_to_send_document(
+        self, frontend: TelegramFrontend, tmp_path: Path
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_photo = AsyncMock()
+        frontend._app.bot.send_document = AsyncMock()
+        doc = tmp_path / "report.csv"
+        doc.write_text("data")
+
+        await frontend._send_attachments(1, [doc])
+
+        frontend._app.bot.send_document.assert_awaited_once()
+        assert (
+            frontend._app.bot.send_document.call_args.kwargs["filename"] == "report.csv"
+        )
+        frontend._app.bot.send_photo.assert_not_awaited()
+
+    async def test_failure_logged_and_loop_continues(
+        self, frontend: TelegramFrontend, tmp_path: Path
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_document = AsyncMock(
+            side_effect=[Exception("boom"), None]
+        )
+        first = tmp_path / "a.csv"
+        first.write_text("x")
+        second = tmp_path / "b.csv"
+        second.write_text("y")
+
+        await frontend._send_attachments(1, [first, second])
+        # Both attempted despite the first failing; no exception propagates.
+        assert frontend._app.bot.send_document.await_count == 2
+
+    async def test_noop_when_no_app(
+        self, frontend: TelegramFrontend, tmp_path: Path
+    ) -> None:
+        frontend._app = None
+        # Should not raise.
+        await frontend._send_attachments(1, [tmp_path / "x.txt"])
+
+
+# ============================================================
 # _allowed
 # ============================================================
 

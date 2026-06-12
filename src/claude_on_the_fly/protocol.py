@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from claude_on_the_fly.agent import Response
@@ -19,8 +20,10 @@ class Frontend(ABC):
         """Start listening. Call on_message(chat_id, text) for each incoming message."""
 
     @abstractmethod
-    async def send(self, chat_id: int, response: Response) -> None:
-        """Send a response to the user."""
+    async def send(self, chat_id: int, response: Response) -> list[Path] | None:
+        """Send a response to the user. Return the attachment paths actually
+        handed off for delivery so the caller archives only what was sent;
+        None or [] means nothing was delivered (don't archive)."""
 
     @abstractmethod
     async def send_typing(self, chat_id: int) -> None:

@@ -27,6 +27,7 @@ Messaging-platform adapters (Telegram, Slack, Gmail, scheduler) implement the `F
 - **Persona**: `ensure_persona()` at `src/claude_on_the_fly/agent.py:40` is called per workspace; the new frontend just needs to construct a `Path` workspace and pass it through.
 - **Stats footer**: `stats_mode(platform)` and `footer_parts(response, platform)` in `agent.py` (`agent.py:57`, `agent.py:68`) generate the per-channel footer based on `{TELEGRAM,SLACK,GMAIL}_STATS_MODE` env vars. Add a new var for the new frontend if you want the same control.
 - **Image / file input**: frontends save uploads into the workspace path; the agent reads them through its own file tooling. Don't try to pipe image bytes through the agent CLI.
+- **File output (outbox)**: the agent attaches files by dropping them in `workspace/outbox/`. The orchestrator scans that folder after the run (`agent.collect_outbox`), sets `response.attachments`, lets `send()` upload them, then archives to `outbox/.sent/<ts>/` (`agent.archive_outbox`). This is gated on `agent.ATTACHMENT_PLATFORMS` — the single source of truth that also injects the outbox instruction into the system prompt. To support outbox on a new frontend: add its platform to `ATTACHMENT_PLATFORMS` and have `send()` upload `response.attachments`. Slack uploads via `files_upload_v2` and must record the share `ts` (echo guard, since it posts as the user); Telegram routes images to `send_photo`, else `send_document`.
 
 ## Scheduler is a frontend too
 

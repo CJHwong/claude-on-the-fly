@@ -32,8 +32,9 @@ class StubFrontend(Frontend):
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         pass
 
-    async def send(self, chat_id: int, response: Response) -> None:
+    async def send(self, chat_id: int, response: Response) -> list[Path] | None:
         self.sent.append((chat_id, response))
+        return response.attachments
 
     async def send_typing(self, chat_id: int) -> None:
         self.typing_sent.append(chat_id)
@@ -395,6 +396,72 @@ class TestProcess:
         await asyncio.sleep(0.05)
         # If typing_task leaked we'd see ongoing send_typing calls; this is
         # covered implicitly by no hanging tasks.
+
+    async def test_attaches_and_archives_outbox_for_attachment_platform(
+        self, frontend: StubFrontend, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        outbox = tmp_path / "workspaces" / "test/1" / "outbox"
+        outbox.mkdir(parents=True)
+        (outbox / "report.csv").write_text("data")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
+        ):
+            await orch._process(1, "make a file")
+
+        sent = frontend.sent[0][1]
+        assert [p.name for p in sent.attachments] == ["report.csv"]
+        assert not (outbox / "report.csv").exists()  # archived, not left behind
+        assert list((outbox / ".sent").rglob("report.csv"))
+
+    async def test_does_not_archive_when_send_reports_nothing_delivered(
+        self, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        # If send() couldn't deliver (e.g. text post failed), the file must stay
+        # in outbox for a retry, not get archived out from under the user.
+        from claude_on_the_fly import agent
+
+        class UndeliveredFrontend(StubFrontend):
+            async def send(self, chat_id, response):
+                self.sent.append((chat_id, response))
+                return []
+
+        frontend = UndeliveredFrontend()
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        outbox = tmp_path / "workspaces" / "test/1" / "outbox"
+        outbox.mkdir(parents=True)
+        (outbox / "report.csv").write_text("data")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
+        ):
+            await orch._process(1, "make a file")
+
+        assert (outbox / "report.csv").exists()  # preserved for retry
+        assert not (outbox / ".sent").exists()  # nothing archived
+
+    async def test_skips_outbox_for_non_attachment_platform(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        outbox = tmp_path / "workspaces" / "test/1" / "outbox"
+        outbox.mkdir(parents=True)
+        (outbox / "report.csv").write_text("data")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
+        ):
+            await orch._process(1, "hi")
+
+        assert frontend.sent[0][1].attachments == []
+        assert (outbox / "report.csv").exists()  # untouched
 
 
 # ---------------------------------------------------------------------------
