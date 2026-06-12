@@ -391,7 +391,12 @@ class TestResume:
         monkeypatch.delenv("SLACK_USER_TOKEN", raising=False)
         popen = MagicMock(return_value=MagicMock(pid=4242))
 
-        results = supervisor.resume(popen_factory=popen, wait_for_heartbeat=False)
+        # env_file=None so preflight reads only the monkeypatched env, not the
+        # developer's real ~/.claude-on-the-fly/.env, which may define SLACK_*
+        # and would mask the intended "slack has nothing" case.
+        results = supervisor.resume(
+            env_file=None, popen_factory=popen, wait_for_heartbeat=False
+        )
 
         by_name = {r[0]: r for r in results}
         assert by_name["telegram"][2] is None  # success
