@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,93 @@ MEMORY_DIR = DATA_DIR / "memory"
 MEMORY_ROOT = str(MEMORY_DIR)
 KNOWLEDGE_DIR = str(MEMORY_DIR / "knowledge")
 PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text()
+
+# Frontends that can upload files back to the user. Single source of truth for
+# both the outbox prompt instruction and the orchestrator scan/archive.
+ATTACHMENT_PLATFORMS = frozenset({"slack", "telegram"})
+OUTBOX_DIRNAME = "outbox"
+OUTBOX_ARCHIVE = ".sent"
+MAX_ATTACHMENTS = 10
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+OUTBOX_INSTRUCTION = (
+    "<IMPORTANT>\n"
+    "You CAN send files to the user, not only text. To deliver a file (a report, "
+    "image, export, generated document, screenshot, anything), write or copy it "
+    "into this exact directory before you finish (create it if missing):\n"
+    "  {outbox_dir}\n"
+    "Use that absolute path, not a relative `outbox/` — your shell's working "
+    "directory may differ. Everything left in that directory is uploaded to the "
+    "user along with your reply. When the user asks for a file, deliver it this "
+    "way. Do NOT tell the user you can only send text or cannot attach files, that "
+    "is false. Keep scratch and working files out of it.\n"
+    "If you have several files to deliver, zip them into a single archive and drop "
+    "that in instead, so the user gets one file rather than a flood of separate "
+    "uploads. A lone file goes in as-is.\n"
+    "</IMPORTANT>"
+)
+
+
+def collect_outbox(workspace: Path) -> list[Path]:
+    """Files the agent left in workspace/outbox to attach to the reply.
+
+    Only regular files directly under outbox/ — skips the archive dir, subdirs,
+    and dotfiles. Sorted by name for a deterministic order. Enforces count/size
+    caps and logs every skip; nothing is dropped silently.
+    """
+    outbox = workspace / OUTBOX_DIRNAME
+    if not outbox.is_dir():
+        return []
+    files = sorted(
+        p for p in outbox.iterdir() if p.is_file() and not p.name.startswith(".")
+    )
+    collected: list[Path] = []
+    for index, path in enumerate(files):
+        if len(collected) >= MAX_ATTACHMENTS:
+            dropped = ", ".join(p.name for p in files[index:])
+            logger.warning(
+                "outbox: %d-file cap hit, not sending %d file(s): %s",
+                MAX_ATTACHMENTS,
+                len(files) - index,
+                dropped,
+            )
+            break
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            logger.warning("outbox: cannot stat %s, skipping: %s", path.name, exc)
+            continue
+        if size > MAX_ATTACHMENT_BYTES:
+            logger.warning(
+                "outbox: skipping %s (%d bytes exceeds %d cap)",
+                path.name,
+                size,
+                MAX_ATTACHMENT_BYTES,
+            )
+            continue
+        collected.append(path)
+    return collected
+
+
+def archive_outbox(workspace: Path, files: list[Path]) -> None:
+    """Move handed-off outbox files into outbox/.sent/<timestamp>/.
+
+    Keeps the files on disk (never deletes) so an upload failure isn't silent
+    data loss, while emptying outbox/ so they don't re-send on the next turn.
+    """
+    if not files:
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    archive = workspace / OUTBOX_DIRNAME / OUTBOX_ARCHIVE / stamp
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("outbox: cannot create archive dir %s: %s", archive, exc)
+        return
+    for path in files:
+        try:
+            shutil.move(str(path), str(archive / path.name))
+        except OSError as exc:
+            logger.warning("outbox: failed to archive %s: %s", path.name, exc)
 
 
 def _link_persona(source: Path, target: Path) -> None:
@@ -101,10 +189,18 @@ FORMAT_HINTS = {
 
 
 def build_system_prompt(
-    platform: str, user_name: str, channel_context: str = "dm"
+    platform: str,
+    user_name: str,
+    channel_context: str = "dm",
+    workspace: Path | None = None,
 ) -> str:
+    if platform in ATTACHMENT_PLATFORMS and workspace is not None:
+        outbox = OUTBOX_INSTRUCTION.format(outbox_dir=workspace / OUTBOX_DIRNAME)
+    else:
+        outbox = ""
     return PROMPT_TEMPLATE.format(
         format_hint=FORMAT_HINTS.get(platform, FORMAT_HINTS["telegram"]),
+        outbox_instruction=outbox,
         user_name=user_name,
         channel_context=channel_context,
         memory_root=MEMORY_ROOT,
@@ -117,6 +213,7 @@ class Response:
     """Structured response from the agent."""
 
     body: str
+    attachments: list[Path] = field(default_factory=list)
     cost: float = 0
     duration: float = 0
     tokens_in: int = 0

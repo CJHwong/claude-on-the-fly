@@ -214,7 +214,9 @@ class PiBackend:
             workspace,
         )
 
-        system_prompt = build_system_prompt(platform, user_name, channel_context)
+        system_prompt = build_system_prompt(
+            platform, user_name, channel_context, workspace
+        )
 
         # pi's --system-prompt flag converts to a "developer" role message
         # which some providers (ollama, openai-compatible) don't support.

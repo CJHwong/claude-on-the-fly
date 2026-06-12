@@ -115,7 +115,9 @@ class ClaudeBackend:
             channel_context,
             workspace,
         )
-        system_prompt = build_system_prompt(platform, user_name, channel_context)
+        system_prompt = build_system_prompt(
+            platform, user_name, channel_context, workspace
+        )
         # --system-prompt is only attached when (re-)establishing a session; a
         # healthy --resume reuses the prompt already persisted in the session.
         sysprompt_args = ["--system-prompt", system_prompt]

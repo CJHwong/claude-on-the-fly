@@ -171,7 +171,9 @@ class CodexBackend:
             user_payload = transcript.prepend_latest_handoff(
                 workspace, prompt, exclude_uuid=session_uuid
             )
-            system_prompt = build_system_prompt(platform, user_name, channel_context)
+            system_prompt = build_system_prompt(
+                platform, user_name, channel_context, workspace
+            )
             composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"
 
         # `ollama launch codex` already invokes the codex binary; repeating

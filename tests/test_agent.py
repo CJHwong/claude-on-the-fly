@@ -12,12 +12,18 @@ import pytest
 
 from claude_on_the_fly.agent import (
     FORMAT_HINTS,
+    MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_BYTES,
     NUDGE_PROMPT,
+    OUTBOX_ARCHIVE,
+    OUTBOX_DIRNAME,
     ClaudeUnavailableError,
     OllamaLauncher,
     Response,
     _classify,
+    archive_outbox,
     build_system_prompt,
+    collect_outbox,
     current_backend_key,
     ensure_persona,
     _exec,
@@ -253,6 +259,90 @@ class TestBuildSystemPrompt:
         assert "{channel_context}" not in result
         assert "{memory_root}" not in result
         assert "{knowledge_dir}" not in result
+        assert "{outbox_instruction}" not in result
+
+    def test_outbox_names_absolute_dir_for_attachment_platforms(self, tmp_path: Path):
+        for platform in ("slack", "telegram"):
+            result = build_system_prompt(platform, "hoss", "dm", tmp_path)
+            assert str(tmp_path / OUTBOX_DIRNAME) in result
+            assert "You CAN send files" in result
+            assert "{outbox_dir}" not in result  # placeholder fully substituted
+
+    def test_outbox_instruction_absent_for_non_attachment_platforms(
+        self, tmp_path: Path
+    ):
+        for platform in ("gmail", "symphony", "discord"):
+            result = build_system_prompt(platform, "hoss", "dm", tmp_path)
+            assert "You CAN send files" not in result
+
+    def test_outbox_instruction_absent_without_workspace(self):
+        # Can't name the absolute dir with no workspace, so don't inject it.
+        result = build_system_prompt("telegram", "hoss", "dm")
+        assert "You CAN send files" not in result
+
+
+# ---------------------------------------------------------------------------
+# collect_outbox / archive_outbox
+# ---------------------------------------------------------------------------
+
+
+class TestCollectOutbox:
+    def test_no_outbox_dir_returns_empty(self, tmp_path: Path):
+        assert collect_outbox(tmp_path) == []
+
+    def test_collects_regular_files_sorted_by_name(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        (outbox / "b.txt").write_text("b")
+        (outbox / "a.txt").write_text("a")
+        result = collect_outbox(tmp_path)
+        assert [p.name for p in result] == ["a.txt", "b.txt"]
+
+    def test_skips_dotfiles_subdirs_and_archive(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        (outbox / "keep.txt").write_text("x")
+        (outbox / ".hidden").write_text("x")
+        (outbox / "sub").mkdir()
+        (outbox / OUTBOX_ARCHIVE).mkdir()
+        (outbox / OUTBOX_ARCHIVE / "old.txt").write_text("x")
+        result = collect_outbox(tmp_path)
+        assert [p.name for p in result] == ["keep.txt"]
+
+    def test_skips_oversize_file(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        (outbox / "small.txt").write_text("x")
+        (outbox / "big.bin").write_bytes(b"0" * (MAX_ATTACHMENT_BYTES + 1))
+        result = collect_outbox(tmp_path)
+        assert [p.name for p in result] == ["small.txt"]
+
+    def test_enforces_count_cap(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        for i in range(MAX_ATTACHMENTS + 3):
+            (outbox / f"f{i:02d}.txt").write_text("x")
+        result = collect_outbox(tmp_path)
+        assert len(result) == MAX_ATTACHMENTS
+
+
+class TestArchiveOutbox:
+    def test_empty_list_is_noop(self, tmp_path: Path):
+        archive_outbox(tmp_path, [])
+        assert not (tmp_path / OUTBOX_DIRNAME / OUTBOX_ARCHIVE).exists()
+
+    def test_moves_files_into_archive_and_empties_outbox(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        f = outbox / "report.csv"
+        f.write_text("data")
+        archive_outbox(tmp_path, [f])
+        assert not f.exists()
+        archived = list((outbox / OUTBOX_ARCHIVE).rglob("report.csv"))
+        assert len(archived) == 1
+        assert archived[0].read_text() == "data"
+        # A fresh scan finds nothing left to re-send.
+        assert collect_outbox(tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
