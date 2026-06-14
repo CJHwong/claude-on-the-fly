@@ -19,6 +19,7 @@ from typing import Awaitable, Callable
 
 from claude_on_the_fly.agent import Response, footer_parts
 from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def _split_blocks(text: str) -> list[str]:
 def _build_response_blocks(body: str, response: Response) -> list[dict]:
     """Render a Response as Slack block-kit: section chunks + stats/tools context."""
     blocks: list[dict] = []
-    for chunk in _split_blocks(body):
+    for chunk in _split_blocks(to_mrkdwn(body)):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
     stats, tools = footer_parts(response, "slack")
     if stats:

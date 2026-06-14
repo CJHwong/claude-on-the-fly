@@ -8,6 +8,7 @@ dependencies = [
     "aiohttp>=3.13.3",
     "croniter>=2.0.0",
     "httpx>=0.28.1",
+    "markdown-it-py>=3.0.0",
     "python-dotenv>=1.2.2",
     "python-liquid>=2.1.0",
     "python-telegram-bot>=22.7",

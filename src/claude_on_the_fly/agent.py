@@ -171,10 +171,8 @@ FORMAT_HINTS = {
         "Do NOT use # headings or --- dividers."
     ),
     "slack": (
-        "Format responses using Slack mrkdwn: "
-        "*bold*, _italic_, `inline code`, ```code blocks```, - for lists. "
-        "Do NOT use # headings, --- dividers, or ** for bold. "
-        "For tables, use code blocks - Slack mrkdwn has no table syntax."
+        "Write normal Markdown (**bold**, # headings, tables, lists, "
+        "```code```). It is converted to Slack formatting on delivery."
     ),
     "gmail": (
         "Format responses as plain text. No markdown, no HTML. "
