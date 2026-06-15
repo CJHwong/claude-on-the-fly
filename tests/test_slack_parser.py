@@ -449,7 +449,10 @@ class TestRenderForward:
 # ---------------------------------------------------------------------------
 
 
-def _make_frontend() -> SlackFrontend:
+def _make_frontend(
+    allowed_user_ids: set[str] | None = None,
+    allowed_bot_ids: set[str] | None = None,
+) -> SlackFrontend:
     with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
         mock_app = MagicMock()
         mock_app.client = MagicMock()
@@ -458,7 +461,8 @@ def _make_frontend() -> SlackFrontend:
             app_token="xapp-fake",
             user_token="xoxp-fake",
             user_id="UBOT",
-            allowed_user_ids={"*"},
+            allowed_user_ids=allowed_user_ids or {"*"},
+            allowed_bot_ids=allowed_bot_ids,
         )
     fe._on_message = AsyncMock()
     # short-circuit helpers that would hit the network
@@ -832,3 +836,72 @@ class TestThreadContextFetch:
         _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
         assert 'author="github-bot"' in payload
         assert "PR opened" in payload
+
+
+# ---------------------------------------------------------------------------
+# _ingest_event trusted-bot handling (HubSpot / Jira app posts)
+# ---------------------------------------------------------------------------
+
+
+def _bot_event(bot_id: str = "B07JPABE2", **overrides) -> dict:
+    """A real-shaped bot_message: no user field, empty text, content in attachments."""
+    event = {
+        "type": "message",
+        "subtype": "bot_message",
+        "text": "",
+        "bot_id": bot_id,
+        "channel": "C07EBTHK6",
+        "channel_type": "channel",
+        "ts": "1781239423.701139",
+        "attachments": [
+            {
+                "id": 1,
+                "fallback": "HubSpot deal moved to Closed Won",
+                "pretext": "HubSpot deal moved to Closed Won",
+                "title": "Acme Corp",
+            }
+        ],
+    }
+    event.update(overrides)
+    return event
+
+
+class TestIngestEventTrustedBot:
+    async def test_trusted_bot_dispatches_with_attachment_content(self):
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        await fe._ingest_event(_bot_event())
+
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+        _, text = fe._on_message.call_args[0]  # type: ignore[union-attr]
+        assert "HubSpot deal moved to Closed Won" in text
+
+    async def test_untrusted_bot_is_skipped(self):
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        await fe._ingest_event(_bot_event(bot_id="B_OTHER"))
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_bot_message_skipped_when_no_bots_allowlisted(self):
+        fe = _make_frontend()  # default: no allowed_bot_ids
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_trusted_bot_in_channel_needs_no_mention(self):
+        # Channel post with no @mention still goes through for a trusted bot.
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_trusted_bot_bypasses_restricted_user_allowlist(self):
+        # sender_id is "" for a bot; a non-"*" user allowlist must not drop it.
+        fe = _make_frontend(
+            allowed_user_ids={"USOMEONE"}, allowed_bot_ids={"B07JPABE2"}
+        )
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_trusted_bot_sender_comes_from_username(self):
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        await fe._ingest_event(_bot_event(username="HubSpot"))
+        assert fe._sender_names[next(iter(fe._sender_names))] == "HubSpot"
+        # never falls back to the human user lookup
+        fe._resolve_sender.assert_not_awaited()  # type: ignore[union-attr]

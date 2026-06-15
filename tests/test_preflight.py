@@ -545,12 +545,14 @@ class TestRunSlack:
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
         monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U1, U2 ,U3")
         monkeypatch.setenv("SLACK_BLOCKED_USER_IDS", "U9, U8")
-        app, user, uid, allowed, blocked = run_slack()
+        monkeypatch.setenv("SLACK_ALLOWED_BOT_IDS", "B1, B2")
+        app, user, uid, allowed, blocked, bots = run_slack()
         assert app == "xapp-abc"
         assert user == "xoxp-abc"
         assert uid == "U123"
         assert allowed == {"U1", "U2", "U3"}
         assert blocked == {"U9", "U8"}
+        assert bots == {"B1", "B2"}
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
@@ -560,7 +562,7 @@ class TestRunSlack:
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
         monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "")
-        _, _, _, allowed, _ = run_slack()
+        _, _, _, allowed, _, _ = run_slack()
         assert allowed == set()
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
@@ -571,7 +573,7 @@ class TestRunSlack:
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
         monkeypatch.delenv("SLACK_ALLOWED_USER_IDS", raising=False)
-        _, _, _, allowed, _ = run_slack()
+        _, _, _, allowed, _, _ = run_slack()
         assert allowed == set()
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
@@ -582,8 +584,19 @@ class TestRunSlack:
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
         monkeypatch.delenv("SLACK_BLOCKED_USER_IDS", raising=False)
-        _, _, _, _, blocked = run_slack()
+        _, _, _, _, blocked, _ = run_slack()
         assert blocked == set()
+
+    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
+    @patch("claude_on_the_fly.preflight.check_claude_cli")
+    def test_missing_bot_ids_yields_empty_set(
+        self, _mock_claude, _mock_arun, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
+        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
+        monkeypatch.delenv("SLACK_ALLOWED_BOT_IDS", raising=False)
+        _, _, _, _, _, bots = run_slack()
+        assert bots == set()
 
 
 # ---------------------------------------------------------------------------

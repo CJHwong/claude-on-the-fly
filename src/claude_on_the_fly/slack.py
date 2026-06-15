@@ -268,6 +268,7 @@ class SlackFrontend(Frontend):
         user_id: str,
         allowed_user_ids: set[str] | None = None,
         blocked_user_ids: set[str] | None = None,
+        allowed_bot_ids: set[str] | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
@@ -275,12 +276,14 @@ class SlackFrontend(Frontend):
         self._allowed_user_ids.add(user_id)
         self._allow_all_senders = "*" in self._allowed_user_ids
         self._blocked_user_ids = blocked_user_ids or set()
+        self._allowed_bot_ids = allowed_bot_ids or set()
         logger.debug(
-            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s",
+            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s, allowed_bot_ids=%s",
             user_id,
             self._allowed_user_ids,
             self._allow_all_senders,
             self._blocked_user_ids,
+            self._allowed_bot_ids,
         )
         self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
         self._handler: AsyncSocketModeHandler | None = None
@@ -326,6 +329,7 @@ class SlackFrontend(Frontend):
             "user_id": self._user_id,
             "allowed_users": allowed or "<none>",
             "blocked_users": ",".join(sorted(self._blocked_user_ids)) or "<none>",
+            "allowed_bots": ",".join(sorted(self._allowed_bot_ids)) or "<none>",
         }
 
     # --- Lifecycle ---
@@ -354,7 +358,16 @@ class SlackFrontend(Frontend):
 
     async def _ingest_event(self, event: dict) -> None:
         subtype = event.get("subtype")
-        if subtype and subtype not in _ALLOWED_SUBTYPES:
+        bot_id = event.get("bot_id", "")
+        # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
+        # no user field. Only let through bots explicitly trusted by bot_id.
+        is_trusted_bot = subtype == "bot_message" and bot_id in self._allowed_bot_ids
+        if subtype == "bot_message":
+            if not is_trusted_bot:
+                logger.debug("skipped: untrusted bot_message bot_id=%s", bot_id)
+                return
+            logger.info("trusted bot_message accepted: bot_id=%s", bot_id)
+        elif subtype and subtype not in _ALLOWED_SUBTYPES:
             logger.debug("skipped: subtype=%s", subtype)
             return
         ts = event.get("ts", "")
@@ -390,23 +403,26 @@ class SlackFrontend(Frontend):
             fwd_refs,
         )
 
-        # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
-        if sender_id in self._blocked_user_ids:
-            logger.debug("skipped: sender %s in blocked_user_ids", sender_id)
-            return
-
-        # Allowlist applies to all channel types, including DMs and group DMs.
-        if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
-            logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
-            return
-
-        # Channels and groups additionally require an @mention.
-        if channel_type in ("channel", "group"):
-            mention = f"<@{self._user_id}>"
-            if mention not in text:
-                logger.debug("skipped: no mention of %s in text", self._user_id)
+        # Trusted bots are already authorized by bot_id and carry no user field,
+        # so the human allow/block and @mention gates don't apply to them.
+        if not is_trusted_bot:
+            # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
+            if sender_id in self._blocked_user_ids:
+                logger.debug("skipped: sender %s in blocked_user_ids", sender_id)
                 return
-            text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
+
+            # Allowlist applies to all channel types, including DMs and group DMs.
+            if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
+                logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
+                return
+
+            # Channels and groups additionally require an @mention.
+            if channel_type in ("channel", "group"):
+                mention = f"<@{self._user_id}>"
+                if mention not in text:
+                    logger.debug("skipped: no mention of %s in text", self._user_id)
+                    return
+                text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
         session_id = _session_key(channel, thread_ts)
         is_new_session = session_id not in self._sessions
@@ -420,7 +436,10 @@ class SlackFrontend(Frontend):
         if is_new_session and is_mid_thread:
             thread_context = await self._fetch_thread_context(channel, thread_ts, ts)
 
-        sender = await self._resolve_sender(event.get("user", "unknown"))
+        if is_trusted_bot:
+            sender = event.get("username") or bot_id or "bot"
+        else:
+            sender = await self._resolve_sender(event.get("user", "unknown"))
         self._sender_names[session_id] = sender
         await self._resolve_session_metadata(
             session_id, sender, channel, channel_type, thread_ts
@@ -895,13 +914,21 @@ def main() -> None:  # pragma: no cover
     from claude_on_the_fly.preflight import run_slack
 
     load_dotenv()
-    app_token, user_token, user_id, allowed_user_ids, blocked_user_ids = run_slack()
+    (
+        app_token,
+        user_token,
+        user_id,
+        allowed_user_ids,
+        blocked_user_ids,
+        allowed_bot_ids,
+    ) = run_slack()
     frontend = SlackFrontend(
         app_token=app_token,
         user_token=user_token,
         user_id=user_id,
         allowed_user_ids=allowed_user_ids,
         blocked_user_ids=blocked_user_ids,
+        allowed_bot_ids=allowed_bot_ids,
     )
     asyncio.run(run(frontend, platform="slack"))
 

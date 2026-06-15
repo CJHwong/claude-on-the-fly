@@ -27,6 +27,8 @@ export SLACK_USER_TOKEN="xoxp-..."
 # export SLACK_ALLOWED_USER_IDS="U111,U222"
 # Or set to "*" to allow any sender to @mention the bot in channels:
 # export SLACK_ALLOWED_USER_IDS="*"
+# Optional: let trusted app/bot posts (HubSpot, Jira) trigger Claude by bot ID:
+# export SLACK_ALLOWED_BOT_IDS="B07JPABE2"
 uv run claude-slack
 ```
 
@@ -34,6 +36,7 @@ uv run claude-slack
 
 - Anyone who DMs you triggers Claude (if they can DM you, they're trusted)
 - In channels, only allowed users (your own ID + `SLACK_ALLOWED_USER_IDS`) can trigger Claude via @mention
+- App/bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID is in `SLACK_ALLOWED_BOT_IDS`; trusted bot posts trigger Claude without an @mention
 - Claude responds as you (via user token) in a thread
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
