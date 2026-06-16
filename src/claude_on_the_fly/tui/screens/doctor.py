@@ -11,6 +11,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Footer, Static
 
 from claude_on_the_fly import checks
+from claude_on_the_fly.tui import supervisor
 from claude_on_the_fly.tui.screens.overlay import OverlayScreen
 
 
@@ -55,6 +56,7 @@ class DoctorScreen(OverlayScreen):
         self._refresh()
 
     def _refresh(self) -> None:
-        all_checks = checks.check_all()
+        env = supervisor._load_env(supervisor.DEFAULT_ENV_FILE)
+        all_checks = checks.check_all(env)
         tables = [_group_table(name, results) for name, results in all_checks.items()]
         self.query_one("#doctor-content", Static).update(Group(*tables))
