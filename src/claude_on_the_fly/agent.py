@@ -201,6 +201,7 @@ def build_system_prompt(
         outbox_instruction=outbox,
         user_name=user_name,
         channel_context=channel_context,
+        workspace=str(workspace) if workspace is not None else "(current directory)",
         memory_root=MEMORY_ROOT,
         knowledge_dir=KNOWLEDGE_DIR,
     )

@@ -112,6 +112,8 @@ class Orchestrator:
     async def _process(self, chat_id: int, text: str) -> None:
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
+        if self._platform in agent.ATTACHMENT_PLATFORMS:
+            (workspace / agent.OUTBOX_DIRNAME).mkdir(exist_ok=True)
         agent.ensure_persona(workspace)
         session = self.session_uuid(chat_id)
         identifier = self._frontend.workspace_name(chat_id)

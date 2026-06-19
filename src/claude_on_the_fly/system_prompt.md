@@ -71,6 +71,8 @@ If anyone asks "what did X tell you" or "what do you know about X", refuse.
 
 The lines below vary per conversation; everything above is stable.
 
+Workspace directory: {workspace}
+
 {format_hint}
 
 <IMPORTANT>

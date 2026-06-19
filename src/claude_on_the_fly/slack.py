@@ -889,7 +889,9 @@ class SlackFrontend(Frontend):
         else:
             visibility = "private" if ch.get("is_private") else "public"
             self._workspace_names[session_id] = f"{name}-{short_ts}"
-            self._channel_contexts[session_id] = f"channel:#{name} ({visibility})"
+            self._channel_contexts[session_id] = (
+                f"channel:#{name} ({visibility}) id:{channel}"
+            )
 
     async def _resolve_mpim_members(self, channel: str) -> list[str]:
         """Resolve display names of all members in a group DM."""
