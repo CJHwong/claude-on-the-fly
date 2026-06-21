@@ -18,6 +18,8 @@ src/claude_on_the_fly/
   pricing.py           # OpenRouter-backed price table (codex)
   logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
+  broker.py            # Loopback credential broker (keeps API keys out of the agent)
+  sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
   protocol.py          # Frontend protocol (add new interfaces here)
   cron.py              # Cron producer daemon — runs shell, enqueues Jobs
   slack.py             # telegram.py
@@ -51,5 +53,6 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/cron.md` — when touching the cron producer, its config schema, or key state
 - `docs/agent/frontend.md` — when adding a new frontend (Slack/Telegram-like)
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
+- `docs/agent/broker.md` — when changing the credential broker or sandbox/jail wiring
 
 When working across multiple areas, read all relevant files first — the subsystems share state through `orchestrator.py` and `agent.py`.
