@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, broker, sandbox
 from claude_on_the_fly.agent import (
     DATA_DIR,
     ClaudeUnavailableError,
@@ -446,6 +446,18 @@ async def run(frontend: Frontend, platform: str) -> None:
 
     _log_settings_summary(platform, frontend)
 
+    # When sandboxing is enabled, the broker holds the real API keys and the
+    # agent reaches them only through loopback. start_default_broker publishes
+    # base-urls into os.environ that sandbox.agent_env forwards to the agent.
+    broker_instance = None
+    if sandbox.enabled():
+        broker_instance = await broker.start_default_broker()
+        logger.info(
+            "sandbox: mode=%s broker=%s",
+            sandbox.mode(),
+            "on" if broker_instance else "none",
+        )
+
     orch = Orchestrator(frontend, platform)
     frontend.set_orchestrator(orch)
 
@@ -468,5 +480,7 @@ async def run(frontend: Frontend, platform: str) -> None:
     await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
     await orch.shutdown()
     await frontend.stop()
+    if broker_instance is not None:
+        await broker_instance.stop()
     with contextlib.suppress(FileNotFoundError):
         heartbeat.path.unlink()

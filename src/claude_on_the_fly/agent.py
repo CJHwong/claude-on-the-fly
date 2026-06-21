@@ -24,6 +24,8 @@ from typing import Protocol
 
 import yaml
 
+from claude_on_the_fly import sandbox
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path.home() / ".claude-on-the-fly"
@@ -571,6 +573,7 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
 
 
 async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -> dict:
+    cmd = sandbox.wrap(cmd, workspace)
     logger.debug(
         "exec: cwd=%s cmd=%s timeout=%s",
         workspace,
@@ -584,6 +587,7 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         cwd=workspace,
         limit=16 * 1024 * 1024,
         start_new_session=True,
+        env=sandbox.agent_env(),
     )
     track_agent_process(proc, cmd)
     try:

@@ -9,7 +9,7 @@ import os
 import shutil
 from pathlib import Path
 
-from claude_on_the_fly import agent, checks, pricing, transcript
+from claude_on_the_fly import agent, checks, pricing, sandbox, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     Compaction,
@@ -682,6 +682,7 @@ async def _exec_pty(
     skill_counts are always empty in pty mode (pty doesn't surface per-turn
     tool_use events).
     """
+    cmd = sandbox.wrap(cmd, workspace)
     logger.debug(
         "exec_pty: cwd=%s cmd=%s timeout=%s",
         workspace,
@@ -695,6 +696,7 @@ async def _exec_pty(
         cwd=workspace,
         limit=16 * 1024 * 1024,
         start_new_session=True,
+        env=sandbox.agent_env(),
     )
     agent.track_agent_process(proc, cmd)
 
