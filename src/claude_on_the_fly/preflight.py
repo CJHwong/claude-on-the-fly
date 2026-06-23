@@ -13,8 +13,6 @@ import logging
 import os
 import shutil
 import subprocess
-from collections.abc import Mapping
-
 import httpx
 
 from claude_on_the_fly import checks
@@ -342,18 +340,11 @@ def run_telegram() -> tuple[str, int]:
     return token, allowed_user_id
 
 
-def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
-    raw = env.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], bool]:
+def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], set[str]]:
     """Validate env vars and tokens.
 
     Returns (app_token, user_token, user_id, allowed_user_ids, blocked_user_ids,
-    allowed_bot_ids, suppress_bot_replies). user_id is resolved from Slack
+    allowed_bot_ids, silent_sender_ids). user_id is resolved from Slack
     auth.test — no need to pass it via env.
     """
     _setup_logging()
@@ -368,16 +359,17 @@ def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], bool]:
     # through and loop. Bot senders must be allowlisted by explicit bot_id.
     bot_raw = os.environ.get("SLACK_ALLOWED_BOT_IDS", "")
     allowed_bot_ids = {bid.strip() for bid in bot_raw.split(",") if bid.strip()}
-    suppress_bot_replies = _env_bool(os.environ, "SLACK_SUPPRESS_BOT_REPLIES", True)
+    silent_raw = os.environ.get("SLACK_SILENT_SENDER_IDS", "")
+    silent_sender_ids = {sid.strip() for sid in silent_raw.split(",") if sid.strip()}
     check_backend()
     user_id = asyncio.run(check_slack(app_token, user_token))
     logger.debug(
-        "preflight: user_id=%s allowed_user_ids=%s blocked_user_ids=%s allowed_bot_ids=%s suppress_bot_replies=%s",
+        "preflight: user_id=%s allowed_user_ids=%s blocked_user_ids=%s allowed_bot_ids=%s silent_sender_ids=%s",
         user_id,
         allowed_user_ids,
         blocked_user_ids,
         allowed_bot_ids,
-        suppress_bot_replies,
+        silent_sender_ids,
     )
     return (
         app_token,
@@ -386,7 +378,7 @@ def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], bool]:
         allowed_user_ids,
         blocked_user_ids,
         allowed_bot_ids,
-        suppress_bot_replies,
+        silent_sender_ids,
     )
 
 

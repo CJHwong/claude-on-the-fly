@@ -269,7 +269,7 @@ class SlackFrontend(Frontend):
         allowed_user_ids: set[str] | None = None,
         blocked_user_ids: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
-        suppress_bot_replies: bool = True,
+        silent_sender_ids: set[str] | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
@@ -278,15 +278,15 @@ class SlackFrontend(Frontend):
         self._allow_all_senders = "*" in self._allowed_user_ids
         self._blocked_user_ids = blocked_user_ids or set()
         self._allowed_bot_ids = allowed_bot_ids or set()
-        self._suppress_bot_replies = suppress_bot_replies
+        self._silent_sender_ids = silent_sender_ids or set()
         logger.debug(
-            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s, allowed_bot_ids=%s, suppress_bot_replies=%s",
+            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s, allowed_bot_ids=%s, silent_sender_ids=%s",
             user_id,
             self._allowed_user_ids,
             self._allow_all_senders,
             self._blocked_user_ids,
             self._allowed_bot_ids,
-            self._suppress_bot_replies,
+            self._silent_sender_ids,
         )
         self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
         self._handler: AsyncSocketModeHandler | None = None
@@ -335,7 +335,7 @@ class SlackFrontend(Frontend):
             "allowed_users": allowed or "<none>",
             "blocked_users": ",".join(sorted(self._blocked_user_ids)) or "<none>",
             "allowed_bots": ",".join(sorted(self._allowed_bot_ids)) or "<none>",
-            "suppress_bot_replies": str(self._suppress_bot_replies).lower(),
+            "silent_senders": ",".join(sorted(self._silent_sender_ids)) or "<none>",
         }
 
     # --- Lifecycle ---
@@ -486,9 +486,10 @@ class SlackFrontend(Frontend):
         final_text = "\n\n".join(segments)
 
         self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
-        self._pending_reply_suppressed.setdefault(session_id, deque()).append(
-            is_trusted_bot and self._suppress_bot_replies
+        silent = bool(bot_id and bot_id in self._silent_sender_ids) or (
+            sender_id in self._silent_sender_ids
         )
+        self._pending_reply_suppressed.setdefault(session_id, deque()).append(silent)
         preview = text[:80] if text else "(forward only)"
         fwd_marker = f" (+{len(forwards)} fwd)" if forwards else ""
         logger.info(
@@ -542,7 +543,7 @@ class SlackFrontend(Frontend):
         channel, thread_ts = route
         if self._in_flight_reply_suppressed.get(chat_id, False):
             logger.info(
-                "slack %s/%s => reply omitted for trusted bot message",
+                "slack %s/%s => reply omitted for silenced sender",
                 channel,
                 thread_ts,
             )
@@ -945,7 +946,7 @@ def main() -> None:  # pragma: no cover
         allowed_user_ids,
         blocked_user_ids,
         allowed_bot_ids,
-        suppress_bot_replies,
+        silent_sender_ids,
     ) = run_slack()
     frontend = SlackFrontend(
         app_token=app_token,
@@ -954,7 +955,7 @@ def main() -> None:  # pragma: no cover
         allowed_user_ids=allowed_user_ids,
         blocked_user_ids=blocked_user_ids,
         allowed_bot_ids=allowed_bot_ids,
-        suppress_bot_replies=suppress_bot_replies,
+        silent_sender_ids=silent_sender_ids,
     )
     asyncio.run(run(frontend, platform="slack"))
 

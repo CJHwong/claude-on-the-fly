@@ -17,7 +17,7 @@
 | `SLACK_ALLOWED_USER_IDS` | no | Extra allowed user IDs (comma-separated). Your own ID is resolved from the user token. Use `*` to allow any sender (applies to channels and DMs) |
 | `SLACK_BLOCKED_USER_IDS` | no | User IDs to deny (comma-separated). Takes priority over the allowlist, so `*` can allow everyone except these |
 | `SLACK_ALLOWED_BOT_IDS` | no | Bot IDs (comma-separated, e.g. `B07JPABE2`) whose app/bot posts trigger Claude — HubSpot, Jira, etc. Bot posts are dropped by default. No `*` wildcard (it would loop on this app's own posts); don't list this app's own bot ID |
-| `SLACK_SUPPRESS_BOT_REPLIES` | no | Whether to omit Slack replies for trusted bot-triggered runs. Default: `true`; set to `false` to reply in-thread |
+| `SLACK_SILENT_SENDER_IDS` | no | Sender IDs (comma-separated) that trigger Claude but get no reply posted back. Accepts bot IDs (`B…`) and user IDs (`U…`). Empty by default, so every triggered run replies |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
 ## Gmail

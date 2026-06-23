@@ -307,7 +307,7 @@ class TestEnvVarDeclarations:
         assert "SLACK_APP_TOKEN" in vars_
         assert "SLACK_USER_TOKEN" in vars_
         assert "SLACK_ALLOWED_BOT_IDS" in vars_
-        assert "SLACK_SUPPRESS_BOT_REPLIES" in vars_
+        assert "SLACK_SILENT_SENDER_IDS" in vars_
 
     def test_gmail_declares_project_and_senders(self):
         vars_ = FRONTEND_ENV_VARS["gmail"]

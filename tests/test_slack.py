@@ -126,9 +126,9 @@ class TestSlackFrontendInit:
         assert frontend._allow_all_senders is True
 
     @patch("claude_on_the_fly.slack.AsyncApp")
-    def test_suppress_bot_replies_defaults_on(self, mock_app_cls):
+    def test_silent_sender_ids_default_empty(self, mock_app_cls):
         frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
-        assert frontend._suppress_bot_replies is True
+        assert frontend._silent_sender_ids == set()
 
     @patch("claude_on_the_fly.slack.AsyncApp")
     def test_no_wildcard_keeps_allow_all_off(self, mock_app_cls):
