@@ -12,9 +12,11 @@ from claude_on_the_fly.slack import (
     _flatten_rich_elements,
     _render_attachment,
     _render_forward,
+    _session_key,
     _text_from_blocks,
     _text_from_primary_blocks,
 )
+from claude_on_the_fly.agent import Response
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +454,7 @@ class TestRenderForward:
 def _make_frontend(
     allowed_user_ids: set[str] | None = None,
     allowed_bot_ids: set[str] | None = None,
+    suppress_bot_replies: bool = True,
 ) -> SlackFrontend:
     with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
         mock_app = MagicMock()
@@ -463,6 +466,7 @@ def _make_frontend(
             user_id="UBOT",
             allowed_user_ids=allowed_user_ids or {"*"},
             allowed_bot_ids=allowed_bot_ids,
+            suppress_bot_replies=suppress_bot_replies,
         )
     fe._on_message = AsyncMock()
     # short-circuit helpers that would hit the network
@@ -905,3 +909,30 @@ class TestIngestEventTrustedBot:
         assert fe._sender_names[next(iter(fe._sender_names))] == "HubSpot"
         # never falls back to the human user lookup
         fe._resolve_sender.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_trusted_bot_reply_is_omitted_by_default(self):
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        fe._app.client.chat_postMessage = AsyncMock()  # type: ignore[invalid-assignment]
+        event = _bot_event()
+
+        await fe._ingest_event(event)
+        session_id = _session_key(event["channel"], event["ts"])
+        await fe.notify_start(session_id)
+        delivered = await fe.send(session_id, Response(body="done"))
+
+        assert delivered == []
+        fe._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_trusted_bot_reply_can_be_enabled(self):
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"}, suppress_bot_replies=False)
+        fe._app.client.chat_postMessage = AsyncMock(  # type: ignore[invalid-assignment]
+            return_value={"ok": True, "ts": "99.0"}
+        )
+        event = _bot_event()
+
+        await fe._ingest_event(event)
+        session_id = _session_key(event["channel"], event["ts"])
+        await fe.notify_start(session_id)
+        await fe.send(session_id, Response(body="done"))
+
+        fe._app.client.chat_postMessage.assert_awaited_once()

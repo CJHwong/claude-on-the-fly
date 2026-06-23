@@ -126,6 +126,11 @@ class TestSlackFrontendInit:
         assert frontend._allow_all_senders is True
 
     @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_suppress_bot_replies_defaults_on(self, mock_app_cls):
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert frontend._suppress_bot_replies is True
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
     def test_no_wildcard_keeps_allow_all_off(self, mock_app_cls):
         frontend = SlackFrontend(
             "xapp-tok", "xoxp-tok", "U_SELF", allowed_user_ids={"U_OTHER"}
@@ -527,6 +532,32 @@ class TestSend:
         blocks = call_kwargs["blocks"]
         assert any(b["type"] == "section" for b in blocks)
         assert any(b["type"] == "context" for b in blocks)
+
+    async def test_suppressed_bot_reply_omits_slack_post(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._in_flight_reply_suppressed[session_id] = True
+
+        delivered = await frontend.send(session_id, Response(body="hi"))
+
+        assert delivered == []
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_suppressed_bot_reply_marks_attachments_handled(
+        self, frontend, tmp_path
+    ):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._in_flight_reply_suppressed[session_id] = True
+        report = tmp_path / "report.csv"
+        report.write_text("data")
+
+        delivered = await frontend.send(
+            session_id, Response(body="hi", attachments=[report])
+        )
+
+        assert delivered == [report]
+        frontend._app.client.chat_postMessage.assert_not_awaited()
 
     async def test_tools_footer_in_context_block(self, frontend, monkeypatch):
         monkeypatch.setenv("SLACK_STATS_MODE", "detailed")

@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 
 import httpx
 
@@ -341,12 +342,19 @@ def run_telegram() -> tuple[str, int]:
     return token, allowed_user_id
 
 
-def run_slack() -> tuple[str, str, str, set[str], set[str], set[str]]:
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], bool]:
     """Validate env vars and tokens.
 
     Returns (app_token, user_token, user_id, allowed_user_ids, blocked_user_ids,
-    allowed_bot_ids). user_id is resolved from Slack auth.test — no need to pass
-    it via env.
+    allowed_bot_ids, suppress_bot_replies). user_id is resolved from Slack
+    auth.test — no need to pass it via env.
     """
     _setup_logging()
     _raise_on_failures(checks.check_slack(os.environ))
@@ -360,14 +368,16 @@ def run_slack() -> tuple[str, str, str, set[str], set[str], set[str]]:
     # through and loop. Bot senders must be allowlisted by explicit bot_id.
     bot_raw = os.environ.get("SLACK_ALLOWED_BOT_IDS", "")
     allowed_bot_ids = {bid.strip() for bid in bot_raw.split(",") if bid.strip()}
+    suppress_bot_replies = _env_bool(os.environ, "SLACK_SUPPRESS_BOT_REPLIES", True)
     check_backend()
     user_id = asyncio.run(check_slack(app_token, user_token))
     logger.debug(
-        "preflight: user_id=%s allowed_user_ids=%s blocked_user_ids=%s allowed_bot_ids=%s",
+        "preflight: user_id=%s allowed_user_ids=%s blocked_user_ids=%s allowed_bot_ids=%s suppress_bot_replies=%s",
         user_id,
         allowed_user_ids,
         blocked_user_ids,
         allowed_bot_ids,
+        suppress_bot_replies,
     )
     return (
         app_token,
@@ -376,6 +386,7 @@ def run_slack() -> tuple[str, str, str, set[str], set[str], set[str]]:
         allowed_user_ids,
         blocked_user_ids,
         allowed_bot_ids,
+        suppress_bot_replies,
     )
 
 

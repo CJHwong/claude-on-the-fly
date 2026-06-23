@@ -269,6 +269,7 @@ class SlackFrontend(Frontend):
         allowed_user_ids: set[str] | None = None,
         blocked_user_ids: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
+        suppress_bot_replies: bool = True,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
@@ -277,13 +278,15 @@ class SlackFrontend(Frontend):
         self._allow_all_senders = "*" in self._allowed_user_ids
         self._blocked_user_ids = blocked_user_ids or set()
         self._allowed_bot_ids = allowed_bot_ids or set()
+        self._suppress_bot_replies = suppress_bot_replies
         logger.debug(
-            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s, allowed_bot_ids=%s",
+            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s, allowed_bot_ids=%s, suppress_bot_replies=%s",
             user_id,
             self._allowed_user_ids,
             self._allow_all_senders,
             self._blocked_user_ids,
             self._allowed_bot_ids,
+            self._suppress_bot_replies,
         )
         self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
         self._handler: AsyncSocketModeHandler | None = None
@@ -304,7 +307,9 @@ class SlackFrontend(Frontend):
         self._pending_msg: dict[
             int, deque[tuple[str, str]]
         ] = {}  # session -> FIFO of (channel, ts)
+        self._pending_reply_suppressed: dict[int, deque[bool]] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
+        self._in_flight_reply_suppressed: dict[int, bool] = {}
 
     def set_orchestrator(self, orchestrator: object) -> None:
         self._orchestrator = orchestrator
@@ -330,6 +335,7 @@ class SlackFrontend(Frontend):
             "allowed_users": allowed or "<none>",
             "blocked_users": ",".join(sorted(self._blocked_user_ids)) or "<none>",
             "allowed_bots": ",".join(sorted(self._allowed_bot_ids)) or "<none>",
+            "suppress_bot_replies": str(self._suppress_bot_replies).lower(),
         }
 
     # --- Lifecycle ---
@@ -480,6 +486,9 @@ class SlackFrontend(Frontend):
         final_text = "\n\n".join(segments)
 
         self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
+        self._pending_reply_suppressed.setdefault(session_id, deque()).append(
+            is_trusted_bot and self._suppress_bot_replies
+        )
         preview = text[:80] if text else "(forward only)"
         fwd_marker = f" (+{len(forwards)} fwd)" if forwards else ""
         logger.info(
@@ -531,6 +540,13 @@ class SlackFrontend(Frontend):
             logger.error("No channel found for session %s", chat_id)
             return []
         channel, thread_ts = route
+        if self._in_flight_reply_suppressed.get(chat_id, False):
+            logger.info(
+                "slack %s/%s => reply omitted for trusted bot message",
+                channel,
+                thread_ts,
+            )
+            return response.attachments
         logger.info("slack %s/%s => %s", channel, thread_ts, response.body[:80])
 
         blocks = _build_response_blocks(response.body, response)
@@ -640,13 +656,19 @@ class SlackFrontend(Frontend):
             logger.debug("notify_start: no pending msg for chat_id=%s", chat_id)
             return
         channel, ts = pending.popleft()
+        suppressed_queue = self._pending_reply_suppressed.get(chat_id)
+        suppress_reply = suppressed_queue.popleft() if suppressed_queue else False
+        if suppressed_queue is not None and not suppressed_queue:
+            self._pending_reply_suppressed.pop(chat_id, None)
         await self._unreact(channel, ts, "hourglass_flowing_sand")
         await self._react(channel, ts, "eyes")
         self._in_flight[chat_id] = (channel, ts)
+        self._in_flight_reply_suppressed[chat_id] = suppress_reply
 
     async def notify_complete(self, chat_id: int) -> None:
         """Remove :eyes: from the in-flight message."""
         in_flight = self._in_flight.pop(chat_id, None)
+        self._in_flight_reply_suppressed.pop(chat_id, None)
         if not in_flight:
             logger.debug("notify_complete: no in-flight msg for chat_id=%s", chat_id)
             return
@@ -923,6 +945,7 @@ def main() -> None:  # pragma: no cover
         allowed_user_ids,
         blocked_user_ids,
         allowed_bot_ids,
+        suppress_bot_replies,
     ) = run_slack()
     frontend = SlackFrontend(
         app_token=app_token,
@@ -931,6 +954,7 @@ def main() -> None:  # pragma: no cover
         allowed_user_ids=allowed_user_ids,
         blocked_user_ids=blocked_user_ids,
         allowed_bot_ids=allowed_bot_ids,
+        suppress_bot_replies=suppress_bot_replies,
     )
     asyncio.run(run(frontend, platform="slack"))
 
