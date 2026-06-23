@@ -221,7 +221,11 @@ class DashboardScreen(Screen):
         # resolves the per-tracker workspace dir.
         self._ticket_sources: dict[str, str] = {}
         # "<frontend>:<identifier>" → session_uuid for the watch pane.
+        # Chat rows key on the unique chat_id (workspace_name is not unique
+        # across concurrent jobs), so the watch pane needs the workspace name
+        # resolved separately: "<frontend>:<chat_id>" → workspace_name.
         self._job_sessions: dict[str, str] = {}
+        self._chat_workspaces: dict[str, str] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
         # Which daemon the lifecycle keys + log row follow for the scheduler /
@@ -736,7 +740,7 @@ class DashboardScreen(Screen):
             if job is not None and job != "__empty__":
                 target = f"schedule:{job}"
         elif name in CHAT_FRONTENDS:
-            # Follow the highlighted request row (key = "<source>:<identifier>")
+            # Follow the highlighted request row (key = "<source>:<chat_id>")
             # so selecting any request tails its own session, not just the
             # first in-flight job for the daemon.
             key = self._datatable_cursor_key("#chat-strip")
@@ -786,21 +790,25 @@ class DashboardScreen(Screen):
         chat workspaces live under `DATA_DIR/workspaces/<frontend>/<user>`.
         The backend itself is agnostic — it just needs (workspace, uuid).
         """
+        key = f"{source}:{identifier}"
         if source == "symphony":
             tracker = self._ticket_sources.get(identifier, "jira")
             workspace = WORKSPACES_ROOT / tracker / sanitize_key(identifier)
+            label = identifier
         else:
-            # `identifier` is the chat workspace_name, e.g. "telegram/H".
-            workspace = DATA_DIR / "workspaces" / identifier
+            # Chat rows key on chat_id; the workspace_name (e.g. "telegram/H")
+            # is resolved from the side map populated by the chat strip.
+            label = self._chat_workspaces.get(key, identifier)
+            workspace = DATA_DIR / "workspaces" / label
 
-        session_uuid = self._job_sessions.get(f"{source}:{identifier}")
+        session_uuid = self._job_sessions.get(key)
         if not session_uuid:
             if force_reload or self._watch_path is not None:
                 self._watch_path = None
                 self._watch_mtime = None
                 pane.clear()
-                pane.write(f"[dim]no session uuid for {identifier} yet[/dim]")
-                header.update(f"[bold]watch: {identifier}[/bold] [dim](pending)[/dim]")
+                pane.write(f"[dim]no session uuid for {label} yet[/dim]")
+                header.update(f"[bold]watch: {label}[/bold] [dim](pending)[/dim]")
             return
 
         # Resolve across backends: the daemon may have run this job under a
@@ -813,11 +821,11 @@ class DashboardScreen(Screen):
                 self._watch_mtime = None
                 pane.clear()
                 pane.write(
-                    f"[dim]no session log yet for {identifier} — "
+                    f"[dim]no session log yet for {label} — "
                     f"agent hasn't run a turn[/dim]"
                 )
                 header.update(
-                    f"[bold]watch: {identifier}[/bold] [dim](no session yet)[/dim]"
+                    f"[bold]watch: {label}[/bold] [dim](no session yet)[/dim]"
                 )
             return
 
@@ -832,7 +840,7 @@ class DashboardScreen(Screen):
 
         self._watch_path = path
         self._watch_mtime = mtime
-        header.update(f"[bold]watch: {identifier}[/bold] [dim]{path.name}[/dim]")
+        header.update(f"[bold]watch: {label}[/bold] [dim]{path.name}[/dim]")
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
         render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
@@ -925,6 +933,7 @@ class DashboardScreen(Screen):
         # Rebuilt every tick from the heartbeat; reset before repopulating.
         self._ticket_sources = {}
         self._job_sessions = {}
+        self._chat_workspaces = {}
 
         self._refresh_symphony(by_name.get("symphony"))
         self._refresh_scheduler(snap, by_name.get("schedule"))
@@ -1137,7 +1146,10 @@ class DashboardScreen(Screen):
         for job in running:
             identifier = str(job.get("identifier", "?"))
             session = job.get("session_uuid")
-            key = f"{selected}:{identifier}"
+            # chat_id is the unique discriminator; workspace_name (identifier)
+            # can repeat when one sender has concurrent jobs across threads.
+            key = f"{selected}:{job.get('chat_id', identifier)}"
+            self._chat_workspaces[key] = identifier
             if session:
                 self._job_sessions[key] = str(session)
             table.add_row(identifier, render.fmt_age(job.get("uptime_s")), key=key)
