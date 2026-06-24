@@ -10,7 +10,9 @@ from slack_sdk.errors import SlackApiError
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
+    CONTINUE_COMMAND,
     SLACK_BLOCK_LIMIT,
+    SLACK_REPLY_SOFT_LIMIT,
     SlackFrontend,
     _session_key,
     _split_blocks,
@@ -1197,3 +1199,129 @@ class TestWorkspacePath:
         fe._workspace_names[42] = "my-ws"
         result = fe._workspace_path(42)
         assert result == Path("/data/workspaces/slack/my-ws")
+
+
+# ---------------------------------------------------------------------------
+# Reply soft-limit gate
+# ---------------------------------------------------------------------------
+
+
+class TestReplySoftLimit:
+    def _dm_event(self, ts: str, text: str) -> dict:
+        return {
+            "ts": ts,
+            "text": text,
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+
+    async def test_gates_inbound_when_over_limit(self, frontend):
+        session_id = _session_key("D1", "200.0")
+        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.0"}
+
+        await frontend._ingest_event(self._dm_event("200.0", "another question"))
+
+        frontend._on_message.assert_not_awaited()
+        warning = frontend._app.client.chat_postMessage.call_args[1]["text"]
+        assert CONTINUE_COMMAND in warning
+
+    async def test_under_limit_processes_normally(self, frontend):
+        session_id = _session_key("D1", "201.0")
+        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT - 1
+
+        await frontend._ingest_event(self._dm_event("201.0", "still going"))
+
+        frontend._on_message.assert_awaited_once()
+
+    async def test_continue_resets_and_processes_remainder(self, frontend):
+        session_id = _session_key("D1", "202.0")
+        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT
+
+        await frontend._ingest_event(
+            self._dm_event("202.0", f"{CONTINUE_COMMAND} now do X")
+        )
+
+        assert frontend._reply_counts[session_id] == 0
+        frontend._on_message.assert_awaited_once()
+        _, text = frontend._on_message.call_args[0]
+        assert "now do X" in text
+        assert CONTINUE_COMMAND not in text
+
+    async def test_bare_continue_resets_and_drops(self, frontend):
+        session_id = _session_key("D1", "203.0")
+        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT
+
+        await frontend._ingest_event(self._dm_event("203.0", CONTINUE_COMMAND))
+
+        assert frontend._reply_counts[session_id] == 0
+        frontend._on_message.assert_not_awaited()
+
+    async def test_send_increments_reply_count(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+
+        await frontend.send(session_id, Response(body="hello"))
+
+        assert frontend._reply_counts[session_id] == 1
+
+
+# ---------------------------------------------------------------------------
+# Session eviction (memory bound)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionEviction:
+    def _dm_event(self, ts: str, thread_ts: str | None = None) -> dict:
+        event = {
+            "ts": ts,
+            "text": "hi",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
+        return event
+
+    async def test_evicts_oldest_over_cap(self, frontend):
+        with patch("claude_on_the_fly.slack.SLACK_SESSION_CAP", 2):
+            for ts in ("300.0", "301.0", "302.0"):
+                await frontend._ingest_event(self._dm_event(ts))
+
+        assert len(frontend._sessions) == 2
+        oldest = _session_key("D1", "300.0")
+        assert oldest not in frontend._sessions
+        assert oldest not in frontend._sender_names
+        assert oldest not in frontend._workspace_names
+        assert oldest not in frontend._channel_contexts
+        assert oldest not in frontend._session_sender_ids
+        assert oldest not in frontend._reply_counts
+
+    async def test_recent_activity_protects_session(self, frontend):
+        with patch("claude_on_the_fly.slack.SLACK_SESSION_CAP", 2):
+            await frontend._ingest_event(self._dm_event("400.0"))
+            await frontend._ingest_event(self._dm_event("401.0"))
+            # Touch the first thread again with a reply, moving it to the back.
+            await frontend._ingest_event(self._dm_event("400.1", thread_ts="400.0"))
+            # A new thread now evicts 401 (the oldest), not the touched 400.
+            await frontend._ingest_event(self._dm_event("402.0"))
+
+        assert _session_key("D1", "400.0") in frontend._sessions
+        assert _session_key("D1", "401.0") not in frontend._sessions
+
+    async def test_forget_session_clears_all_dicts(self, frontend):
+        session_id = 12345
+        frontend._sessions[session_id] = ("D1", "t")
+        frontend._sender_names[session_id] = "hoss"
+        frontend._reply_counts[session_id] = 5
+        frontend._in_flight[session_id] = ("D1", "t")
+
+        frontend._forget_session(session_id)
+
+        assert session_id not in frontend._sessions
+        assert session_id not in frontend._sender_names
+        assert session_id not in frontend._reply_counts
+        assert session_id not in frontend._in_flight

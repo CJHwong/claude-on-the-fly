@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 
 import aiohttp
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path.home() / ".claude-on-the-fly"
 SLACK_BLOCK_LIMIT = 3000
+# Soft cap on agent replies per thread. Once reached, inbound messages are
+# gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
+# counter. Overridable via env for chattier or stricter threads.
+SLACK_REPLY_SOFT_LIMIT = int(os.environ.get("SLACK_REPLY_SOFT_LIMIT", "10"))
+CONTINUE_COMMAND = "/continue"
+# Max live threads whose per-session state we retain. Past this, the
+# least-recently-active thread is evicted; it re-hydrates from scratch if it
+# ever sees another message. Bounds memory in a long-running daemon.
+SLACK_SESSION_CAP = int(os.environ.get("SLACK_SESSION_CAP", "1000"))
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
@@ -292,7 +302,7 @@ class SlackFrontend(Frontend):
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
         self._orchestrator: object | None = None
-        self._sessions: dict[int, tuple[str, str | None]] = {}
+        self._sessions: OrderedDict[int, tuple[str, str | None]] = OrderedDict()
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
         self._processed_ts: deque[str] = deque(maxlen=1000)
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
@@ -310,6 +320,7 @@ class SlackFrontend(Frontend):
         self._pending_reply_suppressed: dict[int, deque[bool]] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
+        self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
 
     def set_orchestrator(self, orchestrator: object) -> None:
         self._orchestrator = orchestrator
@@ -337,6 +348,32 @@ class SlackFrontend(Frontend):
             "allowed_bots": ",".join(sorted(self._allowed_bot_ids)) or "<none>",
             "silent_senders": ",".join(sorted(self._silent_sender_ids)) or "<none>",
         }
+
+    def _evict_stale_sessions(self) -> None:
+        """Drop the least-recently-active threads once over SLACK_SESSION_CAP.
+
+        _sessions is an OrderedDict moved-to-end on every message, so the front
+        is the oldest by last activity. Active threads (in-flight, or replied to
+        recently) sit at the back and are never the eviction candidate.
+        """
+        while len(self._sessions) > SLACK_SESSION_CAP:
+            oldest_id = next(iter(self._sessions))
+            self._forget_session(oldest_id)
+            logger.debug("evicted stale session %s", oldest_id)
+
+    def _forget_session(self, session_id: int) -> None:
+        """Drop every per-session dict entry for one thread. All of this state
+        is reconstructable, so a re-hydrating thread just re-resolves it."""
+        self._sessions.pop(session_id, None)
+        self._workspace_names.pop(session_id, None)
+        self._sender_names.pop(session_id, None)
+        self._channel_contexts.pop(session_id, None)
+        self._session_sender_ids.pop(session_id, None)
+        self._reply_counts.pop(session_id, None)
+        self._pending_msg.pop(session_id, None)
+        self._pending_reply_suppressed.pop(session_id, None)
+        self._in_flight.pop(session_id, None)
+        self._in_flight_reply_suppressed.pop(session_id, None)
 
     # --- Lifecycle ---
 
@@ -434,9 +471,31 @@ class SlackFrontend(Frontend):
         is_new_session = session_id not in self._sessions
         is_mid_thread = bool(event.get("thread_ts")) and event["thread_ts"] != ts
         self._sessions[session_id] = (channel, thread_ts)
+        self._sessions.move_to_end(session_id)
+        self._evict_stale_sessions()
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
+
+        # Reply soft-limit gate. CONTINUE_COMMAND resets the counter and any
+        # trailing text is processed as the next turn; otherwise, once the
+        # thread is over budget we post the warning and stop here (no agent run).
+        stripped = text.strip()
+        if stripped == CONTINUE_COMMAND or stripped.startswith(CONTINUE_COMMAND + " "):
+            self._reply_counts[session_id] = 0
+            text = stripped[len(CONTINUE_COMMAND) :].strip()
+            logger.info(
+                "slack %s/%s: reply count reset via continue", channel, thread_ts
+            )
+        elif self._reply_counts.get(session_id, 0) >= SLACK_REPLY_SOFT_LIMIT:
+            logger.info(
+                "slack %s/%s: reply soft-limit %d reached, gating message",
+                channel,
+                thread_ts,
+                SLACK_REPLY_SOFT_LIMIT,
+            )
+            await self._warn_reply_limit(channel, thread_ts)
+            return
 
         thread_context = ""
         if is_new_session and is_mid_thread:
@@ -571,6 +630,7 @@ class SlackFrontend(Frontend):
 
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
+            self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             logger.debug("send: ok ts=%s", resp["ts"])
             await self._upload_attachments(channel, thread_ts, response.attachments)
             return response.attachments
@@ -623,6 +683,23 @@ class SlackFrontend(Frontend):
             )
         except Exception as exc:
             logger.error("upload: failed to post failure notice: %s", exc)
+            return
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+
+    async def _warn_reply_limit(self, channel: str, thread_ts: str | None) -> None:
+        """Tell the user the thread hit the reply soft-limit and how to resume."""
+        note = (
+            f"Hit the {SLACK_REPLY_SOFT_LIMIT}-message limit for this thread. "
+            f"Reply `{CONTINUE_COMMAND}` to keep going, or "
+            f"`{CONTINUE_COMMAND} <your next message>` to continue and ask in one go."
+        )
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, text=note, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("reply-limit: failed to post warning: %s", exc)
             return
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
@@ -744,6 +821,7 @@ class SlackFrontend(Frontend):
             return []
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
+            self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             await self._upload_attachments(dm_channel, None, response.attachments)
             logger.info(
                 "fallback_dm: delivered response to %s for session %s",
