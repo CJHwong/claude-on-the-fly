@@ -30,7 +30,7 @@ SLACK_BLOCK_LIMIT = 3000
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
 # counter. Overridable via env for chattier or stricter threads.
 SLACK_REPLY_SOFT_LIMIT = int(os.environ.get("SLACK_REPLY_SOFT_LIMIT", "10"))
-CONTINUE_COMMAND = "/continue"
+CONTINUE_COMMAND = "$continue"
 # Max live threads whose per-session state we retain. Past this, the
 # least-recently-active thread is evicted; it re-hydrates from scratch if it
 # ever sees another message. Bounds memory in a long-running daemon.
