@@ -95,6 +95,46 @@ def tail_lines(path: Path, n: int) -> list[str]:
         return []
 
 
+def read_new_lines(path: Path, offset: int | None) -> tuple[list[str], int]:
+    """Read only the complete lines appended to `path` since byte `offset`.
+
+    Powers the dashboard's live-tail panes: instead of re-reading the last N
+    lines every tick, the caller keeps the byte offset it last consumed and
+    only the freshly-appended bytes are read and written. Returns the new
+    lines (no trailing newlines) and the offset to resume from next call.
+
+    - `offset is None` → attach: seek to EOF and return no lines, so the
+      backlog is skipped (the full file stays available in the [l] screen).
+    - `offset > size` → the file was truncated/rotated under us; re-read from
+      the start so the new file's content isn't missed.
+    - A trailing partial line (writer mid-write) is left unconsumed: the offset
+      stops at the last newline, so the rest arrives intact next tick.
+    """
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)  # SEEK_END
+            size = f.tell()
+            if offset is None or offset > size:
+                start = 0 if offset is not None and offset > size else size
+                if start == size:
+                    return [], size
+                offset = start
+            if offset == size:
+                return [], size
+            f.seek(offset)
+            data = f.read(size - offset)
+    except OSError:
+        return [], offset or 0
+    last_newline = data.rfind(b"\n")
+    if last_newline == -1:
+        return [], offset  # no complete line yet; wait for the rest
+    complete = data[: last_newline + 1].decode("utf-8", errors="replace")
+    lines = complete.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines, offset + last_newline + 1
+
+
 def capture_scroll(pane) -> tuple[bool, int]:
     """Snapshot (at_bottom, scroll_y) of a RichLog before a clear()+rewrite, so
     a live update can avoid yanking a reader who scrolled up. Duck-typed on the

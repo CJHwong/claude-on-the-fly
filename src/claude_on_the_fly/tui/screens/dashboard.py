@@ -32,6 +32,7 @@ from a fresh state.snapshot() while preserving each table's cursor by row key.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar, Literal
 
@@ -194,6 +195,13 @@ class DashboardScreen(Screen):
         # Daemon log pane state.
         self._log_path: Path | None = None
         self._log_mtime: float | None = None
+        # Live-tail state, keyed by daemon name. The pane shows only lines
+        # written since you first opened that daemon's log (older history lives
+        # in the [l] screen). `_log_offsets` is the byte position last read;
+        # `_log_buffer` keeps the lines already shown so a tab switch can repaint
+        # them instead of blanking the pane.
+        self._log_offsets: dict[str, int] = {}
+        self._log_buffer: dict[str, deque[str]] = {}
         # Chat frontends currently worth showing (running / broken / ever-run),
         # in display order. Drives the header, the request filter, and the
         # supervisor target. Seeded with all chat frontends so the pre-mount
@@ -688,17 +696,31 @@ class DashboardScreen(Screen):
         self._refresh_watch_pane(force_reload=force_reload)
 
     def _refresh_daemon_log(self, *, force_reload: bool) -> None:
+        """Live-tail the active daemon's log into the dashboard pane.
+
+        Append-only: the pane shows only lines written since you opened that
+        daemon's log, so the 1Hz tick writes the few new bytes instead of
+        re-rendering a 200-line backlog every second; the full history is one
+        keypress away in the [l] Logs screen. The pane can only tail one file,
+        so a tab switch clears it — but the per-daemon resume offset means
+        switching back replays what was logged while you were away rather than
+        starting blank.
+        """
         name = self._active_daemon() or "symphony"
         header = self.query_one("#log-header", Static)
         pane = self.query_one("#log-pane", RichLog)
 
         path = LOG_DIR / f"{name}.log"
+        switched = path != self._log_path
+
         if not path.is_file():
-            if path != self._log_path or force_reload:
+            if switched or force_reload:
                 self._log_path = path
                 self._log_mtime = None
+                self._log_offsets.pop(name, None)
+                self._log_buffer.pop(name, None)
                 pane.clear()
-                pane.write(f"[dim]no log yet at {path}[/dim]")
+                pane.write(Text(f"no log yet at {path}", style="dim"))
                 header.update(f"[dim]log: {path.name} (missing)[/dim]")
             return
 
@@ -707,23 +729,45 @@ class DashboardScreen(Screen):
         except OSError:
             return
 
-        switched = path != self._log_path
-        if not switched and not force_reload and mtime == self._log_mtime:
-            return
+        if switched:
+            # The pane can only show one file: repaint this daemon's last-shown
+            # tail so a tab switch doesn't blank it. First view shows nothing but
+            # the marker (no buffer yet, and the offset below seeks to EOF, so
+            # the pre-open backlog stays hidden — full history is in [l]).
+            self._log_path = path
+            self._log_mtime = None
+            render.begin_scroll_aware_rewrite(pane, stick_to_bottom=True)
+            pane.write(Text("live tail · full log in [l]", style="dim"))
+            for line in self._log_buffer.get(name, ()):
+                pane.write(line)
+            header.update(f"[bold]log: {path.name}[/bold] [dim]· live tail[/dim]")
 
-        self._log_path = path
+        if not switched and not force_reload and mtime == self._log_mtime:
+            return  # same daemon, nothing appended since last tick
         self._log_mtime = mtime
-        header.update(f"[bold]log: {path.name}[/bold]")
-        lines = render.tail_lines(path, TAIL_LINES)
-        was_bottom, prev_y = render.capture_scroll(pane)
-        stick = switched or force_reload or was_bottom
-        render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
-        if not lines:
-            pane.write(f"[dim]({path.name} is empty or unreadable)[/dim]")
+
+        # Append whatever is new since we last read (also catches lines written
+        # while this daemon's tab was in the background). None → first view, so
+        # read_new_lines seeks to EOF and the backlog stays hidden.
+        offset = self._log_offsets.get(name)
+        new_lines, self._log_offsets[name] = render.read_new_lines(path, offset)
+        new_lines = new_lines[-TAIL_LINES:]  # bound a long background catch-up
+        if not new_lines:
             return
-        for line in lines:
-            pane.write(line.rstrip("\n"))
-        if not stick:
+        buffer = self._log_buffer.setdefault(name, deque(maxlen=TAIL_LINES))
+        if switched:
+            # auto_scroll is already on from the repaint above — stay pinned to
+            # the bottom rather than reading a not-yet-settled scroll position.
+            for line in new_lines:
+                buffer.append(line)
+                pane.write(line)
+            return
+        was_bottom, prev_y = render.capture_scroll(pane)
+        pane.auto_scroll = was_bottom  # follow the bottom only if reader was there
+        for line in new_lines:
+            buffer.append(line)
+            pane.write(line)
+        if not was_bottom:
             render.restore_scroll(pane, prev_y=prev_y)
 
     def _refresh_watch_pane(self, *, force_reload: bool) -> None:

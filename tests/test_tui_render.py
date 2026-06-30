@@ -14,6 +14,7 @@ from claude_on_the_fly.tui.render import (
     _format_extra_notes,
     chat_header,
     frontends_table,
+    read_new_lines,
     render_snapshot_json,
     render_snapshot_rich,
     tab_label,
@@ -289,3 +290,47 @@ class TestTailLines:
         p.write_text(f"first\n{big}\nlast\n")
         assert tail_lines(p, 1) == ["last\n"]
         assert tail_lines(p, 2) == [f"{big}\n", "last\n"]
+
+
+class TestReadNewLines:
+    def test_attach_skips_backlog(self, tmp_path: Path) -> None:
+        p = tmp_path / "x.log"
+        p.write_text("old1\nold2\n")
+        # offset=None means "attach": seek to EOF, return nothing, mark offset.
+        lines, offset = read_new_lines(p, None)
+        assert lines == []
+        assert offset == p.stat().st_size
+
+    def test_returns_only_appended(self, tmp_path: Path) -> None:
+        p = tmp_path / "x.log"
+        p.write_text("old\n")
+        _, offset = read_new_lines(p, None)
+        with p.open("a") as f:
+            f.write("new1\nnew2\n")
+        lines, offset = read_new_lines(p, offset)
+        assert lines == ["new1", "new2"]
+        assert offset == p.stat().st_size
+
+    def test_holds_back_partial_line(self, tmp_path: Path) -> None:
+        p = tmp_path / "x.log"
+        p.write_text("a\n")
+        _, offset = read_new_lines(p, None)
+        with p.open("a") as f:
+            f.write("complete\npartial")  # no trailing newline
+        lines, offset = read_new_lines(p, offset)
+        assert lines == ["complete"]
+        # The partial line is consumed only once it's terminated.
+        with p.open("a") as f:
+            f.write(" now done\n")
+        lines, _ = read_new_lines(p, offset)
+        assert lines == ["partial now done"]
+
+    def test_rereads_after_truncation(self, tmp_path: Path) -> None:
+        p = tmp_path / "x.log"
+        p.write_text("line1\nline2\nline3\n")
+        _, offset = read_new_lines(p, None)
+        # Rotation/truncation: file shrinks below our offset.
+        p.write_text("fresh\n")
+        lines, offset = read_new_lines(p, offset)
+        assert lines == ["fresh"]
+        assert offset == p.stat().st_size
