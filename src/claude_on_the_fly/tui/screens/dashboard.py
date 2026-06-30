@@ -437,6 +437,11 @@ class DashboardScreen(Screen):
             return
         for i, key in enumerate(keys):
             if key == previously:
+                # Already there? Don't move — move_cursor emits RowHighlighted
+                # even for a no-op, and the 1Hz refresh would otherwise fire a
+                # spurious highlight (and a log rewrite) every tick.
+                if table.cursor_row == i:
+                    return
                 try:
                     table.move_cursor(row=i)
                 except Exception:
@@ -444,9 +449,11 @@ class DashboardScreen(Screen):
                 return
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        # Reload the log pane immediately when the cursor moves. Moving within
-        # the chat strip also changes which daemon the lifecycle keys target.
-        self._refresh_log(force_reload=True)
+        # Repoint the log pane when the cursor moves. No force_reload: a real
+        # selection change is caught downstream by the path/target-switch checks
+        # (_refresh_daemon_log, _refresh_watch_pane), so a same-file highlight
+        # hits the mtime guard and no-ops instead of rewriting 200+ lines.
+        self._refresh_log()
         self._update_action_cue()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
