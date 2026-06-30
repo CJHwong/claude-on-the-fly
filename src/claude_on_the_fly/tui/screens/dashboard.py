@@ -714,7 +714,11 @@ class DashboardScreen(Screen):
         switched = path != self._log_path
 
         if not path.is_file():
-            if switched or force_reload:
+            # Render the missing state on entry: a switch/force, or a
+            # present→missing transition (we still hold a real mtime because the
+            # file was there last tick). After rendering it once, mtime is None,
+            # so an idle missing pane isn't re-cleared every tick.
+            if switched or force_reload or self._log_mtime is not None:
                 self._log_path = path
                 self._log_mtime = None
                 self._log_offsets.pop(name, None)
@@ -729,7 +733,10 @@ class DashboardScreen(Screen):
         except OSError:
             return
 
-        if switched:
+        if switched or self._log_mtime is None:
+            # Repaint on a tab switch, and on a missing→present transition (the
+            # missing branch left mtime None), so the "(missing)" header and
+            # "no log yet" line are cleared once the log finally appears.
             # The pane can only show one file: repaint this daemon's last-shown
             # tail so a tab switch doesn't blank it. First view shows nothing but
             # the marker (no buffer yet, and the offset below seeks to EOF, so
