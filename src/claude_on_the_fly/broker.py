@@ -96,6 +96,13 @@ class Route:
     # Env var the agent's SDK reads to find this provider, e.g.
     # "ANTHROPIC_BASE_URL". Published by the broker pointing at itself.
     base_url_env_var: str = ""
+    # Optional sub-scoping. Both empty = today's behavior (any method, any
+    # path under the prefix). Set to narrow a delegated credential: methods is
+    # the allowed HTTP verbs; allowed_tails is the exact path tails (path minus
+    # prefix, e.g. "v1/messages") the route may reach. Exact strings, not
+    # patterns, so a typo can never silently reopen the prefix.
+    methods: frozenset[str] = frozenset()
+    allowed_tails: frozenset[str] = frozenset()
 
 
 def read_keychain(service: str) -> str:
@@ -234,9 +241,51 @@ class Broker:
             logger.warning(
                 "broker: deny %s %s (no matching route)", request.method, request.path
             )
-            return web.Response(status=403, text="no route for path")
+            return web.Response(
+                status=403,
+                text=(
+                    "[sandbox] egress policy: no allowlisted broker route for this "
+                    "path, so this host cannot be reached. This is policy, not an "
+                    "outage; retrying will not help. If it is genuinely required, "
+                    "tell the user the operator must add a broker route for it."
+                ),
+            )
 
         tail = request.path[len(route.prefix) :].lstrip("/")
+        # Sub-scoping checks (fail-closed, and only ever narrow): an empty set
+        # means "no restriction" so an unscoped route behaves as before.
+        if route.methods and request.method not in route.methods:
+            logger.warning(
+                "broker: deny %s %s (method not allowed for route %s)",
+                request.method,
+                request.path,
+                route.prefix,
+            )
+            return web.Response(
+                status=403,
+                text=(
+                    f"[sandbox] egress policy: this route does not permit "
+                    f"{request.method}. This is policy, not an outage; retrying "
+                    "will not help. If it is genuinely required, tell the user the "
+                    "operator must widen the route's allowed methods."
+                ),
+            )
+        if route.allowed_tails and tail not in route.allowed_tails:
+            logger.warning(
+                "broker: deny %s %s (path not allowed for route %s)",
+                request.method,
+                request.path,
+                route.prefix,
+            )
+            return web.Response(
+                status=403,
+                text=(
+                    "[sandbox] egress policy: this route does not permit this path. "
+                    "This is policy, not an outage; retrying will not help. If it "
+                    "is genuinely required, tell the user the operator must add "
+                    "this path to the route's allowlist."
+                ),
+            )
         url = route.upstream.rstrip("/") + "/" + tail
         headers = _forward_request_headers(request.headers)
         headers[route.header] = route.value_prefix + self._creds[route.keychain_service]
@@ -255,10 +304,11 @@ class Broker:
             allow_redirects=False,
         ) as upstream:
             logger.info(
-                "broker: allow %s %s%s -> %d",
+                "broker: allow %s %s%s [%s] -> %d",
                 request.method,
                 upstream_host,
                 request.path,
+                route.keychain_service,
                 upstream.status,
             )
             response = web.StreamResponse(
@@ -283,6 +333,16 @@ DEFAULT_ROUTES: list[Route] = [
         keychain_service="cotf-anthropic",
         base_url_env_var="ANTHROPIC_BASE_URL",
     ),
+    # Delegate another provider by appending a Route and provisioning its
+    # keychain item (`security add-generic-password -s cotf-<name> -w <key>`).
+    # It stays inert until the item exists (routes_from_keychain filters it).
+    # Narrow the grant with methods=/allowed_tails=, e.g. a read-only, single-
+    # endpoint route:
+    #   Route(prefix="/openai", upstream="https://api.openai.com",
+    #         header="authorization", value_prefix="Bearer ",
+    #         keychain_service="cotf-openai", base_url_env_var="OPENAI_BASE_URL",
+    #         methods=frozenset({"POST"}),
+    #         allowed_tails=frozenset({"v1/chat/completions"}))
 ]
 
 

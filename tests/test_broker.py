@@ -274,3 +274,95 @@ async def test_start_default_broker_publishes_base_url(monkeypatch):
 async def test_start_default_broker_none_without_keychain(monkeypatch):
     monkeypatch.setattr(broker, "keychain_exists", lambda s: False)
     assert await broker.start_default_broker() is None
+
+
+# --- Slice 1: per-route method / path sub-scoping ---
+
+
+async def _scoped_broker(fake_keychain, received, **route_kwargs):
+    """Start a broker with a single scoped route pointed at an echo upstream."""
+    fake_keychain["cotf-scoped"] = "REAL"
+    up_runner, up_port = await _start(_echo_app(received))
+    bro = Broker(
+        [
+            Route(
+                prefix="/scoped",
+                upstream=f"http://localhost:{up_port}",
+                header="x-api-key",
+                keychain_service="cotf-scoped",
+                **route_kwargs,
+            )
+        ]
+    )
+    port = await bro.start()
+    return bro, up_runner, port
+
+
+async def test_scoped_route_allows_listed_method_and_tail(fake_keychain):
+    received: list[dict] = []
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain,
+        received,
+        methods=frozenset({"POST"}),
+        allowed_tails=frozenset({"v1/messages"}),
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{port}/scoped/v1/messages", json={"hi": 1}
+            )
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    # The in-scope call reached upstream with the injected key.
+    assert received[0]["path"] == "/v1/messages"
+    assert received[0]["headers"]["x-api-key"] == "REAL"
+
+
+async def test_scoped_route_blocks_disallowed_method(fake_keychain):
+    received: list[dict] = []
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain, received, methods=frozenset({"POST"})
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            assert resp.status == 403
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    # Fail-closed: the disallowed method never reached upstream.
+    assert received == []
+
+
+async def test_scoped_route_blocks_disallowed_tail(fake_keychain):
+    received: list[dict] = []
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain, received, allowed_tails=frozenset({"v1/messages"})
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.post(f"http://127.0.0.1:{port}/scoped/v1/admin")
+            assert resp.status == 403
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert received == []
+
+
+async def test_unscoped_route_allows_any_method_and_tail(fake_keychain):
+    # Empty methods/allowed_tails (the default) preserve today's behavior.
+    received: list[dict] = []
+    bro, up_runner, port = await _scoped_broker(fake_keychain, received)
+    try:
+        async with ClientSession() as client:
+            for method, tail in (("GET", "anything"), ("DELETE", "v9/wild")):
+                resp = await client.request(
+                    method, f"http://127.0.0.1:{port}/scoped/{tail}"
+                )
+                assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert {r["path"] for r in received} == {"/anything", "/v9/wild"}
