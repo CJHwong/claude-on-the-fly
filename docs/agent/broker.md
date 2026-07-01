@@ -36,6 +36,38 @@ A route activates only if its item exists (`routes_from_keychain`), so the broke
 with whatever is provisioned. Add providers by extending `DEFAULT_ROUTES` with a `Route`
 (prefix, upstream, header, keychain_service, base_url_env_var).
 
+To hand the agent a subset of a credential rather than its full use, set `methods` and/or
+`allowed_tails` on the `Route`. Both are exact-match sets; empty (the default) means no
+restriction, so existing routes are unchanged. A request that misses either gets a 403 and
+never reaches upstream:
+
+```python
+Route(prefix="/openai", upstream="https://api.openai.com", header="authorization",
+      value_prefix="Bearer ", keychain_service="cotf-openai",
+      base_url_env_var="OPENAI_BASE_URL",
+      methods=frozenset({"POST"}), allowed_tails=frozenset({"v1/chat/completions"}))
+```
+
+## Narrowing the filesystem and loopback (jail mode)
+
+These knobs only take effect under `COTF_SANDBOX=jail` and each defaults to the current
+behavior when unset:
+
+- `COTF_SANDBOX_FS=deny-most` swaps the read-permissive base (`my.sb`) for `my.deny-most.sb`,
+  which makes `$HOME` opaque and re-grants only the project dir, `~/.claude`, `~/.cache/uv`,
+  and up to three operator paths. Reads outside `$HOME` (system libraries, the toolchain)
+  stay allowed so binaries run. This is coarser than `my.sb` by design: an agent that reads
+  a home dotfile outside the granted set (e.g. `~/.gitconfig`) is denied. Note the agent's own
+  binary and interpreters often live under `$HOME` (`~/.local/bin`, mise/nvm/npm paths); grant
+  those via `COTF_SANDBOX_EXTRA_PATHS` or the agent cannot exec and the run fails to start.
+- `COTF_SANDBOX_EXTRA_PATHS` (colon-separated, capped at 3) are extra read grants for
+  deny-most. Seatbelt has no arrays, so a fourth path is dropped with a warning; nest under
+  a shared parent or edit the profile if you need more.
+- `COTF_SANDBOX_BROKER_ONLY_LOOPBACK=1` narrows egress from all loopback ports to just the
+  broker's port (read from the published `*_BASE_URL`), closing the arbitrary-local-sink
+  path. If no broker base-url is present it leaves loopback open, so the agent is never
+  locked out of a broker it needs.
+
 ## Seatbelt (jail mode)
 
 Nothing to install. The profiles live in `src/claude_on_the_fly/seatbelt/`
