@@ -213,7 +213,7 @@ def build_system_prompt(
         outbox = OUTBOX_INSTRUCTION.format(outbox_dir=workspace / OUTBOX_DIRNAME)
     else:
         outbox = ""
-    return PROMPT_TEMPLATE.format(
+    prompt = PROMPT_TEMPLATE.format(
         format_hint=FORMAT_HINTS.get(platform, FORMAT_HINTS["telegram"]),
         outbox_instruction=outbox,
         user_name=user_name,
@@ -222,6 +222,11 @@ def build_system_prompt(
         memory_root=MEMORY_ROOT,
         knowledge_dir=KNOWLEDGE_DIR,
     )
+    # Backend-agnostic sandbox note (empty unless COTF_SANDBOX is on).
+    guidance = sandbox.agent_guidance(workspace)
+    if guidance:
+        prompt = f"{prompt}\n\n{guidance}"
+    return prompt
 
 
 @dataclass(frozen=True)

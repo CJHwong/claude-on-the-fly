@@ -23,9 +23,13 @@
 (version 1)
 (import (param "_BASE"))
 
-;; -- Egress: internet denied, loopback (broker + local dev) allowed --
+;; -- Egress: internet denied, loopback allowed --
+;; _LOOPBACK is "localhost:*" by default (all loopback ports, so the agent's own
+;; dev servers and tests work). When COTF_SANDBOX_BROKER_ONLY_LOOPBACK is set the
+;; wrapper narrows it to "localhost:<broker-port>", closing the arbitrary-local-
+;; sink path so the only reachable endpoint is the broker.
 (deny network-outbound)
-(allow network-outbound (remote ip "localhost:*"))
+(allow network-outbound (remote ip (param "_LOOPBACK")))
 
 ;; -- Keychain: denied (the broker holds credentials) --
 (deny file-read* (subpath (string-append (param "_HOME") "/Library/Keychains")))
