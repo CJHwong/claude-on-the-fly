@@ -2037,6 +2037,48 @@ class TestResumeSystemPrompt:
         assert "--system-prompt" not in cmd
 
 
+class TestScheduleSkipsHandoff:
+    """The scheduler mints a fresh session per fire on purpose, so a new session
+    must NOT inherit the prior fire's transcript via the handoff preamble."""
+
+    async def test_normal_platform_forwards_handoff(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with (
+            patch(
+                "claude_on_the_fly.transcript.prepend_latest_handoff",
+                return_value="hi",
+            ) as handoff,
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(),
+            ),
+        ):
+            await ClaudeBackend().run(workspace, "sess-new", "hi", "telegram")
+        handoff.assert_called_once()
+
+    async def test_schedule_platform_skips_handoff(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with (
+            patch(
+                "claude_on_the_fly.transcript.prepend_latest_handoff",
+            ) as handoff,
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(),
+            ),
+        ):
+            await ClaudeBackend().run(workspace, "sess-new", "hi", "schedule")
+        handoff.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # resolve_pty_binary
 # ---------------------------------------------------------------------------

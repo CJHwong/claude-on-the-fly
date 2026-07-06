@@ -188,9 +188,10 @@ class ClaudeBackend:
             argv = [*base, *sysprompt_args, "--resume", session_uuid, prompt]
         else:
             logger.info("No existing session %s, creating new", session_uuid)
-            prompt = transcript.prepend_latest_handoff(
-                workspace, prompt, exclude_uuid=session_uuid
-            )
+            if platform not in agent.NO_HANDOFF_PLATFORMS:
+                prompt = transcript.prepend_latest_handoff(
+                    workspace, prompt, exclude_uuid=session_uuid
+                )
             argv = [*base, *sysprompt_args, "--session-id", session_uuid, prompt]
         cli_output = await executor(workspace, argv, timeout=timeout)
 

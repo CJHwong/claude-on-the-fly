@@ -229,9 +229,11 @@ class OpencodeBackend:
         if existing_session:
             composed_prompt = prompt
         else:
-            user_payload = transcript.prepend_latest_handoff(
-                workspace, prompt, exclude_uuid=session_uuid
-            )
+            user_payload = prompt
+            if platform not in agent.NO_HANDOFF_PLATFORMS:
+                user_payload = transcript.prepend_latest_handoff(
+                    workspace, prompt, exclude_uuid=session_uuid
+                )
             system_prompt = build_system_prompt(
                 platform, user_name, channel_context, workspace
             )

@@ -269,9 +269,10 @@ class PiBackend:
             ]
         else:
             logger.info("pi: no existing session %s, creating new", session_uuid)
-            prompt = transcript.prepend_latest_handoff(
-                workspace, prompt, exclude_uuid=session_uuid
-            )
+            if platform not in agent.NO_HANDOFF_PLATFORMS:
+                prompt = transcript.prepend_latest_handoff(
+                    workspace, prompt, exclude_uuid=session_uuid
+                )
             argv = [
                 *base,
                 "--session-id",

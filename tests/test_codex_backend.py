@@ -370,6 +370,24 @@ class TestCodexBackendRun:
         assert not composed.startswith("\n")
         assert composed.endswith("USER_TEXT_TOKEN")
 
+    async def test_schedule_platform_skips_handoff(self, tmp_path: Path):
+        """A fresh scheduler fire must not inherit the prior fire's transcript."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.transcript.prepend_latest_handoff",
+            ) as handoff,
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(),
+            ),
+        ):
+            await CodexBackend().run(workspace, "sess", "hi", "schedule")
+        handoff.assert_not_called()
+
     async def test_tokens_in_does_not_double_count_cached(self, tmp_path: Path):
         """OpenAI's `cached_input_tokens` is a subset of `input_tokens`, so
         do not sum them like we do for Anthropic's cache_read field."""

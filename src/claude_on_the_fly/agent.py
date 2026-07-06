@@ -28,6 +28,11 @@ PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text()
 # Frontends that can upload files back to the user. Single source of truth for
 # both the outbox prompt instruction and the orchestrator scan/archive.
 ATTACHMENT_PLATFORMS = frozenset({"slack", "telegram"})
+# Frontends whose fresh sessions must NOT inherit the prior fire's transcript.
+# The scheduler mints a new session UUID per fire on purpose — each cron run is
+# independent — so the cross-backend handoff preamble would drag the last run's
+# conversation into a run that's meant to start clean.
+NO_HANDOFF_PLATFORMS = frozenset({"schedule"})
 OUTBOX_DIRNAME = "outbox"
 OUTBOX_ARCHIVE = ".sent"
 MAX_ATTACHMENTS = 10
