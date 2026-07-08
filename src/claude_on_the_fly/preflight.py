@@ -273,21 +273,26 @@ async def check_telegram(token: str) -> None:
         logger.info("Telegram bot: @%s", bot_name)
 
 
-async def check_slack(app_token: str, user_token: str) -> str:
-    """Verify Slack tokens are valid. Returns the user_id owning the user token."""
+async def check_slack(app_token: str, token: str) -> str:
+    """Verify Slack tokens are valid. `token` is the bearer used for the API —
+    either a user token (xoxp-) or a bot token (xoxb-). Returns the user_id it
+    authenticates as (the bot's own user id for a bot token), which the frontend
+    uses for the @mention gate and self-message checks."""
+    kind = "bot" if token.startswith("xoxb-") else "user"
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://slack.com/api/auth.test",
-            headers={"Authorization": f"Bearer {user_token}"},
+            headers={"Authorization": f"Bearer {token}"},
         )
         data = resp.json()
         if not data.get("ok"):
-            raise _exit(f"Invalid Slack user token: {data.get('error', 'unknown')}")
+            raise _exit(f"Invalid Slack {kind} token: {data.get('error', 'unknown')}")
         user_id = data.get("user_id")
         if not user_id:
             raise _exit("Slack auth.test returned no user_id")
         logger.info(
-            "Slack user token: %s (%s, %s)",
+            "Slack %s token: %s (%s, %s)",
+            kind,
             data.get("user"),
             data.get("team"),
             user_id,
@@ -343,40 +348,40 @@ def run_telegram() -> tuple[str, int]:
 def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], set[str]]:
     """Validate env vars and tokens.
 
-    Returns (app_token, user_token, user_id, allowed_user_ids, blocked_user_ids,
-    allowed_bot_ids, silent_sender_ids). user_id is resolved from Slack
-    auth.test — no need to pass it via env.
+    Returns (app_token, token, user_id, allowed_user_ids, blocked_senders,
+    allowed_bot_ids, silent_sender_ids). SLACK_ALLOWED_SENDER_IDS is split into
+    user vs bot sets by id prefix; `token` is resolved from SLACK_TOKEN. user_id
+    is resolved from Slack auth.test — no need to pass it via env.
     """
     _setup_logging()
     _raise_on_failures(checks.check_slack(os.environ))
     app_token = os.environ["SLACK_APP_TOKEN"]
-    user_token = os.environ["SLACK_USER_TOKEN"]
-    allowed_raw = os.environ.get("SLACK_ALLOWED_USER_IDS", "")
-    allowed_user_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
-    blocked_raw = os.environ.get("SLACK_BLOCKED_USER_IDS", "")
-    blocked_user_ids = {uid.strip() for uid in blocked_raw.split(",") if uid.strip()}
-    # No "*" wildcard here on purpose: it would let our own app's echoed posts
-    # through and loop. Bot senders must be allowlisted by explicit bot_id.
-    bot_raw = os.environ.get("SLACK_ALLOWED_BOT_IDS", "")
-    allowed_bot_ids = {bid.strip() for bid in bot_raw.split(",") if bid.strip()}
-    silent_raw = os.environ.get("SLACK_SILENT_SENDER_IDS", "")
-    silent_sender_ids = {sid.strip() for sid in silent_raw.split(",") if sid.strip()}
+    _, token = checks.resolve_slack_token(os.environ)
+    for legacy, preferred in checks.slack_deprecations(os.environ):
+        logger.warning("Slack env %s is deprecated; use %s", legacy, preferred)
+    # One "allowed senders" list; ids route by Slack prefix. Bot ids (B…) get the
+    # trusted-bot path (bypass @mention); everything else (U…/W…/"*") is a human.
+    allowed = checks.resolve_slack_ids(os.environ, "SLACK_ALLOWED_SENDER_IDS")
+    allowed_bot_ids = {sid for sid in allowed if sid.startswith("B")}
+    allowed_user_ids = allowed - allowed_bot_ids
+    blocked_senders = checks.resolve_slack_ids(os.environ, "SLACK_BLOCKED_SENDER_IDS")
+    silent_sender_ids = checks.resolve_slack_ids(os.environ, "SLACK_SILENT_SENDER_IDS")
     check_backend()
-    user_id = asyncio.run(check_slack(app_token, user_token))
+    user_id = asyncio.run(check_slack(app_token, token))
     logger.debug(
-        "preflight: user_id=%s allowed_user_ids=%s blocked_user_ids=%s allowed_bot_ids=%s silent_sender_ids=%s",
+        "preflight: user_id=%s allowed_user_ids=%s allowed_bot_ids=%s blocked_senders=%s silent_sender_ids=%s",
         user_id,
         allowed_user_ids,
-        blocked_user_ids,
         allowed_bot_ids,
+        blocked_senders,
         silent_sender_ids,
     )
     return (
         app_token,
-        user_token,
+        token,
         user_id,
         allowed_user_ids,
-        blocked_user_ids,
+        blocked_senders,
         allowed_bot_ids,
         silent_sender_ids,
     )

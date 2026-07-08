@@ -24,7 +24,7 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-telegram
 
 # Slack
 export SLACK_APP_TOKEN=xapp-...
-export SLACK_USER_TOKEN=xoxp-...
+export SLACK_TOKEN=xoxb-...   # xoxp- replies as you, xoxb- replies as the app
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
 
 # Gmail

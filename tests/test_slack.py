@@ -139,6 +139,20 @@ class TestSlackFrontendInit:
         )
         assert frontend._allow_all_senders is False
 
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_user_token_keeps_self_events(self, mock_app_cls):
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert frontend._is_bot_token is False
+        _, kwargs = mock_app_cls.call_args
+        assert kwargs["ignoring_self_events_enabled"] is False
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_bot_token_ignores_self_events(self, mock_app_cls):
+        frontend = SlackFrontend("xapp-tok", "xoxb-tok", "U_SELF")
+        assert frontend._is_bot_token is True
+        _, kwargs = mock_app_cls.call_args
+        assert kwargs["ignoring_self_events_enabled"] is True
+
 
 # ---------------------------------------------------------------------------
 # workspace_name / sender_name / channel_context
@@ -291,7 +305,7 @@ class TestIngestEvent:
 
     async def test_blocklist_wins_over_wildcard(self, frontend):
         frontend._allow_all_senders = True
-        frontend._blocked_user_ids = {"U_BANNED"}
+        frontend._blocked_senders = {"U_BANNED"}
         event = {
             "ts": "4.2",
             "text": "<@U_SELF> hello",

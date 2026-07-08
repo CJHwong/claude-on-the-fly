@@ -455,6 +455,7 @@ def _make_frontend(
     allowed_user_ids: set[str] | None = None,
     allowed_bot_ids: set[str] | None = None,
     silent_sender_ids: set[str] | None = None,
+    blocked_senders: set[str] | None = None,
 ) -> SlackFrontend:
     with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
         mock_app = MagicMock()
@@ -462,11 +463,12 @@ def _make_frontend(
         mock_app_cls.return_value = mock_app
         fe = SlackFrontend(
             app_token="xapp-fake",
-            user_token="xoxp-fake",
+            token="xoxp-fake",
             user_id="UBOT",
             allowed_user_ids=allowed_user_ids or {"*"},
             allowed_bot_ids=allowed_bot_ids,
             silent_sender_ids=silent_sender_ids,
+            blocked_senders=blocked_senders,
         )
     fe._on_message = AsyncMock()
     # short-circuit helpers that would hit the network
@@ -886,6 +888,13 @@ class TestIngestEventTrustedBot:
 
     async def test_bot_message_skipped_when_no_bots_allowlisted(self):
         fe = _make_frontend()  # default: no allowed_bot_ids
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_blocked_bot_is_skipped_even_if_allowlisted(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"}, blocked_senders={"B07JPABE2"}
+        )
         await fe._ingest_event(_bot_event())
         fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
 

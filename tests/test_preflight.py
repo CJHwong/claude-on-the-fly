@@ -399,12 +399,30 @@ class TestCheckSlack:
 
     @pytest.mark.asyncio
     @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
+    async def test_returns_user_id_for_bot_token(self, mock_client_cls):
+        mock_client_cls.return_value = _make_slack_client(
+            {"ok": True, "user_id": "UBOT", "user": "claude", "team": "myteam"}
+        )
+        user_id = await check_slack("xapp-valid", "xoxb-valid")
+        assert user_id == "UBOT"
+
+    @pytest.mark.asyncio
+    @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
     async def test_exits_on_invalid_user_token(self, mock_client_cls):
         mock_client_cls.return_value = _make_slack_client(
             {"ok": False, "error": "invalid_auth"}
         )
         with pytest.raises(SystemExit, match="Invalid Slack user token.*invalid_auth"):
             await check_slack("xapp-valid", "bad-token")
+
+    @pytest.mark.asyncio
+    @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
+    async def test_exits_on_invalid_bot_token(self, mock_client_cls):
+        mock_client_cls.return_value = _make_slack_client(
+            {"ok": False, "error": "invalid_auth"}
+        )
+        with pytest.raises(SystemExit, match="Invalid Slack bot token.*invalid_auth"):
+            await check_slack("xapp-valid", "xoxb-bad")
 
     @pytest.mark.asyncio
     @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
@@ -555,6 +573,32 @@ class TestRunSlack:
         assert blocked == {"U9", "U8"}
         assert bots == {"B1", "B2"}
         assert silent == {"B1", "U7"}
+
+    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
+    @patch("claude_on_the_fly.preflight.check_claude_cli")
+    def test_allowed_sender_ids_split_by_prefix(
+        self, _mock_claude, _mock_arun, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
+        monkeypatch.setenv("SLACK_TOKEN", "xoxb-abc")
+        monkeypatch.setenv("SLACK_ALLOWED_SENDER_IDS", "U1, B2, W3, B4")
+        monkeypatch.setenv("SLACK_BLOCKED_SENDER_IDS", "U9, B8")
+        _, _, _, allowed_users, blocked, bots, _ = run_slack()
+        assert allowed_users == {"U1", "W3"}
+        assert bots == {"B2", "B4"}
+        assert blocked == {"U9", "B8"}
+
+    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
+    @patch("claude_on_the_fly.preflight.check_claude_cli")
+    def test_new_names_win_over_legacy(self, _mock_claude, _mock_arun, monkeypatch):
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
+        monkeypatch.setenv("SLACK_TOKEN", "xoxb-abc")
+        monkeypatch.setenv("SLACK_ALLOWED_SENDER_IDS", "U1")
+        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U_OLD")
+        monkeypatch.setenv("SLACK_ALLOWED_BOT_IDS", "B_OLD")
+        _, _, _, allowed_users, _, bots, _ = run_slack()
+        assert allowed_users == {"U1"}
+        assert bots == set()
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")

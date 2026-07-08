@@ -18,7 +18,30 @@ from claude_on_the_fly.checks import (
     check_slack,
     check_telegram,
     first_failure,
+    resolve_slack_ids,
+    slack_deprecations,
 )
+
+
+class TestSlackResolvers:
+    def test_new_name_wins_and_no_deprecation(self):
+        env = {"SLACK_ALLOWED_SENDER_IDS": "U1,B2"}
+        assert resolve_slack_ids(env, "SLACK_ALLOWED_SENDER_IDS") == {"U1", "B2"}
+        assert slack_deprecations(env) == []
+
+    def test_legacy_allow_lists_merge(self):
+        env = {"SLACK_ALLOWED_USER_IDS": "U1, U2", "SLACK_ALLOWED_BOT_IDS": "B9"}
+        assert resolve_slack_ids(env, "SLACK_ALLOWED_SENDER_IDS") == {"U1", "U2", "B9"}
+
+    def test_deprecation_reports_legacy_in_use(self):
+        env = {"SLACK_USER_TOKEN": "xoxp-1", "SLACK_BLOCKED_USER_IDS": "U9"}
+        pairs = dict(slack_deprecations(env))
+        assert pairs["SLACK_USER_TOKEN"] == "SLACK_TOKEN"
+        assert pairs["SLACK_BLOCKED_USER_IDS"] == "SLACK_BLOCKED_SENDER_IDS"
+
+    def test_no_deprecation_when_preferred_set(self):
+        env = {"SLACK_TOKEN": "xoxb-1", "SLACK_USER_TOKEN": "xoxp-old"}
+        assert slack_deprecations(env) == []
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +118,53 @@ class TestCheckSlack:
         )
         bad = [r for r in results if r.status == "invalid"]
         assert any(r.name == "SLACK_USER_TOKEN" for r in bad)
+
+    def test_bot_token_ok(self):
+        results = check_slack(
+            {"SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": "xoxb-1"}
+        )
+        assert all_ok(results)
+
+    def test_bad_bot_token_format(self):
+        results = check_slack(
+            {"SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": "not-xoxb"}
+        )
+        bad = [r for r in results if r.status == "invalid"]
+        assert any(r.name == "SLACK_BOT_TOKEN" for r in bad)
+
+    def test_slack_token_user(self):
+        results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxp-1"})
+        assert all_ok(results)
+        assert any(r.name == "SLACK_TOKEN" and "(user)" in r.detail for r in results)
+
+    def test_slack_token_bot(self):
+        results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxb-1"})
+        assert all_ok(results)
+        assert any(r.name == "SLACK_TOKEN" and "(bot)" in r.detail for r in results)
+
+    def test_bad_slack_token_format(self):
+        results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "nope"})
+        bad = [r for r in results if r.status == "invalid"]
+        assert any(r.name == "SLACK_TOKEN" for r in bad)
+
+    def test_missing_all_bearer_tokens(self):
+        results = check_slack({"SLACK_APP_TOKEN": "xapp-1"})
+        fail = first_failure(results)
+        assert fail is not None
+        assert fail.name == "SLACK_TOKEN"
+        assert fail.status == "missing"
+
+    def test_slack_token_wins_over_legacy(self):
+        results = check_slack(
+            {
+                "SLACK_APP_TOKEN": "xapp-1",
+                "SLACK_TOKEN": "xoxb-new",
+                "SLACK_USER_TOKEN": "xoxp-old",
+            }
+        )
+        assert all_ok(results)
+        assert any(r.name == "SLACK_TOKEN" and "(bot)" in r.detail for r in results)
+        assert not any(r.name == "SLACK_USER_TOKEN" for r in results)
 
 
 # ---------------------------------------------------------------------------

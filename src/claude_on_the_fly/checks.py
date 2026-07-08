@@ -42,12 +42,17 @@ TELEGRAM_ENV_VARS: tuple[str, ...] = (
 )
 SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_APP_TOKEN",
+    "SLACK_TOKEN",
+    "SLACK_ALLOWED_SENDER_IDS",
+    "SLACK_BLOCKED_SENDER_IDS",
+    "SLACK_SILENT_SENDER_IDS",
+    "SLACK_STATS_MODE",
+    # Deprecated aliases (still honored; see SLACK_LEGACY).
     "SLACK_USER_TOKEN",
+    "SLACK_BOT_TOKEN",
     "SLACK_ALLOWED_USER_IDS",
     "SLACK_BLOCKED_USER_IDS",
     "SLACK_ALLOWED_BOT_IDS",
-    "SLACK_SILENT_SENDER_IDS",
-    "SLACK_STATS_MODE",
 )
 GMAIL_ENV_VARS: tuple[str, ...] = (
     "GMAIL_GCP_PROJECT",
@@ -189,19 +194,81 @@ def check_slack(env: Mapping[str, str]) -> list[CheckResult]:
             )
     results.append(app_check)
 
-    user_check = _require(env, "SLACK_USER_TOKEN")
-    if user_check.status == "ok":
-        token = env["SLACK_USER_TOKEN"]
-        if not token.startswith("xoxp-"):
-            user_check = CheckResult(
-                name="SLACK_USER_TOKEN",
-                status="invalid",
-                detail="must start with 'xoxp-'",
-                fix_hint="Use the User OAuth Token from Slack admin",
-            )
-    results.append(user_check)
+    results.append(_check_slack_bearer(env))
 
     return results
+
+
+# Preferred env var -> deprecated fallbacks it replaces. Legacy names still work
+# but are undocumented; run_slack warns when one is used. SLACK_ALLOWED_SENDER_IDS
+# supersedes both the old user and bot allowlists (ids route by prefix).
+SLACK_LEGACY: dict[str, tuple[str, ...]] = {
+    "SLACK_TOKEN": ("SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"),
+    "SLACK_ALLOWED_SENDER_IDS": ("SLACK_ALLOWED_USER_IDS", "SLACK_ALLOWED_BOT_IDS"),
+    "SLACK_BLOCKED_SENDER_IDS": ("SLACK_BLOCKED_USER_IDS",),
+}
+
+
+def _parse_ids(raw: str) -> set[str]:
+    return {piece.strip() for piece in raw.split(",") if piece.strip()}
+
+
+def resolve_slack_token(env: Mapping[str, str]) -> tuple[str | None, str]:
+    """Return (var_name, token) for the first set Slack bearer var, or (None, "").
+    The token kind (user vs bot) is inferred from its prefix, so one SLACK_TOKEN
+    field covers both; SLACK_USER_TOKEN / SLACK_BOT_TOKEN still work."""
+    for name in ("SLACK_TOKEN", *SLACK_LEGACY["SLACK_TOKEN"]):
+        value = env.get(name, "")
+        if value:
+            return name, value
+    return None, ""
+
+
+def resolve_slack_ids(env: Mapping[str, str], preferred: str) -> set[str]:
+    """Resolve a comma-separated id set. The preferred var wins; otherwise its
+    legacy fallbacks are merged (so the old split user/bot allowlists combine)."""
+    raw = env.get(preferred, "")
+    if raw:
+        return _parse_ids(raw)
+    ids: set[str] = set()
+    for legacy in SLACK_LEGACY.get(preferred, ()):
+        ids |= _parse_ids(env.get(legacy, ""))
+    return ids
+
+
+def slack_deprecations(env: Mapping[str, str]) -> list[tuple[str, str]]:
+    """(legacy_var, preferred_var) for every deprecated Slack var in use — i.e.
+    set while its preferred replacement is not."""
+    out: list[tuple[str, str]] = []
+    for preferred, legacy_names in SLACK_LEGACY.items():
+        if env.get(preferred, ""):
+            continue
+        out.extend(
+            (legacy, preferred) for legacy in legacy_names if env.get(legacy, "")
+        )
+    return out
+
+
+def _check_slack_bearer(env: Mapping[str, str]) -> CheckResult:
+    """A single bearer token, either kind: `xoxp-` (replies as you) or `xoxb-`
+    (replies as the app). Set it as SLACK_TOKEN."""
+    name, token = resolve_slack_token(env)
+    if not token:
+        return CheckResult(
+            name="SLACK_TOKEN",
+            status="missing",
+            detail="set SLACK_TOKEN to an xoxp- (user) or xoxb- (bot) token",
+            fix_hint=DOTENV_HINT,
+        )
+    if not token.startswith(("xoxp-", "xoxb-")):
+        return CheckResult(
+            name=name or "SLACK_TOKEN",
+            status="invalid",
+            detail="must start with 'xoxp-' (user) or 'xoxb-' (bot)",
+            fix_hint="Use the User or Bot OAuth Token from Slack admin",
+        )
+    kind = "bot" if token.startswith("xoxb-") else "user"
+    return CheckResult(name=name or "SLACK_TOKEN", status="ok", detail=f"set ({kind})")
 
 
 def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:

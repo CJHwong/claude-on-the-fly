@@ -1,4 +1,5 @@
-"""Slack frontend. Replies as you via user token + Socket Mode."""
+"""Slack frontend over Socket Mode. Replies as you (user token) or as the app
+(bot token) — the kind is inferred from the token prefix."""
 
 from __future__ import annotations
 
@@ -274,10 +275,10 @@ class SlackFrontend(Frontend):
     def __init__(
         self,
         app_token: str,
-        user_token: str,
+        token: str,
         user_id: str,
         allowed_user_ids: set[str] | None = None,
-        blocked_user_ids: set[str] | None = None,
+        blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
     ) -> None:
@@ -286,19 +287,29 @@ class SlackFrontend(Frontend):
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
         self._allow_all_senders = "*" in self._allowed_user_ids
-        self._blocked_user_ids = blocked_user_ids or set()
+        # Blocks both humans (U…) and bots (B…) — a single sender denylist.
+        self._blocked_senders = blocked_senders or set()
         self._allowed_bot_ids = allowed_bot_ids or set()
         self._silent_sender_ids = silent_sender_ids or set()
         logger.debug(
-            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_user_ids=%s, allowed_bot_ids=%s, silent_sender_ids=%s",
+            "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_senders=%s, allowed_bot_ids=%s, silent_sender_ids=%s",
             user_id,
             self._allowed_user_ids,
             self._allow_all_senders,
-            self._blocked_user_ids,
+            self._blocked_senders,
             self._allowed_bot_ids,
             self._silent_sender_ids,
         )
-        self._app = AsyncApp(token=user_token, ignoring_self_events_enabled=False)
+        # A bot token (xoxb-) replies as the app, so Bolt's own self-event
+        # filter correctly drops our reply echoes — let it. A user token (xoxp-)
+        # replies as the human, and we deliberately keep self-events so messages
+        # typed from another Slack client still reach the agent; dedup of our own
+        # replies then falls to _our_sent_timestamps (which _catchup relies on
+        # regardless, since fetched history bypasses Bolt's filter).
+        self._is_bot_token = token.startswith("xoxb-")
+        self._app = AsyncApp(
+            token=token, ignoring_self_events_enabled=self._is_bot_token
+        )
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
         self._orchestrator: object | None = None
@@ -342,9 +353,10 @@ class SlackFrontend(Frontend):
         )
         return {
             "app_token": _redact_token(self._app_token),
+            "token_kind": "bot" if self._is_bot_token else "user",
             "user_id": self._user_id,
             "allowed_users": allowed or "<none>",
-            "blocked_users": ",".join(sorted(self._blocked_user_ids)) or "<none>",
+            "blocked_senders": ",".join(sorted(self._blocked_senders)) or "<none>",
             "allowed_bots": ",".join(sorted(self._allowed_bot_ids)) or "<none>",
             "silent_senders": ",".join(sorted(self._silent_sender_ids)) or "<none>",
         }
@@ -403,8 +415,12 @@ class SlackFrontend(Frontend):
         subtype = event.get("subtype")
         bot_id = event.get("bot_id", "")
         # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
-        # no user field. Only let through bots explicitly trusted by bot_id.
-        is_trusted_bot = subtype == "bot_message" and bot_id in self._allowed_bot_ids
+        # no user field. Only let through bots trusted by bot_id and not blocked.
+        is_trusted_bot = (
+            subtype == "bot_message"
+            and bot_id in self._allowed_bot_ids
+            and bot_id not in self._blocked_senders
+        )
         if subtype == "bot_message":
             if not is_trusted_bot:
                 logger.debug("skipped: untrusted bot_message bot_id=%s", bot_id)
@@ -450,8 +466,8 @@ class SlackFrontend(Frontend):
         # so the human allow/block and @mention gates don't apply to them.
         if not is_trusted_bot:
             # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
-            if sender_id in self._blocked_user_ids:
-                logger.debug("skipped: sender %s in blocked_user_ids", sender_id)
+            if sender_id in self._blocked_senders:
+                logger.debug("skipped: sender %s in blocked_senders", sender_id)
                 return
 
             # Allowlist applies to all channel types, including DMs and group DMs.
@@ -706,7 +722,7 @@ class SlackFrontend(Frontend):
 
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload
-        isn't re-ingested as an inbound message (we reply via the user token)."""
+        isn't re-ingested as an inbound message."""
         for f in resp.get("files") or []:
             for visibility in (f.get("shares") or {}).values():
                 for share_list in visibility.values():
@@ -1019,19 +1035,19 @@ def main() -> None:  # pragma: no cover
     load_dotenv()
     (
         app_token,
-        user_token,
+        token,
         user_id,
         allowed_user_ids,
-        blocked_user_ids,
+        blocked_senders,
         allowed_bot_ids,
         silent_sender_ids,
     ) = run_slack()
     frontend = SlackFrontend(
         app_token=app_token,
-        user_token=user_token,
+        token=token,
         user_id=user_id,
         allowed_user_ids=allowed_user_ids,
-        blocked_user_ids=blocked_user_ids,
+        blocked_senders=blocked_senders,
         allowed_bot_ids=allowed_bot_ids,
         silent_sender_ids=silent_sender_ids,
     )

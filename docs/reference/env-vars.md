@@ -13,11 +13,10 @@
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SLACK_APP_TOKEN` | yes | App-level token (`xapp-...`) for Socket Mode |
-| `SLACK_USER_TOKEN` | yes | User OAuth token (`xoxp-...`) to post as you |
-| `SLACK_ALLOWED_USER_IDS` | no | Extra allowed user IDs (comma-separated). Your own ID is resolved from the user token. Use `*` to allow any sender (applies to channels and DMs) |
-| `SLACK_BLOCKED_USER_IDS` | no | User IDs to deny (comma-separated). Takes priority over the allowlist, so `*` can allow everyone except these |
-| `SLACK_ALLOWED_BOT_IDS` | no | Bot IDs (comma-separated, e.g. `B07JPABE2`) whose app/bot posts trigger Claude — HubSpot, Jira, etc. Bot posts are dropped by default. No `*` wildcard (it would loop on this app's own posts); don't list this app's own bot ID |
-| `SLACK_SILENT_SENDER_IDS` | no | Sender IDs (comma-separated) that trigger Claude but get no reply posted back. Accepts bot IDs (`B…`) and user IDs (`U…`). Empty by default, so every triggered run replies |
+| `SLACK_TOKEN` | yes | Bearer token; kind inferred from prefix. `xoxp-...` replies as you (sees everything you can); `xoxb-...` replies as the app (bot must be in each channel — fine for DMs) |
+| `SLACK_ALLOWED_SENDER_IDS` | no | Sender IDs allowed to trigger Claude (comma-separated). Users (`U…`/`W…`) and bots (`B…`, e.g. `B07JPABE2` for HubSpot/Jira) share one list; bots bypass the @mention gate. Your own ID is always allowed. `*` allows any human; bots always need an explicit id (no wildcard, or it loops on this app's own posts) |
+| `SLACK_BLOCKED_SENDER_IDS` | no | Sender IDs (users or bots) to deny (comma-separated). Takes priority over the allowlist, so `*` can allow everyone except these |
+| `SLACK_SILENT_SENDER_IDS` | no | Sender IDs (users or bots) that trigger Claude but get no reply posted back. Empty by default, so every triggered run replies |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
 ## Gmail
