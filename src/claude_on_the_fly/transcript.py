@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -38,7 +39,9 @@ BackendName = Literal["claude", "codex", "pi", "opencode"]
 # prompt. We rsplit on it to recover the raw user text from a codex transcript.
 _CODEX_PROMPT_SEPARATOR = "\n\n---\n\n"
 
-CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CLAUDE_PROJECTS_DIR = (
+    Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+)
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 # opencode maps our session_uuid -> its ses_ id under this per-workspace dir;
