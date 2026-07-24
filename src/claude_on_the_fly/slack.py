@@ -7,7 +7,9 @@ import asyncio
 import hashlib
 import logging
 import os
+import random
 import re
+import time
 from collections import OrderedDict, deque
 from pathlib import Path
 
@@ -17,11 +19,14 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
-from claude_on_the_fly.agent import Response, footer_parts
+from claude_on_the_fly.agent import Response, footer_parts, get_backend
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+
+if TYPE_CHECKING:
+    from claude_on_the_fly.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +37,212 @@ SLACK_BLOCK_LIMIT = 3000
 # counter. Overridable via env for chattier or stricter threads.
 SLACK_REPLY_SOFT_LIMIT = int(os.environ.get("SLACK_REPLY_SOFT_LIMIT", "10"))
 CONTINUE_COMMAND = "$continue"
+# Abort the in-flight turn. A plain-text prefix (not a slash command) so it
+# works inside threads, where Slack blocks custom slash commands. Reuses the
+# orchestrator abort primitive that /cof stop calls.
+STOP_COMMAND = "$stop"
+# Bot-token-only slash command. Must match the command registered in the Slack
+# app manifest. Under a user token it is never received, so the $ prefixes above
+# stay the only control surface.
+SLASH_COMMAND = os.environ.get("SLACK_SLASH_COMMAND", "/cof")
+# The 185 default spinner verbs Claude Code ships with. Rendered by
+# assistant.threads.setStatus as "<bot> is <verb>… (Ns)" while a turn runs, so
+# the status is alive rather than a frozen "thinking". Source:
+# github.com/wynandw87/claude-code-spinner-verbs (built-in defaults).
+SPINNER_VERBS = (
+    "Accomplishing",
+    "Actioning",
+    "Actualizing",
+    "Architecting",
+    "Baking",
+    "Beaming",
+    "Beboppin'",
+    "Befuddling",
+    "Billowing",
+    "Blanching",
+    "Bloviating",
+    "Boogieing",
+    "Boondoggling",
+    "Booping",
+    "Bootstrapping",
+    "Brewing",
+    "Burrowing",
+    "Calculating",
+    "Canoodling",
+    "Caramelizing",
+    "Cascading",
+    "Catapulting",
+    "Cerebrating",
+    "Channeling",
+    "Channelling",
+    "Choreographing",
+    "Churning",
+    "Clauding",
+    "Coalescing",
+    "Cogitating",
+    "Combobulating",
+    "Composing",
+    "Computing",
+    "Concocting",
+    "Considering",
+    "Contemplating",
+    "Cooking",
+    "Crafting",
+    "Creating",
+    "Crunching",
+    "Crystallizing",
+    "Cultivating",
+    "Deciphering",
+    "Deliberating",
+    "Determining",
+    "Dilly-dallying",
+    "Discombobulating",
+    "Doing",
+    "Doodling",
+    "Drizzling",
+    "Ebbing",
+    "Effecting",
+    "Elucidating",
+    "Embellishing",
+    "Enchanting",
+    "Envisioning",
+    "Evaporating",
+    "Fermenting",
+    "Fiddle-faddling",
+    "Finagling",
+    "Flambeing",
+    "Flibbertigibbeting",
+    "Flowing",
+    "Flummoxing",
+    "Fluttering",
+    "Forging",
+    "Forming",
+    "Frolicking",
+    "Frosting",
+    "Gallivanting",
+    "Galloping",
+    "Garnishing",
+    "Generating",
+    "Germinating",
+    "Gitifying",
+    "Grooving",
+    "Gusting",
+    "Harmonizing",
+    "Hashing",
+    "Hatching",
+    "Herding",
+    "Honking",
+    "Hullaballooing",
+    "Hyperspacing",
+    "Ideating",
+    "Imagining",
+    "Improvising",
+    "Incubating",
+    "Inferring",
+    "Infusing",
+    "Ionizing",
+    "Jitterbugging",
+    "Julienning",
+    "Kneading",
+    "Leavening",
+    "Levitating",
+    "Lollygagging",
+    "Manifesting",
+    "Marinating",
+    "Meandering",
+    "Metamorphosing",
+    "Misting",
+    "Moonwalking",
+    "Moseying",
+    "Mulling",
+    "Mustering",
+    "Musing",
+    "Nebulizing",
+    "Nesting",
+    "Newspapering",
+    "Noodling",
+    "Nucleating",
+    "Orbiting",
+    "Orchestrating",
+    "Osmosing",
+    "Perambulating",
+    "Percolating",
+    "Perusing",
+    "Philosophising",
+    "Photosynthesizing",
+    "Pollinating",
+    "Pondering",
+    "Pontificating",
+    "Pouncing",
+    "Precipitating",
+    "Prestidigitating",
+    "Processing",
+    "Proofing",
+    "Propagating",
+    "Puttering",
+    "Puzzling",
+    "Quantumizing",
+    "Razzle-dazzling",
+    "Razzmatazzing",
+    "Recombobulating",
+    "Reticulating",
+    "Roosting",
+    "Ruminating",
+    "Sauteing",
+    "Scampering",
+    "Schlepping",
+    "Scurrying",
+    "Seasoning",
+    "Shenaniganing",
+    "Shimmying",
+    "Simmering",
+    "Skedaddling",
+    "Sketching",
+    "Slithering",
+    "Smooshing",
+    "Sock-hopping",
+    "Spelunking",
+    "Spinning",
+    "Sprouting",
+    "Stewing",
+    "Sublimating",
+    "Swirling",
+    "Swooping",
+    "Symbioting",
+    "Synthesizing",
+    "Tempering",
+    "Thinking",
+    "Thundering",
+    "Tinkering",
+    "Tomfoolering",
+    "Topsy-turvying",
+    "Transfiguring",
+    "Transmuting",
+    "Twisting",
+    "Undulating",
+    "Unfurling",
+    "Unravelling",
+    "Vibing",
+    "Waddling",
+    "Wandering",
+    "Warping",
+    "Whatchamacalliting",
+    "Whirlpooling",
+    "Whirring",
+    "Whisking",
+    "Wibbling",
+    "Working",
+    "Wrangling",
+    "Zesting",
+    "Zigzagging",
+)
 # Max live threads whose per-session state we retain. Past this, the
 # least-recently-active thread is evicted; it re-hydrates from scratch if it
 # ever sees another message. Bounds memory in a long-running daemon.
 SLACK_SESSION_CAP = int(os.environ.get("SLACK_SESSION_CAP", "1000"))
+# Seconds of elapsed time between spinner-verb changes. The order is shuffled
+# once per turn (at message-in); ticks just index into it by elapsed time.
+STATUS_VERB_ROTATE_SECS = 4
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
@@ -312,8 +519,15 @@ class SlackFrontend(Frontend):
         )
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
-        self._orchestrator: object | None = None
+        self._orchestrator: Orchestrator | None = None
+        self._warm_task: asyncio.Task | None = None
         self._sessions: OrderedDict[int, tuple[str, str | None]] = OrderedDict()
+        # Slash commands have a channel but no thread timestamp. Remember the
+        # most recent registered session in each channel, plus the one that is
+        # currently running, so /cof stop and /cof continue target a real
+        # message or command-anchor session instead of an unregistered root.
+        self._last_session_by_channel: dict[str, int] = {}
+        self._active_session_by_channel: dict[str, int] = {}
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
         self._processed_ts: deque[str] = deque(maxlen=1000)
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
@@ -332,8 +546,14 @@ class SlackFrontend(Frontend):
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
         self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
+        self._status_started: dict[int, float] = {}  # session -> turn start (mono)
+        self._status_verbs: dict[int, list[str]] = {}  # session -> shuffled verbs
 
     def set_orchestrator(self, orchestrator: object) -> None:
+        from claude_on_the_fly.orchestrator import Orchestrator
+
+        if not isinstance(orchestrator, Orchestrator):
+            raise TypeError(f"Expected Orchestrator, got {type(orchestrator)}")
         self._orchestrator = orchestrator
 
     def workspace_name(self, chat_id: int) -> str:
@@ -376,7 +596,13 @@ class SlackFrontend(Frontend):
     def _forget_session(self, session_id: int) -> None:
         """Drop every per-session dict entry for one thread. All of this state
         is reconstructable, so a re-hydrating thread just re-resolves it."""
-        self._sessions.pop(session_id, None)
+        route = self._sessions.pop(session_id, None)
+        if route:
+            channel, _ = route
+            if self._last_session_by_channel.get(channel) == session_id:
+                self._last_session_by_channel.pop(channel, None)
+            if self._active_session_by_channel.get(channel) == session_id:
+                self._active_session_by_channel.pop(channel, None)
         self._workspace_names.pop(session_id, None)
         self._sender_names.pop(session_id, None)
         self._channel_contexts.pop(session_id, None)
@@ -393,15 +619,307 @@ class SlackFrontend(Frontend):
         self._on_message = on_message
 
         @self._app.event({"type": "message"})
-        async def handle_message(event, say):
+        async def handle_message(event, body):
             logger.debug("raw slack event: %s", event)
+            if self._is_bot_token and not self._event_is_bot_authorized(body):
+                logger.debug(
+                    "skip: event delivered via user auth, not the bot "
+                    "(channel=%s) — not the bot's conversation",
+                    event.get("channel"),
+                )
+                return
             await self._ingest_event(event)
 
         self._app.event("hello")(self._on_hello)
 
+        # Slash commands + the skill picker are an app interaction: they only
+        # reach a bot-token install (commands/interactivity scopes). A user
+        # token never receives them, so registering would be dead weight.
+        if self._is_bot_token:
+            self._register_slash_commands()
+            self._warm_task = asyncio.create_task(self._warm_skills())
+
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         await self._handler.start_async()
         logger.info("Slack connected via Socket Mode (user_id=%s)", self._user_id)
+
+    def _register_slash_commands(self) -> None:
+        app = self._app
+        logger.info("slack: registering slash command %s + skill picker", SLASH_COMMAND)
+
+        @app.command(SLASH_COMMAND)
+        async def handle_command(ack, command, body, respond):
+            await self._handle_slash_command(ack, command, body, respond)
+
+        @app.options("cc_skill")
+        async def handle_skill_options(ack, payload):
+            await self._handle_skill_options(ack, payload)
+
+        @app.view("cc_picker")
+        async def handle_picker_submit(ack, view):
+            await self._handle_picker_submit(ack, view)
+
+        @app.shortcut("cof_run_skill")
+        async def handle_run_skill_shortcut(ack, shortcut):
+            await self._handle_run_skill_shortcut(ack, shortcut)
+
+    async def _warm_skills(self) -> None:
+        """Populate the backend skill cache before the first picker opens.
+
+        Slack gives an options request 3s; a cold probe spawns the CLI and can
+        blow that, so the first picker would show an empty menu. Warming at
+        startup makes the first real request hit the cache.
+        """
+        try:
+            names = await get_backend().list_skills()
+            logger.info("slack: warmed %d skills for picker", len(names))
+        except Exception:
+            logger.exception("slack: skill warm failed")
+
+    def _is_allowed(self, sender_id: str) -> bool:
+        """Single dispatch gate: only allowed senders reach the agent.
+
+        Mirrors the message-path check in _ingest_event so every entry point
+        (messages, slash command, shortcut, picker) enforces the same policy.
+        """
+        if sender_id in self._blocked_senders:
+            return False
+        return self._allow_all_senders or sender_id in self._allowed_user_ids
+
+    async def _handle_slash_command(self, ack, command, body, respond) -> None:
+        text = (command.get("text") or "").strip()
+        channel = command.get("channel_id", "")
+        user_id = command.get("user_id", "")
+        logger.info("slack: slash command text=%r channel=%s", text, channel)
+        if not self._is_allowed(user_id):
+            logger.info("slack: slash command from %s denied (not allowed)", user_id)
+            await ack()
+            await respond("Not authorized.")
+            return
+        verb = text.split(" ", 1)[0].lower()
+        rest = text[len(verb) :].strip()
+
+        if not text:
+            await ack()
+            await self._open_skill_picker(body.get("trigger_id", ""), channel, user_id)
+            return
+        if verb == "stop":
+            await ack()
+            await self._command_stop(channel, respond)
+            return
+        if verb == "continue":
+            await ack()
+            await self._command_continue(channel, user_id, rest, respond)
+            return
+        # Everything else forwards verbatim as a `/skill args` prompt.
+        await ack()
+        prompt = f"/{text}"
+        thread_ts = await self._anchor_run(channel, None, f"Running `{prompt}`…")
+        session_id = await self._enter_command_session(channel, user_id, thread_ts)
+        if self._on_message:
+            await self._on_message(session_id, prompt)
+
+    async def _command_stop(self, channel: str, respond) -> None:
+        stopped = False
+        session_id = self._command_target_session(channel)
+        if session_id is not None and self._orchestrator is not None:
+            stopped = await self._orchestrator.abort(session_id)
+        await respond(
+            "Stopped the current turn." if stopped else "Nothing was running."
+        )
+
+    async def _command_continue(
+        self, channel: str, user_id: str, rest: str, respond
+    ) -> None:
+        session_id = self._command_target_session(channel)
+        if session_id is None:
+            if not rest:
+                await respond("Nothing to continue.")
+                return
+            thread_ts = await self._anchor_run(channel, None, "Continuing…")
+            session_id = await self._enter_command_session(channel, user_id, thread_ts)
+        self._reply_counts[session_id] = 0
+        if not rest:
+            await respond("reply counter reset")
+            return
+        await respond("continuing")
+        if self._on_message:
+            await self._on_message(session_id, rest)
+
+    async def _handle_run_skill_shortcut(self, ack, shortcut) -> None:
+        await ack()
+        channel = (shortcut.get("channel") or {}).get("id", "")
+        user_id = (shortcut.get("user") or {}).get("id", "")
+        if not self._is_allowed(user_id):
+            logger.info(
+                "slack: run-skill shortcut from %s denied (not allowed)", user_id
+            )
+            return
+        message = shortcut.get("message") or {}
+        # A message shortcut carries the message it fired on; use its thread so
+        # the run continues that thread (thread_ts for a reply, else its own ts).
+        thread_ts = message.get("thread_ts") or message.get("ts")
+        logger.info(
+            "slack: run-skill shortcut channel=%s thread_ts=%s", channel, thread_ts
+        )
+        await self._open_skill_picker(
+            shortcut.get("trigger_id", ""), channel, user_id, thread_ts
+        )
+
+    async def _open_skill_picker(
+        self, trigger_id: str, channel: str, user_id: str, thread_ts: str | None = None
+    ) -> None:
+        if not trigger_id:
+            return
+        view = {
+            "type": "modal",
+            "callback_id": "cc_picker",
+            "private_metadata": f"{channel}:{user_id}:{thread_ts or ''}",
+            "title": {"type": "plain_text", "text": "Run a skill"},
+            "submit": {"type": "plain_text", "text": "Run"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "skill",
+                    "label": {"type": "plain_text", "text": "Skill"},
+                    "element": {
+                        "type": "external_select",
+                        "action_id": "cc_skill",
+                        "min_query_length": 0,
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "search skills",
+                        },
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "args",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "Arguments"},
+                    "element": {"type": "plain_text_input", "action_id": "cc_args"},
+                },
+            ],
+        }
+        try:
+            await self._app.client.views_open(trigger_id=trigger_id, view=view)
+        except SlackApiError as exc:
+            logger.error("views_open failed: %s", exc)
+
+    async def _handle_skill_options(self, ack, payload) -> None:
+        query = (payload.get("value") or "").lower()
+        names = await get_backend().list_skills()
+        if query:
+            names = [n for n in names if query in n.lower()]
+        options = [
+            {
+                "text": {"type": "plain_text", "text": name[:75]},
+                "value": name[:75],
+            }
+            for name in names[:100]
+        ]
+        await ack(options=options)
+
+    async def _handle_picker_submit(self, ack, view) -> None:
+        await ack()
+        values = view.get("state", {}).get("values", {})
+        selected = (
+            values.get("skill", {}).get("cc_skill", {}).get("selected_option") or {}
+        )
+        skill = selected.get("value")
+        args = values.get("args", {}).get("cc_args", {}).get("value") or ""
+        channel, _, rest = (view.get("private_metadata") or "").partition(":")
+        user_id, _, thread_ts = rest.partition(":")
+        if not skill or not channel:
+            return
+        if not self._is_allowed(user_id):
+            logger.info("slack: picker submit from %s denied (not allowed)", user_id)
+            return
+        prompt = f"/{skill} {args}".strip()
+        thread_ts = await self._anchor_run(
+            channel, thread_ts or None, f"Running `{prompt}`…"
+        )
+        session_id = await self._enter_command_session(channel, user_id, thread_ts)
+        if self._on_message:
+            await self._on_message(session_id, prompt)
+
+    async def _enter_command_session(
+        self, channel: str, user_id: str, thread_ts: str | None = None
+    ) -> int:
+        """Register the session a command/shortcut forward targets.
+
+        A slash command carries no thread_ts (channel/DM root); a message
+        shortcut does, so it continues that thread. Mirrors _ingest_event's
+        session bookkeeping so send() can route the reply and the agent gets a
+        workspace + context.
+        """
+        session_id = _session_key(channel, thread_ts)
+        self._sessions[session_id] = (channel, thread_ts)
+        self._sessions.move_to_end(session_id)
+        self._evict_stale_sessions()
+        self._last_session_by_channel[channel] = session_id
+        sender = await self._resolve_sender(user_id) if user_id else "unknown"
+        self._sender_names[session_id] = sender
+        if user_id:
+            self._session_sender_ids[session_id] = user_id
+        channel_type = await self._channel_type(channel)
+        await self._resolve_session_metadata(
+            session_id, sender, channel, channel_type, thread_ts or ""
+        )
+        return session_id
+
+    def _command_target_session(self, channel: str) -> int | None:
+        """Return the running, or most recently registered, channel session.
+
+        Slack slash requests have no thread context. A command anchor or an
+        ordinary message already registered the actual thread session, so use
+        that route rather than synthesizing the channel-root key (which has no
+        send route and cannot identify the active orchestrator task).
+        """
+        session_id = self._active_session_by_channel.get(channel)
+        if session_id is None:
+            session_id = self._last_session_by_channel.get(channel)
+        if session_id is not None and session_id in self._sessions:
+            return session_id
+        return None
+
+    async def _channel_type(self, channel: str) -> str:
+        cached = self._channel_types.get(channel)
+        if cached:
+            return cached
+        try:
+            info = await self._app.client.conversations_info(channel=channel)
+            ch = info["channel"]
+        except Exception as exc:
+            logger.warning("channel_type: failed for %s: %s", channel, exc)
+            return ""
+        if ch.get("is_im"):
+            kind = "im"
+        elif ch.get("is_mpim"):
+            kind = "mpim"
+        elif ch.get("is_group") or ch.get("is_private"):
+            kind = "group"
+        else:
+            kind = "channel"
+        self._channel_types[channel] = kind
+        return kind
+
+    @staticmethod
+    def _event_is_bot_authorized(body: dict) -> bool:
+        """True if this event was delivered for the bot's own authorization.
+
+        A bot-token app that ALSO holds a user-token authorization receives the
+        user's whole message surface (their private DMs with other people, etc.)
+        via user-scoped events, marked is_bot=false in `authorizations`. Under a
+        bot token we only want the bot's own conversations, so keep is_bot=true.
+        Missing authorizations (unexpected) fails open so real traffic is never
+        silently dropped.
+        """
+        auths = body.get("authorizations")
+        if not auths:
+            return True
+        return any(a.get("is_bot") for a in auths)
 
     async def _on_hello(self, event, say):
         if not self._connected_once:
@@ -489,9 +1007,25 @@ class SlackFrontend(Frontend):
         self._sessions[session_id] = (channel, thread_ts)
         self._sessions.move_to_end(session_id)
         self._evict_stale_sessions()
+        self._last_session_by_channel[channel] = session_id
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
+
+        # $stop aborts this thread's in-flight turn. Checked before the soft-limit
+        # gate so a stop lands even when the thread is over budget. Works in
+        # threads (it's a message, not a slash command).
+        if text.strip() == STOP_COMMAND:
+            logger.info("slack %s/%s: %s", channel, thread_ts, STOP_COMMAND)
+            stopped = False
+            if self._orchestrator is not None:
+                stopped = await self._orchestrator.abort(session_id)
+            await self._post_notice(
+                channel,
+                thread_ts,
+                "Stopped the current turn." if stopped else "Nothing was running.",
+            )
+            return
 
         # Reply soft-limit gate. CONTINUE_COMMAND resets the counter and any
         # trailing text is processed as the next turn; otherwise, once the
@@ -720,6 +1254,50 @@ class SlackFrontend(Frontend):
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
 
+    async def _anchor_run(
+        self, channel: str, thread_ts: str | None, label: str
+    ) -> str | None:
+        """Return the thread a command/picker run should live in.
+
+        A message shortcut already carries a thread, so reuse it. A slash
+        command / bare picker has none, so post a real anchor message and thread
+        the run under it — that both contains the run and gives the progress
+        status a thread to attach to (setStatus is thread-scoped). Falls back to
+        channel-root (no status) if the anchor post fails.
+        """
+        if thread_ts:
+            return thread_ts
+        return await self._post_anchor(channel, label)
+
+    async def _post_anchor(self, channel: str, text: str) -> str | None:
+        try:
+            resp = await self._app.client.chat_postMessage(channel=channel, text=text)
+        except Exception as exc:
+            logger.error("anchor: failed to post %r: %s", text, exc)
+            return None
+        if resp.get("ok"):
+            ts = resp["ts"]
+            self._our_sent_timestamps.append(ts)
+            return ts
+        return None
+
+    async def _post_notice(
+        self, channel: str, thread_ts: str | None, text: str
+    ) -> None:
+        """Post a short control-command acknowledgement into the thread.
+
+        Records the ts so a user-token deploy doesn't re-ingest our own notice
+        as an inbound message (same echo guard as send/_warn_reply_limit)."""
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, text=text, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("post_notice: failed to post %r: %s", text, exc)
+            return
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload
         isn't re-ingested as an inbound message."""
@@ -732,7 +1310,16 @@ class SlackFrontend(Frontend):
                             self._our_sent_timestamps.append(ts)
 
     async def send_typing(self, chat_id: int) -> None:
-        pass
+        """Live progress tick. The orchestrator calls this every ~4s while a
+        turn runs; repurpose it to refresh the bot status with a rotating verb
+        and elapsed seconds, so a long turn visibly stays alive."""
+        start = self._status_started.get(chat_id)
+        seq = self._status_verbs.get(chat_id)
+        if start is None or not seq:
+            return
+        elapsed = int(time.monotonic() - start)
+        verb = seq[(elapsed // STATUS_VERB_ROTATE_SECS) % len(seq)]
+        await self._set_status(chat_id, f"is {verb}… ({elapsed}s)")
 
     async def notify_queued(self, chat_id: int, position: int) -> None:
         """React with hourglass on the most recently ingested message."""
@@ -744,10 +1331,26 @@ class SlackFrontend(Frontend):
         await self._react(channel, ts, "hourglass_flowing_sand")
 
     async def notify_start(self, chat_id: int) -> None:
-        """Transition the oldest pending message from hourglass to eyes."""
+        """Start the live status, then (for message-driven turns) flip the
+        hourglass reaction to eyes.
+
+        The status runs for every path: slash commands and picker runs have no
+        pending reaction message but still get a status via their session's
+        thread, so it must not sit behind the pending-msg guard.
+        """
+        route = self._sessions.get(chat_id)
+        if route:
+            self._active_session_by_channel[route[0]] = chat_id
+        self._status_started[chat_id] = time.monotonic()
+        # Shuffle the verb order once here; ticks walk it by elapsed time.
+        seq = [v.lower() for v in random.sample(SPINNER_VERBS, len(SPINNER_VERBS))]
+        self._status_verbs[chat_id] = seq
+        await self._set_status(chat_id, f"is {seq[0]}…")
         pending = self._pending_msg.get(chat_id)
         if not pending:
-            logger.debug("notify_start: no pending msg for chat_id=%s", chat_id)
+            logger.debug(
+                "notify_start: no pending reaction msg for chat_id=%s", chat_id
+            )
             return
         channel, ts = pending.popleft()
         suppressed_queue = self._pending_reply_suppressed.get(chat_id)
@@ -760,7 +1363,13 @@ class SlackFrontend(Frontend):
         self._in_flight_reply_suppressed[chat_id] = suppress_reply
 
     async def notify_complete(self, chat_id: int) -> None:
-        """Remove :eyes: from the in-flight message."""
+        """Remove :eyes: from the in-flight message and clear the status."""
+        route = self._sessions.get(chat_id)
+        if route and self._active_session_by_channel.get(route[0]) == chat_id:
+            self._active_session_by_channel.pop(route[0], None)
+        self._status_started.pop(chat_id, None)
+        self._status_verbs.pop(chat_id, None)
+        await self._set_status(chat_id, "")
         in_flight = self._in_flight.pop(chat_id, None)
         self._in_flight_reply_suppressed.pop(chat_id, None)
         if not in_flight:
@@ -790,6 +1399,35 @@ class SlackFrontend(Frontend):
                 logger.warning(
                     "unreact: failed to remove :%s: from %s: %s", emoji, timestamp, exc
                 )
+
+    async def _set_status(self, chat_id: int, status: str) -> None:
+        """Bot-only 'is thinking…' indicator via assistant.threads.setStatus.
+
+        No-op under a user token (the method is bot-only) and when the session
+        has no thread to attach to. Guarded: if Slack rejects it (e.g. the
+        thread isn't an assistant thread), it degrades silently to the emoji
+        reaction that's already shown. Pass "" to clear.
+        """
+        if not self._is_bot_token:
+            return
+        route = self._sessions.get(chat_id)
+        if not route:
+            return
+        channel, thread_ts = route
+        if not thread_ts:
+            return
+        try:
+            await self._app.client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status=status
+            )
+        except Exception as exc:
+            logger.warning(
+                "set_status: %r not applied (%s/%s): %s",
+                status,
+                channel,
+                thread_ts,
+                exc,
+            )
 
     async def _open_dm_channel(self, user_id: str) -> str | None:
         """Resolve a user_id to their IM channel id. Cached after first call."""

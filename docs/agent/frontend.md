@@ -29,6 +29,19 @@ Messaging-platform adapters (Telegram, Slack, Gmail, scheduler) implement the `F
 - **Image / file input**: frontends save uploads into the workspace path; the agent reads them through its own file tooling. Don't try to pipe image bytes through the agent CLI.
 - **File output (outbox)**: the agent attaches files by dropping them in `workspace/outbox/`. The orchestrator scans that folder after the run (`agent.collect_outbox`), sets `response.attachments`, lets `send()` upload them, then archives to `outbox/.sent/<ts>/` (`agent.archive_outbox`). This is gated on `agent.ATTACHMENT_PLATFORMS` — the single source of truth that also injects the outbox instruction into the system prompt. To support outbox on a new frontend: add its platform to `ATTACHMENT_PLATFORMS` and have `send()` upload `response.attachments`. Slack uploads via `files_upload_v2` and must record the share `ts` (echo guard, since it posts as the user); Telegram routes images to `send_photo`, else `send_document`.
 
+## Slack control surface (token-kind split)
+
+Slack exposes two control surfaces, chosen by the token kind (`_is_bot_token`, from the `xoxb`/`xoxp` prefix):
+
+- **Text prefixes (`$continue`, `$stop`)**: plain messages intercepted in `_ingest_event`, so they work under either token kind **and inside threads** — the only control surface Slack allows in threads (custom slash commands are hard-blocked there). `$stop` aborts the in-flight turn for that thread's session via `Orchestrator.abort`.
+- **Bot token (`xoxb`) only**: the `SLACK_SLASH_COMMAND` (default `/cof`) + skill picker + a **message shortcut** ("Run a skill"), registered in `start()`. These are app interactions a user token never receives, and a slash command can't run in a thread — so the shortcut (from a message's `...` menu) is the thread-capable way to open the picker. Requires the manifest to declare the command + shortcut + `commands` scope + interactivity; all rides the existing Socket Mode connection (no public URL).
+
+Routing: `/cof` (`_handle_slash_command`) — bare opens the picker; `continue [text]` resets the soft-limit counter; `stop` aborts; else forwards `/<skill> args`. A slash command has no `thread_ts`, so it targets the channel/DM root. The **message shortcut** (`_handle_run_skill_shortcut`) carries the clicked message's thread, so its picker forward is thread-scoped. Both go through `_enter_command_session(channel, user_id, thread_ts)`.
+
+The picker's type-ahead is a real `external_select`: `_handle_skill_options` filters the backend's skill list server-side (≤100 per Slack's cap). Skills come from `AgentBackend.list_skills()`, which for claude reads the `system/init` stream-json event (`slash_commands`/`skills`) from a one-shot probe and caches it process-wide; other backends return `[]`. The cache is warmed at startup so the first picker beats Slack's 3s options deadline.
+
+`/cof stop` calls `Orchestrator.abort(chat_id)`, which cancels the drain task and clears the queue. Because every backend now spawns with `start_new_session=True` and reaps via `agent._kill_process_tree` (SIGKILL to the process group), cancelling a turn kills the agent CLI *and* its tool subprocesses instead of orphaning them.
+
 ## Scheduler is a frontend too
 
 `src/claude_on_the_fly/scheduler.py` implements `Frontend` to fire cron jobs through the same path as chat frontends. Look here if you're adding anything cron-shaped rather than chat-shaped — the existing pattern (jobs are prompts OR shell scripts, YAML config, mtime hot reload) is a useful template.

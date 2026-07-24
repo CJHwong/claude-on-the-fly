@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -92,6 +94,14 @@ class TestSessionKey:
 
     def test_different_thread_ts_different_key(self):
         assert _session_key("C123", "111.222") != _session_key("C123", "333.444")
+
+
+class TestSlackManifest:
+    def test_bot_scope_includes_assistant_write(self) -> None:
+        manifest_path = Path(__file__).parents[1] / "docs/how-to/slack_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+
+        assert "assistant:write" in manifest["oauth_config"]["scopes"]["bot"]
 
 
 # ---------------------------------------------------------------------------
@@ -805,10 +815,18 @@ class TestResolveSessionMetadata:
 class TestSetOrchestrator:
     @patch("claude_on_the_fly.slack.AsyncApp")
     def test_stores_orchestrator(self, mock_app_cls):
+        from claude_on_the_fly.orchestrator import Orchestrator
+
         fe = SlackFrontend("xapp", "xoxp", "U1")
-        sentinel = object()
-        fe.set_orchestrator(sentinel)
-        assert fe._orchestrator is sentinel
+        orch = Orchestrator(fe, "slack")
+        fe.set_orchestrator(orch)
+        assert fe._orchestrator is orch
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_rejects_non_orchestrator(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        with pytest.raises(TypeError):
+            fe.set_orchestrator(object())
 
 
 # ---------------------------------------------------------------------------
@@ -1339,3 +1357,501 @@ class TestSessionEviction:
         assert session_id not in frontend._sender_names
         assert session_id not in frontend._reply_counts
         assert session_id not in frontend._in_flight
+
+
+# ---------------------------------------------------------------------------
+# Slash commands + skill picker (bot token only)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bot_frontend():
+    with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
+        mock_app = MagicMock()
+        mock_app.client = MagicMock()
+        mock_app.client.users_info = AsyncMock(
+            return_value={"user": {"name": "testuser"}}
+        )
+        mock_app.client.conversations_info = AsyncMock(
+            return_value={
+                "channel": {"name": "general", "is_mpim": False, "is_private": False}
+            }
+        )
+        mock_app.client.conversations_members = AsyncMock()
+        mock_app.client.views_open = AsyncMock()
+        mock_app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "111.222"}
+        )
+        mock_app_cls.return_value = mock_app
+
+        fe = SlackFrontend("xapp-tok", "xoxb-tok", "U_SELF", allowed_user_ids={"*"})
+        fe._on_message = AsyncMock()
+        yield fe
+
+
+class TestSlashCommandRouting:
+    async def test_forwards_skill_verbatim(self, bot_frontend):
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {
+            "text": "simplify make it lean",
+            "channel_id": "D1",
+            "user_id": "U_A",
+        }
+        await bot_frontend._handle_slash_command(
+            ack, command, {"trigger_id": "t"}, respond
+        )
+
+        ack.assert_awaited()
+        # A real anchor message is posted and the run is threaded under it.
+        bot_frontend._app.client.chat_postMessage.assert_awaited_once()
+        bot_frontend._on_message.assert_awaited_once()
+        session_id, prompt = bot_frontend._on_message.await_args.args
+        assert prompt == "/simplify make it lean"
+        assert session_id == _session_key("D1", "111.222")
+
+    async def test_stop_calls_orchestrator_abort(self, bot_frontend):
+        start_ack, start_respond = AsyncMock(), AsyncMock()
+        await bot_frontend._handle_slash_command(
+            start_ack,
+            {"text": "simplify", "channel_id": "D1", "user_id": "U"},
+            {},
+            start_respond,
+        )
+        session_id, _ = bot_frontend._on_message.await_args.args
+        bot_frontend._on_message.reset_mock()
+
+        ack, respond = AsyncMock(), AsyncMock()
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        bot_frontend._orchestrator = orch
+        await bot_frontend._handle_slash_command(
+            ack, {"text": "stop", "channel_id": "D1", "user_id": "U"}, {}, respond
+        )
+        orch.abort.assert_awaited_once_with(session_id)
+        respond.assert_awaited_with("Stopped the current turn.")
+        bot_frontend._on_message.assert_not_awaited()
+
+    async def test_stop_reports_nothing_running(self, bot_frontend):
+        ack, respond = AsyncMock(), AsyncMock()
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=False)
+        bot_frontend._orchestrator = orch
+        await bot_frontend._handle_slash_command(
+            ack, {"text": "stop", "channel_id": "D1", "user_id": "U"}, {}, respond
+        )
+        respond.assert_awaited_with("Nothing was running.")
+
+    async def test_continue_resets_counter_only(self, bot_frontend):
+        start_ack, start_respond = AsyncMock(), AsyncMock()
+        await bot_frontend._handle_slash_command(
+            start_ack,
+            {"text": "simplify", "channel_id": "D1", "user_id": "U"},
+            {},
+            start_respond,
+        )
+        sid, _ = bot_frontend._on_message.await_args.args
+        bot_frontend._on_message.reset_mock()
+
+        ack, respond = AsyncMock(), AsyncMock()
+        bot_frontend._reply_counts[sid] = 7
+        await bot_frontend._handle_slash_command(
+            ack, {"text": "continue", "channel_id": "D1", "user_id": "U"}, {}, respond
+        )
+        assert bot_frontend._reply_counts[sid] == 0
+        respond.assert_awaited_with("reply counter reset")
+        bot_frontend._on_message.assert_not_awaited()
+
+    async def test_continue_with_text_forwards(self, bot_frontend):
+        start_ack, start_respond = AsyncMock(), AsyncMock()
+        await bot_frontend._handle_slash_command(
+            start_ack,
+            {"text": "simplify", "channel_id": "D1", "user_id": "U_A"},
+            {},
+            start_respond,
+        )
+        sid, _ = bot_frontend._on_message.await_args.args
+        bot_frontend._on_message.reset_mock()
+
+        ack, respond = AsyncMock(), AsyncMock()
+        await bot_frontend._handle_slash_command(
+            ack,
+            {"text": "continue keep going", "channel_id": "D1", "user_id": "U_A"},
+            {},
+            respond,
+        )
+        bot_frontend._on_message.assert_awaited_once()
+        received_sid, prompt = bot_frontend._on_message.await_args.args
+        assert received_sid == sid
+        assert prompt == "keep going"
+
+    async def test_continue_with_text_creates_a_routable_anchor(self, bot_frontend):
+        ack, respond = AsyncMock(), AsyncMock()
+        await bot_frontend._handle_slash_command(
+            ack,
+            {"text": "continue keep going", "channel_id": "D1", "user_id": "U_A"},
+            {},
+            respond,
+        )
+
+        session_id, prompt = bot_frontend._on_message.await_args.args
+        assert prompt == "keep going"
+        assert bot_frontend._sessions[session_id] == ("D1", "111.222")
+
+        await bot_frontend.send(session_id, Response(body="answer"))
+        assert (
+            bot_frontend._app.client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == "111.222"
+        )
+
+    async def test_bare_command_opens_picker(self, bot_frontend):
+        ack, respond = AsyncMock(), AsyncMock()
+        await bot_frontend._handle_slash_command(
+            ack,
+            {"text": "", "channel_id": "D1", "user_id": "U"},
+            {"trigger_id": "trig"},
+            respond,
+        )
+        bot_frontend._app.client.views_open.assert_awaited_once()
+        kwargs = bot_frontend._app.client.views_open.await_args.kwargs
+        assert kwargs["trigger_id"] == "trig"
+        assert kwargs["view"]["callback_id"] == "cc_picker"
+        bot_frontend._on_message.assert_not_awaited()
+
+
+class TestSkillOptions:
+    async def test_filters_by_query(self, bot_frontend):
+        ack = AsyncMock()
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=["alpha", "beta", "alphabet"])
+        with patch("claude_on_the_fly.slack.get_backend", return_value=backend):
+            await bot_frontend._handle_skill_options(ack, {"value": "alph"})
+        assert ack.await_args is not None
+        values = [o["value"] for o in ack.await_args.kwargs["options"]]
+        assert values == ["alpha", "alphabet"]
+
+    async def test_caps_at_100(self, bot_frontend):
+        ack = AsyncMock()
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=[f"s{i}" for i in range(150)])
+        with patch("claude_on_the_fly.slack.get_backend", return_value=backend):
+            await bot_frontend._handle_skill_options(ack, {"value": ""})
+        assert ack.await_args is not None
+        assert len(ack.await_args.kwargs["options"]) == 100
+
+
+class TestPickerSubmit:
+    async def test_forwards_selected_skill_with_args(self, bot_frontend):
+        ack = AsyncMock()
+        view = {
+            "private_metadata": "D1:U_A",
+            "state": {
+                "values": {
+                    "skill": {"cc_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cc_args": {"value": "trim it"}},
+                }
+            },
+        }
+        await bot_frontend._handle_picker_submit(ack, view)
+        ack.assert_awaited()
+        # No thread in metadata (bare picker) -> anchors to a posted message.
+        bot_frontend._app.client.chat_postMessage.assert_awaited_once()
+        bot_frontend._on_message.assert_awaited_once()
+        session_id, prompt = bot_frontend._on_message.await_args.args
+        assert prompt == "/simplify trim it"
+        assert session_id == _session_key("D1", "111.222")
+
+    async def test_no_selection_is_noop(self, bot_frontend):
+        ack = AsyncMock()
+        view = {"private_metadata": "D1:U", "state": {"values": {}}}
+        await bot_frontend._handle_picker_submit(ack, view)
+        bot_frontend._on_message.assert_not_awaited()
+
+
+class TestStartGatesOnToken:
+    async def test_bot_token_registers_commands(self, bot_frontend):
+        bot_frontend._register_slash_commands = MagicMock()
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=[])
+        with (
+            patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls,
+            patch("claude_on_the_fly.slack.get_backend", return_value=backend),
+        ):
+            handler_cls.return_value.start_async = AsyncMock()
+            await bot_frontend.start(AsyncMock())
+        bot_frontend._register_slash_commands.assert_called_once()
+        if bot_frontend._warm_task:
+            await bot_frontend._warm_task
+
+    async def test_user_token_skips_commands(self, frontend):
+        frontend._register_slash_commands = MagicMock()
+        with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
+            handler_cls.return_value.start_async = AsyncMock()
+            await frontend.start(AsyncMock())
+        frontend._register_slash_commands.assert_not_called()
+        assert frontend._warm_task is None
+
+
+# ---------------------------------------------------------------------------
+# $stop text prefix (works in threads; both token kinds)
+# ---------------------------------------------------------------------------
+
+
+class TestStopPrefix:
+    async def test_aborts_and_does_not_forward(self, frontend):
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$stop",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        orch.abort.assert_awaited_once_with(_session_key("D1", "9.0"))
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_awaited()
+
+    async def test_targets_thread_session(self, frontend):
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=False)
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.9",
+            "thread_ts": "5.0",
+            "text": "$stop",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        orch.abort.assert_awaited_once_with(_session_key("D1", "5.0"))
+        frontend._on_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Message shortcut (thread-aware picker)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSkillShortcut:
+    async def test_opens_thread_scoped_picker(self, bot_frontend):
+        ack = AsyncMock()
+        shortcut = {
+            "trigger_id": "trig",
+            "channel": {"id": "D1"},
+            "user": {"id": "U_A"},
+            "message": {"ts": "1.0", "thread_ts": "5.0"},
+        }
+        await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
+        ack.assert_awaited()
+        assert bot_frontend._app.client.views_open.await_args is not None
+        view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
+        assert view["private_metadata"] == "D1:U_A:5.0"
+
+    async def test_root_message_uses_its_ts(self, bot_frontend):
+        ack = AsyncMock()
+        shortcut = {
+            "trigger_id": "t",
+            "channel": {"id": "D1"},
+            "user": {"id": "U"},
+            "message": {"ts": "1.0"},
+        }
+        await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
+        assert bot_frontend._app.client.views_open.await_args is not None
+        view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
+        assert view["private_metadata"] == "D1:U:1.0"
+
+    async def test_picker_submit_forwards_into_thread(self, bot_frontend):
+        ack = AsyncMock()
+        view = {
+            "private_metadata": "D1:U_A:5.0",
+            "state": {
+                "values": {
+                    "skill": {"cc_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cc_args": {"value": ""}},
+                }
+            },
+        }
+        await bot_frontend._handle_picker_submit(ack, view)
+        # Thread already known (message shortcut) -> reuse it, no anchor post.
+        bot_frontend._app.client.chat_postMessage.assert_not_awaited()
+        bot_frontend._on_message.assert_awaited_once()
+        session_id, prompt = bot_frontend._on_message.await_args.args
+        assert prompt == "/simplify"
+        assert session_id == _session_key("D1", "5.0")
+
+
+# ---------------------------------------------------------------------------
+# Bot-only progress indicator (assistant.threads.setStatus)
+# ---------------------------------------------------------------------------
+
+
+class TestStatusIndicator:
+    async def test_bot_sets_status_when_thread_present(self, bot_frontend):
+        sid = _session_key("D1", "5.0")
+        bot_frontend._sessions[sid] = ("D1", "5.0")
+        bot_frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await bot_frontend._set_status(sid, "is thinking...")
+        bot_frontend._app.client.assistant_threads_setStatus.assert_awaited_once_with(
+            channel_id="D1", thread_ts="5.0", status="is thinking..."
+        )
+
+    async def test_user_token_skips_status(self, frontend):
+        sid = _session_key("D1", "5.0")
+        frontend._sessions[sid] = ("D1", "5.0")
+        frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await frontend._set_status(sid, "is thinking...")
+        frontend._app.client.assistant_threads_setStatus.assert_not_awaited()
+
+    async def test_no_thread_skips_status(self, bot_frontend):
+        sid = _session_key("D1", None)
+        bot_frontend._sessions[sid] = ("D1", None)
+        bot_frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await bot_frontend._set_status(sid, "is thinking...")
+        bot_frontend._app.client.assistant_threads_setStatus.assert_not_awaited()
+
+    async def test_status_failure_is_swallowed(self, bot_frontend):
+        sid = _session_key("D1", "5.0")
+        bot_frontend._sessions[sid] = ("D1", "5.0")
+        bot_frontend._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=Exception("not an assistant thread")
+        )
+        # Must not raise — degrades to the emoji reaction already shown.
+        await bot_frontend._set_status(sid, "is thinking...")
+
+    async def test_send_typing_updates_live_status(self, bot_frontend):
+        sid = _session_key("D1", "5.0")
+        bot_frontend._sessions[sid] = ("D1", "5.0")
+        bot_frontend._status_started[sid] = time.monotonic() - 12
+        bot_frontend._status_verbs[sid] = ["percolating"]
+        bot_frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await bot_frontend.send_typing(sid)
+        call = bot_frontend._app.client.assistant_threads_setStatus.await_args
+        assert call is not None
+        status = call.kwargs["status"]
+        assert status.startswith("is ") and status.endswith("s)")
+
+    async def test_verb_rotates_through_the_fixed_sequence(self, bot_frontend):
+        # The order is shuffled once at notify_start; ticks walk that fixed
+        # sequence by elapsed time — no per-tick random draw.
+        sid = _session_key("D1", "5.0")
+        bot_frontend._sessions[sid] = ("D1", "5.0")
+        bot_frontend._status_verbs[sid] = ["alpha", "beta", "gamma"]
+        set_status = AsyncMock()
+        bot_frontend._app.client.assistant_threads_setStatus = set_status
+
+        bot_frontend._status_started[sid] = time.monotonic()  # elapsed ~0 -> idx 0
+        await bot_frontend.send_typing(sid)
+        bot_frontend._status_started[sid] = time.monotonic() - 6  # ~6s -> idx 1
+        await bot_frontend.send_typing(sid)
+
+        statuses = [c.kwargs["status"] for c in set_status.await_args_list]
+        assert statuses[0].startswith("is alpha… (")
+        assert statuses[1].startswith("is beta… (")
+
+    async def test_send_typing_noop_without_active_turn(self, bot_frontend):
+        sid = _session_key("D1", "5.0")
+        bot_frontend._sessions[sid] = ("D1", "5.0")
+        bot_frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await bot_frontend.send_typing(sid)
+        bot_frontend._app.client.assistant_threads_setStatus.assert_not_awaited()
+
+    async def test_notify_start_sets_status_without_pending_reaction(
+        self, bot_frontend
+    ):
+        # Slash/picker forwards have a session route but no _pending_msg entry;
+        # the status must still fire (regression: it used to sit behind the
+        # pending-msg early return).
+        sid = _session_key("D1", "5.0")
+        bot_frontend._sessions[sid] = ("D1", "5.0")
+        bot_frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await bot_frontend.notify_start(sid)
+        bot_frontend._app.client.assistant_threads_setStatus.assert_awaited_once()
+        assert sid in bot_frontend._status_started
+
+
+# ---------------------------------------------------------------------------
+# Allowlist enforced on every command/shortcut/picker path
+# ---------------------------------------------------------------------------
+
+
+class TestAllowlistGate:
+    async def test_slash_command_denied_for_unlisted_user(self, bot_frontend):
+        bot_frontend._allow_all_senders = False
+        bot_frontend._allowed_user_ids = {"U_OK"}
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {"text": "simplify", "channel_id": "D1", "user_id": "U_BAD"}
+        await bot_frontend._handle_slash_command(
+            ack, command, {"trigger_id": "t"}, respond
+        )
+        respond.assert_awaited_with("Not authorized.")
+        bot_frontend._on_message.assert_not_awaited()
+
+    async def test_blocked_sender_denied_even_with_wildcard(self, bot_frontend):
+        # bot_frontend allows "*"; a blocked id must still be refused.
+        bot_frontend._blocked_senders = {"U_BAD"}
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {"text": "simplify", "channel_id": "D1", "user_id": "U_BAD"}
+        await bot_frontend._handle_slash_command(
+            ack, command, {"trigger_id": "t"}, respond
+        )
+        respond.assert_awaited_with("Not authorized.")
+        bot_frontend._on_message.assert_not_awaited()
+
+    async def test_shortcut_denied_for_unlisted_user(self, bot_frontend):
+        bot_frontend._allow_all_senders = False
+        bot_frontend._allowed_user_ids = {"U_OK"}
+        ack = AsyncMock()
+        shortcut = {
+            "trigger_id": "t",
+            "channel": {"id": "D1"},
+            "user": {"id": "U_BAD"},
+            "message": {"ts": "1.0"},
+        }
+        await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
+        bot_frontend._app.client.views_open.assert_not_awaited()
+
+    async def test_picker_submit_denied_for_unlisted_user(self, bot_frontend):
+        bot_frontend._allow_all_senders = False
+        bot_frontend._allowed_user_ids = {"U_OK"}
+        ack = AsyncMock()
+        view = {
+            "private_metadata": "D1:U_BAD:",
+            "state": {
+                "values": {
+                    "skill": {"cc_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cc_args": {"value": ""}},
+                }
+            },
+        }
+        await bot_frontend._handle_picker_submit(ack, view)
+        bot_frontend._on_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Bot token ignores events delivered via the user authorization
+# ---------------------------------------------------------------------------
+
+
+class TestEventAuthorizationGate:
+    def test_bot_authorized_event_accepted(self):
+        assert (
+            SlackFrontend._event_is_bot_authorized(
+                {"authorizations": [{"is_bot": True}]}
+            )
+            is True
+        )
+
+    def test_user_authorized_event_rejected(self):
+        # A private DM delivered via the user's own authorization.
+        assert (
+            SlackFrontend._event_is_bot_authorized(
+                {"authorizations": [{"is_bot": False, "user_id": "UAHLLNL4E"}]}
+            )
+            is False
+        )
+
+    def test_missing_authorizations_fails_open(self):
+        assert SlackFrontend._event_is_bot_authorized({}) is True
