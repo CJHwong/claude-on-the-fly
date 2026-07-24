@@ -11,12 +11,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -502,6 +506,25 @@ def _merge_cli_output(first: dict, second: dict) -> dict:
     return merged
 
 
+_FRONTMATTER_RE = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
+
+
+def parse_frontmatter(text: str) -> dict:
+    """Parse a leading YAML front-matter block into a dict (empty if none).
+
+    Uses a real YAML parse so block scalars (`description: |`) and quoting are
+    handled. Shared by backends that read skill/prompt metadata files.
+    """
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return {}
+    try:
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class AgentBackend(Protocol):
     """Minimal contract every backend implements."""
 
@@ -533,11 +556,12 @@ class AgentBackend(Protocol):
         """
         ...
 
-    async def list_skills(self) -> list[str]:
-        """Return the backend's available skill names, for the Slack picker.
+    async def list_skills(self) -> list[tuple[str, str]]:
+        """Return the backend's skills as (name, description) for the picker.
 
-        Empty when the backend can't enumerate (codex/pi/opencode). Backends
-        cache the result — this may spawn the CLI on the first call.
+        Description is "" when unavailable. Empty list when the backend can't
+        enumerate (pi/opencode). Uncached and may spawn the CLI or read files;
+        callers should go through `cached_skills()` for the TTL disk cache.
         """
         ...
 
@@ -550,6 +574,67 @@ class OllamaLauncher:
 
     def prefix(self, agent_name: str) -> list[str]:
         return ["ollama", "launch", agent_name, "--model", self.model, "--yes", "--"]
+
+
+# Skill list changes only when plugins/prompts change, and probing spawns the
+# CLI (~0.8s), so cache it with a TTL (default 1h). Set <= 0 to disable the
+# cache and probe every query. Overridable via env.
+SKILLS_CACHE_TTL = float(os.environ.get("SKILLS_CACHE_TTL_SECONDS", "3600"))
+_skills_mem: dict[str, tuple[float, list[tuple[str, str]]]] = {}
+_skills_cache_lock = asyncio.Lock()
+
+
+async def cached_skills(
+    backend: "AgentBackend", *, force: bool = False
+) -> list[tuple[str, str]]:
+    """Return `backend.list_skills()` behind a TTL cache shared by all queries.
+
+    Two layers, both TTL-governed by SKILLS_CACHE_TTL: an in-memory entry (so
+    per-keystroke picker queries don't touch disk) and a JSON file under
+    DATA_DIR/cache (so a picker opened before startup warm finishes is still
+    instant rather than paying the cold CLI probe). A single lock collapses
+    concurrent misses into one recompute.
+
+    `force=True` skips both cache layers and re-probes, then overwrites them.
+    Startup warm uses it so a daemon restart always picks up newly
+    installed/updated skills (the cache alone would otherwise mask changes for
+    up to the TTL, even across restarts).
+    """
+    if SKILLS_CACHE_TTL <= 0:  # cache disabled: probe every query
+        return await backend.list_skills()
+    key = os.environ.get("AGENT_BACKEND", "claude").lower()
+    path = DATA_DIR / "cache" / f"skills-{key}.json"
+    now = time.time()
+    if not force:
+        entry = _skills_mem.get(key)
+        if entry and now - entry[0] < SKILLS_CACHE_TTL:
+            return entry[1]
+    async with _skills_cache_lock:
+        if not force:
+            entry = _skills_mem.get(key)
+            if entry and time.time() - entry[0] < SKILLS_CACHE_TTL:
+                return entry[1]
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                stamp = float(data["cached_at"])
+                if time.time() - stamp < SKILLS_CACHE_TTL:
+                    skills = [(str(n), str(d)) for n, d in data["skills"]]
+                    _skills_mem[key] = (stamp, skills)
+                    return skills
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        skills = await backend.list_skills()
+        stamp = time.time()
+        _skills_mem[key] = (stamp, skills)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"cached_at": stamp, "skills": [list(s) for s in skills]}),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("skills cache: write failed: %s", exc)
+        return skills
 
 
 def get_backend() -> AgentBackend:

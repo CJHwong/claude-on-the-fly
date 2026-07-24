@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2292,6 +2293,7 @@ class TestListSkills:
                     "type": "system",
                     "subtype": "init",
                     "skills": ["review", "babysit", "loop"],
+                    "plugins": [{"name": "p", "path": "/x"}, "junk"],
                 }
             ).encode()
             + b"\n"
@@ -2306,8 +2308,9 @@ class TestListSkills:
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
         monkeypatch.setattr(claude_mod.agent, "_kill_process_tree", AsyncMock())
 
-        result = await claude_mod._probe_skills([], ["claude"])
-        assert result == ["babysit", "loop", "review"]
+        names, plugins = await claude_mod._probe_skills([], ["claude"])
+        assert names == ["babysit", "loop", "review"]
+        assert plugins == [{"name": "p", "path": "/x"}]  # non-dict entries dropped
 
     async def test_probe_ignores_non_init_first_line(self, monkeypatch):
         from claude_on_the_fly.backends import claude as claude_mod
@@ -2322,19 +2325,38 @@ class TestListSkills:
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
         monkeypatch.setattr(claude_mod.agent, "_kill_process_tree", AsyncMock())
 
-        assert await claude_mod._probe_skills([], ["claude"]) == []
+        assert await claude_mod._probe_skills([], ["claude"]) == ([], [])
 
-    async def test_claude_list_skills_caches(self, monkeypatch):
+    async def test_claude_list_skills_builds_name_description_pairs(self, monkeypatch):
         from claude_on_the_fly.backends import claude as claude_mod
 
-        monkeypatch.setattr(claude_mod, "_skills_cache", None)
-        probe = AsyncMock(return_value=["a", "b"])
+        probe = AsyncMock(return_value=(["a", "b"], []))
         monkeypatch.setattr(claude_mod, "_probe_skills", probe)
-
+        monkeypatch.setattr(
+            claude_mod, "_skill_descriptions", lambda plugins: {"a": "first"}
+        )
         backend = claude_mod.ClaudeBackend()
-        assert await backend.list_skills() == ["a", "b"]
-        assert await backend.list_skills() == ["a", "b"]
-        probe.assert_awaited_once()
+        # missing description -> ""; caching now lives in agent.cached_skills.
+        assert await backend.list_skills() == [("a", "first"), ("b", "")]
+
+    async def test_claude_descriptions_from_skill_frontmatter(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        skill = tmp_path / "plug" / "skills" / "deploy"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: deploy\ndescription: |\n  Ship the\n  release safely\n---\nbody"
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "empty-cfg"))
+        out = claude_mod._skill_descriptions(
+            [{"name": "gf-ops", "path": str(tmp_path / "plug")}]
+        )
+        # block scalar folded to one line, keyed both plain and namespaced
+        # (plugin skills appear namespaced in the init list).
+        assert out["deploy"] == "Ship the release safely"
+        assert out["gf-ops:deploy"] == "Ship the release safely"
 
     async def test_pi_opencode_return_empty(self):
         from claude_on_the_fly.backends.opencode import OpencodeBackend
@@ -2348,14 +2370,73 @@ class TestListSkills:
 
         prompts = tmp_path / "prompts"
         prompts.mkdir()
-        (prompts / "deploy.md").write_text("run the deploy")
-        (prompts / "review.md").write_text("review the diff")
+        (prompts / "deploy.md").write_text(
+            "---\ndescription: ship it\n---\nrun the deploy"
+        )
+        (prompts / "review.md").write_text("review the diff")  # no front-matter -> ""
         (prompts / "notes.txt").write_text("not a prompt")  # non-.md ignored
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-        assert await CodexBackend().list_skills() == ["deploy", "review"]
+        assert await CodexBackend().list_skills() == [
+            ("deploy", "ship it"),
+            ("review", ""),
+        ]
 
     async def test_codex_empty_without_prompts_dir(self, tmp_path, monkeypatch):
         from claude_on_the_fly.backends.codex import CodexBackend
 
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))  # no prompts/ subdir
         assert await CodexBackend().list_skills() == []
+
+
+# ---------------------------------------------------------------------------
+# cached_skills — shared TTL disk cache
+# ---------------------------------------------------------------------------
+
+
+class TestCachedSkills:
+    def _reset(self, monkeypatch, tmp_path, ttl):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(agent, "_skills_mem", {})
+        monkeypatch.setattr(agent, "SKILLS_CACHE_TTL", ttl)
+        monkeypatch.setenv("AGENT_BACKEND", "claude")
+        return agent
+
+    async def test_caches_within_ttl_and_persists_to_disk(self, tmp_path, monkeypatch):
+        agent = self._reset(monkeypatch, tmp_path, 1000.0)
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=[("x", "desc")])
+        assert await agent.cached_skills(backend) == [("x", "desc")]
+        assert await agent.cached_skills(backend) == [("x", "desc")]
+        backend.list_skills.assert_awaited_once()  # served from cache 2nd time
+        assert (tmp_path / "cache" / "skills-claude.json").is_file()
+
+    async def test_disabled_ttl_probes_every_call(self, tmp_path, monkeypatch):
+        agent = self._reset(monkeypatch, tmp_path, 0.0)  # TTL <= 0 disables cache
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=[("x", "")])
+        await agent.cached_skills(backend)
+        await agent.cached_skills(backend)
+        assert backend.list_skills.await_count == 2  # probes every call
+        assert not (tmp_path / "cache" / "skills-claude.json").exists()  # no disk write
+
+    async def test_force_bypasses_cache_and_reprobes(self, tmp_path, monkeypatch):
+        agent = self._reset(monkeypatch, tmp_path, 1000.0)  # long TTL
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=[("x", "")])
+        await agent.cached_skills(backend)  # populate (fresh) cache
+        await agent.cached_skills(backend, force=True)  # startup-warm behaviour
+        assert backend.list_skills.await_count == 2  # force re-probes despite TTL
+
+    async def test_loads_from_disk_without_probing(self, tmp_path, monkeypatch):
+        agent = self._reset(monkeypatch, tmp_path, 1000.0)  # fresh in-mem (restart)
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "skills-claude.json").write_text(
+            json.dumps({"cached_at": time.time(), "skills": [["disk", "fromdisk"]]})
+        )
+        backend = MagicMock()
+        backend.list_skills = AsyncMock(return_value=[("live", "")])
+        assert await agent.cached_skills(backend) == [("disk", "fromdisk")]
+        backend.list_skills.assert_not_awaited()  # disk hit, no CLI probe

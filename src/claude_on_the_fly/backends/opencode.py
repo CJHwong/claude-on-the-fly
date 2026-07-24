@@ -319,6 +319,6 @@ class OpencodeBackend:
         pane to follow. Explicitly None."""
         return None
 
-    async def list_skills(self) -> list[str]:
-        """opencode exposes no enumerable skill list; the picker stays empty."""
+    async def list_skills(self) -> list[tuple[str, str]]:
+        """opencode enumeration is not wired yet; the picker stays empty."""
         return []

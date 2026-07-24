@@ -21,7 +21,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from claude_on_the_fly.agent import Response, footer_parts, get_backend
+from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
@@ -281,6 +281,53 @@ def _build_response_blocks(body: str, response: Response) -> list[dict]:
     return blocks
 
 
+# Slack only shows a short single line for an option description; keep it well
+# under the 75-char hard cap and truncate on a word boundary with an ellipsis.
+SKILL_DESC_MAXLEN = 72
+
+
+def _one_line(text: str) -> str:
+    """Collapse whitespace and truncate to one short line for Slack display."""
+    text = " ".join(text.split())
+    if len(text) <= SKILL_DESC_MAXLEN:
+        return text
+    return (
+        text[:SKILL_DESC_MAXLEN].rsplit(" ", 1)[0] or text[:SKILL_DESC_MAXLEN]
+    ) + "…"
+
+
+def _skill_option_groups(skills: list[tuple[str, str]]) -> list[dict]:
+    """Group (name, description) skills by plugin namespace into Block Kit
+    option_groups (label = plugin, or 'user' for un-namespaced names).
+
+    A static_select shows these browsable on open, and option_groups lift the
+    flat 100-option cap (up to 100 groups x 100 options), so the whole list is
+    reachable without typing. Value stays the full `plugin:skill` name so the
+    forward matches what the agent expects.
+    """
+    grouped: dict[str, list[tuple[str, str, str]]] = {}
+    for name, desc in skills:
+        plugin, sep, short = name.partition(":")
+        if not sep:
+            plugin, short = "user", name
+        grouped.setdefault(plugin, []).append((name, short, desc))
+    groups: list[dict] = []
+    for plugin in sorted(grouped):
+        options = []
+        for name, short, desc in sorted(grouped[plugin], key=lambda t: t[1])[:100]:
+            option = {
+                "text": {"type": "plain_text", "text": short[:75]},
+                "value": name[:75],
+            }
+            if desc:
+                option["description"] = {"type": "plain_text", "text": _one_line(desc)}
+            options.append(option)
+        groups.append(
+            {"label": {"type": "plain_text", "text": plugin[:75]}, "options": options}
+        )
+    return groups[:100]
+
+
 def _session_key(channel: str, thread_ts: str | None) -> int:
     raw = f"{channel}:{thread_ts or 'root'}"
     return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
@@ -532,6 +579,7 @@ class SlackFrontend(Frontend):
         self._processed_ts: deque[str] = deque(maxlen=1000)
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
         self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
+        self._own_dm: dict[str, bool] = {}  # channel_id -> is a DM the bot is in
         self._connected_once = False
         self._workspace_names: dict[int, str] = {}
         self._sender_names: dict[int, str] = {}
@@ -619,15 +667,8 @@ class SlackFrontend(Frontend):
         self._on_message = on_message
 
         @self._app.event({"type": "message"})
-        async def handle_message(event, body):
+        async def handle_message(event):
             logger.debug("raw slack event: %s", event)
-            if self._is_bot_token and not self._event_is_bot_authorized(body):
-                logger.debug(
-                    "skip: event delivered via user auth, not the bot "
-                    "(channel=%s) — not the bot's conversation",
-                    event.get("channel"),
-                )
-                return
             await self._ingest_event(event)
 
         self._app.event("hello")(self._on_hello)
@@ -651,10 +692,6 @@ class SlackFrontend(Frontend):
         async def handle_command(ack, command, body, respond):
             await self._handle_slash_command(ack, command, body, respond)
 
-        @app.options("cc_skill")
-        async def handle_skill_options(ack, payload):
-            await self._handle_skill_options(ack, payload)
-
         @app.view("cc_picker")
         async def handle_picker_submit(ack, view):
             await self._handle_picker_submit(ack, view)
@@ -671,7 +708,9 @@ class SlackFrontend(Frontend):
         startup makes the first real request hit the cache.
         """
         try:
-            names = await get_backend().list_skills()
+            # force=True so a restart re-probes and picks up plugin changes,
+            # rather than serving a stale (but within-TTL) cached list.
+            names = await cached_skills(get_backend(), force=True)
             logger.info("slack: warmed %d skills for picker", len(names))
         except Exception:
             logger.exception("slack: skill warm failed")
@@ -771,6 +810,32 @@ class SlackFrontend(Frontend):
     ) -> None:
         if not trigger_id:
             return
+        try:
+            skills = await cached_skills(get_backend())
+        except Exception:
+            logger.exception("skill picker: failed to load skills")
+            skills = []
+        groups = _skill_option_groups(skills)
+        # static_select shows the full grouped list on open (no typing). When
+        # there are no skills, drop the select so the modal still renders.
+        skill_block = (
+            {
+                "type": "input",
+                "block_id": "skill",
+                "label": {"type": "plain_text", "text": "Skill"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "cc_skill",
+                    "placeholder": {"type": "plain_text", "text": "pick a skill"},
+                    "option_groups": groups,
+                },
+            }
+            if groups
+            else {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "No skills available."},
+            }
+        )
         view = {
             "type": "modal",
             "callback_id": "cc_picker",
@@ -779,20 +844,7 @@ class SlackFrontend(Frontend):
             "submit": {"type": "plain_text", "text": "Run"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": [
-                {
-                    "type": "input",
-                    "block_id": "skill",
-                    "label": {"type": "plain_text", "text": "Skill"},
-                    "element": {
-                        "type": "external_select",
-                        "action_id": "cc_skill",
-                        "min_query_length": 0,
-                        "placeholder": {
-                            "type": "plain_text",
-                            "text": "search skills",
-                        },
-                    },
-                },
+                skill_block,
                 {
                     "type": "input",
                     "block_id": "args",
@@ -806,20 +858,6 @@ class SlackFrontend(Frontend):
             await self._app.client.views_open(trigger_id=trigger_id, view=view)
         except SlackApiError as exc:
             logger.error("views_open failed: %s", exc)
-
-    async def _handle_skill_options(self, ack, payload) -> None:
-        query = (payload.get("value") or "").lower()
-        names = await get_backend().list_skills()
-        if query:
-            names = [n for n in names if query in n.lower()]
-        options = [
-            {
-                "text": {"type": "plain_text", "text": name[:75]},
-                "value": name[:75],
-            }
-            for name in names[:100]
-        ]
-        await ack(options=options)
 
     async def _handle_picker_submit(self, ack, view) -> None:
         await ack()
@@ -905,21 +943,31 @@ class SlackFrontend(Frontend):
         self._channel_types[channel] = kind
         return kind
 
-    @staticmethod
-    def _event_is_bot_authorized(body: dict) -> bool:
-        """True if this event was delivered for the bot's own authorization.
+    async def _is_bot_conversation(self, channel: str) -> bool:
+        """Whether `channel` is a DM/group-DM the bot itself is in.
 
-        A bot-token app that ALSO holds a user-token authorization receives the
-        user's whole message surface (their private DMs with other people, etc.)
-        via user-scoped events, marked is_bot=false in `authorizations`. Under a
-        bot token we only want the bot's own conversations, so keep is_bot=true.
-        Missing authorizations (unexpected) fails open so real traffic is never
-        silently dropped.
+        A bot-token app that also holds the user-token grant receives the
+        authorizing user's *other* DMs (with third parties) too, which are not
+        addressed to the bot. conversations.info on the bot token resolves the
+        bot's own DMs and returns channel_not_found / not_in_channel for ones it
+        isn't in. Cached per channel; fail-open (only a definitive not-a-member
+        error is False) so it can never drop the bot's own DMs.
         """
-        auths = body.get("authorizations")
-        if not auths:
-            return True
-        return any(a.get("is_bot") for a in auths)
+        cached = self._own_dm.get(channel)
+        if cached is not None:
+            return cached
+        result = True
+        try:
+            info = await self._app.client.conversations_info(channel=channel)
+            ch = info["channel"]
+            result = bool(ch.get("is_im") or ch.get("is_mpim"))
+        except SlackApiError as exc:
+            if exc.response.get("error") in ("channel_not_found", "not_in_channel"):
+                result = False
+        except Exception as exc:
+            logger.warning("is_bot_conversation: %s: %s", channel, exc)
+        self._own_dm[channel] = result
+        return result
 
     async def _on_hello(self, event, say):
         if not self._connected_once:
@@ -1000,6 +1048,17 @@ class SlackFrontend(Frontend):
                     logger.debug("skipped: no mention of %s in text", self._user_id)
                     return
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
+
+            # Under a bot token the app also receives the authorizing user's own
+            # DMs with third parties (via the user-token grant); those aren't
+            # addressed to the bot. Only act on DMs the bot itself is in.
+            if (
+                self._is_bot_token
+                and channel_type in ("im", "mpim")
+                and not await self._is_bot_conversation(channel)
+            ):
+                logger.debug("skipped: %s is not a DM the bot is in", channel)
+                return
 
         session_id = _session_key(channel, thread_ts)
         is_new_session = session_id not in self._sessions

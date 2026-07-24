@@ -65,17 +65,16 @@ def resolve_pty_binary() -> str | None:
     return None
 
 
-_skills_cache: list[str] | None = None
-_skills_lock = asyncio.Lock()
+async def _probe_skills(
+    prefix: list[str], binary: list[str]
+) -> tuple[list[str], list[dict]]:
+    """Read skill names and active plugins from a print-mode `system/init` event.
 
-
-async def _probe_skills(prefix: list[str], binary: list[str]) -> list[str]:
-    """Read the skill list from a print-mode session's `system/init` event.
-
-    The init line lists every resolvable skill and is emitted before the model
-    turn runs, so we read that one line and reap the whole process tree before
-    any tokens are spent. Probed from $HOME so it reflects the user + plugin
-    skills a workspace inherits (workspaces carry no project-local .claude).
+    The init line lists every resolvable skill (and the active plugins with
+    their paths) and is emitted before the model turn runs, so we read that one
+    line and reap the whole process tree before any tokens are spent. Probed
+    from $HOME so it reflects the user + plugin skills a workspace inherits
+    (workspaces carry no project-local .claude).
     """
     cmd = [
         *prefix,
@@ -101,16 +100,53 @@ async def _probe_skills(prefix: list[str], binary: list[str]) -> list[str]:
         line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
     except asyncio.TimeoutError:
         logger.warning("list_skills: timed out waiting for init event")
-        return []
+        return [], []
     finally:
         await agent._kill_process_tree(proc)
     try:
         event = json.loads(line)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return []
+        return [], []
     if event.get("type") != "system" or event.get("subtype") != "init":
-        return []
-    return sorted(str(s) for s in (event.get("skills") or []))
+        return [], []
+    names = sorted(str(s) for s in (event.get("skills") or []))
+    plugins = [p for p in (event.get("plugins") or []) if isinstance(p, dict)]
+    return names, plugins
+
+
+def _skill_descriptions(plugins: list[dict]) -> dict[str, str]:
+    """Map skill name -> one-line description from SKILL.md front-matter.
+
+    Scans the user skills dir ($CLAUDE_CONFIG_DIR/skills, default ~/.claude) and
+    each active plugin's skills dir (paths straight from the init event), so it
+    covers the reported skills without walking the whole marketplace clone.
+    Descriptions the init event doesn't carry, so this is the only source.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(config_dir) if config_dir else Path.home() / ".claude"
+    # (plugin_name, skills_root); user skills have no plugin namespace.
+    roots: list[tuple[str | None, Path]] = [(None, base / "skills")]
+    roots += [
+        (p.get("name"), Path(p["path"]) / "skills") for p in plugins if p.get("path")
+    ]
+    out: dict[str, str] = {}
+    for plugin_name, root in roots:
+        try:
+            skill_files = sorted(root.glob("*/SKILL.md"))
+        except OSError:
+            continue
+        for skill_file in skill_files:
+            try:
+                meta = agent.parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            name = str(meta.get("name") or skill_file.parent.name)
+            desc = " ".join(str(meta.get("description") or "").split())
+            out.setdefault(name, desc)
+            # Plugin skills appear in the init list namespaced as plugin:skill.
+            if plugin_name:
+                out.setdefault(f"{plugin_name}:{name}", desc)
+    return out
 
 
 class ClaudeBackend:
@@ -355,19 +391,19 @@ class ClaudeBackend:
         )
         return path if path.is_file() else None
 
-    async def list_skills(self) -> list[str]:
-        """Enumerate skills via a one-shot init probe, cached process-wide."""
-        global _skills_cache
-        async with _skills_lock:
-            if _skills_cache is not None:
-                return _skills_cache
-            # Probe the real `claude` binary directly even in pty mode —
-            # claude-pty never emits stream-json, but the init event does.
-            prefix = self.launcher.prefix("claude") if self.launcher else []
-            binary = [] if self.launcher else ["claude"]
-            _skills_cache = await _probe_skills(prefix, binary)
-            logger.info("list_skills: cached %d skills", len(_skills_cache))
-            return _skills_cache
+    async def list_skills(self) -> list[tuple[str, str]]:
+        """Enumerate skills (name, description) via a one-shot init probe plus
+        SKILL.md front-matter. Uncached — the TTL cache lives in
+        agent.cached_skills, which callers use."""
+        # Probe the real `claude` binary directly even in pty mode —
+        # claude-pty never emits stream-json, but the init event does.
+        prefix = self.launcher.prefix("claude") if self.launcher else []
+        binary = [] if self.launcher else ["claude"]
+        names, plugins = await _probe_skills(prefix, binary)
+        descriptions = _skill_descriptions(plugins)
+        skills = [(name, descriptions.get(name, "")) for name in names]
+        logger.info("list_skills: probed %d skills", len(skills))
+        return skills
 
 
 def _statusline_response_fields(statusline: dict) -> dict:

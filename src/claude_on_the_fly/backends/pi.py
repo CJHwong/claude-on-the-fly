@@ -341,6 +341,6 @@ class PiBackend:
         """Live JSONL pi appends to as the session runs."""
         return _find_pi_session_path(workspace, session_uuid)
 
-    async def list_skills(self) -> list[str]:
-        """pi exposes no enumerable skill list; the picker stays empty."""
+    async def list_skills(self) -> list[tuple[str, str]]:
+        """pi enumeration is not wired yet; the picker stays empty."""
         return []

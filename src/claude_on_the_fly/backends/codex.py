@@ -411,16 +411,27 @@ class CodexBackend:
         # blank until the turn completes.
         return transcript._find_codex_rollout_by_cwd(str(workspace))
 
-    async def list_skills(self) -> list[str]:
-        """List codex custom prompts, each invoked as a `/<name>` slash command.
+    async def list_skills(self) -> list[tuple[str, str]]:
+        """List codex custom prompts as (name, description).
 
         Codex has no CLI to enumerate them, so scan its prompts dir directly:
         `$CODEX_HOME/prompts/*.md` (CODEX_HOME defaults to ~/.codex). The
-        filename without .md is the slash name. Empty when the dir is absent.
+        filename without .md is the slash name; the description comes from the
+        file's YAML front-matter. Empty when the dir is absent.
         """
         prompts_dir = _codex_prompts_dir()
         try:
-            return sorted(p.stem for p in prompts_dir.glob("*.md") if p.is_file())
+            files = sorted(p for p in prompts_dir.glob("*.md") if p.is_file())
         except OSError as exc:
             logger.warning("list_skills: cannot read %s: %s", prompts_dir, exc)
             return []
+        out: list[tuple[str, str]] = []
+        for path in files:
+            try:
+                meta = agent.parse_frontmatter(path.read_text(encoding="utf-8"))
+            except OSError:
+                meta = {}
+            out.append(
+                (path.stem, " ".join(str(meta.get("description") or "").split()))
+            )
+        return out

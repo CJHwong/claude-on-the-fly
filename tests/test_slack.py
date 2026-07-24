@@ -1505,12 +1505,16 @@ class TestSlashCommandRouting:
 
     async def test_bare_command_opens_picker(self, bot_frontend):
         ack, respond = AsyncMock(), AsyncMock()
-        await bot_frontend._handle_slash_command(
-            ack,
-            {"text": "", "channel_id": "D1", "user_id": "U"},
-            {"trigger_id": "trig"},
-            respond,
-        )
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await bot_frontend._handle_slash_command(
+                ack,
+                {"text": "", "channel_id": "D1", "user_id": "U"},
+                {"trigger_id": "trig"},
+                respond,
+            )
         bot_frontend._app.client.views_open.assert_awaited_once()
         kwargs = bot_frontend._app.client.views_open.await_args.kwargs
         assert kwargs["trigger_id"] == "trig"
@@ -1518,25 +1522,60 @@ class TestSlashCommandRouting:
         bot_frontend._on_message.assert_not_awaited()
 
 
-class TestSkillOptions:
-    async def test_filters_by_query(self, bot_frontend):
-        ack = AsyncMock()
-        backend = MagicMock()
-        backend.list_skills = AsyncMock(return_value=["alpha", "beta", "alphabet"])
-        with patch("claude_on_the_fly.slack.get_backend", return_value=backend):
-            await bot_frontend._handle_skill_options(ack, {"value": "alph"})
-        assert ack.await_args is not None
-        values = [o["value"] for o in ack.await_args.kwargs["options"]]
-        assert values == ["alpha", "alphabet"]
+class TestSkillPicker:
+    def test_option_groups_grouped_by_plugin(self):
+        from claude_on_the_fly.slack import _skill_option_groups
 
-    async def test_caps_at_100(self, bot_frontend):
-        ack = AsyncMock()
-        backend = MagicMock()
-        backend.list_skills = AsyncMock(return_value=[f"s{i}" for i in range(150)])
-        with patch("claude_on_the_fly.slack.get_backend", return_value=backend):
-            await bot_frontend._handle_skill_options(ack, {"value": ""})
-        assert ack.await_args is not None
-        assert len(ack.await_args.kwargs["options"]) == 100
+        groups = _skill_option_groups(
+            [("gf-qa:foo", "desc foo"), ("gf-qa:bar", ""), ("babysit", "triage")]
+        )
+        assert [g["label"]["text"] for g in groups] == ["gf-qa", "user"]  # sorted
+        gfqa = {o["value"]: o for o in groups[0]["options"]}
+        assert gfqa["gf-qa:foo"]["text"]["text"] == "foo"  # short name shown
+        assert gfqa["gf-qa:foo"]["description"]["text"] == "desc foo"
+        assert "description" not in gfqa["gf-qa:bar"]  # omitted when empty
+        assert groups[1]["options"][0]["value"] == "babysit"  # plain -> "user"
+
+    def test_option_groups_empty(self):
+        from claude_on_the_fly.slack import _skill_option_groups
+
+        assert _skill_option_groups([]) == []
+
+    def test_long_description_truncated_to_one_line(self):
+        from claude_on_the_fly.slack import SKILL_DESC_MAXLEN, _skill_option_groups
+
+        long = "word " * 40  # ~200 chars, multi-word
+        groups = _skill_option_groups([("plug:x", long)])
+        text = groups[0]["options"][0]["description"]["text"]
+        assert len(text) <= SKILL_DESC_MAXLEN + 1  # + the ellipsis
+        assert text.endswith("…")
+        assert "\n" not in text
+
+    async def test_open_picker_builds_static_select(self, bot_frontend):
+        skills = AsyncMock(return_value=[("gf-qa:foo", "d"), ("babysit", "")])
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", skills),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await bot_frontend._open_skill_picker("trig", "D1", "U", "5.0")
+        view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
+        element = view["blocks"][0]["element"]
+        assert element["type"] == "static_select"
+        assert element["action_id"] == "cc_skill"
+        assert {g["label"]["text"] for g in element["option_groups"]} == {
+            "gf-qa",
+            "user",
+        }
+        assert view["private_metadata"] == "D1:U:5.0"
+
+    async def test_open_picker_empty_skills_drops_select(self, bot_frontend):
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await bot_frontend._open_skill_picker("trig", "D1", "U", None)
+        view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
+        assert view["blocks"][0]["type"] == "section"  # message, no select
 
 
 class TestPickerSubmit:
@@ -1570,11 +1609,10 @@ class TestPickerSubmit:
 class TestStartGatesOnToken:
     async def test_bot_token_registers_commands(self, bot_frontend):
         bot_frontend._register_slash_commands = MagicMock()
-        backend = MagicMock()
-        backend.list_skills = AsyncMock(return_value=[])
         with (
             patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls,
-            patch("claude_on_the_fly.slack.get_backend", return_value=backend),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
         ):
             handler_cls.return_value.start_async = AsyncMock()
             await bot_frontend.start(AsyncMock())
@@ -1644,7 +1682,11 @@ class TestRunSkillShortcut:
             "user": {"id": "U_A"},
             "message": {"ts": "1.0", "thread_ts": "5.0"},
         }
-        await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
         ack.assert_awaited()
         assert bot_frontend._app.client.views_open.await_args is not None
         view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
@@ -1658,7 +1700,11 @@ class TestRunSkillShortcut:
             "user": {"id": "U"},
             "message": {"ts": "1.0"},
         }
-        await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await bot_frontend._handle_run_skill_shortcut(ack, shortcut)
         assert bot_frontend._app.client.views_open.await_args is not None
         view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
         assert view["private_metadata"] == "D1:U:1.0"
@@ -1831,27 +1877,55 @@ class TestAllowlistGate:
 
 
 # ---------------------------------------------------------------------------
-# Bot token ignores events delivered via the user authorization
+# Bot-token DM gate: only act on DMs the bot itself is in
 # ---------------------------------------------------------------------------
 
 
-class TestEventAuthorizationGate:
-    def test_bot_authorized_event_accepted(self):
-        assert (
-            SlackFrontend._event_is_bot_authorized(
-                {"authorizations": [{"is_bot": True}]}
-            )
-            is True
+class TestBotConversationGate:
+    async def test_own_dm_is_bot_conversation(self, bot_frontend):
+        bot_frontend._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"is_im": True}}
         )
+        assert await bot_frontend._is_bot_conversation("D1") is True
 
-    def test_user_authorized_event_rejected(self):
-        # A private DM delivered via the user's own authorization.
-        assert (
-            SlackFrontend._event_is_bot_authorized(
-                {"authorizations": [{"is_bot": False, "user_id": "UAHLLNL4E"}]}
-            )
-            is False
+    async def test_foreign_dm_is_not(self, bot_frontend):
+        bot_frontend._app.client.conversations_info = AsyncMock(
+            side_effect=SlackApiError("x", {"ok": False, "error": "channel_not_found"})
         )
+        assert await bot_frontend._is_bot_conversation("DX") is False
 
-    def test_missing_authorizations_fails_open(self):
-        assert SlackFrontend._event_is_bot_authorized({}) is True
+    async def test_ambiguous_error_fails_open(self, bot_frontend):
+        bot_frontend._app.client.conversations_info = AsyncMock(
+            side_effect=SlackApiError("x", {"ok": False, "error": "ratelimited"})
+        )
+        assert await bot_frontend._is_bot_conversation("DY") is True
+
+    async def test_ingest_skips_foreign_dm(self, bot_frontend):
+        bot_frontend._app.client.conversations_info = AsyncMock(
+            side_effect=SlackApiError("x", {"ok": False, "error": "channel_not_found"})
+        )
+        await bot_frontend._ingest_event(
+            {
+                "ts": "1.0",
+                "text": "hi",
+                "channel": "DX",
+                "channel_type": "im",
+                "user": "U_ALLOWED",
+            }
+        )
+        bot_frontend._on_message.assert_not_awaited()
+
+    async def test_ingest_processes_own_dm(self, bot_frontend):
+        bot_frontend._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"is_im": True}}
+        )
+        await bot_frontend._ingest_event(
+            {
+                "ts": "2.0",
+                "text": "hi",
+                "channel": "D1",
+                "channel_type": "im",
+                "user": "U_ALLOWED",
+            }
+        )
+        bot_frontend._on_message.assert_awaited_once()
