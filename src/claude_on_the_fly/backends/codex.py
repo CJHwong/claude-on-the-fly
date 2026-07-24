@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shlex
 import time
 from pathlib import Path
 
@@ -120,6 +122,82 @@ async def _run_codex_exec(
     return parsed
 
 
+def _codex_prompts_dir() -> Path:
+    """Codex custom-prompt dir: `$CODEX_HOME/prompts` (defaults to ~/.codex)."""
+    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(home) / "prompts"
+
+
+_NAMED_ARG_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+_PLACEHOLDER_RE = re.compile(r"\$\$|\$([1-9])|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Drop a leading YAML front-matter block (metadata, not prompt body)."""
+    if text.startswith("---\n") or text.startswith("---\r\n"):
+        return re.sub(r"^---\r?\n.*?\r?\n---\r?\n", "", text, count=1, flags=re.DOTALL)
+    return text
+
+
+def _substitute_placeholders(template: str, args_raw: str) -> str:
+    """Fill codex prompt placeholders: $ARGUMENTS, $1..$9, named $NAME (from
+    KEY=value args), and $$ for a literal $. Unknown placeholders become empty,
+    matching codex's own substitution."""
+    try:
+        tokens = shlex.split(args_raw)
+    except ValueError:
+        tokens = args_raw.split()
+    positional: list[str] = []
+    named: dict[str, str] = {}
+    for tok in tokens:
+        match = _NAMED_ARG_RE.match(tok)
+        if match:
+            named[match.group(1)] = match.group(2)
+        else:
+            positional.append(tok)
+
+    def _replace(match: re.Match) -> str:
+        if match.group(0) == "$$":
+            return "$"
+        if match.group(1):
+            idx = int(match.group(1))
+            return positional[idx - 1] if idx <= len(positional) else ""
+        name = match.group(2)
+        if name == "ARGUMENTS":
+            return args_raw
+        return named.get(name, "")
+
+    return _PLACEHOLDER_RE.sub(_replace, template)
+
+
+def _expand_codex_prompt(prompt: str) -> str:
+    """Expand a `/<name> [args]` codex custom-prompt into its file body.
+
+    `codex exec` (non-interactive) does not expand custom prompts — that is an
+    interactive slash-menu feature — so the picker's forwarded `/name` would
+    otherwise reach the model as literal text. Read the matching prompt file,
+    strip front-matter, substitute placeholders, and return the body. Leaves the
+    prompt unchanged when it isn't a slash invocation or has no matching file.
+    """
+    stripped = prompt.strip()
+    if not stripped.startswith("/"):
+        return prompt
+    name, _, args_raw = stripped[1:].partition(" ")
+    if name.startswith("prompts:"):  # accept the namespaced form too
+        name = name[len("prompts:") :]
+    if not name:
+        return prompt
+    path = _codex_prompts_dir() / f"{name}.md"
+    if not path.is_file():
+        return prompt
+    try:
+        template = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("expand: cannot read %s: %s", path, exc)
+        return prompt
+    return _substitute_placeholders(_strip_frontmatter(template), args_raw.strip())
+
+
 class CodexBackend:
     """Drives the `codex exec` CLI in non-interactive (`--json`) mode.
 
@@ -149,6 +227,8 @@ class CodexBackend:
             channel_context,
             workspace,
         )
+        # codex exec won't expand a /custom-prompt itself, so do it here.
+        prompt = _expand_codex_prompt(prompt)
         sessions_dir = workspace / ".codex_sessions"
         session_file = sessions_dir / session_uuid
         existing_thread = (
@@ -332,5 +412,15 @@ class CodexBackend:
         return transcript._find_codex_rollout_by_cwd(str(workspace))
 
     async def list_skills(self) -> list[str]:
-        """Codex exposes no enumerable skill list; the picker stays empty."""
-        return []
+        """List codex custom prompts, each invoked as a `/<name>` slash command.
+
+        Codex has no CLI to enumerate them, so scan its prompts dir directly:
+        `$CODEX_HOME/prompts/*.md` (CODEX_HOME defaults to ~/.codex). The
+        filename without .md is the slash name. Empty when the dir is absent.
+        """
+        prompts_dir = _codex_prompts_dir()
+        try:
+            return sorted(p.stem for p in prompts_dir.glob("*.md") if p.is_file())
+        except OSError as exc:
+            logger.warning("list_skills: cannot read %s: %s", prompts_dir, exc)
+            return []

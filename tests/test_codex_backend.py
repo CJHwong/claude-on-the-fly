@@ -931,3 +931,64 @@ class TestCodexSessionLogPath:
         old = time.time() - 3600
         os.utime(rollout, (old, old))
         assert CodexBackend().session_log_path(ws, "uuid-no-mapping") is None
+
+
+# ---------------------------------------------------------------------------
+# Custom-prompt expansion (codex exec doesn't expand /name itself)
+# ---------------------------------------------------------------------------
+
+
+class TestExpandCodexPrompt:
+    def _prompt(self, tmp_path, name, body):
+        prompts = tmp_path / "prompts"
+        prompts.mkdir(exist_ok=True)
+        (prompts / f"{name}.md").write_text(body)
+
+    def test_non_slash_prompt_unchanged(self):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        assert _expand_codex_prompt("just a message") == "just a message"
+
+    def test_unknown_prompt_unchanged(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        assert _expand_codex_prompt("/nope") == "/nope"
+
+    def test_expands_body_strips_frontmatter_and_named_args(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        self._prompt(
+            tmp_path,
+            "draftpr",
+            "---\ndescription: draft a PR\n---\nPR titled $PR_TITLE for $ARGUMENTS",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        out = _expand_codex_prompt('/draftpr FILES="a b" PR_TITLE="Add hero"')
+        assert out == 'PR titled Add hero for FILES="a b" PR_TITLE="Add hero"'
+
+    def test_positional_args_and_escape(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        self._prompt(tmp_path, "greet", "Hi $1, you owe $$5. Rest: $2")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        assert (
+            _expand_codex_prompt("/greet alice bob")
+            == "Hi alice, you owe $5. Rest: bob"
+        )
+
+    def test_namespaced_invocation(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        self._prompt(tmp_path, "x", "BODY")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        assert _expand_codex_prompt("/prompts:x") == "BODY"
+
+    def test_missing_placeholders_become_empty(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        self._prompt(tmp_path, "p", "[$3][$NOPE]")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        assert _expand_codex_prompt("/p only") == "[][]"

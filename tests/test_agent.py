@@ -2336,11 +2336,26 @@ class TestListSkills:
         assert await backend.list_skills() == ["a", "b"]
         probe.assert_awaited_once()
 
-    async def test_other_backends_return_empty(self):
-        from claude_on_the_fly.backends.codex import CodexBackend
+    async def test_pi_opencode_return_empty(self):
         from claude_on_the_fly.backends.opencode import OpencodeBackend
         from claude_on_the_fly.backends.pi import PiBackend
 
-        assert await CodexBackend().list_skills() == []
         assert await PiBackend().list_skills() == []
         assert await OpencodeBackend().list_skills() == []
+
+    async def test_codex_lists_prompt_files(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.codex import CodexBackend
+
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        (prompts / "deploy.md").write_text("run the deploy")
+        (prompts / "review.md").write_text("review the diff")
+        (prompts / "notes.txt").write_text("not a prompt")  # non-.md ignored
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        assert await CodexBackend().list_skills() == ["deploy", "review"]
+
+    async def test_codex_empty_without_prompts_dir(self, tmp_path, monkeypatch):
+        from claude_on_the_fly.backends.codex import CodexBackend
+
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))  # no prompts/ subdir
+        assert await CodexBackend().list_skills() == []
