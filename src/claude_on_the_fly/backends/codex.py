@@ -92,6 +92,7 @@ async def _run_codex_exec(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
+        start_new_session=True,
     )
     try:
         if timeout is not None:
@@ -102,15 +103,9 @@ async def _run_codex_exec(
             stdout_bytes, stderr_bytes = await proc.communicate()
     except asyncio.TimeoutError:
         logger.warning("codex exec: timed out after %ss", timeout)
-        if proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                logger.exception("codex exec: failed to reap subprocess")
         raise RuntimeError(f"Codex CLI timed out after {timeout}s")
+    finally:
+        await agent._kill_process_tree(proc)
 
     parsed = parse_codex_stream(stdout_bytes)
     if proc.returncode != 0:
@@ -335,3 +330,7 @@ class CodexBackend:
         # the workspace cwd. Lets the watch pane tail live instead of staying
         # blank until the turn completes.
         return transcript._find_codex_rollout_by_cwd(str(workspace))
+
+    async def list_skills(self) -> list[str]:
+        """Codex exposes no enumerable skill list; the picker stays empty."""
+        return []

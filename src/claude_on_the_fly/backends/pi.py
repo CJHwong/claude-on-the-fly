@@ -127,20 +127,15 @@ async def _run_pi_exec(workspace: Path, cmd: list[str], timeout: float | None) -
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
         limit=16 * 1024 * 1024,
+        start_new_session=True,
     )
     try:
         result = await asyncio.wait_for(_consume_pi(proc), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning("pi exec: timed out after %ss", timeout)
-        if proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                logger.exception("pi exec: failed to reap subprocess")
         raise RuntimeError(f"pi timed out after {timeout}s")
+    finally:
+        await agent._kill_process_tree(proc)
     return result
 
 
@@ -345,3 +340,7 @@ class PiBackend:
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
         """Live JSONL pi appends to as the session runs."""
         return _find_pi_session_path(workspace, session_uuid)
+
+    async def list_skills(self) -> list[str]:
+        """pi exposes no enumerable skill list; the picker stays empty."""
+        return []

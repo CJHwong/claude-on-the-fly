@@ -139,6 +139,7 @@ async def _run_opencode_exec(
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
         limit=16 * 1024 * 1024,
+        start_new_session=True,
     )
     try:
         if timeout is not None:
@@ -149,15 +150,9 @@ async def _run_opencode_exec(
             stdout_bytes, stderr_bytes = await proc.communicate()
     except asyncio.TimeoutError:
         logger.warning("opencode exec: timed out after %ss", timeout)
-        if proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                logger.exception("opencode exec: failed to reap subprocess")
         raise RuntimeError(f"opencode timed out after {timeout}s")
+    finally:
+        await agent._kill_process_tree(proc)
 
     parsed = parse_opencode_stream(stdout_bytes)
     if proc.returncode != 0:
@@ -323,3 +318,7 @@ class OpencodeBackend:
         store, not a single tailable JSONL — so there's nothing for the watch
         pane to follow. Explicitly None."""
         return None
+
+    async def list_skills(self) -> list[str]:
+        """opencode exposes no enumerable skill list; the picker stays empty."""
+        return []

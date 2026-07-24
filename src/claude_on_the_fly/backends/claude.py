@@ -65,6 +65,54 @@ def resolve_pty_binary() -> str | None:
     return None
 
 
+_skills_cache: list[str] | None = None
+_skills_lock = asyncio.Lock()
+
+
+async def _probe_skills(prefix: list[str], binary: list[str]) -> list[str]:
+    """Read the skill list from a print-mode session's `system/init` event.
+
+    The init line lists every resolvable skill and is emitted before the model
+    turn runs, so we read that one line and reap the whole process tree before
+    any tokens are spent. Probed from $HOME so it reflects the user + plugin
+    skills a workspace inherits (workspaces carry no project-local .claude).
+    """
+    cmd = [
+        *prefix,
+        *binary,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "bypassPermissions",
+        "warm",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(Path.home()),
+        limit=16 * 1024 * 1024,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    try:
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+    except asyncio.TimeoutError:
+        logger.warning("list_skills: timed out waiting for init event")
+        return []
+    finally:
+        await agent._kill_process_tree(proc)
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if event.get("type") != "system" or event.get("subtype") != "init":
+        return []
+    return sorted(str(s) for s in (event.get("skills") or []))
+
+
 class ClaudeBackend:
     """Drives the `claude` CLI.
 
@@ -307,6 +355,20 @@ class ClaudeBackend:
         )
         return path if path.is_file() else None
 
+    async def list_skills(self) -> list[str]:
+        """Enumerate skills via a one-shot init probe, cached process-wide."""
+        global _skills_cache
+        async with _skills_lock:
+            if _skills_cache is not None:
+                return _skills_cache
+            # Probe the real `claude` binary directly even in pty mode —
+            # claude-pty never emits stream-json, but the init event does.
+            prefix = self.launcher.prefix("claude") if self.launcher else []
+            binary = [] if self.launcher else ["claude"]
+            _skills_cache = await _probe_skills(prefix, binary)
+            logger.info("list_skills: cached %d skills", len(_skills_cache))
+            return _skills_cache
+
 
 def _statusline_response_fields(statusline: dict) -> dict:
     """Pull the Response-friendly subset of fields out of a pty statusline.
@@ -360,6 +422,7 @@ async def _exec_pty(
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
         limit=16 * 1024 * 1024,
+        start_new_session=True,
     )
 
     async def _wait() -> tuple[bytes, bytes, int]:
@@ -373,13 +436,12 @@ async def _exec_pty(
             stdout, stderr, rc = await _wait()
     except asyncio.TimeoutError:
         logger.warning("exec_pty: timed out after %ss", timeout)
-        if proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
         raise RuntimeError(f"claude-pty timed out after {timeout}s")
+    finally:
+        # Cancellation is how frontends stop a live turn. Reap the dedicated
+        # process group here (rather than only in the timeout branch) so the
+        # pty wrapper and any tools it launched cannot outlive the turn.
+        await agent._kill_process_tree(proc)
 
     stdout_text = stdout.decode(errors="replace").strip()
     stderr_text = stderr.decode(errors="replace").strip()

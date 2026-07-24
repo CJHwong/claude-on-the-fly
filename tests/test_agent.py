@@ -553,14 +553,19 @@ class TestExec:
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
         proc.kill.assert_called_once()
 
-    async def test_timeout_kill_raises_generic_exception(self) -> None:
-        """kill() raises a generic Exception — logged, timeout still propagates."""
+    async def test_timeout_reaps_process_tree_and_raises(self) -> None:
+        """On timeout the CLI is reaped via the process-tree kill and the
+        timeout still propagates as RuntimeError."""
         proc = _never_ending_proc()
-        proc.kill = MagicMock(side_effect=Exception("OS kill failed"))
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch(
+                "claude_on_the_fly.agent._kill_process_tree", new_callable=AsyncMock
+            ) as mock_kill,
+        ):
             with pytest.raises(RuntimeError, match="timed out after 0.1s"):
                 await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
-        proc.kill.assert_called_once()
+        mock_kill.assert_awaited_once_with(proc)
 
 
 def _never_ending_proc() -> MagicMock:
@@ -2218,3 +2223,124 @@ class TestResolveSessionLog:
         # Env points at pi, but the session was written by claude — still found.
         monkeypatch.setenv("AGENT_BACKEND", "pi")
         assert resolve_session_log(ws, "uuid-x") == log
+
+
+# ---------------------------------------------------------------------------
+# _kill_process_tree — orphan-safe reap
+# ---------------------------------------------------------------------------
+
+
+class TestKillProcessTree:
+    async def test_reaps_grandchild(self):
+        import os
+
+        from claude_on_the_fly.agent import _kill_process_tree
+
+        # A shell (session leader) backgrounds a grandchild sleep and prints its
+        # pid. Job control is off in a script, so the sleep shares the shell's
+        # process group — killpg must take it down with the shell.
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            "sleep 300 & echo $!; wait",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+        grandchild = int(line.strip())
+        os.kill(grandchild, 0)  # alive — raises if not
+
+        await _kill_process_tree(proc)
+
+        for _ in range(30):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("grandchild survived the process-tree kill")
+
+    async def test_noop_on_exited_process(self):
+        from claude_on_the_fly.agent import _kill_process_tree
+
+        proc = await asyncio.create_subprocess_exec(
+            "true",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        await proc.wait()
+        # Already exited — must not raise.
+        await _kill_process_tree(proc)
+
+
+# ---------------------------------------------------------------------------
+# Backend skill enumeration
+# ---------------------------------------------------------------------------
+
+
+class TestListSkills:
+    async def test_probe_parses_and_sorts_init_skills(self, monkeypatch):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        init = (
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "skills": ["review", "babysit", "loop"],
+                }
+            ).encode()
+            + b"\n"
+        )
+        fake_proc = MagicMock()
+        fake_proc.stdout.readline = AsyncMock(return_value=init)
+        fake_proc.returncode = 0
+
+        async def fake_exec(*args, **kwargs):
+            return fake_proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(claude_mod.agent, "_kill_process_tree", AsyncMock())
+
+        result = await claude_mod._probe_skills([], ["claude"])
+        assert result == ["babysit", "loop", "review"]
+
+    async def test_probe_ignores_non_init_first_line(self, monkeypatch):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        fake_proc = MagicMock()
+        fake_proc.stdout.readline = AsyncMock(return_value=b'{"type":"assistant"}\n')
+        fake_proc.returncode = 0
+
+        async def fake_exec(*args, **kwargs):
+            return fake_proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(claude_mod.agent, "_kill_process_tree", AsyncMock())
+
+        assert await claude_mod._probe_skills([], ["claude"]) == []
+
+    async def test_claude_list_skills_caches(self, monkeypatch):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        monkeypatch.setattr(claude_mod, "_skills_cache", None)
+        probe = AsyncMock(return_value=["a", "b"])
+        monkeypatch.setattr(claude_mod, "_probe_skills", probe)
+
+        backend = claude_mod.ClaudeBackend()
+        assert await backend.list_skills() == ["a", "b"]
+        assert await backend.list_skills() == ["a", "b"]
+        probe.assert_awaited_once()
+
+    async def test_other_backends_return_empty(self):
+        from claude_on_the_fly.backends.codex import CodexBackend
+        from claude_on_the_fly.backends.opencode import OpencodeBackend
+        from claude_on_the_fly.backends.pi import PiBackend
+
+        assert await CodexBackend().list_skills() == []
+        assert await PiBackend().list_skills() == []
+        assert await OpencodeBackend().list_skills() == []

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -409,6 +410,32 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     return result
 
 
+async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """Reap a subprocess and every descendant it spawned.
+
+    Agent CLIs are spawned with start_new_session=True, so the child leads its
+    own process group; a SIGKILL to that group reaps the CLI *and* the tool
+    subprocesses it forked. A bare proc.kill() only hits the direct child and
+    orphans the rest. Safe to call on an already-exited process.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        # getpgid/killpg can race with a natural exit; fall back to a plain kill.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await proc.wait()
+    except ProcessLookupError:
+        pass
+
+
 async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -> dict:
     logger.debug(
         "exec: cwd=%s cmd=%s timeout=%s",
@@ -422,6 +449,7 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
         limit=16 * 1024 * 1024,
+        start_new_session=True,
     )
     try:
         if timeout is not None:
@@ -431,14 +459,7 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         logger.warning("exec: timed out after %ss", timeout)
         raise RuntimeError(f"Claude CLI timed out after {timeout}s")
     finally:
-        if proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                logger.exception("exec: failed to reap subprocess")
+        await _kill_process_tree(proc)
 
 
 NUDGE_PROMPT = "Please provide your final reply to the user."
@@ -509,6 +530,14 @@ class AgentBackend(Protocol):
 
         Used by `claude-symphony watch` to tail per-turn events. None signals
         either no session yet, or the backend doesn't expose a streamable log.
+        """
+        ...
+
+    async def list_skills(self) -> list[str]:
+        """Return the backend's available skill names, for the Slack picker.
+
+        Empty when the backend can't enumerate (codex/pi/opencode). Backends
+        cache the result — this may spawn the CLI on the first call.
         """
         ...
 
