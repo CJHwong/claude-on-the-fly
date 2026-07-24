@@ -78,6 +78,30 @@ class Orchestrator:
         queue = self._queues.get(chat_id)
         return queue.qsize() if queue else 0
 
+    async def abort(self, chat_id: int) -> bool:
+        """Stop the in-flight turn for a chat and drop anything queued behind it.
+
+        Cancelling the drain task raises CancelledError into the awaited
+        agent.run; the backend's exec finally reaps the whole process tree
+        (spawned with start_new_session), so the agent CLI and its tool
+        subprocesses die together instead of orphaning. Returns whether a turn
+        was actually running.
+        """
+        queue = self._queues.get(chat_id)
+        if queue is not None:
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        task = self._running.get(chat_id)
+        if task is None or task.done():
+            return False
+        logger.info("abort: chat_id=%s cancelling in-flight turn", chat_id)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
     async def on_message(self, chat_id: int, text: str) -> None:
         logger.debug("on_message: chat_id=%s text=%s", chat_id, text[:80])
         if chat_id not in self._queues:
@@ -135,9 +159,14 @@ class Orchestrator:
             "session_uuid": session,
         }
 
-        await self._frontend.notify_start(chat_id)
-        typing_task = asyncio.create_task(self._typing_loop(chat_id))
+        # Startup notification performs frontend I/O and is therefore a
+        # cancellation point. Keep it inside the lifecycle try/finally so an
+        # abort while it is in progress still clears the in-flight slot and
+        # any partially-applied frontend status/reaction.
+        typing_task: asyncio.Task | None = None
         try:
+            await self._frontend.notify_start(chat_id)
+            typing_task = asyncio.create_task(self._typing_loop(chat_id))
             response = await agent.run(
                 workspace,
                 session,
@@ -170,6 +199,9 @@ class Orchestrator:
                 tokens_in=response.tokens_in,
                 tokens_out=response.tokens_out,
             )
+        except asyncio.CancelledError:
+            logger.info("process: chat_id=%s aborted", chat_id)
+            raise
         except ClaudeUnavailableError as exc:
             logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
             await self._frontend.send(
@@ -199,7 +231,8 @@ class Orchestrator:
             )
         finally:
             self._in_flight.pop(chat_id, None)
-            typing_task.cancel()
+            if typing_task is not None:
+                typing_task.cancel()
             await self._frontend.notify_complete(chat_id)
 
     def heartbeat_extra(self) -> dict:

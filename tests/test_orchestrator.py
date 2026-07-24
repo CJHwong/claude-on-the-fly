@@ -680,3 +680,69 @@ class TestEventEmission:
             await task
 
         assert orch.heartbeat_extra() == {"running_jobs": []}
+
+
+# ---------------------------------------------------------------------------
+# abort
+# ---------------------------------------------------------------------------
+
+
+class TestAbort:
+    async def test_returns_false_when_idle(self, orch: Orchestrator) -> None:
+        assert await orch.abort(999) is False
+
+    async def test_cancels_running_turn_and_clears_queue(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_run(*args, **kwargs):
+            started.set()
+            await release.wait()  # held open to simulate a long turn
+            return Response(body="done")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = slow_run
+            await orch.on_message(1, "go")
+            await asyncio.wait_for(started.wait(), timeout=2)
+            orch._queues[1].put_nowait("queued-behind")
+            assert orch.is_busy(1)
+
+            stopped = await orch.abort(1)
+
+        assert stopped is True
+        assert orch.queue_size(1) == 0
+        assert 1 not in orch._in_flight
+        assert not orch.is_busy(1)
+
+    async def test_cancellation_during_startup_cleans_lifecycle_state(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        """A stop may land while notify_start is awaiting Slack I/O."""
+        started = asyncio.Event()
+
+        async def slow_notify_start(chat_id: int) -> None:
+            frontend.start_notifications.append(chat_id)
+            started.set()
+            await asyncio.Event().wait()
+
+        frontend.notify_start = slow_notify_start  # type: ignore[method-assign]
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            mock_agent.run = AsyncMock()
+            await orch.on_message(1, "go")
+            await asyncio.wait_for(started.wait(), timeout=2)
+
+            assert await orch.abort(1) is True
+
+        mock_agent.run.assert_not_called()
+        assert frontend.complete_notifications == [1]
+        assert 1 not in orch._in_flight
+        assert not orch.is_busy(1)
