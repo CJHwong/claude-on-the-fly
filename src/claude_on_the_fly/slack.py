@@ -684,7 +684,7 @@ class SlackFrontend(Frontend):
         async def handle_command(ack, command, body, respond):
             await self._handle_slash_command(ack, command, body, respond)
 
-        @app.view("cc_picker")
+        @app.view("cof_picker")
         async def handle_picker_submit(ack, view):
             await self._handle_picker_submit(ack, view)
 
@@ -782,7 +782,7 @@ class SlackFrontend(Frontend):
                 "label": {"type": "plain_text", "text": "Skill"},
                 "element": {
                     "type": "static_select",
-                    "action_id": "cc_skill",
+                    "action_id": "cof_skill",
                     "placeholder": {"type": "plain_text", "text": "pick a skill"},
                     "option_groups": groups,
                 },
@@ -795,7 +795,7 @@ class SlackFrontend(Frontend):
         )
         view = {
             "type": "modal",
-            "callback_id": "cc_picker",
+            "callback_id": "cof_picker",
             "private_metadata": f"{channel}:{user_id}:{thread_ts or ''}",
             "title": {"type": "plain_text", "text": "Run a skill"},
             "submit": {"type": "plain_text", "text": "Run"},
@@ -807,7 +807,7 @@ class SlackFrontend(Frontend):
                     "block_id": "args",
                     "optional": True,
                     "label": {"type": "plain_text", "text": "Arguments"},
-                    "element": {"type": "plain_text_input", "action_id": "cc_args"},
+                    "element": {"type": "plain_text_input", "action_id": "cof_args"},
                 },
             ],
         }
@@ -820,10 +820,10 @@ class SlackFrontend(Frontend):
         await ack()
         values = view.get("state", {}).get("values", {})
         selected = (
-            values.get("skill", {}).get("cc_skill", {}).get("selected_option") or {}
+            values.get("skill", {}).get("cof_skill", {}).get("selected_option") or {}
         )
         skill = selected.get("value")
-        args = values.get("args", {}).get("cc_args", {}).get("value") or ""
+        args = values.get("args", {}).get("cof_args", {}).get("value") or ""
         channel, _, rest = (view.get("private_metadata") or "").partition(":")
         user_id, _, thread_ts = rest.partition(":")
         if not skill or not channel:

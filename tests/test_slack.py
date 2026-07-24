@@ -1424,7 +1424,7 @@ class TestSlashCommandRouting:
         bot_frontend._app.client.views_open.assert_awaited_once()
         kwargs = bot_frontend._app.client.views_open.await_args.kwargs
         assert kwargs["trigger_id"] == "trig"
-        assert kwargs["view"]["callback_id"] == "cc_picker"
+        assert kwargs["view"]["callback_id"] == "cof_picker"
         bot_frontend._on_message.assert_not_awaited()
 
 
@@ -1467,7 +1467,7 @@ class TestSkillPicker:
         view = bot_frontend._app.client.views_open.await_args.kwargs["view"]
         element = view["blocks"][0]["element"]
         assert element["type"] == "static_select"
-        assert element["action_id"] == "cc_skill"
+        assert element["action_id"] == "cof_skill"
         assert {g["label"]["text"] for g in element["option_groups"]} == {
             "gf-qa",
             "user",
@@ -1491,8 +1491,8 @@ class TestPickerSubmit:
             "private_metadata": "D1:U_A",
             "state": {
                 "values": {
-                    "skill": {"cc_skill": {"selected_option": {"value": "simplify"}}},
-                    "args": {"cc_args": {"value": "trim it"}},
+                    "skill": {"cof_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cof_args": {"value": "trim it"}},
                 }
             },
         }
@@ -1621,8 +1621,8 @@ class TestRunSkillShortcut:
             "private_metadata": "D1:U_A:5.0",
             "state": {
                 "values": {
-                    "skill": {"cc_skill": {"selected_option": {"value": "simplify"}}},
-                    "args": {"cc_args": {"value": ""}},
+                    "skill": {"cof_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cof_args": {"value": ""}},
                 }
             },
         }
@@ -1773,8 +1773,8 @@ class TestAllowlistGate:
             "private_metadata": "D1:U_BAD:",
             "state": {
                 "values": {
-                    "skill": {"cc_skill": {"selected_option": {"value": "simplify"}}},
-                    "args": {"cc_args": {"value": ""}},
+                    "skill": {"cof_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cof_args": {"value": ""}},
                 }
             },
         }
