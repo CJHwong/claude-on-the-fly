@@ -573,8 +573,6 @@ class SlackFrontend(Frontend):
         # most recent registered session in each channel, plus the one that is
         # currently running, so /cof stop and /cof continue target a real
         # message or command-anchor session instead of an unregistered root.
-        self._last_session_by_channel: dict[str, int] = {}
-        self._active_session_by_channel: dict[str, int] = {}
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
         self._processed_ts: deque[str] = deque(maxlen=1000)
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
@@ -644,13 +642,7 @@ class SlackFrontend(Frontend):
     def _forget_session(self, session_id: int) -> None:
         """Drop every per-session dict entry for one thread. All of this state
         is reconstructable, so a re-hydrating thread just re-resolves it."""
-        route = self._sessions.pop(session_id, None)
-        if route:
-            channel, _ = route
-            if self._last_session_by_channel.get(channel) == session_id:
-                self._last_session_by_channel.pop(channel, None)
-            if self._active_session_by_channel.get(channel) == session_id:
-                self._active_session_by_channel.pop(channel, None)
+        self._sessions.pop(session_id, None)
         self._workspace_names.pop(session_id, None)
         self._sender_names.pop(session_id, None)
         self._channel_contexts.pop(session_id, None)
@@ -735,55 +727,20 @@ class SlackFrontend(Frontend):
             await ack()
             await respond("Not authorized.")
             return
-        verb = text.split(" ", 1)[0].lower()
-        rest = text[len(verb) :].strip()
-
+        # Bare `/cof` opens the picker; anything else is forwarded verbatim as a
+        # `/skill args` prompt. Turn control (stop/continue) is the $stop/$continue
+        # text prefix instead, since it must work inside threads where slash
+        # commands can't run.
         if not text:
             await ack()
             await self._open_skill_picker(body.get("trigger_id", ""), channel, user_id)
             return
-        if verb == "stop":
-            await ack()
-            await self._command_stop(channel, respond)
-            return
-        if verb == "continue":
-            await ack()
-            await self._command_continue(channel, user_id, rest, respond)
-            return
-        # Everything else forwards verbatim as a `/skill args` prompt.
         await ack()
         prompt = f"/{text}"
         thread_ts = await self._anchor_run(channel, None, f"Running `{prompt}`…")
         session_id = await self._enter_command_session(channel, user_id, thread_ts)
         if self._on_message:
             await self._on_message(session_id, prompt)
-
-    async def _command_stop(self, channel: str, respond) -> None:
-        stopped = False
-        session_id = self._command_target_session(channel)
-        if session_id is not None and self._orchestrator is not None:
-            stopped = await self._orchestrator.abort(session_id)
-        await respond(
-            "Stopped the current turn." if stopped else "Nothing was running."
-        )
-
-    async def _command_continue(
-        self, channel: str, user_id: str, rest: str, respond
-    ) -> None:
-        session_id = self._command_target_session(channel)
-        if session_id is None:
-            if not rest:
-                await respond("Nothing to continue.")
-                return
-            thread_ts = await self._anchor_run(channel, None, "Continuing…")
-            session_id = await self._enter_command_session(channel, user_id, thread_ts)
-        self._reply_counts[session_id] = 0
-        if not rest:
-            await respond("reply counter reset")
-            return
-        await respond("continuing")
-        if self._on_message:
-            await self._on_message(session_id, rest)
 
     async def _handle_run_skill_shortcut(self, ack, shortcut) -> None:
         await ack()
@@ -896,7 +853,6 @@ class SlackFrontend(Frontend):
         self._sessions[session_id] = (channel, thread_ts)
         self._sessions.move_to_end(session_id)
         self._evict_stale_sessions()
-        self._last_session_by_channel[channel] = session_id
         sender = await self._resolve_sender(user_id) if user_id else "unknown"
         self._sender_names[session_id] = sender
         if user_id:
@@ -906,21 +862,6 @@ class SlackFrontend(Frontend):
             session_id, sender, channel, channel_type, thread_ts or ""
         )
         return session_id
-
-    def _command_target_session(self, channel: str) -> int | None:
-        """Return the running, or most recently registered, channel session.
-
-        Slack slash requests have no thread context. A command anchor or an
-        ordinary message already registered the actual thread session, so use
-        that route rather than synthesizing the channel-root key (which has no
-        send route and cannot identify the active orchestrator task).
-        """
-        session_id = self._active_session_by_channel.get(channel)
-        if session_id is None:
-            session_id = self._last_session_by_channel.get(channel)
-        if session_id is not None and session_id in self._sessions:
-            return session_id
-        return None
 
     async def _channel_type(self, channel: str) -> str:
         cached = self._channel_types.get(channel)
@@ -1066,7 +1007,6 @@ class SlackFrontend(Frontend):
         self._sessions[session_id] = (channel, thread_ts)
         self._sessions.move_to_end(session_id)
         self._evict_stale_sessions()
-        self._last_session_by_channel[channel] = session_id
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
@@ -1397,9 +1337,6 @@ class SlackFrontend(Frontend):
         pending reaction message but still get a status via their session's
         thread, so it must not sit behind the pending-msg guard.
         """
-        route = self._sessions.get(chat_id)
-        if route:
-            self._active_session_by_channel[route[0]] = chat_id
         self._status_started[chat_id] = time.monotonic()
         # Shuffle the verb order once here; ticks walk it by elapsed time.
         seq = [v.lower() for v in random.sample(SPINNER_VERBS, len(SPINNER_VERBS))]
@@ -1423,9 +1360,6 @@ class SlackFrontend(Frontend):
 
     async def notify_complete(self, chat_id: int) -> None:
         """Remove :eyes: from the in-flight message and clear the status."""
-        route = self._sessions.get(chat_id)
-        if route and self._active_session_by_channel.get(route[0]) == chat_id:
-            self._active_session_by_channel.pop(route[0], None)
         self._status_started.pop(chat_id, None)
         self._status_verbs.pop(chat_id, None)
         await self._set_status(chat_id, "")

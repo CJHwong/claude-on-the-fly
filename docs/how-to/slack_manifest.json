@@ -17,8 +17,8 @@
     "slash_commands": [
       {
         "command": "/cof",
-        "description": "Run a skill, continue, or stop the agent",
-        "usage_hint": "[skill args | continue | stop]",
+        "description": "Run a skill (bare opens a picker). In a thread, use the Run a skill shortcut instead.",
+        "usage_hint": "[skill] [args]",
         "should_escape": false
       }
     ],
