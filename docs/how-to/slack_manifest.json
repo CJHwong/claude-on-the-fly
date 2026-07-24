@@ -17,7 +17,7 @@
     "slash_commands": [
       {
         "command": "/cof",
-        "description": "Run a skill (bare opens a picker). In a thread, use the Run a skill shortcut instead.",
+        "description": "Run a skill; in threads use the shortcut",
         "usage_hint": "[skill] [args]",
         "should_escape": false
       }
