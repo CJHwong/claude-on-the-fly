@@ -46,6 +46,7 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_ALLOWED_SENDER_IDS",
     "SLACK_BLOCKED_SENDER_IDS",
     "SLACK_SILENT_SENDER_IDS",
+    "SLACK_SLASH_COMMAND",
     "SLACK_STATS_MODE",
     # Deprecated aliases (still honored; see SLACK_LEGACY).
     "SLACK_USER_TOKEN",
@@ -196,7 +197,29 @@ def check_slack(env: Mapping[str, str]) -> list[CheckResult]:
 
     results.append(_check_slack_bearer(env))
 
+    command = env.get("SLACK_SLASH_COMMAND", "")
+    if command:
+        results.append(_check_slack_command(command))
+
     return results
+
+
+def _check_slack_command(command: str) -> CheckResult:
+    """Validate SLACK_SLASH_COMMAND if set. It is optional, but a malformed one
+    fails silently at runtime: slack_bolt registers the handler and Slack simply
+    never routes anything to it."""
+    from claude_on_the_fly.slack_manifest import command_error
+
+    problem = command_error(command)
+    if problem is None:
+        return CheckResult(name="SLACK_SLASH_COMMAND", status="ok", detail=command)
+    return CheckResult(
+        name="SLACK_SLASH_COMMAND",
+        status="invalid",
+        detail=f"{command} {problem}",
+        fix_hint="Unset it to drop the slash command, or run "
+        "`claude-slack --manifest` to pick one and get a matching manifest",
+    )
 
 
 # Preferred env var -> deprecated fallbacks it replaces. Legacy names still work

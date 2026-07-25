@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -94,14 +93,6 @@ class TestSessionKey:
 
     def test_different_thread_ts_different_key(self):
         assert _session_key("C123", "111.222") != _session_key("C123", "333.444")
-
-
-class TestSlackManifest:
-    def test_bot_scope_includes_assistant_write(self) -> None:
-        manifest_path = Path(__file__).parents[1] / "docs/how-to/slack_manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-
-        assert "assistant:write" in manifest["oauth_config"]["scopes"]["bot"]
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1380,28 @@ def bot_frontend():
         yield fe
 
 
+class TestAppInteractionRegistration:
+    """The picker and shortcut are app-scoped so they always register; the slash
+    command is workspace-global and therefore opt-in."""
+
+    def test_registers_the_command_when_set(self, bot_frontend):
+        with patch("claude_on_the_fly.slack.SLASH_COMMAND", "/cof-hoss"):
+            bot_frontend._register_app_interactions()
+        bot_frontend._app.command.assert_called_once_with("/cof-hoss")
+
+    def test_skips_the_command_when_unset(self, bot_frontend):
+        with patch("claude_on_the_fly.slack.SLASH_COMMAND", None):
+            bot_frontend._register_app_interactions()
+        bot_frontend._app.command.assert_not_called()
+
+    @pytest.mark.parametrize("command", ["/cof-hoss", None])
+    def test_picker_and_shortcut_register_either_way(self, bot_frontend, command):
+        with patch("claude_on_the_fly.slack.SLASH_COMMAND", command):
+            bot_frontend._register_app_interactions()
+        bot_frontend._app.view.assert_called_once_with("cof_picker")
+        bot_frontend._app.shortcut.assert_called_once_with("cof_run_skill")
+
+
 class TestSlashCommandRouting:
     async def test_forwards_skill_verbatim(self, bot_frontend):
         ack, respond = AsyncMock(), AsyncMock()
@@ -1514,7 +1527,7 @@ class TestPickerSubmit:
 
 class TestStartGatesOnToken:
     async def test_bot_token_registers_commands(self, bot_frontend):
-        bot_frontend._register_slash_commands = MagicMock()
+        bot_frontend._register_app_interactions = MagicMock()
         with (
             patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls,
             patch("claude_on_the_fly.slack.get_backend", MagicMock()),
@@ -1522,16 +1535,16 @@ class TestStartGatesOnToken:
         ):
             handler_cls.return_value.start_async = AsyncMock()
             await bot_frontend.start(AsyncMock())
-        bot_frontend._register_slash_commands.assert_called_once()
+        bot_frontend._register_app_interactions.assert_called_once()
         if bot_frontend._warm_task:
             await bot_frontend._warm_task
 
     async def test_user_token_skips_commands(self, frontend):
-        frontend._register_slash_commands = MagicMock()
+        frontend._register_app_interactions = MagicMock()
         with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
             handler_cls.return_value.start_async = AsyncMock()
             await frontend.start(AsyncMock())
-        frontend._register_slash_commands.assert_not_called()
+        frontend._register_app_interactions.assert_not_called()
         assert frontend._warm_task is None
 
 

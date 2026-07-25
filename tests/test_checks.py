@@ -132,6 +132,36 @@ class TestCheckSlack:
         bad = [r for r in results if r.status == "invalid"]
         assert any(r.name == "SLACK_BOT_TOKEN" for r in bad)
 
+    def test_slash_command_absent_is_fine(self):
+        # Opt-in: no command means the picker is shortcut-only, not an error.
+        results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxb-1"})
+        assert all_ok(results)
+        assert not any(r.name == "SLACK_SLASH_COMMAND" for r in results)
+
+    def test_slash_command_valid(self):
+        results = check_slack(
+            {
+                "SLACK_APP_TOKEN": "xapp-1",
+                "SLACK_TOKEN": "xoxb-1",
+                "SLACK_SLASH_COMMAND": "/cof-hoss",
+            }
+        )
+        assert all_ok(results)
+
+    def test_slash_command_missing_slash(self):
+        # Registers fine and then never fires, so fail loudly at startup.
+        results = check_slack(
+            {
+                "SLACK_APP_TOKEN": "xapp-1",
+                "SLACK_TOKEN": "xoxb-1",
+                "SLACK_SLASH_COMMAND": "cof-hoss",
+            }
+        )
+        fail = first_failure(results)
+        assert fail is not None
+        assert fail.name == "SLACK_SLASH_COMMAND"
+        assert fail.status == "invalid"
+
     def test_slack_token_user(self):
         results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxp-1"})
         assert all_ok(results)

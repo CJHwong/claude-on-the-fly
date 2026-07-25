@@ -16,7 +16,7 @@
     },
     "slash_commands": [
       {
-        "command": "/cof",
+        "command": "/cof-CHANGEME",
         "description": "Run a skill; in threads use the shortcut",
         "usage_hint": "[skill] [args]",
         "should_escape": false

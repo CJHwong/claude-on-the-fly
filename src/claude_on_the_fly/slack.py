@@ -38,13 +38,16 @@ SLACK_BLOCK_LIMIT = 3000
 SLACK_REPLY_SOFT_LIMIT = int(os.environ.get("SLACK_REPLY_SOFT_LIMIT", "10"))
 CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
-# works inside threads, where Slack blocks custom slash commands. Reuses the
-# orchestrator abort primitive that /cof stop calls.
+# works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
-# Bot-token-only slash command. Must match the command registered in the Slack
-# app manifest. Under a user token it is never received, so the $ prefixes above
-# stay the only control surface.
-SLASH_COMMAND = os.environ.get("SLACK_SLASH_COMMAND", "/cof")
+# Bot-token-only slash command, opt-in: unset registers no command at all, and
+# the skill picker is reached from a message's "..." shortcut instead. When set
+# it must match the command in the Slack app manifest — Slack does not namespace
+# slash commands, so two installs sharing one command means the newest install
+# wins and the older silently stops firing. `claude-slack --manifest` renders a
+# manifest that agrees with this value. Under a user token the command is never
+# received, so the $ prefixes above stay the only control surface.
+SLASH_COMMAND = os.environ.get("SLACK_SLASH_COMMAND") or None
 # The 185 default spinner verbs Claude Code ships with. Rendered by
 # assistant.threads.setStatus as "<bot> is <verb>… (Ns)" while a turn runs, so
 # the status is alive rather than a frozen "thinking". Source:
@@ -571,8 +574,8 @@ class SlackFrontend(Frontend):
         self._sessions: OrderedDict[int, tuple[str, str | None]] = OrderedDict()
         # Slash commands have a channel but no thread timestamp. Remember the
         # most recent registered session in each channel, plus the one that is
-        # currently running, so /cof stop and /cof continue target a real
-        # message or command-anchor session instead of an unregistered root.
+        # currently running, so a slash command targets a real message or
+        # command-anchor session instead of an unregistered root.
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
         self._processed_ts: deque[str] = deque(maxlen=1000)
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
@@ -669,20 +672,27 @@ class SlackFrontend(Frontend):
         # reach a bot-token install (commands/interactivity scopes). A user
         # token never receives them, so registering would be dead weight.
         if self._is_bot_token:
-            self._register_slash_commands()
+            self._register_app_interactions()
             self._warm_task = asyncio.create_task(self._warm_skills())
 
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         await self._handler.start_async()
         logger.info("Slack connected via Socket Mode (user_id=%s)", self._user_id)
 
-    def _register_slash_commands(self) -> None:
-        app = self._app
-        logger.info("slack: registering slash command %s + skill picker", SLASH_COMMAND)
+    def _register_app_interactions(self) -> None:
+        """Register the bot-token-only surface: picker, shortcut, and (when
+        SLACK_SLASH_COMMAND is set) the slash command.
 
-        @app.command(SLASH_COMMAND)
-        async def handle_command(ack, command, body, respond):
-            await self._handle_slash_command(ack, command, body, respond)
+        The view and shortcut callback ids are app-scoped, so they can't collide
+        with another install and register unconditionally. The slash command is
+        workspace-global and therefore opt-in."""
+        app = self._app
+
+        if SLASH_COMMAND:
+
+            @app.command(SLASH_COMMAND)
+            async def handle_command(ack, command, body, respond):
+                await self._handle_slash_command(ack, command, body, respond)
 
         @app.view("cof_picker")
         async def handle_picker_submit(ack, view):
@@ -691,6 +701,11 @@ class SlackFrontend(Frontend):
         @app.shortcut("cof_run_skill")
         async def handle_run_skill_shortcut(ack, shortcut):
             await self._handle_run_skill_shortcut(ack, shortcut)
+
+        logger.info(
+            "slack: skill picker registered (slash command: %s)",
+            SLASH_COMMAND or "off, use the message shortcut",
+        )
 
     async def _warm_skills(self) -> None:
         """Populate the backend skill cache before the first picker opens.
@@ -727,7 +742,7 @@ class SlackFrontend(Frontend):
             await ack()
             await respond("Not authorized.")
             return
-        # Bare `/cof` opens the picker; anything else is forwarded verbatim as a
+        # A bare command opens the picker; anything else is forwarded verbatim as a
         # `/skill args` prompt. Turn control (stop/continue) is the $stop/$continue
         # text prefix instead, since it must work inside threads where slash
         # commands can't run.
@@ -1658,10 +1673,41 @@ class SlackFrontend(Frontend):
 
 
 def main() -> None:  # pragma: no cover
+    import argparse
+
     from dotenv import load_dotenv
 
+    from claude_on_the_fly import slack_manifest
     from claude_on_the_fly.orchestrator import run
     from claude_on_the_fly.preflight import run_slack
+
+    parser = argparse.ArgumentParser(prog="claude-slack")
+    parser.add_argument(
+        "--manifest",
+        action="store_true",
+        help="generate a Slack app manifest for this install, then exit",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=slack_manifest.MODES,
+        help="manifest token kind; asked interactively when omitted",
+    )
+    parser.add_argument("--name", help="app name as it appears in Slack")
+    parser.add_argument(
+        "--command",
+        help="slash command to declare, e.g. /cof-yourname (bot mode only)",
+    )
+    parser.add_argument(
+        "--out", help="write the manifest here instead of stdout (flag mode)"
+    )
+    args = parser.parse_args()
+
+    if args.manifest:
+        raise SystemExit(
+            slack_manifest.generate(
+                mode=args.mode, name=args.name, command=args.command, out=args.out
+            )
+        )
 
     load_dotenv()
     (
