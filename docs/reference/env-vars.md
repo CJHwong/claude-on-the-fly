@@ -17,6 +17,7 @@
 | `SLACK_ALLOWED_SENDER_IDS` | no | Sender IDs allowed to trigger Claude (comma-separated). Users (`U…`/`W…`) and bots (`B…`, e.g. `B07JPABE2` for HubSpot/Jira) share one list; bots bypass the @mention gate. Your own ID is always allowed. `*` allows any human; bots always need an explicit id (no wildcard, or it loops on this app's own posts) |
 | `SLACK_BLOCKED_SENDER_IDS` | no | Sender IDs (users or bots) to deny (comma-separated). Takes priority over the allowlist, so `*` can allow everyone except these |
 | `SLACK_SILENT_SENDER_IDS` | no | Sender IDs (users or bots) that trigger Claude but get no reply posted back. Empty by default, so every triggered run replies |
+| `SLACK_SLASH_COMMAND` | no | Slash command to register, e.g. `/cof-yourname` (bot token only). Must match the command in the app manifest. Unset registers none, leaving the skill picker on the message shortcut. Slack doesn't namespace commands, so pick one nobody else in the workspace uses or the newest install wins and yours stops firing. `claude-slack --manifest` renders a matching manifest |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
 ## Gmail

@@ -23,6 +23,8 @@ export TELEGRAM_ALLOWED_USER_ID=...
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-telegram
 
 # Slack
+# first time: generate the app manifest to paste into Slack (asks 3 questions)
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack --manifest
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_TOKEN=xoxb-...   # xoxp- replies as you, xoxb- replies as the app
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack

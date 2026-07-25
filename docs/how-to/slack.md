@@ -4,11 +4,39 @@
 
 ### Create the app
 
+Generate a manifest for your install. It asks three questions (token kind, app
+name, slash command) and explains each. No clone needed:
+
+```bash
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack --manifest
+```
+
+From a checkout it's `uv run claude-slack --manifest`.
+
+Non-interactively, for scripts and headless installs, pass the answers as flags
+and it prints the manifest to stdout instead of asking:
+
+```bash
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack \
+  --manifest --mode bot --name "COF (yourname)" --command /cof-yourname \
+  > slack_manifest.json
+```
+
+`--mode` is required in that form. `--command` is optional: leave it out and no
+slash command is declared.
+
 1. Go to https://api.slack.com/apps
 2. Click "Create New App" -> "From a manifest"
 3. Select your workspace
-4. Switch to JSON tab, paste the contents of [`slack_manifest.json`](slack_manifest.json)
+4. Switch to JSON tab, paste the generated manifest
 5. Click "Create"
+
+Why it's generated rather than a file you copy: a bot install and a user install
+need different scope blocks, and the slash command has to be unique in the
+workspace. Slack doesn't namespace slash commands, so if two installed apps
+declare the same one, the most recent install wins for everybody and the other
+silently stops firing. The suggested command carries your login name for that
+reason (`/cof-yourname`); answer `none` if you'd rather have no slash command.
 
 ### Get your tokens
 
@@ -25,6 +53,10 @@
 ```bash
 export SLACK_APP_TOKEN="xapp-..."
 export SLACK_TOKEN="xoxb-..."   # xoxp- to reply as you, xoxb- to reply as the app
+# Optional, bot token only: the slash command you declared in the manifest. Must
+# match it exactly. Unset means no slash command — open the skill picker from a
+# message's "..." menu instead.
+# export SLACK_SLASH_COMMAND="/cof-yourname"
 # Optional: sender IDs allowed to trigger Claude — users (U…/W…) and bots (B…) in
 # one list; "*" allows any human. Your own ID is always allowed.
 # export SLACK_ALLOWED_SENDER_IDS="U111,U222,B07JPABE2"
