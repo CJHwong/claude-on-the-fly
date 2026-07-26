@@ -62,6 +62,7 @@ _FRONTEND_MODULE: dict[str, str] = {
     "gmail": "claude_on_the_fly.gmail",
     "schedule": "claude_on_the_fly.scheduler",
     "symphony": "claude_on_the_fly.symphony.cli",
+    "jobs": "claude_on_the_fly.jobs.cli",
 }
 
 

@@ -1848,3 +1848,161 @@ class TestBotConversationGate:
             }
         )
         bot_frontend._on_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# $job — background-job producer intercept
+# ---------------------------------------------------------------------------
+
+
+class _FakeJobQueue:
+    """Records enqueued jobs; the rest of the port is inert for producer tests."""
+
+    def __init__(self) -> None:
+        self.jobs: list = []
+
+    def enqueue(self, job) -> None:
+        self.jobs.append(job)
+
+    def claim(self):
+        return None
+
+    def complete(self, job, result) -> None:
+        pass
+
+    def recover_stale(self, ttl_s):
+        return 0
+
+
+class TestJobCommand:
+    def _frontend(self, queue):
+        with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
+            mock_app = MagicMock()
+            mock_app.client = MagicMock()
+            mock_app.client.chat_postMessage = AsyncMock(
+                return_value={"ok": True, "ts": "99.9"}
+            )
+            mock_app_cls.return_value = mock_app
+            fe = SlackFrontend(
+                "xapp-tok",
+                "xoxp-tok",
+                "U_SELF",
+                allowed_user_ids={"U_ALLOWED"},
+                job_queue=queue,
+            )
+            fe._on_message = AsyncMock()
+            return fe, mock_app
+
+    async def test_job_command_enqueues_and_acks(self):
+        queue = _FakeJobQueue()
+        fe, mock_app = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job summarize the incident",
+            }
+        )
+
+        # Exactly one job, with the task and the origin (carrying sender_id).
+        assert len(queue.jobs) == 1
+        job = queue.jobs[0]
+        assert job.prompt == "summarize the incident"
+        assert job.origin == {
+            "channel": "C1",
+            "thread_ts": "123.45",
+            "sender_id": "U_ALLOWED",
+        }
+        # Acked immediately; no agent turn in the chat process.
+        mock_app.client.chat_postMessage.assert_awaited()
+        fe._on_message.assert_not_awaited()
+        # No orphaned pending message/reaction (returned before _pending_msg).
+        assert not fe._pending_msg
+        # ts marked processed so a catchup re-ingest won't enqueue a duplicate.
+        assert "123.45" in fe._processed_ts
+
+    async def test_job_command_advances_catchup_watermark(self):
+        # A $job in a channel with no normal traffic since restart must still
+        # register the channel as active (with its watermark and type), or
+        # _catchup never re-fetches it and a message lost during a disconnect is
+        # silently dropped. Mirrors the normal path's bookkeeping.
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job summarize the incident",
+            }
+        )
+        assert fe._active_channels["C1"] == "123.45"
+        assert fe._channel_types["C1"] == "im"
+
+    async def test_job_command_uses_thread_ts_when_in_thread(self):
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "200.0",
+                "thread_ts": "100.0",
+                "text": "$job do the thing",
+            }
+        )
+        assert queue.jobs[0].origin["thread_ts"] == "100.0"
+
+    async def test_empty_job_command_posts_usage_and_enqueues_nothing(self):
+        queue = _FakeJobQueue()
+        fe, mock_app = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job",
+            }
+        )
+        assert queue.jobs == []
+        mock_app.client.chat_postMessage.assert_awaited()  # usage notice
+        fe._on_message.assert_not_awaited()
+
+    async def test_job_command_enqueue_failure_is_reported(self):
+        class _BoomQueue(_FakeJobQueue):
+            def enqueue(self, job):
+                raise RuntimeError("disk full")
+
+        fe, mock_app = self._frontend(_BoomQueue())
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job something",
+            }
+        )
+        # A failure notice is posted; no agent turn kicked off.
+        mock_app.client.chat_postMessage.assert_awaited()
+        fe._on_message.assert_not_awaited()
+
+    async def test_non_job_message_still_reaches_agent(self):
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "just a normal question",
+            }
+        )
+        assert queue.jobs == []
+        fe._on_message.assert_awaited_once()

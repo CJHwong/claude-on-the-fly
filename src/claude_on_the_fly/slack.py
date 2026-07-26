@@ -12,6 +12,7 @@ import re
 import time
 from collections import OrderedDict, deque
 from pathlib import Path
+from uuid import uuid4
 
 import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -22,6 +23,8 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
+from claude_on_the_fly.jobs.core import Job, JobQueue
+from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
@@ -40,6 +43,10 @@ CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
+# Queue a background job that survives this chat turn. The worker (claude-jobs)
+# runs it in a fresh session and replies into this thread when done. Same
+# plain-text-prefix rationale as $stop.
+JOB_COMMAND = "$job"
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
 # it must match the command in the Slack app manifest — Slack does not namespace
@@ -538,9 +545,14 @@ class SlackFrontend(Frontend):
         blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
+        job_queue: JobQueue | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
+        # Producer side of the background-jobs bridge. Defaults to the same
+        # file queue the worker reads (make_queue), so `$job` and claude-jobs
+        # agree on one inbox. Construction is side-effect-free (lazy mkdir).
+        self._job_queue = job_queue or make_queue()
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
         self._allow_all_senders = "*" in self._allowed_user_ids
@@ -1038,6 +1050,64 @@ class SlackFrontend(Frontend):
                 channel,
                 thread_ts,
                 "Stopped the current turn." if stopped else "Nothing was running.",
+            )
+            return
+
+        # $job <task> queues a background job that outlives this chat turn; the
+        # worker replies into this thread when done. Placed before the soft-limit
+        # gate so enqueue+ack isn't blocked by the reply budget, and before the
+        # message reaches self._pending_msg (slack.py) so there's no orphaned
+        # pending entry / hourglass. sender_id (raw id) is already resolved and
+        # authorized at the allow/block gate above; the resolved display `sender`
+        # isn't assigned yet — and the notifier reads neither, so origin carries
+        # sender_id.
+        job_text = text.strip()
+        if job_text == JOB_COMMAND or job_text.startswith(JOB_COMMAND + " "):
+            task = job_text[len(JOB_COMMAND) :].strip()
+            # Unlike $stop, $job is not idempotent — a catchup re-ingest on
+            # reconnect would enqueue a second job. Mirror the normal path's
+            # catch-up bookkeeping (which this branch returns before reaching):
+            # mark the ts processed (dedup), record the channel + watermark so
+            # _catchup re-fetches it after a disconnect, and cache the channel
+            # type so the recovered messages gate identically to the live path.
+            self._processed_ts.append(ts)
+            self._active_channels[channel] = ts
+            if channel_type:
+                self._channel_types[channel] = channel_type
+            if not task:
+                await self._post_notice(
+                    channel,
+                    thread_ts,
+                    "Usage: `$job <task>` — I'll run it in the background and "
+                    "reply here when it's done.",
+                )
+                return
+            job = Job(
+                id=f"{time.time_ns()}-{uuid4().hex[:8]}",
+                prompt=task,
+                origin={
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "sender_id": sender_id,
+                },
+            )
+            try:
+                self._job_queue.enqueue(job)
+            except Exception as exc:
+                logger.exception(
+                    "slack %s/%s: job enqueue failed: %s", channel, thread_ts, exc
+                )
+                await self._post_notice(
+                    channel,
+                    thread_ts,
+                    "Couldn't queue that job — check the worker logs.",
+                )
+                return
+            logger.info("slack %s/%s: queued job %s", channel, thread_ts, job.id)
+            await self._post_notice(
+                channel,
+                thread_ts,
+                f"Queued job `{job.id}` — I'll reply here when it's done.",
             )
             return
 
