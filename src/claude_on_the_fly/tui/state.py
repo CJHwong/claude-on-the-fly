@@ -1,8 +1,9 @@
 """Snapshot of system state — what every TUI screen reads from.
 
 Pure function: given a state_dir (heartbeat JSONs) and an optional
-schedule.yaml, produce a Snapshot describing every frontend's liveness and
-the scheduler's upcoming fires.
+schedule.yaml, produce a Snapshot describing every frontend's liveness, the
+scheduler's upcoming fires, and the background-job queue's depth. Every read
+here is read-only — the snapshot never creates or mutates what it describes.
 
 Liveness contract (must match heartbeat.HeartbeatWriter):
     running:  heartbeat fresh AND process exists
@@ -27,12 +28,22 @@ from typing import Literal
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.heartbeat import STATE_DIR
+from claude_on_the_fly.jobs.file_queue import (
+    DEFAULT_ROW_LIMIT,
+    QueueDepth,
+    QueueRow,
+    read_queue_depth,
+    read_queue_rows,
+)
 from claude_on_the_fly.scheduler import load_config as load_schedule_config
 from claude_on_the_fly.scheduler import next_fire as scheduler_next_fire
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEDULE_YAML = DATA_DIR / "schedule.yaml"
+# The background-job worker's maildir. A module constant, like STATE_DIR, so a
+# test can redirect it (snapshot() takes no jobs argument).
+DEFAULT_JOBS_DIR = DATA_DIR / "jobs"
 
 # Per-frontend staleness threshold (seconds). Symphony's poll cadence and Jira
 # call latency can occasionally starve the heartbeat coroutine, so we give it
@@ -40,6 +51,7 @@ DEFAULT_SCHEDULE_YAML = DATA_DIR / "schedule.yaml"
 STALENESS_S: dict[str, int] = {
     "default": 15,
     "symphony": 60,
+    "jobs": 30,
 }
 
 FrontendState = Literal["running", "stopped", "broken"]
@@ -69,11 +81,30 @@ class JobInfo:
 
 
 @dataclass(frozen=True)
+class JobsQueueView:
+    """What the background-job queue looks like right now.
+
+    Read straight off the maildir rather than out of the worker's heartbeat, so
+    queue depth still shows when the worker is stopped — the same reason the
+    scheduler tab reads schedule.yaml instead of asking the daemon.
+    """
+
+    depth: QueueDepth
+    rows: list[QueueRow]
+    # Unfinished jobs the row cap left out, so the table can say so itself
+    # instead of making the operator subtract 20 from the header's count.
+    hidden: int = 0
+
+
+@dataclass(frozen=True)
 class Snapshot:
     timestamp: datetime
     frontends: list[FrontendStatus]
     jobs: list[JobInfo]
     schedule_error: str | None = None
+    # None when the configured queue is not the file adapter, so there is no
+    # maildir to observe. Distinct from an empty queue.
+    jobs_queue: JobsQueueView | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +258,63 @@ def _load_schedule_cached(path: Path):
     return specs
 
 
+# Memoize the queue kind on the env file's own mtime, plus whatever the process
+# environment says: dotenv_values() reparses the file on every call and this is
+# read at 1Hz, but an env override must still win on the next tick.
+_queue_kind_cache: tuple[Path, int, str | None, str] | None = None
+
+
+def _queue_kind() -> str:
+    """`JOBS_QUEUE_KIND`, read the way the daemons actually receive it.
+
+    The value lives in `~/.claude-on-the-fly/.env` and no TUI module calls
+    `load_dotenv()` — the daemons see it because `supervisor.spawn` merges that
+    file into the child's environment. So reading `os.environ` alone would
+    report `file` for every deployment that configures anything else, which is
+    the very lie the caller's guard exists to prevent. `supervisor._load_env`
+    is that merge (file wins on conflicts), reused rather than reimplemented.
+    """
+    global _queue_kind_cache
+    # Deferred: supervisor imports this module, so a top-level import cycles.
+    from claude_on_the_fly.tui import supervisor
+
+    env_file = supervisor.DEFAULT_ENV_FILE
+    try:
+        mtime_ns = env_file.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = -1
+    override = os.environ.get("JOBS_QUEUE_KIND")
+    cached = _queue_kind_cache
+    if cached is not None and cached[:3] == (env_file, mtime_ns, override):
+        return cached[3]
+    kind = supervisor._load_env(env_file).get("JOBS_QUEUE_KIND", "file").lower()
+    _queue_kind_cache = (env_file, mtime_ns, override, kind)
+    return kind
+
+
+def _jobs_queue_view() -> JobsQueueView | None:
+    """Observe the background-job maildir, or None when there is nothing to
+    observe.
+
+    The kind check mirrors `jobs/registry.make_queue`: only the `file` adapter
+    keeps its state in a directory we can read. Any other kind (a broker) lives
+    somewhere this reader cannot see, and reporting zeros for it would be a
+    lie — so the caller gets None and renders "queue unavailable".
+    """
+    if _queue_kind() != "file":
+        return None
+    depth = read_queue_depth(DEFAULT_JOBS_DIR)
+    rows = read_queue_rows(DEFAULT_JOBS_DIR, DEFAULT_ROW_LIMIT)
+    # Only a full page can have been truncated. Subtracting from depth alone
+    # would report the job that finished between the two reads as hidden.
+    hidden = (
+        max(0, depth.new + depth.running - len(rows))
+        if len(rows) >= DEFAULT_ROW_LIMIT
+        else 0
+    )
+    return JobsQueueView(depth=depth, rows=rows, hidden=hidden)
+
+
 def _jobs_from_schedule(
     schedule_yaml: Path, now: datetime
 ) -> tuple[list[JobInfo], str | None]:
@@ -287,4 +375,5 @@ def snapshot(
         frontends=frontends,
         jobs=jobs,
         schedule_error=schedule_error,
+        jobs_queue=_jobs_queue_view(),
     )

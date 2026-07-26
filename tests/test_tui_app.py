@@ -339,10 +339,10 @@ class TestDashboardLayout:
 
     @pytest.mark.asyncio
     async def test_tab_keys_switch_active_daemon(self, tmp_path, monkeypatch):
-        """[1]/[2]/[3] switch tabs, which is how the supervisor keys + log row
+        """[1]-[4] switch tabs, which is how the supervisor keys + log row
         pick a daemon now (tab, not focus). Switching also lands focus on the
-        new tab's table. Tab order: chat / scheduler / symphony."""
-        from textual.widgets import TabbedContent
+        new tab's table. Tab order: chat / scheduler / symphony / jobs."""
+        from textual.widgets import DataTable, Static, TabbedContent
 
         # Isolate disk: cold start → chat target falls back to the first
         # frontend (telegram) regardless of the dev machine's real state.
@@ -370,6 +370,22 @@ class TestDashboardLayout:
             assert screen._active_daemon() == "symphony"
             assert getattr(app.focused, "id", None) == "symphony-tickets"
 
+            await pilot.press("4")
+            await pilot.pause()
+            assert tabs.active == "tab-jobs"
+            assert screen._active_daemon() == "jobs"
+            assert getattr(app.focused, "id", None) == "jobs-queue"
+            # The widget ids the DEFAULT_CSS rules name must actually exist:
+            # Textual ignores a selector that matches nothing, so a typo here
+            # would style nothing and break no test.
+            screen.query_one("#jobs-panel")
+            screen.query_one("#jobs-queue-header", Static)
+            screen.query_one("#jobs-queue", DataTable)
+            # The scheduler's own cron table is a DIFFERENT widget, untouched.
+            assert screen.query_one("#jobs-content", DataTable) is not screen.query_one(
+                "#jobs-queue", DataTable
+            )
+
             await pilot.press("1")
             await pilot.pause()
             assert tabs.active == "tab-chat"
@@ -396,6 +412,7 @@ class TestDashboardLayout:
             "1",
             "2",
             "3",
+            "4",
             "left",
             "right",
         }
@@ -512,7 +529,7 @@ class TestDashboardLayout:
         """Each tab title carries its daemon's health glyph, so the tab bar
         shows every zone's liveness regardless of which tab is active. Isolate
         the state dir so the dev machine's real daemons don't bleed in — empty
-        → all three read stopped (○)."""
+        → all four read stopped (○)."""
         from textual.widgets import TabbedContent
 
         monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
@@ -524,6 +541,7 @@ class TestDashboardLayout:
             assert str(tabs.get_tab("tab-chat").label) == "[1] ○ chat"
             assert str(tabs.get_tab("tab-scheduler").label) == "[2] ○ scheduler"
             assert str(tabs.get_tab("tab-symphony").label) == "[3] ○ symphony"
+            assert str(tabs.get_tab("tab-jobs").label) == "[4] ○ jobs"
 
     @pytest.mark.asyncio
     async def test_disabled_tracker_reads_disabled_in_strip(
@@ -649,6 +667,292 @@ async def test_g_picks_symphony_then_shows_config_preview(tmp_path, monkeypatch)
         await pilot.press("escape")
         await pilot.pause()
         assert app.screen.__class__.__name__ == "DashboardScreen"
+
+
+class TestJobsTab:
+    """The [4] jobs tab: a read-only observer of the worker's maildir."""
+
+    @staticmethod
+    def _drop(root, stage, job_id, prompt="do it"):
+        import json
+
+        (root / stage).mkdir(parents=True, exist_ok=True)
+        (root / stage / f"{job_id}.json").write_text(
+            json.dumps({"id": job_id, "prompt": prompt, "origin": {}}),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _isolate(tmp_path, monkeypatch):
+        """STATE_DIR and DEFAULT_JOBS_DIR, both under this test's tmp_path.
+
+        Patching DEFAULT_JOBS_DIR here duplicates conftest's autouse
+        `isolate_jobs_dir` on purpose. These are the only tests that *write* a
+        maildir, so leaning on the autouse fixture alone made them the ones that
+        populate the developer's live queue the moment that fixture is weakened
+        — which is exactly what happened. A test that creates files owns the
+        directory it creates them in. Hands back the isolated root for a test
+        that wants to populate it."""
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
+        root = tmp_path / "jobs"
+        monkeypatch.setattr("claude_on_the_fly.tui.state.DEFAULT_JOBS_DIR", root)
+        return root
+
+    @pytest.mark.asyncio
+    async def test_queue_renders_with_the_worker_stopped(self, tmp_path, monkeypatch):
+        """The point of reading the directory instead of the heartbeat: with no
+        worker running at all, the backlog is still on screen."""
+        from textual.widgets import DataTable, Static
+
+        root = self._isolate(tmp_path, monkeypatch)
+        self._drop(root, "cur", "100-aaaaaaaa", prompt="the running one")
+        # A prompt is a Slack user's own words — the only third-party text on
+        # this dashboard. `[/]` is a closing markup tag with nothing to close:
+        # rendered as a bare str it raises MarkupError, which Textual escalates
+        # to an app exit. run_test() re-raises, so this fixture fails loudly if
+        # the cell ever stops being wrapped in Text.
+        self._drop(root, "new", "200-bbbbbbbb", prompt="fix [/] and\nthe [b] route")
+        (root / "done").mkdir(parents=True, exist_ok=True)
+        (root / "done" / "010-z.json").write_text("{}", encoding="utf-8")
+        (root / "done" / "010-z.result.json").write_text("{}", encoding="utf-8")
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+
+            header = str(app.screen.query_one("#jobs-queue-header", Static).render())
+            assert "JOBS" in header
+            assert "stopped" in header  # no heartbeat in the isolated state dir
+            assert "new 1" in header
+            assert "running 1" in header
+            assert "done 1" in header  # counted once, not twice
+
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert table.row_count == 2
+            first = table.get_row_at(0)
+            assert str(first[0]) == "aaaaaaaa"  # short id; row key holds the full one
+            assert str(first[1]) == "running"
+            assert str(first[2]) == "the running one"
+            second = table.get_row_at(1)
+            assert str(second[1]) == "queued"
+            # A newline would break the cell; the preview collapses whitespace.
+            # The brackets must survive verbatim — markup would swallow them.
+            # (This assertion reads the stored value, so on its own it can't
+            # prove markup-safety; reaching it at all is the real check —
+            # add_row measures each cell, so an unwrapped str raises there.)
+            assert str(second[2]) == "fix [/] and the [b] route"
+
+    @pytest.mark.asyncio
+    async def test_capped_queue_shows_what_it_left_out(self, tmp_path, monkeypatch):
+        """The 20-row cap is a display limit. With a deeper queue the table has
+        to say what it cut — otherwise the operator reads "new 25" in the header
+        against 20 rows and has to do the subtraction."""
+        from textual.widgets import DataTable
+
+        from claude_on_the_fly.jobs.file_queue import DEFAULT_ROW_LIMIT
+
+        root = self._isolate(tmp_path, monkeypatch)
+        for i in range(DEFAULT_ROW_LIMIT + 5):
+            self._drop(root, "new", f"{1000 + i}-xxxxxxxx")
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            screen = _dashboard(app)
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert table.row_count == DEFAULT_ROW_LIMIT + 1
+            assert str(table.get_row_at(DEFAULT_ROW_LIMIT)[0]) == "… 5 more"
+
+            # Parkable like any other row: the 1Hz tick clears and rebuilds the
+            # table, so a key the cursor restore cannot find leaves an operator
+            # sitting on the last row yanked back to the top a second later.
+            table.move_cursor(row=DEFAULT_ROW_LIMIT)
+            await pilot.pause()
+            assert screen._datatable_cursor_key("#jobs-queue") == "__more__"
+            screen._refresh()
+            await pilot.pause()
+            assert screen._datatable_cursor_key("#jobs-queue") == "__more__"
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_shows_placeholder_row(self, tmp_path, monkeypatch):
+        from textual.widgets import DataTable
+
+        self._isolate(tmp_path, monkeypatch)
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert table.row_count == 1
+            assert "queue empty" in str(table.get_row_at(0)[0])
+
+    @pytest.mark.asyncio
+    async def test_nothing_the_table_composes_gets_clipped(self, tmp_path, monkeypatch):
+        """The strings the table composes itself — the column headers, the two
+        placeholder sentinels, the "… N more" truncation row, and a data row's
+        state cell — have to fit the width the widget declares: a fixed-width
+        column clips rather than wraps, so an over-long placeholder reads on
+        screen as a bug in the queue. A data row's prompt and age are left
+        unmeasured on purpose: both have always been allowed to overflow, so
+        measuring them would encode a rule that is not the contract."""
+        from rich.cells import cell_len
+        from textual.widgets import DataTable
+
+        from claude_on_the_fly.jobs.file_queue import DEFAULT_ROW_LIMIT
+
+        def fits(table, row_index, phase):
+            # Column.width, not get_render_width(): the latter adds the two
+            # cells of padding, which would leave "queue empty" (11) passing
+            # against the 10-wide column that clips it.
+            for column, cell in zip(table.ordered_columns, table.get_row_at(row_index)):
+                text = str(cell)
+                assert cell_len(text) <= column.width, (
+                    f"{phase}: {column.label} cell {text!r} is {cell_len(text)} "
+                    f"cells, column is {column.width}"
+                )
+
+        root = self._isolate(tmp_path, monkeypatch)
+        app = ClaudeTuiApp()
+        # Pinned, because the budget below is a claim about an 80-column
+        # terminal — run_test()'s own default is not this test's to assume.
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            screen = _dashboard(app)
+            table = app.screen.query_one("#jobs-queue", DataTable)
+
+            # A header too wide for its own column clips the same way.
+            for column in table.ordered_columns:
+                assert cell_len(str(column.label)) <= column.width, column.label
+
+            # Widening one column at another's expense is the edit this test
+            # exists to catch, and every cell can fit while the table itself no
+            # longer does — so budget the row against the space it is given.
+            assert (
+                sum(column.get_render_width(table) for column in table.ordered_columns)
+                <= table.container_size.width
+            )
+
+            assert table.row_count == 1
+            fits(table, 0, "empty queue")
+
+            self._drop(root, "cur", "0999-aaaaaaaa")
+            for i in range(DEFAULT_ROW_LIMIT + 5):
+                self._drop(root, "new", f"{1000 + i}-xxxxxxxx")
+            screen._refresh()
+            await pilot.pause()
+            assert table.row_count == DEFAULT_ROW_LIMIT + 1
+            # Pin the subject by key, not by copy: this has to measure the
+            # truncation row, never a data row that shifted into its place.
+            assert table.ordered_rows[DEFAULT_ROW_LIMIT].key.value == "__more__"
+            fits(table, DEFAULT_ROW_LIMIT, "capped queue")
+
+            # "running" / "queued" are the table's own literals too, and a data
+            # row's state cell is the only place they land. Both are collected
+            # by value rather than by row position — an index into a row that
+            # turned out to be a placeholder would measure an empty cell and
+            # prove nothing.
+            states = {str(table.get_row_at(i)[1]) for i in range(DEFAULT_ROW_LIMIT)}
+            assert states == {"running", "queued"}
+            assert max(cell_len(s) for s in states) <= table.ordered_columns[1].width
+
+            # A broker-backed queue can't be read from here, and says so in the
+            # longest string this table can print.
+            monkeypatch.setenv("JOBS_QUEUE_KIND", "redis")
+            screen._refresh()
+            await pilot.pause()
+            assert "unavailable" in str(table.get_row_at(0)[0])
+            fits(table, 0, "queue unavailable")
+
+    @pytest.mark.asyncio
+    async def test_rendering_the_tab_never_creates_the_maildir(
+        self, tmp_path, monkeypatch
+    ):
+        """The hard constraint, as a test: a live worker owns that directory and
+        the TUI is only allowed to look."""
+        root = self._isolate(tmp_path, monkeypatch)
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            _dashboard(app)._refresh()  # force another full tick
+            await pilot.pause()
+        assert not root.exists()
+
+    @pytest.mark.asyncio
+    async def test_arrows_and_watch_pane_no_op_on_the_jobs_tab(
+        self, tmp_path, monkeypatch
+    ):
+        """No tracker/frontend strip to move through, and no per-job watch yet
+        (the worker doesn't publish a session uuid) — so the daemon log keeps
+        the full width."""
+        from textual.containers import Vertical
+
+        self._isolate(tmp_path, monkeypatch)
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            screen = _dashboard(app)
+            before = screen._chat_selected_idx, screen._symphony_selected_idx
+            await pilot.press("right")
+            await pilot.press("left")
+            await pilot.pause()
+            assert (screen._chat_selected_idx, screen._symphony_selected_idx) == before
+            assert screen._active_daemon() == "jobs"
+            assert app.screen.query_one("#log-watch-col", Vertical).display is False
+
+    @pytest.mark.asyncio
+    async def test_log_pane_follows_the_worker_log(self, tmp_path, monkeypatch):
+        """The shared log row follows the active tab, so the jobs tab tails
+        logs/jobs.log — which jobs/cli.py's own _setup_logging now writes."""
+        from textual.widgets import Static
+
+        from claude_on_the_fly.tui.screens import dashboard as dash
+
+        self._isolate(tmp_path, monkeypatch)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "jobs.log").write_text("worker line\n", encoding="utf-8")
+        monkeypatch.setattr(dash, "LOG_DIR", log_dir)
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            header = str(app.screen.query_one("#log-header", Static).render())
+            assert "jobs.log" in header
+            assert "missing" not in header
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_keys_target_the_jobs_worker(self, tmp_path, monkeypatch):
+        """k/r resolve through _active_daemon, so the single elif is the whole
+        of the supervisor wiring — assert it reaches supervisor.stop."""
+        from claude_on_the_fly.tui.screens import dashboard as dash
+
+        self._isolate(tmp_path, monkeypatch)
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+
+            stopped: list[str] = []
+            monkeypatch.setattr(
+                dash.supervisor, "stop", lambda name: stopped.append(name) or 4321
+            )
+            await pilot.press("k")
+            await pilot.pause()
+            assert stopped == ["jobs"]
 
 
 class TestLogScrollPreservation:

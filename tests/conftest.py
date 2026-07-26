@@ -7,6 +7,36 @@ import json
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_jobs_dir(tmp_path, monkeypatch):
+    """Keep the whole suite off the real background-job maildir.
+
+    `snapshot()` reads `state.DEFAULT_JOBS_DIR` with no argument (the 1Hz
+    dashboard refresh calls it that way), so any test that boots the TUI reads
+    it — and on a dev machine a real worker owns that directory. The reads are
+    read-only, but a test suite whose behavior depends on the developer's live
+    queue is not hermetic. Autouse so it cannot be forgotten; returns the root,
+    so a test wanting a populated queue just fills it in.
+    """
+    root = tmp_path / "isolated-jobs"
+    monkeypatch.setattr("claude_on_the_fly.tui.state.DEFAULT_JOBS_DIR", root)
+    return root
+
+
+@pytest.fixture(autouse=True)
+def isolate_env_file(tmp_path, monkeypatch):
+    """Keep the whole suite off the developer's real `.env`.
+
+    `state._queue_kind()` reads it through `supervisor.DEFAULT_ENV_FILE` on
+    every `snapshot()`, so without this a `JOBS_QUEUE_KIND` on the dev machine
+    would decide what the TUI tests see. Returns the (initially absent) path, so
+    a test wanting a specific setting just writes it.
+    """
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr("claude_on_the_fly.tui.supervisor.DEFAULT_ENV_FILE", env_file)
+    return env_file
+
+
 @pytest.fixture
 def clear_backend_env(monkeypatch):
     """Strip backend-selection env vars so tests start from a clean slate."""

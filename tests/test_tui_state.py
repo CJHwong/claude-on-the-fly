@@ -381,3 +381,112 @@ class TestSnapshotShape:
         )
         snap = state_mod.snapshot(process_check=alive_check)
         assert isinstance(snap, Snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot — background-job queue
+# ---------------------------------------------------------------------------
+
+
+class TestJobsQueueView:
+    """snapshot() observes the jobs maildir directly, so queue depth is visible
+    even with the worker stopped — and observing it must never build it."""
+
+    @pytest.fixture
+    def jobs_root(self, isolate_jobs_dir):
+        """conftest's autouse fixture already points DEFAULT_JOBS_DIR at a tmp
+        maildir — this is only a local name for it."""
+        return isolate_jobs_dir
+
+    @staticmethod
+    def _drop(root: Path, stage: str, job_id: str, prompt: str = "do it") -> None:
+        """Hand-place a job file — the queue's own writers are exercised in
+        tests/jobs/test_file_queue.py; here we only need the layout."""
+        (root / stage).mkdir(parents=True, exist_ok=True)
+        (root / stage / f"{job_id}.json").write_text(
+            json.dumps({"id": job_id, "prompt": prompt, "origin": {}}),
+            encoding="utf-8",
+        )
+
+    def test_missing_maildir_reads_as_empty_and_stays_missing(
+        self, jobs_root, empty_state, alive_check
+    ):
+        snap = snapshot(empty_state, None, process_check=alive_check)
+        assert snap.jobs_queue is not None
+        depth = snap.jobs_queue.depth
+        assert (depth.new, depth.running, depth.done, depth.failed) == (0, 0, 0, 0)
+        assert snap.jobs_queue.rows == []
+        # The read-only contract: the TUI must never create the worker's maildir.
+        assert not jobs_root.exists()
+
+    def test_counts_and_rows_reflect_the_maildir(
+        self, jobs_root, empty_state, alive_check
+    ):
+        self._drop(jobs_root, "cur", "100-a", prompt="in flight")
+        self._drop(jobs_root, "new", "200-b", prompt="queued next")
+        self._drop(jobs_root, "failed", "050-x")
+        (jobs_root / "done").mkdir(parents=True, exist_ok=True)
+        # complete() writes BOTH of these; the job must count once.
+        (jobs_root / "done" / "010-z.json").write_text("{}", encoding="utf-8")
+        (jobs_root / "done" / "010-z.result.json").write_text("{}", encoding="utf-8")
+
+        snap = snapshot(empty_state, None, process_check=alive_check)
+        assert snap.jobs_queue is not None
+        depth = snap.jobs_queue.depth
+        assert (depth.new, depth.running, depth.done, depth.failed) == (1, 1, 1, 1)
+        assert [(r.id, r.in_flight) for r in snap.jobs_queue.rows] == [
+            ("100-a", True),
+            ("200-b", False),
+        ]
+        assert snap.jobs_queue.rows[0].prompt == "in flight"
+
+    def test_rows_are_capped(self, jobs_root, empty_state, alive_check):
+        from claude_on_the_fly.jobs.file_queue import DEFAULT_ROW_LIMIT
+
+        for i in range(DEFAULT_ROW_LIMIT + 5):
+            self._drop(jobs_root, "new", f"{1000 + i}-x")
+        snap = snapshot(empty_state, None, process_check=alive_check)
+        assert snap.jobs_queue is not None
+        assert len(snap.jobs_queue.rows) == DEFAULT_ROW_LIMIT
+        assert snap.jobs_queue.hidden == 5  # what the cap left out
+
+    def test_a_short_page_is_never_reported_as_truncated(
+        self, jobs_root, empty_state, alive_check, monkeypatch
+    ):
+        """Depth and rows are two reads and a job can finish between them, so a
+        page shorter than the cap is that race — never a hidden row."""
+        from claude_on_the_fly.tui import state as state_mod
+
+        for i in range(3):
+            self._drop(jobs_root, "new", f"{100 + i}-x")
+        # As if all three were claimed and completed after the depth read.
+        monkeypatch.setattr(state_mod, "read_queue_rows", lambda root, limit: [])
+
+        snap = snapshot(empty_state, None, process_check=alive_check)
+        assert snap.jobs_queue is not None
+        assert snap.jobs_queue.depth.new == 3
+        assert snap.jobs_queue.hidden == 0
+
+    def test_non_file_queue_kind_yields_none(
+        self, jobs_root, empty_state, alive_check, monkeypatch
+    ):
+        """A broker-backed queue keeps its state somewhere this reader can't
+        see; reporting zeros would be a lie, so the view is None."""
+        self._drop(jobs_root, "new", "100-a")
+        monkeypatch.setenv("JOBS_QUEUE_KIND", "redis")
+        snap = snapshot(empty_state, None, process_check=alive_check)
+        assert snap.jobs_queue is None
+
+    def test_queue_kind_is_read_from_the_env_file(
+        self, jobs_root, empty_state, alive_check, isolate_env_file, monkeypatch
+    ):
+        """Set in the .env FILE, not the process environment — which is where a
+        real deployment sets it, and no TUI module calls load_dotenv(). Reading
+        os.environ alone renders a broker-backed queue as an all-zero maildir."""
+        # The file has to be the only source, or a shell that exports the var
+        # passes this test against the very read it exists to rule out.
+        monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+        self._drop(jobs_root, "new", "100-a")
+        isolate_env_file.write_text("JOBS_QUEUE_KIND=redis\n", encoding="utf-8")
+        snap = snapshot(empty_state, None, process_check=alive_check)
+        assert snap.jobs_queue is None
