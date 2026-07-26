@@ -17,10 +17,12 @@ from claude_on_the_fly.checks import (
     check_binaries,
     check_frontend,
     check_gmail,
+    check_jobs,
     check_pty_hooks,
     check_slack,
     check_telegram,
     first_failure,
+    resolve_jobs_token,
     resolve_slack_ids,
     slack_deprecations,
 )
@@ -330,6 +332,68 @@ class TestCheckBinaries:
 
 
 # ---------------------------------------------------------------------------
+# Jobs (background worker)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckJobs:
+    def test_ok_via_shared_slack_token(self):
+        results = check_jobs({"SLACK_TOKEN": "xoxb-123"})
+        assert all_ok(results)
+        assert results[0].name == "SLACK_TOKEN"
+
+    def test_ok_via_jobs_override(self):
+        results = check_jobs({"JOBS_SLACK_TOKEN": "xoxp-abc", "SLACK_TOKEN": "xoxb-x"})
+        assert all_ok(results)
+        assert results[0].name == "JOBS_SLACK_TOKEN"
+        assert "user" in results[0].detail  # kind inferred from prefix
+
+    def test_missing_token(self):
+        results = check_jobs({})
+        assert not all_ok(results)
+
+    def test_invalid_override_prefix(self):
+        results = check_jobs({"JOBS_SLACK_TOKEN": "nope"})
+        assert results[0].status == "invalid"
+        assert results[0].name == "JOBS_SLACK_TOKEN"
+
+    def test_resolve_jobs_token_override_wins(self):
+        assert resolve_jobs_token(
+            {"JOBS_SLACK_TOKEN": "xoxb-j", "SLACK_TOKEN": "xoxp-s"}
+        ) == (
+            "JOBS_SLACK_TOKEN",
+            "xoxb-j",
+        )
+
+    def test_resolve_jobs_token_falls_back(self):
+        assert resolve_jobs_token({"SLACK_TOKEN": "xoxp-s"}) == (
+            "SLACK_TOKEN",
+            "xoxp-s",
+        )
+
+
+class TestJobsRegistration:
+    def test_jobs_is_supervisable(self):
+        assert "jobs" in SUPERVISABLE_FRONTENDS
+
+    def test_jobs_declares_env_vars(self):
+        vars_ = FRONTEND_ENV_VARS["jobs"]
+        assert "JOBS_SLACK_TOKEN" in vars_
+        # SLACK_TOKEN is shared with the slack frontend (editing it affects both).
+        assert "SLACK_TOKEN" in vars_
+
+    def test_check_frontend_dispatches_to_check_jobs(self):
+        env = {"SLACK_TOKEN": "xoxb-1"}
+        assert check_frontend("jobs", env) == check_jobs(env)
+
+    def test_jobs_needs_no_config_file(self):
+        # jobs is absent from _config_files → check_config_file returns [], so
+        # check_frontend is env-only.
+        results = check_frontend("jobs", {"SLACK_TOKEN": "xoxb-1"})
+        assert all_ok(results)
+
+
+# ---------------------------------------------------------------------------
 # Aggregators
 # ---------------------------------------------------------------------------
 
@@ -378,6 +442,7 @@ class TestAggregators:
             "gmail",
             "schedule",
             "symphony",
+            "jobs",
             "backend",
             "binaries",
         }

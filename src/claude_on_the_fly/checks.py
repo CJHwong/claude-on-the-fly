@@ -61,6 +61,17 @@ GMAIL_ENV_VARS: tuple[str, ...] = (
     "GMAIL_POLL_INTERVAL",
     "GMAIL_STATS_MODE",
 )
+# The worker shares SLACK_TOKEN with the slack frontend (editing it affects both);
+# JOBS_SLACK_TOKEN optionally overrides it. JOBS_TIMEOUT is the per-job wall-clock
+# limit in seconds (0 or negative = no limit). JOBS_STALE_TTL_S is deferred with
+# multi-worker support.
+JOBS_ENV_VARS: tuple[str, ...] = (
+    "JOBS_QUEUE_KIND",
+    "JOBS_POLL_INTERVAL_S",
+    "JOBS_TIMEOUT",
+    "JOBS_SLACK_TOKEN",
+    "SLACK_TOKEN",
+)
 BACKEND_ENV_VARS: tuple[str, ...] = (
     "AGENT_BACKEND",
     "CLAUDE_MODE",
@@ -81,6 +92,7 @@ FRONTEND_ENV_VARS: dict[str, tuple[str, ...]] = {
     "gmail": GMAIL_ENV_VARS,
     "schedule": (),  # no per-frontend env vars; uses schedule.yaml
     "symphony": (),  # uses symphony.yaml
+    "jobs": JOBS_ENV_VARS,
 }
 
 SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
@@ -89,6 +101,7 @@ SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
     "gmail",
     "schedule",
     "symphony",
+    "jobs",
 )
 
 
@@ -247,6 +260,18 @@ def resolve_slack_token(env: Mapping[str, str]) -> tuple[str | None, str]:
     return None, ""
 
 
+def resolve_jobs_token(env: Mapping[str, str]) -> tuple[str | None, str]:
+    """Return (var_name, token) for the claude-jobs notifier's Slack bearer.
+
+    `JOBS_SLACK_TOKEN` overrides the shared `SLACK_TOKEN` so the worker can post
+    under a different identity than the acking frontend (deployer-controlled).
+    Falls back to `resolve_slack_token` (honoring the legacy aliases)."""
+    override = env.get("JOBS_SLACK_TOKEN", "")
+    if override:
+        return "JOBS_SLACK_TOKEN", override
+    return resolve_slack_token(env)
+
+
 def resolve_slack_ids(env: Mapping[str, str], preferred: str) -> set[str]:
     """Resolve a comma-separated id set. The preferred var wins; otherwise its
     legacy fallbacks are merged (so the old split user/bot allowlists combine)."""
@@ -317,6 +342,28 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
             )
         )
     return results
+
+
+def check_jobs(env: Mapping[str, str]) -> list[CheckResult]:
+    """The worker's notifier needs a resolvable Slack bearer token.
+
+    Honors JOBS_SLACK_TOKEN (worker-specific override) first, else the shared
+    SLACK_TOKEN via `_check_slack_bearer`. Same token-kind rules as slack — no
+    hardcoded identity, no mandated kind."""
+    override = env.get("JOBS_SLACK_TOKEN", "")
+    if not override:
+        return [_check_slack_bearer(env)]
+    if not override.startswith(("xoxp-", "xoxb-")):
+        return [
+            CheckResult(
+                name="JOBS_SLACK_TOKEN",
+                status="invalid",
+                detail="must start with 'xoxp-' (user) or 'xoxb-' (bot)",
+                fix_hint="Use the User or Bot OAuth Token from Slack admin",
+            )
+        ]
+    kind = "bot" if override.startswith("xoxb-") else "user"
+    return [CheckResult(name="JOBS_SLACK_TOKEN", status="ok", detail=f"set ({kind})")]
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +632,7 @@ _ENV_CHECKERS: dict[str, Callable[[Mapping[str, str]], list[CheckResult]]] = {
     "telegram": check_telegram,
     "slack": check_slack,
     "gmail": check_gmail,
+    "jobs": check_jobs,
 }
 
 
