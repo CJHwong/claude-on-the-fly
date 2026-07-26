@@ -23,6 +23,9 @@ src/claude_on_the_fly/
   symphony/            # Jira-driven daemon (poll/claim/dispatch)
     tracker/jira.py    # Tracker Protocol implementations live here
     ...
+  jobs/                # Background-job daemon (claim/run/notify)
+    file_queue.py      # JobQueue Protocol implementations live here
+    ...
 ```
 
 ## Verification
@@ -43,5 +46,6 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/backends.md` — when modifying or adding an agent backend
 - `docs/agent/symphony.md` — when modifying or adding a tracker, or changing the dispatch loop
 - `docs/agent/frontend.md` — when adding a new frontend (Telegram/Slack/Gmail-like)
+- `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
 
 When working across multiple areas, read all relevant files first — the subsystems share state through `orchestrator.py` and `agent.py`.
