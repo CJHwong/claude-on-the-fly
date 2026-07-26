@@ -36,8 +36,9 @@ ATTACHMENT_PLATFORMS = frozenset({"slack", "telegram"})
 # Frontends whose fresh sessions must NOT inherit the prior fire's transcript.
 # The scheduler mints a new session UUID per fire on purpose — each cron run is
 # independent — so the cross-backend handoff preamble would drag the last run's
-# conversation into a run that's meant to start clean.
-NO_HANDOFF_PLATFORMS = frozenset({"schedule"})
+# conversation into a run that's meant to start clean. Background jobs are the
+# same shape: each job is an independent one-shot in a fresh workspace/session.
+NO_HANDOFF_PLATFORMS = frozenset({"schedule", "jobs"})
 OUTBOX_DIRNAME = "outbox"
 OUTBOX_ARCHIVE = ".sent"
 MAX_ATTACHMENTS = 10
@@ -192,6 +193,12 @@ FORMAT_HINTS = {
         "Output goes to daemon logs, not a chat user. Plain markdown is fine. "
         "Tracker writes (status transitions, comments, label edits) are your "
         "responsibility — see your prompt for the tools available."
+    ),
+    "jobs": (
+        "Write normal Markdown (**bold**, # headings, tables, lists, "
+        "```code```). Your reply is delivered into the chat thread that "
+        "requested this job; it is converted to that platform's formatting on "
+        "delivery."
     ),
 }
 

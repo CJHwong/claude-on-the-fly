@@ -12,9 +12,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from claude_on_the_fly.agent import (
+    ATTACHMENT_PLATFORMS,
     FORMAT_HINTS,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES,
+    NO_HANDOFF_PLATFORMS,
     NUDGE_PROMPT,
     OUTBOX_ARCHIVE,
     OUTBOX_DIRNAME,
@@ -226,6 +228,23 @@ class TestResponseFormatTools:
 # ---------------------------------------------------------------------------
 # build_system_prompt
 # ---------------------------------------------------------------------------
+
+
+class TestJobsPlatformRegistration:
+    """Acceptance #15: the "jobs" platform is wired into agent.py correctly."""
+
+    def test_jobs_is_no_handoff(self):
+        # Each job is an independent one-shot in a fresh session — no transcript
+        # handoff, same as "schedule".
+        assert "jobs" in NO_HANDOFF_PLATFORMS
+
+    def test_jobs_has_format_hint(self):
+        assert "jobs" in FORMAT_HINTS
+
+    def test_jobs_is_not_attachment_platform(self):
+        # Nothing collects the outbox on the jobs path and Result is text-only,
+        # so adding "jobs" here would make the agent promise files it can't send.
+        assert "jobs" not in ATTACHMENT_PLATFORMS
 
 
 class TestBuildSystemPrompt:
