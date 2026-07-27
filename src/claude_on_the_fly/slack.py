@@ -43,10 +43,14 @@ CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
-# Queue a background job that survives this chat turn. The worker (claude-jobs)
-# runs it in a fresh session and replies into this thread when done. Same
-# plain-text-prefix rationale as $stop.
-JOB_COMMAND = "$job"
+# Background-job trigger, opt-in: unset means the feature does not exist for
+# this install, and a message that would have queued a job is answered as an
+# ordinary one instead. When set, the message tail is queued as a job that
+# survives this chat turn — the worker (claude-jobs) runs it in a fresh session
+# and replies into this thread when done. A plain-text prefix, same rationale as
+# $stop: it works inside threads, where Slack blocks custom slash commands.
+# `checks._job_command_error` rejects the values that don't work as a trigger.
+JOB_COMMAND = os.environ.get("SLACK_JOB_COMMAND") or None
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
 # it must match the command in the Slack app manifest — Slack does not namespace
@@ -550,9 +554,14 @@ class SlackFrontend(Frontend):
         self._app_token = app_token
         self._user_id = user_id
         # Producer side of the background-jobs bridge. Defaults to the same
-        # file queue the worker reads (make_queue), so `$job` and claude-jobs
-        # agree on one inbox. Construction is side-effect-free (lazy mkdir).
-        self._job_queue = job_queue or make_queue()
+        # file queue the worker reads (make_queue), so the trigger and
+        # claude-jobs agree on one inbox. Built only when the trigger is set:
+        # make_queue() raises ValueError on an unknown JOBS_QUEUE_KIND, so
+        # without this gate a typo in the jobs env kills the *Slack* daemon for
+        # someone who never enabled jobs at all.
+        self._job_queue: JobQueue | None = job_queue or (
+            make_queue() if JOB_COMMAND else None
+        )
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
         self._allow_all_senders = "*" in self._allowed_user_ids
@@ -1053,8 +1062,11 @@ class SlackFrontend(Frontend):
             )
             return
 
-        # $job <task> queues a background job that outlives this chat turn; the
-        # worker replies into this thread when done. Placed before the soft-limit
+        # The job trigger queues a background job that outlives this chat turn;
+        # the worker replies into this thread when done. Opt-in, so the whole
+        # branch is skipped unless JOB_COMMAND is set and a queue was built —
+        # with the feature off the message falls through to the normal path and
+        # is answered as ordinary text. Placed before the soft-limit
         # gate so enqueue+ack isn't blocked by the reply budget, and before the
         # message reaches self._pending_msg (slack.py) so there's no orphaned
         # pending entry / hourglass. sender_id (raw id) is already resolved and
@@ -1062,7 +1074,11 @@ class SlackFrontend(Frontend):
         # isn't assigned yet — and the notifier reads neither, so origin carries
         # sender_id.
         job_text = text.strip()
-        if job_text == JOB_COMMAND or job_text.startswith(JOB_COMMAND + " "):
+        if (
+            JOB_COMMAND
+            and self._job_queue is not None
+            and (job_text == JOB_COMMAND or job_text.startswith(JOB_COMMAND + " "))
+        ):
             task = job_text[len(JOB_COMMAND) :].strip()
             # Unlike $stop, $job is not idempotent — a catchup re-ingest on
             # reconnect would enqueue a second job. Mirror the normal path's
@@ -1078,8 +1094,8 @@ class SlackFrontend(Frontend):
                 await self._post_notice(
                     channel,
                     thread_ts,
-                    "Usage: `$job <task>` — I'll run it in the background and "
-                    "reply here when it's done.",
+                    f"Usage: `{JOB_COMMAND} <task>` — I'll run it in the "
+                    "background and reply here when it's done.",
                 )
                 return
             job = Job(

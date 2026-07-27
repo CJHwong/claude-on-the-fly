@@ -57,6 +57,11 @@ export SLACK_TOKEN="xoxb-..."   # xoxp- to reply as you, xoxb- to reply as the a
 # match it exactly. Unset means no slash command — open the skill picker from a
 # message's "..." menu instead.
 # export SLACK_SLASH_COMMAND="/cof-yourname"
+# Optional: text prefix that queues a background job, run by the `claude-jobs`
+# worker in a fresh session, which replies in the same thread when it finishes.
+# Needs claude-jobs running. Unset means no trigger. Single-quoted so the shell
+# doesn't expand the $.
+# export SLACK_JOB_COMMAND='$job'
 # Optional: sender IDs allowed to trigger Claude — users (U…/W…) and bots (B…) in
 # one list; "*" allows any human. Your own ID is always allowed.
 # export SLACK_ALLOWED_SENDER_IDS="U111,U222,B07JPABE2"

@@ -2,6 +2,8 @@
 
 A single daemon that drains a durable queue: claim a job, run it through an agent, reply into wherever it came from. Where symphony polls a tracker for work, jobs waits for work someone handed it — a Slack user asking for something long-running, or `claude-jobs enqueue`.
 
+The Slack half of that is opt-in: the producer exists only where `SLACK_JOB_COMMAND` names a trigger, and the Slack frontend builds no queue at all without it. Unset, the queue is reachable from `claude-jobs enqueue` alone — which is why `claude-jobs doctor` reports the producer's state as an informational line rather than passing silently.
+
 Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Ports and data types: `jobs/core.py`.
 
 ## Layers

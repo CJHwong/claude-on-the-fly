@@ -47,6 +47,10 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_BLOCKED_SENDER_IDS",
     "SLACK_SILENT_SENDER_IDS",
     "SLACK_SLASH_COMMAND",
+    # Declared here and not in JOBS_ENV_VARS: the slack daemon is the process
+    # that binds it (slack.JOB_COMMAND), so it is the one env_editor must
+    # restart when it changes.
+    "SLACK_JOB_COMMAND",
     "SLACK_STATS_MODE",
     # Deprecated aliases (still honored; see SLACK_LEGACY).
     "SLACK_USER_TOKEN",
@@ -214,6 +218,10 @@ def check_slack(env: Mapping[str, str]) -> list[CheckResult]:
     if command:
         results.append(_check_slack_command(command))
 
+    job_command = env.get("SLACK_JOB_COMMAND", "")
+    if job_command:
+        results.append(_check_slack_job_command(job_command))
+
     return results
 
 
@@ -232,6 +240,69 @@ def _check_slack_command(command: str) -> CheckResult:
         detail=f"{command} {problem}",
         fix_hint="Unset it to drop the slash command, or run "
         "`claude-slack --manifest` to pick one and get a matching manifest",
+    )
+
+
+def _job_command_error(value: str) -> str | None:
+    """None when `value` is a usable job trigger, else why it isn't.
+
+    Three kinds of mistake, worth keeping apart: Slack never delivers it
+    ('/', '<>&'); one of our own prefixes eats it ($stop, $continue); or it
+    fires, but not as its author meant (whitespace, a leading word character).
+    Only that last group is a trap rather than a dead trigger. Deliberately not
+    a full charset check, for the same reason as `slack_manifest.command_error`:
+    Slack is the authority on what a message may contain.
+    """
+    if any(char.isspace() for char in value):
+        # Fires, so don't read this as "can never match": *internal* whitespace
+        # matches — "$my job" on "$my job <task>" — but only on exactly the
+        # spacing its author typed, so a doubled one misses with no error. Only
+        # the *leading* form can never match, and a *trailing* one kills the
+        # bare-trigger usage form: `_ingest_event` strips before comparing.
+        return "cannot contain whitespace"
+    if value.startswith("/"):
+        return "cannot start with '/' — Slack routes that as a slash command"
+    if any(char in value for char in "<>&"):
+        # `_ingest_event` reads `event["text"]` raw, with nothing unescaping it.
+        return "cannot contain '<', '>' or '&' — Slack escapes them in message text"
+    # The turn-control prefixes as literals: importing them from
+    # `claude_on_the_fly.slack` would pull slack_bolt into every checks import.
+    # test_checks.py `test_turn_control_prefixes_match_the_slack_constants`
+    # fails on drift, so the duplication is checked rather than merely noted.
+    if value == "$stop":
+        # Matched by exact equality and wins first, so the trigger is not merely
+        # dead: a bare "$stop" still aborts the turn while "$stop do the thing"
+        # falls past it and queues a job — one prefix, two behaviours.
+        return "collides with the $stop turn-control prefix"
+    if value == "$continue":
+        # Intercepted *after* the job branch, so a trigger equal to it shadows
+        # the reply soft-limit reset entirely — a gated thread could never be
+        # un-gated.
+        return "collides with the $continue turn-control prefix"
+    if value[:1].isalnum():
+        # A footgun, not a silent failure: it fires exactly as written, and the
+        # trigger is matched against the head of every inbound message, so an
+        # ordinary word swallows any message that opens with it.
+        return (
+            "should start with punctuation, e.g. `$job` — a plain word "
+            "swallows every message beginning with it"
+        )
+    return None
+
+
+def _check_slack_job_command(command: str) -> CheckResult:
+    """Validate SLACK_JOB_COMMAND if set. It is optional, but a malformed one
+    costs nothing at startup and everything at runtime — see
+    `_job_command_error` for the three ways it goes wrong."""
+    problem = _job_command_error(command)
+    if problem is None:
+        return CheckResult(name="SLACK_JOB_COMMAND", status="ok", detail=command)
+    return CheckResult(
+        name="SLACK_JOB_COMMAND",
+        status="invalid",
+        detail=f"{command} {problem}",
+        fix_hint="Unset it to drop the background-job trigger, or pick a "
+        "punctuation-led value like `$job`",
     )
 
 
@@ -345,25 +416,52 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
 
 
 def check_jobs(env: Mapping[str, str]) -> list[CheckResult]:
-    """The worker's notifier needs a resolvable Slack bearer token.
+    """The worker's notifier needs a resolvable Slack bearer token, and the
+    worker itself needs something able to enqueue into it."""
+    return [_check_jobs_token(env), _slack_job_producer_note(env)]
 
-    Honors JOBS_SLACK_TOKEN (worker-specific override) first, else the shared
+
+def _check_jobs_token(env: Mapping[str, str]) -> CheckResult:
+    """Honors JOBS_SLACK_TOKEN (worker-specific override) first, else the shared
     SLACK_TOKEN via `_check_slack_bearer`. Same token-kind rules as slack — no
     hardcoded identity, no mandated kind."""
     override = env.get("JOBS_SLACK_TOKEN", "")
     if not override:
-        return [_check_slack_bearer(env)]
+        return _check_slack_bearer(env)
     if not override.startswith(("xoxp-", "xoxb-")):
-        return [
-            CheckResult(
-                name="JOBS_SLACK_TOKEN",
-                status="invalid",
-                detail="must start with 'xoxp-' (user) or 'xoxb-' (bot)",
-                fix_hint="Use the User or Bot OAuth Token from Slack admin",
-            )
-        ]
+        return CheckResult(
+            name="JOBS_SLACK_TOKEN",
+            status="invalid",
+            detail="must start with 'xoxp-' (user) or 'xoxb-' (bot)",
+            fix_hint="Use the User or Bot OAuth Token from Slack admin",
+        )
     kind = "bot" if override.startswith("xoxb-") else "user"
-    return [CheckResult(name="JOBS_SLACK_TOKEN", status="ok", detail=f"set ({kind})")]
+    return CheckResult(name="JOBS_SLACK_TOKEN", status="ok", detail=f"set ({kind})")
+
+
+def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
+    """Report whether Slack can enqueue into this worker at all.
+
+    `claude-jobs doctor` runs `check_jobs`, never `check_slack`, so without this
+    line a worker whose SLACK_JOB_COMMAND is unset reports "all checks passed"
+    while nothing in Slack can ever reach it. A malformed value reports its
+    problem here too, because the doctor view renders the `slack` and `jobs`
+    groups on one screen (`tui/screens/doctor.py`) and a bare "producer on"
+    would contradict `check_slack`'s `invalid` row of the same name. Always
+    `ok`: an `enqueue`-only install is legitimate, and any other status would
+    make `claude-jobs doctor` (`jobs/cli.py` `_cmd_doctor`) exit 1 on it.
+    """
+    command = env.get("SLACK_JOB_COMMAND", "")
+    if not command:
+        detail = "unset — Slack cannot enqueue; `claude-jobs enqueue` only"
+    else:
+        problem = _job_command_error(command)
+        detail = (
+            f"Slack producer on ({command})"
+            if problem is None
+            else f"Slack producer misconfigured: {command} {problem}"
+        )
+    return CheckResult(name="SLACK_JOB_COMMAND", status="ok", detail=detail)
 
 
 # ---------------------------------------------------------------------------

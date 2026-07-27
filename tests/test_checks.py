@@ -167,6 +167,58 @@ class TestCheckSlack:
         assert fail.name == "SLACK_SLASH_COMMAND"
         assert fail.status == "invalid"
 
+    def test_job_command_absent_is_fine(self):
+        # Opt-in: unset means the background-job trigger does not exist for this
+        # install, which is the default, not an error.
+        results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxb-1"})
+        assert all_ok(results)
+        assert not any(r.name == "SLACK_JOB_COMMAND" for r in results)
+
+    def test_job_command_valid(self):
+        results = check_slack(
+            {
+                "SLACK_APP_TOKEN": "xapp-1",
+                "SLACK_TOKEN": "xoxb-1",
+                "SLACK_JOB_COMMAND": "$job",
+            }
+        )
+        assert all_ok(results)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            # Which rule each row exercises; `_job_command_error` says why.
+            "job",  # leading alphanumeric — fires, and swallows ordinary messages
+            "$my job",  # whitespace — fires, but only on that exact spacing
+            "/bg",  # leading '/' — Slack routes it as a slash command
+            "$a<b",  # '<>&' — Slack escapes these in message text
+            "$stop",  # collides with a turn-control prefix
+            "$continue",  # collides with a turn-control prefix
+        ],
+    )
+    def test_job_command_invalid(self, value):
+        results = check_slack(
+            {
+                "SLACK_APP_TOKEN": "xapp-1",
+                "SLACK_TOKEN": "xoxb-1",
+                "SLACK_JOB_COMMAND": value,
+            }
+        )
+        fail = first_failure(results)
+        assert fail is not None
+        assert fail.name == "SLACK_JOB_COMMAND"
+        assert fail.status == "invalid"
+
+    def test_turn_control_prefixes_match_the_slack_constants(self):
+        # `_job_command_error` copies these as literals (see its comment). The
+        # duplication is only safe if drift fails somewhere, so it fails here:
+        # rename either constant and the validator would silently stop
+        # rejecting the colliding trigger.
+        from claude_on_the_fly import slack
+
+        assert slack.STOP_COMMAND == "$stop"
+        assert slack.CONTINUE_COMMAND == "$continue"
+
     def test_slack_token_user(self):
         results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxp-1"})
         assert all_ok(results)
@@ -357,6 +409,45 @@ class TestCheckJobs:
         assert results[0].status == "invalid"
         assert results[0].name == "JOBS_SLACK_TOKEN"
 
+    def test_reports_slack_producer_off(self):
+        # `claude-jobs doctor` runs check_jobs, never check_slack, so this line is
+        # the only place a worker learns Slack can't reach it. Informational: it
+        # must stay "ok", or doctor would exit 1 on every enqueue-only install.
+        results = check_jobs({"SLACK_TOKEN": "xoxb-123"})
+        note = next(r for r in results if r.name == "SLACK_JOB_COMMAND")
+        assert note.status == "ok"
+        assert "unset" in note.detail
+        assert all_ok(results)
+
+    def test_reports_slack_producer_on(self):
+        results = check_jobs({"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": "$job"})
+        note = next(r for r in results if r.name == "SLACK_JOB_COMMAND")
+        assert note.status == "ok"
+        assert "$job" in note.detail
+
+    def test_producer_note_does_not_contradict_the_slack_group(self):
+        # Both groups render on one doctor screen, so a malformed value would
+        # otherwise show two rows of the same name: check_slack's "invalid", and
+        # a flat "producer on" here. Still "ok" — a non-ok result exits
+        # `claude-jobs doctor` 1, and this check is not what gates a worker.
+        env = {"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": "job"}
+        note = next(r for r in check_jobs(env) if r.name == "SLACK_JOB_COMMAND")
+        assert note.status == "ok"
+        assert "misconfigured" in note.detail
+        assert (
+            first_failure(check_slack({**env, "SLACK_APP_TOKEN": "xapp-1"})) is not None
+        )
+
+    def test_producer_note_survives_the_override_paths(self):
+        # The token check has three branches; the note has to appear on all of
+        # them, or it vanishes for exactly the installs that configured a worker.
+        for env in (
+            {"SLACK_TOKEN": "xoxb-1"},
+            {"JOBS_SLACK_TOKEN": "xoxb-j"},
+            {"JOBS_SLACK_TOKEN": "nope"},
+        ):
+            assert any(r.name == "SLACK_JOB_COMMAND" for r in check_jobs(env))
+
     def test_resolve_jobs_token_override_wins(self):
         assert resolve_jobs_token(
             {"JOBS_SLACK_TOKEN": "xoxb-j", "SLACK_TOKEN": "xoxp-s"}
@@ -381,6 +472,13 @@ class TestJobsRegistration:
         assert "JOBS_SLACK_TOKEN" in vars_
         # SLACK_TOKEN is shared with the slack frontend (editing it affects both).
         assert "SLACK_TOKEN" in vars_
+
+    def test_job_command_belongs_to_the_slack_daemon(self):
+        # env_editor maps a changed var back to the daemons that declare it. The
+        # slack daemon is the process that binds the trigger, so it is the one to
+        # restart; declaring it under jobs would restart the wrong one.
+        assert "SLACK_JOB_COMMAND" in FRONTEND_ENV_VARS["slack"]
+        assert "SLACK_JOB_COMMAND" not in FRONTEND_ENV_VARS["jobs"]
 
     def test_check_frontend_dispatches_to_check_jobs(self):
         env = {"SLACK_TOKEN": "xoxb-1"}
