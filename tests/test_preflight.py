@@ -556,6 +556,27 @@ class TestRunSlack:
         """Same reason as TestRunTelegram — keep `CLAUDE_MODE=pty` from
         the dev's shell from rerouting backend dispatch in run_slack()."""
 
+    @pytest.fixture(autouse=True)
+    def _reset_slack_env(self, monkeypatch):
+        """Each test sets only the SLACK_* vars it asserts on, so on a dev's
+        machine the rest resolve from the real workspace — and the mismatch
+        prints their live token and sender ids into the assertion diff."""
+        for var in (
+            "SLACK_APP_TOKEN",
+            "SLACK_TOKEN",
+            "SLACK_ALLOWED_SENDER_IDS",
+            "SLACK_BLOCKED_SENDER_IDS",
+            "SLACK_SILENT_SENDER_IDS",
+            "SLACK_SLASH_COMMAND",
+            # Deprecated aliases, still honored by run_slack.
+            "SLACK_USER_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "SLACK_ALLOWED_USER_IDS",
+            "SLACK_BLOCKED_USER_IDS",
+            "SLACK_ALLOWED_BOT_IDS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_returns_tokens_and_ids(self, _mock_claude, _mock_arun, monkeypatch):
