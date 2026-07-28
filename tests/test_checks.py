@@ -188,7 +188,8 @@ class TestCheckSlack:
         "value",
         [
             # Which rule each row exercises; `_job_command_error` says why.
-            "job",  # leading alphanumeric — fires, and swallows ordinary messages
+            # A leading alphanumeric is NOT here: it works as written, so it
+            # warns rather than blocks — see test_job_command_advisory_only.
             "$my job",  # whitespace — fires, but only on that exact spacing
             "/bg",  # leading '/' — Slack routes it as a slash command
             "$a<b",  # '<>&' — Slack escapes these in message text
@@ -208,6 +209,25 @@ class TestCheckSlack:
         assert fail is not None
         assert fail.name == "SLACK_JOB_COMMAND"
         assert fail.status == "invalid"
+
+    def test_job_command_advisory_only(self):
+        """A leading word character fires exactly as written — the validator's
+        own comment says so. Reporting it as invalid made supervisor.spawn
+        refuse to start Slack at all over a naming preference, which is the
+        collateral damage the opt-in gate exists to prevent."""
+        env = {
+            "SLACK_APP_TOKEN": "xapp-1",
+            "SLACK_TOKEN": "xoxb-1",
+            "SLACK_JOB_COMMAND": "job",
+        }
+        results = check_slack(env)
+
+        note = next(r for r in results if r.name == "SLACK_JOB_COMMAND")
+        assert note.status == "warn"
+        assert "swallows" in note.detail
+        # Surfaced in doctor, but Slack still starts.
+        assert first_failure(results) is None
+        assert all_ok(results)
 
     def test_turn_control_prefixes_match_the_slack_constants(self):
         # `_job_command_error` copies these as literals (see its comment). The
@@ -430,7 +450,7 @@ class TestCheckJobs:
         # otherwise show two rows of the same name: check_slack's "invalid", and
         # a flat "producer on" here. Still "ok" — a non-ok result exits
         # `claude-jobs doctor` 1, and this check is not what gates a worker.
-        env = {"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": "job"}
+        env = {"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": "$a<b"}
         note = next(r for r in check_jobs(env) if r.name == "SLACK_JOB_COMMAND")
         assert note.status == "ok"
         assert "misconfigured" in note.detail

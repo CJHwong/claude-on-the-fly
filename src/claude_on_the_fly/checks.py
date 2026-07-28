@@ -243,8 +243,11 @@ def _check_slack_command(command: str) -> CheckResult:
     )
 
 
-def _job_command_error(value: str) -> str | None:
-    """None when `value` is a usable job trigger, else why it isn't.
+def _job_command_error(value: str) -> tuple[Status, str] | None:
+    """None when `value` is a usable job trigger, else (status, why).
+
+    The status separates "this cannot work" from "this works, but probably not
+    as you meant": only the first is a reason to refuse to start the daemon.
 
     Three kinds of mistake, worth keeping apart: Slack never delivers it
     ('/', '<>&'); one of our own prefixes eats it ($stop, $continue); or it
@@ -259,12 +262,18 @@ def _job_command_error(value: str) -> str | None:
         # spacing its author typed, so a doubled one misses with no error. Only
         # the *leading* form can never match, and a *trailing* one kills the
         # bare-trigger usage form: `_ingest_event` strips before comparing.
-        return "cannot contain whitespace"
+        return "invalid", "cannot contain whitespace"
     if value.startswith("/"):
-        return "cannot start with '/' — Slack routes that as a slash command"
+        return (
+            "invalid",
+            "cannot start with '/' — Slack routes that as a slash command",
+        )
     if any(char in value for char in "<>&"):
         # `_ingest_event` reads `event["text"]` raw, with nothing unescaping it.
-        return "cannot contain '<', '>' or '&' — Slack escapes them in message text"
+        return (
+            "invalid",
+            "cannot contain '<', '>' or '&' — Slack escapes them in message text",
+        )
     # The turn-control prefixes as literals: importing them from
     # `claude_on_the_fly.slack` would pull slack_bolt into every checks import.
     # test_checks.py `test_turn_control_prefixes_match_the_slack_constants`
@@ -273,19 +282,20 @@ def _job_command_error(value: str) -> str | None:
         # Matched by exact equality and wins first, so the trigger is not merely
         # dead: a bare "$stop" still aborts the turn while "$stop do the thing"
         # falls past it and queues a job — one prefix, two behaviours.
-        return "collides with the $stop turn-control prefix"
+        return "invalid", "collides with the $stop turn-control prefix"
     if value == "$continue":
         # Intercepted *after* the job branch, so a trigger equal to it shadows
         # the reply soft-limit reset entirely — a gated thread could never be
         # un-gated.
-        return "collides with the $continue turn-control prefix"
+        return "invalid", "collides with the $continue turn-control prefix"
     if value[:1].isalnum():
         # A footgun, not a silent failure: it fires exactly as written, and the
         # trigger is matched against the head of every inbound message, so an
         # ordinary word swallows any message that opens with it.
         return (
+            "warn",
             "should start with punctuation, e.g. `$job` — a plain word "
-            "swallows every message beginning with it"
+            "swallows every message beginning with it",
         )
     return None
 
@@ -297,10 +307,11 @@ def _check_slack_job_command(command: str) -> CheckResult:
     problem = _job_command_error(command)
     if problem is None:
         return CheckResult(name="SLACK_JOB_COMMAND", status="ok", detail=command)
+    status, detail = problem
     return CheckResult(
         name="SLACK_JOB_COMMAND",
-        status="invalid",
-        detail=f"{command} {problem}",
+        status=status,
+        detail=f"{command} {detail}",
         fix_hint="Unset it to drop the background-job trigger, or pick a "
         "punctuation-led value like `$job`",
     )
@@ -780,13 +791,21 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
     }
 
 
+# Statuses that do not stop a daemon from starting. `warn` reports a setting
+# that works exactly as written but is likely not what its author meant — advice
+# worth surfacing in `doctor`, never a reason to refuse to run. `missing` and
+# `invalid` stay blocking: they describe a daemon that cannot do its job.
+NON_BLOCKING_STATUSES: frozenset[Status] = frozenset({"ok", "warn"})
+
+
 def first_failure(results: list[CheckResult]) -> CheckResult | None:
-    """Return the first non-ok result, or None if all passed."""
+    """Return the first blocking result, or None if none blocks startup."""
     for r in results:
-        if r.status != "ok":
+        if r.status not in NON_BLOCKING_STATUSES:
             return r
     return None
 
 
 def all_ok(results: list[CheckResult]) -> bool:
-    return all(r.status == "ok" for r in results)
+    """True when nothing blocks startup. Advisory `warn` results do not."""
+    return all(r.status in NON_BLOCKING_STATUSES for r in results)
