@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1884,16 +1883,14 @@ class _FakeJobQueue:
 
 class TestJobCommand:
     @pytest.fixture(autouse=True)
-    def _enable_job_command(self, monkeypatch):
-        # JOB_COMMAND binds at import from SLACK_JOB_COMMAND, so a real value in
-        # the developer's shell would otherwise decide what this class tests —
-        # and with the var unset the feature is off, which would make every
-        # enqueue test below silently vacuous. Pin it for the whole class; the
-        # tests that need the feature OFF, or under another name, re-patch it.
+    def _clear_job_command_env(self, monkeypatch):
+        # The trigger resolves per instance from SLACK_JOB_COMMAND, so a real
+        # value in the developer's shell would otherwise decide what this class
+        # tests. Clear it and let `_frontend` pass the trigger explicitly.
         # (Function-scoped: monkeypatch cannot be requested by a class fixture.)
-        monkeypatch.setattr("claude_on_the_fly.slack.JOB_COMMAND", "$job")
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
 
-    def _frontend(self, queue=None):
+    def _frontend(self, queue=None, job_command="$job"):
         with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
             mock_app = MagicMock()
             mock_app.client = MagicMock()
@@ -1906,6 +1903,7 @@ class TestJobCommand:
                 "xoxp-tok",
                 "U_SELF",
                 allowed_user_ids={"U_ALLOWED"},
+                job_command=job_command,
                 job_queue=queue,
             )
             fe._on_message = AsyncMock()
@@ -1996,15 +1994,14 @@ class TestJobCommand:
         mock_app.client.chat_postMessage.assert_awaited()  # usage notice
         fe._on_message.assert_not_awaited()
 
-    async def test_usage_notice_names_the_configured_trigger(self, monkeypatch):
-        # The notice interpolates JOB_COMMAND. Nothing else would catch a
-        # regression to a hardcoded `$job`: the test above runs under the
-        # default trigger and only asserts that *something* was posted, so the
-        # notice would keep telling every operator on another trigger to type a
-        # string their install does not answer to.
-        monkeypatch.setattr("claude_on_the_fly.slack.JOB_COMMAND", "!bg")
+    async def test_usage_notice_names_the_configured_trigger(self):
+        # The notice interpolates the configured trigger. Nothing else would
+        # catch a regression to a hardcoded `$job`: the test above runs under
+        # the default trigger and only asserts that *something* was posted, so
+        # the notice would keep telling every operator on another trigger to
+        # type a string their install does not answer to.
         queue = _FakeJobQueue()
-        fe, mock_app = self._frontend(queue)
+        fe, mock_app = self._frontend(queue, job_command="!bg")
         await fe._ingest_event(
             {
                 "user": "U_ALLOWED",
@@ -2058,9 +2055,8 @@ class TestJobCommand:
         # branch enqueues and returns before _on_message), so this discriminates.
         # Note it does NOT assert the ts is absent from _processed_ts: the normal
         # path marks it processed too, so that would hold either way.
-        monkeypatch.setattr("claude_on_the_fly.slack.JOB_COMMAND", None)
         queue = _FakeJobQueue()
-        fe, _ = self._frontend(queue)
+        fe, _ = self._frontend(queue, job_command=None)
         await fe._ingest_event(
             {
                 "user": "U_ALLOWED",
@@ -2073,12 +2069,11 @@ class TestJobCommand:
         assert queue.jobs == []
         fe._on_message.assert_awaited_once()
 
-    async def test_custom_trigger_replaces_the_default(self, monkeypatch):
+    async def test_custom_trigger_replaces_the_default(self):
         # The trigger is whatever the operator named — "$job" holds no special
         # status once it is read from the environment.
-        monkeypatch.setattr("claude_on_the_fly.slack.JOB_COMMAND", "!bg")
         queue = _FakeJobQueue()
-        fe, _ = self._frontend(queue)
+        fe, _ = self._frontend(queue, job_command="!bg")
         await fe._ingest_event(
             {
                 "user": "U_ALLOWED",
@@ -2107,10 +2102,9 @@ class TestJobCommand:
         # make_queue() raises on an unknown JOBS_QUEUE_KIND, so constructing it
         # unconditionally lets an unrelated jobs-env typo kill the Slack daemon
         # for someone who never enabled jobs.
-        monkeypatch.setattr("claude_on_the_fly.slack.JOB_COMMAND", None)
         made = MagicMock()
         monkeypatch.setattr("claude_on_the_fly.slack.make_queue", made)
-        fe, _ = self._frontend()
+        fe, _ = self._frontend(job_command=None)
         assert fe._job_queue is None
         made.assert_not_called()
 
@@ -2123,26 +2117,49 @@ class TestJobCommand:
         made.assert_called_once()
 
 
-async def test_job_command_reads_its_documented_env_var(monkeypatch):
-    """Every other test patches `slack.JOB_COMMAND` directly, so a typo in the
-    env var name — SLACK_JOBS_COMMAND in slack.py against SLACK_JOB_COMMAND in
-    checks.py and the docs — would pass the entire suite. Reload the module
-    against a real environment to pin which name the constant is bound from.
+def test_job_command_reads_its_documented_env_var(monkeypatch):
+    """Every other test passes the trigger explicitly, so a typo in the env var
+    name — SLACK_JOBS_COMMAND in slack.py against SLACK_JOB_COMMAND in checks.py
+    and the docs — would pass the entire suite. Pin which name the constructor
+    reads, against a real environment.
     """
-    import claude_on_the_fly.slack as slack_module
-
-    try:
+    with patch("claude_on_the_fly.slack.AsyncApp"):
         monkeypatch.setenv("SLACK_JOB_COMMAND", "!bg")
-        importlib.reload(slack_module)
-        assert slack_module.JOB_COMMAND == "!bg"
+        with patch("claude_on_the_fly.slack.make_queue"):
+            fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert fe._job_command == "!bg"
 
         # And unset really means off, rather than falling back to a default.
         monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
-        importlib.reload(slack_module)
-        assert slack_module.JOB_COMMAND is None
-    finally:
-        # monkeypatch's own teardown runs after this body, so the variable has to
-        # be cleared here: a restoring reload that still saw the test's value
-        # would leave the module poisoned for the rest of the session.
-        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
-        importlib.reload(slack_module)
+        fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert fe._job_command is None
+        assert fe._job_queue is None
+
+
+async def test_injected_queue_enables_the_feature_without_patching_globals():
+    """The constructor seam has to work on its own. The intercept used to gate
+    on an import-time module global, so passing a queue could not switch the
+    feature on and every caller had to reach in and patch that too."""
+    with patch("claude_on_the_fly.slack.AsyncApp"):
+        queue = _FakeJobQueue()
+        fe = SlackFrontend(
+            "xapp-tok",
+            "xoxp-tok",
+            "U_SELF",
+            allowed_user_ids={"U_ALLOWED"},
+            job_command="$job",
+            job_queue=queue,
+        )
+        fe._on_message = AsyncMock()
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "1.0",
+                "text": "$job do the thing",
+            }
+        )
+
+    assert [job.prompt for job in queue.jobs] == ["do the thing"]
+    fe._on_message.assert_not_awaited()

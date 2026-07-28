@@ -50,7 +50,11 @@ STOP_COMMAND = "$stop"
 # and replies into this thread when done. A plain-text prefix, same rationale as
 # $stop: it works inside threads, where Slack blocks custom slash commands.
 # `checks._job_command_error` rejects the values that don't work as a trigger.
-JOB_COMMAND = os.environ.get("SLACK_JOB_COMMAND") or None
+# The trigger itself is resolved per-instance in `SlackFrontend.__init__` from
+# `SLACK_JOB_COMMAND` (or an explicit argument), deliberately not bound here:
+# an import-time constant cannot see a value that only `load_dotenv()` puts in
+# the environment, and it made the constructor's job_queue seam unusable on its
+# own.
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
 # it must match the command in the Slack app manifest — Slack does not namespace
@@ -532,18 +536,26 @@ class SlackFrontend(Frontend):
         blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
+        job_command: str | None = None,
         job_queue: JobQueue | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
-        # Producer side of the background-jobs bridge. Defaults to the same
-        # file queue the worker reads (make_queue), so the trigger and
-        # claude-jobs agree on one inbox. Built only when the trigger is set:
-        # make_queue() raises ValueError on an unknown JOBS_QUEUE_KIND, so
-        # without this gate a typo in the jobs env kills the *Slack* daemon for
-        # someone who never enabled jobs at all.
+        # Producer side of the background-jobs bridge. Trigger and queue resolve
+        # together, here rather than at import: injecting a queue alone could
+        # not switch the feature on, since the branch gated on the module
+        # global, and a caller had to reach in and patch that too. Resolving at
+        # construction also means a SLACK_JOB_COMMAND that only exists in .env
+        # works — `main` calls load_dotenv() before this runs, whereas the
+        # import-time binding needed the value already in the environment.
+        self._job_command = job_command or os.environ.get("SLACK_JOB_COMMAND") or None
+        # Defaults to the same file queue the worker reads (make_queue), so the
+        # trigger and claude-jobs agree on one inbox. Built only when the
+        # trigger is set: make_queue() raises ValueError on an unknown
+        # JOBS_QUEUE_KIND, so without this gate a typo in the jobs env kills the
+        # *Slack* daemon for someone who never enabled jobs at all.
         self._job_queue: JobQueue | None = job_queue or (
-            make_queue() if JOB_COMMAND else None
+            make_queue() if self._job_command else None
         )
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
@@ -1047,7 +1059,7 @@ class SlackFrontend(Frontend):
 
         # The job trigger queues a background job that outlives this chat turn;
         # the worker replies into this thread when done. Opt-in, so the whole
-        # branch is skipped unless JOB_COMMAND is set and a queue was built —
+        # branch is skipped unless the trigger is set and a queue was built —
         # with the feature off the message falls through to the normal path and
         # is answered as ordinary text. Placed before the soft-limit
         # gate so enqueue+ack isn't blocked by the reply budget, and before the
@@ -1056,13 +1068,14 @@ class SlackFrontend(Frontend):
         # authorized at the allow/block gate above; the resolved display `sender`
         # isn't assigned yet — and the notifier reads neither, so origin carries
         # sender_id.
+        job_command = self._job_command
         job_text = text.strip()
         if (
-            JOB_COMMAND
+            job_command
             and self._job_queue is not None
-            and (job_text == JOB_COMMAND or job_text.startswith(JOB_COMMAND + " "))
+            and (job_text == job_command or job_text.startswith(job_command + " "))
         ):
-            task = job_text[len(JOB_COMMAND) :].strip()
+            task = job_text[len(job_command) :].strip()
             # Unlike $stop, $job is not idempotent — a catchup re-ingest on
             # reconnect would enqueue a second job. Mirror the normal path's
             # catch-up bookkeeping (which this branch returns before reaching):
@@ -1077,7 +1090,7 @@ class SlackFrontend(Frontend):
                 await self._post_notice(
                     channel,
                     thread_ts,
-                    f"Usage: `{JOB_COMMAND} <task>` — I'll run it in the "
+                    f"Usage: `{job_command} <task>` — I'll run it in the "
                     "background and reply here when it's done.",
                 )
                 return
