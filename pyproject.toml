@@ -1,7 +1,7 @@
 [project]
 name = "claude-on-the-fly"
 dynamic = ["version"]
-description = "Remote access to Claude Code via Telegram, Slack, and Gmail"
+description = "Remote access to Claude Code via Slack and Telegram"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -19,9 +19,8 @@ dependencies = [
 ]
 
 [project.scripts]
-claude-telegram = "claude_on_the_fly.telegram:main"
 claude-slack = "claude_on_the_fly.slack:main"
-claude-gmail = "claude_on_the_fly.gmail:main"
+claude-telegram = "claude_on_the_fly.telegram:main"
 claude-schedule = "claude_on_the_fly.scheduler:main"
 claude-symphony = "claude_on_the_fly.symphony.cli:main"
 claude-jobs = "claude_on_the_fly.jobs.cli:main"
@@ -32,11 +31,40 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
+    # Pinned to the same minor the pre-commit hook installs. Undeclared, `uv run
+    # ruff` fell through to whatever ruff was on PATH, so a hand-run fix could
+    # differ from what the gate applies.
+    "ruff>=0.16,<0.17",
 ]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py312"
+# Line length is left at ruff-format's default: raising it would reflow every
+# file in the repo, which is a reformat, not a lint change.
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    # ruff-format owns wrapping; E501 only fires where it deliberately can't
+    # break (long string literals, URLs in comments).
+    "E501",
+    # Em-dashes and arrows are used on purpose throughout the prose in
+    # docstrings, comments, and user-facing strings.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # Textual declares BINDINGS / DEFAULT_CSS as plain mutable class
+    # attributes; that is the framework's own interface, not our default.
+    "RUF012",
+    # The Frontend ABC's optional hooks (set_orchestrator, notify_start,
+    # notify_complete) are concrete no-ops on purpose so a frontend overrides
+    # only what it can actually do.
+    "B027",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
