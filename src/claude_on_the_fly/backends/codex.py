@@ -104,9 +104,9 @@ async def _run_codex_exec(
             )
         else:
             stdout_bytes, stderr_bytes = await proc.communicate()
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("codex exec: timed out after %ss", timeout)
-        raise RuntimeError(f"Codex CLI timed out after {timeout}s")
+        raise RuntimeError(f"Codex CLI timed out after {timeout}s") from None
     finally:
         await agent._kill_process_tree(proc)
 

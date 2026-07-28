@@ -6,21 +6,16 @@ import json
 import time
 from pathlib import Path
 
-from unittest.mock import patch
-
 from claude_on_the_fly.transcript import (
     Turn,
     _workspace_to_claude_hash,
-    _workspace_to_pi_hash,
     extract_claude,
     extract_codex,
     extract_codex_cumulative_tokens,
     extract_codex_model,
-    extract_opencode,
     format_handoff,
     remove_workspace_sessions,
 )
-
 
 # ---------------------------------------------------------------------------
 # _workspace_to_claude_hash — must match claude's own scheme byte-for-byte
@@ -790,107 +785,22 @@ class TestFindLatestPriorTranscript:
         assert any(t.text == "prior turn" for t in turns)
 
 
-# ---------------------------------------------------------------------------
-# extract_opencode — reads back via `opencode export`, strips system prefix
-# ---------------------------------------------------------------------------
-
-
-def _opencode_export_payload(*messages: tuple[str, str]) -> dict:
-    """Build a fake `opencode export` dict from (role, text) pairs."""
-    return {
-        "info": {"id": "ses_abc"},
-        "messages": [
-            {
-                "info": {"role": role},
-                "parts": [{"type": "text", "text": text}],
-            }
-            for role, text in messages
-        ],
-    }
-
-
-def _write_opencode_mapping(workspace: Path, uuid: str, ses_id: str) -> None:
-    sessions_dir = workspace / ".opencode_sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    (sessions_dir / uuid).write_text(ses_id)
-
-
-class TestExtractOpencode:
-    def test_no_mapping_returns_none(self, tmp_path: Path):
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        assert extract_opencode(workspace, "missing") is None
-
-    def test_export_failure_returns_none(self, tmp_path: Path):
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        _write_opencode_mapping(workspace, "u1", "ses_abc")
-        with patch("claude_on_the_fly.transcript._opencode_export", return_value=None):
-            assert extract_opencode(workspace, "u1") is None
-
-    def test_happy_path_returns_turns(self, tmp_path: Path):
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        _write_opencode_mapping(workspace, "u1", "ses_abc")
-        payload = _opencode_export_payload(
-            ("user", "question one"),
-            ("assistant", "answer one"),
-        )
-        with patch(
-            "claude_on_the_fly.transcript._opencode_export", return_value=payload
-        ):
-            turns = extract_opencode(workspace, "u1")
-        assert turns == [Turn("user", "question one"), Turn("assistant", "answer one")]
-
-    def test_strips_system_prompt_prefix_from_first_user_message(self, tmp_path: Path):
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        _write_opencode_mapping(workspace, "u1", "ses_abc")
-        payload = _opencode_export_payload(
-            ("user", "SYSTEM PROMPT BLOCK\n\n---\n\nreal user text"),
-            ("assistant", "reply"),
-        )
-        with patch(
-            "claude_on_the_fly.transcript._opencode_export", return_value=payload
-        ):
-            turns = extract_opencode(workspace, "u1")
-        assert turns == [Turn("user", "real user text"), Turn("assistant", "reply")]
-
-    def test_no_messages_returns_none(self, tmp_path: Path):
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        _write_opencode_mapping(workspace, "u1", "ses_abc")
-        with patch(
-            "claude_on_the_fly.transcript._opencode_export",
-            return_value={"info": {}, "messages": []},
-        ):
-            assert extract_opencode(workspace, "u1") is None
-
-
-# ---------------------------------------------------------------------------
-# remove_workspace_sessions — the session stores that outlive a workspace
-# ---------------------------------------------------------------------------
-
-
 class TestRemoveWorkspaceSessions:
-    def test_removes_the_claude_and_pi_directories(
-        self, tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+    def test_removes_the_claude_directory(
+        self, tmp_path: Path, claude_projects_dir: Path
     ) -> None:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         claude_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
-        pi_dir = pi_sessions_dir / _workspace_to_pi_hash(workspace)
-        for directory in (claude_dir, pi_dir):
-            directory.mkdir(parents=True)
-            (directory / "session.jsonl").write_text("{}\n")
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "session.jsonl").write_text("{}\n")
 
         remove_workspace_sessions(workspace)
 
         assert not claude_dir.exists()
-        assert not pi_dir.exists()
 
     def test_leaves_other_workspaces_alone(
-        self, tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+        self, tmp_path: Path, claude_projects_dir: Path
     ) -> None:
         """The directory name encodes one workspace path, so a sibling's store
         must survive — this is what makes the removal safe to run per job."""
@@ -906,7 +816,7 @@ class TestRemoveWorkspaceSessions:
         assert survivor.exists()
 
     def test_missing_directories_are_not_an_error(
-        self, tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+        self, tmp_path: Path, claude_projects_dir: Path
     ) -> None:
         """Cleanup is best-effort: a backend that never wrote a session store
         must not turn teardown into a failure."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -15,8 +16,8 @@ import claude_on_the_fly.agent as agent_mod
 from claude_on_the_fly.agent import (
     ATTACHMENT_PLATFORMS,
     FORMAT_HINTS,
-    MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS,
     NO_HANDOFF_PLATFORMS,
     NUDGE_PROMPT,
     OUTBOX_ARCHIVE,
@@ -25,13 +26,13 @@ from claude_on_the_fly.agent import (
     OllamaLauncher,
     Response,
     _classify,
+    _exec,
+    _merge_cli_output,
     archive_outbox,
     build_system_prompt,
     collect_outbox,
     current_backend_key,
     ensure_persona,
-    _exec,
-    _merge_cli_output,
     get_backend,
     parse_stream,
     run,
@@ -178,8 +179,8 @@ class TestStatsMode:
         assert stats_mode("telegram") == "off"
 
     def test_case_insensitive(self, monkeypatch):
-        monkeypatch.setenv("GMAIL_STATS_MODE", "DETAILED")
-        assert stats_mode("gmail") == "detailed"
+        monkeypatch.setenv("TELEGRAM_STATS_MODE", "DETAILED")
+        assert stats_mode("telegram") == "detailed"
 
     def test_invalid_value_falls_back_to_summary(self, monkeypatch):
         monkeypatch.setenv("SLACK_STATS_MODE", "bogus")
@@ -261,16 +262,11 @@ class TestBuildSystemPrompt:
         assert "alice" in result
         assert "#general" in result
 
-    def test_gmail_platform(self):
-        result = build_system_prompt("gmail", "bob", "thread")
-        assert FORMAT_HINTS["gmail"] in result
-
     def test_unknown_platform_falls_back_to_telegram(self):
         result = build_system_prompt("discord", "charlie", "dm")
         assert FORMAT_HINTS["telegram"] in result
-        # Slack and gmail hints should NOT be present
+        # The slack hint should NOT be present
         assert FORMAT_HINTS["slack"] not in result
-        assert FORMAT_HINTS["gmail"] not in result
 
     def test_all_template_variables_substituted(self):
         result = build_system_prompt("telegram", "hoss", "channel:dev")
@@ -292,7 +288,7 @@ class TestBuildSystemPrompt:
     def test_outbox_instruction_absent_for_non_attachment_platforms(
         self, tmp_path: Path
     ):
-        for platform in ("gmail", "symphony", "discord"):
+        for platform in ("symphony", "schedule", "discord"):
             result = build_system_prompt(platform, "hoss", "dm", tmp_path)
             assert "You CAN send files" not in result
 
@@ -433,16 +429,20 @@ class TestExec:
     async def test_nonzero_exit_raises_with_stderr(self):
         proc = _make_proc(1, b"", stderr=b"something broke")
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="something broke"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="something broke"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_nonzero_exit_empty_stderr_uses_fallback(self):
         proc = _make_proc(42, b"", stderr=b"")
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="Exit code 42"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="Exit code 42"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_is_error_true_raises(self):
         stream = _ndjson(
@@ -450,9 +450,11 @@ class TestExec:
         )
         proc = _make_proc(0, stream)
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="bad stuff"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="bad stuff"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_error_subtype_raises(self):
         stream = _ndjson(
@@ -460,18 +462,22 @@ class TestExec:
         )
         proc = _make_proc(0, stream)
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="too many"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="too many"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_is_error_missing_result_defaults(self):
         # Result line with is_error but no result field
         stream = _ndjson({"type": "result", "is_error": True})
         proc = _make_proc(0, stream)
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="Unknown error"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="Unknown error"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_nonzero_exit_with_stream_result_extracts_result(self):
         stream = _ndjson(
@@ -483,11 +489,11 @@ class TestExec:
         )
         proc = _make_proc(1, stream, stderr=b"")
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(
-                RuntimeError, match="API Error: Could not process image"
-            ):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="API Error: Could not process image"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_usage_limit_raises_unavailable(self):
         stream = _ndjson(
@@ -495,9 +501,11 @@ class TestExec:
         )
         proc = _make_proc(1, stream)
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(ClaudeUnavailableError, match="usage limit"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(ClaudeUnavailableError, match="usage limit"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_usage_allocation_disabled_raises_unavailable(self):
         stream = _ndjson(
@@ -505,9 +513,11 @@ class TestExec:
         )
         proc = _make_proc(1, stream)
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(ClaudeUnavailableError, match="allocation"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(ClaudeUnavailableError, match="allocation"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
 
     async def test_timeout_kills_proc_and_raises(self):
         # Stdout that never ends — will block the consumer.
@@ -527,9 +537,11 @@ class TestExec:
         proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
         proc.wait = AsyncMock(return_value=-9)
 
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="timed out after 0.1s"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match=re.escape("timed out after 0.1s")),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
 
         proc.kill.assert_called_once()
         proc.wait.assert_awaited()
@@ -569,9 +581,11 @@ class TestExec:
         """kill() raises ProcessLookupError — swallowed, timeout still propagates."""
         proc = _never_ending_proc()
         proc.kill = MagicMock(side_effect=ProcessLookupError)
-        with patch("asyncio.create_subprocess_exec", return_value=proc):
-            with pytest.raises(RuntimeError, match="timed out after 0.1s"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match=re.escape("timed out after 0.1s")),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
         proc.kill.assert_called_once()
 
     async def test_timeout_reaps_process_tree_and_raises(self) -> None:
@@ -583,9 +597,9 @@ class TestExec:
             patch(
                 "claude_on_the_fly.agent._kill_process_tree", new_callable=AsyncMock
             ) as mock_kill,
+            pytest.raises(RuntimeError, match=re.escape("timed out after 0.1s")),
         ):
-            with pytest.raises(RuntimeError, match="timed out after 0.1s"):
-                await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
         mock_kill.assert_awaited_once_with(proc)
 
 
@@ -881,13 +895,15 @@ class TestRun:
         assert "--session-id" not in cmd
 
     async def test_other_runtime_error_reraised(self):
-        with patch(
-            "claude_on_the_fly.agent._exec",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("something completely different"),
+        with (
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("something completely different"),
+            ),
+            pytest.raises(RuntimeError, match="something completely different"),
         ):
-            with pytest.raises(RuntimeError, match="something completely different"):
-                await run(Path("/tmp"), "sess-1", "hello", "telegram")
+            await run(Path("/tmp"), "sess-1", "hello", "telegram")
 
     async def test_duration_converts_ms_to_seconds(self):
         output = _cli_output(duration_ms=12500)
@@ -940,7 +956,7 @@ class TestRun:
             new_callable=AsyncMock,
             return_value=minimal_output,
         ):
-            resp = await run(Path("/tmp"), "sess-1", "hi", "gmail")
+            resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
 
         assert resp.body == "bare response"
         assert resp.cost == 0
@@ -1098,13 +1114,15 @@ class TestRun:
 
     async def test_unavailable_short_circuits_fallback(self):
         """When --resume raises ClaudeUnavailableError, do NOT try --session-id fallback."""
-        with patch(
-            "claude_on_the_fly.agent._exec",
-            new_callable=AsyncMock,
-            side_effect=ClaudeUnavailableError("monthly usage limit"),
-        ) as mock:
-            with pytest.raises(ClaudeUnavailableError, match="usage limit"):
-                await run(Path("/tmp"), "sess-1", "hi", "telegram")
+        with (
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                side_effect=ClaudeUnavailableError("monthly usage limit"),
+            ) as mock,
+            pytest.raises(ClaudeUnavailableError, match="usage limit"),
+        ):
+            await run(Path("/tmp"), "sess-1", "hi", "telegram")
         assert mock.await_count == 1
 
     async def test_timeout_threaded_to_exec(self):
@@ -2200,12 +2218,14 @@ class TestPtyModeFactory:
     def test_pty_mode_missing_binary_raises(self, clear_backend_env, monkeypatch):
         """Defense in depth: ctor raises if the binary vanished after preflight."""
         monkeypatch.setenv("CLAUDE_MODE", "pty")
-        with patch(
-            "claude_on_the_fly.backends.claude.resolve_pty_binary",
-            return_value=None,
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value=None,
+            ),
+            pytest.raises(RuntimeError, match="claude-pty binary not found"),
         ):
-            with pytest.raises(RuntimeError, match="claude-pty binary not found"):
-                get_backend()
+            get_backend()
 
     def test_unknown_mode_message_lists_pty(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("CLAUDE_MODE", "garbage")
@@ -2215,20 +2235,19 @@ class TestPtyModeFactory:
 
 class TestResolveSessionLog:
     """resolve_session_log finds a job's log in whichever backend wrote it,
-    independent of the current env backend (daemon may run pi, TUI claude)."""
+    independent of the current env backend (daemon may run codex, TUI claude)."""
 
     def test_returns_none_when_no_backend_has_it(
-        self, claude_projects_dir, codex_sessions_dir, pi_sessions_dir, tmp_path
+        self, claude_projects_dir, codex_sessions_dir, tmp_path
     ) -> None:
         from claude_on_the_fly.agent import resolve_session_log
 
         assert resolve_session_log(tmp_path / "ws", "missing-uuid") is None
 
-    def test_finds_claude_session_even_when_env_is_pi(
+    def test_finds_claude_session_even_when_env_is_codex(
         self,
         claude_projects_dir,
         codex_sessions_dir,
-        pi_sessions_dir,
         tmp_path,
         monkeypatch,
     ) -> None:
@@ -2241,8 +2260,8 @@ class TestResolveSessionLog:
         log = proj / "uuid-x.jsonl"
         log.write_text('{"type":"x"}\n')
 
-        # Env points at pi, but the session was written by claude — still found.
-        monkeypatch.setenv("AGENT_BACKEND", "pi")
+        # Env points at codex, but the session was written by claude — still found.
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
         assert resolve_session_log(ws, "uuid-x") == log
 
 
@@ -2377,13 +2396,6 @@ class TestListSkills:
         # (plugin skills appear namespaced in the init list).
         assert out["deploy"] == "Ship the release safely"
         assert out["gf-ops:deploy"] == "Ship the release safely"
-
-    async def test_pi_opencode_return_empty(self):
-        from claude_on_the_fly.backends.opencode import OpencodeBackend
-        from claude_on_the_fly.backends.pi import PiBackend
-
-        assert await PiBackend().list_skills() == []
-        assert await OpencodeBackend().list_skills() == []
 
     async def test_codex_lists_prompt_files(self, tmp_path, monkeypatch):
         from claude_on_the_fly.backends.codex import CodexBackend

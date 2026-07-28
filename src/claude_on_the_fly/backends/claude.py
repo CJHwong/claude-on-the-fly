@@ -99,7 +99,7 @@ async def _probe_skills(
     assert proc.stdout is not None
     try:
         line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("list_skills: timed out waiting for init event")
         return [], []
     finally:
@@ -472,9 +472,9 @@ async def _exec_pty(
             stdout, stderr, rc = await asyncio.wait_for(_wait(), timeout=timeout)
         else:
             stdout, stderr, rc = await _wait()
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("exec_pty: timed out after %ss", timeout)
-        raise RuntimeError(f"claude-pty timed out after {timeout}s")
+        raise RuntimeError(f"claude-pty timed out after {timeout}s") from None
     finally:
         # Cancellation is how frontends stop a live turn. Reap the dedicated
         # process group here (rather than only in the timeout branch) so the

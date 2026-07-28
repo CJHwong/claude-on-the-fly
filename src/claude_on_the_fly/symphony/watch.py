@@ -20,7 +20,6 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-
 _SKIP_TYPES = {"ai-title", "attachment", "last-prompt", "pr-link", "system"}
 _RULE_FILL = "━" * 60  # generous trailing run; terminals wider than ~80 cols swallow it
 _BODY_INDENT = "    "
@@ -167,8 +166,8 @@ def format_event(raw: dict) -> str | None:
         return _format_assistant(raw, ts)
     if t == "result":
         return _format_result(raw, ts)
-    # pi (and legacy codex) emit a single top-level `message` type rather than
-    # claude's separate user/assistant types.
+    # Legacy codex emits a single top-level `message` type rather than claude's
+    # separate user/assistant types.
     if t == "message":
         return _format_message_event(raw, ts)
     # codex_exec wraps each turn item: type=response_item with the real message
@@ -181,7 +180,7 @@ def format_event(raw: dict) -> str | None:
 
 
 def _extract_message_text(content: Any) -> str:
-    """Renderable text from a pi/codex message's content — a string, or a list
+    """Renderable text from a codex message's content — a string, or a list
     of blocks carrying a `text` field ({type: text | input_text | output_text}).
     Tool / reasoning blocks without text are ignored."""
     if isinstance(content, str):
@@ -197,8 +196,8 @@ def _extract_message_text(content: Any) -> str:
 
 
 def _format_message_event(raw: dict, ts: str) -> str | None:
-    """Render a pi/codex `type:"message"` event. pi nests role/content under
-    `message`; codex puts them at the top level. Both carry Anthropic-ish
+    """Render a codex `type:"message"` event. Some emitters nest role/content
+    under `message`, others put them at the top level. Both carry Anthropic-ish
     content blocks with a `text` field, so one path handles both."""
     message = raw.get("message")
     msg = message if isinstance(message, dict) else raw

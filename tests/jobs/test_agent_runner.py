@@ -12,10 +12,7 @@ import pytest
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, Response
 from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
-from claude_on_the_fly.transcript import (
-    _workspace_to_claude_hash,
-    _workspace_to_pi_hash,
-)
+from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
 
 async def test_run_calls_agent_run_for_jobs_platform(tmp_path: Path) -> None:
@@ -163,18 +160,18 @@ async def test_cancelled_error_propagates(tmp_path: Path) -> None:
             "claude_on_the_fly.jobs.agent_runner.current_backend_key",
             return_value="claude:native:sonnet",
         ),
+        pytest.raises(asyncio.CancelledError),
     ):
-        with pytest.raises(asyncio.CancelledError):
-            await runner.run("p")
+        await runner.run("p")
 
 
 async def test_backend_session_dir_removed_with_the_workspace(
-    tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+    tmp_path: Path, claude_projects_dir: Path
 ) -> None:
-    """Deleting the workspace is not enough: claude and pi each name a directory
-    in their own config tree after the workspace path, and the name encodes a
-    path that will never exist again — so anything left there is unreclaimable,
-    one dead directory per job."""
+    """Deleting the workspace is not enough: claude names a directory in its own
+    config tree after the workspace path, and the name encodes a path that will
+    never exist again — so anything left there is unreclaimable, one dead
+    directory per job."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
 
@@ -183,7 +180,6 @@ async def test_backend_session_dir_removed_with_the_workspace(
         captured["ws"] = workspace
         # Stand in for what the agent CLI writes while it runs.
         (claude_projects_dir / _workspace_to_claude_hash(workspace)).mkdir(parents=True)
-        (pi_sessions_dir / _workspace_to_pi_hash(workspace)).mkdir(parents=True)
         return Response(body="ok")
 
     with (
@@ -199,7 +195,6 @@ async def test_backend_session_dir_removed_with_the_workspace(
     assert result.ok is True
     workspace = captured["ws"]
     assert not (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
-    assert not (pi_sessions_dir / _workspace_to_pi_hash(workspace)).exists()
 
 
 async def test_cleanup_runs_when_the_task_is_cancelled_from_outside(
@@ -295,8 +290,8 @@ async def test_workspace_removed_on_cancel_path(tmp_path: Path) -> None:
             "claude_on_the_fly.jobs.agent_runner.current_backend_key",
             return_value="claude:native:sonnet",
         ),
+        pytest.raises(asyncio.CancelledError),
     ):
-        with pytest.raises(asyncio.CancelledError):
-            await runner.run("p")
+        await runner.run("p")
 
     assert not captured["ws"].exists()  # torn down on the cancel path

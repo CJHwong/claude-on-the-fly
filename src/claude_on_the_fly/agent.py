@@ -8,6 +8,7 @@ frontends. Claude-CLI specifics live in `claude_on_the_fly.backends.claude`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -15,10 +16,10 @@ import re
 import shutil
 import signal
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Callable
 from typing import Protocol
 
 import yaml
@@ -165,7 +166,7 @@ def stats_mode(platform: str) -> str:
     return mode if mode in STATS_MODES else "summary"
 
 
-def footer_parts(response: "Response", platform: str) -> tuple[str, str]:
+def footer_parts(response: Response, platform: str) -> tuple[str, str]:
     """Return (stats_line, tools_line) for a reply, gated by the platform's mode.
 
     Either value is "" when the mode suppresses that line.
@@ -185,10 +186,6 @@ FORMAT_HINTS = {
     "slack": (
         "Write normal Markdown (**bold**, # headings, tables, lists, "
         "```code```). It is converted to Slack formatting on delivery."
-    ),
-    "gmail": (
-        "Format responses as plain text. No markdown, no HTML. "
-        "Use line breaks for structure. Keep it concise."
     ),
     "symphony": (
         "Output goes to daemon logs, not a chat user. Plain markdown is fine. "
@@ -493,14 +490,10 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             pass
         except OSError:
             # getpgid/killpg can race with a natural exit; fall back to a plain kill.
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 proc.kill()
-            except ProcessLookupError:
-                pass
-        try:
+        with contextlib.suppress(ProcessLookupError):
             await proc.wait()
-        except ProcessLookupError:
-            pass
     finally:
         _announce_process(proc, "", running=False)
 
@@ -525,9 +518,9 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         if timeout is not None:
             return await asyncio.wait_for(_consume(proc), timeout=timeout)
         return await _consume(proc)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("exec: timed out after %ss", timeout)
-        raise RuntimeError(f"Claude CLI timed out after {timeout}s")
+        raise RuntimeError(f"Claude CLI timed out after {timeout}s") from None
     finally:
         await _kill_process_tree(proc)
 
@@ -625,8 +618,8 @@ class AgentBackend(Protocol):
     async def list_skills(self) -> list[tuple[str, str]]:
         """Return the backend's skills as (name, description) for the picker.
 
-        Description is "" when unavailable. Empty list when the backend can't
-        enumerate (pi/opencode). Uncached and may spawn the CLI or read files;
+        Description is "" when unavailable, and the list is empty when the
+        backend can't enumerate. Uncached and may spawn the CLI or read files;
         callers should go through `cached_skills()` for the TTL disk cache.
         """
         ...
@@ -651,7 +644,7 @@ _skills_cache_lock = asyncio.Lock()
 
 
 async def cached_skills(
-    backend: "AgentBackend", *, force: bool = False
+    backend: AgentBackend, *, force: bool = False
 ) -> list[tuple[str, str]]:
     """Return `backend.list_skills()` behind a TTL cache shared by all queries.
 
@@ -710,13 +703,7 @@ def get_backend() -> AgentBackend:
         return _build_claude_backend()
     if name == "codex":
         return _build_codex_backend()
-    if name == "pi":
-        return _build_pi_backend()
-    if name == "opencode":
-        return _build_opencode_backend()
-    raise ValueError(
-        f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi, opencode)"
-    )
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
 
 
 def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
@@ -724,24 +711,20 @@ def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
     one.
 
     The process viewing the log (the TUI) isn't necessarily configured for the
-    backend that ran the job: the daemon may run pi while the dashboard's shell
-    is claude:native. Each backend stores logs in its own tree, and session
+    backend that ran the job: the daemon may run codex while the dashboard's
+    shell is claude:native. Each backend stores logs in its own tree, and session
     UUIDs are seeded per backend, so a given (workspace, uuid) exists in exactly
     one store — the first hit is unambiguous. Each backend's session_log_path
     only depends on its store location, so the bare constructor is enough.
 
-    Codex is tried last on purpose: claude and pi resolve with a single path
-    stat, but codex's no-mapping fallback scans the rollout tree, so we only
-    pay for it when the cheap backends miss (a real codex session, or none yet).
+    Codex is tried last on purpose: claude resolves with a single path stat, but
+    codex's no-mapping fallback scans the rollout tree, so we only pay for it
+    when the cheap backend misses (a real codex session, or none yet).
     """
     from claude_on_the_fly.backends.claude import ClaudeBackend
     from claude_on_the_fly.backends.codex import CodexBackend
-    from claude_on_the_fly.backends.opencode import OpencodeBackend
-    from claude_on_the_fly.backends.pi import PiBackend
 
-    # OpencodeBackend.session_log_path is always None (no single tailable log),
-    # so it never wins the scan — listed for completeness.
-    for build in (ClaudeBackend, PiBackend, OpencodeBackend, CodexBackend):
+    for build in (ClaudeBackend, CodexBackend):
         try:
             path = build().session_log_path(workspace, session_uuid)
         except Exception:
@@ -790,32 +773,7 @@ def current_backend_key() -> str:
                 raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"codex:ollama:{model}"
         raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
-    if name == "pi":
-        mode = os.environ.get("PI_MODE", "native").lower()
-        if mode == "native":
-            return f"pi:native:{os.environ.get('PI_MODEL', '').strip() or 'default'}"
-        if mode == "ollama":
-            model = os.environ.get("OLLAMA_MODEL", "").strip()
-            if not model:
-                raise ValueError("PI_MODE=ollama requires OLLAMA_MODEL to be set")
-            return f"pi:ollama:{model}"
-        raise ValueError(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
-    if name == "opencode":
-        mode = os.environ.get("OPENCODE_MODE", "native").lower()
-        if mode == "native":
-            return (
-                "opencode:native:"
-                f"{os.environ.get('OPENCODE_MODEL', '').strip() or 'default'}"
-            )
-        if mode == "ollama":
-            model = os.environ.get("OLLAMA_MODEL", "").strip()
-            if not model:
-                raise ValueError("OPENCODE_MODE=ollama requires OLLAMA_MODEL to be set")
-            return f"opencode:ollama:{model}"
-        raise ValueError(f"Unknown OPENCODE_MODE: {mode!r} (supported: native, ollama)")
-    raise ValueError(
-        f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex, pi, opencode)"
-    )
+    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
 
 
 def _build_claude_backend() -> AgentBackend:
@@ -846,34 +804,6 @@ def _build_codex_backend() -> AgentBackend:
             raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
         return CodexBackend(launcher=OllamaLauncher(model=model))
     raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
-
-
-def _build_pi_backend() -> AgentBackend:
-    from claude_on_the_fly.backends.pi import PiBackend
-
-    mode = os.environ.get("PI_MODE", "native").lower()
-    if mode == "native":
-        return PiBackend()
-    if mode == "ollama":
-        model = os.environ.get("OLLAMA_MODEL", "").strip()
-        if not model:
-            raise ValueError("PI_MODE=ollama requires OLLAMA_MODEL to be set")
-        return PiBackend(launcher=OllamaLauncher(model=model))
-    raise ValueError(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
-
-
-def _build_opencode_backend() -> AgentBackend:
-    from claude_on_the_fly.backends.opencode import OpencodeBackend
-
-    mode = os.environ.get("OPENCODE_MODE", "native").lower()
-    if mode == "native":
-        return OpencodeBackend()
-    if mode == "ollama":
-        model = os.environ.get("OLLAMA_MODEL", "").strip()
-        if not model:
-            raise ValueError("OPENCODE_MODE=ollama requires OLLAMA_MODEL to be set")
-        return OpencodeBackend(launcher=OllamaLauncher(model=model))
-    raise ValueError(f"Unknown OPENCODE_MODE: {mode!r} (supported: native, ollama)")
 
 
 async def run(

@@ -11,8 +11,8 @@ A handled agent failure becomes a `Result(ok=False, ...)`; `CancelledError`
 (a `BaseException`, not caught here) still propagates so cancel-in-flight works.
 
 Teardown removes the workspace *and* the session directory the active backend
-named after it (claude and pi both keep one outside the workspace), and runs in
-a worker thread so it cannot eat the shutdown grace — see `_discard_workspace`.
+named after it (claude keeps one outside the workspace), and runs in a worker
+thread so it cannot eat the shutdown grace — see `_discard_workspace`.
 
 NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
 so the child inherits this process's stdin. That is harmless for the supervised

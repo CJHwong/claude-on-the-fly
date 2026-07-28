@@ -17,7 +17,6 @@ from claude_on_the_fly.symphony.watch import (
     tail,
 )
 
-
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
@@ -306,10 +305,10 @@ def _write_jsonl(path: Path, events: list[dict]) -> None:
 
 
 class TestFormatMessageEvent:
-    """pi/codex emit a single `message` type rather than claude's separate
+    """Codex emits a single `message` type rather than claude's separate
     user/assistant top-level types; format_event renders both shapes."""
 
-    def test_pi_user_message(self) -> None:
+    def test_nested_user_message(self) -> None:
         out = format_event(
             {
                 "type": "message",
@@ -322,7 +321,7 @@ class TestFormatMessageEvent:
         )
         assert out is not None and "USER" in out and "hello there" in out
 
-    def test_pi_assistant_message(self) -> None:
+    def test_nested_assistant_message(self) -> None:
         out = format_event(
             {
                 "type": "message",
@@ -355,7 +354,7 @@ class TestFormatMessageEvent:
         assert a is not None and "ASSISTANT" in a and "here you go" in a
 
     def test_control_and_textless_events_skipped(self) -> None:
-        # pi control events, tool-only turns, and non-user/assistant roles skip.
+        # Control events, tool-only turns, and non-user/assistant roles skip.
         assert format_event({"type": "model_change", "provider": "ollama"}) is None
         assert (
             format_event(

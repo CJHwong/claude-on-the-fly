@@ -82,9 +82,6 @@ def clear_backend_env(monkeypatch):
         "CLAUDE_MODE",
         "OLLAMA_MODEL",
         "CODEX_MODE",
-        "PI_MODE",
-        "OPENCODE_MODE",
-        "OPENCODE_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -104,20 +101,6 @@ def codex_sessions_dir(tmp_path, monkeypatch):
     root = tmp_path / "codex-sessions"
     root.mkdir()
     monkeypatch.setattr("claude_on_the_fly.transcript.CODEX_SESSIONS_DIR", root)
-    return root
-
-
-@pytest.fixture
-def pi_sessions_dir(tmp_path, monkeypatch):
-    """Redirect transcript module's PI_SESSIONS_DIR to a tmp_path subdir.
-
-    Also patches the backend module's PI_SESSIONS_DIR for takeover_command
-    and session_log_path tests.
-    """
-    root = tmp_path / "pi-sessions"
-    root.mkdir()
-    monkeypatch.setattr("claude_on_the_fly.transcript.PI_SESSIONS_DIR", root)
-    monkeypatch.setattr("claude_on_the_fly.backends.pi.PI_SESSIONS_DIR", root)
     return root
 
 
