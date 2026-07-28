@@ -12,6 +12,8 @@ from pathlib import Path
 
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.file_queue import (
+    DONE_RETENTION_S,
+    PROMPT_PREVIEW_LIMIT,
     FileInboxQueue,
     read_queue_depth,
     read_queue_rows,
@@ -445,3 +447,70 @@ def test_rows_never_repeat_an_id_across_cur_and_new(tmp_path: Path) -> None:
     rows = read_queue_rows(root)
     assert [r.id for r in rows] == ["100-a"]
     assert rows[0].in_flight is True  # cur/ wins
+
+
+def test_archive_prunes_entries_past_the_retention_window(tmp_path: Path) -> None:
+    """done/ keeps every prompt and every agent reply verbatim and nothing else
+    removes them, so without a window it is unbounded disk growth."""
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    queue.enqueue(_job("100-old"))
+    claimed = queue.claim()
+    assert claimed is not None
+    queue.complete(claimed, Result(ok=True, text="ancient"))
+
+    stale = os.stat(root / "done" / "100-old.json").st_mtime - DONE_RETENTION_S - 60
+    for name in ("100-old.json", "100-old.result.json"):
+        os.utime(root / "done" / name, (stale, stale))
+
+    queue.enqueue(_job("200-new"))
+    fresh = queue.claim()
+    assert fresh is not None
+    queue.complete(fresh, Result(ok=True, text="recent"))
+
+    archived = sorted(p.name for p in (root / "done").glob("*.json"))
+    assert archived == ["200-new.json", "200-new.result.json"]
+
+
+def test_archive_keeps_entries_inside_the_window(tmp_path: Path) -> None:
+    """Age, not count: a burst of new jobs must not evict this morning's."""
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    for job_id in ("100-a", "200-b", "300-c"):
+        queue.enqueue(_job(job_id))
+        claimed = queue.claim()
+        assert claimed is not None
+        queue.complete(claimed, Result(ok=True, text="ok"))
+
+    assert read_queue_depth(root).done == 3
+
+
+def test_row_prompt_is_truncated_at_read(tmp_path: Path) -> None:
+    """Rows are memoized for as long as the queue holds still, so an untruncated
+    prompt is pinned in the observing process — and a prompt is whatever
+    somebody pasted into a chat message, with no size limit."""
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    queue.enqueue(_job("100-a", prompt="x" * (PROMPT_PREVIEW_LIMIT * 4)))
+
+    rows = read_queue_rows(root)
+
+    assert rows[0].prompt is not None
+    assert len(rows[0].prompt) == PROMPT_PREVIEW_LIMIT
+
+
+def test_observer_memos_stay_bounded_across_roots(tmp_path: Path) -> None:
+    """The memos are process-global with no eviction of their own: a caller that
+    varies root — every test in this suite, via tmp_path — would otherwise grow
+    them for the life of the process."""
+    from claude_on_the_fly.jobs import file_queue as fq
+
+    for index in range(50):
+        root = tmp_path / f"queue-{index}"
+        queue = FileInboxQueue(root)
+        queue.enqueue(_job(f"{index + 100}-a"))
+        read_queue_depth(root)
+        read_queue_rows(root)
+
+    assert len(fq._archive_count_cache) <= fq._MAX_COUNT_MEMOS
+    assert len(fq._rows_cache) <= fq._MAX_ROW_MEMOS

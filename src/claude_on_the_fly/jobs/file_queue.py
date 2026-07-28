@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 # Cap on how many queued jobs an observer parses per read. A deep queue must not
 # turn a 1Hz dashboard tick into hundreds of file reads.
 DEFAULT_ROW_LIMIT = 20
+# How long a completed job's record and reply stay in `done/`. Matches the
+# 7-day log retention in `jobs/cli._setup_logging`.
+DONE_RETENTION_S = 7 * 24 * 60 * 60
+# Longest prompt an observer keeps in memory. The dashboard renders a short
+# preview, so retaining a multi-megabyte prompt for the life of the process buys
+# nothing; the cap is far above any prompt a preview could show.
+PROMPT_PREVIEW_LIMIT = 500
 
 
 def _utcnow_iso() -> str:
@@ -114,6 +121,31 @@ class FileInboxQueue:
             os.replace(self._cur / f"{job.id}.json", self._done / f"{job.id}.json")
         except FileNotFoundError:
             logger.warning("jobs: complete: %s not in cur/ (already moved?)", job.id)
+        self._prune_archive()
+
+    def _prune_archive(self) -> None:
+        """Drop archived jobs older than the retention window.
+
+        `done/` holds each job's prompt and the agent's full reply verbatim, and
+        nothing else ever removes them, so an unpruned archive grows without
+        bound in both disk and the cost of the observers that count it. Age, not
+        count: a burst of small jobs should not evict the one from this morning
+        somebody still wants to read. The 7-day window matches the log retention
+        in `jobs/cli._setup_logging`, so the archive and the logs covering it
+        expire together.
+
+        Runs on completion, not on a timer — once per job is rare enough for an
+        O(archive) scan, and it means a worker that stops never leaves a growing
+        directory behind.
+        """
+        cutoff = time.time() - DONE_RETENTION_S
+        for path in self._done.glob("*.json"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+            except OSError as exc:  # racing reader, or a permissions problem
+                logger.debug("jobs: could not prune %s: %s", path.name, exc)
 
     def recover_stale(self, ttl_s: float | None) -> int:
         """Requeue in-flight jobs from `cur/` back to `new/`. `ttl_s=None`
@@ -220,17 +252,37 @@ class QueueRow:
 
 
 # Memoize archive counts by (dir, pattern) -> (mtime_ns, count) so the 1Hz
-# dashboard refresh doesn't re-walk an unbounded done/ on every tick. Exact for
-# this queue, which only ever adds/removes whole files — never for in-place
-# edits, which never happen here — and only to the resolution the filesystem
-# stamps mtimes at: where that is a whole second rather than a nanosecond, a
-# second change inside the same second reads stale until the next one.
+# dashboard refresh doesn't re-walk done/ on every tick. Exact for this queue,
+# which only ever adds/removes whole files — never for in-place edits, which
+# never happen here — and only to the resolution the filesystem stamps mtimes
+# at: where that is a whole second rather than a nanosecond, a second change
+# inside the same second reads stale until the next one.
+#
+# Bounded, because these are process-global and nothing else evicts them: a
+# caller that varies `root` grows them for the life of the process. Two
+# directories are counted per read, so the cap only has to sit above that.
+_MAX_COUNT_MEMOS = 8
 _archive_count_cache: dict[tuple[Path, str], tuple[int, int]] = {}
 
 # Memoize the unfinished-row read by (root, limit) -> (cur mtime_ns, new
 # mtime_ns, rows). Same argument, applied to the reader that actually opens
-# files rather than merely counting them.
+# files rather than merely counting them — and this one pins the rows, prompts
+# included, so it is capped tighter.
+_MAX_ROW_MEMOS = 2
 _rows_cache: dict[tuple[Path, int], tuple[int, int, list[QueueRow]]] = {}
+
+
+def _store_memo(cache: dict, key, value, limit: int) -> None:
+    """Record `value` under `key`, clearing the cache first if it is full.
+
+    Clear-and-refill rather than LRU eviction: these memos exist to spare a 1Hz
+    reader some directory walks, and the only cost of dropping one is the walk
+    it would have skipped. A real eviction policy would be more machinery than
+    the thing it protects.
+    """
+    if len(cache) >= limit and key not in cache:
+        cache.clear()
+    cache[key] = value
 
 
 def _mtime_ns(directory: Path) -> int:
@@ -263,7 +315,7 @@ def _count_memoized(directory: Path, pattern: str) -> int:
     if cached is not None and cached[0] == mtime_ns:
         return cached[1]
     count = _count(directory, pattern)
-    _archive_count_cache[key] = (mtime_ns, count)
+    _store_memo(_archive_count_cache, key, (mtime_ns, count), _MAX_COUNT_MEMOS)
     return count
 
 
@@ -289,8 +341,14 @@ def _enqueued_at(job_id: str) -> datetime | None:
 
 
 def _read_prompt(path: Path) -> str | None:
-    """The job's prompt, or None if the file vanished (claimed mid-read) or does
-    not parse."""
+    """The head of the job's prompt, or None if the file vanished (claimed
+    mid-read) or does not parse.
+
+    Truncated here rather than at render time: the row it lands in is memoized
+    for as long as the queue holds still, so returning the whole string pins
+    every queued prompt in the observing process — and a prompt has no size
+    limit, since it is whatever somebody typed or pasted into a chat message.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -298,7 +356,7 @@ def _read_prompt(path: Path) -> str | None:
     if not isinstance(data, dict):
         return None
     prompt = data.get("prompt")
-    return prompt if isinstance(prompt, str) else None
+    return prompt[:PROMPT_PREVIEW_LIMIT] if isinstance(prompt, str) else None
 
 
 def read_queue_depth(root: Path) -> QueueDepth:
@@ -343,7 +401,7 @@ def read_queue_rows(root: Path, limit: int = DEFAULT_ROW_LIMIT) -> list[QueueRow
     if cached is not None and cached[0] == cur_ns and cached[1] == new_ns:
         return cached[2]
     rows = _scan_rows(cur, new, limit)
-    _rows_cache[key] = (cur_ns, new_ns, rows)
+    _store_memo(_rows_cache, key, (cur_ns, new_ns, rows), _MAX_ROW_MEMOS)
     return rows
 
 
