@@ -27,6 +27,7 @@ from claude_on_the_fly.jobs.core import Job, JobQueue
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path.home() / ".claude-on-the-fly"
-SLACK_BLOCK_LIMIT = 3000
 # Soft cap on agent replies per thread. Once reached, inbound messages are
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
 # counter. Overridable via env for chattier or stricter threads.
@@ -259,23 +259,6 @@ SLACK_SESSION_CAP = int(os.environ.get("SLACK_SESSION_CAP", "1000"))
 STATUS_VERB_ROTATE_SECS = 4
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
-
-
-def _split_blocks(text: str) -> list[str]:
-    """Split text into chunks that fit Slack's block text limit, on line boundaries."""
-    chunks: list[str] = []
-    chunk = ""
-    for line in text.split("\n"):
-        candidate = f"{chunk}\n{line}" if chunk else line
-        if len(candidate) > SLACK_BLOCK_LIMIT:
-            if chunk:
-                chunks.append(chunk)
-            chunk = line[:SLACK_BLOCK_LIMIT]
-        else:
-            chunk = candidate
-    if chunk:
-        chunks.append(chunk)
-    return chunks or [""]
 
 
 def _build_response_blocks(body: str, response: Response) -> list[dict]:

@@ -13,12 +13,12 @@ from slack_sdk.errors import SlackApiError
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
-    SLACK_BLOCK_LIMIT,
     SLACK_REPLY_SOFT_LIMIT,
     SlackFrontend,
     _session_key,
     _split_blocks,
 )
+from claude_on_the_fly.slack_mrkdwn import SLACK_BLOCK_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +37,19 @@ class TestSplitBlocks:
         result = _split_blocks(text)
         assert len(result) == 2
         assert result[0] == line
-        assert result[1] == line
+        # The newline the split consumed rides with the following chunk, so the
+        # chunks still reassemble into exactly the input.
+        assert result[1] == f"\n{line}"
+        assert "".join(result) == text
 
-    def test_very_long_single_line_truncated(self):
+    def test_very_long_single_line_is_sliced_not_truncated(self):
+        """A line over the limit used to be cut to line[:LIMIT] with the tail
+        dropped — no error, no log, and nothing in the output saying so."""
         text = "a" * (SLACK_BLOCK_LIMIT + 500)
         result = _split_blocks(text)
-        assert len(result) == 1
-        assert len(result[0]) == SLACK_BLOCK_LIMIT
+        assert len(result) == 2
+        assert all(len(chunk) <= SLACK_BLOCK_LIMIT for chunk in result)
+        assert "".join(result) == text
 
     def test_empty_text_returns_list_with_empty_string(self):
         assert _split_blocks("") == [""]
@@ -65,7 +71,8 @@ class TestSplitBlocks:
         text = f"{short}\n{long_line}"
         result = _split_blocks(text)
         assert result[0] == short
-        assert result[1] == long_line[:SLACK_BLOCK_LIMIT]
+        assert all(len(chunk) <= SLACK_BLOCK_LIMIT for chunk in result)
+        assert "".join(result) == text
 
 
 # ---------------------------------------------------------------------------

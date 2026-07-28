@@ -6,10 +6,10 @@ never hardcoded). It reads only the routing keys the producer put in `origin`
 (`channel`, `thread_ts`) — never `sender_id` — and converts the agent's Markdown
 to Slack mrkdwn with the shared `to_mrkdwn`.
 
-It owns a small block splitter rather than reaching into `slack.py`'s private
-`_split_blocks`; a shared-helper extraction is a deliberate follow-up.
-Delivery is best-effort: a post failure is logged, not raised — the result is
-already durable in the queue's `done/`.
+Block splitting comes from `slack_mrkdwn.split_blocks`, shared with the chat
+frontend so the same reply cannot render differently depending on which one
+produced it. Delivery is best-effort: a post failure is logged, not raised —
+the result is already durable in the queue's `done/`.
 """
 
 from __future__ import annotations
@@ -18,15 +18,18 @@ import logging
 from typing import Any, Protocol
 
 from claude_on_the_fly.jobs.core import Result
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import split_blocks, to_mrkdwn
 
 logger = logging.getLogger(__name__)
 
-SLACK_BLOCK_LIMIT = 3000
 # Slack's chat.postMessage accepts at most 50 blocks per message; past that it
 # rejects the whole call with `invalid_blocks`. A result that produces more is
 # posted across several messages rather than dropped (see `notify`).
 SLACK_MAX_BLOCKS = 50
+# `text` is the notification/fallback string, not the message body — Slack caps
+# it at 40,000 characters and rejects the whole call past that. The blocks carry
+# the content; this only has to say what arrived.
+FALLBACK_TEXT_LIMIT = 200
 
 
 class _PostsMessages(Protocol):
@@ -44,40 +47,19 @@ class _PostsMessages(Protocol):
     async def chat_postMessage(self, *, channel: str, **kwargs: Any) -> Any: ...
 
 
-def _split(text: str) -> list[str]:
-    """Split text into chunks within Slack's per-block limit, preferring line breaks.
-
-    Every character of `text` (newlines included) lands in exactly one chunk, in
-    order, so ``"".join(_split(text)) == text``: a single line longer than the
-    limit is hard-sliced into limit-sized pieces rather than truncated, so its
-    tail is never dropped.
-    """
-    chunks: list[str] = []
-    chunk = ""
-    for i, line in enumerate(text.split("\n")):
-        segment = f"\n{line}" if i else line  # restore the split newline
-        if len(chunk) + len(segment) <= SLACK_BLOCK_LIMIT:
-            chunk += segment
-            continue
-        # Overflow: flush the running chunk, then lay `segment` down, hard-slicing
-        # it into limit-sized pieces if the line alone exceeds the limit.
-        if chunk:
-            chunks.append(chunk)
-            chunk = ""
-        while len(segment) > SLACK_BLOCK_LIMIT:
-            chunks.append(segment[:SLACK_BLOCK_LIMIT])
-            segment = segment[SLACK_BLOCK_LIMIT:]
-        chunk = segment
-    if chunk:
-        chunks.append(chunk)
-    return chunks or [""]
-
-
 def _blocks(mrkdwn_text: str) -> list[dict]:
     return [
         {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
-        for chunk in _split(mrkdwn_text)
+        for chunk in split_blocks(mrkdwn_text)
     ]
+
+
+def _fallback_text(body: str) -> str:
+    """The notification line Slack shows where blocks cannot render."""
+    head = body.strip().split("\n", 1)[0]
+    if len(head) <= FALLBACK_TEXT_LIMIT:
+        return head or "Job result"
+    return head[: FALLBACK_TEXT_LIMIT - 1] + "…"
 
 
 class SlackThreadNotifier:
@@ -99,11 +81,12 @@ class SlackThreadNotifier:
             # delivered across several messages instead of tripping Slack's
             # per-message block cap (which `chat_postMessage` would reject with
             # `invalid_blocks` — swallowed below and lost). No content is dropped.
+            fallback = _fallback_text(body)
             for start in range(0, len(blocks), SLACK_MAX_BLOCKS):
                 await self._client.chat_postMessage(
                     channel=channel,
                     thread_ts=thread_ts,
-                    text=body if start == 0 else "(continued)",
+                    text=fallback if start == 0 else "(continued)",
                     blocks=blocks[start : start + SLACK_MAX_BLOCKS],
                 )
         except Exception as exc:  # best-effort; result is durable in done/

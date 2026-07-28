@@ -7,13 +7,12 @@ from unittest.mock import AsyncMock
 
 from claude_on_the_fly.jobs.core import Result
 from claude_on_the_fly.jobs.slack_notifier import (
-    SLACK_BLOCK_LIMIT,
+    FALLBACK_TEXT_LIMIT,
     SLACK_MAX_BLOCKS,
     SlackThreadNotifier,
     _blocks,
-    _split,
 )
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import SLACK_BLOCK_LIMIT, split_blocks, to_mrkdwn
 
 
 def _client() -> AsyncMock:
@@ -59,9 +58,11 @@ async def test_failure_result_is_marked() -> None:
     client = _client()
     notifier = SlackThreadNotifier(client)
     await notifier.notify({"channel": "C1"}, Result(ok=False, text="stack trace"))
-    text = client.chat_postMessage.call_args.kwargs["text"]
-    assert "Job failed" in text
-    assert "stack trace" in text
+    kwargs = client.chat_postMessage.call_args.kwargs
+    # The notification line marks the failure; the detail rides in the blocks,
+    # which are what Slack actually renders.
+    assert "Job failed" in kwargs["text"]
+    assert "stack trace" in kwargs["blocks"][0]["text"]["text"]
 
 
 async def test_no_channel_skips_post() -> None:
@@ -95,7 +96,7 @@ def test_single_over_limit_line_reassembles_with_zero_loss() -> None:
     # The old splitter truncated it to line[:SLACK_BLOCK_LIMIT] and dropped the
     # tail; every character must now survive across the produced chunks.
     line = "J" * (SLACK_BLOCK_LIMIT * 2 + 137)
-    chunks = _split(line)
+    chunks = split_blocks(line)
     assert len(chunks) == 3  # 3000 + 3000 + 137
     assert all(len(c) <= SLACK_BLOCK_LIMIT for c in chunks)
     assert "".join(chunks) == line  # nothing dropped
@@ -138,3 +139,29 @@ async def test_result_over_block_budget_splits_into_multiple_messages() -> None:
 
 def test_blocks_helper_never_empty() -> None:
     assert _blocks("") == [{"type": "section", "text": {"type": "mrkdwn", "text": ""}}]
+
+
+async def test_fallback_text_stays_within_slacks_cap() -> None:
+    """`text` is the notification string, not the body: Slack caps it at 40,000
+    characters and rejects the whole call past that. Passing the full result
+    there defeated the block batching exactly in the case it exists for — a
+    reply big enough to need it — and the surrounding except swallowed the
+    rejection, so nothing at all was delivered."""
+    client = _client()
+    notifier = SlackThreadNotifier(client)
+
+    await notifier.notify({"channel": "C1"}, Result(ok=True, text="L" * 60_000))
+
+    for call in client.chat_postMessage.call_args_list:
+        assert len(call.kwargs["text"]) <= FALLBACK_TEXT_LIMIT
+
+
+async def test_fallback_text_summarises_the_first_line() -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client)
+
+    await notifier.notify(
+        {"channel": "C1"}, Result(ok=True, text="Deploy finished\ndetail\nmore detail")
+    )
+
+    assert client.chat_postMessage.call_args.kwargs["text"] == "Deploy finished"

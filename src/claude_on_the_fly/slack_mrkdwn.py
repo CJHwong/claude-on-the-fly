@@ -140,3 +140,41 @@ def _render_link(node: SyntaxTreeNode) -> str:
     if not href:
         return label
     return f"<{href}|{label}>" if label and label != href else f"<{href}>"
+
+
+# Slack rejects a section block whose text exceeds this, so a long reply has to
+# be laid across several blocks. Lives here beside `to_mrkdwn` because every
+# caller that splits has already converted: chunking is the last step of
+# rendering mrkdwn for Slack, not a concern of any one frontend.
+SLACK_BLOCK_LIMIT = 3000
+
+
+def split_blocks(text: str) -> list[str]:
+    """Split text into chunks within Slack's per-block limit, preferring line
+    breaks.
+
+    Lossless: every character of `text`, newlines included, lands in exactly one
+    chunk in order, so ``"".join(split_blocks(text)) == text``. A single line
+    longer than the limit is sliced into limit-sized pieces rather than cut off,
+    because the alternative is dropping the tail of somebody's output with no
+    error and no log line — and the reader has no way to tell it happened.
+    """
+    chunks: list[str] = []
+    chunk = ""
+    for index, line in enumerate(text.split("\n")):
+        segment = f"\n{line}" if index else line  # restore the split newline
+        if len(chunk) + len(segment) <= SLACK_BLOCK_LIMIT:
+            chunk += segment
+            continue
+        # Overflow: flush the running chunk, then lay `segment` down, slicing it
+        # into limit-sized pieces if the line alone exceeds the limit.
+        if chunk:
+            chunks.append(chunk)
+            chunk = ""
+        while len(segment) > SLACK_BLOCK_LIMIT:
+            chunks.append(segment[:SLACK_BLOCK_LIMIT])
+            segment = segment[SLACK_BLOCK_LIMIT:]
+        chunk = segment
+    if chunk:
+        chunks.append(chunk)
+    return chunks or [""]
