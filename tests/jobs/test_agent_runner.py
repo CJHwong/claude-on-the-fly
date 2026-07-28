@@ -12,6 +12,10 @@ import pytest
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, Response
 from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
+from claude_on_the_fly.transcript import (
+    _workspace_to_claude_hash,
+    _workspace_to_pi_hash,
+)
 
 
 async def test_run_calls_agent_run_for_jobs_platform(tmp_path: Path) -> None:
@@ -164,19 +168,55 @@ async def test_cancelled_error_propagates(tmp_path: Path) -> None:
             await runner.run("p")
 
 
+async def test_backend_session_dir_removed_with_the_workspace(
+    tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+) -> None:
+    """Deleting the workspace is not enough: claude and pi each name a directory
+    in their own config tree after the workspace path, and the name encodes a
+    path that will never exist again — so anything left there is unreclaimable,
+    one dead directory per job."""
+    runner = OrchestratorAgentRunner(data_dir=tmp_path)
+    captured: dict[str, Path] = {}
+
+    async def _fake_run(**kwargs):
+        workspace = kwargs["workspace"]
+        captured["ws"] = workspace
+        # Stand in for what the agent CLI writes while it runs.
+        (claude_projects_dir / _workspace_to_claude_hash(workspace)).mkdir(parents=True)
+        (pi_sessions_dir / _workspace_to_pi_hash(workspace)).mkdir(parents=True)
+        return Response(body="ok")
+
+    with (
+        patch("claude_on_the_fly.jobs.agent_runner.agent.run", side_effect=_fake_run),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        result = await runner.run("p")
+
+    assert result.ok is True
+    workspace = captured["ws"]
+    assert not (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
+    assert not (pi_sessions_dir / _workspace_to_pi_hash(workspace)).exists()
+
+
 async def test_cleanup_runs_when_the_task_is_cancelled_from_outside(
-    tmp_path: Path,
+    tmp_path: Path, claude_projects_dir: Path
 ) -> None:
     """The shape the real shutdown takes: `run_loop` cancels the task rather than
     letting the agent raise. Teardown now awaits, and an await inside a `finally`
     is exactly what a careless cancel would skip — so assert it still runs, or
-    every stop leaks a workspace."""
+    every stop leaks a workspace and a session directory."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
     running = asyncio.Event()
 
     async def _hang(**kwargs):
-        captured["ws"] = kwargs["workspace"]
+        workspace = kwargs["workspace"]
+        captured["ws"] = workspace
+        (claude_projects_dir / _workspace_to_claude_hash(workspace)).mkdir(parents=True)
         running.set()
         await asyncio.sleep(3600)  # cancelled out from under us
 
@@ -194,7 +234,9 @@ async def test_cleanup_runs_when_the_task_is_cancelled_from_outside(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert not captured["ws"].exists()
+    workspace = captured["ws"]
+    assert not workspace.exists()
+    assert not (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
 
 
 async def test_cleanup_does_not_block_the_event_loop(tmp_path: Path) -> None:

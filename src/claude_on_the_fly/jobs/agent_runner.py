@@ -10,8 +10,9 @@ process tree within the supervisor's grace.
 A handled agent failure becomes a `Result(ok=False, ...)`; `CancelledError`
 (a `BaseException`, not caught here) still propagates so cancel-in-flight works.
 
-Teardown runs in a worker thread so it cannot eat that grace — see
-`_discard_workspace`.
+Teardown removes the workspace *and* the session directory the active backend
+named after it (claude and pi both keep one outside the workspace), and runs in
+a worker thread so it cannot eat the shutdown grace — see `_discard_workspace`.
 
 NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
 so the child inherits this process's stdin. That is harmless for the supervised
@@ -33,12 +34,20 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from claude_on_the_fly import agent
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
 from claude_on_the_fly.jobs.core import Result
+from claude_on_the_fly.transcript import remove_workspace_sessions
 
 logger = logging.getLogger(__name__)
 
 
 def _discard_workspace(workspace: Path) -> None:
-    """Remove a finished job's workspace. Blocking; call it off the event loop."""
+    """Remove a finished job's workspace and the session directory the backend
+    keyed to it. Blocking; call it off the event loop.
+
+    Session dirs go first, while the workspace path still resolves — see
+    `transcript.remove_workspace_sessions`, which is what stops
+    `~/.claude/projects/` from gaining a dead directory per job.
+    """
+    remove_workspace_sessions(workspace)
     shutil.rmtree(workspace, ignore_errors=True)
 
 
