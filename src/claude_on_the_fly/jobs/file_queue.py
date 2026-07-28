@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_on_the_fly.jobs.core import Job, Result
+from claude_on_the_fly.jobs.core import Job, QueueRow, Result
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,13 @@ class FileInboxQueue:
             except OSError as exc:  # racing reader, or a permissions problem
                 logger.debug("jobs: could not prune %s: %s", path.name, exc)
 
+    def list_unfinished(self, limit: int = DEFAULT_ROW_LIMIT) -> list[QueueRow]:
+        """The unfinished jobs, newest-claimed first. Delegates to the
+        module-level reader below, so this stays a pure read: unlike every
+        write method here it does not `_ensure_tree()`, and a missing maildir
+        reads as an empty queue rather than being built on the spot."""
+        return read_queue_rows(self._root, limit)
+
     def recover_stale(self, ttl_s: float | None) -> int:
         """Requeue in-flight jobs from `cur/` back to `new/`. `ttl_s=None`
         requeues all (single-worker default); a positive TTL requeues only those
@@ -236,19 +243,10 @@ class QueueDepth:
     failed: int
 
 
-@dataclass(frozen=True)
-class QueueRow:
-    """One not-yet-finished job: in `cur/` (in_flight) or waiting in `new/`.
-
-    `enqueued_at` comes from the id, not the file — see `_enqueued_at`. Both it
-    and `prompt` are None when they could not be derived, so a half-written or
-    hand-mangled file degrades one cell instead of failing the whole read.
-    """
-
-    id: str
-    prompt: str | None
-    enqueued_at: datetime | None
-    in_flight: bool
+# QueueRow is defined in `core` (it is the JobQueue port's return type) and
+# re-exported here, where every reader of this maildir already looks. In this
+# adapter `enqueued_at` comes from the id rather than the file — see
+# `_enqueued_at`.
 
 
 # Memoize archive counts by (dir, pattern) -> (mtime_ns, count) so the 1Hz
@@ -340,23 +338,32 @@ def _enqueued_at(job_id: str) -> datetime | None:
         return None
 
 
-def _read_prompt(path: Path) -> str | None:
-    """The head of the job's prompt, or None if the file vanished (claimed
-    mid-read) or does not parse.
+def _read_row_fields(path: Path) -> tuple[str | None, dict]:
+    """The job's prompt head and its origin, from one read of the file.
 
-    Truncated here rather than at render time: the row it lands in is memoized
-    for as long as the queue holds still, so returning the whole string pins
-    every queued prompt in the observing process — and a prompt has no size
-    limit, since it is whatever somebody typed or pasted into a chat message.
+    ``(None, {})`` if the file vanished (claimed mid-read) or does not parse —
+    each field degrades on its own, so a hand-mangled record costs one cell
+    rather than the whole listing.
+
+    The prompt is truncated here rather than at render time: the row it lands in
+    is memoized for as long as the queue holds still, so returning the whole
+    string pins every queued prompt in the observing process — and a prompt has
+    no size limit, being whatever somebody typed or pasted into a chat message.
+    The origin is small, flat, and the only thing a caller can filter a listing
+    by, so it is carried whole.
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        return None, {}
     if not isinstance(data, dict):
-        return None
+        return None, {}
     prompt = data.get("prompt")
-    return prompt[:PROMPT_PREVIEW_LIMIT] if isinstance(prompt, str) else None
+    origin = data.get("origin")
+    return (
+        prompt[:PROMPT_PREVIEW_LIMIT] if isinstance(prompt, str) else None,
+        origin if isinstance(origin, dict) else {},
+    )
 
 
 def read_queue_depth(root: Path) -> QueueDepth:
@@ -428,10 +435,12 @@ def _scan_rows(cur: Path, new: Path, limit: int) -> list[QueueRow]:
             if path.stem in seen:
                 continue
             seen.add(path.stem)
+            prompt, origin = _read_row_fields(path)
             rows.append(
                 QueueRow(
                     id=path.stem,
-                    prompt=_read_prompt(path),
+                    prompt=prompt,
+                    origin=origin,
                     enqueued_at=_enqueued_at(path.stem),
                     in_flight=in_flight,
                 )

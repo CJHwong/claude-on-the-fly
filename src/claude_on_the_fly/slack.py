@@ -11,6 +11,7 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,7 +24,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
-from claude_on_the_fly.jobs.core import Job, JobQueue
+from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
@@ -263,6 +264,62 @@ SLACK_SESSION_CAP = int(os.environ.get("SLACK_SESSION_CAP", "1000"))
 STATUS_VERB_ROTATE_SECS = 4
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
+
+
+# How many queued jobs a bare-trigger listing shows before it summarises the
+# rest. A listing is a glance, not a report, and it competes with the rest of
+# the thread for screen.
+JOB_LIST_LIMIT = 10
+# Prompt characters per listed row. Long enough to recognise the job you asked
+# for, short enough that ten of them stay one screen.
+JOB_LIST_PROMPT_CHARS = 80
+
+
+def _fmt_job_age(enqueued_at: datetime | None, now: datetime) -> str:
+    """Coarse age for a listing: `12s`, `4m`, `3h`, `2d`, or `?` when the id
+    carried no timestamp."""
+    if enqueued_at is None:
+        return "?"
+    seconds = max(0, int((now - enqueued_at).total_seconds()))
+    for size, suffix in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{seconds // size}{suffix}"
+    return f"{seconds}s"
+
+
+def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> str:
+    """The bare-trigger listing, as Slack mrkdwn.
+
+    Scoped to `channel`: a listing prints other people's prompts verbatim, and
+    in a shared channel the queue holds work from threads its readers were never
+    part of. Jobs elsewhere are counted, never quoted, so the reader still knows
+    the worker is busy without being shown what with.
+    """
+    usage = f"Usage: `{job_command} <task>` — runs in the background, replies here."
+    here = [row for row in rows if row.origin.get("channel") == channel]
+    elsewhere = len(rows) - len(here)
+
+    lines: list[str] = []
+    if not here:
+        lines.append("No jobs queued from this channel.")
+    else:
+        now = datetime.now(timezone.utc)
+        shown = here[:JOB_LIST_LIMIT]
+        lines.append(f"*{len(here)} job(s) from this channel:*")
+        for row in shown:
+            state = "running" if row.in_flight else "queued"
+            prompt = (row.prompt or "").strip().replace("\n", " ") or "(no prompt)"
+            if len(prompt) > JOB_LIST_PROMPT_CHARS:
+                prompt = prompt[: JOB_LIST_PROMPT_CHARS - 1] + "…"
+            lines.append(
+                f"• `{state}` · {_fmt_job_age(row.enqueued_at, now)} · {prompt}"
+            )
+        if len(here) > len(shown):
+            lines.append(f"_…and {len(here) - len(shown)} more._")
+    if elsewhere:
+        lines.append(f"_{elsewhere} job(s) queued from other channels._")
+    lines.append(usage)
+    return "\n".join(lines)
 
 
 def _build_response_blocks(body: str, response: Response) -> list[dict]:
@@ -1087,11 +1144,15 @@ class SlackFrontend(Frontend):
             if channel_type:
                 self._channel_types[channel] = channel_type
             if not task:
+                # A bare trigger is somebody asking what is already running,
+                # which is the one moment the answer is worth more than the
+                # usage line — so show both.
                 await self._post_notice(
                     channel,
                     thread_ts,
-                    f"Usage: `{job_command} <task>` — I'll run it in the "
-                    "background and reply here when it's done.",
+                    _render_job_list(
+                        self._read_unfinished_jobs(), channel, job_command
+                    ),
                 )
                 return
             job = Job(
@@ -1376,6 +1437,23 @@ class SlackFrontend(Frontend):
             self._our_sent_timestamps.append(ts)
             return ts
         return None
+
+    def _read_unfinished_jobs(self) -> list[QueueRow]:
+        """What is queued or running, or [] if the queue cannot say.
+
+        A listing is a courtesy: the queue lives on a filesystem (or, for
+        another adapter, across a network) that a chat turn has no business
+        failing over, so a read error degrades to "nothing to show" and is
+        logged. The limit is asked for before filtering, so a busy queue can
+        still fill a channel's page.
+        """
+        if self._job_queue is None:
+            return []
+        try:
+            return self._job_queue.list_unfinished(JOB_LIST_LIMIT * 4)
+        except Exception as exc:
+            logger.warning("slack: could not read the job queue: %s", exc)
+            return []
 
     async def _post_notice(
         self, channel: str, thread_ts: str | None, text: str

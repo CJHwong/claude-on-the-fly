@@ -8,7 +8,7 @@ import asyncio
 from pathlib import Path
 
 import claude_on_the_fly.jobs.worker as worker
-from claude_on_the_fly.jobs.core import Job, Result
+from claude_on_the_fly.jobs.core import Job, QueueRow, Result
 from claude_on_the_fly.jobs.file_queue import FileInboxQueue
 from claude_on_the_fly.jobs.worker import run_loop, run_once
 
@@ -33,6 +33,9 @@ class _FakeQueue:
 
     def complete(self, job: Job, result: Result) -> None:
         self.completed.append((job, result))
+
+    def list_unfinished(self, limit: int) -> list[QueueRow]:
+        return []
 
     def recover_stale(self, ttl_s: float | None) -> int:
         return 0

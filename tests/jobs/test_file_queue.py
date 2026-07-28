@@ -401,13 +401,13 @@ def test_idle_tick_does_not_reopen_job_files(tmp_path: Path, monkeypatch) -> Non
     q.enqueue(_job("100-a"))
 
     opened: list[Path] = []
-    real_read_prompt = fq._read_prompt
+    real_read_fields = fq._read_row_fields
 
-    def _spy(path: Path) -> str | None:
+    def _spy(path: Path) -> tuple[str | None, dict]:
         opened.append(path)
-        return real_read_prompt(path)
+        return real_read_fields(path)
 
-    monkeypatch.setattr(fq, "_read_prompt", _spy)
+    monkeypatch.setattr(fq, "_read_row_fields", _spy)
 
     assert [r.id for r in read_queue_rows(root)] == ["100-a"]
     assert opened == [root / "new" / "100-a.json"]  # cold read

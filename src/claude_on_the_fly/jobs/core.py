@@ -15,6 +15,7 @@ timestamps) lives inside `origin` and is never named here. Protocol style mirror
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -42,6 +43,26 @@ class Result:
     text: str
 
 
+@dataclass(frozen=True)
+class QueueRow:
+    """One not-yet-finished job, as a reader sees it: still queued, or claimed
+    and running.
+
+    `prompt` and `enqueued_at` are None when they could not be derived, so a
+    half-written or hand-mangled record degrades one field instead of failing
+    the whole read. `prompt` may be truncated — this is a listing, not the job.
+    `origin` is the same opaque dict the producer attached; the core does not
+    read it, but a caller that speaks the producer's vocabulary can (the Slack
+    frontend filters a listing down to the channel that asked).
+    """
+
+    id: str
+    prompt: str | None
+    origin: dict[str, Any]
+    enqueued_at: datetime | None
+    in_flight: bool
+
+
 @runtime_checkable
 class JobQueue(Protocol):
     """Read-write persistence port.
@@ -62,6 +83,17 @@ class JobQueue(Protocol):
 
     def complete(self, job: Job, result: Result) -> None:
         """Mark a claimed job finished and persist its result."""
+        ...
+
+    def list_unfinished(self, limit: int) -> list[QueueRow]:
+        """Up to `limit` jobs that have not completed — in-flight first, then
+        queued, oldest first within each.
+
+        A read, not a claim: it must not create, move, or modify anything, so a
+        producer can answer "what is queued?" without disturbing the worker.
+        Callers use it to show a listing, so an adapter is free to return
+        truncated prompts.
+        """
         ...
 
     def recover_stale(self, ttl_s: float | None) -> int:

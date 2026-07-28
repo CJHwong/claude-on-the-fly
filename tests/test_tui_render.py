@@ -395,6 +395,7 @@ class TestJobsQueueJson:
                     QueueRow(
                         id="100-a",
                         prompt="do the thing",
+                        origin={"channel": "C1"},
                         enqueued_at=datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc),
                         in_flight=True,
                     )

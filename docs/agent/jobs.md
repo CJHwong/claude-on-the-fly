@@ -20,6 +20,8 @@ Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Po
 
 A `Job` carries an opaque `origin` dict. The core, the queue, and the worker pass it through untouched; only the notifier reads it. That is what keeps vendor vocabulary (`channel`, `thread_ts`) out of the core.
 
+`JobQueue.list_unfinished(limit)` is the read half of the port, returning `QueueRow`s. A producer answering "what is already queued?" goes through it rather than reaching into `file_queue`, so the answer survives a swap to a broker-backed adapter. Rows carry `origin` for the same reason a `Job` does: the core cannot filter by channel, but the Slack frontend can.
+
 ## Adding a new queue adapter
 
 `SUPPORTED_QUEUES` in `jobs/registry.py` maps a kind name to a factory over a root directory; `make_queue()` picks one via `JOBS_QUEUE_KIND` (default `file`). Implement the `JobQueue` Protocol, register the kind, set the env var — no worker changes. This mirrors symphony's `SUPPORTED_TRACKERS`. The file also marks the attach point for a Python entry-points group, not built yet.
@@ -42,6 +44,8 @@ Two properties everything else rests on:
 - **Ids are `f"{time.time_ns()}-{uuid4().hex[:8]}"`.** Time-sortable, so `sorted(new/)` is FIFO — and the enqueue time is readable straight out of the name, with no `stat()` and no reliance on an mtime a copy or a `touch` would move.
 
 **Execution is at-least-once.** A crashed worker leaves its job in `cur/`; `recover_stale` moves it back to `new/` on the next start, and shutdown deliberately *cancels* an in-flight job rather than finishing it (so the process tree is reaped inside the supervisor's grace). A job must therefore be safe to re-run.
+
+**`done/` is pruned to 7 days on completion** (`DONE_RETENTION_S`), matching the log retention so an archive and the logs covering it expire together. By age rather than count, so a burst of small jobs cannot evict this morning's.
 
 **`complete()` writes two files into `done/`** — `<id>.result.json` first (so a crash between the two still leaves a durable result), then the job file moves in. Anything counting finished jobs must count `*.result.json`; counting `*.json` double-counts every one of them.
 
@@ -70,7 +74,7 @@ There is no watch pane for a running job: that needs the worker to publish the r
 
 ## Logging
 
-`jobs/cli.py` has its own `_setup_logging` (adds a midnight-rotating file handler, 7 backups) rather than `preflight._setup_logging`, which is console-only. Without it `logs/jobs.log` is never written and the tab's log pane has nothing to tail. Console and file share one level: `basicConfig` sets the *root* logger from `LOG_LEVEL`, so the file handler's own `DEBUG` floor only bites when `LOG_LEVEL=DEBUG`.
+`preflight.setup_daemon_logging("jobs")` adds a midnight-rotating file handler (7 backups) beside the console, which `preflight._setup_logging` — console-only — does not: without it `logs/jobs.log` is never written and the tab's log pane has nothing to tail. Symphony uses the same helper. Console and file share one level: `basicConfig` sets the *root* logger from `LOG_LEVEL`, so the file handler's own `DEBUG` floor only bites when `LOG_LEVEL=DEBUG`.
 
 ## Config
 

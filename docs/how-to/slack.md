@@ -59,6 +59,7 @@ export SLACK_TOKEN="xoxb-..."   # xoxp- to reply as you, xoxb- to reply as the a
 # export SLACK_SLASH_COMMAND="/cof-yourname"
 # Optional: text prefix that queues a background job, run by the `claude-jobs`
 # worker in a fresh session, which replies in the same thread when it finishes.
+# Sent on its own it lists what this channel already has queued.
 # Needs claude-jobs running. Unset means no trigger. Single-quoted so the shell
 # doesn't expand the $.
 # export SLACK_JOB_COMMAND='$job'

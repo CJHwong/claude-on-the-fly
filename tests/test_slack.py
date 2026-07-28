@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +13,10 @@ from slack_sdk.errors import SlackApiError
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
+    JOB_LIST_LIMIT,
     SLACK_REPLY_SOFT_LIMIT,
     SlackFrontend,
+    _render_job_list,
     _session_key,
     _split_blocks,
 )
@@ -1865,8 +1868,10 @@ class TestBotConversationGate:
 class _FakeJobQueue:
     """Records enqueued jobs; the rest of the port is inert for producer tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, unfinished: list | None = None) -> None:
         self.jobs: list = []
+        self.unfinished = list(unfinished or [])
+        self.list_limits: list[int] = []
 
     def enqueue(self, job) -> None:
         self.jobs.append(job)
@@ -1876,6 +1881,10 @@ class _FakeJobQueue:
 
     def complete(self, job, result) -> None:
         pass
+
+    def list_unfinished(self, limit):
+        self.list_limits.append(limit)
+        return self.unfinished[:limit]
 
     def recover_stale(self, ttl_s):
         return 0
@@ -2163,3 +2172,136 @@ async def test_injected_queue_enables_the_feature_without_patching_globals():
 
     assert [job.prompt for job in queue.jobs] == ["do the thing"]
     fe._on_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Bare-trigger job listing
+# ---------------------------------------------------------------------------
+
+
+def _row(job_id, prompt, channel, *, in_flight=False, age_s=0):
+    from claude_on_the_fly.jobs.core import QueueRow
+
+    return QueueRow(
+        id=job_id,
+        prompt=prompt,
+        origin={"channel": channel},
+        enqueued_at=datetime.now(timezone.utc) - timedelta(seconds=age_s),
+        in_flight=in_flight,
+    )
+
+
+class TestJobListing:
+    def test_lists_this_channels_jobs_with_state_and_age(self):
+        rows = [
+            _row("1-a", "rebuild the index", "C1", in_flight=True, age_s=125),
+            _row("2-b", "check the deploy", "C1", age_s=30),
+        ]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert "2 job(s) from this channel" in out
+        assert "`running` · 2m · rebuild the index" in out
+        assert "`queued` · 30s · check the deploy" in out
+        assert "Usage: `$job <task>`" in out
+
+    def test_other_channels_are_counted_never_quoted(self):
+        """A listing prints prompts verbatim, and a shared channel's queue holds
+        work from threads its readers were never part of."""
+        rows = [
+            _row("1-a", "mine", "C1"),
+            _row("2-b", "someone else's secret plan", "C2"),
+            _row("3-c", "another", "C3"),
+        ]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert "mine" in out
+        assert "secret plan" not in out
+        assert "2 job(s) queued from other channels" in out
+
+    def test_empty_queue_says_so_and_still_shows_usage(self):
+        out = _render_job_list([], "C1", "$job")
+        assert "No jobs queued from this channel." in out
+        assert "Usage: `$job <task>`" in out
+
+    def test_listing_is_capped_and_says_how_many_it_hid(self):
+        rows = [_row(f"{i}-a", f"job {i}", "C1") for i in range(25)]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert out.count("• ") == JOB_LIST_LIMIT
+        assert f"…and {25 - JOB_LIST_LIMIT} more." in out
+
+    def test_long_prompt_is_truncated_into_one_line(self):
+        rows = [_row("1-a", "x" * 400 + "\nsecond line", "C1")]
+        out = _render_job_list(rows, "C1", "$job")
+
+        listed = next(line for line in out.split("\n") if line.startswith("• "))
+        assert "\n" not in listed
+        assert len(listed) < 140
+
+    def test_missing_timestamp_degrades_to_one_cell(self):
+        from claude_on_the_fly.jobs.core import QueueRow
+
+        rows = [
+            QueueRow(
+                id="hand-written",
+                prompt=None,
+                origin={"channel": "C1"},
+                enqueued_at=None,
+                in_flight=False,
+            )
+        ]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert "`queued` · ? · (no prompt)" in out
+
+
+class TestBareTriggerListsJobs(TestJobCommand):
+    async def test_bare_trigger_posts_the_listing_not_just_usage(self):
+        queue = _FakeJobQueue(
+            unfinished=[
+                _row("1-a", "rebuild the index", "C1", in_flight=True),
+                _row("2-b", "elsewhere", "C-other"),
+            ]
+        )
+        fe, mock_app = self._frontend(queue)
+
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job",
+            }
+        )
+
+        assert queue.jobs == []  # a listing must never enqueue
+        posted = mock_app.client.chat_postMessage.call_args.kwargs["text"]
+        assert "rebuild the index" in posted
+        assert "elsewhere" not in posted
+        assert "1 job(s) queued from other channels" in posted
+        fe._on_message.assert_not_awaited()
+
+    async def test_listing_survives_a_queue_that_cannot_be_read(self):
+        """A chat turn has no business failing over a filesystem the listing is
+        only a courtesy about."""
+
+        class _BrokenQueue(_FakeJobQueue):
+            def list_unfinished(self, limit):
+                raise OSError("queue directory is gone")
+
+        fe, mock_app = self._frontend(_BrokenQueue())
+
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job",
+            }
+        )
+
+        posted = mock_app.client.chat_postMessage.call_args.kwargs["text"]
+        assert "No jobs queued from this channel." in posted
+        assert "Usage:" in posted

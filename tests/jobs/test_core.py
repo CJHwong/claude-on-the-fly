@@ -13,12 +13,13 @@ from claude_on_the_fly.jobs.core import (
     Job,
     JobQueue,
     Notifier,
+    QueueRow,
     Result,
 )
 
 # Roots the clean core is allowed to import. Anything else — an I/O SDK, `agent`,
 # Slack — is a clean-arch leak and fails the gate below.
-_ALLOWED_CORE_ROOTS = {"__future__", "dataclasses", "typing"}
+_ALLOWED_CORE_ROOTS = {"__future__", "dataclasses", "datetime", "typing"}
 
 
 def _imported_modules(module_path: Path) -> set[str]:
@@ -66,6 +67,9 @@ class _FakeQueue:
         return None
 
     def complete(self, job: Job, result: Result) -> None: ...
+    def list_unfinished(self, limit: int) -> list[QueueRow]:
+        return []
+
     def recover_stale(self, ttl_s: float | None) -> int:
         return 0
 
@@ -85,6 +89,23 @@ def test_ports_are_runtime_checkable() -> None:
     assert isinstance(_FakeNotifier(), Notifier)
 
 
+def test_list_unfinished_is_on_the_queue_port() -> None:
+    """A producer asks the port what is queued, never the file adapter — so a
+    queue that cannot answer does not satisfy the Protocol, and swapping in a
+    broker-backed adapter cannot silently drop the listing."""
+
+    class _NoListing:
+        def enqueue(self, job: Job) -> None: ...
+        def claim(self) -> Job | None:
+            return None
+
+        def complete(self, job: Job, result: Result) -> None: ...
+        def recover_stale(self, ttl_s: float | None) -> int:
+            return 0
+
+    assert not isinstance(_NoListing(), JobQueue)
+
+
 def test_recover_stale_is_on_the_queue_port() -> None:
     """Finding 1: recover_stale is a first-class port method, so a queue missing
     it does not satisfy the Protocol (the worker depends only on the port)."""
@@ -95,5 +116,7 @@ def test_recover_stale_is_on_the_queue_port() -> None:
             return None
 
         def complete(self, job: Job, result: Result) -> None: ...
+        def list_unfinished(self, limit: int) -> list[QueueRow]:
+            return []
 
     assert not isinstance(_NoRecover(), JobQueue)
