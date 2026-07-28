@@ -11,12 +11,14 @@ from unittest.mock import patch
 from claude_on_the_fly.transcript import (
     Turn,
     _workspace_to_claude_hash,
+    _workspace_to_pi_hash,
     extract_claude,
     extract_codex,
     extract_codex_cumulative_tokens,
     extract_codex_model,
     extract_opencode,
     format_handoff,
+    remove_workspace_sessions,
 )
 
 
@@ -863,3 +865,51 @@ class TestExtractOpencode:
             return_value={"info": {}, "messages": []},
         ):
             assert extract_opencode(workspace, "u1") is None
+
+
+# ---------------------------------------------------------------------------
+# remove_workspace_sessions — the session stores that outlive a workspace
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveWorkspaceSessions:
+    def test_removes_the_claude_and_pi_directories(
+        self, tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+    ) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        claude_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        pi_dir = pi_sessions_dir / _workspace_to_pi_hash(workspace)
+        for directory in (claude_dir, pi_dir):
+            directory.mkdir(parents=True)
+            (directory / "session.jsonl").write_text("{}\n")
+
+        remove_workspace_sessions(workspace)
+
+        assert not claude_dir.exists()
+        assert not pi_dir.exists()
+
+    def test_leaves_other_workspaces_alone(
+        self, tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+    ) -> None:
+        """The directory name encodes one workspace path, so a sibling's store
+        must survive — this is what makes the removal safe to run per job."""
+        mine = tmp_path / "mine"
+        theirs = tmp_path / "theirs"
+        mine.mkdir()
+        theirs.mkdir()
+        survivor = claude_projects_dir / _workspace_to_claude_hash(theirs)
+        survivor.mkdir(parents=True)
+
+        remove_workspace_sessions(mine)
+
+        assert survivor.exists()
+
+    def test_missing_directories_are_not_an_error(
+        self, tmp_path: Path, claude_projects_dir: Path, pi_sessions_dir: Path
+    ) -> None:
+        """Cleanup is best-effort: a backend that never wrote a session store
+        must not turn teardown into a failure."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        remove_workspace_sessions(workspace)

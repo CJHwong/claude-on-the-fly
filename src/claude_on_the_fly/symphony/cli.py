@@ -20,7 +20,6 @@ import argparse
 import asyncio
 import logging
 import logging.handlers
-import os
 import re
 import signal
 import sys
@@ -28,7 +27,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from claude_on_the_fly import checks
 from claude_on_the_fly.agent import current_backend_key, get_backend
+from claude_on_the_fly.preflight import setup_daemon_logging
 
 from . import orchestrator, watch
 from .agent_runner import session_uuid_for
@@ -49,23 +50,7 @@ _GITHUB_PR_RE = re.compile(r"^[\w.-]+/[\w.-]+#\d+$")
 
 def _setup_logging(platform: str = "symphony") -> None:
     """Console respects LOG_LEVEL; file always DEBUG with daily rotation, 7-day retention."""
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format=log_fmt,
-    )
-    log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        log_dir / f"{platform}.log",
-        when="midnight",
-        backupCount=7,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(log_fmt))
-    logging.getLogger().addHandler(file_handler)
+    setup_daemon_logging(platform)
 
 
 def _auto_detect_source(ticket: str) -> str | None:
@@ -226,7 +211,8 @@ def _cmd_doctor() -> int:
             if r.status != "ok":
                 if r.fix_hint:
                     sys.stdout.write(f"    hint: {r.fix_hint}\n")
-                failed += 1
+                if checks.is_blocking(r):
+                    failed += 1
     if failed:
         sys.stdout.write(f"\n{failed} check(s) failed\n")
         return 1

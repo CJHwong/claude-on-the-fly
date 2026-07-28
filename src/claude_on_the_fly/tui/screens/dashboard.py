@@ -1,13 +1,20 @@
-"""Dashboard screen — one tab per daemon zone (chat / scheduler / symphony) +
-log tail.
+"""Dashboard screen — one tab per daemon zone (chat / scheduler / symphony /
+jobs) + log tail.
 
 Layout (top → bottom):
-- Daemon tabs: CHAT, SCHEDULER, and SYMPHONY each get a tab; the tab title
-  carries a health badge ([1]/[2]/[3] switch key + state glyph) so switching to
+- Daemon tabs: CHAT, SCHEDULER, SYMPHONY and JOBS each get a tab; the tab title
+  carries a health badge ([1]–[4] switch key + state glyph) so switching to
   one zone never blinds the operator to the others' state. The chat tab's badge
   aggregates its three daemons (broken > running > stopped). The active tab owns
   the shared log/watch row below.
 - Log row: daemon log (left) + per-ticket / per-job watch (right).
+
+The jobs tab is a read-only observer of the worker's maildir: it renders queue
+depth and the unfinished jobs, and never creates, moves, or writes anything
+under `jobs/`. Its header's liveness half comes from the heartbeat, so a
+stopped worker still shows its backlog. It has no watch pane (that would need
+the worker to publish the running job's session uuid), so the daemon log takes
+the full width.
 
 The symphony tab mirrors the chat tab's selector model: its header shows every
 configured tracker (jira / github / ...) with the ←/→-selected one
@@ -58,6 +65,7 @@ from claude_on_the_fly.agent import (
     current_backend_key,
     resolve_session_log,
 )
+from claude_on_the_fly import checks
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
@@ -86,6 +94,32 @@ CHAT_FRONTENDS: tuple[str, ...] = ("telegram", "slack", "gmail")
 # Memoize parsed symphony config by (path, mtime) so the 1Hz header refresh
 # doesn't reparse YAML every tick. Mirrors state._load_schedule_cached.
 _symphony_cfg_cache: tuple[Path, float, tuple] | None = None
+
+
+def _short_job_id(job_id: str) -> str:
+    """The random tail of a `<time_ns>-<uuid8>` job id.
+
+    The time half is already rendered as the row's `enqueued` age, so showing
+    it again would cost 20 columns to say the same thing twice. The row key
+    keeps the full id, so nothing downstream is truncated. An id in some other
+    shape is shown whole.
+    """
+    _, sep, tail = job_id.rpartition("-")
+    return tail if sep else job_id
+
+
+def _prompt_preview(prompt: str | None, limit: int = 80) -> str:
+    """One-line cell text for a job's prompt.
+
+    Whitespace is collapsed because a DataTable cell cannot render a newline,
+    and the result is clipped so a multi-KB prompt can't blow up the row. None
+    means the file could not be read this tick (claimed mid-read, or hand-
+    mangled) — said plainly rather than shown as an empty cell.
+    """
+    if prompt is None:
+        return "(unreadable)"
+    flat = " ".join(prompt.split())
+    return flat[:limit]
 
 
 def _load_symphony_cached(path: Path) -> tuple[SymphonyConfig | None, str | None]:
@@ -119,14 +153,15 @@ class DashboardScreen(Screen):
     #daemon-tabs {
         height: auto;
     }
-    #chat-panel, #symphony-panel, #scheduler-panel {
+    #chat-panel, #symphony-panel, #scheduler-panel, #jobs-panel {
         height: auto;
     }
-    #symphony-strip-header, #scheduler-header, #chat-strip-header {
+    #symphony-strip-header, #scheduler-header, #chat-strip-header,
+    #jobs-queue-header {
         height: auto;
         padding: 0 0 0 1;
     }
-    #symphony-tickets, #jobs-content, #chat-strip {
+    #symphony-tickets, #jobs-content, #chat-strip, #jobs-queue {
         height: auto;
     }
     #action-cue {
@@ -140,7 +175,7 @@ class DashboardScreen(Screen):
     # and quit. Everything else — the views (logs / history), config, and the
     # utility tail (resume, doctor, copy-tail, refresh, stop-all) — stays bound
     # but `show=False`, surfaced on demand in the `?` help modal. The tab-switch
-    # keys [1]/[2]/[3] ride on the tab titles themselves, so they're hidden too.
+    # keys [1]–[4] ride on the tab titles themselves, so they're hidden too.
     # Keeping one BINDINGS list as the single source means the modal can't drift.
     # `c` copies the highlighted log tail via OSC 52 (iTerm2/kitty/WezTerm/
     # Alacritty); hold Option (macOS) or Shift while click-dragging for the
@@ -161,6 +196,7 @@ class DashboardScreen(Screen):
         Binding("1", "show_tab('tab-chat')", "chat tab", show=False),
         Binding("2", "show_tab('tab-scheduler')", "scheduler tab", show=False),
         Binding("3", "show_tab('tab-symphony')", "symphony tab", show=False),
+        Binding("4", "show_tab('tab-jobs')", "jobs tab", show=False),
         # priority so the screen sees ←/→ before the focused DataTable swallows
         # them for its (row-mode no-op) horizontal cursor. The action no-ops off
         # the chat / symphony tabs, so this doesn't strand arrow keys elsewhere.
@@ -186,6 +222,7 @@ class DashboardScreen(Screen):
         "chat tab": "switch to the chat tab",
         "scheduler tab": "switch to the scheduler tab",
         "symphony tab": "switch to the symphony tab",
+        "jobs tab": "switch to the background-jobs tab",
         "Prev": "select the previous chat frontend / symphony tracker (←)",
         "Next": "select the next chat frontend / symphony tracker (→)",
     }
@@ -276,6 +313,16 @@ class DashboardScreen(Screen):
                     yield DataTable(
                         id="symphony-tickets", cursor_type="row", zebra_stripes=True
                     )
+                # `jobs-queue`, NOT `jobs-content` — the latter is already the
+                # scheduler tab's cron table above.
+                with (
+                    TabPane("jobs", id="tab-jobs"),
+                    Vertical(id="jobs-panel"),
+                ):
+                    yield Static(id="jobs-queue-header", markup=True)
+                    yield DataTable(
+                        id="jobs-queue", cursor_type="row", zebra_stripes=True
+                    )
             with Horizontal(id="log-row"):
                 with Vertical(id="log-daemon-col"):
                     yield Static(id="log-header", markup=True)
@@ -314,6 +361,19 @@ class DashboardScreen(Screen):
         jobs.add_column("cron", width=16)
         jobs.add_column("kind", width=8)
         jobs.add_column("next fire", width=24)
+        # The background-job queue: what the worker is running now and what is
+        # waiting. The id cell shows only the random tail (the time half of the
+        # id is already the `enqueued` column); the row key keeps the full id.
+        # `job` is sized for the widest placeholder rather than the widest id:
+        # "queue unavailable" is 17 cells against an id tail's 8, and a fixed
+        # column clips rather than wraps. `prompt` hands back exactly those 7,
+        # so the four columns still render in 75 cells — inside the 76 the
+        # panel is given at an 80-column terminal.
+        queue = self.query_one("#jobs-queue", DataTable)
+        queue.add_column("job", width=17)
+        queue.add_column("state", width=8)
+        queue.add_column("prompt", width=33)
+        queue.add_column("enqueued", width=9)
         # The chat strip shows the selected frontend's currently-running jobs:
         # what's running and for how long. The header says which frontend.
         chat = self.query_one("#chat-strip", DataTable)
@@ -341,6 +401,7 @@ class DashboardScreen(Screen):
         "tab-chat": "chat-strip",
         "tab-scheduler": "jobs-content",
         "tab-symphony": "symphony-tickets",
+        "tab-jobs": "jobs-queue",
     }
 
     def _active_daemon(self) -> str | None:
@@ -357,6 +418,8 @@ class DashboardScreen(Screen):
             self._last_active_daemon = "schedule"
         elif active == "tab-symphony":
             self._last_active_daemon = "symphony"
+        elif active == "tab-jobs":
+            self._last_active_daemon = "jobs"
         return self._last_active_daemon
 
     def _chat_supervisor_target(self) -> str | None:
@@ -525,7 +588,7 @@ class DashboardScreen(Screen):
                 self._notify(f"{name}: not running", "warning")
                 return
             except supervisor.PreflightFailed as exc:
-                bad = [r for r in exc.results if r.status != "ok"]
+                bad = [r for r in exc.results if checks.is_blocking(r)]
                 detail = bad[0].name if bad else "checks failed"
                 self._notify(
                     f"{name}: preflight failed ({detail}) — opening doctor", "error"
@@ -995,6 +1058,7 @@ class DashboardScreen(Screen):
 
         self._refresh_symphony(by_name.get("symphony"))
         self._refresh_scheduler(snap, by_name.get("schedule"))
+        self._refresh_jobs(snap, by_name.get("jobs"))
         self._refresh_chat_strip(by_name)
         self._refresh_tab_badges(by_name)
         self._refresh_stale_banner(snap)
@@ -1016,9 +1080,11 @@ class DashboardScreen(Screen):
         carries the at-a-glance liveness the stacked-panel layout used to."""
         sym = by_name.get("symphony")
         sched = by_name.get("schedule")
+        jobs = by_name.get("jobs")
         chat_state = self._chat_aggregate_state(by_name)
         sched_state = sched.state if sched else "stopped"
         sym_state = sym.state if sym else "stopped"
+        jobs_state = jobs.state if jobs else "stopped"
         try:
             tabs = self.query_one("#daemon-tabs", TabbedContent)
             tabs.get_tab("tab-chat").label = render.tab_label(1, "chat", chat_state)
@@ -1028,6 +1094,7 @@ class DashboardScreen(Screen):
             tabs.get_tab("tab-symphony").label = render.tab_label(
                 3, "symphony", sym_state
             )
+            tabs.get_tab("tab-jobs").label = render.tab_label(4, "jobs", jobs_state)
         except Exception:
             pass
 
@@ -1155,6 +1222,75 @@ class DashboardScreen(Screen):
             # Short enough to fit the 14-wide name column; `g` opens the config.
             table.add_row(Text("no jobs (g)", style="dim"), "", "", "", key="__empty__")
         else:
+            self._restore_cursor(table, keys, previously)
+
+    def _refresh_jobs(
+        self, snap: state.Snapshot, jobs: state.FrontendStatus | None
+    ) -> None:
+        """Render the background-job worker: liveness in the header, the queue
+        in the table.
+
+        The two halves have different sources on purpose. Liveness comes from
+        the heartbeat, so it is only as good as the worker; the queue is read
+        off the maildir, so a backlog is visible with the worker stopped — the
+        state the operator most needs to see. Read-only throughout: nothing
+        here creates or moves a file under jobs/.
+        """
+        view = snap.jobs_queue
+        self.query_one("#jobs-queue-header", Static).update(
+            render.jobs_header(
+                state=jobs.state if jobs else "stopped",
+                pid=jobs.pid if jobs else None,
+                heartbeat_age_s=jobs.last_heartbeat_age_s if jobs else None,
+                depth=view.depth if view else None,
+            )
+        )
+
+        table = self.query_one("#jobs-queue", DataTable)
+        previously = self._datatable_cursor_key("#jobs-queue")
+        table.clear()
+        keys: list[str] = []
+        for row in view.rows if view else []:
+            keys.append(row.id)
+            age_s = (
+                None
+                if row.enqueued_at is None
+                else (snap.timestamp - row.enqueued_at).total_seconds()
+            )
+            # Text(), not str: a bare str cell goes through Rich's markup
+            # parser, and the prompt is the one cell on this dashboard carrying
+            # third-party text (a Slack user's message). "[pytest]" would be
+            # eaten as a tag and "[/]" raises MarkupError — which Textual turns
+            # into an app exit, killing the whole dashboard. Same reason
+            # _refresh_watch_scheduler wraps log lines.
+            table.add_row(
+                Text(_short_job_id(row.id)),
+                "running" if row.in_flight else "queued",
+                Text(_prompt_preview(row.prompt)),
+                render.fmt_age(age_s),
+                key=row.id,
+            )
+        if not keys:
+            # Keep one row so the table reads as "here, but empty" and stays
+            # focusable for Tab / the lifecycle keys — same as the other tabs.
+            msg = "queue unavailable" if view is None else "queue empty"
+            table.add_row(Text(msg, style="dim"), "", "", "", key="__empty__")
+        else:
+            if view is not None and view.hidden:
+                # The cap is a display limit, so say what it cut rather than
+                # leaving the operator to subtract it out of the header's count.
+                # Same shape as the placeholder above, and in `keys` like a real
+                # row: a key _restore_cursor cannot find leaves the cursor where
+                # clear() dropped it, which would yank an operator parked on the
+                # last row back to the top on the next tick.
+                table.add_row(
+                    Text(f"… {view.hidden} more", style="dim"),
+                    "",
+                    "",
+                    "",
+                    key="__more__",
+                )
+                keys.append("__more__")
             self._restore_cursor(table, keys, previously)
 
     @staticmethod

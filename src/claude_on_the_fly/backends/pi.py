@@ -129,6 +129,7 @@ async def _run_pi_exec(workspace: Path, cmd: list[str], timeout: float | None) -
         limit=16 * 1024 * 1024,
         start_new_session=True,
     )
+    agent.track_agent_process(proc, cmd)
     try:
         result = await asyncio.wait_for(_consume_pi(proc), timeout=timeout)
     except asyncio.TimeoutError:

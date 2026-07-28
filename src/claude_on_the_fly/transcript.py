@@ -18,6 +18,8 @@ Public surface:
   fresh session UUID
 - `prepend_latest_handoff(workspace, prompt, exclude_uuid)` higher-level
   wrapper that combines find + format + prepend, swallowing scan errors
+- `remove_workspace_sessions(workspace)` deletes the session directories a
+  backend keyed to a workspace path but stored outside it
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -83,6 +86,31 @@ def _workspace_to_pi_hash(workspace: Path) -> str:
     """
     resolved = str(workspace.resolve())
     return "--" + resolved[1:].replace("/", "-") + "--"
+
+
+def remove_workspace_sessions(workspace: Path) -> None:
+    """Delete the session directories a backend keys to `workspace` but keeps
+    outside it.
+
+    claude and pi both name a directory in their own config tree after the
+    workspace path, so a caller that deletes a throwaway workspace still leaves
+    that directory behind — and because the name encodes a path that will never
+    exist again, nothing can ever reclaim it. codex and opencode keep their
+    per-workspace mapping *inside* the workspace, so removing the workspace is
+    already enough for them and there is nothing to do here.
+
+    Call this before deleting the workspace: both names are derived from
+    `workspace.resolve()`, and resolution is only reliable while the path is
+    still there.
+
+    Best-effort by design — a cleanup that cannot run must not mask the
+    caller's real outcome.
+    """
+    for directory in (
+        CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace),
+        PI_SESSIONS_DIR / _workspace_to_pi_hash(workspace),
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def _iter_jsonl(path: Path):

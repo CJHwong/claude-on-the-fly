@@ -11,10 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import claude_on_the_fly.agent as agent_mod
 from claude_on_the_fly.agent import (
+    ATTACHMENT_PLATFORMS,
     FORMAT_HINTS,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES,
+    NO_HANDOFF_PLATFORMS,
     NUDGE_PROMPT,
     OUTBOX_ARCHIVE,
     OUTBOX_DIRNAME,
@@ -226,6 +229,23 @@ class TestResponseFormatTools:
 # ---------------------------------------------------------------------------
 # build_system_prompt
 # ---------------------------------------------------------------------------
+
+
+class TestJobsPlatformRegistration:
+    """Acceptance #15: the "jobs" platform is wired into agent.py correctly."""
+
+    def test_jobs_is_no_handoff(self):
+        # Each job is an independent one-shot in a fresh session — no transcript
+        # handoff, same as "schedule".
+        assert "jobs" in NO_HANDOFF_PLATFORMS
+
+    def test_jobs_has_format_hint(self):
+        assert "jobs" in FORMAT_HINTS
+
+    def test_jobs_is_not_attachment_platform(self):
+        # Nothing collects the outbox on the jobs path and Result is text-only,
+        # so adding "jobs" here would make the agent promise files it can't send.
+        assert "jobs" not in ATTACHMENT_PLATFORMS
 
 
 class TestBuildSystemPrompt:
@@ -2440,3 +2460,64 @@ class TestCachedSkills:
         backend.list_skills = AsyncMock(return_value=[("live", "")])
         assert await agent.cached_skills(backend) == [("disk", "fromdisk")]
         backend.list_skills.assert_not_awaited()  # disk hit, no CLI probe
+
+
+class TestProcessListeners:
+    """The seam that lets a worker write down what it will orphan if killed."""
+
+    async def test_exec_announces_the_group_start_and_end(self):
+        from claude_on_the_fly.agent import add_process_listener
+
+        seen: list[tuple[int, str, bool]] = []
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+        proc.pid = 4321
+
+        add_process_listener(lambda *args: seen.append(args))
+        try:
+            with patch("asyncio.create_subprocess_exec", return_value=proc):
+                await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        finally:
+            agent_mod._process_listeners.clear()
+
+        # pgid == pid: start_new_session makes the child its own group leader,
+        # which is knowable without racing the child's setsid().
+        assert seen[0] == (4321, "claude", True)
+        assert seen[-1][0] == 4321
+        assert seen[-1][2] is False
+
+    async def test_announcement_survives_a_broken_listener(self):
+        """A listener writing to a full disk must not take the agent run down."""
+        from claude_on_the_fly.agent import add_process_listener
+
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+        proc.pid = 4321
+
+        def _explode(pgid, command, running):
+            raise OSError("no space left on device")
+
+        add_process_listener(_explode)
+        try:
+            with patch("asyncio.create_subprocess_exec", return_value=proc):
+                result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        finally:
+            agent_mod._process_listeners.clear()
+
+        assert result["result"] == "hi"
+
+    async def test_already_exited_process_is_still_announced_finished(self):
+        """_kill_process_tree returns early for a process that ended on its own;
+        a listener that never heard would keep treating it as live."""
+        from claude_on_the_fly.agent import _kill_process_tree, add_process_listener
+
+        seen: list[tuple[int, str, bool]] = []
+        proc = MagicMock()
+        proc.pid = 777
+        proc.returncode = 0  # already exited
+
+        add_process_listener(lambda *args: seen.append(args))
+        try:
+            await _kill_process_tree(proc)
+        finally:
+            agent_mod._process_listeners.clear()
+
+        assert seen == [(777, "", False)]

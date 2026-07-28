@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from claude_on_the_fly.jobs.file_queue import QueueDepth
 from claude_on_the_fly.tui.state import FrontendStatus, JobInfo, Snapshot
 
 _STATE_STYLES = {
@@ -271,6 +272,35 @@ def scheduler_header(
     return line + "  ·  [dim]no jobs[/dim]"
 
 
+def jobs_header(
+    *,
+    state: str,
+    pid: int | None = None,
+    heartbeat_age_s: float | None = None,
+    depth: QueueDepth | None = None,
+) -> str:
+    """Markup line for the JOBS panel header.
+
+    Worker liveness comes from the heartbeat (pid, freshness); the queue
+    summary comes from the maildir, so it is present whatever the worker is
+    doing. `depth=None` means the configured queue isn't the file adapter and
+    there is nothing to read — said outright rather than shown as zeros.
+    """
+    parts = [_state_markup(state)]
+    if pid is not None:
+        parts.append(f"[dim]pid {pid}[/dim]")
+    if heartbeat_age_s is not None:
+        parts.append(f"[dim]hb {fmt_age(heartbeat_age_s)}[/dim]")
+    if depth is None:
+        parts.append("[dim]queue unavailable[/dim]")
+    else:
+        parts.append(
+            f"new {depth.new} · running {depth.running} · "
+            f"done {depth.done} · failed {depth.failed}"
+        )
+    return "[bold]JOBS[/bold]  " + "  ·  ".join(parts)
+
+
 def chat_header(frontends: list[FrontendStatus], selected: int, active: int) -> str:
     """Markup line for the chat tab — the daemon-health surface that replaced
     the roster table. One frontend reads as that daemon's own line; several
@@ -352,7 +382,11 @@ def render_snapshot_rich(snap: Snapshot, console: Console | None = None) -> None
 
 
 def render_snapshot_json(snap: Snapshot) -> str:
-    """Stable JSON shape for scripts. Datetimes serialized as ISO 8601."""
+    """Stable JSON shape for scripts. Datetimes serialized as ISO 8601.
+
+    Keys are enumerated by hand, so a new Snapshot field stays absent from
+    `status --json` until it is added here too.
+    """
 
     def encode(o):
         if isinstance(o, datetime):
@@ -366,5 +400,6 @@ def render_snapshot_json(snap: Snapshot) -> str:
             {**asdict(j), "next_fire": j.next_fire.isoformat()} for j in snap.jobs
         ],
         "schedule_error": snap.schedule_error,
+        "jobs_queue": (None if snap.jobs_queue is None else asdict(snap.jobs_queue)),
     }
     return json.dumps(payload, indent=2, default=encode)

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from claude_on_the_fly import heartbeat
 from claude_on_the_fly.heartbeat import HeartbeatWriter
 
 
@@ -118,3 +121,59 @@ class TestRunLoop:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class TestLivePid:
+    """`live_pid` answers 'may I start?' for a singleton daemon, so it must
+    require BOTH halves of the liveness contract and treat anything it cannot
+    read as 'nothing is running'."""
+
+    def _write(self, state_dir, frontend="jobs", *, pid=4242, age_s=0.0) -> None:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+        (state_dir / f"{frontend}.json").write_text(
+            json.dumps(
+                {
+                    "frontend": frontend,
+                    "pid": pid,
+                    "last_heartbeat": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+        )
+
+    def test_fresh_heartbeat_with_live_process(self, tmp_path, monkeypatch):
+        self._write(tmp_path)
+        monkeypatch.setattr(heartbeat, "process_exists", lambda pid: True)
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) == 4242
+
+    def test_stale_heartbeat_reads_as_not_running(self, tmp_path, monkeypatch):
+        """A pid alone would be trusted forever once the OS recycles it onto an
+        unrelated process — the daemon could then never start again."""
+        self._write(tmp_path, age_s=3600)
+        monkeypatch.setattr(heartbeat, "process_exists", lambda pid: True)
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) is None
+
+    def test_dead_process_reads_as_not_running(self, tmp_path, monkeypatch):
+        """The mirror case: a worker killed between heartbeats leaves a fresh
+        file behind, and its queue is free for the taking."""
+        self._write(tmp_path)
+        monkeypatch.setattr(heartbeat, "process_exists", lambda pid: False)
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) is None
+
+    def test_missing_file_reads_as_not_running(self, tmp_path):
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) is None
+
+    def test_corrupt_file_reads_as_not_running(self, tmp_path):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "jobs.json").write_text("{not json")
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) is None
+
+    def test_incomplete_payload_reads_as_not_running(self, tmp_path):
+        (tmp_path / "jobs.json").write_text(json.dumps({"frontend": "jobs"}))
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) is None
+
+    def test_a_live_writer_is_visible_to_live_pid(self, tmp_path):
+        """End to end against the real writer and this very process, so the
+        payload format and the reader cannot drift apart."""
+        HeartbeatWriter("jobs", state_dir=tmp_path).write_once()
+        assert heartbeat.live_pid("jobs", state_dir=tmp_path) == os.getpid()

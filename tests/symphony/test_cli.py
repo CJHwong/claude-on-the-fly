@@ -33,7 +33,9 @@ def test_setup_logging_creates_log_dir_and_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / ".claude-on-the-fly"
-    monkeypatch.setattr("claude_on_the_fly.symphony.cli.DATA_DIR", data_dir)
+    # The rotating-file setup is shared with claude-jobs and resolves the data
+    # dir through the agent module, so redirect it there.
+    monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data_dir)
 
     root = logging.getLogger()
     before = set(root.handlers)

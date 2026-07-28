@@ -141,6 +141,7 @@ async def _run_opencode_exec(
         limit=16 * 1024 * 1024,
         start_new_session=True,
     )
+    agent.track_agent_process(proc, cmd)
     try:
         if timeout is not None:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(

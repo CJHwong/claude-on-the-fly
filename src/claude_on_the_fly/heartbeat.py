@@ -6,6 +6,10 @@ State file lives at ~/.claude-on-the-fly/state/<frontend>.json.
 Liveness contract (consumed by tui.state.snapshot):
     alive = (now - last_heartbeat) < staleness_threshold[frontend]
             AND process_exists(pid)
+
+`process_exists` and `live_pid` evaluate that contract here rather than in the
+TUI, because a daemon needs it too — to refuse to start a second copy of itself
+— and daemons must not import the `tui` package.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 STATE_DIR = DATA_DIR / "state"
 DEFAULT_INTERVAL_S = 5.0
+# How recent a heartbeat must be for its pid to count as alive. Generous
+# relative to DEFAULT_INTERVAL_S so a daemon briefly starved of the event loop
+# is not declared dead.
+DEFAULT_LIVENESS_WINDOW_S = 30.0
 
 
 def _package_version() -> str:
@@ -37,6 +45,54 @@ def _package_version() -> str:
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def process_exists(pid: int) -> bool:
+    """True if a process with this pid is currently running.
+
+    Uses signal 0, which performs no-op delivery but raises if the process is
+    gone (or we lack permission to signal it). For our purpose (single-user
+    macOS dev tool), permission errors are vanishingly rare.
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def live_pid(
+    frontend: str,
+    *,
+    state_dir: Path | None = None,
+    liveness_window_s: float = DEFAULT_LIVENESS_WINDOW_S,
+) -> int | None:
+    """The pid of a live daemon for `frontend`, or None if none is running.
+
+    Both halves of the liveness contract are required. The freshness check
+    alone would trust a heartbeat from a process that has since died; the pid
+    check alone would trust a pid the OS has recycled onto something unrelated,
+    which for a startup guard means refusing to ever start again.
+
+    Any unreadable, unparseable, or incomplete state file reads as "nothing
+    running": this answers "may I start?", and a corrupt file is not evidence
+    that something else holds the resource.
+    """
+    path = (state_dir or STATE_DIR) / f"{frontend}.json"
+    try:
+        payload = json.loads(path.read_text())
+        pid = payload["pid"]
+        last = datetime.strptime(payload["last_heartbeat"], "%Y-%m-%dT%H:%M:%SZ")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(pid, int):
+        return None
+    age_s = (
+        datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)
+    ).total_seconds()
+    if age_s > liveness_window_s:
+        return None
+    return pid if process_exists(pid) else None
 
 
 class HeartbeatWriter:

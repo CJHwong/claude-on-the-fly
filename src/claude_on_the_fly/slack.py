@@ -11,7 +11,9 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -22,8 +24,12 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
+from claude_on_the_fly.heartbeat import live_pid
+from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
+from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -31,7 +37,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path.home() / ".claude-on-the-fly"
-SLACK_BLOCK_LIMIT = 3000
 # Soft cap on agent replies per thread. Once reached, inbound messages are
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
 # counter. Overridable via env for chattier or stricter threads.
@@ -40,6 +45,22 @@ CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
+# Background-job trigger. The message tail is queued as a job that survives this
+# chat turn — the worker (claude-jobs) runs it in a fresh session and replies
+# into this thread when done. A plain-text prefix, same rationale as $stop: it
+# works inside threads, where Slack blocks custom slash commands, and like $stop
+# it is on by default rather than something each install has to discover.
+#
+# `SLACK_JOB_COMMAND` renames it; setting it *empty* turns the feature off
+# entirely, which is the difference between "absent" and "present but blank" in
+# `_resolve_job_command`. `checks._job_command_error` rejects values that cannot
+# work as a trigger.
+#
+# Resolved per-instance in `SlackFrontend.__init__`, deliberately not bound here:
+# an import-time constant cannot see a value that only `load_dotenv()` puts in
+# the environment, and it made the constructor's job_queue seam unusable on its
+# own.
+DEFAULT_JOB_COMMAND = "$job"
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
 # it must match the command in the Slack app manifest — Slack does not namespace
@@ -250,21 +271,90 @@ _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
 
-def _split_blocks(text: str) -> list[str]:
-    """Split text into chunks that fit Slack's block text limit, on line boundaries."""
-    chunks: list[str] = []
-    chunk = ""
-    for line in text.split("\n"):
-        candidate = f"{chunk}\n{line}" if chunk else line
-        if len(candidate) > SLACK_BLOCK_LIMIT:
-            if chunk:
-                chunks.append(chunk)
-            chunk = line[:SLACK_BLOCK_LIMIT]
-        else:
-            chunk = candidate
-    if chunk:
-        chunks.append(chunk)
-    return chunks or [""]
+# How many queued jobs a bare-trigger listing shows before it summarises the
+# rest. A listing is a glance, not a report, and it competes with the rest of
+# the thread for screen.
+JOB_LIST_LIMIT = 10
+# Prompt characters per listed row. Long enough to recognise the job you asked
+# for, short enough that ten of them stay one screen.
+JOB_LIST_PROMPT_CHARS = 80
+
+
+def _fmt_job_age(enqueued_at: datetime | None, now: datetime) -> str:
+    """Coarse age for a listing: `12s`, `4m`, `3h`, `2d`, or `?` when the id
+    carried no timestamp."""
+    if enqueued_at is None:
+        return "?"
+    seconds = max(0, int((now - enqueued_at).total_seconds()))
+    for size, suffix in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{seconds // size}{suffix}"
+    return f"{seconds}s"
+
+
+def _resolve_job_command() -> str | None:
+    """The background-job trigger, or None when the feature is switched off.
+
+    Absent means the default; present-but-empty means off. The distinction is
+    the opt-out — `SLACK_JOB_COMMAND=` in a `.env` is how an install that does
+    not want a background-job trigger says so, and `get(name, default) or None`
+    is what keeps those two cases apart.
+    """
+    return os.environ.get("SLACK_JOB_COMMAND", DEFAULT_JOB_COMMAND) or None
+
+
+def _build_job_queue() -> JobQueue | None:
+    """The producer's queue, or None when one cannot be built.
+
+    `make_queue()` raises on an unrecognised `JOBS_QUEUE_KIND`. Now that the
+    trigger is on by default, letting that propagate would mean a typo in the
+    *jobs* configuration takes down the *Slack* daemon of an install that never
+    thought about background jobs. Preflight catches the same mistake earlier
+    and more legibly; this is the backstop for the paths that skip it, and it
+    degrades to "no background jobs" rather than "no Slack".
+    """
+    try:
+        return make_queue()
+    except Exception as exc:
+        logger.error(
+            "slack: background jobs disabled — could not build the queue: %s", exc
+        )
+        return None
+
+
+def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> str:
+    """The bare-trigger listing, as Slack mrkdwn.
+
+    Scoped to `channel`: a listing prints other people's prompts verbatim, and
+    in a shared channel the queue holds work from threads its readers were never
+    part of. Jobs elsewhere are counted, never quoted, so the reader still knows
+    the worker is busy without being shown what with.
+    """
+    usage = f"Usage: `{job_command} <task>` — runs in the background, replies here."
+    here = [row for row in rows if row.origin.get("channel") == channel]
+    elsewhere = len(rows) - len(here)
+
+    lines: list[str] = []
+    if not here:
+        lines.append("No jobs queued from this channel.")
+    else:
+        now = datetime.now(timezone.utc)
+        shown = here[:JOB_LIST_LIMIT]
+        lines.append(f"*{len(here)} job(s) from this channel:*")
+        for row in shown:
+            state = "running" if row.in_flight else "queued"
+            prompt = (row.prompt or "").strip().replace("\n", " ") or "(no prompt)"
+            if len(prompt) > JOB_LIST_PROMPT_CHARS:
+                prompt = prompt[: JOB_LIST_PROMPT_CHARS - 1] + "…"
+            lines.append(
+                f"• `{state}` · {_fmt_job_age(row.enqueued_at, now)} · {prompt}"
+            )
+        if len(here) > len(shown):
+            lines.append(f"_…and {len(here) - len(shown)} more._")
+    if elsewhere:
+        lines.append(f"_{elsewhere} job(s) queued from other channels._")
+    lines.append(usage)
+    return "\n".join(lines)
 
 
 def _build_response_blocks(body: str, response: Response) -> list[dict]:
@@ -538,9 +628,30 @@ class SlackFrontend(Frontend):
         blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
+        job_command: str | None = None,
+        job_queue: JobQueue | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
+        # Producer side of the background-jobs bridge. Trigger and queue resolve
+        # together, here rather than at import: injecting a queue alone could
+        # not switch the feature on, since the branch gated on the module
+        # global, and a caller had to reach in and patch that too. Resolving at
+        # construction also means a SLACK_JOB_COMMAND that only exists in .env
+        # works — `main` calls load_dotenv() before this runs, whereas the
+        # import-time binding needed the value already in the environment.
+        # `None` means "not specified, read the environment"; `""` means off.
+        # Without that split a caller could rename the trigger but never
+        # disable it, since every falsy override would fall through to the
+        # default — the same absent-vs-blank distinction the env var makes.
+        self._job_command = (
+            job_command if job_command is not None else _resolve_job_command()
+        ) or None
+        # The same file queue the worker reads (make_queue), so the trigger and
+        # claude-jobs agree on one inbox.
+        self._job_queue: JobQueue | None = job_queue or (
+            _build_job_queue() if self._job_command else None
+        )
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
         self._allow_all_senders = "*" in self._allowed_user_ids
@@ -1041,6 +1152,83 @@ class SlackFrontend(Frontend):
             )
             return
 
+        # The job trigger queues a background job that outlives this chat turn;
+        # the worker replies into this thread when done. Opt-in, so the whole
+        # branch is skipped unless the trigger is set and a queue was built —
+        # with the feature off the message falls through to the normal path and
+        # is answered as ordinary text. Placed before the soft-limit
+        # gate so enqueue+ack isn't blocked by the reply budget, and before the
+        # message reaches self._pending_msg (slack.py) so there's no orphaned
+        # pending entry / hourglass. sender_id (raw id) is already resolved and
+        # authorized at the allow/block gate above; the resolved display `sender`
+        # isn't assigned yet — and the notifier reads neither, so origin carries
+        # sender_id.
+        job_command = self._job_command
+        job_text = text.strip()
+        if (
+            job_command
+            and self._job_queue is not None
+            and (job_text == job_command or job_text.startswith(job_command + " "))
+        ):
+            task = job_text[len(job_command) :].strip()
+            # Unlike $stop, $job is not idempotent — a catchup re-ingest on
+            # reconnect would enqueue a second job. Mirror the normal path's
+            # catch-up bookkeeping (which this branch returns before reaching):
+            # mark the ts processed (dedup), record the channel + watermark so
+            # _catchup re-fetches it after a disconnect, and cache the channel
+            # type so the recovered messages gate identically to the live path.
+            self._processed_ts.append(ts)
+            self._active_channels[channel] = ts
+            if channel_type:
+                self._channel_types[channel] = channel_type
+            if not task:
+                # A bare trigger is somebody asking what is already running,
+                # which is the one moment the answer is worth more than the
+                # usage line — so show both.
+                await self._post_notice(
+                    channel,
+                    thread_ts,
+                    _render_job_list(
+                        self._read_unfinished_jobs(), channel, job_command
+                    ),
+                )
+                return
+            job = Job(
+                id=f"{time.time_ns()}-{uuid4().hex[:8]}",
+                prompt=task,
+                origin={
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "sender_id": sender_id,
+                },
+            )
+            try:
+                self._job_queue.enqueue(job)
+            except Exception as exc:
+                logger.exception(
+                    "slack %s/%s: job enqueue failed: %s", channel, thread_ts, exc
+                )
+                await self._post_notice(
+                    channel,
+                    thread_ts,
+                    "Couldn't queue that job — check the worker logs.",
+                )
+                return
+            logger.info("slack %s/%s: queued job %s", channel, thread_ts, job.id)
+            # Promise a reply only if something can produce one. With the
+            # trigger on by default, an install that never started the worker
+            # would otherwise get "I'll reply here when it's done" on a job that
+            # nothing will ever run — a failure that looks exactly like success.
+            if live_pid("jobs") is None:
+                notice = (
+                    f"Queued job `{job.id}`, but no worker is running — it will "
+                    "stay queued until one starts (`claude-tui start jobs`)."
+                )
+            else:
+                notice = f"Queued job `{job.id}` — I'll reply here when it's done."
+            await self._post_notice(channel, thread_ts, notice)
+            return
+
         # Reply soft-limit gate. CONTINUE_COMMAND resets the counter and any
         # trailing text is processed as the next turn; otherwise, once the
         # thread is over budget we post the warning and stop here (no agent run).
@@ -1294,6 +1482,23 @@ class SlackFrontend(Frontend):
             self._our_sent_timestamps.append(ts)
             return ts
         return None
+
+    def _read_unfinished_jobs(self) -> list[QueueRow]:
+        """What is queued or running, or [] if the queue cannot say.
+
+        A listing is a courtesy: the queue lives on a filesystem (or, for
+        another adapter, across a network) that a chat turn has no business
+        failing over, so a read error degrades to "nothing to show" and is
+        logged. The limit is asked for before filtering, so a busy queue can
+        still fill a channel's page.
+        """
+        if self._job_queue is None:
+            return []
+        try:
+            return self._job_queue.list_unfinished(JOB_LIST_LIMIT * 4)
+        except Exception as exc:
+            logger.warning("slack: could not read the job queue: %s", exc)
+            return []
 
     async def _post_notice(
         self, channel: str, thread_ts: str | None, text: str

@@ -62,6 +62,7 @@ _FRONTEND_MODULE: dict[str, str] = {
     "gmail": "claude_on_the_fly.gmail",
     "schedule": "claude_on_the_fly.scheduler",
     "symphony": "claude_on_the_fly.symphony.cli",
+    "jobs": "claude_on_the_fly.jobs.cli",
 }
 
 
@@ -82,7 +83,7 @@ class PreflightFailed(SupervisorError):
     results: list[CheckResult]
 
     def __str__(self) -> str:
-        bad = [r for r in self.results if r.status != "ok"]
+        bad = [r for r in self.results if checks.is_blocking(r)]
         if not bad:
             return f"preflight failed for {self.frontend}"
         first = bad[0]

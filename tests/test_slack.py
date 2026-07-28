@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,12 +13,15 @@ from slack_sdk.errors import SlackApiError
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
-    SLACK_BLOCK_LIMIT,
+    DEFAULT_JOB_COMMAND,
+    JOB_LIST_LIMIT,
     SLACK_REPLY_SOFT_LIMIT,
     SlackFrontend,
+    _render_job_list,
     _session_key,
     _split_blocks,
 )
+from claude_on_the_fly.slack_mrkdwn import SLACK_BLOCK_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -36,13 +40,19 @@ class TestSplitBlocks:
         result = _split_blocks(text)
         assert len(result) == 2
         assert result[0] == line
-        assert result[1] == line
+        # The newline the split consumed rides with the following chunk, so the
+        # chunks still reassemble into exactly the input.
+        assert result[1] == f"\n{line}"
+        assert "".join(result) == text
 
-    def test_very_long_single_line_truncated(self):
+    def test_very_long_single_line_is_sliced_not_truncated(self):
+        """A line over the limit used to be cut to line[:LIMIT] with the tail
+        dropped — no error, no log, and nothing in the output saying so."""
         text = "a" * (SLACK_BLOCK_LIMIT + 500)
         result = _split_blocks(text)
-        assert len(result) == 1
-        assert len(result[0]) == SLACK_BLOCK_LIMIT
+        assert len(result) == 2
+        assert all(len(chunk) <= SLACK_BLOCK_LIMIT for chunk in result)
+        assert "".join(result) == text
 
     def test_empty_text_returns_list_with_empty_string(self):
         assert _split_blocks("") == [""]
@@ -64,7 +74,8 @@ class TestSplitBlocks:
         text = f"{short}\n{long_line}"
         result = _split_blocks(text)
         assert result[0] == short
-        assert result[1] == long_line[:SLACK_BLOCK_LIMIT]
+        assert all(len(chunk) <= SLACK_BLOCK_LIMIT for chunk in result)
+        assert "".join(result) == text
 
 
 # ---------------------------------------------------------------------------
@@ -1848,3 +1859,460 @@ class TestBotConversationGate:
             }
         )
         bot_frontend._on_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# $job — background-job producer intercept
+# ---------------------------------------------------------------------------
+
+
+class _FakeJobQueue:
+    """Records enqueued jobs; the rest of the port is inert for producer tests."""
+
+    def __init__(self, unfinished: list | None = None) -> None:
+        self.jobs: list = []
+        self.unfinished = list(unfinished or [])
+        self.list_limits: list[int] = []
+
+    def enqueue(self, job) -> None:
+        self.jobs.append(job)
+
+    def claim(self):
+        return None
+
+    def complete(self, job, result) -> None:
+        pass
+
+    def mark_delivered(self, job_id) -> None:
+        pass
+
+    def undelivered(self):
+        return []
+
+    def list_unfinished(self, limit):
+        self.list_limits.append(limit)
+        return self.unfinished[:limit]
+
+    def recover_stale(self, ttl_s):
+        return 0
+
+
+class TestJobCommand:
+    @pytest.fixture(autouse=True)
+    def _clear_job_command_env(self, monkeypatch):
+        # The trigger resolves per instance from SLACK_JOB_COMMAND, so a real
+        # value in the developer's shell would otherwise decide what this class
+        # tests. Clear it and let `_frontend` pass the trigger explicitly.
+        # (Function-scoped: monkeypatch cannot be requested by a class fixture.)
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+
+    def _frontend(self, queue=None, job_command="$job"):
+        with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
+            mock_app = MagicMock()
+            mock_app.client = MagicMock()
+            mock_app.client.chat_postMessage = AsyncMock(
+                return_value={"ok": True, "ts": "99.9"}
+            )
+            mock_app_cls.return_value = mock_app
+            fe = SlackFrontend(
+                "xapp-tok",
+                "xoxp-tok",
+                "U_SELF",
+                allowed_user_ids={"U_ALLOWED"},
+                job_command=job_command,
+                job_queue=queue,
+            )
+            fe._on_message = AsyncMock()
+            return fe, mock_app
+
+    async def test_job_command_enqueues_and_acks(self):
+        queue = _FakeJobQueue()
+        fe, mock_app = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job summarize the incident",
+            }
+        )
+
+        # Exactly one job, with the task and the origin (carrying sender_id).
+        assert len(queue.jobs) == 1
+        job = queue.jobs[0]
+        assert job.prompt == "summarize the incident"
+        assert job.origin == {
+            "channel": "C1",
+            "thread_ts": "123.45",
+            "sender_id": "U_ALLOWED",
+        }
+        # Acked immediately; no agent turn in the chat process.
+        mock_app.client.chat_postMessage.assert_awaited()
+        fe._on_message.assert_not_awaited()
+        # No orphaned pending message/reaction (returned before _pending_msg).
+        assert not fe._pending_msg
+        # ts marked processed so a catchup re-ingest won't enqueue a duplicate.
+        assert "123.45" in fe._processed_ts
+
+    async def test_job_command_advances_catchup_watermark(self):
+        # A $job in a channel with no normal traffic since restart must still
+        # register the channel as active (with its watermark and type), or
+        # _catchup never re-fetches it and a message lost during a disconnect is
+        # silently dropped. Mirrors the normal path's bookkeeping.
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job summarize the incident",
+            }
+        )
+        # Guard against vacuity: the normal message path sets both of these too
+        # (slack.py, just below the job branch), so without an assertion that the
+        # job branch is the one that ran, this test passes with the feature
+        # entirely disabled.
+        assert len(queue.jobs) == 1
+        assert fe._active_channels["C1"] == "123.45"
+        assert fe._channel_types["C1"] == "im"
+
+    async def test_job_command_uses_thread_ts_when_in_thread(self):
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "200.0",
+                "thread_ts": "100.0",
+                "text": "$job do the thing",
+            }
+        )
+        assert queue.jobs[0].origin["thread_ts"] == "100.0"
+
+    async def test_empty_job_command_posts_usage_and_enqueues_nothing(self):
+        queue = _FakeJobQueue()
+        fe, mock_app = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job",
+            }
+        )
+        assert queue.jobs == []
+        mock_app.client.chat_postMessage.assert_awaited()  # usage notice
+        fe._on_message.assert_not_awaited()
+
+    async def test_usage_notice_names_the_configured_trigger(self):
+        # The notice interpolates the configured trigger. Nothing else would
+        # catch a regression to a hardcoded `$job`: the test above runs under
+        # the default trigger and only asserts that *something* was posted, so
+        # the notice would keep telling every operator on another trigger to
+        # type a string their install does not answer to.
+        queue = _FakeJobQueue()
+        fe, mock_app = self._frontend(queue, job_command="!bg")
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "!bg",
+            }
+        )
+        assert queue.jobs == []
+        assert "!bg" in mock_app.client.chat_postMessage.await_args.kwargs["text"]
+
+    async def test_job_command_enqueue_failure_is_reported(self):
+        class _BoomQueue(_FakeJobQueue):
+            def enqueue(self, job):
+                raise RuntimeError("disk full")
+
+        fe, mock_app = self._frontend(_BoomQueue())
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job something",
+            }
+        )
+        # A failure notice is posted; no agent turn kicked off.
+        mock_app.client.chat_postMessage.assert_awaited()
+        fe._on_message.assert_not_awaited()
+
+    async def test_non_job_message_still_reaches_agent(self):
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue)
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "just a normal question",
+            }
+        )
+        assert queue.jobs == []
+        fe._on_message.assert_awaited_once()
+
+    async def test_disabled_trigger_degrades_to_an_ordinary_message(self, monkeypatch):
+        # Turning the trigger off (SLACK_JOB_COMMAND=) puts the text back on
+        # the ordinary path rather than dropping it silently. Both assertions flip when the trigger is set (the job
+        # branch enqueues and returns before _on_message), so this discriminates.
+        # Note it does NOT assert the ts is absent from _processed_ts: the normal
+        # path marks it processed too, so that would hold either way.
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue, job_command="")
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job summarize the incident",
+            }
+        )
+        assert queue.jobs == []
+        fe._on_message.assert_awaited_once()
+
+    async def test_custom_trigger_replaces_the_default(self):
+        # The trigger is whatever the operator named — "$job" holds no special
+        # status once it is read from the environment.
+        queue = _FakeJobQueue()
+        fe, _ = self._frontend(queue, job_command="!bg")
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "1.0",
+                "text": "!bg do it",
+            }
+        )
+        assert [job.prompt for job in queue.jobs] == ["do it"]
+
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "2.0",
+                "text": "$job do it",
+            }
+        )
+        # The former hardcoded default is now just text, and goes to the agent.
+        assert [job.prompt for job in queue.jobs] == ["do it"]
+        fe._on_message.assert_awaited_once()
+
+    async def test_no_queue_is_built_when_the_trigger_is_disabled(self, monkeypatch):
+        # Nothing can enqueue with the feature off, so touching the queue at all
+        # would be work — and a filesystem dependency — for no reason.
+        made = MagicMock()
+        monkeypatch.setattr("claude_on_the_fly.slack.make_queue", made)
+        fe, _ = self._frontend(job_command="")
+        assert fe._job_queue is None
+        made.assert_not_called()
+
+    async def test_queue_is_built_when_the_trigger_is_set(self, monkeypatch):
+        sentinel = _FakeJobQueue()
+        made = MagicMock(return_value=sentinel)
+        monkeypatch.setattr("claude_on_the_fly.slack.make_queue", made)
+        fe, _ = self._frontend()
+        assert fe._job_queue is sentinel
+        made.assert_called_once()
+
+
+def test_job_command_reads_its_documented_env_var(monkeypatch):
+    """Every other test passes the trigger explicitly, so a typo in the env var
+    name — SLACK_JOBS_COMMAND in slack.py against SLACK_JOB_COMMAND in checks.py
+    and the docs — would pass the entire suite. Pin which name the constructor
+    reads, against a real environment.
+    """
+    with patch("claude_on_the_fly.slack.AsyncApp"):
+        monkeypatch.setenv("SLACK_JOB_COMMAND", "!bg")
+        with patch("claude_on_the_fly.slack.make_queue"):
+            fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert fe._job_command == "!bg"
+
+        # Absent means the default — the feature is on without configuration.
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+        with patch("claude_on_the_fly.slack.make_queue"):
+            fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert fe._job_command == DEFAULT_JOB_COMMAND
+
+        # Present but blank is the opt-out, and the only one.
+        monkeypatch.setenv("SLACK_JOB_COMMAND", "")
+        fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert fe._job_command is None
+        assert fe._job_queue is None
+
+
+async def test_injected_queue_enables_the_feature_without_patching_globals():
+    """The constructor seam has to work on its own. The intercept used to gate
+    on an import-time module global, so passing a queue could not switch the
+    feature on and every caller had to reach in and patch that too."""
+    with patch("claude_on_the_fly.slack.AsyncApp"):
+        queue = _FakeJobQueue()
+        fe = SlackFrontend(
+            "xapp-tok",
+            "xoxp-tok",
+            "U_SELF",
+            allowed_user_ids={"U_ALLOWED"},
+            job_command="$job",
+            job_queue=queue,
+        )
+        fe._on_message = AsyncMock()
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "1.0",
+                "text": "$job do the thing",
+            }
+        )
+
+    assert [job.prompt for job in queue.jobs] == ["do the thing"]
+    fe._on_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Bare-trigger job listing
+# ---------------------------------------------------------------------------
+
+
+def _row(job_id, prompt, channel, *, in_flight=False, age_s=0):
+    from claude_on_the_fly.jobs.core import QueueRow
+
+    return QueueRow(
+        id=job_id,
+        prompt=prompt,
+        origin={"channel": channel},
+        enqueued_at=datetime.now(timezone.utc) - timedelta(seconds=age_s),
+        in_flight=in_flight,
+    )
+
+
+class TestJobListing:
+    def test_lists_this_channels_jobs_with_state_and_age(self):
+        rows = [
+            _row("1-a", "rebuild the index", "C1", in_flight=True, age_s=125),
+            _row("2-b", "check the deploy", "C1", age_s=30),
+        ]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert "2 job(s) from this channel" in out
+        assert "`running` · 2m · rebuild the index" in out
+        assert "`queued` · 30s · check the deploy" in out
+        assert "Usage: `$job <task>`" in out
+
+    def test_other_channels_are_counted_never_quoted(self):
+        """A listing prints prompts verbatim, and a shared channel's queue holds
+        work from threads its readers were never part of."""
+        rows = [
+            _row("1-a", "mine", "C1"),
+            _row("2-b", "someone else's secret plan", "C2"),
+            _row("3-c", "another", "C3"),
+        ]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert "mine" in out
+        assert "secret plan" not in out
+        assert "2 job(s) queued from other channels" in out
+
+    def test_empty_queue_says_so_and_still_shows_usage(self):
+        out = _render_job_list([], "C1", "$job")
+        assert "No jobs queued from this channel." in out
+        assert "Usage: `$job <task>`" in out
+
+    def test_listing_is_capped_and_says_how_many_it_hid(self):
+        rows = [_row(f"{i}-a", f"job {i}", "C1") for i in range(25)]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert out.count("• ") == JOB_LIST_LIMIT
+        assert f"…and {25 - JOB_LIST_LIMIT} more." in out
+
+    def test_long_prompt_is_truncated_into_one_line(self):
+        rows = [_row("1-a", "x" * 400 + "\nsecond line", "C1")]
+        out = _render_job_list(rows, "C1", "$job")
+
+        listed = next(line for line in out.split("\n") if line.startswith("• "))
+        assert "\n" not in listed
+        assert len(listed) < 140
+
+    def test_missing_timestamp_degrades_to_one_cell(self):
+        from claude_on_the_fly.jobs.core import QueueRow
+
+        rows = [
+            QueueRow(
+                id="hand-written",
+                prompt=None,
+                origin={"channel": "C1"},
+                enqueued_at=None,
+                in_flight=False,
+            )
+        ]
+        out = _render_job_list(rows, "C1", "$job")
+
+        assert "`queued` · ? · (no prompt)" in out
+
+
+class TestBareTriggerListsJobs(TestJobCommand):
+    async def test_bare_trigger_posts_the_listing_not_just_usage(self):
+        queue = _FakeJobQueue(
+            unfinished=[
+                _row("1-a", "rebuild the index", "C1", in_flight=True),
+                _row("2-b", "elsewhere", "C-other"),
+            ]
+        )
+        fe, mock_app = self._frontend(queue)
+
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job",
+            }
+        )
+
+        assert queue.jobs == []  # a listing must never enqueue
+        posted = mock_app.client.chat_postMessage.call_args.kwargs["text"]
+        assert "rebuild the index" in posted
+        assert "elsewhere" not in posted
+        assert "1 job(s) queued from other channels" in posted
+        fe._on_message.assert_not_awaited()
+
+    async def test_listing_survives_a_queue_that_cannot_be_read(self):
+        """A chat turn has no business failing over a filesystem the listing is
+        only a courtesy about."""
+
+        class _BrokenQueue(_FakeJobQueue):
+            def list_unfinished(self, limit):
+                raise OSError("queue directory is gone")
+
+        fe, mock_app = self._frontend(_BrokenQueue())
+
+        await fe._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "C1",
+                "channel_type": "im",
+                "ts": "123.45",
+                "text": "$job",
+            }
+        )
+
+        posted = mock_app.client.chat_postMessage.call_args.kwargs["text"]
+        assert "No jobs queued from this channel." in posted
+        assert "Usage:" in posted

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from claude_on_the_fly.jobs.file_queue import QueueDepth, QueueRow
 from claude_on_the_fly.tui.render import (
     _fmt_age,
     _fmt_uptime,
@@ -16,11 +17,17 @@ from claude_on_the_fly.tui.render import (
     frontends_table,
     read_new_lines,
     render_snapshot_json,
+    jobs_header,
     render_snapshot_rich,
     tab_label,
     tail_lines,
 )
-from claude_on_the_fly.tui.state import FrontendStatus, JobInfo, Snapshot
+from claude_on_the_fly.tui.state import (
+    FrontendStatus,
+    JobInfo,
+    JobsQueueView,
+    Snapshot,
+)
 
 
 def _make_snapshot(**overrides):
@@ -47,13 +54,17 @@ def _make_snapshot(**overrides):
             )
         ],
         "schedule_error": None,
+        "jobs_queue": None,
     }
     defaults.update(overrides)
+    # Enumerated (not splatted) so ty can still check the argument types; a new
+    # Snapshot field has to be added here too, or no test can reach it.
     return Snapshot(
         timestamp=defaults["timestamp"],
         frontends=defaults["frontends"],
         jobs=defaults["jobs"],
         schedule_error=defaults["schedule_error"],
+        jobs_queue=defaults["jobs_queue"],
     )
 
 
@@ -334,3 +345,76 @@ class TestReadNewLines:
         lines, offset = read_new_lines(p, offset)
         assert lines == ["fresh"]
         assert offset == p.stat().st_size
+
+
+class TestJobsHeader:
+    """The JOBS panel header: worker liveness from the heartbeat, queue summary
+    from the maildir — so the counts survive a stopped worker."""
+
+    @staticmethod
+    def _depth(new=0, running=0, done=0, failed=0):
+        return QueueDepth(new=new, running=running, done=done, failed=failed)
+
+    def test_running_worker_shows_pid_heartbeat_and_counts(self):
+        line = jobs_header(
+            state="running",
+            pid=4321,
+            heartbeat_age_s=3.0,
+            depth=self._depth(new=2, running=1, done=7, failed=1),
+        )
+        assert "JOBS" in line
+        assert "running" in line
+        assert "pid 4321" in line
+        assert "hb 3s" in line
+        assert "new 2" in line
+        assert "running 1" in line
+        assert "done 7" in line
+        assert "failed 1" in line
+
+    def test_stopped_worker_still_shows_queue_depth(self):
+        """The counts come from the directory, not the daemon — a stopped
+        worker with a backlog must still report it."""
+        line = jobs_header(state="stopped", depth=self._depth(new=5))
+        assert "stopped" in line
+        assert "new 5" in line
+        assert "pid" not in line
+        assert "hb " not in line
+
+    def test_absent_queue_says_so_rather_than_showing_zeros(self):
+        line = jobs_header(state="running", pid=1, depth=None)
+        assert "queue unavailable" in line
+        assert "new 0" not in line
+
+
+class TestJobsQueueJson:
+    def test_json_carries_the_jobs_queue(self):
+        snap = _make_snapshot(
+            jobs_queue=JobsQueueView(
+                depth=QueueDepth(new=1, running=1, done=2, failed=0),
+                rows=[
+                    QueueRow(
+                        id="100-a",
+                        prompt="do the thing",
+                        origin={"channel": "C1"},
+                        enqueued_at=datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc),
+                        in_flight=True,
+                    )
+                ],
+            )
+        )
+        payload = json.loads(render_snapshot_json(snap))
+        assert payload["jobs_queue"]["depth"] == {
+            "new": 1,
+            "running": 1,
+            "done": 2,
+            "failed": 0,
+        }
+        row = payload["jobs_queue"]["rows"][0]
+        assert row["id"] == "100-a"
+        assert row["prompt"] == "do the thing"
+        assert row["in_flight"] is True
+        assert row["enqueued_at"] == "2026-05-19T12:00:00Z"
+
+    def test_json_carries_null_when_there_is_no_queue_to_read(self):
+        payload = json.loads(render_snapshot_json(_make_snapshot()))
+        assert payload["jobs_queue"] is None

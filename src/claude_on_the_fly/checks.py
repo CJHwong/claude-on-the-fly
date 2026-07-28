@@ -47,6 +47,10 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_BLOCKED_SENDER_IDS",
     "SLACK_SILENT_SENDER_IDS",
     "SLACK_SLASH_COMMAND",
+    # Declared here and not in JOBS_ENV_VARS: the slack daemon is the process
+    # that binds it (slack.JOB_COMMAND), so it is the one env_editor must
+    # restart when it changes.
+    "SLACK_JOB_COMMAND",
     "SLACK_STATS_MODE",
     # Deprecated aliases (still honored; see SLACK_LEGACY).
     "SLACK_USER_TOKEN",
@@ -60,6 +64,17 @@ GMAIL_ENV_VARS: tuple[str, ...] = (
     "GMAIL_ALLOWED_SENDERS",
     "GMAIL_POLL_INTERVAL",
     "GMAIL_STATS_MODE",
+)
+# The worker shares SLACK_TOKEN with the slack frontend (editing it affects both);
+# JOBS_SLACK_TOKEN optionally overrides it. JOBS_TIMEOUT is the per-job wall-clock
+# limit in seconds (0 or negative = no limit). JOBS_STALE_TTL_S is deferred with
+# multi-worker support.
+JOBS_ENV_VARS: tuple[str, ...] = (
+    "JOBS_QUEUE_KIND",
+    "JOBS_POLL_INTERVAL_S",
+    "JOBS_TIMEOUT",
+    "JOBS_SLACK_TOKEN",
+    "SLACK_TOKEN",
 )
 BACKEND_ENV_VARS: tuple[str, ...] = (
     "AGENT_BACKEND",
@@ -81,6 +96,7 @@ FRONTEND_ENV_VARS: dict[str, tuple[str, ...]] = {
     "gmail": GMAIL_ENV_VARS,
     "schedule": (),  # no per-frontend env vars; uses schedule.yaml
     "symphony": (),  # uses symphony.yaml
+    "jobs": JOBS_ENV_VARS,
 }
 
 SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
@@ -89,6 +105,7 @@ SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
     "gmail",
     "schedule",
     "symphony",
+    "jobs",
 )
 
 
@@ -201,6 +218,15 @@ def check_slack(env: Mapping[str, str]) -> list[CheckResult]:
     if command:
         results.append(_check_slack_command(command))
 
+    job_command = effective_job_command(env)
+    if job_command:
+        results.append(_check_slack_job_command(job_command))
+        # Only when the trigger is live: that is exactly when this frontend
+        # builds a queue (and could die on a bad kind), and when it starts
+        # making promises a missing worker cannot keep.
+        results.append(_check_queue_kind(env))
+        results.append(_check_jobs_worker_reachable(env))
+
     return results
 
 
@@ -219,6 +245,80 @@ def _check_slack_command(command: str) -> CheckResult:
         detail=f"{command} {problem}",
         fix_hint="Unset it to drop the slash command, or run "
         "`claude-slack --manifest` to pick one and get a matching manifest",
+    )
+
+
+def _job_command_error(value: str) -> tuple[Status, str] | None:
+    """None when `value` is a usable job trigger, else (status, why).
+
+    The status separates "this cannot work" from "this works, but probably not
+    as you meant": only the first is a reason to refuse to start the daemon.
+
+    Three kinds of mistake, worth keeping apart: Slack never delivers it
+    ('/', '<>&'); one of our own prefixes eats it ($stop, $continue); or it
+    fires, but not as its author meant (whitespace, a leading word character).
+    Only that last group is a trap rather than a dead trigger. Deliberately not
+    a full charset check, for the same reason as `slack_manifest.command_error`:
+    Slack is the authority on what a message may contain.
+    """
+    if any(char.isspace() for char in value):
+        # Fires, so don't read this as "can never match": *internal* whitespace
+        # matches — "$my job" on "$my job <task>" — but only on exactly the
+        # spacing its author typed, so a doubled one misses with no error. Only
+        # the *leading* form can never match, and a *trailing* one kills the
+        # bare-trigger usage form: `_ingest_event` strips before comparing.
+        return "invalid", "cannot contain whitespace"
+    if value.startswith("/"):
+        return (
+            "invalid",
+            "cannot start with '/' — Slack routes that as a slash command",
+        )
+    if any(char in value for char in "<>&"):
+        # `_ingest_event` reads `event["text"]` raw, with nothing unescaping it.
+        return (
+            "invalid",
+            "cannot contain '<', '>' or '&' — Slack escapes them in message text",
+        )
+    # The turn-control prefixes as literals: importing them from
+    # `claude_on_the_fly.slack` would pull slack_bolt into every checks import.
+    # test_checks.py `test_turn_control_prefixes_match_the_slack_constants`
+    # fails on drift, so the duplication is checked rather than merely noted.
+    if value == "$stop":
+        # Matched by exact equality and wins first, so the trigger is not merely
+        # dead: a bare "$stop" still aborts the turn while "$stop do the thing"
+        # falls past it and queues a job — one prefix, two behaviours.
+        return "invalid", "collides with the $stop turn-control prefix"
+    if value == "$continue":
+        # Intercepted *after* the job branch, so a trigger equal to it shadows
+        # the reply soft-limit reset entirely — a gated thread could never be
+        # un-gated.
+        return "invalid", "collides with the $continue turn-control prefix"
+    if value[:1].isalnum():
+        # A footgun, not a silent failure: it fires exactly as written, and the
+        # trigger is matched against the head of every inbound message, so an
+        # ordinary word swallows any message that opens with it.
+        return (
+            "warn",
+            "should start with punctuation, e.g. `$job` — a plain word "
+            "swallows every message beginning with it",
+        )
+    return None
+
+
+def _check_slack_job_command(command: str) -> CheckResult:
+    """Validate SLACK_JOB_COMMAND if set. It is optional, but a malformed one
+    costs nothing at startup and everything at runtime — see
+    `_job_command_error` for the three ways it goes wrong."""
+    problem = _job_command_error(command)
+    if problem is None:
+        return CheckResult(name="SLACK_JOB_COMMAND", status="ok", detail=command)
+    status, detail = problem
+    return CheckResult(
+        name="SLACK_JOB_COMMAND",
+        status=status,
+        detail=f"{command} {detail}",
+        fix_hint="Unset it to drop the background-job trigger, or pick a "
+        "punctuation-led value like `$job`",
     )
 
 
@@ -245,6 +345,18 @@ def resolve_slack_token(env: Mapping[str, str]) -> tuple[str | None, str]:
         if value:
             return name, value
     return None, ""
+
+
+def resolve_jobs_token(env: Mapping[str, str]) -> tuple[str | None, str]:
+    """Return (var_name, token) for the claude-jobs notifier's Slack bearer.
+
+    `JOBS_SLACK_TOKEN` overrides the shared `SLACK_TOKEN` so the worker can post
+    under a different identity than the acking frontend (deployer-controlled).
+    Falls back to `resolve_slack_token` (honoring the legacy aliases)."""
+    override = env.get("JOBS_SLACK_TOKEN", "")
+    if override:
+        return "JOBS_SLACK_TOKEN", override
+    return resolve_slack_token(env)
 
 
 def resolve_slack_ids(env: Mapping[str, str], preferred: str) -> set[str]:
@@ -317,6 +429,154 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
             )
         )
     return results
+
+
+# Mirrors `slack.DEFAULT_JOB_COMMAND`. Duplicated as a literal for the same
+# reason the turn-control prefixes are: importing `claude_on_the_fly.slack`
+# would pull slack_bolt into every checks import. Drift fails in
+# test_checks.py::test_job_command_default_matches_the_slack_constant.
+DEFAULT_JOB_COMMAND = "$job"
+
+
+def effective_job_command(env: Mapping[str, str]) -> str | None:
+    """The trigger this env actually produces, or None when jobs are off.
+
+    Absent means the default; present-but-blank is the opt-out. Same rule as
+    `slack._resolve_job_command`, applied to an arbitrary mapping so preflight
+    can reason about a daemon's environment before it starts.
+    """
+    return env.get("SLACK_JOB_COMMAND", DEFAULT_JOB_COMMAND) or None
+
+
+def check_jobs(env: Mapping[str, str]) -> list[CheckResult]:
+    """The worker's notifier needs a resolvable Slack bearer token, the queue
+    kind has to be one that exists, and something has to be able to enqueue."""
+    return [
+        _check_jobs_token(env),
+        _check_queue_kind(env),
+        _slack_job_producer_note(env),
+    ]
+
+
+def _check_queue_kind(env: Mapping[str, str]) -> CheckResult:
+    """Validate JOBS_QUEUE_KIND against the registry.
+
+    Blocking, and deliberately also part of `check_slack`: `make_queue()` raises
+    on an unknown kind, and the Slack frontend calls it while constructing the
+    producer. Without this the typo surfaces as a daemon that dies at startup
+    with a traceback — and it takes down *Slack*, not just jobs. Caught here it
+    is one legible line naming the kinds that exist.
+    """
+    from claude_on_the_fly.jobs.registry import SUPPORTED_QUEUES
+
+    kind = env.get("JOBS_QUEUE_KIND", "").strip().lower()
+    if not kind:
+        return CheckResult(name="JOBS_QUEUE_KIND", status="ok", detail="file (default)")
+    if kind in SUPPORTED_QUEUES:
+        return CheckResult(name="JOBS_QUEUE_KIND", status="ok", detail=kind)
+    return CheckResult(
+        name="JOBS_QUEUE_KIND",
+        status="invalid",
+        detail=f"{kind!r} is not a registered queue kind",
+        fix_hint=f"Use one of: {', '.join(sorted(SUPPORTED_QUEUES))}, or unset it",
+    )
+
+
+def _check_jobs_worker_reachable(env: Mapping[str, str]) -> CheckResult:
+    """Warn when Slack's job trigger is on but no worker is draining the queue.
+
+    `$job` acks "I'll reply here when it's done" the moment it enqueues. With no
+    worker that promise is never kept and nothing in the thread says so, which
+    is the worst shape a failure can take — it looks like it worked.
+
+    Advisory, not blocking: the worker may legitimately be started after the
+    frontend, and refusing to run Slack because a *different* daemon is down
+    would be the collateral damage this whole feature is gated to avoid.
+    """
+    from claude_on_the_fly.heartbeat import live_pid
+
+    pid = live_pid("jobs")
+    if pid is not None:
+        return CheckResult(
+            name="jobs worker", status="ok", detail=f"running (pid {pid})"
+        )
+    return CheckResult(
+        name="jobs worker",
+        status="warn",
+        detail=(
+            f"not running — {env.get('SLACK_JOB_COMMAND', '')} will ack jobs "
+            "that nothing drains"
+        ),
+        fix_hint="Start it: `claude-tui start jobs`",
+    )
+
+
+def _check_jobs_token(env: Mapping[str, str]) -> CheckResult:
+    """Honors JOBS_SLACK_TOKEN (worker-specific override) first, else the shared
+    SLACK_TOKEN via `_check_slack_bearer`. Same token-kind rules as slack — no
+    hardcoded identity, no mandated kind."""
+    override = env.get("JOBS_SLACK_TOKEN", "")
+    if not override:
+        return _check_slack_bearer(env)
+    if not override.startswith(("xoxp-", "xoxb-")):
+        return CheckResult(
+            name="JOBS_SLACK_TOKEN",
+            status="invalid",
+            detail="must start with 'xoxp-' (user) or 'xoxb-' (bot)",
+            fix_hint="Use the User or Bot OAuth Token from Slack admin",
+        )
+    kind = "bot" if override.startswith("xoxb-") else "user"
+    return CheckResult(name="JOBS_SLACK_TOKEN", status="ok", detail=f"set ({kind})")
+
+
+def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
+    """Report whether Slack can enqueue into this worker at all.
+
+    `claude-jobs doctor` runs `check_jobs`, never `check_slack`, so without this
+    line a worker whose SLACK_JOB_COMMAND is unset reports "all checks passed"
+    while nothing in Slack can ever reach it. A malformed value reports its
+    problem here too, because the doctor view renders the `slack` and `jobs`
+    groups on one screen (`tui/screens/doctor.py`) and a bare "producer on"
+    would contradict `check_slack`'s `invalid` row of the same name.
+
+    Explicitly disabled is `warn`, not a failure: an `enqueue`-only install is
+    legitimate — cron, a git hook, another tool shelling out — so the worker
+    must still start. But a worker no chat frontend can reach is a silent
+    no-op, and the operator deserves to be told which of the two they have.
+    """
+    raw = env.get("SLACK_JOB_COMMAND")
+    command = effective_job_command(env)
+    if command is None:
+        return CheckResult(
+            name="SLACK_JOB_COMMAND",
+            status="warn",
+            detail="disabled — only `claude-jobs enqueue` can reach this worker",
+            fix_hint="Unset SLACK_JOB_COMMAND to restore the default trigger "
+            f"`{DEFAULT_JOB_COMMAND}`",
+        )
+    if raw is None:
+        return CheckResult(
+            name="SLACK_JOB_COMMAND",
+            status="ok",
+            detail=f"Slack producer on ({command}, default)",
+        )
+    problem = _job_command_error(command)
+    if problem is None:
+        return CheckResult(
+            name="SLACK_JOB_COMMAND",
+            status="ok",
+            detail=f"Slack producer on ({command})",
+        )
+    # Report the reason and mirror the severity check_slack assigns it, so the
+    # two rows of this name on the doctor screen cannot disagree.
+    status, reason = problem
+    return CheckResult(
+        name="SLACK_JOB_COMMAND",
+        status=status,
+        detail=f"Slack producer misconfigured: {command} {reason}",
+        fix_hint="Unset it to drop the background-job trigger, or pick a "
+        "punctuation-led value like `$job`",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -458,15 +718,58 @@ def check_pty_setup() -> list[CheckResult]:
     return results
 
 
+# Environment variables the two shims are built around: the statusline shim
+# writes the sidecar, the Stop hook writes the envelope whose appearance is
+# pty's "turn done" signal. A script that names one is that shim; a script that
+# does not cannot satisfy the contract whatever it is called or wherever it
+# lives.
+PTY_SIDECAR_MARKER = "CLAUDE_PTY_SIDECAR"
+PTY_ENVELOPE_MARKER = "CLAUDE_PTY_ENVELOPE"
+# Bytes read from a wired script when identifying it. The markers sit in the
+# first few lines of both shims; this only has to be generous, not exact.
+PTY_SHIM_PROBE_BYTES = 64 * 1024
+
+
+def _is_pty_shim(command: str, marker: str) -> bool:
+    """Whether `command` refers to a script implementing pty's side of `marker`.
+
+    Read the script and look for the environment variable it must act on,
+    rather than matching the install path. The path told us which *install*
+    wired the hook, not whether a working one is wired — so a shim installed
+    anywhere else (a sibling tool vendoring the same project, a user's own
+    prefix) read as "missing" and took down every daemon that runs under
+    CLAUDE_MODE=pty, over a functioning setup.
+
+    Falls back to the install-path match when the script cannot be read, so an
+    unreadable-but-correctly-named shim is no worse off than before.
+    """
+    from claude_on_the_fly.backends.claude import PTY_PROJECT_SLUG
+
+    command = command.strip()
+    if not command:
+        return False
+    # The wired value can carry arguments; the script is the first field.
+    script = command.split()[0]
+    try:
+        with open(script, encoding="utf-8", errors="replace") as handle:
+            return marker in handle.read(PTY_SHIM_PROBE_BYTES)
+    except OSError:
+        return PTY_PROJECT_SLUG in command
+
+
 def check_pty_hooks() -> CheckResult:
     """Verify ~/.claude/settings.json wires pty's Stop hook + statusline shim.
 
     The two hooks are what make pty work — without them claude-pty hangs
     forever. install.sh writes them; this check catches a stale config.
+
+    Identified by what the wired scripts do, not where they were installed —
+    see `_is_pty_shim`. Several tools vendor the same shims into their own
+    prefixes and rewrite `statusLine.command` to their copy, so a path match
+    fails whenever the last writer was not the install this repo expects.
     """
     from claude_on_the_fly.backends.claude import (
         PTY_INSTALL_HINT,
-        PTY_PROJECT_SLUG,
     )
 
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
@@ -495,12 +798,12 @@ def check_pty_hooks() -> CheckResult:
     statusline_node = config.get("statusLine")
     if isinstance(statusline_node, dict):
         statusline_cmd = str(statusline_node.get("command", ""))
-    has_statusline = PTY_PROJECT_SLUG in statusline_cmd
+    has_statusline = _is_pty_shim(statusline_cmd, PTY_SIDECAR_MARKER)
 
     has_stop_hook = False
     for entry in config.get("hooks", {}).get("Stop", []) or []:
         for hook in entry.get("hooks", []) or []:
-            if PTY_PROJECT_SLUG in str(hook.get("command", "")):
+            if _is_pty_shim(str(hook.get("command", "")), PTY_ENVELOPE_MARKER):
                 has_stop_hook = True
                 break
         if has_stop_hook:
@@ -542,6 +845,7 @@ _ENV_CHECKERS: dict[str, Callable[[Mapping[str, str]], list[CheckResult]]] = {
     "telegram": check_telegram,
     "slack": check_slack,
     "gmail": check_gmail,
+    "jobs": check_jobs,
 }
 
 
@@ -591,13 +895,31 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
     }
 
 
+# Statuses that do not stop a daemon from starting. `warn` reports a setting
+# that works exactly as written but is likely not what its author meant — advice
+# worth surfacing in `doctor`, never a reason to refuse to run. `missing` and
+# `invalid` stay blocking: they describe a daemon that cannot do its job.
+NON_BLOCKING_STATUSES: frozenset[Status] = frozenset({"ok", "warn"})
+
+
+def is_blocking(result: CheckResult) -> bool:
+    """Whether this result should stop a daemon from starting.
+
+    The question every caller counting "problems" actually means. Advisory
+    `warn` results are worth printing and worth a yellow cell, but exiting 1 or
+    refusing a spawn over one turns advice into an outage.
+    """
+    return result.status not in NON_BLOCKING_STATUSES
+
+
 def first_failure(results: list[CheckResult]) -> CheckResult | None:
-    """Return the first non-ok result, or None if all passed."""
+    """Return the first blocking result, or None if none blocks startup."""
     for r in results:
-        if r.status != "ok":
+        if is_blocking(r):
             return r
     return None
 
 
 def all_ok(results: list[CheckResult]) -> bool:
-    return all(r.status == "ok" for r in results)
+    """True when nothing blocks startup. Advisory `warn` results do not."""
+    return all(r.status in NON_BLOCKING_STATUSES for r in results)

@@ -10,12 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
 import httpx
 
-from claude_on_the_fly import checks
+from claude_on_the_fly import agent, checks
 from claude_on_the_fly.checks import CheckResult
 
 logger = logging.getLogger(__name__)
@@ -332,6 +333,37 @@ def _setup_logging() -> None:
         level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+
+def setup_daemon_logging(platform: str) -> None:
+    """Console plus a daily-rotating `logs/<platform>.log`, 7-day retention.
+
+    The variant for daemons the TUI supervises: without a file handler there is
+    nothing for the dashboard to tail, which `_setup_logging` above (console
+    only) cannot provide. `basicConfig` sets the ROOT logger from LOG_LEVEL, so
+    both sinks share that level and the file handler's own DEBUG floor only
+    bites with LOG_LEVEL=DEBUG.
+    """
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format=log_fmt,
+    )
+    # Read through the module, not a from-import: agent.DATA_DIR binds
+    # Path.home() at import time, and tests redirect it by patching the
+    # attribute.
+    log_dir = agent.DATA_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        log_dir / f"{platform}.log",
+        when="midnight",
+        backupCount=7,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(log_fmt))
+    logging.getLogger().addHandler(file_handler)
 
 
 def run_telegram() -> tuple[str, int]:

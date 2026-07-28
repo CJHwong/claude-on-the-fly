@@ -95,6 +95,7 @@ async def _probe_skills(
         limit=16 * 1024 * 1024,
         start_new_session=True,
     )
+    agent.track_agent_process(proc, cmd)
     assert proc.stdout is not None
     try:
         line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
@@ -460,6 +461,7 @@ async def _exec_pty(
         limit=16 * 1024 * 1024,
         start_new_session=True,
     )
+    agent.track_agent_process(proc, cmd)
 
     async def _wait() -> tuple[bytes, bytes, int]:
         stdout, stderr = await proc.communicate()

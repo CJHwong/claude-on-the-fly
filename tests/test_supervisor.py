@@ -43,6 +43,17 @@ def _write_heartbeat(state_dir: Path, frontend: str, pid: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# frontend registry
+# ---------------------------------------------------------------------------
+
+
+class TestFrontendModule:
+    def test_jobs_runs_the_jobs_cli(self):
+        # Acceptance #16: claude-jobs is spawnable via `python -m <module>`.
+        assert supervisor._FRONTEND_MODULE["jobs"] == "claude_on_the_fly.jobs.cli"
+
+
+# ---------------------------------------------------------------------------
 # spawn
 # ---------------------------------------------------------------------------
 

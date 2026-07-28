@@ -24,6 +24,7 @@ claude-slack = "claude_on_the_fly.slack:main"
 claude-gmail = "claude_on_the_fly.gmail:main"
 claude-schedule = "claude_on_the_fly.scheduler:main"
 claude-symphony = "claude_on_the_fly.symphony.cli:main"
+claude-jobs = "claude_on_the_fly.jobs.cli:main"
 claude-tui = "claude_on_the_fly.tui.app:main"
 
 [dependency-groups]
