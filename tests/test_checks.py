@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +17,7 @@ from claude_on_the_fly.checks import (
     check_binaries,
     check_frontend,
     check_gmail,
+    check_pty_hooks,
     check_slack,
     check_telegram,
     first_failure,
@@ -417,3 +420,105 @@ class TestEnvVarDeclarations:
     def test_schedule_and_symphony_have_no_env_vars(self):
         assert FRONTEND_ENV_VARS["schedule"] == ()
         assert FRONTEND_ENV_VARS["symphony"] == ()
+
+
+# ---------------------------------------------------------------------------
+# check_pty_hooks — identifies the shims by contract, not install path
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPtyHooks:
+    """The wiring is what matters, not which install wrote it. Several tools
+    vendor the same two shims into their own prefixes and rewrite
+    `statusLine.command` to their copy; a path match then reports a working
+    setup as missing and takes down every daemon running under CLAUDE_MODE=pty.
+    """
+
+    def _shims(self, root: Path, *, prefix: str = "vendor-tool") -> tuple[Path, Path]:
+        """A statusline + Stop shim pair under an arbitrary install prefix."""
+        hooks = root / prefix / "hooks"
+        hooks.mkdir(parents=True)
+        statusline = hooks / "statusline.sh"
+        statusline.write_text(
+            '#!/usr/bin/env bash\nif [ -n "${CLAUDE_PTY_SIDECAR:-}" ]; then :; fi\n'
+        )
+        stop = hooks / "stop_envelope.sh"
+        stop.write_text(
+            '#!/usr/bin/env bash\nif [ -z "${CLAUDE_PTY_ENVELOPE:-}" ]; then exit 0; fi\n'
+        )
+        return statusline, stop
+
+    def _settings(self, root: Path, statusline: str, stop: str, monkeypatch) -> None:
+        config_dir = root / "claude-config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "statusLine": {"type": "command", "command": statusline},
+                    "hooks": {"Stop": [{"hooks": [{"command": stop}]}]},
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    def test_shims_under_a_foreign_prefix_are_accepted(self, tmp_path, monkeypatch):
+        """The regression: the path carries no `claude-interactive-p`, but both
+        scripts implement the contract, so pty works and the check must say so."""
+        statusline, stop = self._shims(tmp_path)
+        assert "claude-interactive-p" not in str(statusline)
+        self._settings(tmp_path, str(statusline), str(stop), monkeypatch)
+
+        result = check_pty_hooks()
+
+        assert result.status == "ok"
+
+    def test_a_statusline_that_is_not_a_shim_is_rejected(self, tmp_path, monkeypatch):
+        """Somebody's own statusline sitting in statusLine.command means pty's
+        sidecar is never written — the failure the check exists to catch."""
+        _, stop = self._shims(tmp_path)
+        plain = tmp_path / "my-statusline.sh"
+        plain.write_text('#!/usr/bin/env bash\necho "just a prompt"\n')
+        self._settings(tmp_path, str(plain), str(stop), monkeypatch)
+
+        result = check_pty_hooks()
+
+        assert result.status == "missing"
+        assert "statusLine shim" in result.detail
+        assert "Stop hook" not in result.detail
+
+    def test_a_stop_hook_that_is_not_a_shim_is_rejected(self, tmp_path, monkeypatch):
+        statusline, _ = self._shims(tmp_path)
+        other = tmp_path / "unrelated-hook.sh"
+        other.write_text("#!/usr/bin/env bash\necho hi\n")
+        self._settings(tmp_path, str(statusline), str(other), monkeypatch)
+
+        result = check_pty_hooks()
+
+        assert result.status == "missing"
+        assert "Stop hook" in result.detail
+
+    def test_a_command_with_arguments_still_resolves(self, tmp_path, monkeypatch):
+        statusline, stop = self._shims(tmp_path)
+        self._settings(tmp_path, f"{statusline} --quiet", str(stop), monkeypatch)
+
+        assert check_pty_hooks().status == "ok"
+
+    def test_unreadable_script_falls_back_to_the_install_path(
+        self, tmp_path, monkeypatch
+    ):
+        """No worse than before: a shim that cannot be read but sits on the
+        canonical install path is still recognised."""
+        _, stop = self._shims(tmp_path)
+        ghost = tmp_path / "claude-interactive-p" / "hooks" / "statusline.sh"
+        self._settings(tmp_path, str(ghost), str(stop), monkeypatch)
+
+        assert not ghost.exists()
+        assert check_pty_hooks().status == "ok"
+
+    def test_missing_settings_file_is_reported(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nowhere"))
+
+        result = check_pty_hooks()
+
+        assert result.status == "missing"
+        assert "no settings.json" in result.detail

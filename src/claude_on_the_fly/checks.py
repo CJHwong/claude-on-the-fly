@@ -458,15 +458,58 @@ def check_pty_setup() -> list[CheckResult]:
     return results
 
 
+# Environment variables the two shims are built around: the statusline shim
+# writes the sidecar, the Stop hook writes the envelope whose appearance is
+# pty's "turn done" signal. A script that names one is that shim; a script that
+# does not cannot satisfy the contract whatever it is called or wherever it
+# lives.
+PTY_SIDECAR_MARKER = "CLAUDE_PTY_SIDECAR"
+PTY_ENVELOPE_MARKER = "CLAUDE_PTY_ENVELOPE"
+# Bytes read from a wired script when identifying it. The markers sit in the
+# first few lines of both shims; this only has to be generous, not exact.
+PTY_SHIM_PROBE_BYTES = 64 * 1024
+
+
+def _is_pty_shim(command: str, marker: str) -> bool:
+    """Whether `command` refers to a script implementing pty's side of `marker`.
+
+    Read the script and look for the environment variable it must act on,
+    rather than matching the install path. The path told us which *install*
+    wired the hook, not whether a working one is wired — so a shim installed
+    anywhere else (a sibling tool vendoring the same project, a user's own
+    prefix) read as "missing" and took down every daemon that runs under
+    CLAUDE_MODE=pty, over a functioning setup.
+
+    Falls back to the install-path match when the script cannot be read, so an
+    unreadable-but-correctly-named shim is no worse off than before.
+    """
+    from claude_on_the_fly.backends.claude import PTY_PROJECT_SLUG
+
+    command = command.strip()
+    if not command:
+        return False
+    # The wired value can carry arguments; the script is the first field.
+    script = command.split()[0]
+    try:
+        with open(script, encoding="utf-8", errors="replace") as handle:
+            return marker in handle.read(PTY_SHIM_PROBE_BYTES)
+    except OSError:
+        return PTY_PROJECT_SLUG in command
+
+
 def check_pty_hooks() -> CheckResult:
     """Verify ~/.claude/settings.json wires pty's Stop hook + statusline shim.
 
     The two hooks are what make pty work — without them claude-pty hangs
     forever. install.sh writes them; this check catches a stale config.
+
+    Identified by what the wired scripts do, not where they were installed —
+    see `_is_pty_shim`. Several tools vendor the same shims into their own
+    prefixes and rewrite `statusLine.command` to their copy, so a path match
+    fails whenever the last writer was not the install this repo expects.
     """
     from claude_on_the_fly.backends.claude import (
         PTY_INSTALL_HINT,
-        PTY_PROJECT_SLUG,
     )
 
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
@@ -495,12 +538,12 @@ def check_pty_hooks() -> CheckResult:
     statusline_node = config.get("statusLine")
     if isinstance(statusline_node, dict):
         statusline_cmd = str(statusline_node.get("command", ""))
-    has_statusline = PTY_PROJECT_SLUG in statusline_cmd
+    has_statusline = _is_pty_shim(statusline_cmd, PTY_SIDECAR_MARKER)
 
     has_stop_hook = False
     for entry in config.get("hooks", {}).get("Stop", []) or []:
         for hook in entry.get("hooks", []) or []:
-            if PTY_PROJECT_SLUG in str(hook.get("command", "")):
+            if _is_pty_shim(str(hook.get("command", "")), PTY_ENVELOPE_MARKER):
                 has_stop_hook = True
                 break
         if has_stop_hook:
