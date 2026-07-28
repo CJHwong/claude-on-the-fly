@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -80,10 +81,14 @@ def prompt_consent(
 def run_installer(
     *,
     runner=subprocess.run,
+    extra_env: Mapping[str, str] | None = None,
+    what: str = "claude-pty installed",
 ) -> tuple[bool, str]:
     """Pipe the canonical install script through bash. Returns (ok, message).
 
     `runner` is injectable for tests so we can avoid actually shelling out.
+    `extra_env` layers over the current environment, which is how the
+    hooks-only refresh reaches install.sh's `CLAUDE_PTY_NO_STATUSLINE` switch.
     """
     if not shutil.which("curl"):
         return False, "curl not on PATH"
@@ -97,13 +102,54 @@ def run_installer(
             capture_output=True,
             text=True,
             timeout=180,
+            env={**os.environ, **(extra_env or {})},
         )
     except subprocess.TimeoutExpired:
         return False, "installer timed out after 180s"
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip() or f"exit {proc.returncode}"
         return False, f"installer failed: {detail}"
-    return True, "claude-pty installed"
+    return True, what
+
+
+# install.sh switches for a hooks-only run. NO_STATUSLINE is the important one:
+# a full run rewrites `statusLine.command` to its own copy, and more than one
+# tool vendors these shims, so a daemon doing that at every startup would take
+# the key off whichever tool wired it last — and that tool would take it back on
+# its own next start. Splicing only the hooks leaves ownership where it is.
+# YES skips the confirm prompt, which reads /dev/tty and so would otherwise be
+# skipped anyway under a daemon; setting it makes that explicit rather than
+# incidental.
+HOOKS_ONLY_ENV = {"CLAUDE_PTY_NO_STATUSLINE": "1", "CLAUDE_PTY_YES": "1"}
+# Set to 0/false/no to stop preflight touching settings.json. On by default:
+# this only runs when the hook set is already incomplete, i.e. when pty
+# compaction is already broken.
+AUTO_REFRESH_VAR = "COTF_PTY_AUTO_REFRESH"
+
+
+def auto_refresh_enabled() -> bool:
+    """Whether preflight may re-splice pty's hooks when they're incomplete."""
+    return os.environ.get(AUTO_REFRESH_VAR, "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def refresh_hooks(*, runner=subprocess.run) -> tuple[bool, str]:
+    """Re-run the installer for its hooks only, leaving statusLine alone.
+
+    For an install whose binary is fine but whose hook set predates a hook we
+    need (currently PostCompact, without which a pty compaction hangs). Never
+    raises and never blocks: the caller logs the outcome and carries on, because
+    ordinary turns work either way.
+    """
+    return run_installer(
+        runner=runner,
+        extra_env=HOOKS_ONLY_ENV,
+        what="claude-pty hooks re-spliced (statusLine left untouched)",
+    )
 
 
 def ensure_pty_installed(

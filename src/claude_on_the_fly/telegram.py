@@ -120,6 +120,11 @@ class TelegramFrontend(Frontend):
         self._app = Application.builder().token(self._token).build()
         self._app.add_handler(CommandHandler("new", self._cmd_new))
         self._app.add_handler(CommandHandler("status", self._cmd_status))
+        # A real bot command rather than Slack's `$compact` text prefix: Telegram
+        # delivers slash commands everywhere, so the `$` workaround Slack needs
+        # (its own slash commands are blocked inside threads) buys nothing here,
+        # and a command shows up in the client's command menu.
+        self._app.add_handler(CommandHandler("compact", self._cmd_compact))
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.Document.ALL | filters.PHOTO)
@@ -296,6 +301,24 @@ class TelegramFrontend(Frontend):
             # Keep the session UUID in step with the workspace suffix.
             self._orchestrator.set_session_token(chat_id, token)
         await update.message.reply_text(f"New session ({token}).")
+
+    async def _cmd_compact(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Summarize this chat's history so later turns stop re-paying for it.
+
+        Queued as a turn rather than run here, so it takes its place in FIFO order
+        and reports through the same path a reply does. Auto-compaction already
+        reached Telegram (it lives in `Orchestrator.on_message`); without this it
+        could fire with nothing the user could do to trigger — or to expect — it.
+        """
+        if not self._allowed(update) or not update.message or not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        if not self._orchestrator:
+            await update.message.reply_text("Not connected to a session yet.")
+            return
+        await self._orchestrator.on_compact(chat_id)
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:

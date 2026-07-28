@@ -9,9 +9,10 @@ import os
 import shutil
 from pathlib import Path
 
-from claude_on_the_fly import agent, pricing, transcript
+from claude_on_the_fly import agent, checks, pricing, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
+    Compaction,
     OllamaLauncher,
     Response,
     build_system_prompt,
@@ -28,6 +29,115 @@ PTY_INSTALL_HINT = (
     f"curl -fsSL https://raw.githubusercontent.com/CJHwong/"
     f"{PTY_PROJECT_SLUG}/main/install.sh | bash"
 )
+# claude's own slash command, sent as the prompt. Runs the real compaction and
+# writes a `compact_boundary` into the session transcript.
+COMPACT_PROMPT = "/compact"
+# Cap for a compaction when the caller sets none. The chat frontends all leave
+# `timeout_for` at its default of None, which the executors read as "wait with no
+# deadline" — fine for a turn a human is watching, wrong for this: a compaction
+# is a single summarization pass (measured at 8-22s, minutes on a very large
+# thread), and the drain loop is serial per chat, so an unbounded one wedges
+# every message queued behind it.
+COMPACT_TIMEOUT = 900.0
+
+
+def _last_compact_boundary(path: Path | None) -> dict:
+    """`compactMetadata` from the newest `compact_boundary` in a transcript.
+
+    Streams the file rather than reading it whole: this runs right after a
+    compaction, which is exactly when the transcript is at its largest. Empty
+    dict when the file is unreadable or has never been compacted.
+    """
+    if path is None:
+        return {}
+    found: dict = {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                # Cheap reject before paying for json.loads on every record.
+                if '"compact_boundary"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("subtype") == "compact_boundary":
+                    found = record.get("compactMetadata") or {}
+    except OSError as exc:
+        logger.warning("compact: could not read %s: %s", path, exc)
+    return found
+
+
+def _native_context_fields(cli_output: dict) -> dict:
+    """Prompt size and model window from a `claude -p` result envelope.
+
+    The pty statusline hands these over ready-made; native has to add them up,
+    which is the only reason this looks like arithmetic. All three usage terms
+    count: `tokens_in` deliberately omits `cache_creation_input_tokens` (it
+    measures what a turn read), but a cold cache puts most of the prompt in
+    exactly that term — 22k of 40k on a real turn here — so an auto-compact gate
+    built on `tokens_in` would under-read the prompt by about half in the case it
+    exists to catch.
+
+    `modelUsage` lists every model a turn touched, sub-agents included. The
+    top-level `usage` is the main session's, so pair it with the widest window
+    listed: a sub-agent's smaller one would overstate how full the context is,
+    and for a feature that spends money to act, over-reading is the costly
+    direction. Empty dict when either number is missing, which reads downstream
+    as "no reading" rather than as zero.
+    """
+    usage = cli_output.get("usage") or {}
+    tokens = (
+        int(usage.get("input_tokens", 0))
+        + int(usage.get("cache_read_input_tokens", 0))
+        + int(usage.get("cache_creation_input_tokens", 0))
+    )
+    windows = [
+        int(entry.get("contextWindow", 0))
+        for entry in (cli_output.get("modelUsage") or {}).values()
+        if isinstance(entry, dict) and entry.get("contextWindow")
+    ]
+    if not tokens or not windows:
+        return {}
+    return {"context_tokens": tokens, "context_window_size": max(windows)}
+
+
+def _billable_usage(cli_output: dict) -> tuple[int, int, int, int]:
+    """`(input, output, cache_read, cache_write)` — non-overlapping, for pricing.
+
+    Deliberately not derived from `_extract_tokens`: its `tokens_in` folds cache
+    reads into one display figure (the footer's `↑72.0k`, which is what a reader
+    wants), and `pricing.cost_for` needs the buckets kept apart so each is billed
+    at its own rate. Two jobs that happen to read the same `usage` block.
+    """
+    usage = cli_output.get("usage") or {}
+    return (
+        int(usage.get("input_tokens", 0)),
+        int(usage.get("output_tokens", 0)),
+        int(usage.get("cache_read_input_tokens", 0)),
+        int(usage.get("cache_creation_input_tokens", 0)),
+    )
+
+
+def _compaction_from(cli_output: dict, session_path: Path | None) -> Compaction:
+    """Read a compaction's outcome out of a finished `-p` run.
+
+    The stream's `compact_result` decides success; the transcript's boundary
+    supplies the numbers. A claude build that stops emitting those status events
+    would land here as a failure with an empty error — the compaction still
+    happened, only the report would be wrong.
+    """
+    compact = cli_output.get("compact") or {}
+    if compact.get("result") != "success":
+        error = compact.get("error") or (cli_output.get("result") or "").strip()
+        return Compaction(ok=False, error=error)
+    meta = _last_compact_boundary(session_path)
+    return Compaction(
+        ok=True,
+        pre_tokens=int(meta.get("preTokens", 0)),
+        post_tokens=int(meta.get("postTokens", 0)),
+        duration=int(meta.get("durationMs", 0)) / 1000,
+    )
 
 
 def _session_has_content(path: Path) -> bool:
@@ -211,26 +321,7 @@ class ClaudeBackend:
             base = self._pty_base_argv()
             executor = _exec_pty
         else:
-            # `ollama launch claude` already invokes the claude binary; repeating
-            # "claude" after `--` would make it argv[1], which -p mode parses as
-            # the prompt and silently drops the real one.
-            prefix = self.launcher.prefix("claude") if self.launcher else []
-            binary = [] if self.launcher else ["claude"]
-            # Empty/unset CLAUDE_MODEL → omit --model and let the claude CLI use
-            # its own default (don't pin sonnet).
-            _model = "" if self.launcher else os.environ.get("CLAUDE_MODEL", "").strip()
-            model_args = ["--model", _model] if _model else []
-            base = [
-                *prefix,
-                *binary,
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--permission-mode",
-                "bypassPermissions",
-                *model_args,
-            ]
+            base = self._native_base_argv()
             executor = agent._exec
 
         # Pick --resume vs --session-id deterministically by checking whether
@@ -281,6 +372,19 @@ class ClaudeBackend:
         cli_output = await executor(workspace, argv, timeout=timeout)
 
         body = (cli_output.get("result") or "").strip()
+        if not body and (cli_output.get("compact") or {}).get("result"):
+            # A compaction reports `subtype: "success"` with an empty `result`,
+            # which is byte-identical to a turn that died producing nothing. The
+            # nudge below would then spend a second billed turn asking for a
+            # reply that was never owed, and post its answer as if it were one.
+            # Reaching here means someone sent "/compact" as ordinary text
+            # rather than going through `compact()`; report it and stop.
+            logger.info("agent.run: prompt was a compaction, skipping the nudge")
+            return Response(
+                body=_compaction_from(cli_output, None).summary(),
+                cost=cli_output.get("total_cost_usd", 0),
+                duration=cli_output.get("duration_ms", 0) / 1000,
+            )
         if not body:
             logger.warning(
                 "agent.run: empty result, retrying with nudge, session=%s", session_uuid
@@ -308,15 +412,47 @@ class ClaudeBackend:
         # the OpenRouter registry instead, matching how the codex backend
         # handles its own cost. Native and pty modes keep the CLI's value,
         # which reflects Anthropic's real billing.
+        # Cached prompt tokens are priced separately, and they are not a rounding
+        # error: a thread that goes quiet past the cache TTL re-establishes its
+        # whole prompt, so cache *writes* become the largest term on the turn that
+        # brings it back. Folding them into the prompt rate — or dropping them, as
+        # `tokens_in` does — was 42% out on a measured turn.
         if self.launcher is not None:
+            billable_in, billable_out, cache_read, cache_write = _billable_usage(
+                cli_output
+            )
             cost = (
-                await asyncio.to_thread(pricing.cost_for, model, tokens_in, tokens_out)
+                await asyncio.to_thread(
+                    pricing.cost_for,
+                    model,
+                    billable_in,
+                    billable_out,
+                    cache_read,
+                    cache_write,
+                )
                 or 0
             )
         else:
             cost = cli_output.get("total_cost_usd", 0)
 
         statusline = cli_output.get("statusline") or {}
+        extra = _statusline_response_fields(statusline)
+        if not self.pty and self.launcher is None:
+            # pty already has these from the statusline, and its top-level
+            # `usage` is the last assistant message only (see `_extract_tokens`),
+            # so deriving them there would understate a multi-turn prompt.
+            #
+            # Withheld in ollama mode for the same reason the cost above is
+            # recomputed there: the claude CLI reports `contextWindow` from its
+            # own table even when ollama is serving some other vendor's model, so
+            # the figure describes a model that isn't answering (200000 observed
+            # for glm-5.2:cloud). Cost has a real substitute in the OpenRouter
+            # registry; a context window has none. Reporting nothing leaves the
+            # auto-compact gate with no reading, which switches it off in this
+            # mode rather than thresholding against a made-up denominator —
+            # over-reading is the direction that spends money. `$compact` is
+            # unaffected: it is asked for, and the CLI does the real work.
+            extra.update(_native_context_fields(cli_output))
 
         return Response(
             body=body,
@@ -327,8 +463,98 @@ class ClaudeBackend:
             model=model,
             tool_counts=cli_output.get("tool_counts", {}),
             skill_counts=cli_output.get("skill_counts", {}),
-            **_statusline_response_fields(statusline),
+            **extra,
         )
+
+    def _native_base_argv(self) -> list[str]:
+        """`claude -p` argv minus the prompt and --system-prompt."""
+        # `ollama launch claude` already invokes the claude binary; repeating
+        # "claude" after `--` would make it argv[1], which -p mode parses as
+        # the prompt and silently drops the real one.
+        prefix = self.launcher.prefix("claude") if self.launcher else []
+        binary = [] if self.launcher else ["claude"]
+        # Empty/unset CLAUDE_MODEL → omit --model and let the claude CLI use
+        # its own default (don't pin sonnet).
+        model = "" if self.launcher else os.environ.get("CLAUDE_MODEL", "").strip()
+        model_args = ["--model", model] if model else []
+        return [
+            *prefix,
+            *binary,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "bypassPermissions",
+            *model_args,
+        ]
+
+    async def compact(
+        self,
+        workspace: Path,
+        session_uuid: str,
+        timeout: float | None = DEFAULT_TIMEOUT,
+    ) -> Compaction | None:
+        """Compact the session in place. None when there's no session yet.
+
+        Runs in whichever mode this backend is in — a pty backend compacts
+        through claude-pty, not through `claude -p`. Mixing them would forfeit
+        what pty is for: an operator can `tmux attach` to a live turn, and a
+        compaction is the longest and priciest thing a thread does, so it is the
+        worst one to make invisible. The two also resolve their own settings
+        (effort, fast mode, output style), so a `-p` compaction could summarize a
+        conversation under settings the conversation never ran under.
+
+        pty needs `hooks/postcompact_envelope.sh` from claude-interactive-p to do
+        this at all: a compaction produces no assistant message, so pty's usual
+        **Stop** hook never fires and its envelope never appears. Without that
+        hook the run hangs until `timeout` (an hour by default) — which is what
+        `checks.check_pty_hooks` warns about before a daemon ever gets here.
+        """
+        session_path = self.session_log_path(workspace, session_uuid)
+        if session_path is None:
+            # Not the same as "this backend can't compact" — claude can, there is
+            # simply nothing here yet. Returning None would collapse the two and
+            # tell a claude user their backend has no compaction.
+            logger.info("compact: no session %s yet, nothing to do", session_uuid)
+            return Compaction(
+                ok=False,
+                error="this thread has no session yet, so there is nothing to compact",
+            )
+        if self.pty:
+            if not checks.pty_postcompact_hook_wired():
+                # Refuse in milliseconds rather than wait forever. The frontends
+                # pass no timeout, so `_exec_pty` would skip `wait_for` and block
+                # this chat's serial drain until someone sent $stop.
+                logger.warning("compact: claude-pty has no PostCompact hook, refusing")
+                return Compaction(
+                    ok=False,
+                    error=(
+                        "claude-pty can't finish a compaction without its PostCompact "
+                        f"hook, so I didn't start one. Update it: {PTY_INSTALL_HINT}"
+                    ),
+                )
+            base, executor = self._pty_base_argv(), _exec_pty
+        else:
+            base, executor = self._native_base_argv(), agent._exec
+        argv = [*base, "--resume", session_uuid, COMPACT_PROMPT]
+        # A compaction is one summarization pass, not open-ended agent work, so
+        # it gets a cap of its own even when the caller passes None (which the
+        # chat frontends all do, and which means "no timeout" downstream).
+        deadline = timeout if timeout is not None else COMPACT_TIMEOUT
+        logger.info(
+            "compact: session=%s pty=%s timeout=%s", session_uuid, self.pty, deadline
+        )
+        cli_output = await executor(workspace, argv, timeout=deadline)
+        result = _compaction_from(cli_output, session_path)
+        logger.info(
+            "compact: session=%s ok=%s %s→%s tokens",
+            session_uuid,
+            result.ok,
+            result.pre_tokens,
+            result.post_tokens,
+        )
+        return result
 
     def _pty_base_argv(self) -> list[str]:
         """claude-pty argv minus the prompt and --system-prompt; the caller appends
@@ -430,6 +656,15 @@ def _statusline_response_fields(statusline: dict) -> dict:
         out["rate_limits_7d_resets_at"] = int(seven["resets_at"])
     if "used_percentage" in cw:
         out["context_window_pct"] = int(cw["used_percentage"])
+    # The absolutes the auto-compact gate thresholds on. `total_input_tokens` is
+    # the whole prompt, so it never drops below the system prompt and tool
+    # schemas (tens of thousands of tokens) however hard the conversation is
+    # compacted — the floor is a property of the model, hence carrying the
+    # window size alongside rather than a bare percentage.
+    if "total_input_tokens" in cw:
+        out["context_tokens"] = int(cw["total_input_tokens"])
+    if "context_window_size" in cw:
+        out["context_window_size"] = int(cw["context_window_size"])
     if "exceeds_200k_tokens" in statusline:
         out["exceeds_200k"] = bool(statusline["exceeds_200k_tokens"])
     if "fast_mode" in statusline:

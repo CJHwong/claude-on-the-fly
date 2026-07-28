@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from claude_on_the_fly import pty_install
 
 
@@ -136,3 +138,68 @@ def test_prompt_consent_returns_false_on_eof() -> None:
         raise EOFError
 
     assert pty_install.prompt_consent(is_tty=True, input_fn=boom) is False
+
+
+class TestHooksOnlyRefresh:
+    """Re-splicing hooks on an install whose binary is fine but whose hook set
+    predates PostCompact. The binary-missing gate cannot see that case."""
+
+    def test_passes_the_no_statusline_switch(self):
+        """The whole point: a full install run rewrites statusLine.command, and
+        more than one tool vendors these shims — a daemon doing that every
+        startup would take the key off whichever tool wired it last."""
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        ok, _ = pty_install.refresh_hooks(runner=runner)
+
+        assert ok is True
+        assert captured["env"]["CLAUDE_PTY_NO_STATUSLINE"] == "1"
+
+    def test_inherits_the_rest_of_the_environment(self, monkeypatch):
+        """CLAUDE_CONFIG_DIR decides which settings.json install.sh writes, so
+        dropping the ambient environment would splice into the wrong config."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        pty_install.refresh_hooks(runner=runner)
+
+        assert captured["env"]["CLAUDE_CONFIG_DIR"] == "/somewhere/else"
+
+    def test_reports_installer_failure_without_raising(self):
+        def runner(cmd, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+        ok, message = pty_install.refresh_hooks(runner=runner)
+
+        assert ok is False
+        assert "boom" in message
+
+    def test_enabled_by_default(self, monkeypatch):
+        monkeypatch.delenv(pty_install.AUTO_REFRESH_VAR, raising=False)
+        assert pty_install.auto_refresh_enabled() is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF"])
+    def test_opt_out_values(self, monkeypatch, value):
+        monkeypatch.setenv(pty_install.AUTO_REFRESH_VAR, value)
+        assert pty_install.auto_refresh_enabled() is False
+
+    def test_full_install_still_rewrites_statusline(self):
+        """The refresh is the only caller that opts out; a genuine first install
+        must still wire the shim or pty has no sidecar at all."""
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        pty_install.run_installer(runner=runner)
+
+        assert "CLAUDE_PTY_NO_STATUSLINE" not in captured["env"]

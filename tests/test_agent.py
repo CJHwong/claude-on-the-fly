@@ -23,6 +23,7 @@ from claude_on_the_fly.agent import (
     OUTBOX_ARCHIVE,
     OUTBOX_DIRNAME,
     ClaudeUnavailableError,
+    Compaction,
     OllamaLauncher,
     Response,
     _classify,
@@ -71,6 +72,39 @@ def _tool_use(name: str, **input_fields) -> dict:
         "name": name,
         "input": input_fields,
     }
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+
+class TestCompaction:
+    def test_saved_tokens_is_the_difference(self):
+        c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162)
+        assert c.saved_tokens == 48939 - 5162
+
+    def test_saved_tokens_never_goes_negative(self):
+        """A compaction that grew the conversation is nonsense, not a credit."""
+        assert Compaction(ok=True, pre_tokens=100, post_tokens=500).saved_tokens == 0
+
+    def test_summary_reports_both_sides_and_the_wait(self):
+        c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162, duration=10.8)
+        assert c.summary() == (
+            "Compacted the conversation: 48,939 → 5,162 tokens in 11s."
+        )
+
+    def test_summary_without_numbers_still_says_it_happened(self):
+        """The transcript boundary is the only source of the numbers; a
+        successful compaction whose boundary couldn't be read is still a success."""
+        assert Compaction(ok=True).summary() == "Compacted the conversation."
+
+    def test_summary_prefers_the_clis_own_refusal(self):
+        c = Compaction(ok=False, error="Not enough messages to compact.")
+        assert c.summary() == "Couldn't compact: Not enough messages to compact."
+
+    def test_summary_falls_back_when_there_is_no_reason(self):
+        assert Compaction(ok=False).summary() == "Nothing to compact."
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +711,49 @@ class TestParseStream:
         assert out["tool_counts"] == {}
         assert out["skill_counts"] == {}
 
+    def test_ordinary_turn_reports_no_compaction(self):
+        stream = _ndjson(_result_line(result="done"))
+        assert parse_stream(stream)["compact"] == {}
+
+    def test_compaction_status_events_are_captured(self):
+        """The only in-band way to tell a compaction from a dead turn: both end
+        with `subtype: "success"` and an empty `result`."""
+        stream = _ndjson(
+            {"type": "system", "subtype": "status", "status": "compacting"},
+            {
+                "type": "system",
+                "subtype": "status",
+                "status": None,
+                "compact_result": "success",
+            },
+            _result_line(result=""),
+        )
+        out = parse_stream(stream)
+        assert out["compact"] == {"started": True, "result": "success"}
+
+    def test_failed_compaction_carries_the_clis_own_reason(self):
+        stream = _ndjson(
+            {"type": "system", "subtype": "status", "status": "compacting"},
+            {
+                "type": "system",
+                "subtype": "status",
+                "status": None,
+                "compact_result": "failed",
+                "compact_error": "Not enough messages to compact.",
+            },
+            _result_line(result="Not enough messages to compact."),
+        )
+        out = parse_stream(stream)
+        assert out["compact"]["result"] == "failed"
+        assert out["compact"]["error"] == "Not enough messages to compact."
+
+    def test_unrelated_status_events_do_not_look_like_a_compaction(self):
+        stream = _ndjson(
+            {"type": "system", "subtype": "status", "status": "thinking"},
+            _result_line(result="done"),
+        )
+        assert "result" not in parse_stream(stream)["compact"]
+
     def test_tool_counts_across_multiple_assistant_messages(self):
         stream = _ndjson(
             _assistant_line(_tool_use("Read"), _tool_use("Read"), _tool_use("Bash")),
@@ -816,6 +893,7 @@ def _cli_output(
     duration_ms: int = 3000,
     input_tokens: int = 100,
     cache_read: int = 50,
+    cache_write: int = 0,
     output_tokens: int = 200,
     model: str = "claude-sonnet-4-20250514",
 ) -> dict:
@@ -826,6 +904,7 @@ def _cli_output(
         "usage": {
             "input_tokens": input_tokens,
             "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
             "output_tokens": output_tokens,
         },
         "modelUsage": {model: {"input_tokens": input_tokens}} if model else {},
@@ -1541,6 +1620,7 @@ class TestClaudeBackendLauncher:
             cost=0.99,  # nonsense Anthropic-priced value from CLI
             input_tokens=100,
             cache_read=50,
+            cache_write=400,
             output_tokens=200,
             model="deepseek-v4-flash:cloud",
         )
@@ -1560,7 +1640,13 @@ class TestClaudeBackendLauncher:
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
         assert resp.cost == 0.0042
-        mock_pricing.assert_called_once_with("deepseek-v4-flash:cloud", 150, 200)
+        # Four non-overlapping buckets, each billed at its own rate. This used to
+        # be `(model, 150, 200)` — cache reads folded into the prompt figure at
+        # the prompt rate, and the 400 cache-*write* tokens dropped on the floor,
+        # which understated a measured turn by 39-43%.
+        mock_pricing.assert_called_once_with(
+            "deepseek-v4-flash:cloud", 100, 200, 50, 400
+        )
 
     async def test_launcher_mode_unknown_model_yields_zero(self):
         """Local models (e.g. gpt-oss:20b) aren't in OpenRouter — cost is $0."""

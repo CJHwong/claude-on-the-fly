@@ -652,7 +652,7 @@ class TestStart:
 
         assert frontend._on_message is on_message
         assert frontend._app is mock_app
-        assert mock_app.add_handler.call_count == 4
+        assert mock_app.add_handler.call_count == 5
         mock_app.initialize.assert_awaited_once()
         mock_app.start.assert_awaited_once()
         mock_updater.start_polling.assert_awaited_once()
@@ -1133,3 +1133,69 @@ async def test_notify_queued_sends_text(frontend: TelegramFrontend) -> None:
     call_args = frontend._app.bot.send_message.call_args
     sent_text = call_args.kwargs["text"]
     assert "Queued (3 pending)" in sent_text
+
+
+# ============================================================
+# _cmd_compact
+# ============================================================
+
+
+class TestCmdCompact:
+    """A real bot command, not Slack's `$compact` text prefix: Telegram delivers
+    slash commands everywhere, so the `$` workaround buys nothing here."""
+
+    async def test_queues_a_compaction(self, frontend: TelegramFrontend) -> None:
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+
+        await frontend._cmd_compact(make_update(chat_id=5), MagicMock())
+
+        orch.on_compact.assert_awaited_once_with(5)
+
+    async def test_says_so_with_no_orchestrator(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._orchestrator = None
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_compact(update, MagicMock())
+
+        update.message.reply_text.assert_awaited()
+
+    async def test_ignores_an_unauthorized_user(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+
+        await frontend._cmd_compact(make_update(chat_id=5, user_id=999999), MagicMock())
+
+        orch.on_compact.assert_not_awaited()
+
+    async def test_the_handler_is_registered(self) -> None:
+        """Auto-compaction already reaches Telegram through the orchestrator;
+        without this command it could fire with no way to trigger or expect it."""
+        frontend = TelegramFrontend(token="fake-token", allowed_user_id=123)
+
+        mock_updater = MagicMock()
+        mock_updater.start_polling = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.initialize = AsyncMock()
+        mock_app.start = AsyncMock()
+        mock_app.updater = mock_updater
+        mock_builder = MagicMock()
+        mock_builder.token.return_value = mock_builder
+        mock_builder.build.return_value = mock_app
+
+        with patch("claude_on_the_fly.telegram.Application") as MockApp:
+            MockApp.builder.return_value = mock_builder
+            await frontend.start(AsyncMock())
+
+        registered = {
+            next(iter(call.args[0].commands))
+            for call in mock_app.add_handler.call_args_list
+            if getattr(call.args[0], "commands", None)
+        }
+        assert registered == {"new", "status", "compact"}

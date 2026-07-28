@@ -284,6 +284,10 @@ def _job_command_error(value: str) -> tuple[Status, str] | None:
         # dead: a bare "$stop" still aborts the turn while "$stop do the thing"
         # falls past it and queues a job — one prefix, two behaviours.
         return "invalid", "collides with the $stop turn-control prefix"
+    if value == "$compact":
+        # Same shape as $stop: exact-match, intercepted before the job branch, so
+        # a bare "$compact" compacts while "$compact <task>" queues a job.
+        return "invalid", "collides with the $compact turn-control prefix"
     if value == "$continue":
         # Intercepted *after* the job branch, so a trigger equal to it shadows
         # the reply soft-limit reset entirely — a gated thread could never be
@@ -610,7 +614,58 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
                 CheckResult(name="OLLAMA_MODEL", status="ok", detail=f"= {model}")
             )
 
+    auto_compact = _check_auto_compact(env, backend, mode)
+    if auto_compact is not None:
+        results.append(auto_compact)
+
     return results
+
+
+# Backend/mode pairs that can both compact and supply the prompt-size reading
+# the auto-compact gate thresholds on. The gap is claude's ollama mode, which
+# withholds the window on purpose (see `ClaudeBackend.run`) because the claude
+# CLI reports one for whichever model it thinks is answering rather than the one
+# ollama routed to — so the gate there has nothing trustworthy to compare
+# against however the threshold is set. codex reports both in its rollout.
+_AUTO_COMPACT_CAPABLE: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("claude", "native"),
+        ("claude", "pty"),
+        ("codex", "native"),
+        ("codex", "ollama"),
+    }
+)
+
+
+def _check_auto_compact(
+    env: Mapping[str, str], backend: str, mode: str
+) -> CheckResult | None:
+    """Report a threshold that is set but can never fire. None when unset.
+
+    Advisory: a setting that does nothing is not a reason to refuse to start,
+    but it is a reason to say so — silence here reads as a working setting, and
+    the whole point of the knob is to spend money in the background.
+    """
+    raw = env.get("COTF_AUTO_COMPACT_PCT", "").strip()
+    if not raw:
+        return None
+    if (backend, mode) in _AUTO_COMPACT_CAPABLE:
+        return CheckResult(
+            name="COTF_AUTO_COMPACT_PCT", status="ok", detail=f"= {raw}%"
+        )
+    return CheckResult(
+        name="COTF_AUTO_COMPACT_PCT",
+        status="warn",
+        detail=(
+            f"set to {raw}% but inert under {backend}/{mode} — the claude CLI "
+            "reports a context window for the wrong model under ollama, so the "
+            "reading is withheld"
+        ),
+        fix_hint=(
+            "Use CLAUDE_MODE=native or pty for automatic compaction; manual "
+            "compaction still works in every mode"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +735,7 @@ def check_pty_setup() -> list[CheckResult]:
     results.append(_which("jq", "Install: brew install jq (pty shells out to jq)"))
 
     results.append(check_pty_hooks())
+    results.append(check_pty_hook_paths())
     return results
 
 
@@ -690,6 +746,10 @@ def check_pty_setup() -> list[CheckResult]:
 # lives.
 PTY_SIDECAR_MARKER = "CLAUDE_PTY_SIDECAR"
 PTY_ENVELOPE_MARKER = "CLAUDE_PTY_ENVELOPE"
+# The PostCompact writer must gate on the compaction's trigger; see
+# `_has_pty_postcompact_hook` for why that, and not the envelope marker, is what
+# separates it from the Stop shim.
+PTY_TRIGGER_MARKER = ".trigger"
 # Bytes read from a wired script when identifying it. The markers sit in the
 # first few lines of both shims; this only has to be generous, not exact.
 PTY_SHIM_PROBE_BYTES = 64 * 1024
@@ -774,24 +834,132 @@ def check_pty_hooks() -> CheckResult:
         if has_stop_hook:
             break
 
-    if has_statusline and has_stop_hook:
-        return CheckResult(
-            name="claude-pty hooks",
-            status="ok",
-            detail="Stop hook + statusline shim wired",
-        )
-
     missing = []
     if not has_statusline:
         missing.append("statusLine shim")
     if not has_stop_hook:
         missing.append("Stop hook")
+    if missing:
+        return CheckResult(
+            name="claude-pty hooks",
+            status="missing",
+            detail=f"settings.json missing: {', '.join(missing)}",
+            fix_hint=PTY_INSTALL_HINT,
+        )
+
+    # The PostCompact hook is what lets a compaction finish under pty, and only
+    # that. Ordinary turns are unaffected, so this warns rather than blocks: an
+    # install predating the hook should keep running and just not compact.
+    # Checked by what the script does, like the others — but the envelope marker
+    # alone would also match the Stop shim, and the Stop shim in this slot is
+    # worse than nothing (it writes an envelope for the mid-turn `trigger:
+    # "auto"` compactions too, ending the turn early and returning the summary
+    # in place of the answer). Requiring the trigger gate as well tells the two
+    # apart, since stop_envelope.sh never reads `.trigger`.
+    if not _has_pty_postcompact_hook(config):
+        return CheckResult(
+            name="claude-pty hooks",
+            status="warn",
+            detail=(
+                "Stop hook + statusline shim wired, but no PostCompact hook — "
+                "$compact and auto-compaction would hang under CLAUDE_MODE=pty"
+            ),
+            fix_hint=f"Update claude-pty: {PTY_INSTALL_HINT}",
+        )
+
     return CheckResult(
         name="claude-pty hooks",
-        status="missing",
-        detail=f"settings.json missing: {', '.join(missing)}",
-        fix_hint=PTY_INSTALL_HINT,
+        status="ok",
+        detail="Stop + PostCompact hooks + statusline shim wired",
     )
+
+
+def check_pty_hook_paths() -> CheckResult:
+    """Report wired pty hooks whose script is gone.
+
+    install.sh only ever dedups its *own* path — deliberately, since several
+    tools vendor these shims and an entry this install did not write is not its
+    to delete. The cost is that a tool removed from disk leaves its hook wired
+    forever, and claude then tries to run a missing script on every turn.
+    Reported rather than repaired, for the same reason install.sh leaves it: the
+    entry belongs to whoever wrote it.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    settings_path = Path(config_dir) / "settings.json"
+    import json as _json
+
+    try:
+        config = _json.loads(settings_path.read_text())
+    except (_json.JSONDecodeError, OSError):
+        # check_pty_hooks already reports an unreadable/absent settings.json;
+        # a second row saying so would be noise.
+        return CheckResult(name="claude-pty hook paths", status="ok", detail="—")
+
+    wired: list[str] = []
+    for slot in ("Stop", "PostCompact"):
+        for entry in config.get("hooks", {}).get(slot, []) or []:
+            for hook in entry.get("hooks", []) or []:
+                command = str(hook.get("command", "")).strip()
+                if command:
+                    wired.append(command)
+
+    orphans = [c for c in wired if not Path(c.split()[0]).is_file()]
+    duplicates = {c for c in wired if wired.count(c) > 1}
+    problems = []
+    if orphans:
+        problems.append(f"{len(orphans)} orphaned ({', '.join(orphans)})")
+    if duplicates:
+        problems.append(
+            f"{len(duplicates)} duplicated ({', '.join(sorted(duplicates))})"
+        )
+    if not problems:
+        return CheckResult(
+            name="claude-pty hook paths",
+            status="ok",
+            detail=f"{len(wired)} wired, all present",
+        )
+    return CheckResult(
+        name="claude-pty hook paths",
+        status="warn",
+        detail="; ".join(problems),
+        fix_hint=(
+            "Remove the dead entries from settings.json, or run that tool's "
+            "uninstall.sh — re-running install.sh only tidies its own path"
+        ),
+    )
+
+
+def pty_postcompact_hook_wired() -> bool:
+    """Whether this machine's settings.json can finish a pty compaction.
+
+    Called on the compaction path itself, not only by the doctor: without the
+    hook a pty compaction never returns an envelope, and the frontends pass no
+    timeout, so the turn would wait forever and block every message queued
+    behind it. Cheaper to read one JSON file than to hang a thread.
+
+    Fails closed on an unreadable config — refusing with a message beats an
+    unbounded wait.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    import json as _json
+
+    try:
+        config = _json.loads((Path(config_dir) / "settings.json").read_text())
+    except (_json.JSONDecodeError, OSError):
+        return False
+    return _has_pty_postcompact_hook(config)
+
+
+def _has_pty_postcompact_hook(config: dict) -> bool:
+    """Whether settings.json wires a working pty PostCompact envelope writer."""
+    for entry in config.get("hooks", {}).get("PostCompact", []) or []:
+        for hook in entry.get("hooks", []) or []:
+            command = str(hook.get("command", ""))
+            if _is_pty_shim(command, PTY_ENVELOPE_MARKER) and _is_pty_shim(
+                command, PTY_TRIGGER_MARKER
+            ):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------

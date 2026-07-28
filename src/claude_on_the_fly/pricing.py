@@ -1,13 +1,19 @@
 """Model price-table lookup, backed by OpenRouter's public model registry.
 
 We fetch `https://openrouter.ai/api/v1/models` on demand and cache it at
-`~/.claude-on-the-fly/pricing/openrouter.json`. `cost_for(model, tokens_in,
-tokens_out)` returns USD or None when the model is not in the table.
+`~/.claude-on-the-fly/pricing/openrouter.json`. `cost_for(...)` returns USD or
+None when the model is not in the table.
 
 OpenRouter's keys are `<vendor>/<model>` (e.g. `deepseek/deepseek-v4-flash`).
-We strip the vendor prefix into a flat `model -> (input, output)` index so a
-plain name from our backends (e.g. `deepseek-v4-flash`) hits directly. Across
-the current ~360 entries there are zero stripped-name collisions.
+We strip the vendor prefix into a flat `model -> ModelPrice` index so a plain
+name from our backends (e.g. `deepseek-v4-flash`) hits directly. Across the
+current ~340 entries there are zero stripped-name collisions.
+
+Cached prompt tokens are priced separately because they dominate a long-running
+chat: a thread that goes quiet past the cache TTL re-establishes its whole
+prompt, and on one measured turn that was 37,570 write tokens against 2 plain
+input ones. Billing those at the prompt rate (or, worse, not at all) was a 42%
+error on a real turn.
 
 All failures fall through silently: pricing is a footer nicety, never a
 critical path. The Response.cost field stays 0 on any miss.
@@ -22,6 +28,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -35,9 +42,27 @@ FETCH_TIMEOUT_SECONDS = 5.0
 # Trailing snapshot date in a model name: `-YYYY-MM-DD` or `-YYYYMMDD`.
 _DATE_SUFFIX_RE = re.compile(r"-(\d{4}-\d{2}-\d{2}|\d{8})$")
 
+
+@dataclass(frozen=True)
+class ModelPrice:
+    """Per-token prices for one model.
+
+    `cache_read` and `cache_write` fall back to `prompt` rather than to zero when
+    a model publishes no cache rate. Most models in the registry don't publish a
+    write rate, and for those a cache write really is billed as ordinary prompt
+    input — falling back to zero would make the largest term on a cold thread
+    free, which is the opposite of true.
+    """
+
+    prompt: float
+    completion: float
+    cache_read: float
+    cache_write: float
+
+
 # Module-level memo: (cache_mtime, stripped_index). Invalidated when the cache
-# file's mtime changes. Index is `{stripped_name: (input_per_token, output_per_token)}`.
-_memo: tuple[float | None, dict[str, tuple[float, float]] | None] = (None, None)
+# file's mtime changes. Index is `{stripped_name: ModelPrice}`.
+_memo: tuple[float | None, dict[str, ModelPrice] | None] = (None, None)
 
 
 def _ttl_seconds() -> int:
@@ -56,13 +81,42 @@ def _strip_vendor(key: str) -> str:
     return key.split("/", 1)[1] if "/" in key else key
 
 
-def _build_index(payload: dict) -> dict[str, tuple[float, float]]:
-    """OpenRouter payload -> {stripped_name: (input_per_token, output_per_token)}.
+class _BadPrice(ValueError):
+    """A published price that can't be used: non-numeric, negative, or NaN.
 
-    Prefers non-zero entries when two vendor-prefixed keys strip to the same
-    name (defensive: today there are no such collisions across ~360 entries).
+    Distinct from an absent one. Absent means "not published" — for prompt and
+    completion that is how the registry spells a free model, and for the cache
+    keys it means fall back. Published-but-nonsense means the entry is corrupt,
+    and pricing off a corrupt entry is worse than reporting nothing.
     """
-    index: dict[str, tuple[float, float]] = {}
+
+
+def _price(block: dict, key: str) -> float | None:
+    """Per-token price, or None when the key is absent or null.
+
+    A published 0 is returned as 0.0, not None: some providers really do serve
+    cache reads for free, and that is worth honouring rather than overwriting
+    with a fallback.
+    """
+    raw = block.get(key)
+    if raw is None:
+        return None
+    try:
+        price = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise _BadPrice(key) from exc
+    if price < 0 or price != price:  # NaN fails its own equality
+        raise _BadPrice(key)
+    return price
+
+
+def _build_index(payload: dict) -> dict[str, ModelPrice]:
+    """OpenRouter payload -> {stripped_name: ModelPrice}.
+
+    Prefers priced entries when two vendor-prefixed keys strip to the same
+    name (defensive: today there are no such collisions across ~340 entries).
+    """
+    index: dict[str, ModelPrice] = {}
     raw_models = payload.get("data")
     if not isinstance(raw_models, list):
         return index
@@ -75,29 +129,43 @@ def _build_index(payload: dict) -> dict[str, tuple[float, float]]:
         pricing_block = entry.get("pricing")
         if not isinstance(pricing_block, dict):
             continue
-        prompt_raw = pricing_block.get("prompt")
-        completion_raw = pricing_block.get("completion")
+        # prompt/completion keep the original semantics exactly: absent reads as
+        # free (how a $0 model is expressed here), a corrupt one drops the entry.
         try:
-            input_price = float(prompt_raw) if prompt_raw is not None else 0.0
-            output_price = float(completion_raw) if completion_raw is not None else 0.0
-        except (TypeError, ValueError):
+            prompt_price = _price(pricing_block, "prompt") or 0.0
+            completion_price = _price(pricing_block, "completion") or 0.0
+        except _BadPrice:
             continue
-        if input_price < 0 or output_price < 0:
-            continue
-        if input_price != input_price or output_price != output_price:  # NaN
-            continue
+        # A corrupt cache rate is not fatal, unlike a corrupt prompt rate: falling
+        # back leaves the model priced as it was before cache rates were read at
+        # all, which beats losing the entry over a field we only just started
+        # consulting. Absent falls back the same way — see ModelPrice.
+        try:
+            cache_read = _price(pricing_block, "input_cache_read")
+        except _BadPrice:
+            cache_read = None
+        try:
+            cache_write = _price(pricing_block, "input_cache_write")
+        except _BadPrice:
+            cache_write = None
+        price = ModelPrice(
+            prompt=prompt_price,
+            completion=completion_price,
+            cache_read=cache_read if cache_read is not None else prompt_price,
+            cache_write=cache_write if cache_write is not None else prompt_price,
+        )
         stripped = _strip_vendor(model_id)
         existing = index.get(stripped)
         if existing is None or (
-            (input_price > 0 or output_price > 0)
-            and existing[0] == 0
-            and existing[1] == 0
+            (prompt_price > 0 or completion_price > 0)
+            and existing.prompt == 0
+            and existing.completion == 0
         ):
-            index[stripped] = (input_price, output_price)
+            index[stripped] = price
     return index
 
 
-def _read_cache() -> tuple[dict[str, tuple[float, float]], float] | None:
+def _read_cache() -> tuple[dict[str, ModelPrice], float] | None:
     """Load + index the cache file. Returns (index, mtime) or None on failure."""
     global _memo
     try:
@@ -167,7 +235,7 @@ def _fetch() -> dict | None:
     return payload
 
 
-def _get_index() -> dict[str, tuple[float, float]] | None:
+def _get_index() -> dict[str, ModelPrice] | None:
     """Resolve the stripped-name price index. Refreshes on miss/stale."""
     cached = _read_cache()
     ttl = _ttl_seconds()
@@ -223,12 +291,27 @@ def _candidates(model: str) -> list[str]:
     return out
 
 
-def cost_for(model: str, tokens_in: int, tokens_out: int) -> float | None:
+def cost_for(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float | None:
     """Compute USD cost for one turn, or None when pricing isn't available.
+
+    The four token counts must be **non-overlapping**. `input_tokens` is plain
+    uncached prompt input, so do not pass a display figure that already folds
+    cache reads in (`Response.tokens_in` is exactly such a figure) or those
+    tokens get billed twice, at the dearer rate.
+
+    The cache arguments default to 0 so a caller whose backend has no prompt
+    caching — codex — bills identically to before.
 
     Never raises — pricing is decorative. Caller should coalesce to 0.
     """
-    if not model or tokens_in < 0 or tokens_out < 0:
+    counts = (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+    if not model or any(count < 0 for count in counts):
         return None
     try:
         index = _get_index()
@@ -244,8 +327,12 @@ def cost_for(model: str, tokens_in: int, tokens_out: int) -> float | None:
             break
     if entry is None:
         return None
-    input_price, output_price = entry
-    cost = tokens_in * input_price + tokens_out * output_price
+    cost = (
+        input_tokens * entry.prompt
+        + output_tokens * entry.completion
+        + cache_read_tokens * entry.cache_read
+        + cache_write_tokens * entry.cache_write
+    )
     if cost <= 0:
         return None
     return cost

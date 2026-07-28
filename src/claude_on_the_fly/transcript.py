@@ -282,6 +282,39 @@ def extract_codex_cumulative_tokens(thread_id: str) -> dict | None:
     return latest
 
 
+def extract_codex_prompt_tokens(thread_id: str) -> tuple[int, int] | None:
+    """`(prompt_tokens, context_window)` for a codex thread's most recent turn.
+
+    Unlike `total_token_usage` above, `last_token_usage.input_tokens` is that
+    turn's own prompt — so it tracks how big the thread's context has become,
+    which is the number a compaction is supposed to shrink. Compaction itself
+    reports a turn with `input_tokens: 0`, so those are skipped: they describe
+    the compaction pass, not the context it left behind.
+
+    None when the rollout is missing or has no usable event. Codex publishes no
+    in-band compaction signal in `--json`, so comparing this before and after is
+    the only way to tell whether a compaction actually did anything.
+    """
+    rollout = _find_codex_rollout(thread_id)
+    if rollout is None:
+        return None
+    prompt: int | None = None
+    window = 0
+    for msg in _iter_jsonl(rollout):
+        if msg.get("type") != "event_msg":
+            continue
+        payload = msg.get("payload") or {}
+        if payload.get("type") != "token_count":
+            continue
+        info = payload.get("info") or {}
+        last = info.get("last_token_usage")
+        if isinstance(last, dict) and int(last.get("input_tokens") or 0) > 0:
+            prompt = int(last["input_tokens"])
+        if info.get("model_context_window"):
+            window = int(info["model_context_window"])
+    return (prompt, window) if prompt is not None else None
+
+
 def _render_line(turn: Turn) -> str:
     return f"{turn.role.capitalize()}: {turn.text}"
 

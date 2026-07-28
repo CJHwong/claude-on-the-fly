@@ -184,7 +184,59 @@ def check_pty_mode() -> None:
 
     results = _checks.check_pty_setup()
     _raise_on_failures(results)
+    results = _refresh_stale_pty_hooks(results)
+    for result in results:
+        if result.status == "warn":
+            logger.warning("claude-pty: %s", result.detail)
     logger.info("claude-pty mode: ok")
+
+
+def _refresh_stale_pty_hooks(results: list[CheckResult]) -> list[CheckResult]:
+    """Re-splice pty's hooks when the binary is fine but a hook is missing.
+
+    The binary-missing gate above can't catch this: `is_pty_installed()` only
+    asks whether `claude-pty` resolves, so an install whose hook set predates
+    PostCompact sails past it and pty compaction then hangs at runtime.
+
+    Hooks only — see `pty_install.HOOKS_ONLY_ENV` for why touching
+    `statusLine.command` from a daemon is the wrong move. Returns the re-checked
+    results, or the originals when nothing was attempted. Never raises: an
+    install too old to have the hook still runs ordinary turns, so a failed
+    refresh is a warning, not a startup failure.
+    """
+    from claude_on_the_fly import checks as _checks
+    from claude_on_the_fly import pty_install
+
+    stale = [r for r in results if r.name == "claude-pty hooks" and r.status == "warn"]
+    if not stale:
+        return results
+    if not pty_install.auto_refresh_enabled():
+        logger.warning(
+            "claude-pty: hooks incomplete and %s disables the refresh — %s",
+            pty_install.AUTO_REFRESH_VAR,
+            stale[0].fix_hint or "update claude-pty manually",
+        )
+        return results
+
+    logger.info("claude-pty: hooks incomplete, re-splicing (statusLine untouched)")
+    ok, message = pty_install.refresh_hooks()
+    logger.info("claude-pty: %s", message) if ok else logger.warning(
+        "claude-pty: hook refresh failed: %s", message
+    )
+    rechecked = _checks.check_pty_setup()
+    if (
+        any(r.name == "claude-pty hooks" and r.status == "warn" for r in rechecked)
+        and ok
+    ):
+        # The installer ran clean and the hook is still absent, so the published
+        # claude-pty simply doesn't have it yet. Say that outright rather than
+        # leaving the same warning to look like a failed write.
+        logger.warning(
+            "claude-pty: installer succeeded but the PostCompact hook is still "
+            "absent — the published claude-pty predates it. Compaction stays "
+            "off under CLAUDE_MODE=pty until it ships."
+        )
+    return rechecked
 
 
 def check_claude_cli() -> None:

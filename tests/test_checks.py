@@ -17,6 +17,7 @@ from claude_on_the_fly.checks import (
     check_binaries,
     check_frontend,
     check_jobs,
+    check_pty_hook_paths,
     check_pty_hooks,
     check_slack,
     check_telegram,
@@ -250,6 +251,7 @@ class TestCheckSlack:
 
         assert slack.STOP_COMMAND == "$stop"
         assert slack.CONTINUE_COMMAND == "$continue"
+        assert slack.COMPACT_COMMAND == "$compact"
 
     def test_slack_token_user(self):
         results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxp-1"})
@@ -607,14 +609,38 @@ class TestCheckPtyHooks:
         )
         return statusline, stop
 
-    def _settings(self, root: Path, statusline: str, stop: str, monkeypatch) -> None:
+    def _postcompact(self, root: Path, *, prefix: str = "vendor-tool") -> Path:
+        """A PostCompact envelope writer: writes the envelope, gated on trigger."""
+        hooks = root / prefix / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        script = hooks / "postcompact_envelope.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ -z "${CLAUDE_PTY_ENVELOPE:-}" ]; then exit 0; fi\n'
+            "trigger=$(jq -r '.trigger // \"\"')\n"
+        )
+        return script
+
+    def _settings(
+        self,
+        root: Path,
+        statusline: str,
+        stop: str,
+        monkeypatch,
+        postcompact: str | None = "auto",
+    ) -> None:
         config_dir = root / "claude-config"
         config_dir.mkdir(parents=True, exist_ok=True)
+        if postcompact == "auto":
+            postcompact = str(self._postcompact(root))
+        hooks: dict = {"Stop": [{"hooks": [{"command": stop}]}]}
+        if postcompact:
+            hooks["PostCompact"] = [{"hooks": [{"command": postcompact}]}]
         (config_dir / "settings.json").write_text(
             json.dumps(
                 {
                     "statusLine": {"type": "command", "command": statusline},
-                    "hooks": {"Stop": [{"hooks": [{"command": stop}]}]},
+                    "hooks": hooks,
                 }
             )
         )
@@ -681,6 +707,53 @@ class TestCheckPtyHooks:
 
         assert result.status == "missing"
         assert "no settings.json" in result.detail
+
+    def test_no_postcompact_hook_warns_rather_than_blocking(
+        self, tmp_path, monkeypatch
+    ):
+        """An install predating the hook still runs ordinary turns fine; only
+        compaction hangs. Blocking startup over it would be disproportionate."""
+        from claude_on_the_fly.checks import is_blocking
+
+        statusline, stop = self._shims(tmp_path)
+        self._settings(
+            tmp_path, str(statusline), str(stop), monkeypatch, postcompact=None
+        )
+
+        result = check_pty_hooks()
+
+        assert result.status == "warn"
+        assert is_blocking(result) is False
+        assert "PostCompact" in result.detail
+
+    def test_the_stop_shim_in_the_postcompact_slot_is_not_accepted(
+        self, tmp_path, monkeypatch
+    ):
+        """Worse than nothing: it writes an envelope for the mid-turn
+        `trigger: "auto"` compactions too, so claude-pty would end the turn early
+        and return the summary in place of the answer."""
+        statusline, stop = self._shims(tmp_path)
+        self._settings(
+            tmp_path, str(statusline), str(stop), monkeypatch, postcompact=str(stop)
+        )
+
+        assert check_pty_hooks().status == "warn"
+
+    def test_a_postcompact_writer_under_a_foreign_prefix_is_accepted(
+        self, tmp_path, monkeypatch
+    ):
+        statusline, stop = self._shims(tmp_path, prefix="other-tool")
+        postcompact = self._postcompact(tmp_path, prefix="other-tool")
+        assert "claude-interactive-p" not in str(postcompact)
+        self._settings(
+            tmp_path,
+            str(statusline),
+            str(stop),
+            monkeypatch,
+            postcompact=str(postcompact),
+        )
+
+        assert check_pty_hooks().status == "ok"
 
 
 class TestJobsPreflightGaps:
@@ -807,3 +880,176 @@ def test_effective_job_command_matches_the_frontend_resolution(monkeypatch):
         if raw is not None:
             monkeypatch.setenv("SLACK_JOB_COMMAND", raw)
         assert effective_job_command(env) == slack._resolve_job_command()
+
+
+class TestCheckPtyHookPaths:
+    """Duplicate and orphaned hook entries. install.sh only tidies its own path,
+    so a tool removed from disk leaves its hook wired and claude tries to run a
+    missing script every turn."""
+
+    def _config(self, root: Path, monkeypatch, hooks: dict) -> None:
+        config_dir = root / "claude-config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "settings.json").write_text(json.dumps({"hooks": hooks}))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    def _script(self, root: Path, name: str) -> Path:
+        path = root / name
+        path.write_text("#!/usr/bin/env bash\n")
+        return path
+
+    def test_all_present_is_ok(self, tmp_path, monkeypatch):
+        live = self._script(tmp_path, "stop.sh")
+        self._config(
+            tmp_path, monkeypatch, {"Stop": [{"hooks": [{"command": str(live)}]}]}
+        )
+
+        result = check_pty_hook_paths()
+
+        assert result.status == "ok"
+        assert "1 wired" in result.detail
+
+    def test_a_deleted_tools_entry_is_reported(self, tmp_path, monkeypatch):
+        live = self._script(tmp_path, "stop.sh")
+        dead = tmp_path / "removed-tool" / "hooks" / "stop_envelope.sh"
+        self._config(
+            tmp_path,
+            monkeypatch,
+            {
+                "Stop": [
+                    {"hooks": [{"command": str(live)}]},
+                    {"hooks": [{"command": str(dead)}]},
+                ]
+            },
+        )
+
+        result = check_pty_hook_paths()
+
+        assert result.status == "warn"
+        assert "1 orphaned" in result.detail
+        assert str(dead) in result.detail
+
+    def test_duplicates_are_reported(self, tmp_path, monkeypatch):
+        live = self._script(tmp_path, "stop.sh")
+        self._config(
+            tmp_path,
+            monkeypatch,
+            {
+                "Stop": [
+                    {"hooks": [{"command": str(live)}, {"command": str(live)}]},
+                ]
+            },
+        )
+
+        result = check_pty_hook_paths()
+
+        assert result.status == "warn"
+        assert "1 duplicated" in result.detail
+
+    def test_the_postcompact_slot_is_inspected_too(self, tmp_path, monkeypatch):
+        dead = tmp_path / "gone" / "postcompact_envelope.sh"
+        self._config(
+            tmp_path,
+            monkeypatch,
+            {"PostCompact": [{"hooks": [{"command": str(dead)}]}]},
+        )
+
+        assert check_pty_hook_paths().status == "warn"
+
+    def test_a_command_with_arguments_resolves_to_its_script(
+        self, tmp_path, monkeypatch
+    ):
+        live = self._script(tmp_path, "stop.sh")
+        self._config(
+            tmp_path,
+            monkeypatch,
+            {"Stop": [{"hooks": [{"command": f"{live} --quiet"}]}]},
+        )
+
+        assert check_pty_hook_paths().status == "ok"
+
+    def test_two_distinct_tools_each_wired_once_is_not_a_duplicate(
+        self, tmp_path, monkeypatch
+    ):
+        """The normal state on a machine where several tools vendor the shims."""
+        a = self._script(tmp_path, "a.sh")
+        b = self._script(tmp_path, "b.sh")
+        self._config(
+            tmp_path,
+            monkeypatch,
+            {"Stop": [{"hooks": [{"command": str(a)}, {"command": str(b)}]}]},
+        )
+
+        assert check_pty_hook_paths().status == "ok"
+
+    def test_unreadable_settings_defers_to_the_other_check(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nowhere"))
+
+        assert check_pty_hook_paths().status == "ok"
+
+
+class TestAutoCompactCapability:
+    """A threshold that can never fire must say so. Silence reads as working, and
+    the knob exists to spend money in the background."""
+
+    def test_unset_adds_no_row(self):
+        results = check_backend({"AGENT_BACKEND": "claude"})
+        assert not any(r.name == "COTF_AUTO_COMPACT_PCT" for r in results)
+
+    def test_ok_under_claude_native(self):
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "native",
+                "COTF_AUTO_COMPACT_PCT": "60",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_AUTO_COMPACT_PCT")
+        assert row.status == "ok"
+        assert "60%" in row.detail
+
+    def test_ok_under_claude_pty(self):
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "pty",
+                "COTF_AUTO_COMPACT_PCT": "60",
+            }
+        )
+        assert all_ok(results)
+
+    def test_ok_under_codex(self):
+        """codex compacts by forcing its own auto-compaction threshold, and
+        reports both the prompt size and the window in its rollout — so the
+        threshold is live there, not inert."""
+        results = check_backend(
+            {"AGENT_BACKEND": "codex", "COTF_AUTO_COMPACT_PCT": "60"}
+        )
+        row = next(r for r in results if r.name == "COTF_AUTO_COMPACT_PCT")
+        assert row.status == "ok"
+
+    def test_warns_under_ollama(self):
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "ollama",
+                "OLLAMA_MODEL": "glm-5.2:cloud",
+                "COTF_AUTO_COMPACT_PCT": "60",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_AUTO_COMPACT_PCT")
+        assert row.status == "warn"
+        assert "wrong model" in row.detail
+
+    def test_the_warning_never_blocks_startup(self):
+        from claude_on_the_fly.checks import first_failure
+
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "ollama",
+                "OLLAMA_MODEL": "glm-5.2:cloud",
+                "COTF_AUTO_COMPACT_PCT": "60",
+            }
+        )
+        assert first_failure(results) is None

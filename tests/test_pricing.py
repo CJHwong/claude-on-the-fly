@@ -313,3 +313,122 @@ class TestMemo:
         for _ in range(5):
             pricing.cost_for("gpt-5", 1000, 100)
         assert call_count["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cached prompt tokens
+# ---------------------------------------------------------------------------
+
+
+def _cache_entry(model_id: str, **prices: str) -> dict:
+    return {"id": model_id, "pricing": prices}
+
+
+class TestCachePricing:
+    """Cache tokens dominate a long-running chat: a thread quiet past the cache
+    TTL re-establishes its whole prompt, so the turn that brings it back is
+    mostly cache *writes*."""
+
+    def _seed(self, cache, pricing_block: dict) -> None:
+        _seed_cache(cache, _payload(_cache_entry("vendor/m", **pricing_block)))
+
+    def test_cache_reads_use_their_own_rate(self, isolated_pricing_cache):
+        self._seed(
+            isolated_pricing_cache,
+            {"prompt": "1e-06", "completion": "2e-06", "input_cache_read": "1e-07"},
+        )
+        with patch.object(pricing, "_fetch", return_value=None):
+            cost = pricing.cost_for("m", 0, 0, cache_read_tokens=1_000_000)
+        assert cost == pytest.approx(0.1), "1e-07 * 1e6, not the 1e-06 prompt rate"
+
+    def test_cache_writes_use_their_own_rate(self, isolated_pricing_cache):
+        self._seed(
+            isolated_pricing_cache,
+            {"prompt": "1e-06", "completion": "2e-06", "input_cache_write": "1.25e-06"},
+        )
+        with patch.object(pricing, "_fetch", return_value=None):
+            cost = pricing.cost_for("m", 0, 0, cache_write_tokens=1_000_000)
+        assert cost == pytest.approx(1.25)
+
+    def test_an_unpublished_cache_rate_falls_back_to_prompt(
+        self, isolated_pricing_cache
+    ):
+        """Most of the registry publishes no write rate, and for those a cache
+        write really is billed as ordinary input. Falling back to zero would make
+        the biggest term on a cold thread free."""
+        self._seed(isolated_pricing_cache, {"prompt": "1e-06", "completion": "2e-06"})
+        with patch.object(pricing, "_fetch", return_value=None):
+            cost = pricing.cost_for("m", 0, 0, cache_write_tokens=1_000_000)
+        assert cost == pytest.approx(1.0)
+
+    def test_a_published_zero_cache_rate_is_honoured_as_free(
+        self, isolated_pricing_cache
+    ):
+        """Some providers really do serve cache reads free; overwriting that with
+        a fallback would invent a charge."""
+        self._seed(
+            isolated_pricing_cache,
+            {"prompt": "1e-06", "completion": "2e-06", "input_cache_read": "0"},
+        )
+        with patch.object(pricing, "_fetch", return_value=None):
+            # Reads free, so only the output should cost anything.
+            cost = pricing.cost_for("m", 0, 10, cache_read_tokens=1_000_000)
+        assert cost == pytest.approx(10 * 2e-06)
+
+    def test_a_corrupt_cache_rate_falls_back_instead_of_dropping_the_model(
+        self, isolated_pricing_cache
+    ):
+        """Unlike a corrupt prompt rate: losing the whole entry over a field we
+        only just started reading would be a regression."""
+        self._seed(
+            isolated_pricing_cache,
+            {"prompt": "1e-06", "completion": "2e-06", "input_cache_read": "-5"},
+        )
+        with patch.object(pricing, "_fetch", return_value=None):
+            cost = pricing.cost_for("m", 0, 0, cache_read_tokens=1_000_000)
+        assert cost == pytest.approx(1.0), "falls back to the prompt rate"
+
+    def test_the_four_buckets_are_summed_independently(self, isolated_pricing_cache):
+        self._seed(
+            isolated_pricing_cache,
+            {
+                "prompt": "1e-06",
+                "completion": "2e-06",
+                "input_cache_read": "1e-07",
+                "input_cache_write": "1.25e-06",
+            },
+        )
+        with patch.object(pricing, "_fetch", return_value=None):
+            cost = pricing.cost_for("m", 100, 200, 300, 400)
+        expected = 100 * 1e-06 + 200 * 2e-06 + 300 * 1e-07 + 400 * 1.25e-06
+        assert cost == pytest.approx(expected)
+
+    def test_negative_cache_counts_are_rejected(self, isolated_pricing_cache):
+        self._seed(isolated_pricing_cache, {"prompt": "1e-06", "completion": "2e-06"})
+        with patch.object(pricing, "_fetch", return_value=None):
+            assert pricing.cost_for("m", 1, 1, -1, 0) is None
+            assert pricing.cost_for("m", 1, 1, 0, -1) is None
+
+
+class TestCodexBillingUnchanged:
+    """codex reports no cache tokens at all, so it must bill exactly as before.
+    The cache arguments default to 0 to guarantee that."""
+
+    def test_a_three_arg_call_ignores_cache_rates_entirely(
+        self, isolated_pricing_cache
+    ):
+        _seed_cache(
+            isolated_pricing_cache,
+            _payload(
+                _cache_entry(
+                    "vendor/m",
+                    prompt="1e-06",
+                    completion="2e-06",
+                    input_cache_read="9e-05",
+                    input_cache_write="9e-05",
+                )
+            ),
+        )
+        with patch.object(pricing, "_fetch", return_value=None):
+            cost = pricing.cost_for("m", 1000, 100)
+        assert cost == pytest.approx(1000 * 1e-06 + 100 * 2e-06)

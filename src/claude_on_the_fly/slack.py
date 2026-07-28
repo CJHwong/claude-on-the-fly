@@ -45,6 +45,10 @@ CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
+# Summarize the thread's history so later turns stop re-paying for all of it.
+# Same prefix rationale as $stop, and on by default for the same reason: a
+# long-running thread is exactly where nobody thinks to go looking for a setting.
+COMPACT_COMMAND = "$compact"
 # Background-job trigger. The message tail is queued as a job that survives this
 # chat turn — the worker (claude-jobs) runs it in a fresh session and replies
 # into this thread when done. A plain-text prefix, same rationale as $stop: it
@@ -1152,6 +1156,45 @@ class SlackFrontend(Frontend):
             )
             return
 
+        # $compact summarizes the thread's history in place. Queued as a turn
+        # rather than answered here, so it gets the same reaction and live status
+        # a reply would — a compaction is a couple of minutes of silence on a
+        # large thread, and silence is indistinguishable from a hung daemon.
+        # Ahead of the soft-limit gate for the same reason as $stop: a thread
+        # over budget is the one that most needs this to still work.
+        if text.strip() == COMPACT_COMMAND:
+            logger.info("slack %s/%s: %s", channel, thread_ts, COMPACT_COMMAND)
+            # This branch returns before the normal path's catch-up bookkeeping,
+            # so mirror it here or a reconnect re-ingests the trigger and
+            # compacts a second time.
+            self._processed_ts.append(ts)
+            self._active_channels[channel] = ts
+            if channel_type:
+                self._channel_types[channel] = channel_type
+            if self._orchestrator is None:
+                await self._post_notice(
+                    channel, thread_ts, "Not connected to a session yet."
+                )
+                return
+            # Unlike $stop, a compaction needs to know *which workspace* this
+            # thread's session lives in, and that name is only resolved here. The
+            # normal path does this further down, past the point this branch
+            # returns from — skipping it pointed the compaction at
+            # `slack/<session_key>`, so every thread looked brand new.
+            await self._identify_session(
+                session_id,
+                event,
+                channel,
+                channel_type,
+                thread_ts,
+                bot_id,
+                is_trusted_bot,
+            )
+            self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
+            self._pending_reply_suppressed.setdefault(session_id, deque()).append(False)
+            await self._orchestrator.on_compact(session_id)
+            return
+
         # The job trigger queues a background job that outlives this chat turn;
         # the worker replies into this thread when done. Opt-in, so the whole
         # branch is skipped unless the trigger is set and a queue was built —
@@ -1253,13 +1296,8 @@ class SlackFrontend(Frontend):
         if is_new_session and is_mid_thread:
             thread_context = await self._fetch_thread_context(channel, thread_ts, ts)
 
-        if is_trusted_bot:
-            sender = event.get("username") or bot_id or "bot"
-        else:
-            sender = await self._resolve_sender(event.get("user", "unknown"))
-        self._sender_names[session_id] = sender
-        await self._resolve_session_metadata(
-            session_id, sender, channel, channel_type, thread_ts
+        sender = await self._identify_session(
+            session_id, event, channel, channel_type, thread_ts, bot_id, is_trusted_bot
         )
 
         files = event.get("files") or []
@@ -1822,6 +1860,36 @@ class SlackFrontend(Frontend):
                 logger.warning("Failed to resolve Slack user %s: %s", user_id, exc)
                 return user_id
         return self._user_name_cache[user_id]
+
+    async def _identify_session(
+        self,
+        session_id: int,
+        event: dict,
+        channel: str,
+        channel_type: str,
+        thread_ts: str,
+        bot_id: str,
+        is_trusted_bot: bool,
+    ) -> str:
+        """Resolve and cache this session's sender + workspace name. Returns the
+        sender.
+
+        `workspace_name()` reads `_workspace_names`, which only
+        `_resolve_session_metadata` fills in — so anything that needs the
+        workspace has to come through here first. A control prefix that answers
+        without it gets `slack/<session_key>`, a directory no session was ever
+        created under, which is how `$compact` came to report "no session yet" on
+        threads days deep in conversation.
+        """
+        if is_trusted_bot:
+            sender = event.get("username") or bot_id or "bot"
+        else:
+            sender = await self._resolve_sender(event.get("user", "unknown"))
+        self._sender_names[session_id] = sender
+        await self._resolve_session_metadata(
+            session_id, sender, channel, channel_type, thread_ts
+        )
+        return sender
 
     async def _resolve_session_metadata(
         self,

@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import agent
@@ -27,6 +30,30 @@ from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
 
+# Percentage of the model's context window above which the next inbound message
+# is preceded by a compaction. Unset or 0 disables it, which is the default:
+# compaction is a full-context pass, so firing it unasked costs real money.
+#
+# Read per-instance rather than at import because load_dotenv() runs after this
+# module is imported. Only pty mode can supply the reading it compares against
+# (see `Response.context_tokens`), so in native mode this is inert however it is
+# set — the manual trigger is the whole feature there.
+AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
+
+
+@dataclass(frozen=True)
+class Turn:
+    """One item of queued work for a chat.
+
+    A compaction is queued as a turn rather than run inline so it inherits the
+    whole per-turn lifecycle — the reaction, the live status ticker, `$stop`, and
+    the event-log entry — and so it takes its place in FIFO order ahead of the
+    message that triggered it.
+    """
+
+    text: str
+    compact: bool = False
+
 
 class Orchestrator:
     def __init__(
@@ -42,7 +69,12 @@ class Orchestrator:
         # reset_session; telegram /new pins a string token via set_session_token.
         # Either feeds session_uuid's `{chat_id}-{value}` tag.
         self._session_counters: dict[int, int | str] = {}
-        self._queues: dict[int, asyncio.Queue] = {}
+        self._queues: dict[int, asyncio.Queue[Turn]] = {}
+        # Last turn's prompt size and window per chat, for the auto-compact gate.
+        # Only pty mode populates it; elsewhere the gate never has a reading and
+        # so never fires.
+        self._context: dict[int, tuple[int, int]] = {}
+        self._auto_compact_pct = _auto_compact_pct()
         self._event_log = event_log if event_log is not None else EventLog()
         # chat_id -> {identifier, started_at_monotonic, session_uuid}.
         # Populated at dispatch, cleared on completion. Drives the heartbeat
@@ -62,6 +94,7 @@ class Orchestrator:
         self._session_counters[chat_id] = (
             current if isinstance(current, int) else 0
         ) + 1
+        self._forget_context(chat_id)
 
     def set_session_token(self, chat_id: int, token: str) -> None:
         """Pin the session discriminator to a token the frontend minted, so the
@@ -70,6 +103,18 @@ class Orchestrator:
         accepts a string just as it does the scheduler's integer counter, which
         reset_session still bumps."""
         self._session_counters[chat_id] = token
+        self._forget_context(chat_id)
+
+    def _forget_context(self, chat_id: int) -> None:
+        """Drop this chat's context reading because its session changed.
+
+        The reading is keyed by chat, but it describes a *session* — and both
+        callers above repoint a chat at a fresh one. The scheduler does this
+        before every fire, so without this a big reading from the last fire would
+        survive into the next and queue a compaction against a session that has
+        nothing in it yet.
+        """
+        self._context.pop(chat_id, None)
 
     def is_busy(self, chat_id: int) -> bool:
         return chat_id in self._running and not self._running[chat_id].done()
@@ -104,26 +149,70 @@ class Orchestrator:
 
     async def on_message(self, chat_id: int, text: str) -> None:
         logger.debug("on_message: chat_id=%s text=%s", chat_id, text[:80])
+        if self._due_for_compaction(chat_id):
+            # Ahead of the message, not during the idle window before it. An idle
+            # thread may never be spoken to again, and compacting one that isn't
+            # pays a full-context pass for nothing. Waiting until someone
+            # actually comes back costs them this turn's latency and saves every
+            # turn after it.
+            logger.info("on_message: chat_id=%s auto-compacting first", chat_id)
+            await self.on_compact(chat_id)
+        await self._enqueue(chat_id, Turn(text))
+
+    async def on_compact(self, chat_id: int) -> None:
+        """Queue a compaction for this chat. Runs in FIFO order like any turn."""
+        await self._enqueue(chat_id, Turn("", compact=True))
+
+    async def _enqueue(self, chat_id: int, turn: Turn) -> None:
         if chat_id not in self._queues:
             self._queues[chat_id] = asyncio.Queue()
-        self._queues[chat_id].put_nowait(text)
+        self._queues[chat_id].put_nowait(turn)
         if self.is_busy(chat_id):
             queued = self._queues[chat_id].qsize()
-            logger.debug("on_message: chat_id=%s busy, queued=%s", chat_id, queued)
+            logger.debug("enqueue: chat_id=%s busy, queued=%s", chat_id, queued)
             await self._frontend.notify_queued(chat_id, queued)
         else:
-            logger.debug("on_message: chat_id=%s starting drain", chat_id)
+            logger.debug("enqueue: chat_id=%s starting drain", chat_id)
             self._running[chat_id] = asyncio.create_task(self._drain(chat_id))
+
+    def _due_for_compaction(self, chat_id: int) -> bool:
+        """Whether this chat's last turn left the context over the threshold.
+
+        Consumes the reading, so two messages arriving back to back queue one
+        compaction rather than two — the second would find nothing to compact and
+        bill a full-context pass to be told so.
+        """
+        if not self._auto_compact_pct:
+            return False
+        reading = self._context.get(chat_id)
+        if reading is None:
+            return False
+        tokens, window = reading
+        if window <= 0:
+            return False
+        pct = tokens * 100 / window
+        if pct < self._auto_compact_pct:
+            return False
+        self._context.pop(chat_id, None)
+        logger.info(
+            "auto-compact: chat_id=%s context %.0f%% (%s/%s) >= %s%%",
+            chat_id,
+            pct,
+            tokens,
+            window,
+            self._auto_compact_pct,
+        )
+        return True
 
     async def _drain(self, chat_id: int) -> None:
         queue = self._queues[chat_id]
         try:
             while True:
                 try:
-                    text = queue.get_nowait()
+                    turn = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                await self._process(chat_id, text)
+                await self._process(chat_id, turn)
         finally:
             if self._running.get(chat_id) is asyncio.current_task():
                 self._running.pop(chat_id, None)
@@ -133,7 +222,8 @@ class Orchestrator:
             await self._frontend.send_typing(chat_id)
             await asyncio.sleep(4)
 
-    async def _process(self, chat_id: int, text: str) -> None:
+    async def _process(self, chat_id: int, turn: Turn) -> None:
+        text = turn.text
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
         if self._platform in agent.ATTACHMENT_PLATFORMS:
@@ -167,15 +257,20 @@ class Orchestrator:
         try:
             await self._frontend.notify_start(chat_id)
             typing_task = asyncio.create_task(self._typing_loop(chat_id))
-            response = await agent.run(
-                workspace,
-                session,
-                text,
-                self._platform,
-                user_name=self._frontend.sender_name(chat_id),
-                channel_context=self._frontend.channel_context(chat_id),
-                timeout=self._frontend.timeout_for(chat_id),
-            )
+            if turn.compact:
+                response = await self._run_compaction(
+                    chat_id, workspace, session, self._frontend.timeout_for(chat_id)
+                )
+            else:
+                response = await agent.run(
+                    workspace,
+                    session,
+                    text,
+                    self._platform,
+                    user_name=self._frontend.sender_name(chat_id),
+                    channel_context=self._frontend.channel_context(chat_id),
+                    timeout=self._frontend.timeout_for(chat_id),
+                )
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
                 chat_id,
@@ -183,6 +278,14 @@ class Orchestrator:
                 response.tokens_in,
                 response.tokens_out,
             )
+            # Only pty mode reports this. A turn that doesn't sets nothing rather
+            # than zeroing the reading, so a mode switch mid-thread can't make a
+            # large context look small.
+            if response.context_tokens and response.context_window_size:
+                self._context[chat_id] = (
+                    response.context_tokens,
+                    response.context_window_size,
+                )
             if self._platform in agent.ATTACHMENT_PLATFORMS:
                 response.attachments = agent.collect_outbox(workspace)
             delivered = await self._frontend.send(chat_id, response)
@@ -235,6 +338,20 @@ class Orchestrator:
                 typing_task.cancel()
             await self._frontend.notify_complete(chat_id)
 
+    async def _run_compaction(
+        self, chat_id: int, workspace: Path, session: str, timeout: float | None
+    ) -> Response:
+        """Compact the session and render the outcome as this turn's reply."""
+        # Whatever this chat was holding describes the pre-compaction prompt and
+        # is stale the moment the compaction lands. Dropping it (rather than
+        # guessing the new size) is what stops a manual `$compact` from being
+        # followed straight away by an automatic one on the next message.
+        self._context.pop(chat_id, None)
+        outcome = await agent.compact(workspace, session, timeout=timeout)
+        if outcome is None:
+            return Response(body="This backend can't compact a conversation.")
+        return Response(body=outcome.summary(), compaction=outcome)
+
     def heartbeat_extra(self) -> dict:
         """Snapshot in-flight chat jobs for the TUI's Active AI jobs pane.
 
@@ -257,6 +374,31 @@ class Orchestrator:
         for task in self._running.values():
             task.cancel()
         await asyncio.gather(*self._running.values(), return_exceptions=True)
+
+
+def _auto_compact_pct() -> int:
+    """Resolve the auto-compact threshold. 0 (off) for unset or unusable values.
+
+    A junk value disables the feature rather than taking the daemon down: this
+    is a cost optimization, not something worth refusing to start over. The
+    value is logged so a typo doesn't look like a silently working setting.
+    """
+    raw = os.environ.get(AUTO_COMPACT_PCT_VAR, "").strip()
+    if not raw:
+        return 0
+    try:
+        pct = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number, auto-compact off", AUTO_COMPACT_PCT_VAR, raw
+        )
+        return 0
+    if not 1 <= pct <= 100:
+        logger.warning(
+            "%s=%d is outside 1-100, auto-compact off", AUTO_COMPACT_PCT_VAR, pct
+        )
+        return 0
+    return pct
 
 
 def _redact_token(token: str) -> str:

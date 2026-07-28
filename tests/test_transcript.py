@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+from claude_on_the_fly import transcript
 from claude_on_the_fly.transcript import (
     Turn,
     _workspace_to_claude_hash,
@@ -823,3 +824,60 @@ class TestRemoveWorkspaceSessions:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         remove_workspace_sessions(workspace)
+
+
+class TestExtractCodexPromptTokens:
+    """The auto-compact gate's reading for codex, and the only evidence a
+    compaction did anything — codex publishes no in-band signal."""
+
+    def _rollout(self, tmp_path, monkeypatch, *turns: tuple[int, int]):
+        root = tmp_path / "codex-sessions" / "2026" / "07" / "28"
+        root.mkdir(parents=True)
+        path = root / "rollout-2026-07-28T19-58-02-thread-1.jsonl"
+        lines = [
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {"input_tokens": prompt},
+                            "model_context_window": window,
+                        },
+                    },
+                }
+            )
+            for prompt, window in turns
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        monkeypatch.setattr(
+            transcript, "CODEX_SESSIONS_DIR", tmp_path / "codex-sessions"
+        )
+        return path
+
+    def test_returns_the_latest_prompt_and_window(self, tmp_path, monkeypatch):
+        self._rollout(tmp_path, monkeypatch, (18_318, 258_400), (45_730, 258_400))
+        assert transcript.extract_codex_prompt_tokens("thread-1") == (45_730, 258_400)
+
+    def test_the_compaction_pass_itself_is_skipped(self, tmp_path, monkeypatch):
+        """Compaction reports a turn with input_tokens 0; that describes the pass,
+        not the context it left behind, so it must not be read as an empty
+        context."""
+        self._rollout(
+            tmp_path, monkeypatch, (46_357, 258_400), (0, 258_400), (18_507, 258_400)
+        )
+        assert transcript.extract_codex_prompt_tokens("thread-1") == (18_507, 258_400)
+
+    def test_a_trailing_zero_does_not_erase_the_reading(self, tmp_path, monkeypatch):
+        self._rollout(tmp_path, monkeypatch, (18_507, 258_400), (0, 258_400))
+        assert transcript.extract_codex_prompt_tokens("thread-1") == (18_507, 258_400)
+
+    def test_missing_rollout_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            transcript, "CODEX_SESSIONS_DIR", tmp_path / "codex-sessions"
+        )
+        assert transcript.extract_codex_prompt_tokens("nope") is None
+
+    def test_no_token_count_events_returns_none(self, tmp_path, monkeypatch):
+        self._rollout(tmp_path, monkeypatch)
+        assert transcript.extract_codex_prompt_tokens("thread-1") is None

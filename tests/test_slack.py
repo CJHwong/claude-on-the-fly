@@ -1597,6 +1597,106 @@ class TestStopPrefix:
         frontend._on_message.assert_not_awaited()
 
 
+class TestCompactPrefix:
+    async def test_queues_a_compaction_instead_of_a_reply(self, frontend):
+        """It goes through the queue so it inherits the reaction and the live
+        status a reply gets. A large thread takes minutes to compact, and silence
+        is indistinguishable from a hung daemon."""
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$compact",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        orch.on_compact.assert_awaited_once_with(_session_key("D1", "9.0"))
+        frontend._on_message.assert_not_awaited()
+
+    async def test_targets_the_threads_own_session(self, frontend):
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.9",
+            "thread_ts": "5.0",
+            "text": "$compact",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        orch.on_compact.assert_awaited_once_with(_session_key("D1", "5.0"))
+
+    async def test_records_catchup_bookkeeping(self, frontend):
+        """The branch returns before the normal path does this, so a reconnect
+        would otherwise re-ingest the trigger and compact a second time."""
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$compact",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        assert "9.0" in frontend._processed_ts
+        assert frontend._active_channels["D1"] == "9.0"
+
+    async def test_works_when_the_thread_is_over_its_reply_budget(self, frontend):
+        """Checked ahead of the soft-limit gate: a thread that has hit the cap is
+        exactly the one that most needs compacting."""
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        session = _session_key("D1", "9.0")
+        frontend._reply_counts[session] = 10_000
+        event = {
+            "ts": "9.0",
+            "text": "$compact",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        orch.on_compact.assert_awaited_once()
+
+    async def test_says_so_when_no_orchestrator_is_attached(self, frontend):
+        frontend._orchestrator = None
+        event = {
+            "ts": "9.0",
+            "text": "$compact",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        frontend._app.client.chat_postMessage.assert_awaited()
+        frontend._on_message.assert_not_awaited()
+
+    async def test_trailing_text_is_an_ordinary_message(self, frontend):
+        """Exact match only, like $stop. "$compact the notes" is a request about
+        notes, not a compaction."""
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$compact the meeting notes",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+        orch.on_compact.assert_not_awaited()
+        frontend._on_message.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Message shortcut (thread-aware picker)
 # ---------------------------------------------------------------------------
@@ -2315,3 +2415,53 @@ class TestBareTriggerListsJobs(TestJobCommand):
         posted = mock_app.client.chat_postMessage.call_args.kwargs["text"]
         assert "No jobs queued from this channel." in posted
         assert "Usage:" in posted
+
+
+class TestCompactResolvesTheWorkspace:
+    """The live bug: `$compact` reported "no session yet" on threads days deep.
+
+    `workspace_name()` reads `_workspace_names`, filled in only by
+    `_resolve_session_metadata` — and the intercept returned before the normal
+    path reached it, so the compaction looked for a session under
+    `slack/<session_key>`, a directory nothing was ever created in.
+    """
+
+    def _event(self) -> dict:
+        return {
+            "ts": "1785236668.157229",
+            "thread_ts": "1784899718.993159",
+            "text": "$compact",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+
+    async def test_workspace_name_is_resolved_before_queueing(self, frontend):
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        session = _session_key("D1", "1784899718.993159")
+
+        await frontend._ingest_event(self._event())
+
+        name = frontend.workspace_name(session)
+        assert name != f"slack/{session}", "fell back to the session key"
+        assert name == "slack/dm-testuser-1784899718"  # sender + thread ts
+
+    async def test_it_matches_what_an_ordinary_message_would_produce(self, frontend):
+        """Same thread, same workspace, whichever path got there first — else the
+        compaction targets a different session than the conversation."""
+        orch = MagicMock()
+        orch.on_compact = AsyncMock()
+        frontend._orchestrator = orch
+        session = _session_key("D1", "1784899718.993159")
+
+        ordinary = dict(self._event(), ts="1785236600.000000", text="hello")
+        await frontend._ingest_event(ordinary)
+        from_message = frontend.workspace_name(session)
+
+        frontend._workspace_names.clear()
+        frontend._sender_names.clear()
+        await frontend._ingest_event(self._event())
+
+        assert frontend.workspace_name(session) == from_message

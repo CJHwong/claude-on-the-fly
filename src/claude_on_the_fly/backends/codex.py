@@ -15,12 +15,23 @@ from claude_on_the_fly import agent, pricing, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
+    Compaction,
     OllamaLauncher,
     Response,
     build_system_prompt,
 )
 
 logger = logging.getLogger(__name__)
+
+# Passed via `-c` for one compaction run only, never written to the user's
+# config.toml. Any value comfortably under a real thread's context makes codex's
+# pre-turn `run_auto_compact` check fire; the exact number doesn't matter, so
+# this is small enough to always trip and non-zero to stay a plausible limit.
+COMPACT_TOKEN_LIMIT = 2000
+# Codex compaction is checked *before* a turn, so it needs one to hang off — it
+# cannot be a standalone operation the way claude's `/compact` is. Keep the reply
+# tiny: it lands in the conversation the compaction just summarized.
+COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
 
 
 def _merge_codex_results(first: dict, second: dict) -> dict:
@@ -257,21 +268,7 @@ class CodexBackend:
         # `ollama launch codex` already invokes the codex binary; repeating
         # "codex" after `--` would make it argv[1], which codex treats as the
         # subcommand. Skip the binary when the launcher is set.
-        prefix = self.launcher.prefix("codex") if self.launcher else []
-        binary = [] if self.launcher else ["codex"]
-        model_env = os.environ.get("CODEX_MODEL", "").strip()
-        model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
-        base = [
-            *prefix,
-            *binary,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--yolo",
-            "-C",
-            str(workspace),
-            *model_args,
-        ]
+        base = self._base_argv(workspace)
         if existing_thread:
             logger.debug(
                 "codex: resuming thread=%s session=%s", existing_thread, session_uuid
@@ -328,7 +325,9 @@ class CodexBackend:
         # CODEX_MODEL the configured value is just the literal "codex", which
         # is uninformative — the session-file lookup gives us the real name.
         configured_label = (
-            self.launcher.model if self.launcher else (model_env or "codex")
+            self.launcher.model
+            if self.launcher
+            else (os.environ.get("CODEX_MODEL", "").strip() or "codex")
         )
         thread_for_lookup = result.get("thread_id") or existing_thread
         model_label = (
@@ -371,6 +370,20 @@ class CodexBackend:
             )
             or 0
         )
+        # The reading the auto-compact gate thresholds on. Codex reports it in
+        # the rollout rather than on stdout: `last_token_usage.input_tokens` is
+        # this turn's own prompt, and `model_context_window` the window it has to
+        # fit in. Absent (no rollout yet) leaves both None, which reads
+        # downstream as "no reading" rather than as an empty context.
+        context: dict = {}
+        if thread_for_lookup:
+            reading = transcript.extract_codex_prompt_tokens(thread_for_lookup)
+            if reading and reading[1]:
+                context = {
+                    "context_tokens": reading[0],
+                    "context_window_size": reading[1],
+                }
+
         return Response(
             body=body,
             cost=computed_cost,
@@ -380,7 +393,101 @@ class CodexBackend:
             model=model_label,
             tool_counts=result.get("tool_counts", {}),
             skill_counts={},
+            **context,
         )
+
+    def _base_argv(self, workspace: Path) -> list[str]:
+        """`codex exec` argv up to (not including) the prompt or `resume`."""
+        # `ollama launch codex` already invokes the codex binary; repeating
+        # "codex" after `--` would make it argv[1], which codex treats as the
+        # subcommand. Skip the binary when the launcher is set.
+        prefix = self.launcher.prefix("codex") if self.launcher else []
+        binary = [] if self.launcher else ["codex"]
+        model_env = os.environ.get("CODEX_MODEL", "").strip()
+        model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
+        return [
+            *prefix,
+            *binary,
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--yolo",
+            "-C",
+            str(workspace),
+            *model_args,
+        ]
+
+    def _thread_id(self, workspace: Path, session_uuid: str) -> str | None:
+        """Codex's own thread id for one of our sessions, or None if unmapped."""
+        session_file = workspace / ".codex_sessions" / session_uuid
+        if not session_file.is_file():
+            return None
+        return session_file.read_text().strip() or None
+
+    async def compact(
+        self,
+        workspace: Path,
+        session_uuid: str,
+        timeout: float | None = DEFAULT_TIMEOUT,
+    ) -> Compaction | None:
+        """Compact the thread by forcing codex's own auto-compaction to fire.
+
+        Codex has two compaction paths and neither is a command we can send.
+        `thread/compact/start` belongs to the app-server protocol, which `exec`
+        doesn't speak. And typing `/compact` as a prompt is worse than useless:
+        `exec` *recognizes* it (a bogus slash command answers "Unknown command")
+        and replies "Context compacted." — but the context does not change.
+        Measured across a real thread, 45,730 → 46,335 → 46,357 tokens, and the
+        rollout gains none of the compaction bookkeeping the binary defines. The
+        turn compacts in memory and `exec` exits without writing it back, so the
+        next `resume` rebuilds from an untouched rollout.
+
+        What does work is the threshold codex checks for itself before a turn:
+        `run_auto_compact` lives in exec's own code path. Passing a limit far
+        below the current context via `-c` makes that check fire on this turn
+        only, leaving the user's `~/.codex/config.toml` alone. Same thread, that
+        took 46,357 → 18,507 and it survived later plain resumes.
+
+        The cost is that codex compaction needs a turn to hang off, so it spends
+        one cheap exchange where claude spends none.
+        """
+        thread_id = self._thread_id(workspace, session_uuid)
+        if thread_id is None:
+            logger.info("compact: no codex thread for %s yet", session_uuid)
+            return Compaction(
+                ok=False,
+                error="this thread has no session yet, so there is nothing to compact",
+            )
+
+        before = transcript.extract_codex_prompt_tokens(thread_id)
+        argv = [
+            *self._base_argv(workspace),
+            "-c",
+            f"model_auto_compact_token_limit={COMPACT_TOKEN_LIMIT}",
+            "resume",
+            thread_id,
+            COMPACT_TRIGGER_PROMPT,
+        ]
+        logger.info("compact: codex thread=%s", thread_id)
+        await _run_codex_exec(workspace, argv, timeout=timeout)
+        after = transcript.extract_codex_prompt_tokens(thread_id)
+
+        if before is None or after is None:
+            return Compaction(ok=False, error="couldn't read the thread's token usage")
+        pre_tokens, _ = before
+        post_tokens, _ = after
+        if post_tokens >= pre_tokens:
+            # No in-band signal exists, so the token count is the only evidence.
+            # A context that didn't shrink means the threshold found nothing worth
+            # summarizing — reporting success off the trigger alone would be the
+            # same lie `/compact` tells.
+            logger.info(
+                "compact: codex context did not shrink (%s → %s)",
+                pre_tokens,
+                post_tokens,
+            )
+            return Compaction(ok=False, error="nothing to compact")
+        return Compaction(ok=True, pre_tokens=pre_tokens, post_tokens=post_tokens)
 
     def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
         """`codex resume <thread_id>` when a thread mapping exists for this uuid."""

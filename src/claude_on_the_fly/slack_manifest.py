@@ -39,7 +39,7 @@ MODE_HELP = """Which token kind is this install for?
         and the "Run a skill" message shortcut.
   user  It replies as you, and sees every channel you can. None of the
         interactive surface exists under a user token, so turn control is the
-        $stop / $continue text prefix.
+        $stop / $continue / $compact text prefixes.
 """
 
 COMMAND_HELP = """Slash command (optional).
@@ -50,7 +50,7 @@ no error. So the suggested default carries your login name, which differs from
 your coworkers'.
 
 Answer 'none' to skip the command entirely: the skill picker is still reachable
-from any message's "..." menu, and $stop / $continue still work.
+from any message's "..." menu, and $stop / $continue / $compact still work.
 """
 
 

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from claude_on_the_fly.agent import NUDGE_PROMPT, OllamaLauncher, get_backend
+from claude_on_the_fly.backends import codex as codex_mod
 from claude_on_the_fly.backends.codex import (
     CodexBackend,
     _merge_codex_results,
@@ -992,3 +993,103 @@ class TestExpandCodexPrompt:
         self._prompt(tmp_path, "p", "[$3][$NOPE]")
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))
         assert _expand_codex_prompt("/p only") == "[][]"
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+
+class TestCodexCompact:
+    """Codex has no compaction *command* we can send: `thread/compact/start` is
+    app-server only, and `/compact` typed as a prompt is acknowledged
+    ("Context compacted.") while changing nothing — measured 45,730 → 46,357.
+    What works is forcing codex's own pre-turn threshold via `-c`.
+    """
+
+    def _wire_thread(self, workspace: Path, session_uuid: str, thread_id: str) -> None:
+        mapping = workspace / ".codex_sessions"
+        mapping.mkdir(parents=True, exist_ok=True)
+        (mapping / session_uuid).write_text(thread_id)
+
+    async def test_no_thread_yet_is_not_reported_as_unsupported(self, tmp_path):
+        outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+        assert outcome is not None, "None would claim codex cannot compact at all"
+        assert outcome.ok is False
+        assert "no session" in outcome.error
+
+    async def test_forces_the_threshold_via_a_per_invocation_override(self, tmp_path):
+        """Never writes to the user's ~/.codex/config.toml — the override is
+        scoped to this one run."""
+        self._wire_thread(tmp_path, "sid", "thread-1")
+        with (
+            patch.object(
+                codex_mod.transcript,
+                "extract_codex_prompt_tokens",
+                side_effect=[(45_000, 258_400), (18_000, 258_400)],
+            ),
+            patch.object(
+                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
+            ) as run_exec,
+        ):
+            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+
+        argv = run_exec.await_args[0][1]
+        assert "-c" in argv
+        assert f"model_auto_compact_token_limit={codex_mod.COMPACT_TOKEN_LIMIT}" in argv
+        assert argv[-3:-1] == ["resume", "thread-1"]
+        assert outcome is not None and outcome.ok is True
+        assert (outcome.pre_tokens, outcome.post_tokens) == (45_000, 18_000)
+
+    async def test_never_sends_slash_compact(self, tmp_path):
+        """It would be accepted and do nothing, which is the one outcome worse
+        than an error."""
+        self._wire_thread(tmp_path, "sid", "thread-1")
+        with (
+            patch.object(
+                codex_mod.transcript,
+                "extract_codex_prompt_tokens",
+                side_effect=[(45_000, 258_400), (18_000, 258_400)],
+            ),
+            patch.object(
+                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
+            ) as run_exec,
+        ):
+            await codex_mod.CodexBackend().compact(tmp_path, "sid")
+
+        assert "/compact" not in run_exec.await_args[0][1]
+
+    async def test_a_context_that_did_not_shrink_is_not_success(self, tmp_path):
+        """The only evidence available is the token count — codex publishes no
+        in-band compaction signal, so trusting the trigger would repeat the exact
+        lie `/compact` tells."""
+        self._wire_thread(tmp_path, "sid", "thread-1")
+        with (
+            patch.object(
+                codex_mod.transcript,
+                "extract_codex_prompt_tokens",
+                side_effect=[(45_000, 258_400), (45_100, 258_400)],
+            ),
+            patch.object(
+                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
+            ),
+        ):
+            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+
+        assert outcome is not None and outcome.ok is False
+        assert "nothing to compact" in outcome.error
+
+    async def test_unreadable_usage_is_reported_not_guessed(self, tmp_path):
+        self._wire_thread(tmp_path, "sid", "thread-1")
+        with (
+            patch.object(
+                codex_mod.transcript, "extract_codex_prompt_tokens", return_value=None
+            ),
+            patch.object(
+                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
+            ),
+        ):
+            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+
+        assert outcome is not None and outcome.ok is False
+        assert "token usage" in outcome.error

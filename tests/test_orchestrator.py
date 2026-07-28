@@ -10,9 +10,10 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-from claude_on_the_fly.agent import ClaudeUnavailableError, Response
+from claude_on_the_fly import orchestrator as orchestrator_mod
+from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
-from claude_on_the_fly.orchestrator import Orchestrator
+from claude_on_the_fly.orchestrator import Orchestrator, Turn
 from claude_on_the_fly.protocol import Frontend
 
 # ---------------------------------------------------------------------------
@@ -239,13 +240,13 @@ class TestDrain:
     async def test_processes_all_queued_messages(self, orch: Orchestrator) -> None:
         processed: list[str] = []
 
-        async def fake_process(chat_id: int, text: str) -> None:
-            processed.append(text)
+        async def fake_process(chat_id: int, turn: Turn) -> None:
+            processed.append(turn.text)
 
         orch._queues[1] = asyncio.Queue()
-        orch._queues[1].put_nowait("msg1")
-        orch._queues[1].put_nowait("msg2")
-        orch._queues[1].put_nowait("msg3")
+        orch._queues[1].put_nowait(Turn("msg1"))
+        orch._queues[1].put_nowait(Turn("msg2"))
+        orch._queues[1].put_nowait(Turn("msg3"))
 
         with patch.object(orch, "_process", side_effect=fake_process):
             # Simulate being the running task
@@ -291,7 +292,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(return_value=fake_response)
-            await orch._process(1, "question")
+            await orch._process(1, Turn("question"))
 
         workspace = tmp_path / "workspaces" / "test/1"
         assert workspace.exists()
@@ -318,7 +319,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
-            await orch._process(1, "bad prompt")
+            await orch._process(1, Turn("bad prompt"))
 
         assert len(frontend.sent) == 1
         assert "Error: boom" in frontend.sent[0][1].body
@@ -331,7 +332,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(return_value=Response(body="ok"))
-            await orch._process(1, "question")
+            await orch._process(1, Turn("question"))
 
         assert frontend.complete_notifications == [1]
 
@@ -343,7 +344,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
-            await orch._process(1, "bad")
+            await orch._process(1, Turn("bad"))
 
         assert frontend.complete_notifications == [1]
 
@@ -357,7 +358,7 @@ class TestProcess:
             mock_agent.run = AsyncMock(
                 side_effect=ClaudeUnavailableError("monthly usage limit")
             )
-            await orch._process(1, "hi")
+            await orch._process(1, Turn("hi"))
 
         assert len(frontend.sent) == 1
         body = frontend.sent[0][1].body
@@ -374,7 +375,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(return_value=Response(body="ok"))
-            await orch._process(1, "hi")
+            await orch._process(1, Turn("hi"))
 
         assert mock_agent.run.call_args.kwargs["timeout"] == 99.0
 
@@ -386,7 +387,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(return_value=Response(body="ok"))
-            await orch._process(1, "hello")
+            await orch._process(1, Turn("hello"))
 
         # Typing indicator should have been sent at least once before cancel
         # (the loop fires immediately then sleeps 4s, but agent.run is instant
@@ -410,7 +411,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
         ):
-            await orch._process(1, "make a file")
+            await orch._process(1, Turn("make a file"))
 
         sent = frontend.sent[0][1]
         assert [p.name for p in sent.attachments] == ["report.csv"]
@@ -439,7 +440,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
         ):
-            await orch._process(1, "make a file")
+            await orch._process(1, Turn("make a file"))
 
         assert (outbox / "report.csv").exists()  # preserved for retry
         assert not (outbox / ".sent").exists()  # nothing archived
@@ -457,7 +458,7 @@ class TestProcess:
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
         ):
-            await orch._process(1, "hi")
+            await orch._process(1, Turn("hi"))
 
         assert frontend.sent[0][1].attachments == []
         assert (outbox / "report.csv").exists()  # untouched
@@ -569,7 +570,7 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(return_value=response)
-            await orch._process(7, "hi")
+            await orch._process(7, Turn("hi"))
 
         events = event_log.tail(10)
         types = [e["type"] for e in events]
@@ -594,7 +595,7 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=ClaudeUnavailableError("rate limit"))
-            await orch._process(7, "hi")
+            await orch._process(7, Turn("hi"))
 
         events = event_log.tail(10)
         types = [e["type"] for e in events]
@@ -616,7 +617,7 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
-            await orch._process(7, "hi")
+            await orch._process(7, Turn("hi"))
 
         events = event_log.tail(10)
         types = [e["type"] for e in events]
@@ -637,9 +638,9 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(return_value=Response(body="ok"))
-            await orch._process(7, "hi")
+            await orch._process(7, Turn("hi"))
             mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
-            await orch._process(8, "hi")
+            await orch._process(8, Turn("hi"))
 
         # Both chat_ids should be removed from in-flight after _process exits.
         assert orch._in_flight == {}
@@ -661,7 +662,7 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=hang)
-            task = asyncio.create_task(orch._process(9, "hi"))
+            task = asyncio.create_task(orch._process(9, Turn("hi")))
             # Yield until the orchestrator has registered the in-flight slot.
             for _ in range(20):
                 if orch._in_flight:
@@ -745,3 +746,240 @@ class TestAbort:
         assert frontend.complete_notifications == [1]
         assert 1 not in orch._in_flight
         assert not orch.is_busy(1)
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+
+class TestAutoCompactThreshold:
+    def test_unset_is_off(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_AUTO_COMPACT_PCT", raising=False)
+        assert orchestrator_mod._auto_compact_pct() == 0
+
+    def test_reads_a_valid_percentage(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_AUTO_COMPACT_PCT", "60")
+        assert orchestrator_mod._auto_compact_pct() == 60
+
+    def test_junk_disables_rather_than_crashing_the_daemon(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_AUTO_COMPACT_PCT", "sixty")
+        assert orchestrator_mod._auto_compact_pct() == 0
+
+    def test_out_of_range_disables(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_AUTO_COMPACT_PCT", "0")
+        assert orchestrator_mod._auto_compact_pct() == 0
+        monkeypatch.setenv("COTF_AUTO_COMPACT_PCT", "150")
+        assert orchestrator_mod._auto_compact_pct() == 0
+
+
+class TestDueForCompaction:
+    def test_off_by_default_however_full_the_context(self, orch: Orchestrator) -> None:
+        orch._context[1] = (990_000, 1_000_000)
+        assert orch._due_for_compaction(1) is False
+
+    def test_fires_above_the_threshold(self, orch: Orchestrator) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[1] = (650_000, 1_000_000)
+        assert orch._due_for_compaction(1) is True
+
+    def test_holds_below_the_threshold(self, orch: Orchestrator) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[1] = (500_000, 1_000_000)
+        assert orch._due_for_compaction(1) is False
+
+    def test_never_fires_without_a_reading(self, orch: Orchestrator) -> None:
+        """Native mode reports no context size, so the gate has nothing to read
+        and auto-compaction is inert there however it is configured."""
+        orch._auto_compact_pct = 1
+        assert orch._due_for_compaction(1) is False
+
+    def test_reading_is_consumed_so_it_fires_once(self, orch: Orchestrator) -> None:
+        """Two messages arriving together must queue one compaction, not two —
+        the second would pay a full-context pass to be told there is nothing
+        left to do."""
+        orch._auto_compact_pct = 60
+        orch._context[1] = (650_000, 1_000_000)
+        assert orch._due_for_compaction(1) is True
+        assert orch._due_for_compaction(1) is False
+
+    def test_a_zero_window_cannot_divide(self, orch: Orchestrator) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[1] = (100, 0)
+        assert orch._due_for_compaction(1) is False
+
+    def test_each_chat_is_judged_on_its_own_context(self, orch: Orchestrator) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[1] = (650_000, 1_000_000)
+        orch._context[2] = (10_000, 1_000_000)
+        assert orch._due_for_compaction(1) is True
+        assert orch._due_for_compaction(2) is False
+
+
+class TestOnMessageAutoCompacts:
+    async def test_compaction_is_queued_ahead_of_the_message(
+        self, orch: Orchestrator
+    ) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[1] = (650_000, 1_000_000)
+        seen: list[Turn] = []
+
+        async def capture(chat_id: int, turn: Turn) -> None:
+            seen.append(turn)
+
+        with patch.object(orch, "_process", side_effect=capture):
+            await orch.on_message(1, "and another thing")
+            await orch._running[1]
+
+        assert [(t.compact, t.text) for t in seen] == [
+            (True, ""),
+            (False, "and another thing"),
+        ]
+
+    async def test_no_compaction_when_under_threshold(self, orch: Orchestrator) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[1] = (10_000, 1_000_000)
+        seen: list[Turn] = []
+
+        async def capture(chat_id: int, turn: Turn) -> None:
+            seen.append(turn)
+
+        with patch.object(orch, "_process", side_effect=capture):
+            await orch.on_message(1, "hi")
+            await orch._running[1]
+
+        assert [t.compact for t in seen] == [False]
+
+
+class TestRunCompaction:
+    async def test_reports_the_numbers_to_the_user(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        outcome = Compaction(ok=True, pre_tokens=48939, post_tokens=5162, duration=10.8)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = AsyncMock(return_value=outcome)
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True))
+
+        mock_agent.run.assert_not_called()
+        body = frontend.sent[-1][1].body
+        assert "48,939" in body and "5,162" in body
+
+    async def test_says_so_when_the_backend_cannot_compact(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        """codex has no /compact. Silence would read as a compaction that worked."""
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = AsyncMock(return_value=None)
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True))
+
+        assert "can't compact" in frontend.sent[-1][1].body
+
+    async def test_a_manual_compaction_clears_the_stale_reading(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        """Otherwise the next message sees the pre-compaction size and fires an
+        automatic compaction straight after the manual one."""
+        orch._auto_compact_pct = 60
+        orch._context[1] = (650_000, 1_000_000)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = AsyncMock(return_value=Compaction(ok=True))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True))
+
+        assert orch._due_for_compaction(1) is False
+
+    async def test_a_compaction_still_gets_the_live_status_lifecycle(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        """Minutes of silence on a large thread look exactly like a dead daemon,
+        so the reaction and the ticking status matter more here than on a reply."""
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = AsyncMock(return_value=Compaction(ok=True))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True))
+
+        assert frontend.start_notifications == [1]
+        assert frontend.complete_notifications == [1]
+
+
+class TestContextTracking:
+    async def test_records_the_reading_a_pty_turn_reports(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        response = Response(
+            body="hi", context_tokens=650_000, context_window_size=1_000_000
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=response)
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("hi"))
+
+        assert orch._context[1] == (650_000, 1_000_000)
+
+    async def test_a_native_turn_does_not_erase_a_pty_reading(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        """Zeroing it on a mode switch would make a large context look small."""
+        orch._context[1] = (650_000, 1_000_000)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="hi"))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("hi"))
+
+        assert orch._context[1] == (650_000, 1_000_000)
+
+
+class TestContextIsForgottenOnSessionChange:
+    """The reading is keyed by chat but describes a session, and two callers
+    repoint a chat at a fresh one."""
+
+    def test_scheduler_reset_drops_the_previous_fires_reading(
+        self, orch: Orchestrator
+    ) -> None:
+        """The scheduler resets before every fire. A reading left over from the
+        last one would queue a compaction against a session with nothing in it."""
+        orch._auto_compact_pct = 60
+        orch._context[7] = (650_000, 1_000_000)
+
+        orch.reset_session(7)
+
+        assert orch._context.get(7) is None
+        assert orch._due_for_compaction(7) is False
+
+    def test_pinning_a_session_token_drops_it_too(self, orch: Orchestrator) -> None:
+        """telegram's /new mints a token for a deliberately fresh session."""
+        orch._auto_compact_pct = 60
+        orch._context[7] = (650_000, 1_000_000)
+
+        orch.set_session_token(7, "20260728-120000")
+
+        assert orch._due_for_compaction(7) is False
+
+    def test_other_chats_keep_their_readings(self, orch: Orchestrator) -> None:
+        orch._auto_compact_pct = 60
+        orch._context[7] = (650_000, 1_000_000)
+        orch._context[8] = (650_000, 1_000_000)
+
+        orch.reset_session(7)
+
+        assert orch._context.get(8) == (650_000, 1_000_000)

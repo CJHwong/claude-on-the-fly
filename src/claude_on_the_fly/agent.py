@@ -222,6 +222,48 @@ def build_system_prompt(
     )
 
 
+@dataclass(frozen=True)
+class Compaction:
+    """Outcome of a compaction turn.
+
+    `pre_tokens`/`post_tokens` come from the transcript's `compact_boundary`
+    record, which counts the *conversation* — not the billed prompt. The prompt
+    also carries the system prompt and tool schemas, tens of thousands of tokens
+    that compaction cannot touch, so `saved_tokens` is the ceiling on what a
+    later turn actually stops paying for, never the whole prompt.
+    """
+
+    ok: bool
+    pre_tokens: int = 0
+    post_tokens: int = 0
+    duration: float = 0
+    error: str = ""
+
+    @property
+    def saved_tokens(self) -> int:
+        return max(0, self.pre_tokens - self.post_tokens)
+
+    def summary(self) -> str:
+        """One line for the user. Frontend-agnostic: no mrkdwn, no emoji."""
+        if not self.ok:
+            # The CLI's own refusal ("Not enough messages to compact.") is more
+            # informative than anything we'd write over it.
+            return (
+                f"Couldn't compact: {self.error}"
+                if self.error
+                else "Nothing to compact."
+            )
+        if not self.pre_tokens:
+            return "Compacted the conversation."
+        counts = f"{self.pre_tokens:,} → {self.post_tokens:,} tokens"
+        # Only claude records how long it took; codex publishes no compaction
+        # duration, and "in 0s" reads as a suspiciously fast compaction rather
+        # than as a missing figure.
+        if not self.duration:
+            return f"Compacted the conversation: {counts}."
+        return f"Compacted the conversation: {counts} in {self.duration:.0f}s."
+
+
 @dataclass
 class Response:
     """Structured response from the agent."""
@@ -235,12 +277,20 @@ class Response:
     model: str = ""
     tool_counts: dict[str, int] = field(default_factory=dict)
     skill_counts: dict[str, int] = field(default_factory=dict)
+    # Set only on a compaction turn, so callers can tell one from a reply.
+    compaction: Compaction | None = None
     # Optional statusline-derived fields, only populated in CLAUDE_MODE=pty.
     rate_limits_5h_pct: int | None = None
     rate_limits_5h_resets_at: int | None = None
     rate_limits_7d_pct: int | None = None
     rate_limits_7d_resets_at: int | None = None
     context_window_pct: int | None = None
+    # Prompt size and the model's window, in tokens. The percentage above is
+    # derived from these two and loses the scale: 7% is 70k on a 200k model and
+    # 70k on a 1M model, and only one of those is worth compacting. The
+    # auto-compact gate needs the absolute numbers, so carry them.
+    context_tokens: int | None = None
+    context_window_size: int | None = None
     exceeds_200k: bool = False
     fast_mode: bool = False
 
@@ -287,12 +337,15 @@ class Response:
 
 
 def _fold(
-    msg: dict, tool_counts: dict[str, int], skill_counts: dict[str, int]
+    msg: dict,
+    tool_counts: dict[str, int],
+    skill_counts: dict[str, int],
+    compact: dict | None = None,
 ) -> dict | None:
     """Apply one parsed stream-json message to running tallies.
 
     Returns the message dict if it is a `type: "result"` line, else None.
-    Mutates tool_counts and skill_counts in place.
+    Mutates tool_counts, skill_counts, and (when given) compact in place.
     """
     msg_type = msg.get("type")
     if msg_type == "assistant":
@@ -305,6 +358,21 @@ def _fold(
                 skill = block.get("input", {}).get("skill")
                 if skill:
                     skill_counts[skill] = skill_counts.get(skill, 0) + 1
+    elif (
+        msg_type == "system" and msg.get("subtype") == "status" and compact is not None
+    ):
+        # A compaction bookends itself: `status: "compacting"` on the way in,
+        # then a `compact_result` on the way out. This is the only in-band signal
+        # that the turn compacted rather than answered — the result line reports
+        # `subtype: "success"` with an empty `result` either way, which is
+        # indistinguishable from a turn that produced nothing.
+        if msg.get("status") == "compacting":
+            compact["started"] = True
+        outcome = msg.get("compact_result")
+        if outcome is not None:
+            compact["result"] = outcome
+            if msg.get("compact_error"):
+                compact["error"] = msg["compact_error"]
     elif msg_type == "result":
         return dict(msg)
     return None
@@ -318,6 +386,7 @@ def parse_stream(stdout: bytes) -> dict:
     """
     tool_counts: dict[str, int] = {}
     skill_counts: dict[str, int] = {}
+    compact: dict = {}
     result: dict = {}
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -328,12 +397,13 @@ def parse_stream(stdout: bytes) -> dict:
         except json.JSONDecodeError:
             logger.warning("parse_stream: skipping malformed line: %s", line[:120])
             continue
-        r = _fold(msg, tool_counts, skill_counts)
+        r = _fold(msg, tool_counts, skill_counts, compact)
         if r is not None:
             result = r
     if result:
         result["tool_counts"] = tool_counts
         result["skill_counts"] = skill_counts
+        result["compact"] = compact
     return result
 
 
@@ -367,6 +437,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
 
     tool_counts: dict[str, int] = {}
     skill_counts: dict[str, int] = {}
+    compact: dict = {}
     result: dict = {}
     line_count = 0
     try:
@@ -380,7 +451,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
             except json.JSONDecodeError:
                 logger.warning("exec: skipping malformed line: %s", line[:120])
                 continue
-            r = _fold(msg, tool_counts, skill_counts)
+            r = _fold(msg, tool_counts, skill_counts, compact)
             if r is not None:
                 result = r
     except BaseException:
@@ -403,6 +474,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     if result:
         result["tool_counts"] = tool_counts
         result["skill_counts"] = skill_counts
+        result["compact"] = compact
 
     if proc.returncode != 0:
         err_stderr = stderr_bytes.decode().strip()
@@ -597,6 +669,22 @@ class AgentBackend(Protocol):
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
     ) -> Response: ...
+
+    async def compact(
+        self,
+        workspace: Path,
+        session_uuid: str,
+        timeout: float | None = DEFAULT_TIMEOUT,
+    ) -> Compaction | None:
+        """Summarize the session's history in place, shrinking the next prompt.
+
+        A separate method rather than a `run()` prompt because a compaction is
+        not a turn: it produces no assistant message, so every "did the turn
+        answer?" rule downstream reads it as a dead run. Returns None when the
+        backend has no compaction of its own — callers must treat that as "not
+        supported" and leave the session alone.
+        """
+        ...
 
     def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
         """Return the interactive resume command for an existing session, or None.
@@ -824,3 +912,16 @@ async def run(
         channel_context=channel_context,
         timeout=timeout,
     )
+
+
+async def compact(
+    workspace: Path,
+    session_uuid: str,
+    timeout: float | None = DEFAULT_TIMEOUT,
+) -> Compaction | None:
+    """Compact a session's history. None when the backend doesn't support it."""
+    backend = get_backend()
+    compactor = getattr(backend, "compact", None)
+    if compactor is None:
+        return None
+    return await compactor(workspace, session_uuid, timeout=timeout)
