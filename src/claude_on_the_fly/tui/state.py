@@ -28,6 +28,7 @@ from typing import Literal
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.heartbeat import STATE_DIR
+from claude_on_the_fly.heartbeat import process_exists as heartbeat_process_exists
 from claude_on_the_fly.jobs.file_queue import (
     DEFAULT_ROW_LIMIT,
     QueueDepth,
@@ -112,19 +113,10 @@ class Snapshot:
 # ---------------------------------------------------------------------------
 
 
-def process_exists(pid: int) -> bool:
-    """True if a process with this pid is currently running.
-
-    Uses signal 0, which performs no-op delivery but raises if the process is
-    gone (or we lack permission to signal it). For our purpose (single-user
-    macOS dev tool), permission errors are vanishingly rare.
-    """
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
+# Re-exported, not defined here: the daemons evaluate the same liveness
+# contract to refuse starting a second copy of themselves, and they cannot
+# import this package. Callers keep importing it from either module.
+process_exists = heartbeat_process_exists
 
 # Backward-compat alias (some module-internal callers).
 _process_exists = process_exists

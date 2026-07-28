@@ -28,7 +28,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 
 from claude_on_the_fly import agent, checks
-from claude_on_the_fly.heartbeat import HeartbeatWriter
+from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
 from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
 from claude_on_the_fly.jobs.core import AgentRunner, Job, JobQueue, Notifier
 from claude_on_the_fly.jobs.registry import make_queue
@@ -165,6 +165,22 @@ async def _run(token: str) -> None:
 
 def _cmd_run() -> int:
     _setup_logging()
+    running_pid = live_pid("jobs")
+    if running_pid is not None:
+        # The worker is a singleton, and nothing else enforces it: only
+        # supervisor.spawn checks, so `claude-jobs` typed in a shell next to a
+        # supervised one would sail past. Its first act is
+        # `recover_stale(None)`, which moves the in-flight job out of cur/ and
+        # back into new/ — so it claims the job the live worker is still
+        # executing and runs the whole prompt a second time, concurrently. The
+        # requester gets two replies, any side effect happens twice, and the
+        # original worker's complete() then finds its own file gone.
+        sys.stderr.write(
+            f"claude-jobs is already running (pid {running_pid}); refusing to "
+            "start a second worker on the same queue. Stop it first, or use "
+            "`claude-jobs enqueue` to add work to the running one.\n"
+        )
+        return 2
     check_backend()  # raises SystemExit on a misconfigured/absent agent CLI
     token_var, token = checks.resolve_jobs_token(os.environ)
     if not token:

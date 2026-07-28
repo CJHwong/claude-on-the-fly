@@ -94,3 +94,36 @@ def test_loop_warning_silent_for_bot_token() -> None:
 def test_loop_warning_silent_for_explicit_override() -> None:
     # Deployer chose JOBS_SLACK_TOKEN explicitly — even a user token is their call.
     assert cli._notifier_loop_warning("JOBS_SLACK_TOKEN", "xoxp-abc") is None
+
+
+def test_run_refuses_to_start_beside_a_live_worker(monkeypatch, capsys) -> None:
+    """The worker is a singleton and only supervisor.spawn enforced it, so a
+    hand-started `claude-jobs` next to a supervised one would run
+    recover_stale(None) and steal the job the live worker is executing."""
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: 9999)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("started a second worker on a live queue")
+
+    monkeypatch.setattr(cli, "check_backend", _must_not_run)
+    monkeypatch.setattr(cli.asyncio, "run", _must_not_run)
+
+    assert cli._cmd_run() == 2
+    assert "already running (pid 9999)" in capsys.readouterr().err
+
+
+def test_run_proceeds_when_no_worker_is_live(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(
+        cli.checks, "resolve_jobs_token", lambda env: ("JOBS_SLACK_TOKEN", "xoxb-t")
+    )
+    ran: list[str] = []
+    monkeypatch.setattr(
+        cli.asyncio, "run", lambda coro: (coro.close(), ran.append("x"))
+    )
+
+    assert cli._cmd_run() == 0
+    assert ran == ["x"]
