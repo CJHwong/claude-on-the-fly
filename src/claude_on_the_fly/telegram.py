@@ -6,9 +6,10 @@ import asyncio
 import json
 import logging
 import mimetypes
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from telegram import Update
 from telegram.error import BadRequest
@@ -47,6 +48,10 @@ class TelegramFrontend(Frontend):
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
         self._orchestrator: Orchestrator | None = None
         self._media_groups: dict[str, dict] = {}
+        # The event loop only holds a weak reference to a bare create_task, so a
+        # flush sleeping out its MEDIA_GROUP_WAIT can be garbage-collected before
+        # it ever delivers the album. Hold a strong reference until it finishes.
+        self._flush_tasks: set[asyncio.Task[None]] = set()
         self._chat_names: dict[int, str] = {}
         # chat_id -> current session token (a /new timestamp). Absent = the base
         # session (no suffix). Tokens are unique and never recycle, so pruning
@@ -351,7 +356,9 @@ class TelegramFrontend(Frontend):
                 "files": [],
                 "caption": caption,
             }
-            asyncio.create_task(self._flush_media_group(group_id))
+            task = asyncio.create_task(self._flush_media_group(group_id))
+            self._flush_tasks.add(task)
+            task.add_done_callback(self._flush_tasks.discard)
         self._media_groups[group_id]["files"].append((file_id, file_name))
         if caption:
             self._media_groups[group_id]["caption"] = caption
