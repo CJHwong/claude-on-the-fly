@@ -537,8 +537,16 @@ class TestExec:
         proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
         proc.wait = AsyncMock(return_value=-9)
 
+        # `proc` is a MagicMock, so `proc.pid` resolves through __index__ to 1 and
+        # the reaper would hand `killpg` a real process group. Whether that is
+        # refused (and the fallback below runs) or succeeds is then up to the host:
+        # unprivileged it raises EPERM, but as root in a container pgid 1 is our
+        # own group and the suite SIGKILLs itself. Patch the syscall so the
+        # fallback this test is about is reached deterministically, and nothing
+        # real is ever signalled.
         with (
             patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(agent_mod.os, "killpg", side_effect=PermissionError),
             pytest.raises(RuntimeError, match=re.escape("timed out after 0.1s")),
         ):
             await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
@@ -581,8 +589,11 @@ class TestExec:
         """kill() raises ProcessLookupError — swallowed, timeout still propagates."""
         proc = _never_ending_proc()
         proc.kill = MagicMock(side_effect=ProcessLookupError)
+        # See test_timeout_kills_proc_and_raises: killpg is patched so the mock's
+        # pid cannot reach a live process group.
         with (
             patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(agent_mod.os, "killpg", side_effect=PermissionError),
             pytest.raises(RuntimeError, match=re.escape("timed out after 0.1s")),
         ):
             await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
