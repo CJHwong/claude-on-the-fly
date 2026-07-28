@@ -31,7 +31,10 @@ repos:
     -   id: ruff-check
         args: [--fix, --exit-non-zero-on-fix]
     -   id: ruff-format
--   repo: https://github.com/allganize/ty-pre-commit
-    rev: v0.0.17
+# Astral's own hook. It typechecks the whole project in one pass rather than the
+# files a run happens to touch, so `[tool.ty.src]` in pyproject decides the
+# scope instead of the hook's file list.
+-   repo: https://github.com/astral-sh/ty-pre-commit
+    rev: v0.0.64
     hooks:
-    -   id: ty-check
+    -   id: ty

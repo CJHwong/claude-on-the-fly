@@ -81,3 +81,12 @@ packages = ["src/claude_on_the_fly"]
 
 [tool.ty.environment]
 python = ".venv"
+
+[tool.ty.src]
+# Typecheck the shipped package only. The test suite is built out of Mock and
+# hand-rolled fake doubles passed where a real type is annotated, which is the
+# point of a double and not something ty can be made to like: checking it
+# reported 129 diagnostics, none of them defects. Scoping it here states what is
+# actually covered, instead of leaving it to depend on which files a pre-commit
+# run happened to pass in.
+include = ["src"]
