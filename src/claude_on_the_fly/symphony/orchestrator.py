@@ -17,17 +17,14 @@ Source-vs-tracker terminology:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+from collections.abc import Iterable, Mapping
 from itertools import count
 from pathlib import Path
-from typing import Iterable, Mapping
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
-from claude_on_the_fly.heartbeat import HeartbeatWriter
-
-from .agent_runner import TicketRunner, session_uuid_for
-from .config import SymphonyConfig, TrackerCommonConfig, load_config
 from claude_on_the_fly.events import (
     EVENT_CANCELLED,
     EVENT_DISPATCHED,
@@ -35,6 +32,10 @@ from claude_on_the_fly.events import (
     EVENT_WORKER_FAILED,
     EventLog,
 )
+from claude_on_the_fly.heartbeat import HeartbeatWriter
+
+from .agent_runner import TicketRunner, session_uuid_for
+from .config import SymphonyConfig, TrackerCommonConfig, load_config
 from .cursor import CursorStore, is_claimable
 from .prompt import InstructionResolver
 from .retry import RetryQueue
@@ -578,7 +579,7 @@ async def reconcile(
 
     now = time.monotonic()
     for (source, tracker, tracker_cfg, entries), summaries in zip(
-        runnable, fetch_results
+        runnable, fetch_results, strict=True
     ):
         if isinstance(summaries, BaseException):
             logger.exception(
@@ -684,7 +685,9 @@ async def startup_cleanup(
         return_exceptions=True,
     )
 
-    for (source, tracker, dir_to_ident), summaries in zip(plans, fetch_results):
+    for (source, tracker, dir_to_ident), summaries in zip(
+        plans, fetch_results, strict=True
+    ):
         if isinstance(summaries, BaseException):
             logger.warning(
                 "startup_cleanup[%s]: state fetch failed; skipping (%s)",
@@ -764,7 +767,7 @@ async def _process_due_retries(
     )
 
     for (source, tracker, tracker_cfg, entries), summaries in zip(
-        runnable, fetch_results
+        runnable, fetch_results, strict=True
     ):
         if isinstance(summaries, BaseException):
             logger.warning(
@@ -906,7 +909,7 @@ async def tick(
     )
 
     candidates: list[tuple[Issue, str]] = []  # (issue, source)
-    for (source, _tracker), fetched in zip(sources, fetch_results):
+    for (source, _tracker), fetched in zip(sources, fetch_results, strict=True):
         if isinstance(fetched, BaseException):
             logger.exception(
                 "tick[%s]: fetch_candidates failed; skipping dispatch",
@@ -1177,8 +1180,8 @@ def _maybe_reload_config(
         )
 
     if added:
-        from .tracker import make_tracker
         from .config import JiraTrackerConfig
+        from .tracker import make_tracker
 
         for source in added:
             tcfg = new_config.trackers[source]
@@ -1279,13 +1282,11 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
             except Exception:
                 logger.exception("tick: unexpected failure (continuing)")
 
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop_event.wait(),
                     timeout=config.polling_ms / 1000,
                 )
-            except asyncio.TimeoutError:
-                pass
 
         logger.info(
             "symphony: stop signal received; awaiting %d worker(s)", len(pending_tasks)
@@ -1295,10 +1296,8 @@ async def run_loop(config_path, stop_event: asyncio.Event) -> None:
     finally:
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             heartbeat.path.unlink()
-        except FileNotFoundError:
-            pass
         for tracker in trackers.values():
             await tracker.aclose()
         logger.info("symphony: shut down")

@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from claude_on_the_fly.symphony.config import SymphonyConfig, TrackerConfig
 from claude_on_the_fly.events import EventLog
+from claude_on_the_fly.symphony.config import SymphonyConfig, TrackerConfig
 from claude_on_the_fly.symphony.orchestrator import (
     _check_and_cancel_stall,
     _dispatch,

@@ -106,7 +106,7 @@ class JiraTracker:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=self._timeout
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             proc.kill()
             await proc.wait()
             raise JiraAcliError(
@@ -231,7 +231,7 @@ class JiraTracker:
             *(self.fetch_one(k) for k in keys), return_exceptions=True
         )
         out_issues: list[Issue] = []
-        for key, res in zip(keys, results):
+        for key, res in zip(keys, results, strict=True):
             if isinstance(res, Issue):
                 out_issues.append(res)
             else:

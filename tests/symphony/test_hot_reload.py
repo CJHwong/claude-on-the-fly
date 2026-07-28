@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
-
 from claude_on_the_fly.symphony.config import SymphonyConfig, load_config
 from claude_on_the_fly.symphony.cursor import CursorStore
 from claude_on_the_fly.symphony.orchestrator import (

@@ -20,7 +20,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -44,7 +44,7 @@ def _package_version() -> str:
 
 
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def process_exists(pid: int) -> bool:
@@ -87,9 +87,7 @@ def live_pid(
         return None
     if not isinstance(pid, int):
         return None
-    age_s = (
-        datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)
-    ).total_seconds()
+    age_s = (datetime.now(UTC) - last.replace(tzinfo=UTC)).total_seconds()
     if age_s > liveness_window_s:
         return None
     return pid if process_exists(pid) else None

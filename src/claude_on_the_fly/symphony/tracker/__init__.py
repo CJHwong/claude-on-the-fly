@@ -41,11 +41,11 @@ def make_trackers(config) -> dict[str, Tracker]:
 
 
 __all__ = [
+    "SUPPORTED_TRACKERS",
     "BlockerRef",
     "GitHubTracker",
     "Issue",
     "JiraTracker",
-    "SUPPORTED_TRACKERS",
     "Tracker",
     "make_tracker",
     "make_trackers",

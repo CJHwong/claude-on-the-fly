@@ -5,7 +5,6 @@ from __future__ import annotations
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
-
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Static
@@ -13,7 +12,6 @@ from textual.widgets import Footer, Static
 from claude_on_the_fly import checks
 from claude_on_the_fly.tui import supervisor
 from claude_on_the_fly.tui.screens.overlay import OverlayScreen
-
 
 _STATUS_STYLES = {
     "ok": "green",

@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from claude_on_the_fly.jobs.core import Job, Result
@@ -335,9 +335,7 @@ def test_row_enqueued_at_comes_from_the_id_not_the_file(tmp_path: Path) -> None:
     os.utime(root / "new" / f"{minted_ns}-abcd1234.json", (0, 0))
 
     row = read_queue_rows(root)[0]
-    assert row.enqueued_at == datetime.fromtimestamp(
-        minted_ns / 1_000_000_000, tz=timezone.utc
-    )
+    assert row.enqueued_at == datetime.fromtimestamp(minted_ns / 1_000_000_000, tz=UTC)
 
 
 def test_row_with_unparseable_id_has_no_enqueued_at(tmp_path: Path) -> None:

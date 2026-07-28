@@ -1051,11 +1051,11 @@ class TestFlushMediaGroup:
             "caption": "look at these",
         }
 
-        with patch.object(frontend, "_save_file", new_callable=AsyncMock) as mock_save:
-            with patch(
-                "claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock
-            ):
-                await frontend._flush_media_group("grp1")
+        with (
+            patch.object(frontend, "_save_file", new_callable=AsyncMock) as mock_save,
+            patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await frontend._flush_media_group("grp1")
 
         assert mock_save.await_count == 2
         mock_save.assert_any_await(1, "fid1", "a.jpg")
@@ -1078,11 +1078,11 @@ class TestFlushMediaGroup:
             "caption": "",
         }
 
-        with patch.object(frontend, "_save_file", new_callable=AsyncMock):
-            with patch(
-                "claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock
-            ):
-                await frontend._flush_media_group("grp2")
+        with (
+            patch.object(frontend, "_save_file", new_callable=AsyncMock),
+            patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await frontend._flush_media_group("grp2")
 
         call_text = frontend._on_message.call_args[0][1]
         assert "Please review the uploaded files." in call_text
@@ -1105,16 +1105,16 @@ class TestFlushMediaGroup:
             "caption": "",
         }
 
-        with patch.object(
-            frontend,
-            "_save_file",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("boom"),
+        with (
+            patch.object(
+                frontend,
+                "_save_file",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
         ):
-            with patch(
-                "claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock
-            ):
-                await frontend._flush_media_group("grp3")  # should not raise
+            await frontend._flush_media_group("grp3")  # should not raise
 
         frontend._on_message.assert_not_awaited()
 

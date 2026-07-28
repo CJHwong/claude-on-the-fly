@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-
+from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     SlackFrontend,
     _extract_forwards,
@@ -16,8 +16,6 @@ from claude_on_the_fly.slack import (
     _text_from_blocks,
     _text_from_primary_blocks,
 )
-from claude_on_the_fly.agent import Response
-
 
 # ---------------------------------------------------------------------------
 # _flatten_rich_elements

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +22,6 @@ from claude_on_the_fly.slack import (
     _split_blocks,
 )
 from claude_on_the_fly.slack_mrkdwn import SLACK_BLOCK_LIMIT
-
 
 # ---------------------------------------------------------------------------
 # _split_blocks
@@ -2197,7 +2196,7 @@ def _row(job_id, prompt, channel, *, in_flight=False, age_s=0):
         id=job_id,
         prompt=prompt,
         origin={"channel": channel},
-        enqueued_at=datetime.now(timezone.utc) - timedelta(seconds=age_s),
+        enqueued_at=datetime.now(UTC) - timedelta(seconds=age_s),
         in_flight=in_flight,
     )
 

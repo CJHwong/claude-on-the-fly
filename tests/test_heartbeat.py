@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -85,10 +86,8 @@ class TestRunLoop:
         task = asyncio.create_task(writer.run())
         await asyncio.sleep(0.05)  # let the first write happen
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
 
         assert (tmp_path / "telegram.json").is_file()
 
@@ -102,10 +101,8 @@ class TestRunLoop:
         await asyncio.sleep(0.1)
         second = json.loads((tmp_path / "telegram.json").read_text())["last_heartbeat"]
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
 
         # They might be equal if seconds resolution doesn't advance, but the
         # loop should have run multiple iterations. Verify the file is fresh.
@@ -130,7 +127,7 @@ class TestLivePid:
 
     def _write(self, state_dir, frontend="jobs", *, pid=4242, age_s=0.0) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+        stamp = datetime.now(UTC) - timedelta(seconds=age_s)
         (state_dir / f"{frontend}.json").write_text(
             json.dumps(
                 {

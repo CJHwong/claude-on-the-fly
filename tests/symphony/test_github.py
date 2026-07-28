@@ -15,7 +15,6 @@ from claude_on_the_fly.symphony.tracker.github import (
 )
 from claude_on_the_fly.symphony.tracker.issue import IssueSummary
 
-
 # ---------------------------------------------------------------------------
 # parse_identifier
 # ---------------------------------------------------------------------------
@@ -43,11 +42,13 @@ def test_parse_identifier_rejects_garbage() -> None:
 
 
 def test_init_fails_when_gh_missing() -> None:
-    with patch(
-        "claude_on_the_fly.symphony.tracker.github.shutil.which", return_value=None
+    with (
+        patch(
+            "claude_on_the_fly.symphony.tracker.github.shutil.which", return_value=None
+        ),
+        pytest.raises(RuntimeError, match=r"gh.*CLI not found"),
     ):
-        with pytest.raises(RuntimeError, match="gh.*CLI not found"):
-            GitHubTracker()
+        GitHubTracker()
 
 
 def test_from_config_returns_tracker() -> None:
@@ -305,12 +306,14 @@ async def test_run_gh_returns_stdout_on_success() -> None:
 @pytest.mark.asyncio
 async def test_run_gh_raises_on_nonzero_exit() -> None:
     t = _tracker()
-    with patch(
-        "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=_stub_proc(b"", b"not found", returncode=1)),
+    with (
+        patch(
+            "claude_on_the_fly.symphony.tracker.github.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=_stub_proc(b"", b"not found", returncode=1)),
+        ),
+        pytest.raises(GhCliError) as excinfo,
     ):
-        with pytest.raises(GhCliError) as excinfo:
-            await t._run_gh(["api", "user"])
+        await t._run_gh(["api", "user"])
     assert "not found" in str(excinfo.value)
     assert excinfo.value.returncode == 1
 

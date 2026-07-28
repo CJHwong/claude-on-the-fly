@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -165,9 +165,7 @@ def _fmt_uptime(started_at: str | None, now: datetime) -> str:
     if not started_at:
         return "-"
     try:
-        s = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
+        s = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     except ValueError:
         return "-"
     return _fmt_age((now - s).total_seconds())

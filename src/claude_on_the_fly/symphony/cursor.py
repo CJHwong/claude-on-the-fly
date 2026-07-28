@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +150,7 @@ class CursorStore:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def is_claimable(*, ticket_updated: str | None, cursor: TicketCursor) -> bool:
@@ -200,5 +200,5 @@ def _parse_iso(s: str) -> datetime:
     # (which raises TypeError). Real Jira/GitHub stamps carry an offset; this
     # only guards a degenerate tracker payload.
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt

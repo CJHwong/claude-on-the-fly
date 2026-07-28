@@ -11,8 +11,10 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import aiohttp
@@ -21,15 +23,13 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from typing import TYPE_CHECKING, Awaitable, Callable
-
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
+from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -338,7 +338,7 @@ def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> st
     if not here:
         lines.append("No jobs queued from this channel.")
     else:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         shown = here[:JOB_LIST_LIMIT]
         lines.append(f"*{len(here)} job(s) from this channel:*")
         for row in shown:
@@ -1726,24 +1726,26 @@ class SlackFrontend(Frontend):
     @staticmethod
     async def _download_file(url: str, dest: Path, token: str) -> None:
         headers = {"Authorization": f"Bearer {token}"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, allow_redirects=True) as resp:
-                resp.raise_for_status()
-                content_type = resp.content_type or ""
-                if content_type.startswith("text/html"):
-                    raise RuntimeError(
-                        f"got HTML instead of file data (likely auth issue): {url}"
-                    )
-                data = await resp.read()
-                if not data:
-                    raise RuntimeError(f"empty response body: {url}")
-                dest.write_bytes(data)
-                logger.debug(
-                    "downloaded %s: %d bytes, content-type=%s",
-                    dest.name,
-                    len(data),
-                    content_type,
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(url, headers=headers, allow_redirects=True) as resp,
+        ):
+            resp.raise_for_status()
+            content_type = resp.content_type or ""
+            if content_type.startswith("text/html"):
+                raise RuntimeError(
+                    f"got HTML instead of file data (likely auth issue): {url}"
                 )
+            data = await resp.read()
+            if not data:
+                raise RuntimeError(f"empty response body: {url}")
+            dest.write_bytes(data)
+            logger.debug(
+                "downloaded %s: %d bytes, content-type=%s",
+                dest.name,
+                len(data),
+                content_type,
+            )
 
     async def _resolve_message_author(self, msg: dict) -> str:
         """Best-effort author display name for a thread-replay message."""

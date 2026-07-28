@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -45,13 +46,13 @@ def test_core_imports_only_stdlib() -> None:
 
 def test_job_is_frozen() -> None:
     job = Job(id="j1", prompt="do it", origin={"channel": "C1"})
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         job.id = "j2"  # type: ignore[misc]
 
 
 def test_result_is_frozen() -> None:
     result = Result(ok=True, text="done")
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         result.ok = False  # type: ignore[misc]
 
 

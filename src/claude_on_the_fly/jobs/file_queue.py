@@ -28,7 +28,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from claude_on_the_fly.jobs.core import Delivery, Job, QueueRow, Result
@@ -52,7 +52,7 @@ PROMPT_PREVIEW_LIMIT = 500
 
 
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class FileInboxQueue:
@@ -399,7 +399,7 @@ def _enqueued_at(job_id: str) -> datetime | None:
     if ns <= 0:
         return None
     try:
-        return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc)
+        return datetime.fromtimestamp(ns / 1_000_000_000, tz=UTC)
     except (OverflowError, OSError, ValueError):
         return None
 

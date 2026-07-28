@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,6 @@ from claude_on_the_fly.tui.state import (
     Snapshot,
     snapshot,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -49,7 +48,7 @@ def _write_heartbeat(
 
 
 def _at(ts: str) -> datetime:
-    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
 
 @pytest.fixture

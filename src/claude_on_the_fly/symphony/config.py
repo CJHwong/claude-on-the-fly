@@ -188,7 +188,9 @@ def _coerce_int(value: Any, *, field: str, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        raise ValueError(f"tracker.{field} must be an integer (got {value!r})")
+        raise ValueError(
+            f"tracker.{field} must be an integer (got {value!r})"
+        ) from None
 
 
 def _coerce_bool(value: Any, *, field: str, default: bool) -> bool:

@@ -74,7 +74,7 @@ def open_in_editor(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(seed or "")
         created = True
-    runner(_resolve_editor() + [str(path)], check=False)
+    runner([*_resolve_editor(), str(path)], check=False)
     return created
 
 
@@ -94,7 +94,7 @@ def edit_and_diff(
         env_file.touch()
 
     before = dict(dotenv_values(env_file))
-    cmd = _resolve_editor() + [str(env_file)]
+    cmd = [*_resolve_editor(), str(env_file)]
     runner(cmd, check=False)
     after = dict(dotenv_values(env_file))
     return diff_env(before, after)

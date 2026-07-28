@@ -117,7 +117,7 @@ class GitHubTracker:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self._timeout_s
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
             raise GhCliError(args, -1, "timed out") from None

@@ -61,7 +61,7 @@ class RetryQueue:
     call also writes a `retry_scheduled` event for the TUI History pane.
     """
 
-    def __init__(self, event_log: "EventLog | None" = None) -> None:
+    def __init__(self, event_log: EventLog | None = None) -> None:
         self._entries: dict[str, RetryEntry] = {}
         self._event_log = event_log
 

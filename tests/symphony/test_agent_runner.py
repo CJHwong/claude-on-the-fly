@@ -3,7 +3,6 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-
 from claude_on_the_fly.symphony.agent_runner import TicketRunner, session_uuid_for
 from claude_on_the_fly.symphony.config import JiraTrackerConfig, SymphonyConfig
 from claude_on_the_fly.symphony.tracker.issue import Issue

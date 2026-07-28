@@ -181,7 +181,7 @@ def _get_index() -> dict[str, tuple[float, float]] | None:
     fresh = _fetch()
     if fresh is not None:
         _write_cache(fresh)
-        memo_mtime, memo_index = _memo
+        _memo_mtime, memo_index = _memo
         if memo_index is not None:
             return memo_index
 

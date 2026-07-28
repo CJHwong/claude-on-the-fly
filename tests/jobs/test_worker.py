@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 from pathlib import Path
 
 import claude_on_the_fly.jobs.worker as worker
@@ -318,10 +319,8 @@ async def test_cancel_during_delivery_leaves_the_result_unmarked() -> None:
     task = asyncio.create_task(run_once(queue, _CountingRunner(), notifier))
     await notifier.started.wait()
     task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await task
-    except asyncio.CancelledError:
-        pass
 
     assert queue.completed  # work finished
     assert queue.delivered == []  # reply still owed

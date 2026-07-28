@@ -12,7 +12,7 @@ it regresses.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -47,7 +47,7 @@ def _claude_assistant_text(text: str) -> dict:
     """A minimal stream-json assistant turn the watch's format_event accepts."""
     return {
         "type": "assistant",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "message": {
             "role": "assistant",
             "content": [{"type": "text", "text": text}],
@@ -116,10 +116,10 @@ async def test_watch_pane_renders_jsonl_for_symphony_row(
         ],
     )
 
-    from claude_on_the_fly.tui.tui_app import ClaudeTuiApp
     from textual.widgets import DataTable, RichLog
 
     from claude_on_the_fly.tui.screens.history import HistoryScreen
+    from claude_on_the_fly.tui.tui_app import ClaudeTuiApp
 
     app = ClaudeTuiApp()
     async with app.run_test() as pilot:
@@ -185,12 +185,13 @@ async def test_dashboard_session_uuid_uses_current_backend_key(
 
     # Force the dashboard's snapshot to report one running symphony ticket
     # so _refresh populates _job_sessions with our identifier.
-    from datetime import datetime, timezone as tz
+    from datetime import datetime
+
     from claude_on_the_fly.tui.state import FrontendStatus, Snapshot
 
     identifier = "owner/repo#99"
     fake_snapshot = Snapshot(
-        timestamp=datetime.now(tz.utc),
+        timestamp=datetime.now(UTC),
         frontends=[
             FrontendStatus(
                 name="symphony",

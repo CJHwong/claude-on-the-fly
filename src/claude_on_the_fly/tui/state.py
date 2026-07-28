@@ -19,7 +19,7 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -128,7 +128,7 @@ def _staleness_threshold_s(frontend: str) -> int:
 
 def parse_iso_utc(ts: str) -> datetime:
     """Parse a 'YYYY-MM-DDTHH:MM:SSZ' timestamp into a UTC datetime."""
-    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
 
 _parse_iso_utc = parse_iso_utc
@@ -157,9 +157,7 @@ def _is_stale(
         return False
     if daemon_version is not None and daemon_version != self_version:
         return True
-    if daemon_executable is not None and daemon_executable != self_executable:
-        return True
-    return False
+    return daemon_executable is not None and daemon_executable != self_executable
 
 
 def _frontend_status_from_heartbeat(
@@ -353,7 +351,7 @@ def snapshot(
     """
     sd = state_dir if state_dir is not None else STATE_DIR
     sy = schedule_yaml if schedule_yaml is not None else DEFAULT_SCHEDULE_YAML
-    ts = now if now is not None else datetime.now(timezone.utc)
+    ts = now if now is not None else datetime.now(UTC)
     sv = self_version if self_version is not None else tui_version()
     se = self_executable if self_executable is not None else sys.executable
 

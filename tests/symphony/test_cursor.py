@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 from claude_on_the_fly.symphony.cursor import (
     CursorStore,
     TicketCursor,
     _safe_filename,
     is_claimable,
 )
-
 
 # ---------------------------------------------------------------------------
 # _safe_filename

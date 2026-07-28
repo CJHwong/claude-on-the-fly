@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -94,7 +95,7 @@ def test_tracker_rejects_legacy_email_and_api_token():
 def test_load_config_defaults(tmp_path, env_creds):
     from claude_on_the_fly.symphony.config import JiraTrackerConfig
 
-    cfg_path, prompt_path = _write_pair(tmp_path)
+    cfg_path, _prompt_path = _write_pair(tmp_path)
     cfg = load_config(cfg_path)
     cfg.validate()
     tracker = cfg.tracker
@@ -213,7 +214,9 @@ tracker:
   prompt: ./some-prompt.md
 """
     )
-    with pytest.raises(ValueError, match="tracker.prompt / tracker.prompts_dir"):
+    with pytest.raises(
+        ValueError, match=re.escape("tracker.prompt / tracker.prompts_dir")
+    ):
         load_config(cfg_path)
 
 
@@ -227,7 +230,9 @@ def test_load_config_max_concurrent_min(tmp_path, env_creds):
     """Per-tracker max_concurrent must be >= 1."""
     cfg_path, _ = _write_pair(tmp_path, extras="max_concurrent: 0\n")
     cfg = load_config(cfg_path)
-    with pytest.raises(ValueError, match="tracker.max_concurrent must be >= 1"):
+    with pytest.raises(
+        ValueError, match=re.escape("tracker.max_concurrent must be >= 1")
+    ):
         cfg.validate()
 
 
@@ -364,7 +369,7 @@ def test_tracker_validate_base_url_required() -> None:
             "project_key": "PROJ",
         }
     )
-    with pytest.raises(ValueError, match="tracker.base_url is required"):
+    with pytest.raises(ValueError, match=re.escape("tracker.base_url is required")):
         cfg.validate()
 
 
@@ -375,7 +380,7 @@ def test_tracker_validate_project_key_required() -> None:
             "project_key": "",
         }
     )
-    with pytest.raises(ValueError, match="tracker.project_key is required"):
+    with pytest.raises(ValueError, match=re.escape("tracker.project_key is required")):
         cfg.validate()
 
 
@@ -471,14 +476,16 @@ tracker:
   gate_label: stevedore
 """
     )
-    with pytest.raises(ValueError, match="tracker.gate_label is no longer"):
+    with pytest.raises(ValueError, match=re.escape("tracker.gate_label is no longer")):
         load_config(cfg_path)
 
 
 def test_load_config_unsupported_kind_raises(tmp_path, env_creds):
     cfg_path = tmp_path / "symphony.yaml"
     cfg_path.write_text("trackers:\n  bogus:\n    kind: linear\n")
-    with pytest.raises(ValueError, match="tracker.kind='linear' unsupported"):
+    with pytest.raises(
+        ValueError, match=re.escape("tracker.kind='linear' unsupported")
+    ):
         load_config(cfg_path)
 
 

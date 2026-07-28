@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import NAMESPACE_URL, uuid5
 
@@ -14,7 +14,6 @@ from claude_on_the_fly.agent import ClaudeUnavailableError, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import Orchestrator
 from claude_on_the_fly.protocol import Frontend
-
 
 # ---------------------------------------------------------------------------
 # Fake frontend
