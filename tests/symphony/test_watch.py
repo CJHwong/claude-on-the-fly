@@ -7,6 +7,9 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
+from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.watch import (
     _first_line_with_count,
     _format_tool_args,
@@ -444,3 +447,128 @@ class TestFormatMessageEvent:
             )
             is None
         )
+
+
+# ---------------------------------------------------------------------------
+# Markup safety — a transcript is data, not markup we authored
+# ---------------------------------------------------------------------------
+
+
+def _parses(formatted: str | None) -> bool:
+    """Whether every line survives the parser both consumers run it through."""
+    from rich.text import Text
+
+    if formatted is None:
+        return True
+    for line in formatted.split("\n"):
+        Text.from_markup(line)
+    return True
+
+
+class TestMarkupSafety:
+    """The live crash: a `PostCompact [/Users/…/postcompact_envelope.sh] completed`
+    notice in a transcript read as an unmatched closing tag and took the whole
+    TUI down, from `_refresh_watch_pane` -> `RichLog.write` -> `Text.from_markup`.
+    """
+
+    def test_the_bracketed_path_that_crashed_the_tui(self):
+        event = {
+            "type": "user",
+            "timestamp": "2026-07-28T11:43:08.873Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "<local-command-stdout>\x1b[2mCompacted (ctrl+o to see full "
+                    "summary)\x1b[22m\n\x1b[2mPostCompact [/Users/hoss/.local/share/"
+                    "claude-interactive-p/hooks/postcompact_envelope.sh] completed"
+                    "\x1b[22m</local-command-stdout>"
+                ),
+            },
+        }
+        assert _parses(watch.format_event(event))
+
+    def test_ansi_escapes_are_stripped_not_rendered(self):
+        event = {
+            "type": "user",
+            "timestamp": "2026-07-28T11:43:08.873Z",
+            "message": {"role": "user", "content": "\x1b[2mdimmed\x1b[22m"},
+        }
+        formatted = watch.format_event(event)
+        assert "\x1b" not in formatted
+        assert "dimmed" in formatted
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "[/Users/hoss/x.sh]",  # the real one: closing tag
+            "[bold]never closed",
+            "[/]",
+            "see [/etc/passwd] and [/tmp]",
+        ],
+    )
+    def test_hostile_bodies_in_every_role(self, hostile):
+        for event in (
+            {"type": "user", "message": {"role": "user", "content": hostile}},
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": hostile}]},
+            },
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "thinking", "thinking": hostile}]},
+            },
+            {"type": "result", "result": hostile},
+        ):
+            assert _parses(watch.format_event(event)), f"{event['type']} on {hostile!r}"
+
+    def test_hostile_tool_name_and_args(self):
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "[/weird]",
+                        "input": {"command": "rm [/tmp/x]"},
+                    }
+                ]
+            },
+        }
+        assert _parses(watch.format_event(event))
+
+    def test_hostile_tool_result(self):
+        event = {
+            "type": "user",
+            "message": {
+                "content": [{"type": "tool_result", "content": "wrote [/tmp/out.txt]"}]
+            },
+        }
+        assert _parses(watch.format_event(event))
+
+    def test_our_own_markup_still_renders(self):
+        """Escaping the body must not flatten the headers we author on purpose."""
+        event = {
+            "type": "user",
+            "timestamp": "2026-07-28T11:43:08.873Z",
+            "message": {"role": "user", "content": "hello"},
+        }
+        formatted = watch.format_event(event)
+        assert "[bold cyan]" in formatted and "[/bold cyan]" in formatted
+
+    def test_the_body_is_escaped_exactly_once(self):
+        """A second pass would show the backslashes to the reader."""
+        event = {"type": "user", "message": {"role": "user", "content": "[/x]"}}
+        formatted = watch.format_event(event)
+        assert "\\[/x]" in formatted
+        assert "\\\\[" not in formatted
+
+    def test_the_net_rescues_unparseable_markup(self):
+        """Guards a future missed interpolation: render it plainly rather than
+        letting one transcript line kill the viewer."""
+        rescued = watch._guarantee_parseable("[/nope] broken")
+        assert rescued is not None
+        assert _parses(rescued)
+
+    def test_the_net_leaves_valid_markup_untouched(self):
+        good = "[bold cyan]fine[/bold cyan]"
+        assert watch._guarantee_parseable(good) == good

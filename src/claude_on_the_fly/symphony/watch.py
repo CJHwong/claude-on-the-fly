@@ -15,14 +15,42 @@ Visual hierarchy:
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape as _escape_markup
+from rich.text import Text
+
+logger = logging.getLogger(__name__)
+
 _SKIP_TYPES = {"ai-title", "attachment", "last-prompt", "pr-link", "system"}
 _RULE_FILL = "━" * 60  # generous trailing run; terminals wider than ~80 cols swallow it
 _BODY_INDENT = "    "
+# ANSI escape runs (CSI, plus OSC strings) that a transcript can carry verbatim.
+# Claude Code writes the stdout of a local command into the transcript as-is, so
+# anything the command coloured arrives with its escapes intact.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _safe(value: Any) -> str:
+    """Transcript text as a markup-safe, escape-free string.
+
+    Everything here is rendered through Rich markup, and a transcript is *data*
+    we don't author — so a body containing `[/path/to/thing]` reads as a closing
+    tag and raises MarkupError, taking the whole TUI down. That is not
+    hypothetical: a `PostCompact [/Users/…/postcompact_envelope.sh] completed`
+    notice did exactly that.
+
+    Call this once, where a value is pulled out of the event. Escaping is not
+    idempotent (a second pass shows the backslashes), so downstream helpers must
+    assume their input is already safe.
+    """
+    text = value if isinstance(value, str) else str(value or "")
+    return _escape_markup(_ANSI_RE.sub("", text))
 
 
 def _short_ts(ts: Any) -> str:
@@ -79,15 +107,15 @@ def _format_tool_args(args: dict) -> str:
     for key in _TOOL_ARG_KEYS:
         val = args.get(key)
         if isinstance(val, str):
-            return _first_line_with_count(_truncate(val, 200))
+            return _first_line_with_count(_truncate(_safe(val), 200))
     first = next(iter(args))
-    return f"{first}=…"
+    return f"{_safe(first)}=…"
 
 
 def _format_user(raw: dict, ts: str) -> str | None:
     content = raw.get("message", {}).get("content")
     if isinstance(content, str):
-        body = content.strip()
+        body = _safe(content).strip()
         if not body:
             return None
         header = _rule("cyan", ts, "USER")
@@ -100,7 +128,7 @@ def _format_user(raw: dict, ts: str) -> str | None:
             body = block.get("content")
             if isinstance(body, list):
                 body = " ".join(b.get("text", "") for b in body if isinstance(b, dict))
-            body_str = _first_line_with_count(_truncate(str(body or ""), 200))
+            body_str = _first_line_with_count(_truncate(_safe(body), 200))
             lines.append(f"[dim]{ts} ◂ result    {body_str}[/dim]")
         return "\n".join(lines) if lines else None
     return None
@@ -116,13 +144,13 @@ def _format_assistant(raw: dict, ts: str) -> str | None:
             continue
         bt = block.get("type")
         if bt == "text":
-            text = (block.get("text") or "").strip()
+            text = _safe(block.get("text")).strip()
             if not text:
                 continue
             header = _rule("green", ts, "ASSISTANT")
             out_lines.append(f"\n{header}\n{_indent_body(text)}")
         elif bt == "thinking":
-            think = (block.get("thinking") or "").strip()
+            think = _safe(block.get("thinking")).strip()
             if not think:
                 continue
             first = think.split("\n", 1)[0]
@@ -130,7 +158,7 @@ def _format_assistant(raw: dict, ts: str) -> str | None:
                 f"[dim italic]{ts} ▸ thinking  {_truncate(first, 200)}[/dim italic]"
             )
         elif bt == "tool_use":
-            name = block.get("name", "?")
+            name = _safe(block.get("name") or "?")
             args = _format_tool_args(block.get("input") or {})
             args_chunk = f"  {args}" if args else ""
             out_lines.append(
@@ -146,14 +174,42 @@ def _format_result(raw: dict, ts: str) -> str:
     dur_str = f"{dur_ms / 1000:.1f}s" if dur_ms else "-"
     extra = f"{cost_str} | {dur_str}"
     header = _rule("magenta", ts, "DONE", extra)
-    body = (raw.get("result") or "").strip()
+    body = _safe(raw.get("result")).strip()
     if body:
         return f"\n{header}\n{_indent_body(body, max_chars=400)}"
     return f"\n{header}"
 
 
 def format_event(raw: dict) -> str | None:
-    """Render one parsed JSONL event with Rich markup. None means skip."""
+    """Render one parsed JSONL event with Rich markup. None means skip.
+
+    The result is guaranteed to parse as markup — see `_guarantee_parseable`.
+    Callers render it straight into a Textual RichLog or a Rich Console, and a
+    viewer that dies on the file it is tailing is worse than one that renders a
+    line plainly.
+    """
+    return _guarantee_parseable(_format_event(raw))
+
+
+def _guarantee_parseable(formatted: str | None) -> str | None:
+    """Return `formatted` if Rich can parse it, else a fully escaped fallback.
+
+    Belt and braces over `_safe`: that escapes every value we know about, but the
+    panes are otherwise one missed interpolation away from taking the whole TUI
+    down. Degrading to a plain line keeps the content visible, and the warning
+    says which event to go and look at rather than swallowing the problem.
+    """
+    if not formatted:
+        return formatted
+    try:
+        Text.from_markup(formatted)
+    except Exception as exc:
+        logger.warning("watch: unparseable markup (%s), falling back to plain", exc)
+        return _escape_markup(formatted)
+    return formatted
+
+
+def _format_event(raw: dict) -> str | None:
     if not isinstance(raw, dict):
         return None
     t = raw.get("type")
@@ -184,11 +240,11 @@ def _extract_message_text(content: Any) -> str:
     of blocks carrying a `text` field ({type: text | input_text | output_text}).
     Tool / reasoning blocks without text are ignored."""
     if isinstance(content, str):
-        return content.strip()
+        return _safe(content).strip()
     if not isinstance(content, list):
         return ""
     parts = [
-        block["text"]
+        _safe(block["text"])
         for block in content
         if isinstance(block, dict) and isinstance(block.get("text"), str)
     ]
