@@ -454,6 +454,10 @@ class TestCheckJobs:
         note = next(r for r in check_jobs(env) if r.name == "SLACK_JOB_COMMAND")
         assert note.status == "ok"
         assert "misconfigured" in note.detail
+        # The reason, rendered for a human — not the internal (status, reason)
+        # pair, which `claude-jobs doctor` would print verbatim.
+        assert "Slack escapes them" in note.detail
+        assert "(" not in note.detail.split("misconfigured:")[1]
         assert (
             first_failure(check_slack({**env, "SLACK_APP_TOKEN": "xapp-1"})) is not None
         )

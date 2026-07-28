@@ -467,11 +467,13 @@ def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
         detail = "unset — Slack cannot enqueue; `claude-jobs enqueue` only"
     else:
         problem = _job_command_error(command)
-        detail = (
-            f"Slack producer on ({command})"
-            if problem is None
-            else f"Slack producer misconfigured: {command} {problem}"
-        )
+        if problem is None:
+            detail = f"Slack producer on ({command})"
+        else:
+            # Only the reason; the status it carries is check_slack's call to
+            # make, and this row is always ok (see the docstring).
+            _, reason = problem
+            detail = f"Slack producer misconfigured: {command} {reason}"
     return CheckResult(name="SLACK_JOB_COMMAND", status="ok", detail=detail)
 
 
