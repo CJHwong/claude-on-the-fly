@@ -27,6 +27,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from claude_on_the_fly import checks
 from claude_on_the_fly.agent import current_backend_key, get_backend
 from claude_on_the_fly.preflight import setup_daemon_logging
 
@@ -210,7 +211,8 @@ def _cmd_doctor() -> int:
             if r.status != "ok":
                 if r.fix_hint:
                     sys.stdout.write(f"    hint: {r.fix_hint}\n")
-                failed += 1
+                if checks.is_blocking(r):
+                    failed += 1
     if failed:
         sys.stdout.write(f"\n{failed} check(s) failed\n")
         return 1

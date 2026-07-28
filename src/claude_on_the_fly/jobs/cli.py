@@ -197,16 +197,23 @@ def _cmd_doctor() -> int:
         os.environ
     )
     failed = 0
+    warned = 0
     for r in results:
         sys.stdout.write(f"  {r.name:30s} {r.status:8s} {r.detail}\n")
         if r.status != "ok":
             if r.fix_hint:
                 sys.stdout.write(f"    hint: {r.fix_hint}\n")
-            failed += 1
+            # Advisory results are printed with their hint but do not fail the
+            # run: an enqueue-only worker is a legitimate install, not an error.
+            if checks.is_blocking(r):
+                failed += 1
+            else:
+                warned += 1
     if failed:
         sys.stdout.write(f"\n{failed} check(s) failed\n")
         return 1
-    sys.stdout.write("\nall checks passed\n")
+    suffix = f" ({warned} warning(s))" if warned else ""
+    sys.stdout.write(f"\nall checks passed{suffix}\n")
     return 0
 
 

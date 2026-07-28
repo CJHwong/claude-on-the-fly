@@ -221,6 +221,11 @@ def check_slack(env: Mapping[str, str]) -> list[CheckResult]:
     job_command = env.get("SLACK_JOB_COMMAND", "")
     if job_command:
         results.append(_check_slack_job_command(job_command))
+        # Only when the trigger is on: that is exactly when this frontend
+        # builds a queue (and can therefore die on a bad kind), and when it
+        # starts making promises a missing worker cannot keep.
+        results.append(_check_queue_kind(env))
+        results.append(_check_jobs_worker_reachable(env))
 
     return results
 
@@ -427,9 +432,66 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
 
 
 def check_jobs(env: Mapping[str, str]) -> list[CheckResult]:
-    """The worker's notifier needs a resolvable Slack bearer token, and the
-    worker itself needs something able to enqueue into it."""
-    return [_check_jobs_token(env), _slack_job_producer_note(env)]
+    """The worker's notifier needs a resolvable Slack bearer token, the queue
+    kind has to be one that exists, and something has to be able to enqueue."""
+    return [
+        _check_jobs_token(env),
+        _check_queue_kind(env),
+        _slack_job_producer_note(env),
+    ]
+
+
+def _check_queue_kind(env: Mapping[str, str]) -> CheckResult:
+    """Validate JOBS_QUEUE_KIND against the registry.
+
+    Blocking, and deliberately also part of `check_slack`: `make_queue()` raises
+    on an unknown kind, and the Slack frontend calls it while constructing the
+    producer. Without this the typo surfaces as a daemon that dies at startup
+    with a traceback — and it takes down *Slack*, not just jobs. Caught here it
+    is one legible line naming the kinds that exist.
+    """
+    from claude_on_the_fly.jobs.registry import SUPPORTED_QUEUES
+
+    kind = env.get("JOBS_QUEUE_KIND", "").strip().lower()
+    if not kind:
+        return CheckResult(name="JOBS_QUEUE_KIND", status="ok", detail="file (default)")
+    if kind in SUPPORTED_QUEUES:
+        return CheckResult(name="JOBS_QUEUE_KIND", status="ok", detail=kind)
+    return CheckResult(
+        name="JOBS_QUEUE_KIND",
+        status="invalid",
+        detail=f"{kind!r} is not a registered queue kind",
+        fix_hint=f"Use one of: {', '.join(sorted(SUPPORTED_QUEUES))}, or unset it",
+    )
+
+
+def _check_jobs_worker_reachable(env: Mapping[str, str]) -> CheckResult:
+    """Warn when Slack's job trigger is on but no worker is draining the queue.
+
+    `$job` acks "I'll reply here when it's done" the moment it enqueues. With no
+    worker that promise is never kept and nothing in the thread says so, which
+    is the worst shape a failure can take — it looks like it worked.
+
+    Advisory, not blocking: the worker may legitimately be started after the
+    frontend, and refusing to run Slack because a *different* daemon is down
+    would be the collateral damage this whole feature is gated to avoid.
+    """
+    from claude_on_the_fly.heartbeat import live_pid
+
+    pid = live_pid("jobs")
+    if pid is not None:
+        return CheckResult(
+            name="jobs worker", status="ok", detail=f"running (pid {pid})"
+        )
+    return CheckResult(
+        name="jobs worker",
+        status="warn",
+        detail=(
+            f"not running — {env.get('SLACK_JOB_COMMAND', '')} will ack jobs "
+            "that nothing drains"
+        ),
+        fix_hint="Start it: `claude-tui start jobs`",
+    )
 
 
 def _check_jobs_token(env: Mapping[str, str]) -> CheckResult:
@@ -458,23 +520,38 @@ def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
     while nothing in Slack can ever reach it. A malformed value reports its
     problem here too, because the doctor view renders the `slack` and `jobs`
     groups on one screen (`tui/screens/doctor.py`) and a bare "producer on"
-    would contradict `check_slack`'s `invalid` row of the same name. Always
-    `ok`: an `enqueue`-only install is legitimate, and any other status would
-    make `claude-jobs doctor` (`jobs/cli.py` `_cmd_doctor`) exit 1 on it.
+    would contradict `check_slack`'s `invalid` row of the same name.
+
+    Unset is `warn`, not a failure: an `enqueue`-only install is legitimate —
+    cron, a git hook, another tool shelling out — so the worker must still
+    start. But a worker no chat frontend can reach is a silent no-op, and the
+    operator deserves to be told which of the two they have.
     """
     command = env.get("SLACK_JOB_COMMAND", "")
     if not command:
-        detail = "unset — Slack cannot enqueue; `claude-jobs enqueue` only"
-    else:
-        problem = _job_command_error(command)
-        if problem is None:
-            detail = f"Slack producer on ({command})"
-        else:
-            # Only the reason; the status it carries is check_slack's call to
-            # make, and this row is always ok (see the docstring).
-            _, reason = problem
-            detail = f"Slack producer misconfigured: {command} {reason}"
-    return CheckResult(name="SLACK_JOB_COMMAND", status="ok", detail=detail)
+        return CheckResult(
+            name="SLACK_JOB_COMMAND",
+            status="warn",
+            detail="unset — only `claude-jobs enqueue` can reach this worker",
+            fix_hint="Set SLACK_JOB_COMMAND (e.g. `$job`) to enqueue from Slack",
+        )
+    problem = _job_command_error(command)
+    if problem is None:
+        return CheckResult(
+            name="SLACK_JOB_COMMAND",
+            status="ok",
+            detail=f"Slack producer on ({command})",
+        )
+    # Report the reason and mirror the severity check_slack assigns it, so the
+    # two rows of this name on the doctor screen cannot disagree.
+    status, reason = problem
+    return CheckResult(
+        name="SLACK_JOB_COMMAND",
+        status=status,
+        detail=f"Slack producer misconfigured: {command} {reason}",
+        fix_hint="Unset it to drop the background-job trigger, or pick a "
+        "punctuation-led value like `$job`",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -800,10 +877,20 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
 NON_BLOCKING_STATUSES: frozenset[Status] = frozenset({"ok", "warn"})
 
 
+def is_blocking(result: CheckResult) -> bool:
+    """Whether this result should stop a daemon from starting.
+
+    The question every caller counting "problems" actually means. Advisory
+    `warn` results are worth printing and worth a yellow cell, but exiting 1 or
+    refusing a spawn over one turns advice into an outage.
+    """
+    return result.status not in NON_BLOCKING_STATUSES
+
+
 def first_failure(results: list[CheckResult]) -> CheckResult | None:
     """Return the first blocking result, or None if none blocks startup."""
     for r in results:
-        if r.status not in NON_BLOCKING_STATUSES:
+        if is_blocking(r):
             return r
     return None
 

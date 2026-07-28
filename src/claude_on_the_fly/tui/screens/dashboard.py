@@ -65,6 +65,7 @@ from claude_on_the_fly.agent import (
     current_backend_key,
     resolve_session_log,
 )
+from claude_on_the_fly import checks
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
@@ -587,7 +588,7 @@ class DashboardScreen(Screen):
                 self._notify(f"{name}: not running", "warning")
                 return
             except supervisor.PreflightFailed as exc:
-                bad = [r for r in exc.results if r.status != "ok"]
+                bad = [r for r in exc.results if checks.is_blocking(r)]
                 detail = bad[0].name if bad else "checks failed"
                 self._notify(
                     f"{name}: preflight failed ({detail}) — opening doctor", "error"

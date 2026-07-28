@@ -430,14 +430,19 @@ class TestCheckJobs:
         assert results[0].name == "JOBS_SLACK_TOKEN"
 
     def test_reports_slack_producer_off(self):
-        # `claude-jobs doctor` runs check_jobs, never check_slack, so this line is
-        # the only place a worker learns Slack can't reach it. Informational: it
-        # must stay "ok", or doctor would exit 1 on every enqueue-only install.
+        # `claude-jobs doctor` runs check_jobs, never check_slack, so this line
+        # is the only place a worker learns Slack cannot reach it. Advisory:
+        # an enqueue-only install is legitimate (cron, a git hook), so the
+        # worker must still start — but a worker nothing can reach is a silent
+        # no-op and the operator should be told which of the two they have.
         results = check_jobs({"SLACK_TOKEN": "xoxb-123"})
         note = next(r for r in results if r.name == "SLACK_JOB_COMMAND")
-        assert note.status == "ok"
+        assert note.status == "warn"
         assert "unset" in note.detail
+        assert note.fix_hint is not None
+        # Warned, never blocked: doctor must not exit 1 and spawn must not fail.
         assert all_ok(results)
+        assert first_failure(results) is None
 
     def test_reports_slack_producer_on(self):
         results = check_jobs({"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": "$job"})
@@ -446,13 +451,12 @@ class TestCheckJobs:
         assert "$job" in note.detail
 
     def test_producer_note_does_not_contradict_the_slack_group(self):
-        # Both groups render on one doctor screen, so a malformed value would
-        # otherwise show two rows of the same name: check_slack's "invalid", and
-        # a flat "producer on" here. Still "ok" — a non-ok result exits
-        # `claude-jobs doctor` 1, and this check is not what gates a worker.
+        # Both groups render on one doctor screen, so the two rows of this name
+        # must agree on severity as well as wording — a "producer on" beside
+        # check_slack's "invalid" would leave the operator guessing.
         env = {"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": "$a<b"}
         note = next(r for r in check_jobs(env) if r.name == "SLACK_JOB_COMMAND")
-        assert note.status == "ok"
+        assert note.status == "invalid"
         assert "misconfigured" in note.detail
         # The reason, rendered for a human — not the internal (status, reason)
         # pair, which `claude-jobs doctor` would print verbatim.
@@ -709,3 +713,100 @@ class TestCheckPtyHooks:
 
         assert result.status == "missing"
         assert "no settings.json" in result.detail
+
+
+class TestJobsPreflightGaps:
+    """The three ways a jobs setup fails silently, each caught before a daemon
+    starts rather than after it dies."""
+
+    def test_unknown_queue_kind_is_blocking(self):
+        """make_queue() raises on an unknown kind, and the Slack frontend calls
+        it while building the producer — so a typo here kills *Slack*. Caught in
+        preflight it is one line instead of a daemon that won't start."""
+        env = {"SLACK_TOKEN": "xoxb-1", "JOBS_QUEUE_KIND": "redis"}
+        results = check_jobs(env)
+
+        row = next(r for r in results if r.name == "JOBS_QUEUE_KIND")
+        assert row.status == "invalid"
+        assert "redis" in row.detail
+        assert "file" in (row.fix_hint or "")
+        assert not all_ok(results)
+
+    def test_known_queue_kind_passes(self):
+        env = {"SLACK_TOKEN": "xoxb-1", "JOBS_QUEUE_KIND": "file"}
+        row = next(r for r in check_jobs(env) if r.name == "JOBS_QUEUE_KIND")
+        assert row.status == "ok"
+
+    def test_unset_queue_kind_is_the_default(self):
+        row = next(
+            r
+            for r in check_jobs({"SLACK_TOKEN": "xoxb-1"})
+            if r.name == "JOBS_QUEUE_KIND"
+        )
+        assert row.status == "ok"
+        assert "default" in row.detail
+
+    def test_slack_preflight_catches_the_queue_kind_that_would_kill_it(self):
+        """The frontend only builds a queue when the trigger is set, so that is
+        exactly when a bad kind can take it down."""
+        env = {
+            "SLACK_APP_TOKEN": "xapp-1",
+            "SLACK_TOKEN": "xoxb-1",
+            "SLACK_JOB_COMMAND": "$job",
+            "JOBS_QUEUE_KIND": "nope",
+        }
+        assert not all_ok(check_slack(env))
+
+    def test_slack_ignores_the_queue_kind_when_jobs_are_off(self):
+        """No trigger means no queue is constructed, so a jobs-side typo must
+        not stop Slack — the collateral damage the opt-in gate exists for."""
+        env = {
+            "SLACK_APP_TOKEN": "xapp-1",
+            "SLACK_TOKEN": "xoxb-1",
+            "JOBS_QUEUE_KIND": "nope",
+        }
+        assert all_ok(check_slack(env))
+        assert not any(r.name == "JOBS_QUEUE_KIND" for r in check_slack(env))
+
+    def test_warns_when_the_trigger_is_on_but_no_worker_runs(self, monkeypatch):
+        """`$job` acks 'I'll reply here when it's done'. With no worker that
+        promise is never kept and nothing in the thread says so."""
+        monkeypatch.setattr("claude_on_the_fly.heartbeat.live_pid", lambda f: None)
+        env = {
+            "SLACK_APP_TOKEN": "xapp-1",
+            "SLACK_TOKEN": "xoxb-1",
+            "SLACK_JOB_COMMAND": "$job",
+        }
+        results = check_slack(env)
+
+        row = next(r for r in results if r.name == "jobs worker")
+        assert row.status == "warn"
+        assert "nothing drains" in row.detail
+        # Advisory: the worker may be started after the frontend, and Slack must
+        # not refuse to run because a different daemon is down.
+        assert all_ok(results)
+
+    def test_no_warning_when_the_worker_is_running(self, monkeypatch):
+        monkeypatch.setattr("claude_on_the_fly.heartbeat.live_pid", lambda f: 4242)
+        env = {
+            "SLACK_APP_TOKEN": "xapp-1",
+            "SLACK_TOKEN": "xoxb-1",
+            "SLACK_JOB_COMMAND": "$job",
+        }
+        row = next(r for r in check_slack(env) if r.name == "jobs worker")
+        assert row.status == "ok"
+        assert "4242" in row.detail
+
+    def test_no_worker_row_at_all_when_jobs_are_off(self):
+        env = {"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxb-1"}
+        assert not any(r.name == "jobs worker" for r in check_slack(env))
+
+
+class TestIsBlocking:
+    def test_warn_is_advisory(self):
+        from claude_on_the_fly.checks import CheckResult, is_blocking
+
+        assert not is_blocking(CheckResult(name="x", status="warn", detail=""))
+        assert not is_blocking(CheckResult(name="x", status="ok", detail=""))
+        assert is_blocking(CheckResult(name="x", status="missing", detail=""))
+        assert is_blocking(CheckResult(name="x", status="invalid", detail=""))

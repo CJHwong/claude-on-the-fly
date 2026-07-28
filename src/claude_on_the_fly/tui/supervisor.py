@@ -83,7 +83,7 @@ class PreflightFailed(SupervisorError):
     results: list[CheckResult]
 
     def __str__(self) -> str:
-        bad = [r for r in self.results if r.status != "ok"]
+        bad = [r for r in self.results if checks.is_blocking(r)]
         if not bad:
             return f"preflight failed for {self.frontend}"
         first = bad[0]

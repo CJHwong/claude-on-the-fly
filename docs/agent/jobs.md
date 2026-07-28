@@ -66,6 +66,18 @@ Rules for any future observer:
 - **Stay bounded.** `read_queue_rows` is hard-capped (default 20), which bounds the file reads — the expensive part. Listing and sorting the two directories is still O(depth); the cap cannot come before the sort without losing oldest-first.
 - **The expensive reads are memoized on the directory's own mtime** — the `done/` and `failed/` counts, and the `cur/`+`new/` row list. A directory's mtime changes on any add, remove, or rename within it, so the memo is exact *for this queue's access pattern* — the queue only ever moves whole files. It would **not** be exact for in-place edits of existing files, which never happen here — and it is only ever exact to the resolution the filesystem stamps mtimes at: on a mount that stamps whole seconds rather than nanoseconds, a second change inside the same second reads stale until the next one. An idle tick therefore no longer walks `done/` or opens and parses every unfinished job file — which the 1Hz dashboard refresh would otherwise do whether or not the jobs tab is visible. The `new/` and `cur/` *counts* are not memoized: `read_queue_depth` lists those two directories on every tick.
 
+## What preflight catches
+
+Three ways a jobs setup fails quietly, each caught before a daemon starts rather than after it dies:
+
+| Condition | Status | Why |
+|---|---|---|
+| `SLACK_JOB_COMMAND` unset | `warn` on `jobs` | The worker runs, but only `claude-jobs enqueue` can reach it. Advisory, not blocking — an enqueue-only install (cron, a git hook) is legitimate. |
+| `JOBS_QUEUE_KIND` not registered | `invalid` on `jobs` **and** `slack` | `make_queue()` raises on an unknown kind and the Slack frontend calls it while building the producer, so a jobs-side typo kills *Slack*. Only added to `check_slack` when the trigger is set, since that is the only time a queue is constructed. |
+| Trigger set, no worker running | `warn` on `slack` | `$job` acks "I'll reply here when it's done" and nothing ever does. Advisory: the worker may start after the frontend. |
+
+`warn` is non-blocking by construction — `checks.is_blocking` is what every caller counting problems should use, so a `doctor` run reports the advice and still exits 0.
+
 ## Orphaned agent processes
 
 `agent._exec` spawns the CLI with `start_new_session=True` so one `killpg` reaps the CLI *and* every tool subprocess it forked. The cost: the child is unreachable from the parent's group, and `supervisor.stop()` signals the worker pid alone before SIGKILLing it after a five-second grace. A worker that misses that window would leave a full agent CLI running with no parent and no record of its pid.
