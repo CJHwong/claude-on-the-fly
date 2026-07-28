@@ -12,7 +12,6 @@ import pytest
 
 from claude_on_the_fly.tui import supervisor
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -304,7 +303,7 @@ class TestStopAll:
         sigterm_called = {"v": False}
 
         def fake_exists(pid: int) -> bool:
-            return not sigterm_called["v"] or pid not in (11, 22) and False or False
+            return not sigterm_called["v"] or (pid not in (11, 22) and False) or False
 
         # Simpler: keep alive for is_running checks, then after stop's SIGTERM,
         # report dead. Use a stateful counter per pid.
@@ -349,12 +348,12 @@ class TestStopAll:
         self, isolated_state, monkeypatch
     ):
         # Pre-populate with a stale list; if nothing was running, don't clobber.
-        supervisor._write_last_running(["slack", "gmail"])
+        supervisor._write_last_running(["slack", "telegram"])
         monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
 
         supervisor.stop_all()
 
-        assert supervisor.read_last_running() == ["slack", "gmail"]
+        assert supervisor.read_last_running() == ["slack", "telegram"]
 
 
 class TestResume:

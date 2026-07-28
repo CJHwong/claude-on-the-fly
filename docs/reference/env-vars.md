@@ -21,15 +21,6 @@
 | `SLACK_JOB_COMMAND` | no | Text prefix that queues a background job. Defaults to `$job`; set it to rename the trigger, or set it **empty** to turn background jobs off. A message starting with it is handed to the `claude-jobs` worker, which runs the rest in a fresh session and replies in the same thread when it finishes — so the task outlives the chat turn that asked for it. Sent on its own, with no task, it lists the jobs queued from that channel. Works under either token kind, and inside threads. A custom value should be punctuation-led: the trigger is matched against the head of every message, so a plain word swallows every message beginning with it. If `SLACK_TOKEN` is a user token, also set `JOBS_SLACK_TOKEN` to a bot token — otherwise the worker's replies post as you and this daemon re-ingests them as new input |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
-## Gmail
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GMAIL_GCP_PROJECT` | yes | GCP project ID (for Pub/Sub) |
-| `GMAIL_ALLOWED_SENDERS` | yes | Allowed senders (comma-separated). Each entry is an exact address (`alice@example.com`), a domain wildcard (`*@gofreight.com`), or `*` for any sender |
-| `GMAIL_POLL_INTERVAL` | no | Seconds between Pub/Sub pulls (default: 5) |
-| `GMAIL_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
-
 ## Symphony
 
 | Variable | Required | Description |
@@ -43,15 +34,12 @@ The `tracker.base_url`, `tracker.project_key`, and `tracker.jql_extra` live in `
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default), `codex`, `pi`, or `opencode` |
+| `AGENT_BACKEND` | no | Agent CLI to drive: `claude` (default) or `codex` |
 | `CLAUDE_MODE` | no | `native` runs `claude` directly; `ollama` wraps it in `ollama launch claude`; `pty` drives `claude-pty` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) to surface rate-limit and context-window stats (default: `native`) |
 | `CODEX_MODE` | no | `native` runs `codex` directly; `ollama` wraps it in `ollama launch codex` (default: `native`) |
-| `PI_MODE` | no | `native` runs `pi` directly; `ollama` wraps it in `ollama launch pi` (default: `native`) |
-| `OPENCODE_MODE` | no | `native` runs `opencode` directly; `ollama` wraps it in `ollama launch opencode` (default: `native`) |
-| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama`, `CODEX_MODE=ollama`, `PI_MODE=ollama`, or `OPENCODE_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
+| `OLLAMA_MODEL` | conditional | Required when `CLAUDE_MODE=ollama` or `CODEX_MODE=ollama`. Name from `ollama list` (e.g. `deepseek-v4-flash:cloud`) |
 | `CLAUDE_MODEL` | no | Model passed to `claude --model` in native/pty mode. Unset (default) omits `--model` so the claude CLI uses its own default. Ignored in ollama mode |
 | `CODEX_MODEL` | no | Model passed to `codex exec -m` in native mode (e.g. `o3`, `gpt-4.1`). Ignored in ollama mode |
-| `PI_MODEL` | no | Model passed to `pi --model` in native mode (e.g. `deepseek-v4-flash:cloud`). Ignored in ollama mode |
-| `OPENCODE_MODEL` | no | Model passed to `opencode run -m` in native mode, in `provider/model` form (e.g. `github-copilot/claude-haiku-4.5`). Unset omits `-m` so opencode uses its own default. Ignored in ollama mode |
-| `PI_PROVIDER` | no | Provider passed to `pi --provider` (default: `google`). Set to `ollama` for local/cloud ollama models, or use `PI_MODE=ollama` |
-| `LOG_LEVEL` | no | Console log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
+| `LOG_LEVEL` | no | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
+| `COTF_HOST_TAG` | no | Machine name in log filenames (`logs/<role>-<host>-<date>.log`). Defaults to the short hostname; dashes become underscores |
+| `COTF_LOG_KEEP_DAYS` | no | Days of logs to keep, pruned by the date in the filename (default: 7). `0` disables pruning |

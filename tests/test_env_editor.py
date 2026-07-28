@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-
 from claude_on_the_fly.tui.env_editor import (
     EnvDiff,
     affected_daemons,
     diff_env,
     edit_and_diff,
 )
-
 
 # ---------------------------------------------------------------------------
 # diff_env
@@ -61,9 +59,9 @@ class TestAffectedDaemons:
         diff = EnvDiff(changed={"SLACK_USER_TOKEN": ("a", "b")})
         assert affected_daemons(diff) == {"slack"}
 
-    def test_gmail_vars_affect_gmail(self):
-        diff = EnvDiff(removed={"GMAIL_GCP_PROJECT": "p"})
-        assert affected_daemons(diff) == {"gmail"}
+    def test_telegram_vars_affect_telegram(self):
+        diff = EnvDiff(removed={"TELEGRAM_BOT_TOKEN": "t"})
+        assert affected_daemons(diff) == {"telegram"}
 
     def test_unknown_var_affects_nothing(self):
         diff = EnvDiff(added={"NOT_A_KNOWN_VAR": "x"})

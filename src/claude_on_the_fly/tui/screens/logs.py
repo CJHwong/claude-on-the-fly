@@ -1,9 +1,9 @@
 """Logs screen — pick any .log file under ~/.claude-on-the-fly/logs/, tail it.
 
 Complements the dashboard's inline log pane (which is glued to the highlighted
-frontend). This screen lets you browse every log file in the directory,
-including per-job scheduler logs (`schedule-<jobname>.log`) and rotated
-archives (`telegram.log.2026-04-15`).
+frontend). This screen lets you browse every log file in the directory, newest
+first: one per (role, host, day), so it also lists earlier days and per-job
+scheduler logs (`schedule-<job>-<host>-<date>.log`).
 """
 
 from __future__ import annotations

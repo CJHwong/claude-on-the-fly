@@ -40,11 +40,11 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from rich.text import Text
-
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -60,18 +60,20 @@ from textual.widgets import (
     TabPane,
 )
 
+from claude_on_the_fly import checks, logs
 from claude_on_the_fly.agent import (
     DATA_DIR,
     current_backend_key,
     resolve_session_log,
 )
-from claude_on_the_fly import checks
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
 from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
 
 if TYPE_CHECKING:
     from claude_on_the_fly.symphony.config import SymphonyConfig
+import contextlib
+
 from claude_on_the_fly.tui import env_editor, render, state, supervisor
 from claude_on_the_fly.tui.screens.config_picker import ConfigPickerScreen
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
@@ -89,7 +91,9 @@ LOG_PANE_MAX_LINES = 10_000
 
 # Reactive, user-driven daemons. Demoted to the compact strip so the two
 # autonomous engines (symphony, scheduler) own the top of the dashboard.
-CHAT_FRONTENDS: tuple[str, ...] = ("telegram", "slack", "gmail")
+# Order (and the default selection) comes from checks, which every other
+# frontend-ordered surface reads too.
+CHAT_FRONTENDS = checks.CHAT_FRONTENDS
 
 # Memoize parsed symphony config by (path, mtime) so the 1Hz header refresh
 # doesn't reparse YAML every tick. Mirrors state._load_schedule_cached.
@@ -407,7 +411,7 @@ class DashboardScreen(Screen):
     def _active_daemon(self) -> str | None:
         """Which daemon the supervisor keys + log row act on — decided by the
         active tab (stable across window blur, unlike focus). On the chat tab the
-        highlighted row picks the specific daemon (telegram / slack / gmail)."""
+        highlighted row picks the specific daemon (slack / telegram)."""
         try:
             active = self.query_one("#daemon-tabs", TabbedContent).active
         except Exception:
@@ -460,10 +464,8 @@ class DashboardScreen(Screen):
         """Activate a daemon tab by id (bound to [1]/[2]/[3]). The TabActivated
         handler lands focus on the tab's table, so the lifecycle keys and the
         log row follow."""
-        try:
+        with contextlib.suppress(Exception):
             self.query_one("#daemon-tabs", TabbedContent).active = tab_id
-        except Exception:
-            pass
 
     def on_tabbed_content_tab_activated(
         self, event: TabbedContent.TabActivated
@@ -472,10 +474,8 @@ class DashboardScreen(Screen):
         table and repoint the shared log/watch row + action cue."""
         active = event.tabbed_content.active
         table_id = self._TAB_TABLES.get(active, "chat-strip")
-        try:
+        with contextlib.suppress(Exception):
             self.query_one(f"#{table_id}", DataTable).focus()
-        except Exception:
-            pass
         self._refresh_log(force_reload=True)
         self._update_action_cue()
 
@@ -513,10 +513,8 @@ class DashboardScreen(Screen):
                 # spurious highlight (and a log rewrite) every tick.
                 if table.cursor_row == i:
                     return
-                try:
+                with contextlib.suppress(Exception):
                     table.move_cursor(row=i)
-                except Exception:
-                    pass
                 return
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -773,10 +771,10 @@ class DashboardScreen(Screen):
         header = self.query_one("#log-header", Static)
         pane = self.query_one("#log-pane", RichLog)
 
-        path = LOG_DIR / f"{name}.log"
+        path = logs.find_log(name, directory=LOG_DIR)
         switched = path != self._log_path
 
-        if not path.is_file():
+        if path is None or not path.is_file():
             # Render the missing state on entry: a switch/force, or a
             # present→missing transition (we still hold a real mtime because the
             # file was there last tick). After rendering it once, mtime is None,
@@ -933,7 +931,7 @@ class DashboardScreen(Screen):
             return
 
         # Resolve across backends: the daemon may have run this job under a
-        # different backend than the TUI's env points at (e.g. pi vs native).
+        # different backend than the TUI's env points at (e.g. codex vs claude).
         path = resolve_session_log(workspace, session_uuid)
 
         if path is None:
@@ -991,14 +989,14 @@ class DashboardScreen(Screen):
     def _refresh_watch_scheduler(
         self, job: str, header: Static, pane: RichLog, force_reload: bool
     ) -> None:
-        """Tail the per-job log at logs/schedule-<name>.log as plain text.
+        """Tail the per-job log for `job` as plain text.
 
         Markup is bypassed via rich.text.Text so literal log brackets like
         [INFO] survive intact even though the pane has markup=True (which the
         symphony branch relies on for colors).
         """
-        path = LOG_DIR / f"schedule-{job}.log"
-        if not path.is_file():
+        path = logs.find_log(f"schedule-{job}", directory=LOG_DIR)
+        if path is None or not path.is_file():
             if force_reload or self._watch_path is not None:
                 self._watch_path = None
                 self._watch_mtime = None
@@ -1037,10 +1035,8 @@ class DashboardScreen(Screen):
         self, msg: str, severity: Literal["information", "warning", "error"]
     ) -> None:
         # Textual notify; also surface on the dashboard's bottom line.
-        try:
+        with contextlib.suppress(Exception):
             self.app.notify(msg, severity=severity)
-        except Exception:
-            pass
         line = self.query_one("#status-line", Static)
         line.update(f"[dim]{msg}[/dim]")
 

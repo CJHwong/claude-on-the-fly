@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -119,10 +120,9 @@ async def _run(token: str) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        # add_signal_handler is not implemented on Windows.
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass  # Windows
 
     queue, runner, notifier = build_components(token)
 
@@ -149,10 +149,8 @@ async def _run(token: str) -> None:
         agent.remove_process_listener(ledger.on_process)
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             heartbeat.path.unlink()
-        except FileNotFoundError:
-            pass
         logger.info("claude-jobs: shut down")
 
 
@@ -185,10 +183,8 @@ def _cmd_run() -> int:
     loop_warning = _notifier_loop_warning(token_var, token)
     if loop_warning:
         logger.warning("%s", loop_warning)
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run(token))
-    except KeyboardInterrupt:
-        pass
     return 0
 
 

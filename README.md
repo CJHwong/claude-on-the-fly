@@ -2,7 +2,7 @@
 
 > **Experimental.** This is a personal project, not production software. It spawns Claude Code with `--permission-mode bypassPermissions`, meaning Claude has full read/write access to files on the host machine within its workspace. Use at your own risk. Do not run this on a machine with sensitive data you wouldn't want an LLM to access.
 
-Remote access to Claude Code via Telegram, Slack, and Gmail. Send a message, get Claude working on it, see the response with cost/latency/token stats.
+Remote access to Claude Code via Slack and Telegram. Send a message, get Claude working on it, see the response with cost/latency/token stats.
 
 ## Important: API Key Required
 
@@ -29,11 +29,6 @@ export SLACK_APP_TOKEN=xapp-...
 export SLACK_TOKEN=xoxb-...   # xoxp- replies as you, xoxb- replies as the app
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
 
-# Gmail
-export GMAIL_GCP_PROJECT=your-gcp-project
-export GMAIL_ALLOWED_SENDERS=alice@example.com,bob@example.com
-uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-gmail
-
 # Scheduler
 # write ~/.claude-on-the-fly/schedule.yaml (see docs/how-to/scheduler.md)
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-schedule
@@ -51,11 +46,11 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-symphony
 git clone https://github.com/CJHwong/claude-on-the-fly && cd claude-on-the-fly
 cp .env.example .env  # fill in your tokens
 uv sync
-uv run claude-telegram  # or claude-slack, claude-gmail, claude-symphony, claude-schedule
+uv run claude-slack  # or claude-telegram, claude-symphony, claude-schedule, claude-jobs
 ```
 
 ## Documentation
 
-- [How-to guides](docs/how-to/) — setup for each channel: [Telegram](docs/how-to/telegram.md), [Slack](docs/how-to/slack.md), [Gmail](docs/how-to/gmail.md), [Scheduler](docs/how-to/scheduler.md), [Symphony](docs/how-to/symphony.md)
+- [How-to guides](docs/how-to/) — setup for each channel: [Slack](docs/how-to/slack.md), [Telegram](docs/how-to/telegram.md), [Scheduler](docs/how-to/scheduler.md), [Symphony](docs/how-to/symphony.md)
 - [Reference](docs/reference/) — [Environment variables](docs/reference/env-vars.md), [Persona (CLAUDE.md)](docs/reference/persona.md), [Response footer](docs/reference/footer.md)
 - `CLAUDE.md` — agent-only notes (backend quirks, architecture, Symphony internals)

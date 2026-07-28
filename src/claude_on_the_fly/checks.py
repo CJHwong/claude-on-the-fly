@@ -59,12 +59,6 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_BLOCKED_USER_IDS",
     "SLACK_ALLOWED_BOT_IDS",
 )
-GMAIL_ENV_VARS: tuple[str, ...] = (
-    "GMAIL_GCP_PROJECT",
-    "GMAIL_ALLOWED_SENDERS",
-    "GMAIL_POLL_INTERVAL",
-    "GMAIL_STATS_MODE",
-)
 # The worker shares SLACK_TOKEN with the slack frontend (editing it affects both);
 # JOBS_SLACK_TOKEN optionally overrides it. JOBS_TIMEOUT is the per-job wall-clock
 # limit in seconds (0 or negative = no limit). JOBS_STALE_TTL_S is deferred with
@@ -80,29 +74,31 @@ BACKEND_ENV_VARS: tuple[str, ...] = (
     "AGENT_BACKEND",
     "CLAUDE_MODE",
     "CODEX_MODE",
-    "PI_MODE",
-    "OPENCODE_MODE",
     "OLLAMA_MODEL",
     "CLAUDE_MODEL",
     "CODEX_MODEL",
-    "PI_MODEL",
-    "OPENCODE_MODEL",
-    "PI_PROVIDER",
 )
 
 FRONTEND_ENV_VARS: dict[str, tuple[str, ...]] = {
     "telegram": TELEGRAM_ENV_VARS,
     "slack": SLACK_ENV_VARS,
-    "gmail": GMAIL_ENV_VARS,
     "schedule": (),  # no per-frontend env vars; uses schedule.yaml
     "symphony": (),  # uses symphony.yaml
     "jobs": JOBS_ENV_VARS,
 }
 
-SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
-    "telegram",
+# The chat frontends, in display order. This tuple is the single source of that
+# order: the dashboard's chat rows, the history filter cycle, and the doctor all
+# read it, so reordering here reorders every surface at once. The first entry is
+# also the dashboard's default selection before a tab is activated.
+CHAT_FRONTENDS: tuple[str, ...] = (
     "slack",
-    "gmail",
+    "telegram",
+)
+
+# Every daemon the TUI can start/stop, chat frontends first.
+SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
+    *CHAT_FRONTENDS,
     "schedule",
     "symphony",
     "jobs",
@@ -406,31 +402,6 @@ def _check_slack_bearer(env: Mapping[str, str]) -> CheckResult:
     return CheckResult(name=name or "SLACK_TOKEN", status="ok", detail=f"set ({kind})")
 
 
-def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
-    results: list[CheckResult] = [_require(env, "GMAIL_GCP_PROJECT")]
-
-    senders_raw = env.get("GMAIL_ALLOWED_SENDERS", "")
-    senders = {s.strip() for s in senders_raw.split(",") if s.strip()}
-    if not senders:
-        results.append(
-            CheckResult(
-                name="GMAIL_ALLOWED_SENDERS",
-                status="missing",
-                detail="must contain at least one email address, pattern, or '*'",
-                fix_hint=DOTENV_HINT,
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                name="GMAIL_ALLOWED_SENDERS",
-                status="ok",
-                detail=f"{len(senders)} sender(s)",
-            )
-        )
-    return results
-
-
 # Mirrors `slack.DEFAULT_JOB_COMMAND`. Duplicated as a literal for the same
 # reason the turn-control prefixes are: importing `claude_on_the_fly.slack`
 # would pull slack_bolt into every checks import. Drift fails in
@@ -583,7 +554,7 @@ def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
 # Backend (CLI selection) env checks
 # ---------------------------------------------------------------------------
 
-_VALID_BACKENDS = ("claude", "codex", "pi", "opencode")
+_VALID_BACKENDS = ("claude", "codex")
 _VALID_MODES = ("native", "ollama")
 # claude-pty is claude-only; codex has no equivalent wrapper.
 _VALID_CLAUDE_MODES = ("native", "ollama", "pty")
@@ -668,12 +639,6 @@ def check_binaries(env: Mapping[str, str]) -> list[CheckResult]:
         )
     elif backend == "codex":
         results.append(_which("codex", "Install: https://github.com/openai/codex"))
-    elif backend == "pi":
-        results.append(
-            _which("pi", "Install: https://github.com/earendil-works/pi-coding-agent")
-        )
-    elif backend == "opencode":
-        results.append(_which("opencode", "Install: https://opencode.ai"))
 
     mode = env.get(f"{backend.upper()}_MODE", "native").lower()
     if mode == "ollama":
@@ -829,13 +794,6 @@ def check_pty_hooks() -> CheckResult:
     )
 
 
-def check_gws_binary() -> CheckResult:
-    return _which(
-        "gws",
-        "Install: npm install -g @googleworkspace/cli",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Top-level aggregator
 # ---------------------------------------------------------------------------
@@ -844,7 +802,6 @@ def check_gws_binary() -> CheckResult:
 _ENV_CHECKERS: dict[str, Callable[[Mapping[str, str]], list[CheckResult]]] = {
     "telegram": check_telegram,
     "slack": check_slack,
-    "gmail": check_gmail,
     "jobs": check_jobs,
 }
 

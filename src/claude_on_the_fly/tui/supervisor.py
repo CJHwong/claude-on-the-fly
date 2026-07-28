@@ -18,6 +18,7 @@ heartbeat (or a timeout fires), so callers get a real "did it start" signal.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -27,12 +28,12 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import dotenv_values
 
-from claude_on_the_fly import checks
+from claude_on_the_fly import checks, logs
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import CheckResult
 from claude_on_the_fly.heartbeat import STATE_DIR
@@ -59,7 +60,6 @@ def _last_running_file() -> Path:
 _FRONTEND_MODULE: dict[str, str] = {
     "telegram": "claude_on_the_fly.telegram",
     "slack": "claude_on_the_fly.slack",
-    "gmail": "claude_on_the_fly.gmail",
     "schedule": "claude_on_the_fly.scheduler",
     "symphony": "claude_on_the_fly.symphony.cli",
     "jobs": "claude_on_the_fly.jobs.cli",
@@ -147,8 +147,14 @@ def _heartbeat_file(frontend: str) -> Path:
 
 
 def _stdout_file(frontend: str) -> Path:
+    """Where this spawn's inherited stdout/stderr goes.
+
+    Same `<role>-<host>-<date>` contract as the log files so retention can see
+    it; `logs.prune` never removes the newest capture per (role, host), since a
+    live daemon still holds it open.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    return LOG_DIR / f"{frontend}.stdout"
+    return logs.log_file(frontend, suffix=".stdout", directory=LOG_DIR)
 
 
 def _resolve_pid(frontend: str) -> int | None:
@@ -180,10 +186,8 @@ def _write_pid(frontend: str, pid: int) -> None:
 
 
 def _remove_pid(frontend: str) -> None:
-    try:
+    with contextlib.suppress(FileNotFoundError):
         _pid_file(frontend).unlink()
-    except FileNotFoundError:
-        pass
 
 
 def _remove_heartbeat(frontend: str) -> None:
@@ -192,10 +196,8 @@ def _remove_heartbeat(frontend: str) -> None:
     pid reads as alive (os.kill(pid, 0) is true for an unreaped zombie), so the
     TUI shows it running, then broken as the timestamp ages. Removing it here
     makes a stopped daemon read as stopped immediately."""
-    try:
+    with contextlib.suppress(FileNotFoundError):
         _heartbeat_file(frontend).unlink()
-    except FileNotFoundError:
-        pass
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
@@ -218,8 +220,8 @@ def _heartbeat_fresh(frontend: str) -> bool:
         last = data.get("last_heartbeat")
         if not isinstance(last, str):
             return False
-        dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - dt).total_seconds()
         return age < HEARTBEAT_FRESH_WINDOW_S
     except (OSError, json.JSONDecodeError, ValueError):
         return False
@@ -319,10 +321,8 @@ def spawn(
             time.sleep(HEARTBEAT_POLL_INTERVAL_S)
 
         # Timed out without a heartbeat — child still running but unresponsive.
-        try:
+        with contextlib.suppress(OSError, ProcessLookupError):
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
         _remove_pid(frontend)
         raise SpawnTimeout(
             frontend=frontend,
@@ -391,16 +391,12 @@ def restart(
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
 ) -> int:
     """Stop (if running) and respawn. Returns the new pid."""
-    try:
+    with contextlib.suppress(NotRunning):
         stop(frontend, grace_s=grace_s)
-    except NotRunning:
-        pass
     # Remove stale heartbeat so spawn's wait_for_heartbeat checks a fresh write
     # rather than the one the old daemon wrote before exiting.
-    try:
+    with contextlib.suppress(FileNotFoundError):
         _heartbeat_file(frontend).unlink()
-    except FileNotFoundError:
-        pass
     return spawn(
         frontend,
         env_file=env_file,

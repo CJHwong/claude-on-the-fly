@@ -1,6 +1,6 @@
 """Append-only JSONL audit log of AI-job lifecycle events.
 
-Every AI run, whether triggered by symphony, telegram, slack, or gmail,
+Every AI run, whether triggered by symphony, slack, or telegram,
 emits its dispatch / complete / failure transitions here. Heartbeats tell
 the TUI what is currently running; this log tells it what *has happened*
 so users can find jobs that have aged out of the live pane and re-attach
@@ -8,7 +8,7 @@ to them.
 
 Format: one JSON object per line. Required keys: ts (ISO-8601 UTC), type,
 source, identifier. `source` is the frontend ("symphony" | "telegram" |
-"slack" | "gmail"). For symphony rows, the tracker (jira | github) lives
+"slack" | "telegram"). For symphony rows, the tracker (jira | github) lives
 in an optional `tracker` field. Optional everywhere: workspace,
 session_uuid, plus type-specific extras (state, reason, attempt, error).
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,7 @@ class EventLog:
         **extra: Any,
     ) -> None:
         record: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
             "type": event_type,
             "source": source,
             "identifier": identifier,

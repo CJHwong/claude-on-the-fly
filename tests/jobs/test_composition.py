@@ -20,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, logs
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.jobs import cli
 from claude_on_the_fly.jobs.core import Job
@@ -114,16 +114,22 @@ def test_cmd_run_calls_setup_logging_and_wires_token(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(cli, "_run", _fake_run)
 
     root = logging.getLogger()
-    before = set(root.handlers)
+    before = list(root.handlers)
     try:
         rc = cli._cmd_run()
+        # The handler delay-opens, so nothing exists until a record is emitted.
+        logging.getLogger("test").info("hello")
+        # The whole point of the local _setup_logging: a real per-day jobs log
+        # for the dashboard's jobs tab to tail.
+        assert (tmp_path / "logs" / logs.log_name("jobs")).is_file()
     finally:
-        for handler in set(root.handlers) - before:
+        # `configure` replaces the root handlers wholesale, so restore whatever
+        # the suite had rather than only removing what was added.
+        for handler in list(root.handlers):
             handler.close()
             root.removeHandler(handler)
+        for handler in before:
+            root.addHandler(handler)
 
     assert rc == 0
     assert seen["token"] == "xoxb-wired"
-    # The whole point of the local _setup_logging: a real logs/jobs.log for the
-    # dashboard's jobs tab to tail.
-    assert (tmp_path / "logs" / "jobs.log").is_file()

@@ -1,11 +1,11 @@
 # CLAUDE.md
 
-Experimental project that spawns Claude Code with `--permission-mode bypassPermissions` to give Telegram/Slack/Gmail/scheduler/symphony frontends a Claude session. See [README.md](README.md) for human-facing overview.
+Experimental project that spawns Claude Code with `--permission-mode bypassPermissions` to give Slack/Telegram/scheduler/symphony frontends a Claude session. See [README.md](README.md) for human-facing overview.
 
 ## Stack
 
 - Python 3.12+, [uv](https://docs.astral.sh/uv/) (never pip)
-- Three agent backends: `claude` (default), `codex`, `pi` — see `src/claude_on_the_fly/agent.py` for dispatch
+- Two agent backends: `claude` (default), `codex` — see `src/claude_on_the_fly/agent.py` for dispatch
 - `prek` for hooks, `ruff` + `ruff-format` for lint/format, `ty` for typecheck, `pytest` + `pytest-asyncio` (asyncio_mode=auto)
 
 ## Layout
@@ -13,13 +13,14 @@ Experimental project that spawns Claude Code with `--permission-mode bypassPermi
 ```
 src/claude_on_the_fly/
   agent.py             # Backend dispatch + Response + shared helpers
-  backends/            # claude.py, codex.py, pi.py
+  backends/            # claude.py, codex.py
   transcript.py        # Cross-backend conversation handoff
-  pricing.py           # OpenRouter-backed price table (codex/pi)
+  pricing.py           # OpenRouter-backed price table (codex)
+  logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
   protocol.py          # Frontend protocol (add new interfaces here)
   scheduler.py         # Cron-driven frontend
-  telegram.py          # slack.py, gmail.py
+  slack.py             # telegram.py
   symphony/            # Jira-driven daemon (poll/claim/dispatch)
     tracker/jira.py    # Tracker Protocol implementations live here
     ...
@@ -45,7 +46,7 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 
 - `docs/agent/backends.md` — when modifying or adding an agent backend
 - `docs/agent/symphony.md` — when modifying or adding a tracker, or changing the dispatch loop
-- `docs/agent/frontend.md` — when adding a new frontend (Telegram/Slack/Gmail-like)
+- `docs/agent/frontend.md` — when adding a new frontend (Slack/Telegram-like)
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
 
 When working across multiple areas, read all relevant files first — the subsystems share state through `orchestrator.py` and `agent.py`.

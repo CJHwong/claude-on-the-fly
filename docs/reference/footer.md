@@ -1,6 +1,6 @@
 # Response Footer
 
-Controlled per channel via `{TELEGRAM,SLACK,GMAIL}_STATS_MODE`:
+Controlled per channel via `{SLACK,TELEGRAM}_STATS_MODE`:
 
 - `off` — no footer
 - `summary` (default) — single stats line

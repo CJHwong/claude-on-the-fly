@@ -6,18 +6,21 @@ per-job log files. Config auto-reloads on mtime change."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import yaml
 from croniter import croniter
 
+from claude_on_the_fly import logs
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.protocol import Frontend
 
@@ -86,7 +89,7 @@ class JobSpec:
     @property
     def chat_id(self) -> int:
         # Stable int per name. Survives reload and restart. Matches the
-        # sha256-based pattern used by slack.py and gmail.py for chat_ids.
+        # sha256-based pattern used by slack.py for chat_ids.
         return int(hashlib.sha256(self.name.encode()).hexdigest()[:16], 16)
 
 
@@ -117,7 +120,9 @@ def _validate_job(raw: object, index: int, seen: set[str]) -> JobSpec:
     try:
         croniter(cron_expr, datetime.now())
     except (ValueError, KeyError) as exc:
-        raise ValueError(f"{prefix} ({name}): invalid cron {cron_expr!r}: {exc}")
+        raise ValueError(
+            f"{prefix} ({name}): invalid cron {cron_expr!r}: {exc}"
+        ) from exc
 
     has_prompt = "prompt" in data
     has_script = "script" in data
@@ -197,8 +202,9 @@ def next_fire(cron_expr: str, now: datetime) -> datetime:
 
 
 def _log_path(name: str) -> Path:
+    """`logs/schedule-<job>-<host>-<date>.log` — `schedule-<job>` is the role."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    return LOG_DIR / f"schedule-{name}.log"
+    return logs.log_file(f"schedule-{name}", directory=LOG_DIR)
 
 
 def _append(name: str, block: str) -> None:
@@ -304,10 +310,8 @@ class SchedulerFrontend(Frontend):
     async def _sleep_to_next_minute(self) -> None:
         now = datetime.now()
         wait_s = 60 - now.second - now.microsecond / 1_000_000
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=wait_s)
-        except asyncio.TimeoutError:
-            pass
 
     # --- Dispatch ---
 
@@ -349,7 +353,7 @@ class SchedulerFrontend(Frontend):
                 )
                 try:
                     rc = await asyncio.wait_for(proc.wait(), timeout=spec.timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     proc.kill()
                     await proc.wait()
                     rc = proc.returncode
@@ -449,7 +453,7 @@ def main() -> None:  # pragma: no cover
     from dotenv import load_dotenv
 
     from claude_on_the_fly.orchestrator import run
-    from claude_on_the_fly.preflight import _setup_logging, check_backend
+    from claude_on_the_fly.preflight import check_backend, setup_daemon_logging
 
     parser = argparse.ArgumentParser(prog="claude-schedule")
     parser.add_argument(
@@ -461,7 +465,7 @@ def main() -> None:  # pragma: no cover
     ns = parser.parse_args()
 
     load_dotenv()
-    _setup_logging()
+    setup_daemon_logging("schedule")
 
     if not ns.config.is_file():
         raise SystemExit(f"config not found: {ns.config}")
@@ -469,7 +473,7 @@ def main() -> None:  # pragma: no cover
     try:
         specs = load_config(ns.config)
     except ValueError as exc:
-        raise SystemExit(f"config error: {exc}")
+        raise SystemExit(f"config error: {exc}") from exc
 
     if any(s.kind == "prompt" for s in specs):
         check_backend()

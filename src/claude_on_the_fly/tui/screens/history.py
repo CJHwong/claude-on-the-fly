@@ -2,19 +2,20 @@
 
 The dashboard's Active AI jobs pane only shows what's currently running;
 this screen surfaces the audit trail the EventLog has been accumulating
-across every frontend (symphony, telegram, slack, gmail): dispatch, done,
+across every frontend (symphony, slack, telegram): dispatch, done,
 cancel, retry, worker crash. The intended workflow is "find an inactive
 job from earlier today, copy its takeover command, attach in another
 terminal."
 
-Filter cycles via `s` over the frontend source (all → symphony → telegram
-→ slack → gmail → all). The detail column collapses event-type-specific
-fields into a one-line summary so the table stays readable at typical
-terminal widths.
+Filter cycles via `s` over the frontend source (all → symphony, then each chat
+frontend in `checks.CHAT_FRONTENDS` order). The detail column collapses
+event-type-specific fields into a one-line summary so the table stays readable
+at typical terminal widths.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Literal
@@ -30,6 +31,7 @@ from claude_on_the_fly.agent import (
     get_backend,
     resolve_session_log,
 )
+from claude_on_the_fly.checks import CHAT_FRONTENDS
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.symphony import watch
 from claude_on_the_fly.symphony.agent_runner import session_uuid_for
@@ -65,14 +67,11 @@ HISTORY_ROWS = 1000
 # Cap on JSONL events we tail into the watch pane per refresh.
 WATCH_EVENTS = 80
 
-SourceFilter = Literal["all", "symphony", "telegram", "slack", "gmail"]
-_SOURCE_CYCLE: tuple[SourceFilter, ...] = (
-    "all",
-    "symphony",
-    "telegram",
-    "slack",
-    "gmail",
-)
+SourceFilter = str
+# "all" and symphony first, then the chat frontends in their display order, so
+# this cycle can never disagree with the dashboard about what exists or in what
+# order (checks.CHAT_FRONTENDS is the one definition).
+_SOURCE_CYCLE: tuple[SourceFilter, ...] = ("all", "symphony", *CHAT_FRONTENDS)
 
 
 class HistoryScreen(OverlayScreen):
@@ -416,7 +415,7 @@ class HistoryScreen(OverlayScreen):
                 WORKSPACES_ROOT / tracker / sanitize_key(ident),
                 session_uuid_for(ident, source=tracker, backend_key=row_backend),
             )
-        if src in ("telegram", "slack", "gmail"):
+        if src in CHAT_FRONTENDS:
             session_uuid = e.get("session_uuid")
             if session_uuid:
                 return DATA_DIR / "workspaces" / ident, str(session_uuid)
@@ -495,7 +494,7 @@ class HistoryScreen(OverlayScreen):
         workspace, session_uuid = resolved
 
         # Resolve across backends: the row's job may have run under a different
-        # backend than the TUI's env points at (e.g. pi vs native).
+        # backend than the TUI's env points at (e.g. codex vs claude).
         path = resolve_session_log(workspace, session_uuid)
 
         if path is None:
@@ -545,8 +544,10 @@ class HistoryScreen(OverlayScreen):
         if not stick:
             render.restore_scroll(pane, prev_y=prev_y)
 
-    def _notify(self, msg: str, severity: str) -> None:
-        try:
-            self.app.notify(msg, severity=severity)  # type: ignore[arg-type]
-        except Exception:
-            pass
+    def _notify(
+        self, msg: str, severity: Literal["information", "warning", "error"]
+    ) -> None:
+        # Same signature as the dashboard's `_notify`: Textual's own severity
+        # literal, so the call typechecks instead of needing a suppression.
+        with contextlib.suppress(Exception):
+            self.app.notify(msg, severity=severity)

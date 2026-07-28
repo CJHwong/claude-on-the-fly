@@ -23,7 +23,6 @@ from claude_on_the_fly.symphony.cli import (
     resolve_source,
 )
 
-
 # ---------------------------------------------------------------------------
 # _setup_logging
 # ---------------------------------------------------------------------------
@@ -38,22 +37,24 @@ def test_setup_logging_creates_log_dir_and_file(
     monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data_dir)
 
     root = logging.getLogger()
-    before = set(root.handlers)
+    before = list(root.handlers)
 
     _setup_logging()
-
-    after = set(root.handlers)
-    new_handlers = after - before
-
-    # Remove added handlers so we don't pollute other tests
-    for h in new_handlers:
-        h.close()
-        root.removeHandler(h)
-
-    log_dir = data_dir / "logs"
-    assert log_dir.is_dir()
-    log_files = list(log_dir.glob("symphony.log*"))
-    assert len(log_files) > 0
+    try:
+        # The handler delay-opens, so nothing exists until a record is emitted.
+        logging.getLogger("test").info("hello")
+        log_dir = data_dir / "logs"
+        assert log_dir.is_dir()
+        # One file per (role, host, day) — the role is all that is fixed here.
+        assert list(log_dir.glob("symphony-*-*.log"))
+    finally:
+        # `configure` replaces the root handlers wholesale, so restore whatever
+        # the suite had rather than only removing what was added.
+        for handler in list(root.handlers):
+            handler.close()
+            root.removeHandler(handler)
+        for handler in before:
+            root.addHandler(handler)
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +80,14 @@ async def test_run_signal_handler_not_implemented() -> None:
     with (
         patch.object(loop, "add_signal_handler", side_effect=NotImplementedError),
         patch("claude_on_the_fly.symphony.cli.orchestrator.run_loop") as mock_run_loop,
-        patch.object(asyncio, "get_running_loop", return_value=loop),
-        patch.object(loop, "add_signal_handler", side_effect=NotImplementedError),
-    ):
-        # Re-patch on the function level - _run calls get_running_loop() and add_signal_handler
-        with patch(
+        # `_run` resolves both through its own module, so patch it there too.
+        patch(
             "claude_on_the_fly.symphony.cli.asyncio.get_running_loop", return_value=loop
-        ):
-            mock_run_loop.return_value = None
-            await _run(Path("/tmp/s.yaml"))
-            mock_run_loop.assert_awaited_once()
+        ),
+    ):
+        mock_run_loop.return_value = None
+        await _run(Path("/tmp/s.yaml"))
+        mock_run_loop.assert_awaited_once()
 
 
 def test_main_keyboard_interrupt() -> None:
@@ -439,9 +438,11 @@ def test_resolve_source_raises_when_undetermined() -> None:
 def test_resolve_source_raises_when_multi_match() -> None:
     """Same sanitized name exists under two sources — caller must pass
     `--source` to disambiguate."""
-    with patch(
-        "claude_on_the_fly.symphony.cli._scan_workspace_sources",
-        return_value=["jira", "github"],
+    with (
+        patch(
+            "claude_on_the_fly.symphony.cli._scan_workspace_sources",
+            return_value=["jira", "github"],
+        ),
+        pytest.raises(ValueError, match="multiple sources"),
     ):
-        with pytest.raises(ValueError, match="multiple sources"):
-            resolve_source("weird/key")
+        resolve_source("weird/key")

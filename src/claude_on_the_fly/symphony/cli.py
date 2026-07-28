@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
-import logging.handlers
 import re
 import signal
 import sys
@@ -113,10 +113,9 @@ async def _run(config_path: Path) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        # add_signal_handler is not implemented on Windows.
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass  # Windows
     await orchestrator.run_loop(config_path, stop)
 
 
@@ -135,10 +134,8 @@ def _cmd_run(config_path: Path, *, once: bool = False) -> int:
     if once:
         return _cmd_run_once(config_path)
 
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run(config_path))
-    except KeyboardInterrupt:
-        pass
     return 0
 
 
@@ -146,17 +143,20 @@ def _cmd_run_once(config_path: Path) -> int:
     """Single poll tick + exit. Useful for debugging config / tracker auth."""
 
     async def _one_tick() -> int:
+        from claude_on_the_fly.events import EventLog
+
+        from .. import agent as _agent_mod
         from .config import load_config
         from .orchestrator import (
             _build_cursor_stores,
             _refresh_prompt_stores,
             make_trackers,
+        )
+        from .orchestrator import (
             tick as _tick,
         )
-        from claude_on_the_fly.events import EventLog
         from .retry import RetryQueue
         from .state import OrchestratorState
-        from .. import agent as _agent_mod
 
         cfg = load_config(config_path)
         cfg.validate()

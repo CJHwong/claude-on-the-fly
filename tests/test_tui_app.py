@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,10 +46,10 @@ def _write_heartbeat(state_dir, name, running_jobs=()):
     in-flight jobs. Uses the live pid so state.snapshot() sees it alive."""
     import json
     import os
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     state_dir.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     (state_dir / f"{name}.json").write_text(
         json.dumps(
             {
@@ -208,7 +209,7 @@ class TestDashboardLayout:
             await pilot.pause()
             header = str(app.screen.query_one("#chat-strip-header", Static).render())
             # Cold start (no heartbeats): all chat daemons surface in the header.
-            for name in ("telegram", "slack", "gmail"):
+            for name in ("slack", "telegram"):
                 assert name in header
             strip = app.screen.query_one("#chat-strip", DataTable)
             # Table is the live monitor, not a roster. Cold start → the selected
@@ -222,18 +223,18 @@ class TestDashboardLayout:
         self, tmp_path, monkeypatch
     ):
         """Starting one frontend must not hide the others: ←/→ can still land on
-        a stopped frontend (so k/r can start it), even while telegram runs."""
+        a stopped frontend (so k/r can start it), even while slack runs."""
         from textual.widgets import DataTable
 
         state_dir = tmp_path / "state"
         _write_heartbeat(
             state_dir,
-            "telegram",
+            "slack",
             running_jobs=[
-                {"identifier": "telegram/H", "uptime_s": 4, "session_uuid": "u1"}
+                {"identifier": "slack/H", "uptime_s": 4, "session_uuid": "u1"}
             ],
         )
-        # slack + gmail never started (no heartbeat) — must still be reachable.
+        # telegram never started (no heartbeat) — must still be reachable.
         monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", state_dir)
 
         app = ClaudeTuiApp()
@@ -242,20 +243,15 @@ class TestDashboardLayout:
             screen = _dashboard(app)
             strip = app.screen.query_one("#chat-strip", DataTable)
 
-            # telegram is selected and running.
-            assert screen._active_daemon() == "telegram"
-
-            # → reaches slack even though it never ran; the table shows the
-            # start hint and k/r now target slack.
-            await pilot.press("right")
-            await pilot.pause()
+            # slack is first in the roster, so it is selected, and it is running.
             assert screen._active_daemon() == "slack"
-            assert "press r to start" in str(strip.get_cell_at(Coordinate(0, 0)))
 
-            # → again reaches gmail.
+            # → reaches telegram even though it never ran; the table shows the
+            # start hint and k/r now target telegram.
             await pilot.press("right")
             await pilot.pause()
-            assert screen._active_daemon() == "gmail"
+            assert screen._active_daemon() == "telegram"
+            assert "press r to start" in str(strip.get_cell_at(Coordinate(0, 0)))
 
     @pytest.mark.asyncio
     async def test_chat_tab_lists_running_jobs_from_heartbeat(
@@ -268,10 +264,10 @@ class TestDashboardLayout:
         state_dir = tmp_path / "state"
         _write_heartbeat(
             state_dir,
-            "telegram",
+            "slack",
             running_jobs=[
-                {"identifier": "telegram/H", "uptime_s": 14, "session_uuid": "u1"},
-                {"identifier": "telegram/Bob", "uptime_s": 5, "session_uuid": "u2"},
+                {"identifier": "slack/H", "uptime_s": 14, "session_uuid": "u1"},
+                {"identifier": "slack/Bob", "uptime_s": 5, "session_uuid": "u2"},
             ],
         )
         monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", state_dir)
@@ -280,10 +276,10 @@ class TestDashboardLayout:
         async with app.run_test() as pilot:
             await pilot.pause()
             strip = app.screen.query_one("#chat-strip", DataTable)
-            # Only telegram has a heartbeat → single relevant frontend, selected.
+            # Only slack has a heartbeat → single relevant frontend, selected.
             assert strip.row_count == 2
             idents = [str(strip.get_cell_at(Coordinate(r, 0))) for r in range(2)]
-            assert idents == ["telegram/H", "telegram/Bob"]
+            assert idents == ["slack/H", "slack/Bob"]
             uptimes = [str(strip.get_cell_at(Coordinate(r, 1))) for r in range(2)]
             assert uptimes == ["14s", "5s"]
 
@@ -318,24 +314,24 @@ class TestDashboardLayout:
             screen = _dashboard(app)
             strip = app.screen.query_one("#chat-strip", DataTable)
 
-            # telegram + slack are both relevant; selection starts on telegram.
-            assert screen._active_daemon() == "telegram"
-            assert [
-                str(strip.get_cell_at(Coordinate(r, 0))) for r in range(strip.row_count)
-            ] == ["telegram/H"]
-
-            # Right → next frontend (slack): table scopes to slack, target flips.
-            await pilot.press("right")
-            await pilot.pause()
+            # slack + telegram are both relevant; selection starts on slack.
             assert screen._active_daemon() == "slack"
             assert [
                 str(strip.get_cell_at(Coordinate(r, 0))) for r in range(strip.row_count)
             ] == ["slack/ops"]
 
-            # Left wraps back to telegram.
-            await pilot.press("left")
+            # Right → next frontend (telegram): table scopes to it, target flips.
+            await pilot.press("right")
             await pilot.pause()
             assert screen._active_daemon() == "telegram"
+            assert [
+                str(strip.get_cell_at(Coordinate(r, 0))) for r in range(strip.row_count)
+            ] == ["telegram/H"]
+
+            # Left wraps back to slack.
+            await pilot.press("left")
+            await pilot.pause()
+            assert screen._active_daemon() == "slack"
 
     @pytest.mark.asyncio
     async def test_tab_keys_switch_active_daemon(self, tmp_path, monkeypatch):
@@ -345,7 +341,7 @@ class TestDashboardLayout:
         from textual.widgets import DataTable, Static, TabbedContent
 
         # Isolate disk: cold start → chat target falls back to the first
-        # frontend (telegram) regardless of the dev machine's real state.
+        # frontend (slack) regardless of the dev machine's real state.
         monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
 
         app = ClaudeTuiApp()
@@ -356,7 +352,7 @@ class TestDashboardLayout:
             # Opens on chat; cold start → target is the first chat daemon.
             assert tabs.active == "tab-chat"
             assert app.focused is not None and app.focused.id == "chat-strip"
-            assert screen._active_daemon() == "telegram"
+            assert screen._active_daemon() == "slack"
 
             await pilot.press("2")
             await pilot.pause()
@@ -389,7 +385,7 @@ class TestDashboardLayout:
             await pilot.press("1")
             await pilot.pause()
             assert tabs.active == "tab-chat"
-            assert screen._active_daemon() == "telegram"
+            assert screen._active_daemon() == "slack"
             assert getattr(app.focused, "id", None) == "chat-strip"
 
     def test_footer_keeps_core_keys_visible_hides_rest_in_modal(self):
@@ -517,8 +513,8 @@ class TestDashboardLayout:
         async with app.run_test() as pilot:
             await pilot.pause()
             cue = app.screen.query_one("#action-cue", Static)
-            # Opens on chat → first chat daemon (telegram) is the target.
-            assert "telegram" in str(cue.render())
+            # Opens on chat → first chat daemon (slack) is the target.
+            assert "slack" in str(cue.render())
 
             await pilot.press("3")
             await pilot.pause()
@@ -809,7 +805,9 @@ class TestJobsTab:
             # Column.width, not get_render_width(): the latter adds the two
             # cells of padding, which would leave "queue empty" (11) passing
             # against the 10-wide column that clips it.
-            for column, cell in zip(table.ordered_columns, table.get_row_at(row_index)):
+            for column, cell in zip(
+                table.ordered_columns, table.get_row_at(row_index), strict=True
+            ):
                 text = str(cell)
                 assert cell_len(text) <= column.width, (
                     f"{phase}: {column.label} cell {text!r} is {cell_len(text)} "
@@ -912,16 +910,18 @@ class TestJobsTab:
 
     @pytest.mark.asyncio
     async def test_log_pane_follows_the_worker_log(self, tmp_path, monkeypatch):
-        """The shared log row follows the active tab, so the jobs tab tails
-        logs/jobs.log — which jobs/cli.py's own _setup_logging now writes."""
+        """The shared log row follows the active tab, so the jobs tab tails the
+        worker's own per-day log — which jobs/cli.py's _setup_logging writes."""
         from textual.widgets import Static
 
+        from claude_on_the_fly import logs
         from claude_on_the_fly.tui.screens import dashboard as dash
 
         self._isolate(tmp_path, monkeypatch)
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        (log_dir / "jobs.log").write_text("worker line\n", encoding="utf-8")
+        log_name = logs.log_name("jobs")
+        (log_dir / log_name).write_text("worker line\n", encoding="utf-8")
         monkeypatch.setattr(dash, "LOG_DIR", log_dir)
 
         app = ClaudeTuiApp()
@@ -930,7 +930,7 @@ class TestJobsTab:
             await pilot.press("4")
             await pilot.pause()
             header = str(app.screen.query_one("#log-header", Static).render())
-            assert "jobs.log" in header
+            assert log_name in header
             assert "missing" not in header
 
     @pytest.mark.asyncio

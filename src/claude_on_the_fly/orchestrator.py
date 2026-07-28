@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import logging.handlers
 import signal
 import time
 from uuid import NAMESPACE_URL, uuid5
@@ -296,29 +296,9 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
 
 async def run(frontend: Frontend, platform: str) -> None:
     """Start the orchestrator with the given frontend. Blocks until SIGINT/SIGTERM."""
-    import os
+    from claude_on_the_fly import logs
 
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-
-    # Console: respects LOG_LEVEL
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format=log_fmt,
-    )
-
-    # File: always DEBUG, daily rotation, 7 days
-    log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        log_dir / f"{platform}.log",
-        when="midnight",
-        backupCount=7,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(log_fmt))
-    logging.getLogger().addHandler(file_handler)
+    logs.configure(platform)
     (DATA_DIR / "memory" / "users").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
 
@@ -346,7 +326,5 @@ async def run(frontend: Frontend, platform: str) -> None:
     await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
     await orch.shutdown()
     await frontend.stop()
-    try:
+    with contextlib.suppress(FileNotFoundError):
         heartbeat.path.unlink()
-    except FileNotFoundError:
-        pass

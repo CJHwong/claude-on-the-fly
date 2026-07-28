@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 from claude_on_the_fly.tui.screens.history import (
     _aggregate_by_job,
     _compute_runtimes,
@@ -20,7 +22,7 @@ class TestEventSource:
     def test_chat_row_returns_frontend(self) -> None:
         assert _event_source({"source": "telegram"}) == "telegram"
         assert _event_source({"source": "slack"}) == "slack"
-        assert _event_source({"source": "gmail"}) == "gmail"
+        assert _event_source({"source": "telegram"}) == "telegram"
 
     def test_legacy_tracker_in_source_field_maps_to_symphony(self) -> None:
         # Rows written before the source/tracker split stored the tracker
@@ -112,12 +114,12 @@ class TestFormatRuntime:
 
 class TestFormatLocalTime:
     def test_utc_converts_to_system_local_time(self) -> None:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         ts = "2026-05-25T10:00:00Z"
         # Independent reference: same instant rendered in the local zone.
         expected = (
-            datetime(2026, 5, 25, 10, 0, 0, tzinfo=timezone.utc)
+            datetime(2026, 5, 25, 10, 0, 0, tzinfo=UTC)
             .astimezone()
             .strftime("%H:%M:%S")
         )

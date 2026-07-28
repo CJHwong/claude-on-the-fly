@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -15,9 +15,9 @@ from claude_on_the_fly.tui.render import (
     _format_extra_notes,
     chat_header,
     frontends_table,
+    jobs_header,
     read_new_lines,
     render_snapshot_json,
-    jobs_header,
     render_snapshot_rich,
     tab_label,
     tail_lines,
@@ -32,7 +32,7 @@ from claude_on_the_fly.tui.state import (
 
 def _make_snapshot(**overrides):
     defaults = {
-        "timestamp": datetime(2026, 5, 19, 13, 0, 5, tzinfo=timezone.utc),
+        "timestamp": datetime(2026, 5, 19, 13, 0, 5, tzinfo=UTC),
         "frontends": [
             FrontendStatus(
                 name="telegram",
@@ -82,7 +82,7 @@ class TestFmtHelpers:
         assert _fmt_age(7200) == "2.0h"
 
     def test_fmt_uptime_invalid_returns_dash(self):
-        now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=UTC)
         assert _fmt_uptime(None, now) == "-"
         assert _fmt_uptime("garbage", now) == "-"
 
@@ -122,15 +122,14 @@ class TestChatHeader:
     def test_multiple_frontends_collapse_to_glyph_strip(self):
         line = chat_header(
             [
-                self._fe("telegram", "running"),
                 self._fe("slack", "running"),
-                self._fe("gmail", "stopped"),
+                self._fe("telegram", "stopped"),
             ],
-            selected=1,
+            selected=0,
             active=3,
         )
         assert "CHAT" in line
-        for name in ("telegram", "slack", "gmail"):
+        for name in ("slack", "telegram"):
             assert name in line
         # Non-running frontends carry their state word so a down daemon shows.
         assert "stopped" in line
@@ -226,7 +225,7 @@ class TestFrontendsTableWithNestedExtras:
             },
         )
         out = self._render(
-            frontends_table([f], datetime(2026, 5, 19, 13, 0, 5, tzinfo=timezone.utc))
+            frontends_table([f], datetime(2026, 5, 19, 13, 0, 5, tzinfo=UTC))
         )
         assert "running=2" in out
         assert "PROJ-1" not in out
@@ -396,7 +395,7 @@ class TestJobsQueueJson:
                         id="100-a",
                         prompt="do the thing",
                         origin={"channel": "C1"},
-                        enqueued_at=datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc),
+                        enqueued_at=datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
                         in_flight=True,
                     )
                 ],

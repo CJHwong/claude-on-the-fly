@@ -11,6 +11,7 @@ from textual.app import App
 from textual.widgets import RichLog
 
 import claude_on_the_fly.tui.screens.dashboard as dash
+from claude_on_the_fly import logs
 from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 
 
@@ -47,7 +48,7 @@ async def test_daemon_log_missing_present_recovery(tmp_path, monkeypatch):
     `if not new_lines` and left the stale '(missing)' header/line stuck once the
     file appeared."""
     _isolate(tmp_path, monkeypatch)
-    log = tmp_path / "symphony.log"
+    log = tmp_path / logs.log_name("symphony")
 
     app = _DashboardOnlyApp()
     async with app.run_test() as pilot:

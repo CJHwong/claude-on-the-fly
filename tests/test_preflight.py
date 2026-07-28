@@ -12,16 +12,13 @@ from claude_on_the_fly.preflight import (
     check_backend,
     check_claude_cli,
     check_codex_cli,
-    check_gws_cli,
     check_ollama_mode,
     check_slack,
     check_telegram,
     require_env,
-    run_gmail,
     run_slack,
     run_telegram,
 )
-
 
 # ---------------------------------------------------------------------------
 # require_env
@@ -70,7 +67,7 @@ class TestCheckClaudeCli:
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=2, stdout="", stderr="something broke"
         )
-        with pytest.raises(SystemExit, match="check failed.*exit 2"):
+        with pytest.raises(SystemExit, match=r"check failed.*exit 2"):
             check_claude_cli()
 
     @patch("claude_on_the_fly.preflight.subprocess.run")
@@ -275,7 +272,7 @@ class TestCheckOllamaMode:
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="boom"
         )
-        with pytest.raises(SystemExit, match="ollama list failed.*boom"):
+        with pytest.raises(SystemExit, match=r"ollama list failed.*boom"):
             check_ollama_mode()
 
     @patch("claude_on_the_fly.preflight.subprocess.run")
@@ -325,11 +322,13 @@ class TestCheckOllamaMode:
         self, clear_backend_env, monkeypatch
     ):
         # No OLLAMA_MODEL -> error message names CODEX_MODE for codex agent
-        with patch(
-            "claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x"
+        with (
+            patch(
+                "claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x"
+            ),
+            pytest.raises(SystemExit, match="CODEX_MODE=ollama"),
         ):
-            with pytest.raises(SystemExit, match="CODEX_MODE=ollama"):
-                check_ollama_mode("codex")
+            check_ollama_mode("codex")
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +364,7 @@ class TestCheckTelegram:
             {"ok": False, "description": "Unauthorized"}
         )
         with pytest.raises(
-            SystemExit, match="Invalid Telegram bot token.*Unauthorized"
+            SystemExit, match=r"Invalid Telegram bot token.*Unauthorized"
         ):
             await check_telegram("bad-token")
 
@@ -412,7 +411,7 @@ class TestCheckSlack:
         mock_client_cls.return_value = _make_slack_client(
             {"ok": False, "error": "invalid_auth"}
         )
-        with pytest.raises(SystemExit, match="Invalid Slack user token.*invalid_auth"):
+        with pytest.raises(SystemExit, match=r"Invalid Slack user token.*invalid_auth"):
             await check_slack("xapp-valid", "bad-token")
 
     @pytest.mark.asyncio
@@ -421,7 +420,7 @@ class TestCheckSlack:
         mock_client_cls.return_value = _make_slack_client(
             {"ok": False, "error": "invalid_auth"}
         )
-        with pytest.raises(SystemExit, match="Invalid Slack bot token.*invalid_auth"):
+        with pytest.raises(SystemExit, match=r"Invalid Slack bot token.*invalid_auth"):
             await check_slack("xapp-valid", "xoxb-bad")
 
     @pytest.mark.asyncio
@@ -441,70 +440,6 @@ class TestCheckSlack:
         )
         with pytest.raises(SystemExit, match="must start with 'xapp-'"):
             await check_slack("not-xapp", "xoxp-valid")
-
-
-# ---------------------------------------------------------------------------
-# check_gws_cli
-# ---------------------------------------------------------------------------
-
-
-class TestCheckGwsCli:
-    @patch("claude_on_the_fly.preflight.shutil.which", return_value=None)
-    def test_exits_if_not_found(self, _mock_which):
-        with pytest.raises(SystemExit, match="gws CLI not found"):
-            check_gws_cli()
-
-    @patch("claude_on_the_fly.preflight.subprocess.run")
-    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/gws")
-    def test_exits_on_nonzero_returncode(self, _mock_which, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="", stderr="auth failed"
-        )
-        with pytest.raises(SystemExit, match="gws auth check failed"):
-            check_gws_cli()
-
-    @patch("claude_on_the_fly.preflight.subprocess.run")
-    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/gws")
-    def test_exits_on_invalid_token(self, _mock_which, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps({"token_valid": False, "enabled_apis": []}),
-            stderr="",
-        )
-        with pytest.raises(SystemExit, match="gws token invalid"):
-            check_gws_cli()
-
-    @patch("claude_on_the_fly.preflight.subprocess.run")
-    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/gws")
-    def test_exits_when_gmail_api_not_enabled(self, _mock_which, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps(
-                {"token_valid": True, "enabled_apis": ["calendar.googleapis.com"]}
-            ),
-            stderr="",
-        )
-        with pytest.raises(SystemExit, match="Gmail API not enabled"):
-            check_gws_cli()
-
-    @patch("claude_on_the_fly.preflight.subprocess.run")
-    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/gws")
-    def test_succeeds_with_valid_status(self, _mock_which, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "token_valid": True,
-                    "enabled_apis": ["gmail.googleapis.com"],
-                    "user": "hoss@gofreight.com",
-                }
-            ),
-            stderr="",
-        )
-        check_gws_cli()  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -675,34 +610,3 @@ class TestRunSlack:
         monkeypatch.delenv("SLACK_SILENT_SENDER_IDS", raising=False)
         *_, silent = run_slack()
         assert silent == set()
-
-
-# ---------------------------------------------------------------------------
-# run_gmail
-# ---------------------------------------------------------------------------
-
-
-class TestRunGmail:
-    @pytest.fixture(autouse=True)
-    def _reset_backend_env(self, clear_backend_env):
-        """Same reason as TestRunTelegram — keep `CLAUDE_MODE=pty` from
-        the dev's shell from rerouting backend dispatch in run_gmail()."""
-
-    @patch("claude_on_the_fly.preflight.check_gws_cli")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_returns_project_and_senders(self, _mock_claude, _mock_gws, monkeypatch):
-        monkeypatch.setenv("GMAIL_GCP_PROJECT", "my-proj")
-        monkeypatch.setenv("GMAIL_ALLOWED_SENDERS", "a@b.com, c@d.com")
-        project, senders = run_gmail()
-        assert project == "my-proj"
-        assert senders == {"a@b.com", "c@d.com"}
-
-    @patch("claude_on_the_fly.preflight.check_gws_cli")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_exits_if_senders_empty_after_parse(
-        self, _mock_claude, _mock_gws, monkeypatch
-    ):
-        monkeypatch.setenv("GMAIL_GCP_PROJECT", "my-proj")
-        monkeypatch.setenv("GMAIL_ALLOWED_SENDERS", " , , ")
-        with pytest.raises(SystemExit, match="at least one email"):
-            run_gmail()

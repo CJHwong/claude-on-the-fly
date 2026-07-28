@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from claude_on_the_fly import scheduler
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.scheduler import (
     EXAMPLE_YAML,
@@ -348,11 +349,12 @@ class TestFirePrompt:
         with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
             spec = fe._state["ping"].spec
             await fe._fire_prompt(spec)
+            log_path = scheduler._log_path("ping")
 
         orch.reset_session.assert_called_once_with(spec.chat_id)
         on_message.assert_awaited_once_with(spec.chat_id, "hello")
         # Log block was written
-        log = (tmp_path / "logs" / "schedule-ping.log").read_text()
+        log = log_path.read_text()
         assert "fire (prompt)" in log
         assert "> hello" in log
 
@@ -419,8 +421,9 @@ class TestRunScript:
         with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
             spec = fe._state["job"].spec
             await fe._run_script(spec)
+            log_path = scheduler._log_path("job")
 
-        log = (tmp_path / "logs" / "schedule-job.log").read_text()
+        log = log_path.read_text()
         assert "hello from script" in log
         assert "fire (script)" in log
         assert "exit=0" in log
@@ -441,8 +444,9 @@ class TestRunScript:
                 side_effect=Exception("spawn failed"),
             ):
                 await fe._run_script(spec)
+            log_path = scheduler._log_path("x")
 
-        log = (tmp_path / "logs" / "schedule-x.log").read_text()
+        log = log_path.read_text()
         assert "error: spawn failed" in log
 
     async def test_script_timeout_kills(self, tmp_path: Path) -> None:
@@ -467,10 +471,11 @@ class TestRunScript:
         with patch("claude_on_the_fly.scheduler.LOG_DIR", tmp_path / "logs"):
             spec = fe._state["slow"].spec
             await fe._run_script(spec)
+            log_path = scheduler._log_path("slow")
         elapsed = time.monotonic() - started
         assert elapsed < 5  # should have been killed quickly
 
-        log = (tmp_path / "logs" / "schedule-slow.log").read_text()
+        log = log_path.read_text()
         assert "timed out after 1s" in log
 
 
@@ -521,7 +526,7 @@ class TestReload:
             cfg,
             {"jobs": [{"name": "a", "cron": "* * * * *", "prompt": "hi"}]},
         )
-        added, removed, modified = fe._reload()
+        added, removed, _modified = fe._reload()
         assert added == set()
         assert removed == {"b"}
         assert set(fe._state) == {"a"}
@@ -554,7 +559,7 @@ class TestReload:
                 assert "slow" not in fe._state
                 # Wait for the in-flight task
                 await asyncio.gather(*fe._script_tasks)
-                log = (tmp_path / "logs" / "schedule-slow.log").read_text()
+                log = scheduler._log_path("slow").read_text()
                 return "done" in log
 
         assert asyncio.run(_go())
@@ -572,7 +577,7 @@ class TestReload:
             cfg,
             {"jobs": [{"name": "a", "cron": "0 15 * * *", "prompt": "hi"}]},
         )
-        added, removed, modified = fe._reload()
+        _added, _removed, modified = fe._reload()
         assert modified == {"a"}
         after = fe._state["a"].next_fire
         assert before != after
@@ -625,7 +630,7 @@ class TestReload:
             cfg,
             {"jobs": [{"name": "a", "cron": "0 3 * * *", "prompt": "new prompt"}]},
         )
-        added, removed, modified = fe._reload()
+        _added, _removed, modified = fe._reload()
         assert modified == {"a"}
         after = fe._state["a"].next_fire
         assert before == after  # cron unchanged, so next_fire preserved
@@ -743,8 +748,9 @@ class TestFrontendProtocol:
                 spec.chat_id,
                 Response(body="answer", cost=0.01, model="claude-sonnet-4-6"),
             )
+            log_path = scheduler._log_path("ping")
 
-        log = (tmp_path / "logs" / "schedule-ping.log").read_text()
+        log = log_path.read_text()
         assert "answer" in log
         assert "claude-sonnet-4-6" in log
         assert "=== done ===" in log

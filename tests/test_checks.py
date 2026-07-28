@@ -16,7 +16,6 @@ from claude_on_the_fly.checks import (
     check_backend,
     check_binaries,
     check_frontend,
-    check_gmail,
     check_jobs,
     check_pty_hooks,
     check_slack,
@@ -288,44 +287,6 @@ class TestCheckSlack:
 
 
 # ---------------------------------------------------------------------------
-# Gmail
-# ---------------------------------------------------------------------------
-
-
-class TestCheckGmail:
-    def test_all_ok(self):
-        results = check_gmail(
-            {"GMAIL_GCP_PROJECT": "my-proj", "GMAIL_ALLOWED_SENDERS": "a@b.com"}
-        )
-        assert all_ok(results)
-
-    def test_missing_project(self):
-        results = check_gmail({"GMAIL_ALLOWED_SENDERS": "a@b.com"})
-        fail = first_failure(results)
-        assert fail is not None
-        assert fail.name == "GMAIL_GCP_PROJECT"
-
-    def test_empty_senders_after_parse(self):
-        results = check_gmail(
-            {"GMAIL_GCP_PROJECT": "my-proj", "GMAIL_ALLOWED_SENDERS": ", , "}
-        )
-        bad = [r for r in results if r.name == "GMAIL_ALLOWED_SENDERS"]
-        assert len(bad) == 1
-        assert bad[0].status == "missing"
-
-    def test_senders_count_in_detail(self):
-        results = check_gmail(
-            {
-                "GMAIL_GCP_PROJECT": "my-proj",
-                "GMAIL_ALLOWED_SENDERS": "a@b.com, c@d.com, e@f.com",
-            }
-        )
-        sender_result = next(r for r in results if r.name == "GMAIL_ALLOWED_SENDERS")
-        assert sender_result.status == "ok"
-        assert "3" in sender_result.detail
-
-
-# ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
 
@@ -578,7 +539,6 @@ class TestAggregators:
         assert set(results) == {
             "telegram",
             "slack",
-            "gmail",
             "schedule",
             "symphony",
             "jobs",
@@ -615,11 +575,6 @@ class TestEnvVarDeclarations:
         assert "SLACK_USER_TOKEN" in vars_
         assert "SLACK_ALLOWED_BOT_IDS" in vars_
         assert "SLACK_SILENT_SENDER_IDS" in vars_
-
-    def test_gmail_declares_project_and_senders(self):
-        vars_ = FRONTEND_ENV_VARS["gmail"]
-        assert "GMAIL_GCP_PROJECT" in vars_
-        assert "GMAIL_ALLOWED_SENDERS" in vars_
 
     def test_schedule_and_symphony_have_no_env_vars(self):
         assert FRONTEND_ENV_VARS["schedule"] == ()

@@ -10,13 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import logging.handlers
 import os
 import shutil
 import subprocess
+
 import httpx
 
-from claude_on_the_fly import agent, checks
+from claude_on_the_fly import checks
 from claude_on_the_fly.checks import CheckResult
 
 logger = logging.getLogger(__name__)
@@ -82,8 +82,6 @@ def _extract_cli_result(stdout: str) -> str:
 _AGENT_INSTALL_HINTS = {
     "claude": "https://docs.anthropic.com/en/docs/claude-code",
     "codex": "https://github.com/openai/codex",
-    "pi": "https://github.com/earendil-works/pi-coding-agent",
-    "opencode": "https://opencode.ai",
 }
 
 
@@ -116,28 +114,7 @@ def check_backend() -> None:
             check_ollama_mode("codex")
             return
         raise _exit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
-    if backend_name == "pi":
-        mode = os.environ.get("PI_MODE", "native").lower()
-        if mode == "native":
-            check_pi_cli()
-            return
-        if mode == "ollama":
-            check_ollama_mode("pi")
-            return
-        raise _exit(f"Unknown PI_MODE: {mode!r} (supported: native, ollama)")
-    if backend_name == "opencode":
-        mode = os.environ.get("OPENCODE_MODE", "native").lower()
-        if mode == "native":
-            check_opencode_cli()
-            return
-        if mode == "ollama":
-            check_ollama_mode("opencode")
-            return
-        raise _exit(f"Unknown OPENCODE_MODE: {mode!r} (supported: native, ollama)")
-    raise _exit(
-        f"Unknown AGENT_BACKEND: {backend_name!r} "
-        "(supported: claude, codex, pi, opencode)"
-    )
+    raise _exit(f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex)")
 
 
 def check_codex_cli() -> None:
@@ -145,22 +122,6 @@ def check_codex_cli() -> None:
     if not shutil.which("codex"):
         raise _exit(f"codex CLI not found. Install it: {_AGENT_INSTALL_HINTS['codex']}")
     logger.info("codex CLI: ok")
-
-
-def check_pi_cli() -> None:
-    """Verify pi CLI is installed. Auth is checked at first use."""
-    if not shutil.which("pi"):
-        raise _exit(f"pi CLI not found. Install it: {_AGENT_INSTALL_HINTS['pi']}")
-    logger.info("pi CLI: ok")
-
-
-def check_opencode_cli() -> None:
-    """Verify opencode CLI is installed. Auth is checked at first use."""
-    if not shutil.which("opencode"):
-        raise _exit(
-            f"opencode CLI not found. Install it: {_AGENT_INSTALL_HINTS['opencode']}"
-        )
-    logger.info("opencode CLI: ok")
 
 
 def check_ollama_mode(agent_name: str = "claude") -> None:
@@ -305,28 +266,6 @@ async def check_slack(app_token: str, token: str) -> str:
         return user_id
 
 
-def check_gws_cli() -> None:
-    """Verify gws CLI is installed and authenticated with Gmail scope."""
-    if not shutil.which("gws"):
-        raise _exit(
-            "gws CLI not found. Install it: npm install -g @googleworkspace/cli"
-        )
-    result = subprocess.run(
-        ["gws", "auth", "status"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if result.returncode != 0:
-        raise _exit(f"gws auth check failed: {result.stderr.strip()}")
-    status = json.loads(result.stdout)
-    if not status.get("token_valid"):
-        raise _exit("gws token invalid. Run: gws auth login")
-    if "gmail.googleapis.com" not in status.get("enabled_apis", []):
-        raise _exit("Gmail API not enabled in GCP project. Enable it first.")
-    logger.info("gws CLI: ok (user: %s)", status.get("user", "unknown"))
-
-
 def _setup_logging() -> None:
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -336,34 +275,14 @@ def _setup_logging() -> None:
 
 
 def setup_daemon_logging(platform: str) -> None:
-    """Console plus a daily-rotating `logs/<platform>.log`, 7-day retention.
+    """Wire this daemon's logging: see `claude_on_the_fly.logs.configure`.
 
-    The variant for daemons the TUI supervises: without a file handler there is
-    nothing for the dashboard to tail, which `_setup_logging` above (console
-    only) cannot provide. `basicConfig` sets the ROOT logger from LOG_LEVEL, so
-    both sinks share that level and the file handler's own DEBUG floor only
-    bites with LOG_LEVEL=DEBUG.
+    Kept as a named entry point because every supervised daemon calls it; the
+    naming, rollover, and retention rules all live in `logs`.
     """
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format=log_fmt,
-    )
-    # Read through the module, not a from-import: agent.DATA_DIR binds
-    # Path.home() at import time, and tests redirect it by patching the
-    # attribute.
-    log_dir = agent.DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        log_dir / f"{platform}.log",
-        when="midnight",
-        backupCount=7,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(log_fmt))
-    logging.getLogger().addHandler(file_handler)
+    from claude_on_the_fly import logs
+
+    logs.configure(platform)
 
 
 def run_telegram() -> tuple[str, int]:
@@ -417,15 +336,3 @@ def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], set[str]]:
         allowed_bot_ids,
         silent_sender_ids,
     )
-
-
-def run_gmail() -> tuple[str, set[str]]:
-    """Validate env vars and gws CLI. Returns (gcp_project, allowed_senders)."""
-    _setup_logging()
-    _raise_on_failures(checks.check_gmail(os.environ))
-    gcp_project = os.environ["GMAIL_GCP_PROJECT"]
-    allowed_raw = os.environ["GMAIL_ALLOWED_SENDERS"]
-    allowed_senders = {s.strip() for s in allowed_raw.split(",") if s.strip()}
-    check_backend()
-    check_gws_cli()
-    return gcp_project, allowed_senders
