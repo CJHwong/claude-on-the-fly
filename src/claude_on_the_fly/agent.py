@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Protocol
 
 import yaml
@@ -421,6 +422,55 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     return result
 
 
+# Notified when an agent CLI's process group starts and when it has been
+# reaped, as (pgid, command, running). Every spawn site announces; the single
+# reap path below un-announces.
+#
+# The point is survivability, not bookkeeping: a listener can write the group
+# down somewhere durable *before* anything can go wrong, so a host that is
+# SIGKILLed mid-run leaves a record of what it orphaned. Nothing in-process can
+# do that after the fact — the CLI leads its own session, so it is unreachable
+# from the parent's group and its pid dies with the parent that knew it.
+ProcessListener = Callable[[int, str, bool], None]
+_process_listeners: list[ProcessListener] = []
+
+
+def add_process_listener(listener: ProcessListener) -> None:
+    """Register a listener for agent process-group start/stop."""
+    _process_listeners.append(listener)
+
+
+def remove_process_listener(listener: ProcessListener) -> None:
+    """Unregister a listener. Silent if it was never registered."""
+    if listener in _process_listeners:
+        _process_listeners.remove(listener)
+
+
+def _announce_process(
+    proc: asyncio.subprocess.Process, command: str, *, running: bool
+) -> None:
+    """Tell every listener about an agent process group.
+
+    The pgid is `proc.pid`, not `os.getpgid(proc.pid)`: with
+    start_new_session=True the child calls setsid() and so leads a group whose
+    id equals its own pid, which is knowable immediately and without racing the
+    child's setsid. (`_kill_process_tree` still asks the OS, because by then the
+    process may be gone and the answer matters more than the timing.)
+
+    A listener that raises must not take the agent run down with it.
+    """
+    for listener in list(_process_listeners):
+        try:
+            listener(proc.pid, command, running)
+        except Exception:
+            logger.exception("agent: process listener failed")
+
+
+def track_agent_process(proc: asyncio.subprocess.Process, cmd: list[str]) -> None:
+    """Announce a freshly spawned agent CLI. Call immediately after spawning."""
+    _announce_process(proc, cmd[0] if cmd else "", running=True)
+
+
 async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     """Reap a subprocess and every descendant it spawned.
 
@@ -428,23 +478,31 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     own process group; a SIGKILL to that group reaps the CLI *and* the tool
     subprocesses it forked. A bare proc.kill() only hits the direct child and
     orphans the rest. Safe to call on an already-exited process.
+
+    The single un-announce point for `track_agent_process`, including the
+    already-exited early return — a process that ended on its own is just as
+    finished as one this reaped, and a listener that never heard so would keep
+    treating it as live.
     """
-    if proc.returncode is not None:
-        return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        # getpgid/killpg can race with a natural exit; fall back to a plain kill.
+        if proc.returncode is not None:
+            return
         try:
-            proc.kill()
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
-    try:
-        await proc.wait()
-    except ProcessLookupError:
-        pass
+        except OSError:
+            # getpgid/killpg can race with a natural exit; fall back to a plain kill.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+    finally:
+        _announce_process(proc, "", running=False)
 
 
 async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -> dict:
@@ -462,6 +520,7 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         limit=16 * 1024 * 1024,
         start_new_session=True,
     )
+    track_agent_process(proc, cmd)
     try:
         if timeout is not None:
             return await asyncio.wait_for(_consume(proc), timeout=timeout)

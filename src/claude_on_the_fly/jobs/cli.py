@@ -30,6 +30,7 @@ from claude_on_the_fly import agent, checks
 from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
 from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
 from claude_on_the_fly.jobs.core import AgentRunner, Job, JobQueue, Notifier
+from claude_on_the_fly.jobs.orphans import LEDGER_NAME, ProcessLedger
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.jobs.slack_notifier import SlackThreadNotifier
 from claude_on_the_fly.jobs.worker import run_loop
@@ -125,6 +126,19 @@ async def _run(token: str) -> None:
 
     queue, runner, notifier = build_components(token)
 
+    # Reap what a previous worker orphaned, before anything claims work:
+    # run_loop's first act is recover_stale, and re-running a job whose earlier
+    # copy is still executing is exactly what this prevents.
+    ledger = ProcessLedger(agent.DATA_DIR / "jobs" / LEDGER_NAME)
+    killed = ledger.sweep()
+    if killed:
+        logger.warning(
+            "claude-jobs: reaped %d orphaned agent process group(s) from a "
+            "previous run",
+            killed,
+        )
+    agent.add_process_listener(ledger.on_process)
+
     heartbeat = HeartbeatWriter("jobs")
     heartbeat_task = asyncio.create_task(heartbeat.run())
     logger.info("claude-jobs: started (poll every %.1fs)", _poll_interval_s())
@@ -132,6 +146,7 @@ async def _run(token: str) -> None:
     try:
         await run_loop(queue, runner, notifier, stop, _poll_interval_s())
     finally:
+        agent.remove_process_listener(ledger.on_process)
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
         try:
