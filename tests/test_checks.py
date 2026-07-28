@@ -167,10 +167,23 @@ class TestCheckSlack:
         assert fail.name == "SLACK_SLASH_COMMAND"
         assert fail.status == "invalid"
 
-    def test_job_command_absent_is_fine(self):
-        # Opt-in: unset means the background-job trigger does not exist for this
-        # install, which is the default, not an error.
+    def test_job_command_absent_means_the_default_is_live(self):
+        # On by default: absent is not "off", it is `$job`. The row appears so
+        # the operator can see which trigger their install answers to.
         results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxb-1"})
+        assert all_ok(results)
+        row = next(r for r in results if r.name == "SLACK_JOB_COMMAND")
+        assert row.status == "ok"
+        assert "$job" in row.detail
+
+    def test_blank_job_command_is_the_opt_out(self):
+        results = check_slack(
+            {
+                "SLACK_APP_TOKEN": "xapp-1",
+                "SLACK_TOKEN": "xoxb-1",
+                "SLACK_JOB_COMMAND": "",
+            }
+        )
         assert all_ok(results)
         assert not any(r.name == "SLACK_JOB_COMMAND" for r in results)
 
@@ -435,10 +448,10 @@ class TestCheckJobs:
         # an enqueue-only install is legitimate (cron, a git hook), so the
         # worker must still start — but a worker nothing can reach is a silent
         # no-op and the operator should be told which of the two they have.
-        results = check_jobs({"SLACK_TOKEN": "xoxb-123"})
+        results = check_jobs({"SLACK_TOKEN": "xoxb-123", "SLACK_JOB_COMMAND": ""})
         note = next(r for r in results if r.name == "SLACK_JOB_COMMAND")
         assert note.status == "warn"
-        assert "unset" in note.detail
+        assert "disabled" in note.detail
         assert note.fix_hint is not None
         # Warned, never blocked: doctor must not exit 1 and spawn must not fail.
         assert all_ok(results)
@@ -763,6 +776,7 @@ class TestJobsPreflightGaps:
         env = {
             "SLACK_APP_TOKEN": "xapp-1",
             "SLACK_TOKEN": "xoxb-1",
+            "SLACK_JOB_COMMAND": "",
             "JOBS_QUEUE_KIND": "nope",
         }
         assert all_ok(check_slack(env))
@@ -798,7 +812,11 @@ class TestJobsPreflightGaps:
         assert "4242" in row.detail
 
     def test_no_worker_row_at_all_when_jobs_are_off(self):
-        env = {"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxb-1"}
+        env = {
+            "SLACK_APP_TOKEN": "xapp-1",
+            "SLACK_TOKEN": "xoxb-1",
+            "SLACK_JOB_COMMAND": "",
+        }
         assert not any(r.name == "jobs worker" for r in check_slack(env))
 
 
@@ -810,3 +828,27 @@ class TestIsBlocking:
         assert not is_blocking(CheckResult(name="x", status="ok", detail=""))
         assert is_blocking(CheckResult(name="x", status="missing", detail=""))
         assert is_blocking(CheckResult(name="x", status="invalid", detail=""))
+
+
+def test_job_command_default_matches_the_slack_constant():
+    """checks.py copies the default as a literal so importing it never drags
+    slack_bolt into a preflight run. The duplication is only safe if drift
+    fails somewhere, so it fails here."""
+    from claude_on_the_fly import slack
+    from claude_on_the_fly.checks import DEFAULT_JOB_COMMAND
+
+    assert DEFAULT_JOB_COMMAND == slack.DEFAULT_JOB_COMMAND
+
+
+def test_effective_job_command_matches_the_frontend_resolution(monkeypatch):
+    """The two resolvers must agree on absent-vs-blank, or preflight reasons
+    about a trigger the daemon will not actually use."""
+    from claude_on_the_fly import slack
+    from claude_on_the_fly.checks import effective_job_command
+
+    for raw in (None, "", "!bg"):
+        env = {} if raw is None else {"SLACK_JOB_COMMAND": raw}
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+        if raw is not None:
+            monkeypatch.setenv("SLACK_JOB_COMMAND", raw)
+        assert effective_job_command(env) == slack._resolve_job_command()

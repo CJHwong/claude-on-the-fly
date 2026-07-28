@@ -218,12 +218,12 @@ def check_slack(env: Mapping[str, str]) -> list[CheckResult]:
     if command:
         results.append(_check_slack_command(command))
 
-    job_command = env.get("SLACK_JOB_COMMAND", "")
+    job_command = effective_job_command(env)
     if job_command:
         results.append(_check_slack_job_command(job_command))
-        # Only when the trigger is on: that is exactly when this frontend
-        # builds a queue (and can therefore die on a bad kind), and when it
-        # starts making promises a missing worker cannot keep.
+        # Only when the trigger is live: that is exactly when this frontend
+        # builds a queue (and could die on a bad kind), and when it starts
+        # making promises a missing worker cannot keep.
         results.append(_check_queue_kind(env))
         results.append(_check_jobs_worker_reachable(env))
 
@@ -431,6 +431,23 @@ def check_gmail(env: Mapping[str, str]) -> list[CheckResult]:
     return results
 
 
+# Mirrors `slack.DEFAULT_JOB_COMMAND`. Duplicated as a literal for the same
+# reason the turn-control prefixes are: importing `claude_on_the_fly.slack`
+# would pull slack_bolt into every checks import. Drift fails in
+# test_checks.py::test_job_command_default_matches_the_slack_constant.
+DEFAULT_JOB_COMMAND = "$job"
+
+
+def effective_job_command(env: Mapping[str, str]) -> str | None:
+    """The trigger this env actually produces, or None when jobs are off.
+
+    Absent means the default; present-but-blank is the opt-out. Same rule as
+    `slack._resolve_job_command`, applied to an arbitrary mapping so preflight
+    can reason about a daemon's environment before it starts.
+    """
+    return env.get("SLACK_JOB_COMMAND", DEFAULT_JOB_COMMAND) or None
+
+
 def check_jobs(env: Mapping[str, str]) -> list[CheckResult]:
     """The worker's notifier needs a resolvable Slack bearer token, the queue
     kind has to be one that exists, and something has to be able to enqueue."""
@@ -522,18 +539,26 @@ def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
     groups on one screen (`tui/screens/doctor.py`) and a bare "producer on"
     would contradict `check_slack`'s `invalid` row of the same name.
 
-    Unset is `warn`, not a failure: an `enqueue`-only install is legitimate —
-    cron, a git hook, another tool shelling out — so the worker must still
-    start. But a worker no chat frontend can reach is a silent no-op, and the
-    operator deserves to be told which of the two they have.
+    Explicitly disabled is `warn`, not a failure: an `enqueue`-only install is
+    legitimate — cron, a git hook, another tool shelling out — so the worker
+    must still start. But a worker no chat frontend can reach is a silent
+    no-op, and the operator deserves to be told which of the two they have.
     """
-    command = env.get("SLACK_JOB_COMMAND", "")
-    if not command:
+    raw = env.get("SLACK_JOB_COMMAND")
+    command = effective_job_command(env)
+    if command is None:
         return CheckResult(
             name="SLACK_JOB_COMMAND",
             status="warn",
-            detail="unset — only `claude-jobs enqueue` can reach this worker",
-            fix_hint="Set SLACK_JOB_COMMAND (e.g. `$job`) to enqueue from Slack",
+            detail="disabled — only `claude-jobs enqueue` can reach this worker",
+            fix_hint="Unset SLACK_JOB_COMMAND to restore the default trigger "
+            f"`{DEFAULT_JOB_COMMAND}`",
+        )
+    if raw is None:
+        return CheckResult(
+            name="SLACK_JOB_COMMAND",
+            status="ok",
+            detail=f"Slack producer on ({command}, default)",
         )
     problem = _job_command_error(command)
     if problem is None:

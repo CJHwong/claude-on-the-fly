@@ -2,7 +2,7 @@
 
 A single daemon that drains a durable queue: claim a job, run it through an agent, reply into wherever it came from. Where symphony polls a tracker for work, jobs waits for work someone handed it — a Slack user asking for something long-running, or `claude-jobs enqueue`.
 
-The Slack half of that is opt-in: the producer exists only where `SLACK_JOB_COMMAND` names a trigger, and the Slack frontend builds no queue at all without it. Unset, the queue is reachable from `claude-jobs enqueue` alone — which is why `claude-jobs doctor` reports the producer's state as an informational line rather than passing silently.
+The Slack half is on by default under `$job`. `SLACK_JOB_COMMAND` renames it; setting it **empty** turns it off, and only then does the frontend build no queue — absent versus present-but-blank is the whole opt-out, resolved identically by `slack._resolve_job_command` and `checks.effective_job_command` (a drift test pins them together). With it off the queue is reachable from `claude-jobs enqueue` alone, which is why `claude-jobs doctor` says so rather than passing silently.
 
 Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Ports and data types: `jobs/core.py`.
 
@@ -72,9 +72,9 @@ Three ways a jobs setup fails quietly, each caught before a daemon starts rather
 
 | Condition | Status | Why |
 |---|---|---|
-| `SLACK_JOB_COMMAND` unset | `warn` on `jobs` | The worker runs, but only `claude-jobs enqueue` can reach it. Advisory, not blocking — an enqueue-only install (cron, a git hook) is legitimate. |
+| `SLACK_JOB_COMMAND` set empty | `warn` on `jobs` | The worker runs, but only `claude-jobs enqueue` can reach it. Advisory, not blocking — an enqueue-only install (cron, a git hook) is legitimate. |
 | `JOBS_QUEUE_KIND` not registered | `invalid` on `jobs` **and** `slack` | `make_queue()` raises on an unknown kind and the Slack frontend calls it while building the producer, so a jobs-side typo kills *Slack*. Only added to `check_slack` when the trigger is set, since that is the only time a queue is constructed. |
-| Trigger set, no worker running | `warn` on `slack` | `$job` acks "I'll reply here when it's done" and nothing ever does. Advisory: the worker may start after the frontend. |
+| Trigger live, no worker running | `warn` on `slack` | Advisory: the worker may start after the frontend. The ack itself also tells the truth at runtime — with no worker it says the job stays queued rather than promising a reply. |
 
 `warn` is non-blocking by construction — `checks.is_blocking` is what every caller counting problems should use, so a `doctor` run reports the advice and still exits 0.
 

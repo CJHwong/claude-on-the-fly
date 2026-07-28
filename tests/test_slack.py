@@ -13,6 +13,7 @@ from slack_sdk.errors import SlackApiError
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
+    DEFAULT_JOB_COMMAND,
     JOB_LIST_LIMIT,
     SLACK_REPLY_SOFT_LIMIT,
     SlackFrontend,
@@ -2064,14 +2065,13 @@ class TestJobCommand:
         fe._on_message.assert_awaited_once()
 
     async def test_disabled_trigger_degrades_to_an_ordinary_message(self, monkeypatch):
-        # The whole point of the opt-in: with no trigger configured, text that
-        # would have queued a job is answered as an ordinary message rather than
-        # silently dropped. Both assertions flip when the trigger is set (the job
+        # Turning the trigger off (SLACK_JOB_COMMAND=) puts the text back on
+        # the ordinary path rather than dropping it silently. Both assertions flip when the trigger is set (the job
         # branch enqueues and returns before _on_message), so this discriminates.
         # Note it does NOT assert the ts is absent from _processed_ts: the normal
         # path marks it processed too, so that would hold either way.
         queue = _FakeJobQueue()
-        fe, _ = self._frontend(queue, job_command=None)
+        fe, _ = self._frontend(queue, job_command="")
         await fe._ingest_event(
             {
                 "user": "U_ALLOWED",
@@ -2113,13 +2113,12 @@ class TestJobCommand:
         assert [job.prompt for job in queue.jobs] == ["do it"]
         fe._on_message.assert_awaited_once()
 
-    async def test_no_queue_is_built_when_the_trigger_is_unset(self, monkeypatch):
-        # make_queue() raises on an unknown JOBS_QUEUE_KIND, so constructing it
-        # unconditionally lets an unrelated jobs-env typo kill the Slack daemon
-        # for someone who never enabled jobs.
+    async def test_no_queue_is_built_when_the_trigger_is_disabled(self, monkeypatch):
+        # Nothing can enqueue with the feature off, so touching the queue at all
+        # would be work — and a filesystem dependency — for no reason.
         made = MagicMock()
         monkeypatch.setattr("claude_on_the_fly.slack.make_queue", made)
-        fe, _ = self._frontend(job_command=None)
+        fe, _ = self._frontend(job_command="")
         assert fe._job_queue is None
         made.assert_not_called()
 
@@ -2144,8 +2143,14 @@ def test_job_command_reads_its_documented_env_var(monkeypatch):
             fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
         assert fe._job_command == "!bg"
 
-        # And unset really means off, rather than falling back to a default.
+        # Absent means the default — the feature is on without configuration.
         monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+        with patch("claude_on_the_fly.slack.make_queue"):
+            fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert fe._job_command == DEFAULT_JOB_COMMAND
+
+        # Present but blank is the opt-out, and the only one.
+        monkeypatch.setenv("SLACK_JOB_COMMAND", "")
         fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
         assert fe._job_command is None
         assert fe._job_queue is None

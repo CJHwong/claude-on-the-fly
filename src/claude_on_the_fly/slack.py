@@ -24,6 +24,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
+from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
@@ -44,18 +45,22 @@ CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
-# Background-job trigger, opt-in: unset means the feature does not exist for
-# this install, and a message that would have queued a job is answered as an
-# ordinary one instead. When set, the message tail is queued as a job that
-# survives this chat turn — the worker (claude-jobs) runs it in a fresh session
-# and replies into this thread when done. A plain-text prefix, same rationale as
-# $stop: it works inside threads, where Slack blocks custom slash commands.
-# `checks._job_command_error` rejects the values that don't work as a trigger.
-# The trigger itself is resolved per-instance in `SlackFrontend.__init__` from
-# `SLACK_JOB_COMMAND` (or an explicit argument), deliberately not bound here:
+# Background-job trigger. The message tail is queued as a job that survives this
+# chat turn — the worker (claude-jobs) runs it in a fresh session and replies
+# into this thread when done. A plain-text prefix, same rationale as $stop: it
+# works inside threads, where Slack blocks custom slash commands, and like $stop
+# it is on by default rather than something each install has to discover.
+#
+# `SLACK_JOB_COMMAND` renames it; setting it *empty* turns the feature off
+# entirely, which is the difference between "absent" and "present but blank" in
+# `_resolve_job_command`. `checks._job_command_error` rejects values that cannot
+# work as a trigger.
+#
+# Resolved per-instance in `SlackFrontend.__init__`, deliberately not bound here:
 # an import-time constant cannot see a value that only `load_dotenv()` puts in
 # the environment, and it made the constructor's job_queue seam unusable on its
 # own.
+DEFAULT_JOB_COMMAND = "$job"
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
 # it must match the command in the Slack app manifest — Slack does not namespace
@@ -285,6 +290,36 @@ def _fmt_job_age(enqueued_at: datetime | None, now: datetime) -> str:
         if seconds >= size:
             return f"{seconds // size}{suffix}"
     return f"{seconds}s"
+
+
+def _resolve_job_command() -> str | None:
+    """The background-job trigger, or None when the feature is switched off.
+
+    Absent means the default; present-but-empty means off. The distinction is
+    the opt-out — `SLACK_JOB_COMMAND=` in a `.env` is how an install that does
+    not want a background-job trigger says so, and `get(name, default) or None`
+    is what keeps those two cases apart.
+    """
+    return os.environ.get("SLACK_JOB_COMMAND", DEFAULT_JOB_COMMAND) or None
+
+
+def _build_job_queue() -> JobQueue | None:
+    """The producer's queue, or None when one cannot be built.
+
+    `make_queue()` raises on an unrecognised `JOBS_QUEUE_KIND`. Now that the
+    trigger is on by default, letting that propagate would mean a typo in the
+    *jobs* configuration takes down the *Slack* daemon of an install that never
+    thought about background jobs. Preflight catches the same mistake earlier
+    and more legibly; this is the backstop for the paths that skip it, and it
+    degrades to "no background jobs" rather than "no Slack".
+    """
+    try:
+        return make_queue()
+    except Exception as exc:
+        logger.error(
+            "slack: background jobs disabled — could not build the queue: %s", exc
+        )
+        return None
 
 
 def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> str:
@@ -605,14 +640,17 @@ class SlackFrontend(Frontend):
         # construction also means a SLACK_JOB_COMMAND that only exists in .env
         # works — `main` calls load_dotenv() before this runs, whereas the
         # import-time binding needed the value already in the environment.
-        self._job_command = job_command or os.environ.get("SLACK_JOB_COMMAND") or None
-        # Defaults to the same file queue the worker reads (make_queue), so the
-        # trigger and claude-jobs agree on one inbox. Built only when the
-        # trigger is set: make_queue() raises ValueError on an unknown
-        # JOBS_QUEUE_KIND, so without this gate a typo in the jobs env kills the
-        # *Slack* daemon for someone who never enabled jobs at all.
+        # `None` means "not specified, read the environment"; `""` means off.
+        # Without that split a caller could rename the trigger but never
+        # disable it, since every falsy override would fall through to the
+        # default — the same absent-vs-blank distinction the env var makes.
+        self._job_command = (
+            job_command if job_command is not None else _resolve_job_command()
+        ) or None
+        # The same file queue the worker reads (make_queue), so the trigger and
+        # claude-jobs agree on one inbox.
         self._job_queue: JobQueue | None = job_queue or (
-            make_queue() if self._job_command else None
+            _build_job_queue() if self._job_command else None
         )
         self._allowed_user_ids = allowed_user_ids or set()
         self._allowed_user_ids.add(user_id)
@@ -1177,11 +1215,18 @@ class SlackFrontend(Frontend):
                 )
                 return
             logger.info("slack %s/%s: queued job %s", channel, thread_ts, job.id)
-            await self._post_notice(
-                channel,
-                thread_ts,
-                f"Queued job `{job.id}` — I'll reply here when it's done.",
-            )
+            # Promise a reply only if something can produce one. With the
+            # trigger on by default, an install that never started the worker
+            # would otherwise get "I'll reply here when it's done" on a job that
+            # nothing will ever run — a failure that looks exactly like success.
+            if live_pid("jobs") is None:
+                notice = (
+                    f"Queued job `{job.id}`, but no worker is running — it will "
+                    "stay queued until one starts (`claude-tui start jobs`)."
+                )
+            else:
+                notice = f"Queued job `{job.id}` — I'll reply here when it's done."
+            await self._post_notice(channel, thread_ts, notice)
             return
 
         # Reply soft-limit gate. CONTINUE_COMMAND resets the counter and any
