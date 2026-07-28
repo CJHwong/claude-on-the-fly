@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import logging.handlers
 import os
 import signal
 import sys
@@ -34,7 +33,7 @@ from claude_on_the_fly.jobs.core import AgentRunner, Job, JobQueue, Notifier
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.jobs.slack_notifier import SlackThreadNotifier
 from claude_on_the_fly.jobs.worker import run_loop
-from claude_on_the_fly.preflight import check_backend
+from claude_on_the_fly.preflight import check_backend, setup_daemon_logging
 
 logger = logging.getLogger(__name__)
 
@@ -43,29 +42,8 @@ DEFAULT_POLL_INTERVAL_S = 2.0
 
 
 def _setup_logging() -> None:
-    """Adds a daily-rotating file handler (7-day retention) beside the console.
-    `basicConfig` sets the ROOT logger from LOG_LEVEL, so both sinks share that
-    level and the file handler's own DEBUG floor only bites with
-    LOG_LEVEL=DEBUG. Deliberately NOT `preflight._setup_logging`, which is
-    console-only: without a file handler `logs/jobs.log` is never written and
-    the dashboard's jobs tab has nothing to tail."""
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format=log_fmt,
-    )
-    log_dir = agent.DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        log_dir / "jobs.log",
-        when="midnight",
-        backupCount=7,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(log_fmt))
-    logging.getLogger().addHandler(file_handler)
+    """Console plus `logs/jobs.log`, which the dashboard's jobs tab tails."""
+    setup_daemon_logging("jobs")
 
 
 def _env_float(name: str, default: float) -> float:

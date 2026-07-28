@@ -54,34 +54,38 @@ async def run_loop(
     if recovered:
         logger.info("jobs: recovered %d stale job(s) at startup", recovered)
 
-    while not stop_event.is_set():
-        job_task = asyncio.create_task(run_once(queue, runner, notifier))
-        stop_task = asyncio.create_task(stop_event.wait())
-        await asyncio.wait({job_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+    # One task for the whole loop: nothing ever clears `stop_event`, so its wait
+    # resolves at most once and a per-iteration task would be built and torn
+    # down every poll — roughly 43k allocations a day to watch a flag that can
+    # only be set once.
+    stop_task = asyncio.create_task(stop_event.wait())
+    try:
+        while not stop_event.is_set():
+            job_task = asyncio.create_task(run_once(queue, runner, notifier))
+            await asyncio.wait(
+                {job_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
 
-        if not job_task.done():
-            # Shutdown mid-job: cancel in-flight. The job stays in
-            # cur/ and re-runs at-least-once next start.
-            logger.info("jobs: stop requested — cancelling in-flight job")
-            job_task.cancel()
-            await asyncio.gather(job_task, return_exceptions=True)
-            stop_task.cancel()
-            await asyncio.gather(stop_task, return_exceptions=True)
-            break
+            if not job_task.done():
+                # Shutdown mid-job: cancel in-flight. The job stays in
+                # cur/ and re-runs at-least-once next start.
+                logger.info("jobs: stop requested — cancelling in-flight job")
+                job_task.cancel()
+                await asyncio.gather(job_task, return_exceptions=True)
+                break
 
+            try:
+                did_work = job_task.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("jobs: run_once failed (continuing)")
+                did_work = False
+
+            if not did_work:
+                # `wait` rather than `wait_for`: a timeout here must leave
+                # stop_task alone, and wait_for would cancel it.
+                await asyncio.wait({stop_task}, timeout=poll_interval_s)
+    finally:
         stop_task.cancel()
         await asyncio.gather(stop_task, return_exceptions=True)
-
-        try:
-            did_work = job_task.result()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("jobs: run_once failed (continuing)")
-            did_work = False
-
-        if not did_work:
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=poll_interval_s)
-            except asyncio.TimeoutError:
-                pass

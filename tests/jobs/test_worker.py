@@ -214,3 +214,38 @@ def test_worker_depends_only_on_ports() -> None:
     assert cof <= {"claude_on_the_fly.jobs.core"}, f"worker reaches past ports: {cof}"
     roots = {m.split(".")[0] for m in mods}
     assert roots <= {"__future__", "asyncio", "logging", "claude_on_the_fly"}
+
+
+async def test_stop_watcher_is_created_once_per_loop(monkeypatch) -> None:
+    """stop_event is never cleared, so its wait resolves at most once — a task
+    per poll iteration is pure churn at the default 2s cadence."""
+    queue = _FakeQueue()
+    stop = asyncio.Event()
+    waits = 0
+    real_wait = asyncio.Event.wait
+
+    async def _counting_wait(self):
+        nonlocal waits
+        if self is stop:
+            waits += 1
+        return await real_wait(self)
+
+    monkeypatch.setattr(asyncio.Event, "wait", _counting_wait)
+
+    async def _stop_after_a_few_polls() -> None:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        stop.set()
+
+    await asyncio.gather(
+        run_loop(
+            queue,
+            _CountingRunner(),
+            _RecordingNotifier(),
+            stop,
+            poll_interval_s=0.001,
+        ),
+        _stop_after_a_few_polls(),
+    )
+
+    assert waits == 1
