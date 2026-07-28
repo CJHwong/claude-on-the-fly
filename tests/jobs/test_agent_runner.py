@@ -4,6 +4,7 @@ CancelledError propagate."""
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -161,6 +162,77 @@ async def test_cancelled_error_propagates(tmp_path: Path) -> None:
     ):
         with pytest.raises(asyncio.CancelledError):
             await runner.run("p")
+
+
+async def test_cleanup_runs_when_the_task_is_cancelled_from_outside(
+    tmp_path: Path,
+) -> None:
+    """The shape the real shutdown takes: `run_loop` cancels the task rather than
+    letting the agent raise. Teardown now awaits, and an await inside a `finally`
+    is exactly what a careless cancel would skip — so assert it still runs, or
+    every stop leaks a workspace."""
+    runner = OrchestratorAgentRunner(data_dir=tmp_path)
+    captured: dict[str, Path] = {}
+    running = asyncio.Event()
+
+    async def _hang(**kwargs):
+        captured["ws"] = kwargs["workspace"]
+        running.set()
+        await asyncio.sleep(3600)  # cancelled out from under us
+
+    with (
+        patch("claude_on_the_fly.jobs.agent_runner.agent.run", side_effect=_hang),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        task = asyncio.create_task(runner.run("p"))
+        await running.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert not captured["ws"].exists()
+
+
+async def test_cleanup_does_not_block_the_event_loop(tmp_path: Path) -> None:
+    """Teardown is on the shutdown path, where the supervisor allows 5s before
+    SIGKILL. A synchronous rmtree of a tree an agent just built spends that
+    window on file deletion and gets the worker killed with its agent CLI still
+    running — orphaned, since `_exec` spawns it into its own session. Assert the
+    loop keeps turning by having a slow removal run concurrently with a tick."""
+    runner = OrchestratorAgentRunner(data_dir=tmp_path)
+    ticked = asyncio.Event()
+
+    def _slow_discard(workspace: Path) -> None:
+        time.sleep(0.2)  # a big tree, in a thread
+
+    async def _tick() -> None:
+        await asyncio.sleep(0.01)
+        ticked.set()
+
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            return_value=Response(body="ok"),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner._discard_workspace",
+            side_effect=_slow_discard,
+        ),
+    ):
+        tick = asyncio.create_task(_tick())
+        await runner.run("p")
+        # A blocking cleanup would have starved this until after the sleep.
+        assert ticked.is_set()
+        await tick
 
 
 async def test_workspace_removed_on_cancel_path(tmp_path: Path) -> None:

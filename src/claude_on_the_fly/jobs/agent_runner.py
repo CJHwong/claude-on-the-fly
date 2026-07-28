@@ -10,6 +10,9 @@ process tree within the supervisor's grace.
 A handled agent failure becomes a `Result(ok=False, ...)`; `CancelledError`
 (a `BaseException`, not caught here) still propagates so cancel-in-flight works.
 
+Teardown runs in a worker thread so it cannot eat that grace — see
+`_discard_workspace`.
+
 NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
 so the child inherits this process's stdin. That is harmless for the supervised
 worker — `supervisor.spawn` starts daemons with `stdin=subprocess.DEVNULL` — but
@@ -20,6 +23,7 @@ stdin, and it may consume input meant for the shell. Run the worker detached
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from dataclasses import dataclass
@@ -31,6 +35,11 @@ from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
 from claude_on_the_fly.jobs.core import Result
 
 logger = logging.getLogger(__name__)
+
+
+def _discard_workspace(workspace: Path) -> None:
+    """Remove a finished job's workspace. Blocking; call it off the event loop."""
+    shutil.rmtree(workspace, ignore_errors=True)
 
 
 @dataclass
@@ -78,6 +87,13 @@ class OrchestratorAgentRunner:
             # Each job gets a throwaway workspace; a long-lived worker would grow
             # data_dir/workspaces/jobs without bound otherwise. `finally` cleans up
             # on success, on handled failure, and while CancelledError unwinds —
-            # rmtree neither catches nor masks that propagation (ignore_errors so a
-            # cleanup hiccup can't shadow the real outcome).
-            shutil.rmtree(workspace, ignore_errors=True)
+            # the await neither catches nor masks that propagation.
+            #
+            # Off the event loop, because this is on the shutdown path: an agent
+            # that cloned a repo leaves a tree whose rmtree takes seconds, and
+            # blocking the loop here spends the supervisor's 5s grace on file
+            # deletion — the same window the in-flight cancel needs to reap the
+            # agent's process tree. Blowing it means a SIGKILLed worker and an
+            # orphaned agent CLI. It also keeps the heartbeat coroutine fed, so
+            # the dashboard does not flip to `broken` mid-cleanup.
+            await asyncio.to_thread(_discard_workspace, workspace)
