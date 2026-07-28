@@ -1882,6 +1882,12 @@ class _FakeJobQueue:
     def complete(self, job, result) -> None:
         pass
 
+    def mark_delivered(self, job_id) -> None:
+        pass
+
+    def undelivered(self):
+        return []
+
     def list_unfinished(self, limit):
         self.list_limits.append(limit)
         return self.unfinished[:limit]

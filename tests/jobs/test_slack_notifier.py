@@ -1,9 +1,11 @@
 """SlackThreadNotifier: posts into origin's thread, reads only channel/thread_ts,
-splits long bodies, marks failures, and swallows post errors."""
+splits long bodies, marks failures, and reports post errors to its caller."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
+
+import pytest
 
 from claude_on_the_fly.jobs.core import Result
 from claude_on_the_fly.jobs.slack_notifier import (
@@ -83,12 +85,16 @@ async def test_long_body_splits_into_multiple_blocks() -> None:
         assert len(block["text"]["text"]) <= SLACK_BLOCK_LIMIT
 
 
-async def test_post_failure_is_swallowed() -> None:
+async def test_post_failure_propagates() -> None:
+    """Returning normally is what marks a result delivered, so a swallowed
+    failure would turn a retryable miss into a reply nobody ever receives.
+    The worker decides whether to retry; the adapter only reports."""
     client = AsyncMock()
     client.chat_postMessage = AsyncMock(side_effect=RuntimeError("network down"))
     notifier = SlackThreadNotifier(client)
-    # Must not raise — delivery is best-effort; result stays durable in done/.
-    await notifier.notify({"channel": "C1"}, Result(ok=True, text="ok"))
+
+    with pytest.raises(RuntimeError, match="network down"):
+        await notifier.notify({"channel": "C1"}, Result(ok=True, text="ok"))
 
 
 def test_single_over_limit_line_reassembles_with_zero_loss() -> None:

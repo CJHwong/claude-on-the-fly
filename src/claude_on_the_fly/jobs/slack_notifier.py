@@ -8,8 +8,9 @@ to Slack mrkdwn with the shared `to_mrkdwn`.
 
 Block splitting comes from `slack_mrkdwn.split_blocks`, shared with the chat
 frontend so the same reply cannot render differently depending on which one
-produced it. Delivery is best-effort: a post failure is logged, not raised —
-the result is already durable in the queue's `done/`.
+produced it. A post failure raises: returning normally is what marks a result
+delivered, so swallowing one would turn a retryable miss into a reply nobody
+ever receives. The worker decides what to do about it.
 """
 
 from __future__ import annotations
@@ -76,18 +77,20 @@ class SlackThreadNotifier:
         thread_ts = origin.get("thread_ts")
         body = result.text if result.ok else f":warning: Job failed\n{result.text}"
         blocks = _blocks(to_mrkdwn(body))
-        try:
-            # Post in batches of at most SLACK_MAX_BLOCKS so a large result is
-            # delivered across several messages instead of tripping Slack's
-            # per-message block cap (which `chat_postMessage` would reject with
-            # `invalid_blocks` — swallowed below and lost). No content is dropped.
-            fallback = _fallback_text(body)
-            for start in range(0, len(blocks), SLACK_MAX_BLOCKS):
-                await self._client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=fallback if start == 0 else "(continued)",
-                    blocks=blocks[start : start + SLACK_MAX_BLOCKS],
-                )
-        except Exception as exc:  # best-effort; result is durable in done/
-            logger.exception("jobs: notify failed to post to %s: %s", channel, exc)
+        # Post in batches of at most SLACK_MAX_BLOCKS so a large result is
+        # delivered across several messages instead of tripping Slack's
+        # per-message block cap, which `chat_postMessage` rejects outright with
+        # `invalid_blocks`. No content is dropped.
+        #
+        # A failure propagates. Partial delivery is possible — an early batch
+        # can land before a later one fails — and re-posting the whole result
+        # then duplicates those blocks. That is the deliberate trade: a repeated
+        # message is recoverable by a reader, a missing one is not.
+        fallback = _fallback_text(body)
+        for start in range(0, len(blocks), SLACK_MAX_BLOCKS):
+            await self._client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=fallback if start == 0 else "(continued)",
+                blocks=blocks[start : start + SLACK_MAX_BLOCKS],
+            )

@@ -8,9 +8,9 @@ import asyncio
 from pathlib import Path
 
 import claude_on_the_fly.jobs.worker as worker
-from claude_on_the_fly.jobs.core import Job, QueueRow, Result
+from claude_on_the_fly.jobs.core import Delivery, Job, QueueRow, Result
 from claude_on_the_fly.jobs.file_queue import FileInboxQueue
-from claude_on_the_fly.jobs.worker import run_loop, run_once
+from claude_on_the_fly.jobs.worker import redeliver_pending, run_loop, run_once
 
 
 def _job(job_id: str = "100-a", prompt: str = "p") -> Job:
@@ -24,6 +24,8 @@ class _FakeQueue:
     def __init__(self, jobs: list[Job] | None = None) -> None:
         self._jobs = list(jobs or [])
         self.completed: list[tuple[Job, Result]] = []
+        self.delivered: list[str] = []
+        self.pending: list[Delivery] = []
 
     def enqueue(self, job: Job) -> None:
         self._jobs.append(job)
@@ -33,6 +35,12 @@ class _FakeQueue:
 
     def complete(self, job: Job, result: Result) -> None:
         self.completed.append((job, result))
+
+    def mark_delivered(self, job_id: str) -> None:
+        self.delivered.append(job_id)
+
+    def undelivered(self) -> list[Delivery]:
+        return list(self.pending)
 
     def list_unfinished(self, limit: int) -> list[QueueRow]:
         return []
@@ -252,3 +260,119 @@ async def test_stop_watcher_is_created_once_per_loop(monkeypatch) -> None:
     )
 
     assert waits == 1
+
+
+# --- delivery ---------------------------------------------------------------
+
+
+class _FailingNotifier:
+    def __init__(self, fail_times: int = 1) -> None:
+        self.remaining = fail_times
+        self.calls: list[tuple[dict, Result]] = []
+
+    async def notify(self, origin: dict, result: Result) -> None:
+        self.calls.append((origin, result))
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise RuntimeError("channel unreachable")
+
+
+async def test_successful_delivery_is_marked() -> None:
+    job = _job()
+    queue = _FakeQueue([job])
+
+    await run_once(queue, _CountingRunner(), _RecordingNotifier())
+
+    assert queue.delivered == [job.id]
+
+
+async def test_failed_delivery_is_not_marked_and_does_not_fail_the_job() -> None:
+    """The work is done and durable; only the reply is outstanding. Failing the
+    job here would re-run the agent and repeat every side effect it had."""
+    job = _job()
+    queue = _FakeQueue([job])
+
+    handled = await run_once(queue, _CountingRunner(), _FailingNotifier())
+
+    assert handled is True
+    assert queue.completed  # the result is archived
+    assert queue.delivered == []  # but not marked delivered
+
+
+async def test_cancel_during_delivery_leaves_the_result_unmarked() -> None:
+    """SIGTERM landing on the notify await used to lose the reply for good: the
+    job was already in done/, and recover_stale only ever looks at cur/."""
+
+    class _HangingNotifier:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def notify(self, origin: dict, result: Result) -> None:
+            self.started.set()
+            await asyncio.sleep(3600)
+
+    job = _job()
+    queue = _FakeQueue([job])
+    notifier = _HangingNotifier()
+
+    task = asyncio.create_task(run_once(queue, _CountingRunner(), notifier))
+    await notifier.started.wait()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert queue.completed  # work finished
+    assert queue.delivered == []  # reply still owed
+
+
+async def test_redelivery_reposts_without_rerunning_the_job() -> None:
+    queue = _FakeQueue()
+    queue.pending = [
+        Delivery(job_id="100-a", origin={"channel": "C1"}, result=Result(True, "done")),
+        Delivery(job_id="200-b", origin={"channel": "C2"}, result=Result(True, "also")),
+    ]
+    runner = _CountingRunner()
+    notifier = _RecordingNotifier()
+
+    count = await redeliver_pending(queue, notifier)
+
+    assert count == 2
+    assert queue.delivered == ["100-a", "200-b"]
+    assert runner.prompts == []  # the agent never ran again
+
+
+async def test_redelivery_keeps_a_still_failing_result_for_next_time() -> None:
+    queue = _FakeQueue()
+    queue.pending = [
+        Delivery(job_id="100-a", origin={"channel": "C1"}, result=Result(True, "done"))
+    ]
+
+    count = await redeliver_pending(queue, _FailingNotifier())
+
+    assert count == 0
+    assert queue.delivered == []
+
+
+async def test_run_loop_redelivers_before_claiming_work() -> None:
+    """A reply somebody is already waiting for goes out before new work starts."""
+    queue = _FakeQueue()
+    queue.pending = [
+        Delivery(job_id="100-a", origin={"channel": "C1"}, result=Result(True, "done"))
+    ]
+    stop = asyncio.Event()
+    notifier = _RecordingNotifier()
+
+    async def _stop_soon() -> None:
+        while not notifier.calls:
+            await asyncio.sleep(0.01)
+        stop.set()
+
+    await asyncio.gather(
+        run_loop(queue, _CountingRunner(), notifier, stop, poll_interval_s=0.01),
+        _stop_soon(),
+    )
+
+    assert [origin for origin, _ in notifier.calls] == [{"channel": "C1"}]
+    assert queue.delivered == ["100-a"]

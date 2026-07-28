@@ -12,6 +12,7 @@ from pathlib import Path
 
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.file_queue import (
+    DELIVERY_RETRY_WINDOW_S,
     DONE_RETENTION_S,
     PROMPT_PREVIEW_LIMIT,
     FileInboxQueue,
@@ -514,3 +515,87 @@ def test_observer_memos_stay_bounded_across_roots(tmp_path: Path) -> None:
 
     assert len(fq._archive_count_cache) <= fq._MAX_COUNT_MEMOS
     assert len(fq._rows_cache) <= fq._MAX_ROW_MEMOS
+
+
+# --- delivery tracking -------------------------------------------------------
+
+
+def _complete_one(queue: FileInboxQueue, job_id: str, text: str = "the answer"):
+    queue.enqueue(_job(job_id))
+    claimed = queue.claim()
+    assert claimed is not None
+    queue.complete(claimed, Result(ok=True, text=text))
+    return claimed
+
+
+def test_a_completed_result_starts_undelivered(tmp_path: Path) -> None:
+    queue = FileInboxQueue(tmp_path / "jobs")
+    _complete_one(queue, "100-a")
+
+    pending = queue.undelivered()
+
+    assert [d.job_id for d in pending] == ["100-a"]
+    assert pending[0].result.text == "the answer"
+    assert pending[0].origin == {"channel": "C1"}
+
+
+def test_marking_delivered_removes_it_from_the_pending_list(tmp_path: Path) -> None:
+    queue = FileInboxQueue(tmp_path / "jobs")
+    _complete_one(queue, "100-a")
+
+    queue.mark_delivered("100-a")
+
+    assert queue.undelivered() == []
+
+
+def test_the_marker_does_not_disturb_the_result_or_the_depth(tmp_path: Path) -> None:
+    """The result is written once and never touched again, and `done` counts
+    *.result.json — a marker must not corrupt one or inflate the other."""
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    _complete_one(queue, "100-a")
+    before = (root / "done" / "100-a.result.json").read_text()
+
+    queue.mark_delivered("100-a")
+
+    assert (root / "done" / "100-a.result.json").read_text() == before
+    assert read_queue_depth(root).done == 1
+
+
+def test_undelivered_skips_results_past_the_retry_window(tmp_path: Path) -> None:
+    """A permanently undeliverable result — archived channel, revoked token —
+    must not be retried on every start until the archive prunes it."""
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    _complete_one(queue, "100-a")
+
+    stale = os.stat(root / "done" / "100-a.result.json").st_mtime
+    stale -= DELIVERY_RETRY_WINDOW_S + 60
+    os.utime(root / "done" / "100-a.result.json", (stale, stale))
+
+    assert queue.undelivered() == []
+
+
+def test_undelivered_skips_a_result_whose_origin_is_gone(tmp_path: Path) -> None:
+    """There is nowhere to deliver a result whose job record cannot be read."""
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    _complete_one(queue, "100-a")
+    (root / "done" / "100-a.json").unlink()
+
+    assert queue.undelivered() == []
+
+
+def test_delivery_markers_are_pruned_with_the_archive(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    queue = FileInboxQueue(root)
+    _complete_one(queue, "100-a")
+    queue.mark_delivered("100-a")
+
+    stale = os.stat(root / "done" / "100-a.json").st_mtime - DONE_RETENTION_S - 60
+    for path in (root / "done").glob("100-a*"):
+        os.utime(path, (stale, stale))
+
+    _complete_one(queue, "200-b")  # completion is what prunes
+
+    assert sorted(p.name for p in (root / "done").glob("100-a*")) == []

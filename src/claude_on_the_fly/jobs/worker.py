@@ -17,9 +17,56 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from claude_on_the_fly.jobs.core import AgentRunner, JobQueue, Notifier
+from claude_on_the_fly.jobs.core import AgentRunner, JobQueue, Notifier, Result
 
 logger = logging.getLogger(__name__)
+
+
+async def _deliver(
+    queue: JobQueue,
+    notifier: Notifier,
+    job_id: str,
+    origin: dict,
+    result: Result,
+) -> bool:
+    """Post a result and mark it delivered. False if it could not be posted.
+
+    Marking only after the notifier returns is what makes an interrupted
+    delivery recoverable: the result is already durable, so an undelivered one
+    can be re-posted at the next start without re-running the job. A cancel
+    lands here as CancelledError, which `except Exception` deliberately does not
+    catch — it leaves the result unmarked and propagates, which is both what
+    shutdown needs and what redelivery needs.
+    """
+    try:
+        await notifier.notify(origin, result)
+    except Exception:
+        logger.exception(
+            "jobs: could not deliver %s; keeping it for redelivery at next start",
+            job_id,
+        )
+        return False
+    queue.mark_delivered(job_id)
+    return True
+
+
+async def redeliver_pending(queue: JobQueue, notifier: Notifier) -> int:
+    """Re-post results that were completed but never delivered. Returns the count.
+
+    The reply, not the work: a job whose agent run finished has already cost
+    what it costs, and re-running it would repeat every side effect it had. So
+    the result is kept and only the delivery is retried.
+    """
+    pending = queue.undelivered()
+    if not pending:
+        return 0
+    delivered = 0
+    for delivery in pending:
+        if await _deliver(
+            queue, notifier, delivery.job_id, delivery.origin, delivery.result
+        ):
+            delivered += 1
+    return delivered
 
 
 async def run_once(queue: JobQueue, runner: AgentRunner, notifier: Notifier) -> bool:
@@ -31,7 +78,7 @@ async def run_once(queue: JobQueue, runner: AgentRunner, notifier: Notifier) -> 
     logger.info("jobs: running %s", job.id)
     result = await runner.run(job.prompt)
     queue.complete(job, result)
-    await notifier.notify(job.origin, result)
+    await _deliver(queue, notifier, job.id, job.origin, result)
     logger.info("jobs: completed %s (ok=%s)", job.id, result.ok)
     return True
 
@@ -53,6 +100,12 @@ async def run_loop(
     recovered = queue.recover_stale(None)
     if recovered:
         logger.info("jobs: recovered %d stale job(s) at startup", recovered)
+
+    # Before claiming anything: a reply somebody is still waiting for costs one
+    # message to send, and the alternative to sending it is never sending it.
+    redelivered = await redeliver_pending(queue, notifier)
+    if redelivered:
+        logger.info("jobs: redelivered %d undelivered result(s)", redelivered)
 
     # One task for the whole loop: nothing ever clears `stop_event`, so its wait
     # resolves at most once and a per-iteration task would be built and torn

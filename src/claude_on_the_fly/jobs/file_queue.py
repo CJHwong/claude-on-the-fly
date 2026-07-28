@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_on_the_fly.jobs.core import Job, QueueRow, Result
+from claude_on_the_fly.jobs.core import Delivery, Job, QueueRow, Result
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,10 @@ DEFAULT_ROW_LIMIT = 20
 # How long a completed job's record and reply stay in `done/`. Matches the
 # 7-day log retention in `jobs/cli._setup_logging`.
 DONE_RETENTION_S = 7 * 24 * 60 * 60
+# How long an undelivered result stays worth re-posting. A permanently
+# undeliverable one — archived channel, revoked token — must not be retried on
+# every start until the archive prunes it, and a day-old reply is stale anyway.
+DELIVERY_RETRY_WINDOW_S = 24 * 60 * 60
 # Longest prompt an observer keeps in memory. The dashboard renders a short
 # preview, so retaining a multi-megabyte prompt for the life of the process buys
 # nothing; the cap is far above any prompt a preview could show.
@@ -146,6 +150,68 @@ class FileInboxQueue:
                 path.unlink()
             except OSError as exc:  # racing reader, or a permissions problem
                 logger.debug("jobs: could not prune %s: %s", path.name, exc)
+
+    def mark_delivered(self, job_id: str) -> None:
+        """Drop a marker beside the archived result.
+
+        A sibling file rather than a flag inside the result: the result is
+        written once and never touched again, so a marker cannot corrupt it,
+        and its absence is what makes an interrupted delivery visible. The
+        `.json` suffix keeps it inside `_prune_archive`'s sweep, and it does not
+        match the `*.result.json` the depth count uses.
+        """
+        self._ensure_tree()
+        try:
+            (self._done / f"{job_id}.delivered.json").write_text(
+                json.dumps({"delivered_at": _utcnow_iso()}), encoding="utf-8"
+            )
+        except OSError as exc:
+            # Worst case the reply is delivered twice after a restart, which
+            # beats failing a job whose work is already done.
+            logger.warning("jobs: could not mark %s delivered: %s", job_id, exc)
+
+    def undelivered(self) -> list[Delivery]:
+        """Completed results with no delivery marker, oldest first.
+
+        Bounded by `DELIVERY_RETRY_WINDOW_S`: a permanently undeliverable
+        result — the channel was archived, the token revoked — would otherwise
+        be retried on every start until the archive prunes it, and a reply old
+        enough is not worth posting anyway.
+        """
+        self._ensure_tree()
+        cutoff = time.time() - DELIVERY_RETRY_WINDOW_S
+        pending: list[Delivery] = []
+        for result_path in sorted(self._done.glob("*.result.json")):
+            job_id = result_path.name[: -len(".result.json")]
+            if (self._done / f"{job_id}.delivered.json").exists():
+                continue
+            try:
+                if result_path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            delivery = self._load_delivery(job_id, result_path)
+            if delivery is not None:
+                pending.append(delivery)
+        return pending
+
+    def _load_delivery(self, job_id: str, result_path: Path) -> Delivery | None:
+        """Pair an archived result with the origin from its job file, or None if
+        either cannot be read — there is nowhere to deliver a result whose
+        origin is gone."""
+        try:
+            result_data = json.loads(result_path.read_text(encoding="utf-8"))
+            job_data = json.loads(
+                (self._done / f"{job_id}.json").read_text(encoding="utf-8")
+            )
+            origin = job_data["origin"]
+            result = Result(ok=bool(result_data["ok"]), text=str(result_data["text"]))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("jobs: cannot redeliver %s: %s", job_id, exc)
+            return None
+        if not isinstance(origin, dict):
+            return None
+        return Delivery(job_id=job_id, origin=origin, result=result)
 
     def list_unfinished(self, limit: int = DEFAULT_ROW_LIMIT) -> list[QueueRow]:
         """The unfinished jobs, newest-claimed first. Delegates to the

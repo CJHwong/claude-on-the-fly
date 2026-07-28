@@ -20,7 +20,7 @@ Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Po
 
 A `Job` carries an opaque `origin` dict. The core, the queue, and the worker pass it through untouched; only the notifier reads it. That is what keeps vendor vocabulary (`channel`, `thread_ts`) out of the core.
 
-`JobQueue.list_unfinished(limit)` is the read half of the port, returning `QueueRow`s. A producer answering "what is already queued?" goes through it rather than reaching into `file_queue`, so the answer survives a swap to a broker-backed adapter. Rows carry `origin` for the same reason a `Job` does: the core cannot filter by channel, but the Slack frontend can.
+`JobQueue` also carries `mark_delivered`/`undelivered` (see delivery tracking below) and `list_unfinished(limit)`, the read half of the port, returning `QueueRow`s. A producer answering "what is already queued?" goes through it rather than reaching into `file_queue`, so the answer survives a swap to a broker-backed adapter. Rows carry `origin` for the same reason a `Job` does: the core cannot filter by channel, but the Slack frontend can.
 
 ## Adding a new queue adapter
 
@@ -43,6 +43,10 @@ Two properties everything else rests on:
 - **The claim is a `rename(2)` from `new/` to `cur/`.** Atomic within one filesystem, so two workers racing resolve to exactly one winner with no lock files. `root` and its subdirs must therefore live on one filesystem.
 - **Ids are `f"{time.time_ns()}-{uuid4().hex[:8]}"`.** Time-sortable, so `sorted(new/)` is FIFO — and the enqueue time is readable straight out of the name, with no `stat()` and no reliance on an mtime a copy or a `touch` would move.
 
+**Delivery is tracked separately from completion.** `complete()` archives the result, and a `<id>.delivered.json` marker is written only once a notifier returns. A result with no marker is a reply somebody is still waiting for — the worker was cancelled between finishing and posting, or the post failed — and `redeliver_pending` re-posts it at the next start, before claiming new work. Only the *reply* is retried: the job's agent run already happened, and re-running it would repeat every side effect it had. Bounded by `DELIVERY_RETRY_WINDOW_S` (24h), so a permanently undeliverable result is not retried on every start until the archive prunes it.
+
+That is why `Notifier.notify` **raises** on a failed post rather than swallowing it: returning normally is what marks a result delivered, so an adapter that hides a failure turns a retryable miss into a reply nobody ever receives.
+
 **Execution is at-least-once.** A crashed worker leaves its job in `cur/`; `recover_stale` moves it back to `new/` on the next start, and shutdown deliberately *cancels* an in-flight job rather than finishing it (so the process tree is reaped inside the supervisor's grace). A job must therefore be safe to re-run.
 
 **`done/` is pruned to 7 days on completion** (`DONE_RETENTION_S`), matching the log retention so an archive and the logs covering it expire together. By age rather than count, so a burst of small jobs cannot evict this morning's.
@@ -61,6 +65,14 @@ Rules for any future observer:
 - **Never raise — and never make the caller raise.** A half-written or hand-mangled file degrades one field (`prompt=None`, `enqueued_at=None`), never the whole read. Ids are deduplicated across `cur/` and `new/` for the same reason: the two are listed one after the other, and `recover_stale` moving a file `cur → new` in between would otherwise hand back the same id twice, which is fatal to a caller keying rows by id.
 - **Stay bounded.** `read_queue_rows` is hard-capped (default 20), which bounds the file reads — the expensive part. Listing and sorting the two directories is still O(depth); the cap cannot come before the sort without losing oldest-first.
 - **The expensive reads are memoized on the directory's own mtime** — the `done/` and `failed/` counts, and the `cur/`+`new/` row list. A directory's mtime changes on any add, remove, or rename within it, so the memo is exact *for this queue's access pattern* — the queue only ever moves whole files. It would **not** be exact for in-place edits of existing files, which never happen here — and it is only ever exact to the resolution the filesystem stamps mtimes at: on a mount that stamps whole seconds rather than nanoseconds, a second change inside the same second reads stale until the next one. An idle tick therefore no longer walks `done/` or opens and parses every unfinished job file — which the 1Hz dashboard refresh would otherwise do whether or not the jobs tab is visible. The `new/` and `cur/` *counts* are not memoized: `read_queue_depth` lists those two directories on every tick.
+
+## Orphaned agent processes
+
+`agent._exec` spawns the CLI with `start_new_session=True` so one `killpg` reaps the CLI *and* every tool subprocess it forked. The cost: the child is unreachable from the parent's group, and `supervisor.stop()` signals the worker pid alone before SIGKILLing it after a five-second grace. A worker that misses that window would leave a full agent CLI running with no parent and no record of its pid.
+
+So `agent` announces every process group at spawn and after reap (`add_process_listener`), and the worker registers a `ProcessLedger` (`jobs/orphans.py`) that writes the group to `jobs/worker.pids` the moment it exists. What survives a SIGKILL is a file naming exactly what was orphaned; the next start sweeps it before claiming work, since `recover_stale` would otherwise re-run a job whose first copy is still executing.
+
+The sweep refuses to signal a group whose current command no longer matches what was recorded — killing a stranger's recycled pid is far worse than missing an orphan. The recorded pgid is the child's own pid, which `start_new_session` guarantees without racing the child's `setsid`.
 
 ## The TUI tab
 

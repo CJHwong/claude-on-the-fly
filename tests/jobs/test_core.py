@@ -10,6 +10,7 @@ import pytest
 import claude_on_the_fly.jobs.core as core
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
+    Delivery,
     Job,
     JobQueue,
     Notifier,
@@ -67,6 +68,10 @@ class _FakeQueue:
         return None
 
     def complete(self, job: Job, result: Result) -> None: ...
+    def mark_delivered(self, job_id: str) -> None: ...
+    def undelivered(self) -> list[Delivery]:
+        return []
+
     def list_unfinished(self, limit: int) -> list[QueueRow]:
         return []
 

@@ -63,6 +63,15 @@ class QueueRow:
     in_flight: bool
 
 
+@dataclass(frozen=True)
+class Delivery:
+    """A finished job's result that has not reached its origin yet."""
+
+    job_id: str
+    origin: dict[str, Any]
+    result: Result
+
+
 @runtime_checkable
 class JobQueue(Protocol):
     """Read-write persistence port.
@@ -83,6 +92,30 @@ class JobQueue(Protocol):
 
     def complete(self, job: Job, result: Result) -> None:
         """Mark a claimed job finished and persist its result."""
+        ...
+
+    def mark_delivered(self, job_id: str) -> None:
+        """Record that this job's result reached its origin.
+
+        Separate from `complete` because the two can fail independently: the
+        work is finished and durable the moment `complete` returns, but the
+        reply has not been delivered until a notifier says so.
+        """
+        ...
+
+    def undelivered(self) -> list[Delivery]:
+        """Completed results that were never marked delivered, oldest first.
+
+        These are replies somebody is still waiting for: the worker was
+        cancelled between finishing and posting, or the post itself failed.
+        Re-notifying costs one message; re-running the job would cost another
+        agent execution and repeat its side effects, which is why the result is
+        kept rather than the job being requeued.
+
+        An adapter may bound this by age — a reply old enough is not worth
+        delivering, and a permanently undeliverable one must not be retried
+        forever.
+        """
         ...
 
     def list_unfinished(self, limit: int) -> list[QueueRow]:
@@ -121,6 +154,12 @@ class AgentRunner(Protocol):
 @runtime_checkable
 class Notifier(Protocol):
     """Delivery port — posts a finished job's Result back to its `origin`.
-    Async; the default adapter posts into a chat thread."""
+    Async; the default adapter posts into a chat thread.
+
+    Raises on failure rather than swallowing: returning normally is what marks
+    a result delivered, so an adapter that hides a failed post turns a
+    recoverable miss into a reply nobody ever receives. Whether a failure is
+    worth retrying is the worker's decision, not the adapter's.
+    """
 
     async def notify(self, origin: dict[str, Any], result: Result) -> None: ...
