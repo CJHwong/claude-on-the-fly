@@ -67,7 +67,7 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
         lambda: "claude:native:sonnet",
     )
 
-    queue, runner, notifier = cli.build_components(token="xoxb-test")
+    queue, runner, notifier, recorder = cli.build_components(token="xoxb-test")
 
     job = Job(
         id="100-a",
@@ -76,7 +76,7 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
     )
     queue.enqueue(job)
 
-    did = await run_once(queue, runner, notifier)
+    did = await run_once(queue, runner, notifier, recorder)
     assert did is True
 
     # (a) The notifier posted the reply into the origin channel/thread.
@@ -91,6 +91,52 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
     assert not list((jobs_root / "cur").glob("*.json"))
     assert (jobs_root / "done" / "100-a.json").exists()
     assert (jobs_root / "done" / "100-a.result.json").exists()
+
+
+async def test_real_composition_records_a_keyed_outcome(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The wiring the daemon uses must include the recorder, not just accept one.
+
+    `run_once` taking a recorder is the easy half; the bug this pins is the
+    producer's backoff reading a `failures` count that nothing ever incremented
+    because the composition root never built one.
+    """
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+    monkeypatch.setattr(
+        "slack_sdk.web.async_client.AsyncWebClient",
+        lambda **kwargs: _FakeSlackClient(),
+    )
+
+    async def _fails(**kwargs: Any) -> Response:
+        raise RuntimeError("agent exploded")
+
+    monkeypatch.setattr(agent, "run", _fails)
+    monkeypatch.setattr(
+        "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+        lambda: "claude:native:sonnet",
+    )
+
+    queue, runner, notifier, recorder = cli.build_components(token="xoxb-test")
+    queue.enqueue(
+        Job(
+            id="100-a",
+            prompt="p",
+            origin={"kind": "cron", "entry": "jira"},
+            key="jira/ACE-1",
+            session_key="jira/ACE-1",
+            platform="cron",
+        )
+    )
+
+    assert await run_once(queue, runner, notifier, recorder) is True
+
+    from claude_on_the_fly.jobs.key_state import KeyStateStore
+
+    state = KeyStateStore(tmp_path / "jobs").load("jira/ACE-1")
+    assert state.failures == 1, "a failed keyed job must leave a failure on record"
+    assert state.last_failed_at > 0
 
 
 def test_cmd_run_calls_setup_logging_and_wires_token(monkeypatch, tmp_path) -> None:

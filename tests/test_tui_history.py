@@ -16,37 +16,37 @@ from claude_on_the_fly.tui.screens.history import (
 
 
 class TestEventSource:
-    def test_symphony_row_returns_symphony(self) -> None:
-        assert _event_source({"source": "symphony"}) == "symphony"
+    def test_cron_row_returns_cron(self) -> None:
+        assert _event_source({"source": "cron"}) == "cron"
 
     def test_chat_row_returns_frontend(self) -> None:
         assert _event_source({"source": "telegram"}) == "telegram"
         assert _event_source({"source": "slack"}) == "slack"
         assert _event_source({"source": "telegram"}) == "telegram"
 
-    def test_legacy_tracker_in_source_field_maps_to_symphony(self) -> None:
+    def test_legacy_tracker_in_source_field_maps_to_cron(self) -> None:
         # Rows written before the source/tracker split stored the tracker
-        # name in `source`. They should still surface under the symphony
+        # name in `source`. They should still surface under the cron
         # filter.
-        assert _event_source({"source": "jira"}) == "symphony"
-        assert _event_source({"source": "github"}) == "symphony"
+        assert _event_source({"source": "jira"}) == "cron"
+        assert _event_source({"source": "github"}) == "cron"
 
     def test_missing_source_returns_empty(self) -> None:
         assert _event_source({}) == ""
 
 
 class TestFormatDetail:
-    def test_symphony_dispatched_with_retry_attempt(self) -> None:
+    def test_cron_dispatched_with_retry_attempt(self) -> None:
         e = {
             "type": "dispatched",
-            "source": "symphony",
+            "source": "cron",
             "state": "In Progress",
             "failure_attempt": 2,
         }
         assert _format_detail(e) == "In Progress (retry 2)"
 
-    def test_symphony_dispatched_without_retry(self) -> None:
-        e = {"type": "dispatched", "source": "symphony", "state": "Backlog"}
+    def test_cron_dispatched_without_retry(self) -> None:
+        e = {"type": "dispatched", "source": "cron", "state": "Backlog"}
         assert _format_detail(e) == "Backlog"
 
     def test_chat_dispatched_returns_blank(self) -> None:
@@ -57,10 +57,10 @@ class TestFormatDetail:
         e = {"type": "worker_done", "source": "telegram", "cost": 0.0234}
         assert _format_detail(e) == "cost=$0.0234"
 
-    def test_symphony_worker_done_shows_reason_and_state(self) -> None:
+    def test_cron_worker_done_shows_reason_and_state(self) -> None:
         e = {
             "type": "worker_done",
-            "source": "symphony",
+            "source": "cron",
             "reason": "terminal",
             "state": "Done",
         }
@@ -73,7 +73,7 @@ class TestFormatDetail:
     def test_cancelled_with_state(self) -> None:
         e = {
             "type": "cancelled",
-            "source": "symphony",
+            "source": "cron",
             "reason": "stall",
             "state": "In Progress",
         }
@@ -82,15 +82,15 @@ class TestFormatDetail:
     def test_retry_scheduled(self) -> None:
         e = {
             "type": "retry_scheduled",
-            "source": "symphony",
+            "source": "cron",
             "kind": "failure",
             "attempt": 3,
         }
         assert _format_detail(e) == "failure attempt=3"
 
-    def test_legacy_symphony_dispatched_with_jira_in_source(self) -> None:
-        # Pre-split rows: source="jira", no tracker field, no source="symphony".
-        # The formatter must still render the symphony state line.
+    def test_legacy_cron_dispatched_with_jira_in_source(self) -> None:
+        # Pre-split rows: source="jira", no tracker field, no source="cron".
+        # The formatter must still render the cron state line.
         e = {"type": "dispatched", "source": "jira", "state": "In Progress"}
         assert _format_detail(e) == "In Progress"
 
@@ -157,7 +157,7 @@ class TestComputeRuntimes:
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         assert _compute_runtimes(events)[0] == 0.0
@@ -168,13 +168,13 @@ class TestComputeRuntimes:
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:01:30Z",
                 "type": "worker_done",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         runtimes = _compute_runtimes(events)
@@ -189,25 +189,25 @@ class TestComputeRuntimes:
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:00:30Z",
                 "type": "worker_failed",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:05:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:06:15Z",
                 "type": "worker_done",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         runtimes = _compute_runtimes(events)
@@ -221,7 +221,7 @@ class TestComputeRuntimes:
                 "ts": "2026-05-25T10:01:00Z",
                 "type": "worker_done",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         assert _compute_runtimes(events)[0] is None
@@ -233,19 +233,19 @@ class TestComputeRuntimes:
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:00:30Z",
                 "type": "worker_done",
                 "identifier": "Y",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:01:00Z",
                 "type": "worker_done",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         runtimes = _compute_runtimes(events)
@@ -255,7 +255,7 @@ class TestComputeRuntimes:
 
 class TestAggregateByJob:
     def test_collapses_repeated_dispatches_into_one_row(self) -> None:
-        """Symphony retries explode the event log; the aggregated view must
+        """Cron retries explode the event log; the aggregated view must
         show one row per (identifier, source) with a runs counter."""
         # Newest-first input, like the screen feeds the aggregator.
         events = [
@@ -263,28 +263,28 @@ class TestAggregateByJob:
                 "ts": "2026-05-25T10:05:00Z",
                 "type": "worker_failed",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:ollama:qwen",
             },
             {
                 "ts": "2026-05-25T10:04:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:ollama:qwen",
             },
             {
                 "ts": "2026-05-25T10:02:00Z",
                 "type": "worker_failed",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:ollama:qwen",
             },
             {
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:ollama:qwen",
             },
         ]
@@ -292,7 +292,7 @@ class TestAggregateByJob:
         assert len(rows) == 1
         row = rows[0]
         assert row["identifier"] == "X"
-        assert row["source"] == "symphony"
+        assert row["source"] == "cron"
         assert row["runs"] == 2
         # last_event is newest — worker_failed at 10:05.
         assert row["last_event"]["type"] == "worker_failed"
@@ -305,19 +305,19 @@ class TestAggregateByJob:
                 "ts": "2026-05-25T10:05:30Z",
                 "type": "worker_failed",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:04:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },  # latest retry
             {
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         rows = _aggregate_by_job(events)
@@ -330,7 +330,7 @@ class TestAggregateByJob:
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "tracker": "jira",
             },
             {
@@ -343,7 +343,7 @@ class TestAggregateByJob:
         rows = _aggregate_by_job(events)
         assert len(rows) == 2
         sources = {r["source"] for r in rows}
-        assert sources == {"symphony", "telegram"}
+        assert sources == {"cron", "telegram"}
 
     def test_no_dispatch_in_window_yields_none_runtime(self) -> None:
         events = [
@@ -351,7 +351,7 @@ class TestAggregateByJob:
                 "ts": "2026-05-25T10:05:00Z",
                 "type": "worker_failed",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         rows = _aggregate_by_job(events)
@@ -366,19 +366,19 @@ class TestAggregateByJob:
                 "ts": "2026-05-25T10:05:00Z",
                 "type": "worker_done",
                 "identifier": "B",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:04:00Z",
                 "type": "dispatched",
                 "identifier": "B",
-                "source": "symphony",
+                "source": "cron",
             },
             {
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "worker_done",
                 "identifier": "A",
-                "source": "symphony",
+                "source": "cron",
             },
         ]
         rows = _aggregate_by_job(events)
@@ -392,21 +392,21 @@ class TestAggregateByJob:
                 "ts": "2026-05-25T10:05:00Z",
                 "type": "worker_done",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:native:sonnet",
             },
             {
                 "ts": "2026-05-25T10:04:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:native:sonnet",
             },
             {
                 "ts": "2026-05-25T10:00:00Z",
                 "type": "dispatched",
                 "identifier": "X",
-                "source": "symphony",
+                "source": "cron",
                 "backend": "claude:ollama:qwen",
             },
         ]
@@ -426,28 +426,19 @@ class TestRowUrl:
     def test_github_pr_url(self) -> None:
         s = self._screen()
         assert (
-            s._row_url("hardcoretech/fms#42", "github")
+            s._row_url("hardcoretech/fms#42")
             == "https://github.com/hardcoretech/fms/pull/42"
         )
 
-    def test_github_detected_by_shape_regardless_of_tracker_name(self) -> None:
+    def test_github_detected_by_shape_alone(self) -> None:
         s = self._screen()
-        assert (
-            s._row_url("owner/repo#7", "github-fms")
-            == "https://github.com/owner/repo/pull/7"
-        )
-
-    def test_jira_browse_url(self) -> None:
-        s = self._screen()
-        assert (
-            s._row_url("ACES-123", "jira")
-            == "https://hardcoretech.atlassian.net/browse/ACES-123"
-        )
+        assert s._row_url("owner/repo#7") == "https://github.com/owner/repo/pull/7"
 
     def test_no_url_for_unknown_shape(self) -> None:
         s = self._screen()
-        assert s._row_url("owner/repo", "github") is None  # no #N
-        assert s._row_url("bare", "jira") is None  # no -KEY
+        assert s._row_url("owner/repo") is None  # no #N
+        assert s._row_url("bare") is None  # not a PR shape
         assert (
-            s._row_url("ACES-1", "github") is None
+            # A ticket key cannot become a URL without knowing its instance.
+            s._row_url("ACES-1") is None
         )  # github tracker, no base_url path

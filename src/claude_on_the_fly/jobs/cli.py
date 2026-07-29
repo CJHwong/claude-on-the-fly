@@ -9,8 +9,7 @@ Usage:
 This is the only place that wires the concrete adapters together: the queue
 (`make_queue`), the agent runner, and the Slack notifier (with its own client,
 token resolved from config). It owns the heartbeat and the SIGINT/SIGTERM →
-stop-event plumbing; `run_loop` stays pure use-case. Modeled on
-`symphony/cli.py`.
+stop-event plumbing; `run_loop` stays pure use-case.
 """
 
 from __future__ import annotations
@@ -30,7 +29,18 @@ from dotenv import load_dotenv
 from claude_on_the_fly import agent, checks
 from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
 from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
-from claude_on_the_fly.jobs.core import AgentRunner, Job, JobQueue, Notifier
+from claude_on_the_fly.jobs.core import (
+    AgentRunner,
+    Job,
+    JobQueue,
+    Notifier,
+    OutcomeRecorder,
+)
+from claude_on_the_fly.jobs.key_state import (
+    KeyStateOutcomeRecorder,
+    KeyStateStore,
+)
+from claude_on_the_fly.jobs.notifiers import LogNotifier, RoutingNotifier
 from claude_on_the_fly.jobs.orphans import LEDGER_NAME, ProcessLedger
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.jobs.slack_notifier import SlackThreadNotifier
@@ -41,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 SUBCOMMANDS = ("run", "doctor", "enqueue")
 DEFAULT_POLL_INTERVAL_S = 2.0
+DEFAULT_CONCURRENCY = 1
 
 
 def _setup_logging() -> None:
@@ -62,6 +73,22 @@ def _env_float(name: str, default: float) -> float:
 
 def _poll_interval_s() -> float:
     return _env_float("JOBS_POLL_INTERVAL_S", DEFAULT_POLL_INTERVAL_S)
+
+
+def _concurrency() -> int:
+    """How many jobs this worker runs at once, from `JOBS_CONCURRENCY`.
+
+    Default 1, which is the behavior every install had before this existed. This
+    is a property of the machine (how many agent CLIs it can host), deliberately
+    separate from a producer's own cap on how much of its work may be outstanding.
+    A junk or non-positive value falls back to 1 rather than refusing to start:
+    the worker running slowly beats the worker not running.
+    """
+    value = int(_env_float("JOBS_CONCURRENCY", DEFAULT_CONCURRENCY))
+    if value < 1:
+        logger.warning("JOBS_CONCURRENCY=%s is below 1, using 1", value)
+        return 1
+    return value
 
 
 def _timeout_s() -> float | None:
@@ -95,7 +122,9 @@ def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
     return None
 
 
-def build_components(token: str) -> tuple[JobQueue, AgentRunner, Notifier]:
+def build_components(
+    token: str,
+) -> tuple[JobQueue, AgentRunner, Notifier, OutcomeRecorder]:
     """Wire the worker's three adapters from config — the single construction
     point the daemon uses.
 
@@ -108,10 +137,22 @@ def build_components(token: str) -> tuple[JobQueue, AgentRunner, Notifier]:
     """
     from slack_sdk.web.async_client import AsyncWebClient
 
+    from claude_on_the_fly.cron import append_log
+
     queue = make_queue()
     runner = OrchestratorAgentRunner(data_dir=agent.DATA_DIR, timeout=_timeout_s())
-    notifier = SlackThreadNotifier(AsyncWebClient(token=token))
-    return queue, runner, notifier
+    # One worker drains both producers, so delivery has to fan back out by where
+    # the job came from: a Slack thread, or the cron entry's own log file.
+    notifier = RoutingNotifier(
+        {
+            "slack": SlackThreadNotifier(AsyncWebClient(token=token)),
+            "cron": LogNotifier(append_log),
+        }
+    )
+    # Closes the producer's feedback loop: cron records attempts when it
+    # enqueues, this records how they turned out, and its backoff reads both.
+    recorder = KeyStateOutcomeRecorder(KeyStateStore(agent.DATA_DIR / "jobs"))
+    return queue, runner, notifier, recorder
 
 
 async def _run(token: str) -> None:
@@ -124,7 +165,7 @@ async def _run(token: str) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
-    queue, runner, notifier = build_components(token)
+    queue, runner, notifier, recorder = build_components(token)
 
     # Reap what a previous worker orphaned, before anything claims work:
     # run_loop's first act is recover_stale, and re-running a job whose earlier
@@ -141,10 +182,23 @@ async def _run(token: str) -> None:
 
     heartbeat = HeartbeatWriter("jobs")
     heartbeat_task = asyncio.create_task(heartbeat.run())
-    logger.info("claude-jobs: started (poll every %.1fs)", _poll_interval_s())
+    concurrency = _concurrency()
+    logger.info(
+        "claude-jobs: started (poll every %.1fs, up to %d job(s) at once)",
+        _poll_interval_s(),
+        concurrency,
+    )
 
     try:
-        await run_loop(queue, runner, notifier, stop, _poll_interval_s())
+        await run_loop(
+            queue,
+            runner,
+            notifier,
+            stop,
+            _poll_interval_s(),
+            concurrency=concurrency,
+            recorder=recorder,
+        )
     finally:
         agent.remove_process_listener(ledger.on_process)
         heartbeat_task.cancel()

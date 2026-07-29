@@ -1,15 +1,15 @@
 """Clean core for background jobs — data types and ports, no I/O SDK.
 
 A `Job` is a unit of work carrying an opaque `origin` (the core never reads it;
-adapters at the edge do). A `Result` is the outcome of running one. The three
-ports — `JobQueue`, `AgentRunner`, `Notifier` — are the only surfaces the worker
-loop depends on, so any adapter (a file queue, a broker, a real or fake runner)
+adapters at the edge do). A `Result` is the outcome of running one. The four
+ports — `JobQueue`, `AgentRunner`, `Notifier`, `OutcomeRecorder` — are the only
+surfaces the worker loop depends on, so any adapter (a file queue, a broker, a real or fake runner)
 can be swapped in without touching the use-case.
 
 Imports: standard library only. No chat / DB / network / LLM / filesystem
 client, no `agent`, no Slack. Vendor vocabulary (channel ids, thread
 timestamps) lives inside `origin` and is never named here. Protocol style mirrors
-`symphony/tracker/base.py` and `AgentBackend` in `agent.py`.
+`AgentBackend` in `agent.py`.
 """
 
 from __future__ import annotations
@@ -27,11 +27,31 @@ class Job:
     reads back on completion; the core, the queue, and the worker pass it
     through untouched. It must stay JSON-serializable so a file-backed queue can
     round-trip it (the default producer builds a flat ``{str: str}``).
+
+    `key` and `session_key` are deliberately separate, because dedup identity
+    and transcript identity are different questions. A cron entry firing hourly
+    wants at most one job outstanding (`key` = the entry), but each fire should
+    start clean (`session_key` = None). A ticket polled off a tracker wants both
+    (`key` = `session_key` = the ticket), so turn 2 resumes turn 1 rather than
+    re-reading the world from nothing. Collapsing them into one field would make
+    the hourly job resume forever and grow its context without bound.
+
+    `timeout` of None means "whatever the runner was configured with", not "no
+    limit" — a producer cannot express unlimited, and `JOBS_TIMEOUT` is where
+    that lives.
+
+    `platform` selects the agent's format hint and handoff behavior. It rides on
+    the job rather than being read out of `origin` so that `origin` stays
+    something only the notifier interprets.
     """
 
     id: str
     prompt: str
     origin: dict[str, Any]
+    key: str | None = None
+    session_key: str | None = None
+    timeout: float | None = None
+    platform: str = "jobs"
 
 
 @dataclass(frozen=True)
@@ -83,6 +103,22 @@ class JobQueue(Protocol):
 
     def enqueue(self, job: Job) -> None:
         """Durably record a new job so a later `claim` can return it."""
+        ...
+
+    def count_unfinished(self, entry: str, item: str | None = None) -> int:
+        """How many jobs keyed to `entry` have not completed; one `item`'s if given.
+
+        Admission control for a producer that polls: it re-derives the same work
+        every time it fires, so it needs to know what it already handed over
+        before handing it over again. `item` given is the dedup question, `item`
+        omitted is the concurrency-cap question.
+
+        Counts queued *and* in-flight, because both mean "already handed over".
+        An adapter must answer from the queue's own contents rather than a
+        side-record, so that a worker killed mid-job cannot leave an item looking
+        permanently outstanding. Unkeyed jobs are invisible here — they have no
+        entry to belong to.
+        """
         ...
 
     def claim(self) -> Job | None:
@@ -145,10 +181,36 @@ class JobQueue(Protocol):
 
 @runtime_checkable
 class AgentRunner(Protocol):
-    """Execution port — runs a job's prompt and returns its Result. Async; the
-    default adapter drives a subprocess agent."""
+    """Execution port — runs a job and returns its Result. Async; the default
+    adapter drives a subprocess agent.
 
-    async def run(self, prompt: str) -> Result: ...
+    Takes the whole `Job` rather than its prompt: the adapter needs `session_key`
+    to decide whether this run continues an earlier one, `timeout` because the
+    limit is per-job rather than per-worker, and `platform` for the agent's
+    format hint. It must still not read `origin` — that belongs to the notifier.
+    """
+
+    async def run(self, job: Job) -> Result: ...
+
+
+@runtime_checkable
+class OutcomeRecorder(Protocol):
+    """Bookkeeping port — tells a producer how the work it queued turned out.
+
+    A polling producer decides what to enqueue from its own memory of what it has
+    already tried: how many times, and whether those attempts failed. It cannot
+    learn the second half on its own, because the *worker* is what sees a job
+    finish. Without this port that memory only ever records attempts, never
+    outcomes, so a failing item is retried at the poll interval forever instead of
+    backing off.
+
+    Called once per completed job, after the result is durable. Implementations
+    must not raise: the reply has not been delivered yet at that point, and losing
+    it over a bookkeeping write would trade a recoverable problem for an
+    unrecoverable one. A job with no `key` belongs to no producer and is ignored.
+    """
+
+    def record(self, job: Job, result: Result) -> None: ...
 
 
 @runtime_checkable

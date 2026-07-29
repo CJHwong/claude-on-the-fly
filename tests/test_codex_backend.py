@@ -371,7 +371,7 @@ class TestCodexBackendRun:
         assert not composed.startswith("\n")
         assert composed.endswith("USER_TEXT_TOKEN")
 
-    async def test_schedule_platform_skips_handoff(self, tmp_path: Path):
+    async def test_jobs_platform_skips_handoff(self, tmp_path: Path):
         """A fresh scheduler fire must not inherit the prior fire's transcript."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -386,7 +386,7 @@ class TestCodexBackendRun:
                 return_value=_success_result(),
             ),
         ):
-            await CodexBackend().run(workspace, "sess", "hi", "schedule")
+            await CodexBackend().run(workspace, "sess", "hi", "jobs")
         handoff.assert_not_called()
 
     async def test_tokens_in_does_not_double_count_cached(self, tmp_path: Path):

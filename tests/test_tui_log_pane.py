@@ -26,7 +26,7 @@ class _DashboardOnlyApp(App):
 
 
 def _isolate(tmp_path, monkeypatch) -> None:
-    cfg = tmp_path / "symphony.yaml"
+    cfg = tmp_path / "cron.yaml"
     cfg.write_text(
         "trackers:\n"
         "  jira:\n"
@@ -34,11 +34,10 @@ def _isolate(tmp_path, monkeypatch) -> None:
         "    project_key: PROJ\n"
         "    enabled: true\n"
     )
-    monkeypatch.setattr(dash, "SYMPHONY_CONFIG", cfg)
-    monkeypatch.setattr(dash, "_symphony_cfg_cache", None)
+    monkeypatch.setattr(dash, "CRON_CONFIG", cfg)
     monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(dash, "LOG_DIR", tmp_path)
-    monkeypatch.setattr(DashboardScreen, "_active_daemon", lambda self: "symphony")
+    monkeypatch.setattr(DashboardScreen, "_active_daemon", lambda self: "cron")
 
 
 @pytest.mark.asyncio
@@ -48,7 +47,7 @@ async def test_daemon_log_missing_present_recovery(tmp_path, monkeypatch):
     `if not new_lines` and left the stale '(missing)' header/line stuck once the
     file appeared."""
     _isolate(tmp_path, monkeypatch)
-    log = tmp_path / logs.log_name("symphony")
+    log = tmp_path / logs.log_name("cron")
 
     app = _DashboardOnlyApp()
     async with app.run_test() as pilot:

@@ -170,8 +170,7 @@ def ensure_pty_installed(
     auto_yes_resolved = (
         auto_yes
         if auto_yes is not None
-        else os.environ.get("SYMPHONY_AUTO_INSTALL_PTY", "").lower()
-        in {"1", "true", "yes"}
+        else os.environ.get("COTF_AUTO_INSTALL_PTY", "").lower() in {"1", "true", "yes"}
     )
 
     consented = prompt_consent(

@@ -322,7 +322,7 @@ class TestBuildSystemPrompt:
     def test_outbox_instruction_absent_for_non_attachment_platforms(
         self, tmp_path: Path
     ):
-        for platform in ("symphony", "schedule", "discord"):
+        for platform in ("cron", "jobs", "discord"):
             result = build_system_prompt(platform, "hoss", "dm", tmp_path)
             assert "You CAN send files" not in result
 
@@ -2178,9 +2178,10 @@ class TestResumeSystemPrompt:
         assert "--system-prompt" not in cmd
 
 
-class TestScheduleSkipsHandoff:
-    """The scheduler mints a fresh session per fire on purpose, so a new session
-    must NOT inherit the prior fire's transcript via the handoff preamble."""
+class TestHandoffByPlatform:
+    """A background job is a fresh one-shot, so it must NOT inherit an unrelated
+    transcript via the handoff preamble. A cron job is the opposite case: it
+    carries a session key precisely so it can resume its own earlier run."""
 
     async def test_normal_platform_forwards_handoff(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -2201,7 +2202,7 @@ class TestScheduleSkipsHandoff:
             await ClaudeBackend().run(workspace, "sess-new", "hi", "telegram")
         handoff.assert_called_once()
 
-    async def test_schedule_platform_skips_handoff(
+    async def test_jobs_platform_skips_handoff(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
         workspace = tmp_path / "ws"
@@ -2216,8 +2217,30 @@ class TestScheduleSkipsHandoff:
                 return_value=_cli_output(),
             ),
         ):
-            await ClaudeBackend().run(workspace, "sess-new", "hi", "schedule")
+            await ClaudeBackend().run(workspace, "sess-new", "hi", "jobs")
         handoff.assert_not_called()
+
+    async def test_cron_platform_forwards_handoff(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """A keyed cron job resumes the session its earlier run left behind, so
+        suppressing the preamble here would throw away the continuity the key
+        exists to provide."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with (
+            patch(
+                "claude_on_the_fly.transcript.prepend_latest_handoff",
+                return_value="hi",
+            ) as handoff,
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(),
+            ),
+        ):
+            await ClaudeBackend().run(workspace, "sess-new", "hi", "cron")
+        handoff.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

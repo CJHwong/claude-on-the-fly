@@ -36,11 +36,11 @@ PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text()
 # both the outbox prompt instruction and the orchestrator scan/archive.
 ATTACHMENT_PLATFORMS = frozenset({"slack", "telegram"})
 # Frontends whose fresh sessions must NOT inherit the prior fire's transcript.
-# The scheduler mints a new session UUID per fire on purpose — each cron run is
-# independent — so the cross-backend handoff preamble would drag the last run's
-# conversation into a run that's meant to start clean. Background jobs are the
-# same shape: each job is an independent one-shot in a fresh workspace/session.
-NO_HANDOFF_PLATFORMS = frozenset({"schedule", "jobs"})
+# A background job is an independent one-shot in a fresh workspace and session, so
+# the cross-backend handoff preamble would drag an unrelated conversation into it.
+# `cron` is deliberately absent: a keyed cron job resumes its own earlier session
+# on purpose, which is the whole reason it carries a session key.
+NO_HANDOFF_PLATFORMS = frozenset({"jobs"})
 OUTBOX_DIRNAME = "outbox"
 OUTBOX_ARCHIVE = ".sent"
 MAX_ATTACHMENTS = 10
@@ -187,9 +187,9 @@ FORMAT_HINTS = {
         "Write normal Markdown (**bold**, # headings, tables, lists, "
         "```code```). It is converted to Slack formatting on delivery."
     ),
-    "symphony": (
-        "Output goes to daemon logs, not a chat user. Plain markdown is fine. "
-        "Tracker writes (status transitions, comments, label edits) are your "
+    "cron": (
+        "Output goes to this entry's log file, not a chat user. Plain markdown is "
+        "fine. Tracker writes (status transitions, comments, label edits) are your "
         "responsibility — see your prompt for the tools available."
     ),
     "jobs": (
@@ -698,7 +698,7 @@ class AgentBackend(Protocol):
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
         """Return the live JSONL path appended to as the session runs, or None.
 
-        Used by `claude-symphony watch` to tail per-turn events. None signals
+        Used to tail per-turn events. None signals
         either no session yet, or the backend doesn't expose a streamable log.
         """
         ...

@@ -172,7 +172,7 @@ def _fmt_uptime(started_at: str | None, now: datetime) -> str:
 
 
 def _fmt_next_fire(when: datetime, now: datetime) -> str:
-    # scheduler.next_fire returns a naive local datetime; the caller-supplied
+    # cron.next_fire returns a naive local datetime; the caller-supplied
     # `now` may be tz-aware UTC. Convert both to naive local for the delta.
     when_local = when.replace(tzinfo=None)
     now_local = datetime.now().replace(microsecond=0)
@@ -191,7 +191,7 @@ def _fmt_next_fire(when: datetime, now: datetime) -> str:
 
 def _format_extra_notes(extra: dict) -> str:
     """Flatten scalar heartbeat extras into `k=v, k=v` notes. Nested structures
-    (lists/dicts like symphony's running_tickets) are rendered elsewhere."""
+    (lists/dicts like the worker's running jobs) are rendered elsewhere."""
     scalars = {k: v for k, v in extra.items() if not isinstance(v, (list, dict))}
     return ", ".join(f"{k}={v}" for k, v in sorted(scalars.items()))
 
@@ -208,59 +208,14 @@ def _state_markup(state: str) -> str:
     return f"[{style}]{glyph} {state}[/]" if style else f"{glyph} {state}"
 
 
-def symphony_strip_header(
-    trackers: list[tuple[str, str]],
-    selected: int,
-    active: int,
-    *,
-    error: str | None = None,
-) -> str:
-    """Markup for the symphony tab, mirroring `chat_header`: a glyph strip of
-    every configured tracker with the ←/→-selected one reverse-video'd, so
-    which tracker the table is scoped to is always visible. Each entry is a
-    (name, state) pair — state is already resolved ('disabled' for a parked
-    tracker, else the shared symphony process state). `active` is the selected
-    tracker's in-flight ticket count. `error` (config parse / daemon error) is
-    appended so a broken symphony.yaml doesn't silently read as 'no trackers'."""
-
-    def _with_error(line: str) -> str:
-        return f"{line}  [red]({error})[/red]" if error else line
-
-    if not trackers:
-        return _with_error("[bold]SYMPHONY[/bold]  [dim]no trackers configured[/dim]")
-    if len(trackers) == 1:
-        name, st = trackers[0]
-        tail = f"{active} active" if active else "[dim]idle[/dim]"
-        return _with_error(
-            f"[bold]SYMPHONY[/bold]  [bold]{name}[/bold]  {_state_markup(st)}  ·  {tail}"
-        )
-
-    cells = []
-    for i, (name, st) in enumerate(trackers):
-        glyph = _STATE_GLYPH.get(st, "?")
-        suffix = "" if st == "running" else st
-        if i == selected:
-            body = f"{name} {glyph}" + (f" {suffix}" if suffix else "")
-            cells.append(f"[reverse] {body} [/reverse]")
-        else:
-            style = _STATE_STYLES.get(st, "")
-            cell = f"{name} [{style}]{glyph}[/]" if style else f"{name} {glyph}"
-            if suffix:
-                cell += f" [dim]{suffix}[/dim]"
-            cells.append(cell)
-    line = "[bold]SYMPHONY[/bold]  " + "  ·  ".join(cells)
-    line += f"  ·  {active} active" if active else "  ·  [dim]idle[/dim]"
-    return _with_error(line)
-
-
-def scheduler_header(
+def cron_header(
     *,
     state: str,
     next_fire_str: str | None,
     schedule_error: str | None = None,
 ) -> str:
-    """Markup line for the SCHEDULER panel border-title."""
-    line = f"[bold]SCHEDULER[/bold]  {_state_markup(state)}"
+    """Markup line for the CRON panel border-title."""
+    line = f"[bold]CRON[/bold]  {_state_markup(state)}"
     if schedule_error:
         return line + f"  [red]({schedule_error})[/red]"
     if state != "running":
@@ -374,9 +329,9 @@ def render_snapshot_rich(snap: Snapshot, console: Console | None = None) -> None
     if snap.jobs:
         c.print(jobs_table(snap.jobs, snap.timestamp))
     elif snap.schedule_error:
-        c.print(f"[red]Scheduler config error:[/red] {snap.schedule_error}")
+        c.print(f"[red]Cron config error:[/red] {snap.schedule_error}")
     else:
-        c.print("[dim]No schedule.yaml found.[/dim]")
+        c.print("[dim]No cron.yaml found.[/dim]")
 
 
 def render_snapshot_json(snap: Snapshot) -> str:

@@ -49,15 +49,18 @@ class _FakeQueue:
     def recover_stale(self, ttl_s: float | None) -> int:
         return 0
 
+    def count_unfinished(self, entry: str, item: str | None = None) -> int:
+        return 0
+
 
 class _CountingRunner:
     def __init__(self, result: Result | None = None) -> None:
         self.prompts: list[str] = []
         self._result = result
 
-    async def run(self, prompt: str) -> Result:
-        self.prompts.append(prompt)
-        return self._result or Result(ok=True, text=f"ran:{prompt}")
+    async def run(self, job: Job) -> Result:
+        self.prompts.append(job.prompt)
+        return self._result or Result(ok=True, text=f"ran:{job.prompt}")
 
 
 class _RecordingNotifier:
@@ -76,7 +79,7 @@ class _BlockingRunner:
         self.release = asyncio.Event()
         self.cancelled = False
 
-    async def run(self, prompt: str) -> Result:
+    async def run(self, job: Job) -> Result:
         self.started.set()
         try:
             await self.release.wait()
@@ -375,3 +378,220 @@ async def test_run_loop_redelivers_before_claiming_work() -> None:
 
     assert [origin for origin, _ in notifier.calls] == [{"channel": "C1"}]
     assert queue.delivered == ["100-a"]
+
+
+# --- concurrency -----------------------------------------------------------
+
+
+class _ConcurrencyProbe:
+    """Holds every run open until `expect` of them are in flight at once, so a
+    serial loop deadlocks instead of quietly passing."""
+
+    def __init__(self, expect: int) -> None:
+        self.in_flight = 0
+        self.peak = 0
+        self._expect = expect
+        self._all_in = asyncio.Event()
+
+    async def run(self, job: Job) -> Result:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        if self.in_flight >= self._expect:
+            self._all_in.set()
+        await self._all_in.wait()
+        self.in_flight -= 1
+        return Result(ok=True, text="ok")
+
+
+class _CancelCountingRunner:
+    """Blocks forever; counts starts and cancellations."""
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.cancelled = 0
+
+    async def run(self, job: Job) -> Result:
+        self.started += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        raise AssertionError("unreachable")
+
+
+class _CountingClaimQueue(_FakeQueue):
+    """Counts claims, so a loop that spins on an empty queue is measurable."""
+
+    def __init__(self, jobs: list[Job] | None = None) -> None:
+        super().__init__(jobs)
+        self.claims = 0
+
+    def claim(self) -> Job | None:
+        self.claims += 1
+        return super().claim()
+
+
+async def test_concurrency_runs_jobs_at_the_same_time() -> None:
+    jobs = [_job("100-a", "1"), _job("100-b", "2"), _job("100-c", "3")]
+    q = _FakeQueue(jobs)
+    runner = _ConcurrencyProbe(expect=3)
+    notifier = _RecordingNotifier()
+    stop = asyncio.Event()
+
+    loop_task = asyncio.create_task(
+        run_loop(q, runner, notifier, stop, poll_interval_s=0.01, concurrency=3)
+    )
+
+    async def _done() -> None:
+        while len(notifier.calls) < 3:
+            await asyncio.sleep(0.01)
+
+    # A serial loop never lets all three start, so this times out rather than
+    # reporting a wrong peak.
+    await asyncio.wait_for(_done(), timeout=2.0)
+    stop.set()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert runner.peak == 3
+
+
+async def test_default_concurrency_is_one() -> None:
+    """The pre-existing behavior has to be the default: one claim, one run."""
+    q = _FakeQueue([_job("100-a", "1"), _job("100-b", "2")])
+    runner = _ConcurrencyProbe(expect=2)
+    notifier = _RecordingNotifier()
+    stop = asyncio.Event()
+
+    loop_task = asyncio.create_task(
+        run_loop(q, runner, notifier, stop, poll_interval_s=0.01)
+    )
+    await asyncio.sleep(0.1)
+
+    assert runner.peak == 1, "two jobs must not overlap without opting in"
+    assert runner.in_flight == 1, "and the first is still held open"
+
+    stop.set()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+
+async def test_stop_cancels_every_in_flight_job() -> None:
+    """Shutdown must reach all N, not just one: an un-cancelled agent outlives
+    the supervisor's grace and is orphaned under bypassPermissions."""
+    q = _FakeQueue([_job(f"100-{n}", str(n)) for n in range(3)])
+    runner = _CancelCountingRunner()
+    notifier = _RecordingNotifier()
+    stop = asyncio.Event()
+
+    loop_task = asyncio.create_task(
+        run_loop(q, runner, notifier, stop, poll_interval_s=0.01, concurrency=3)
+    )
+
+    async def _all_started() -> None:
+        while runner.started < 3:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_all_started(), timeout=2.0)
+    stop.set()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert runner.cancelled == 3
+
+
+async def test_an_empty_claim_waits_even_while_another_job_runs() -> None:
+    """The hot-spin guard. With one long job and three idle slots, a loop that
+    only waited when *nothing* was running would respawn the idle three
+    instantly and hammer claim() for as long as the long job lasted."""
+    q = _CountingClaimQueue([_job("100-a", "long")])
+    runner = _CancelCountingRunner()
+    notifier = _RecordingNotifier()
+    stop = asyncio.Event()
+
+    loop_task = asyncio.create_task(
+        run_loop(q, runner, notifier, stop, poll_interval_s=0.05, concurrency=4)
+    )
+    await asyncio.sleep(0.2)
+    stop.set()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    # Paced at ~3 idle claims per 50ms interval this lands near 15; an unguarded
+    # spin over the same 200ms is thousands. The bound is deliberately loose so
+    # only the pathology can trip it.
+    assert q.claims < 60, f"claim() called {q.claims} times — the loop is spinning"
+
+
+# --- outcome recording ------------------------------------------------------
+
+
+class _RecordingOutcomes:
+    def __init__(self, blow_up: bool = False) -> None:
+        self.recorded: list[tuple[str | None, bool]] = []
+        self._blow_up = blow_up
+
+    def record(self, job: Job, result: Result) -> None:
+        if self._blow_up:
+            raise RuntimeError("bookkeeping exploded")
+        self.recorded.append((job.key, result.ok))
+
+
+async def test_run_once_records_the_outcome() -> None:
+    """The gap that made the producer's backoff dead code: nothing reported a
+    finished job back, so failures never accumulated and a broken key was retried
+    at the poll interval forever."""
+    job = Job(id="100-a", prompt="p", origin={"kind": "cron"}, key="jira/ACE-1")
+    q = _FakeQueue([job])
+    recorder = _RecordingOutcomes()
+
+    await run_once(q, _CountingRunner(), _RecordingNotifier(), recorder)
+
+    assert recorder.recorded == [("jira/ACE-1", True)]
+
+
+async def test_a_failed_job_is_recorded_as_a_failure() -> None:
+    job = Job(id="100-a", prompt="p", origin={"kind": "cron"}, key="jira/ACE-1")
+    q = _FakeQueue([job])
+    recorder = _RecordingOutcomes()
+    runner = _CountingRunner(result=Result(ok=False, text="boom"))
+
+    await run_once(q, runner, _RecordingNotifier(), recorder)
+
+    assert recorder.recorded == [("jira/ACE-1", False)]
+
+
+async def test_a_broken_recorder_does_not_cost_the_reply() -> None:
+    """It runs between a durable result and its delivery, so a bookkeeping bug
+    must not turn a recoverable problem into a reply nobody receives."""
+    job = Job(id="100-a", prompt="p", origin={"kind": "cron"}, key="jira/ACE-1")
+    q = _FakeQueue([job])
+    notifier = _RecordingNotifier()
+
+    did = await run_once(
+        q, _CountingRunner(), notifier, _RecordingOutcomes(blow_up=True)
+    )
+
+    assert did is True
+    assert len(notifier.calls) == 1
+    assert q.delivered == ["100-a"]
+
+
+async def test_run_loop_threads_the_recorder_through() -> None:
+    """run_once taking it is not enough — run_loop is what the daemon calls."""
+    job = Job(id="100-a", prompt="p", origin={"kind": "cron"}, key="jira/ACE-1")
+    q = _FakeQueue([job])
+    notifier = _RecordingNotifier()
+    recorder = _RecordingOutcomes()
+    stop = asyncio.Event()
+
+    loop_task = asyncio.create_task(
+        run_loop(q, _CountingRunner(), notifier, stop, 0.02, recorder=recorder)
+    )
+
+    async def _done() -> None:
+        while not recorder.recorded:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_done(), timeout=2.0)
+    stop.set()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert recorder.recorded == [("jira/ACE-1", True)]

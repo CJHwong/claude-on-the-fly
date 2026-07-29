@@ -597,3 +597,177 @@ def test_delivery_markers_are_pruned_with_the_archive(tmp_path: Path) -> None:
     _complete_one(queue, "200-b")  # completion is what prunes
 
     assert sorted(p.name for p in (root / "done").glob("100-a*")) == []
+
+
+# --- dispatch fields round-trip -------------------------------------------
+
+
+def test_dispatch_fields_survive_enqueue_and_claim(tmp_path: Path) -> None:
+    """The queue is the only thing between a producer and the runner, so a field
+    it drops is a field the runner silently defaults."""
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(
+        Job(
+            id="1-a",
+            prompt="p",
+            origin={"kind": "cron"},
+            key="jira/ACE-1",
+            session_key="jira/ACE-1",
+            timeout=90.0,
+            platform="cron",
+        )
+    )
+
+    claimed = queue.claim()
+
+    assert claimed is not None
+    assert claimed.key == "jira/ACE-1"
+    assert claimed.session_key == "jira/ACE-1"
+    assert claimed.timeout == 90.0
+    assert claimed.platform == "cron"
+
+
+def test_a_job_without_dispatch_fields_is_an_unkeyed_one_shot(tmp_path: Path) -> None:
+    """A record written by a producer that does not care about any of them — or
+    before they existed — is ordinary work, not poison."""
+    queue = FileInboxQueue(tmp_path)
+    (tmp_path / "new").mkdir(parents=True)
+    (tmp_path / "new" / "1-a.json").write_text(
+        json.dumps({"id": "1-a", "prompt": "p", "origin": {"channel": "C1"}}),
+        encoding="utf-8",
+    )
+
+    claimed = queue.claim()
+
+    assert claimed is not None
+    assert claimed.key is None
+    assert claimed.session_key is None
+    assert claimed.timeout is None
+    assert claimed.platform == "jobs"
+
+
+def test_a_wrongly_typed_dispatch_field_is_poison(tmp_path: Path) -> None:
+    """A non-string session_key would reach the uuid derivation and a non-numeric
+    timeout would reach asyncio.wait_for, so both are caught at the boundary."""
+    queue = FileInboxQueue(tmp_path)
+    (tmp_path / "new").mkdir(parents=True)
+    (tmp_path / "new" / "1-a.json").write_text(
+        json.dumps(
+            {
+                "id": "1-a",
+                "prompt": "p",
+                "origin": {},
+                "session_key": ["not", "a", "str"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert queue.claim() is None
+    assert (tmp_path / "failed" / "1-a.json").is_file()
+
+
+def test_a_boolean_timeout_is_poison_not_one_second(tmp_path: Path) -> None:
+    """`bool` is an `int` subclass, so a plain isinstance check would accept
+    `true` and quietly impose a one-second limit."""
+    queue = FileInboxQueue(tmp_path)
+    (tmp_path / "new").mkdir(parents=True)
+    (tmp_path / "new" / "1-a.json").write_text(
+        json.dumps({"id": "1-a", "prompt": "p", "origin": {}, "timeout": True}),
+        encoding="utf-8",
+    )
+
+    assert queue.claim() is None
+    assert (tmp_path / "failed" / "1-a.json").is_file()
+
+
+# --- count_unfinished (producer admission) ---------------------------------
+
+
+def _keyed(job_id: str, key: str) -> Job:
+    return Job(id=job_id, prompt="p", origin={"kind": "cron"}, key=key)
+
+
+def test_count_unfinished_sees_queued_and_in_flight(tmp_path: Path) -> None:
+    """Both mean "already handed over", so both have to count — a claimed job
+    that is still running must not be re-enqueued."""
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(_keyed("100-a", "jira/ACE-1"))
+    queue.enqueue(_keyed("101-b", "jira/ACE-2"))
+
+    assert queue.count_unfinished("jira") == 2
+
+    queue.claim()  # ACE-1 moves new/ -> cur/
+
+    assert queue.count_unfinished("jira") == 2
+    assert queue.count_unfinished("jira", "ACE-1") == 1
+
+
+def test_count_unfinished_drops_to_zero_once_complete(tmp_path: Path) -> None:
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(_keyed("100-a", "jira/ACE-1"))
+    job = queue.claim()
+    assert job is not None
+
+    queue.complete(job, Result(ok=True, text="done"))
+
+    assert queue.count_unfinished("jira") == 0
+    assert queue.count_unfinished("jira", "ACE-1") == 0
+
+
+def test_count_unfinished_isolates_entries(tmp_path: Path) -> None:
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(_keyed("100-a", "jira/ACE-1"))
+    queue.enqueue(_keyed("101-b", "prs/owner/repo#7"))
+
+    assert queue.count_unfinished("jira") == 1
+    assert queue.count_unfinished("prs") == 1
+    assert queue.count_unfinished("jira", "ACE-1") == 1
+    assert queue.count_unfinished("jira", "owner/repo#7") == 0
+
+
+def test_count_unfinished_ignores_unkeyed_jobs(tmp_path: Path) -> None:
+    """A Slack-triggered job belongs to no entry, so it cannot consume a cron
+    entry's concurrency budget."""
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(Job(id="100-a", prompt="p", origin={"channel": "C1"}))
+
+    assert queue.count_unfinished("jira") == 0
+
+
+def test_count_unfinished_on_a_missing_queue_is_zero(tmp_path: Path) -> None:
+    """It gates a write on a queue that may not exist yet, and must not build the
+    tree as a side effect of being asked."""
+    queue = FileInboxQueue(tmp_path / "absent")
+
+    assert queue.count_unfinished("jira") == 0
+    assert not (tmp_path / "absent").exists()
+
+
+def test_a_keyed_job_round_trips_through_claim_and_complete(tmp_path: Path) -> None:
+    """The keyed filename must not break the id-vs-filename poison check, which
+    compares the embedded id against the name."""
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(_keyed("100-a", "jira/ACE-1"))
+
+    job = queue.claim()
+
+    assert job is not None
+    assert job.id == "100-a"
+    assert job.key == "jira/ACE-1"
+    queue.complete(job, Result(ok=True, text="ok"))
+    assert (tmp_path / "done" / "100-a.json").is_file()
+    assert (tmp_path / "done" / "100-a.result.json").is_file()
+    assert not list((tmp_path / "failed").glob("*.json"))
+
+
+def test_a_keyed_job_reports_its_bare_id_to_observers(tmp_path: Path) -> None:
+    """The TUI keys rows by id; handing it the id-plus-key stem would show a
+    different string than `claim()` logs and than `done/` is named after."""
+    queue = FileInboxQueue(tmp_path)
+    queue.enqueue(_keyed("100-a", "jira/ACE-1"))
+
+    rows = read_queue_rows(tmp_path)
+
+    assert [row.id for row in rows] == ["100-a"]
+    assert rows[0].enqueued_at is not None

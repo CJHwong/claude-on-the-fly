@@ -11,7 +11,6 @@ import yaml
 
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.tui.state import (
-    STALENESS_S,
     Snapshot,
     snapshot,
 )
@@ -116,23 +115,10 @@ class TestFrontends:
         tg = next(f for f in snap.frontends if f.name == "telegram")
         assert tg.state == "broken"
 
-    def test_symphony_gets_longer_staleness(self, empty_state, alive_check):
-        _write_heartbeat(empty_state, "symphony", last_heartbeat="2026-05-19T13:00:00Z")
-        # 30s old: telegram would be broken, symphony should still be running.
-        snap = snapshot(
-            empty_state,
-            None,
-            now=_at("2026-05-19T13:00:30Z"),
-            process_check=alive_check,
-        )
-        s = next(f for f in snap.frontends if f.name == "symphony")
-        assert s.state == "running"
-        assert STALENESS_S["symphony"] > STALENESS_S["default"]
-
     def test_extra_is_propagated(self, empty_state, alive_check):
         _write_heartbeat(
             empty_state,
-            "symphony",
+            "cron",
             last_heartbeat="2026-05-19T13:00:00Z",
             extra={"running": 3, "retry_queue": 1},
         )
@@ -142,7 +128,7 @@ class TestFrontends:
             now=_at("2026-05-19T13:00:05Z"),
             process_check=alive_check,
         )
-        s = next(f for f in snap.frontends if f.name == "symphony")
+        s = next(f for f in snap.frontends if f.name == "cron")
         assert s.extra == {"running": 3, "retry_queue": 1}
 
     def test_corrupted_heartbeat_is_stopped_with_error(
@@ -171,7 +157,7 @@ class TestFrontends:
 
 def _write_schedule(path: Path, jobs: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump({"jobs": jobs}))
+    path.write_text(yaml.safe_dump({"entries": jobs}))
 
 
 class TestJobs:
@@ -183,7 +169,7 @@ class TestJobs:
         assert snap.schedule_error is None
 
     def test_well_formed_schedule_yields_jobs(self, tmp_path, empty_state, alive_check):
-        schedule = tmp_path / "schedule.yaml"
+        schedule = tmp_path / "cron.yaml"
         _write_schedule(
             schedule,
             [
@@ -203,7 +189,7 @@ class TestJobs:
         assert all(j.kind == "prompt" for j in snap.jobs)
 
     def test_jobs_sorted_by_next_fire(self, tmp_path, empty_state, alive_check):
-        schedule = tmp_path / "schedule.yaml"
+        schedule = tmp_path / "cron.yaml"
         _write_schedule(
             schedule,
             [
@@ -216,8 +202,8 @@ class TestJobs:
         assert snap.jobs[0].name == "every-min"
 
     def test_malformed_yaml_reports_error(self, tmp_path, empty_state, alive_check):
-        schedule = tmp_path / "schedule.yaml"
-        schedule.write_text("jobs: not-a-list")
+        schedule = tmp_path / "cron.yaml"
+        schedule.write_text("entries: not-a-list")
         snap = snapshot(empty_state, schedule, process_check=alive_check)
         assert snap.jobs == []
         assert snap.schedule_error is not None
@@ -375,9 +361,7 @@ class TestSnapshotShape:
         from claude_on_the_fly.tui import state as state_mod
 
         monkeypatch.setattr(state_mod, "STATE_DIR", tmp_path / "state")
-        monkeypatch.setattr(
-            state_mod, "DEFAULT_SCHEDULE_YAML", tmp_path / "schedule.yaml"
-        )
+        monkeypatch.setattr(state_mod, "DEFAULT_SCHEDULE_YAML", tmp_path / "cron.yaml")
         snap = state_mod.snapshot(process_check=alive_check)
         assert isinstance(snap, Snapshot)
 

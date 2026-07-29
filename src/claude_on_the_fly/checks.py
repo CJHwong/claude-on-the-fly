@@ -82,8 +82,7 @@ BACKEND_ENV_VARS: tuple[str, ...] = (
 FRONTEND_ENV_VARS: dict[str, tuple[str, ...]] = {
     "telegram": TELEGRAM_ENV_VARS,
     "slack": SLACK_ENV_VARS,
-    "schedule": (),  # no per-frontend env vars; uses schedule.yaml
-    "symphony": (),  # uses symphony.yaml
+    "cron": (),  # no per-frontend env vars; uses cron.yaml
     "jobs": JOBS_ENV_VARS,
 }
 
@@ -99,8 +98,7 @@ CHAT_FRONTENDS: tuple[str, ...] = (
 # Every daemon the TUI can start/stop, chat frontends first.
 SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
     *CHAT_FRONTENDS,
-    "schedule",
-    "symphony",
+    "cron",
     "jobs",
 )
 
@@ -111,29 +109,53 @@ def _config_files() -> dict[str, Path]:
     from claude_on_the_fly.agent import DATA_DIR
 
     return {
-        "schedule": DATA_DIR / "schedule.yaml",
-        "symphony": DATA_DIR / "symphony.yaml",
+        "cron": DATA_DIR / "cron.yaml",
     }
 
 
+def _config_validators() -> dict[str, Callable[[Path], object]]:
+    """Per-frontend "does this config actually load?" callables.
+
+    Imported lazily and per-frontend so a `doctor` run does not pull yaml,
+    croniter and liquid into every caller just to check that a file exists.
+    """
+    from claude_on_the_fly.cron import load_config as load_cron
+
+    return {"cron": load_cron}
+
+
 def check_config_file(frontend: str) -> list[CheckResult]:
-    """Verify any config file the frontend needs at startup is on disk."""
+    """Verify any config file the frontend needs at startup is on disk and loads.
+
+    Existence alone was the old check, and it passes on a config the daemon then
+    refuses to start with — a bad cron expression, a prompt template that does not
+    compile, a `prompt_file` that has been moved. Doctor is where somebody looks
+    *before* starting a daemon, so it is where that has to surface.
+    """
     path = _config_files().get(frontend)
     if path is None:
         return []
     if path.is_file():
+        validate = _config_validators().get(frontend)
+        if validate is not None:
+            try:
+                validate(path)
+            except ValueError as exc:
+                return [
+                    CheckResult(
+                        name=path.name,
+                        status="invalid",
+                        detail=str(exc),
+                        fix_hint=f"fix {path} — the daemon will refuse to start",
+                    )
+                ]
         return [CheckResult(name=path.name, status="ok", detail=str(path))]
-    hint = (
-        "See README for examples"
-        if frontend == "schedule"
-        else "See symphony.yaml.example"
-    )
     return [
         CheckResult(
             name=path.name,
             status="missing",
             detail=f"required config not found at {path}",
-            fix_hint=hint,
+            fix_hint="See README for examples",
         )
     ]
 
@@ -974,40 +996,18 @@ _ENV_CHECKERS: dict[str, Callable[[Mapping[str, str]], list[CheckResult]]] = {
 }
 
 
-def check_symphony_acli() -> CheckResult:
-    """Symphony shells out to `acli` for every Jira read.
-
-    Auth lives in `acli auth login`. We can probe the binary cheaply; full
-    auth verification would require a network call so we leave that to the
-    daemon's first poll (which raises with a clear error if unauth'd).
-    """
-    if shutil.which("acli"):
-        return CheckResult(
-            name="acli",
-            status="ok",
-            detail="installed (auth verified on first poll)",
-        )
-    return CheckResult(
-        name="acli",
-        status="missing",
-        detail="not on PATH",
-        fix_hint=(
-            "Install acli (https://developer.atlassian.com/cloud/acli/) "
-            "and run `acli auth login`"
-        ),
-    )
-
-
 def check_frontend(frontend: str, env: Mapping[str, str]) -> list[CheckResult]:
-    """Per-frontend checks: env vars + required config files + tool auth."""
+    """Per-frontend checks: env vars + required config files.
+
+    Deliberately no check for the tools a cron entry's `command` shells out to:
+    which ones those are is the entry author's business, and the package cannot
+    know whether a given install needs acli, gh, curl, or nothing at all.
+    """
     if frontend not in SUPERVISABLE_FRONTENDS:
         raise ValueError(f"unknown frontend: {frontend!r}")
     env_checker = _ENV_CHECKERS.get(frontend)
     env_checks = env_checker(env) if env_checker else []
-    extra: list[CheckResult] = []
-    if frontend == "symphony":
-        extra.append(check_symphony_acli())
-    return env_checks + check_config_file(frontend) + extra
+    return env_checks + check_config_file(frontend)
 
 
 def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResult]]:
