@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from claude_on_the_fly.tui.env_editor import (
     EnvDiff,
     affected_daemons,
@@ -135,7 +137,7 @@ class TestEditAndDiff:
 
 
 # ---------------------------------------------------------------------------
-# open_in_editor — generic config-file editor launch (used for symphony.yaml)
+# open_in_editor — generic config-file editor launch (used for cron.yaml)
 # ---------------------------------------------------------------------------
 
 
@@ -149,7 +151,7 @@ class TestOpenInEditor:
         def fake_runner(cmd, **kwargs):
             calls.append(cmd)
 
-        target = tmp_path / "sub" / "symphony.yaml"
+        target = tmp_path / "sub" / "cron.yaml"
         created = open_in_editor(target, seed="# template\n", runner=fake_runner)
         assert created is True
         assert target.read_text() == "# template\n"
@@ -159,7 +161,7 @@ class TestOpenInEditor:
     def test_existing_file_not_overwritten(self, tmp_path):
         from claude_on_the_fly.tui.env_editor import open_in_editor
 
-        target = tmp_path / "symphony.yaml"
+        target = tmp_path / "cron.yaml"
         target.write_text("existing: yes\n")
         created = open_in_editor(
             target, seed="# template\n", runner=lambda cmd, **k: None
@@ -168,18 +170,19 @@ class TestOpenInEditor:
         assert target.read_text() == "existing: yes\n"
 
 
-def test_example_yaml_parses_and_validates(tmp_path, monkeypatch):
-    """The embedded template (seeded on first edit) must be a valid config."""
-    from claude_on_the_fly.symphony.config import EXAMPLE_YAML, load_config
+def test_example_yaml_is_a_valid_template(tmp_path):
+    """The seeded config must be syntactically sound, and must stop short of
+    loading: it ships with an empty `entries` list on purpose, so a fresh install
+    tells you to add one rather than starting a daemon that does nothing."""
+    import yaml
 
-    cfg_path = tmp_path / "symphony.yaml"
-    cfg_path.write_text(EXAMPLE_YAML)
-    from claude_on_the_fly.symphony.config import JiraTrackerConfig
+    from claude_on_the_fly.cron import EXAMPLE_YAML, load_config
 
-    cfg = load_config(cfg_path)
-    cfg.validate()
-    assert set(cfg.trackers) == {"jira", "github"}
-    jira = cfg.trackers["jira"]
-    assert isinstance(jira, JiraTrackerConfig)  # narrows for project_key
-    assert jira.project_key == "PROJ"
-    assert jira.instruction == "_default"
+    parsed = yaml.safe_load(EXAMPLE_YAML)
+    assert isinstance(parsed, dict)
+    assert parsed["entries"] == []
+
+    cfg_path = tmp_path / "cron.yaml"
+    cfg_path.write_text(EXAMPLE_YAML, encoding="utf-8")
+    with pytest.raises(ValueError, match="at least one entry"):
+        load_config(cfg_path)

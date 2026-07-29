@@ -2,12 +2,12 @@
 
 The dashboard's Active AI jobs pane only shows what's currently running;
 this screen surfaces the audit trail the EventLog has been accumulating
-across every frontend (symphony, slack, telegram): dispatch, done,
+across every frontend (cron, slack, telegram): dispatch, done,
 cancel, retry, worker crash. The intended workflow is "find an inactive
 job from earlier today, copy its takeover command, attach in another
 terminal."
 
-Filter cycles via `s` over the frontend source (all → symphony, then each chat
+Filter cycles via `s` over the frontend source (all → cron, then each chat
 frontend in `checks.CHAT_FRONTENDS` order). The detail column collapses
 event-type-specific fields into a one-line summary so the table stays readable
 at typical terminal widths.
@@ -27,16 +27,12 @@ from textual.widgets import DataTable, Footer, RichLog, Static
 
 from claude_on_the_fly.agent import (
     DATA_DIR,
-    current_backend_key,
     get_backend,
     resolve_session_log,
 )
 from claude_on_the_fly.checks import CHAT_FRONTENDS
 from claude_on_the_fly.events import EventLog
-from claude_on_the_fly.symphony import watch
-from claude_on_the_fly.symphony.agent_runner import session_uuid_for
-from claude_on_the_fly.symphony.workspace import WORKSPACES_ROOT, sanitize_key
-from claude_on_the_fly.tui import render
+from claude_on_the_fly.tui import render, session_format
 from claude_on_the_fly.tui.job_rows import (
     _aggregate_by_job,
     _compute_runtimes,
@@ -68,10 +64,10 @@ HISTORY_ROWS = 1000
 WATCH_EVENTS = 80
 
 SourceFilter = str
-# "all" and symphony first, then the chat frontends in their display order, so
+# "all" and cron first, then the chat frontends in their display order, so
 # this cycle can never disagree with the dashboard about what exists or in what
 # order (checks.CHAT_FRONTENDS is the one definition).
-_SOURCE_CYCLE: tuple[SourceFilter, ...] = ("all", "symphony", *CHAT_FRONTENDS)
+_SOURCE_CYCLE: tuple[SourceFilter, ...] = ("all", "cron", *CHAT_FRONTENDS)
 
 
 class HistoryScreen(OverlayScreen):
@@ -107,11 +103,9 @@ class HistoryScreen(OverlayScreen):
         self._view_mode: Literal["aggregated", "events"] = "aggregated"
         # Cache the identifier → source map of *visible* rows so the takeover
         # binding can resolve the highlighted row without re-tailing the log.
-        self._row_sources: dict[str, str] = {}
         # Lazy cache: jira source name -> base_url, for building browse URLs.
-        self._jira_base_urls_cache: dict[str, str] | None = None
         # Cursor row key → resolved (workspace, session_uuid) for the watch
-        # pane. Symphony rows derive deterministically; chat rows read from
+        # pane. Read from what each event recorded rather than derived, so
         # the event row's session_uuid field.
         self._row_watch: dict[str, tuple[Path, str]] = {}
         self._mtime: float | None = None
@@ -221,8 +215,8 @@ class HistoryScreen(OverlayScreen):
         if row_key is None or row_key == self._watch_target:
             return
         if row_key not in self._row_watch:
-            # Row has no resolvable session (e.g. legacy symphony dispatched
-            # without uuid + no tracker). Leave pane on previous target.
+            # Row has no resolvable session (an event recorded without a
+            # workspace or uuid). Leave the pane on its previous target.
             return
         self._watch_target = row_key
         self._watch_path = None
@@ -248,9 +242,8 @@ class HistoryScreen(OverlayScreen):
         # The identifier is everything after the last colon — either form
         # parses the same way with rpartition.
         _, _, ident = row_key.rpartition(":")
-        tracker = self._row_sources.get(ident)
         resolved = self._row_watch.get(row_key)
-        if not ident or not tracker or resolved is None:
+        if not ident or resolved is None:
             self._notify("no takeover for this row", "warning")
             return
 
@@ -275,46 +268,22 @@ class HistoryScreen(OverlayScreen):
             self._notify(f"clipboard write failed: {exc}", "error")
             return
         self._notify(
-            f"copied takeover cmd for {ident} (tracker={tracker})",
+            f"copied takeover cmd for {ident}",
             "information",
         )
 
-    def _jira_base_urls(self) -> dict[str, str]:
-        """Lazy map of jira source name -> base_url, read from the resolved
-        config (cached). Used to build `<base_url>/browse/<KEY>` links."""
-        if self._jira_base_urls_cache is not None:
-            return self._jira_base_urls_cache
-        out: dict[str, str] = {}
-        try:
-            from claude_on_the_fly.symphony.config import (
-                JiraTrackerConfig,
-                load_config,
-            )
-
-            cfg = load_config(DATA_DIR / "symphony.yaml")
-            for src, tcfg in cfg.trackers.items():
-                if isinstance(tcfg, JiraTrackerConfig) and tcfg.base_url:
-                    out[src] = tcfg.base_url
-        except Exception:
-            pass  # no config / load failure → no jira links (github still works)
-        self._jira_base_urls_cache = out
-        return out
-
-    def _row_url(self, identifier: str, tracker: str | None) -> str | None:
+    def _row_url(self, identifier: str) -> str | None:
         """Reconstruct the browser URL for a row's PR/ticket.
 
-        GitHub PRs are detected by identifier shape (`owner/repo#N`), so they
-        work regardless of the tracker's name. Jira needs the tracker's
-        base_url from config.
+        GitHub PRs are detected by identifier shape (`owner/repo#N`) alone, so
+        this needs no configuration. A ticket key cannot be turned into a URL
+        without knowing the instance it belongs to, and nothing in the package
+        knows that any more — the cron entry that produced the row does.
         """
         if "/" in identifier and "#" in identifier:
             head, _, num = identifier.partition("#")
             if head.count("/") == 1 and num.isdigit():
                 return f"https://github.com/{head}/pull/{num}"
-        if tracker and "-" in identifier:
-            base = self._jira_base_urls().get(tracker)
-            if base:
-                return f"{base.rstrip('/')}/browse/{identifier}"
         return None
 
     def action_open_link(self) -> None:
@@ -326,7 +295,7 @@ class HistoryScreen(OverlayScreen):
             self._notify("no row selected", "warning")
             return
         _, _, ident = row_key.rpartition(":")
-        url = self._row_url(ident, self._row_sources.get(ident))
+        url = self._row_url(ident)
         if not url:
             self._notify(f"no link for {ident}", "warning")
             return
@@ -388,12 +357,8 @@ class HistoryScreen(OverlayScreen):
 
         table = self.query_one("#history-table", DataTable)
         table.clear()
-        # `_row_sources` is identifier -> tracker (jira / github); only
-        # symphony rows populate it. The `t` keybind on a chat row no-ops.
-        self._row_sources = {}
-        # `_row_watch` resolves per-row (workspace, session_uuid). Symphony
-        # rows derive the uuid from (identifier, tracker, backend_key); chat
-        # rows read it directly off the event payload.
+        # `_row_watch` resolves per-row (workspace, session_uuid), read off
+        # what the event itself recorded rather than re-derived per source.
         self._row_watch = {}
 
         if self._view_mode == "aggregated":
@@ -407,19 +372,15 @@ class HistoryScreen(OverlayScreen):
         """Map an event row to its (workspace, session_uuid). Picks the
         backend from the event so historical rows resolve to the right
         JSONL even after the dev switches CLAUDE_MODE / models."""
-        row_backend = str(e.get("backend") or current_backend_key())
-        if src == "symphony":
-            tracker = str(e.get("tracker") or e.get("source") or "jira")
-            self._row_sources.setdefault(ident, tracker)
-            return (
-                WORKSPACES_ROOT / tracker / sanitize_key(ident),
-                session_uuid_for(ident, source=tracker, backend_key=row_backend),
-            )
-        if src in CHAT_FRONTENDS:
-            session_uuid = e.get("session_uuid")
-            if session_uuid:
-                return DATA_DIR / "workspaces" / ident, str(session_uuid)
-        return None
+        session_uuid = e.get("session_uuid")
+        if not session_uuid:
+            return None
+        # The dispatching side records the workspace it used, which is the only
+        # thing that knows the layout for that source. Falling back to the chat
+        # convention keeps rows written before that was recorded resolvable.
+        recorded = e.get("workspace")
+        workspace = Path(str(recorded)) if recorded else DATA_DIR / "workspaces" / ident
+        return workspace, str(session_uuid)
 
     def _render_events(self, table: DataTable, events: list[dict]) -> None:
         """One row per raw event — the original audit-trail view."""
@@ -533,7 +494,7 @@ class HistoryScreen(OverlayScreen):
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            formatted = watch.format_event(event)
+            formatted = session_format.format_event(event)
             if formatted is None:
                 continue
             for line in formatted.split("\n"):

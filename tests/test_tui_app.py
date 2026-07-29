@@ -19,28 +19,6 @@ def _ev(ts, type_, ident, uuid="u", **extra):
     return {"ts": ts, "type": type_, "identifier": ident, "session_uuid": uuid, **extra}
 
 
-def _isolate_symphony_config(tmp_path, monkeypatch, *, jira=True, github=True):
-    """Point the dashboard at a tmp symphony.yaml so tracker tabs don't read the
-    dev machine's real config. Both trackers enabled by default."""
-    import claude_on_the_fly.tui.screens.dashboard as dash
-
-    cfg = tmp_path / "symphony.yaml"
-    cfg.write_text(
-        f"""
-trackers:
-  jira:
-    base_url: https://x.atlassian.net
-    project_key: PROJ
-    enabled: {str(jira).lower()}
-  github:
-    enabled: {str(github).lower()}
-"""
-    )
-    monkeypatch.setattr(dash, "SYMPHONY_CONFIG", cfg)
-    monkeypatch.setattr(dash, "_symphony_cfg_cache", None)
-    return cfg
-
-
 def _write_heartbeat(state_dir, name, running_jobs=()):
     """Write a heartbeat JSON that reads as a running daemon with the given
     in-flight jobs. Uses the live pid so state.snapshot() sees it alive."""
@@ -175,21 +153,14 @@ class TestDashboardLayout:
     async def test_hero_panels_render_with_headers(self, tmp_path, monkeypatch):
         from textual.widgets import Static
 
-        _isolate_symphony_config(tmp_path, monkeypatch)
         monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
 
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            sym = str(app.screen.query_one("#symphony-strip-header", Static).render())
-            sched = str(app.screen.query_one("#scheduler-header", Static).render())
-            # The symphony strip lists every configured tracker; both render even
-            # with nothing running (daemon stopped in tests).
-            assert "SYMPHONY" in sym
-            assert "jira" in sym
-            assert "github" in sym
-            assert "stopped" in sym
-            assert "SCHEDULER" in sched
+            sched = str(app.screen.query_one("#cron-header", Static).render())
+            assert "CRON" in sched
+            assert "stopped" in sched
 
     @pytest.mark.asyncio
     async def test_chat_tab_shows_daemons_in_header_and_idle_table(
@@ -337,7 +308,7 @@ class TestDashboardLayout:
     async def test_tab_keys_switch_active_daemon(self, tmp_path, monkeypatch):
         """[1]-[4] switch tabs, which is how the supervisor keys + log row
         pick a daemon now (tab, not focus). Switching also lands focus on the
-        new tab's table. Tab order: chat / scheduler / symphony / jobs."""
+        new tab's table. Tab order: chat / scheduler / jobs."""
         from textual.widgets import DataTable, Static, TabbedContent
 
         # Isolate disk: cold start → chat target falls back to the first
@@ -356,17 +327,11 @@ class TestDashboardLayout:
 
             await pilot.press("2")
             await pilot.pause()
-            assert tabs.active == "tab-scheduler"
-            assert screen._active_daemon() == "schedule"
-            assert getattr(app.focused, "id", None) == "jobs-content"
+            assert tabs.active == "tab-cron"
+            assert screen._active_daemon() == "cron"
+            assert getattr(app.focused, "id", None) == "cron-entries"
 
             await pilot.press("3")
-            await pilot.pause()
-            assert tabs.active == "tab-symphony"
-            assert screen._active_daemon() == "symphony"
-            assert getattr(app.focused, "id", None) == "symphony-tickets"
-
-            await pilot.press("4")
             await pilot.pause()
             assert tabs.active == "tab-jobs"
             assert screen._active_daemon() == "jobs"
@@ -378,7 +343,7 @@ class TestDashboardLayout:
             screen.query_one("#jobs-queue-header", Static)
             screen.query_one("#jobs-queue", DataTable)
             # The scheduler's own cron table is a DIFFERENT widget, untouched.
-            assert screen.query_one("#jobs-content", DataTable) is not screen.query_one(
+            assert screen.query_one("#cron-entries", DataTable) is not screen.query_one(
                 "#jobs-queue", DataTable
             )
 
@@ -408,7 +373,6 @@ class TestDashboardLayout:
             "1",
             "2",
             "3",
-            "4",
             "left",
             "right",
         }
@@ -452,59 +416,19 @@ class TestDashboardLayout:
             screen = _dashboard(app)
             calls: list[object] = []
             monkeypatch.setattr(
-                screen, "_edit_schedule_config", lambda: calls.append("schedule")
+                screen, "_edit_cron_config", lambda: calls.append("cron")
             )
             monkeypatch.setattr(screen, "_edit_env", lambda: calls.append("env"))
             monkeypatch.setattr(
                 app, "push_screen", lambda *a, **k: calls.append(("screen", a[0]))
             )
             # The dialog dismisses with one of these ids (or None on cancel).
-            screen._open_config_target("symphony")
-            screen._open_config_target("schedule")
+            screen._open_config_target("cron")
             screen._open_config_target("env")
             screen._open_config_target(None)  # cancel → no-op
-            assert calls == [("screen", "config"), "schedule", "env"]
+            assert calls == ["cron", "env"]
 
     @pytest.mark.asyncio
-    async def test_empty_tracker_table_shows_placeholder_row(
-        self, tmp_path, monkeypatch
-    ):
-        from textual.widgets import DataTable
-
-        _isolate_symphony_config(tmp_path, monkeypatch)
-        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
-
-        app = ClaudeTuiApp()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            # No symphony daemon in tests → no tickets for the selected tracker
-            # (jira, the default) → one placeholder row, not a bare header (and
-            # the table stays focusable for Tab).
-            table = app.screen.query_one("#symphony-tickets", DataTable)
-            assert table.row_count == 1
-            assert "no active jobs" in str(table.get_row_at(0)[0])
-
-    @pytest.mark.asyncio
-    async def test_disabled_tracker_shows_disabled_placeholder_when_selected(
-        self, tmp_path, monkeypatch
-    ):
-        from textual.widgets import DataTable
-
-        _isolate_symphony_config(tmp_path, monkeypatch, github=False)
-        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
-
-        app = ClaudeTuiApp()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            # Select the parked github tracker (jira is selected first) and the
-            # scoped table reports it disabled, not "no active jobs".
-            await pilot.press("3")  # symphony tab
-            await pilot.press("right")  # jira → github
-            await pilot.pause()
-            table = app.screen.query_one("#symphony-tickets", DataTable)
-            assert table.row_count == 1
-            assert "disabled" in str(table.get_row_at(0)[0])
-
     @pytest.mark.asyncio
     async def test_action_cue_follows_active_tab(self):
         from textual.widgets import Static
@@ -518,14 +442,14 @@ class TestDashboardLayout:
 
             await pilot.press("3")
             await pilot.pause()
-            assert "symphony" in str(cue.render())
+            assert "jobs" in str(cue.render())
 
     @pytest.mark.asyncio
     async def test_tab_labels_reflect_daemon_health(self, tmp_path, monkeypatch):
         """Each tab title carries its daemon's health glyph, so the tab bar
         shows every zone's liveness regardless of which tab is active. Isolate
         the state dir so the dev machine's real daemons don't bleed in — empty
-        → all four read stopped (○)."""
+        → all three read stopped (○)."""
         from textual.widgets import TabbedContent
 
         monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
@@ -535,28 +459,8 @@ class TestDashboardLayout:
             await pilot.pause()
             tabs = app.screen.query_one("#daemon-tabs", TabbedContent)
             assert str(tabs.get_tab("tab-chat").label) == "[1] ○ chat"
-            assert str(tabs.get_tab("tab-scheduler").label) == "[2] ○ scheduler"
-            assert str(tabs.get_tab("tab-symphony").label) == "[3] ○ symphony"
-            assert str(tabs.get_tab("tab-jobs").label) == "[4] ○ jobs"
-
-    @pytest.mark.asyncio
-    async def test_disabled_tracker_reads_disabled_in_strip(
-        self, tmp_path, monkeypatch
-    ):
-        """A parked tracker shows the `disabled` glyph (⊘) in the symphony
-        header strip, while the enabled one carries the process state."""
-        from textual.widgets import Static
-
-        _isolate_symphony_config(tmp_path, monkeypatch, github=False)
-        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
-
-        app = ClaudeTuiApp()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            strip = str(app.screen.query_one("#symphony-strip-header", Static).render())
-            assert "jira" in strip
-            assert "github" in strip
-            assert "disabled" in strip  # github is parked
+            assert str(tabs.get_tab("tab-cron").label) == "[2] ○ cron"
+            assert str(tabs.get_tab("tab-jobs").label) == "[3] ○ jobs"
 
     @pytest.mark.asyncio
     async def test_supervisor_action_targets_active_tab_daemon(self, monkeypatch):
@@ -574,11 +478,11 @@ class TestDashboardLayout:
         async with app.run_test() as pilot:
             await pilot.pause()
             screen = _dashboard(app)
-            # Switch to the scheduler tab, then trigger restart.
+            # Switch to the cron tab, then trigger restart.
             await pilot.press("2")
             await pilot.pause()
             await screen._run_supervisor_action("restart", supervisor.restart)
-            assert captured == ["schedule"]
+            assert captured == ["cron"]
 
     @pytest.mark.asyncio
     async def test_action_with_no_active_daemon_warns_instead_of_acting(
@@ -634,37 +538,6 @@ async def test_escape_returns_from_doctor():
 
 
 @pytest.mark.asyncio
-async def test_g_picks_symphony_then_shows_config_preview(tmp_path, monkeypatch):
-    """`g` → picker → symphony.yaml shows the resolved config; Esc returns."""
-    import claude_on_the_fly.tui.screens.config_preview as cp
-
-    # Point the preview at a throwaway config so it renders real content
-    # without touching the user's real ~/.claude-on-the-fly/symphony.yaml.
-    cfg = tmp_path / "symphony.yaml"
-    cfg.write_text(
-        "tracker:\n  base_url: https://x.atlassian.net\n  project_key: PROJ\n"
-    )
-    monkeypatch.setattr(cp, "CONFIG_PATH", cfg)
-
-    from textual.widgets import Static
-
-    app = ClaudeTuiApp()
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("g")
-        await pilot.pause()
-        assert app.screen.__class__.__name__ == "ConfigPickerScreen"
-        # symphony.yaml is the first/highlighted option — Enter selects it.
-        await pilot.press("enter")
-        await pilot.pause()
-        assert app.screen.__class__.__name__ == "ConfigPreviewScreen"
-        body = app.screen.query_one("#config-preview", Static)
-        assert "project_key: PROJ" in str(body.render())
-        await pilot.press("escape")
-        await pilot.pause()
-        assert app.screen.__class__.__name__ == "DashboardScreen"
-
-
 class TestJobsTab:
     """The [4] jobs tab: a read-only observer of the worker's maildir."""
 
@@ -715,7 +588,7 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
 
             header = str(app.screen.query_one("#jobs-queue-header", Static).render())
@@ -756,7 +629,7 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             screen = _dashboard(app)
             table = app.screen.query_one("#jobs-queue", DataTable)
@@ -781,7 +654,7 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             table = app.screen.query_one("#jobs-queue", DataTable)
             assert table.row_count == 1
@@ -820,7 +693,7 @@ class TestJobsTab:
         # terminal — run_test()'s own default is not this test's to assume.
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             screen = _dashboard(app)
             table = app.screen.query_one("#jobs-queue", DataTable)
@@ -878,7 +751,7 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             _dashboard(app)._refresh()  # force another full tick
             await pilot.pause()
@@ -888,7 +761,7 @@ class TestJobsTab:
     async def test_arrows_and_watch_pane_no_op_on_the_jobs_tab(
         self, tmp_path, monkeypatch
     ):
-        """No tracker/frontend strip to move through, and no per-job watch yet
+        """No frontend strip to move through, and no per-job watch yet
         (the worker doesn't publish a session uuid) — so the daemon log keeps
         the full width."""
         from textual.containers import Vertical
@@ -897,14 +770,14 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             screen = _dashboard(app)
-            before = screen._chat_selected_idx, screen._symphony_selected_idx
+            before = screen._chat_selected_idx
             await pilot.press("right")
             await pilot.press("left")
             await pilot.pause()
-            assert (screen._chat_selected_idx, screen._symphony_selected_idx) == before
+            assert screen._chat_selected_idx == before
             assert screen._active_daemon() == "jobs"
             assert app.screen.query_one("#log-watch-col", Vertical).display is False
 
@@ -927,7 +800,7 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             header = str(app.screen.query_one("#log-header", Static).render())
             assert log_name in header
@@ -943,7 +816,7 @@ class TestJobsTab:
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
 
             stopped: list[str] = []
@@ -1002,3 +875,49 @@ class TestLogScrollPreservation:
                 render.restore_scroll(log, prev_y=prev_y)
             await pilot.pause()
             assert log.scroll_y == log.max_scroll_y
+
+
+@pytest.mark.asyncio
+async def test_doctor_re_reads_env_when_reopened(tmp_path, monkeypatch):
+    """Fix a value in .env, re-open doctor, and it must report the fixed value.
+
+    The screen is registered in App.SCREENS, so Textual builds one instance and
+    re-pushes it — `on_mount` fires only the first time. Refreshing on mount alone
+    left the previous verdict on screen, so fixing what doctor complained about and
+    looking again showed the same complaint, which reads as "my fix did nothing".
+    """
+    from claude_on_the_fly.tui import supervisor
+    from claude_on_the_fly.tui.screens import doctor as doctor_mod
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENT_BACKEND=pty\n", encoding="utf-8")
+    monkeypatch.setattr(supervisor, "DEFAULT_ENV_FILE", env_file)
+    monkeypatch.delenv("AGENT_BACKEND", raising=False)
+
+    reads: list[str | None] = []
+    real_refresh = doctor_mod.DoctorScreen._refresh
+
+    def _spy(self):
+        env = supervisor._load_env(supervisor.DEFAULT_ENV_FILE)
+        reads.append(env.get("AGENT_BACKEND"))
+        return real_refresh(self)
+
+    monkeypatch.setattr(doctor_mod.DoctorScreen, "_refresh", _spy)
+
+    app = ClaudeTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        assert reads == ["pty"]
+
+        # `pty` is a CLAUDE_MODE, not a backend — the mistake this reproduces.
+        env_file.write_text("AGENT_BACKEND=claude\n", encoding="utf-8")
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+
+    assert reads == ["pty", "claude"], (
+        "re-opening doctor must re-read .env, not show the previous render"
+    )

@@ -21,14 +21,11 @@
 | `SLACK_JOB_COMMAND` | no | Text prefix that queues a background job. Defaults to `$job`; set it to rename the trigger, or set it **empty** to turn background jobs off. A message starting with it is handed to the `claude-jobs` worker, which runs the rest in a fresh session and replies in the same thread when it finishes — so the task outlives the chat turn that asked for it. Sent on its own, with no task, it lists the jobs queued from that channel. Works under either token kind, and inside threads. A custom value should be punctuation-led: the trigger is matched against the head of every message, so a plain word swallows every message beginning with it. If `SLACK_TOKEN` is a user token, also set `JOBS_SLACK_TOKEN` to a bot token — otherwise the worker's replies post as you and this daemon re-ingests them as new input |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
-## Symphony
+## Cron
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `JIRA_EMAIL` | yes | Email associated with your Jira API token |
-| `JIRA_API_TOKEN` | yes | Atlassian API token (generate at id.atlassian.com → security → API tokens) |
-
-The `tracker.base_url`, `tracker.project_key`, and `tracker.jql_extra` live in `symphony.yaml`, not env vars.
+No env vars. Everything lives in `~/.claude-on-the-fly/cron.yaml` — see
+[Cron](../how-to/cron.md). Whatever credentials a producer `command` needs are the
+command's own business (`acli auth login`, `gh auth login`, and so on).
 
 ## Shared
 
@@ -44,3 +41,15 @@ The `tracker.base_url`, `tracker.project_key`, and `tracker.jql_extra` live in `
 | `COTF_HOST_TAG` | no | Machine name in log filenames (`logs/<role>-<host>-<date>.log`). Defaults to the short hostname; dashes become underscores |
 | `COTF_LOG_KEEP_DAYS` | no | Days of logs to keep, pruned by the date in the filename (default: 7). `0` disables pruning |
 | `COTF_AUTO_COMPACT_PCT` | no | Compact a chat's history before answering, once the previous turn left the context at or above this share of the model's window (1-100). Unset (default) means compaction only happens when asked for with `$compact`. Live under claude `native`/`pty` and under codex; inert only under `CLAUDE_MODE=ollama`, where the claude CLI reports a context window for whichever model *it* thinks is answering rather than the one ollama routed to, so the reading is withheld. Preflight warns when it is set somewhere it cannot fire. Keep it well clear of the floor: the system prompt and tool schemas alone are ~7% of a 1M window and no compaction shrinks them |
+
+## Background jobs
+
+The worker that runs whatever cron and Slack queue. See [Cron](../how-to/cron.md).
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JOBS_CONCURRENCY` | no | How many jobs run at once (default `1`). A property of the machine, i.e. how many agent CLIs it can host, deliberately separate from a cron entry's own `max_concurrent`. Below 1 or unparseable falls back to 1 with a warning rather than refusing to start |
+| `JOBS_POLL_INTERVAL_S` | no | Idle wait between drain attempts (default `2.0`) |
+| `JOBS_TIMEOUT` | no | Per-job wall clock in seconds (default: the shared agent timeout). `0` or negative means no limit. A cron entry's `timeout` overrides it per job |
+| `JOBS_QUEUE_KIND` | no | Which queue adapter to build (default `file`). An unregistered value fails preflight for both the worker and Slack |
+| `JOBS_SLACK_TOKEN` | no | Token the worker posts replies with; falls back to `SLACK_TOKEN`. Set this to a **bot** (`xoxb-`) token if `SLACK_TOKEN` is a user token, or the worker posts as you and the Slack daemon re-ingests its own replies as new input |

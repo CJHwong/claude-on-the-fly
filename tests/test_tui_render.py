@@ -89,13 +89,13 @@ class TestFmtHelpers:
 
 class TestTabLabel:
     def test_carries_index_and_health_glyph(self):
-        assert tab_label(1, "symphony", "running").plain == "[1] ● symphony"
+        assert tab_label(1, "cron", "running").plain == "[1] ● cron"
         assert tab_label(2, "scheduler", "stopped").plain == "[2] ○ scheduler"
-        assert tab_label(1, "symphony", "broken").plain == "[1] ⚠ symphony"
+        assert tab_label(1, "cron", "broken").plain == "[1] ⚠ cron"
 
     def test_styles_glyph_by_state(self):
         # The glyph reuses state_cell's style table, keyed by state.
-        label = tab_label(1, "symphony", "running")
+        label = tab_label(1, "cron", "running")
         glyph_span = next(s for s in label.spans if s.start == 4)
         assert glyph_span.style == "bold green"
 
@@ -160,14 +160,14 @@ class TestRichRender:
         console = Console(record=True, width=120)
         render_snapshot_rich(snap, console)
         text = console.export_text()
-        assert "No schedule.yaml" in text
+        assert "No cron.yaml" in text
 
-    def test_schedule_error_shown(self):
+    def test_cron_config_error_shown(self):
         snap = _make_snapshot(jobs=[], schedule_error="bad cron")
         console = Console(record=True, width=120)
         render_snapshot_rich(snap, console)
         text = console.export_text()
-        assert "Scheduler config error" in text
+        assert "Cron config error" in text
         assert "bad cron" in text
 
 
@@ -213,7 +213,7 @@ class TestFrontendsTableWithNestedExtras:
         from claude_on_the_fly.tui.state import FrontendStatus
 
         f = FrontendStatus(
-            name="symphony",
+            name="cron",
             state="running",
             pid=42,
             started_at="2026-05-19T12:00:00Z",

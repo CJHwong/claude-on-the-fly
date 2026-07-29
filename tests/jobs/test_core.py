@@ -79,10 +79,13 @@ class _FakeQueue:
     def recover_stale(self, ttl_s: float | None) -> int:
         return 0
 
+    def count_unfinished(self, entry: str, item: str | None = None) -> int:
+        return 0
+
 
 class _FakeRunner:
-    async def run(self, prompt: str) -> Result:
-        return Result(ok=True, text=prompt)
+    async def run(self, job: Job) -> Result:
+        return Result(ok=True, text=job.prompt)
 
 
 class _FakeNotifier:

@@ -65,7 +65,7 @@ class Orchestrator:
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
-        # Session discriminator per chat: the scheduler bumps an int via
+        # Session discriminator per chat: cron bumps an int via
         # reset_session; telegram /new pins a string token via set_session_token.
         # Either feeds session_uuid's `{chat_id}-{value}` tag.
         self._session_counters: dict[int, int | str] = {}
@@ -87,7 +87,7 @@ class Orchestrator:
         return str(uuid5(NAMESPACE_URL, tag))
 
     def reset_session(self, chat_id: int) -> None:
-        # The scheduler uses an int counter here; telegram pins a str token via
+        # Cron uses an int counter here; telegram pins a str token via
         # set_session_token. Only the int form is bumped (different chat_id
         # spaces), so coerce defensively to keep the +1 well-typed.
         current = self._session_counters.get(chat_id, 0)
@@ -100,7 +100,7 @@ class Orchestrator:
         """Pin the session discriminator to a token the frontend minted, so the
         session UUID matches the frontend's workspace suffix (telegram's /new
         uses a unique timestamp token). The tag formatting in session_uuid
-        accepts a string just as it does the scheduler's integer counter, which
+        accepts a string just as it does cron's integer counter, which
         reset_session still bumps."""
         self._session_counters[chat_id] = token
         self._forget_context(chat_id)
@@ -109,7 +109,7 @@ class Orchestrator:
         """Drop this chat's context reading because its session changed.
 
         The reading is keyed by chat, but it describes a *session* — and both
-        callers above repoint a chat at a fresh one. The scheduler does this
+        callers above repoint a chat at a fresh one. Cron does this
         before every fire, so without this a big reading from the last fire would
         survive into the next and queue a compaction against a session that has
         nothing in it yet.
@@ -355,7 +355,7 @@ class Orchestrator:
     def heartbeat_extra(self) -> dict:
         """Snapshot in-flight chat jobs for the TUI's Active AI jobs pane.
 
-        Shape mirrors symphony's running_tickets so the dashboard can merge
+        Shape mirrors the jobs worker's rows so the dashboard can merge
         across sources with a single normalizer.
         """
         now = time.monotonic()
@@ -402,7 +402,7 @@ def _auto_compact_pct() -> int:
 
 
 def _redact_token(token: str) -> str:
-    """Mask a secret for log output. Matches symphony's redaction format."""
+    """Mask a secret for log output."""
     if not token:
         return "<unset>"
     if len(token) <= 4:
@@ -411,7 +411,7 @@ def _redact_token(token: str) -> str:
 
 
 def _log_settings_summary(platform: str, frontend: Frontend) -> None:
-    """Dump the resolved runtime settings at startup, symphony-style.
+    """Dump the resolved runtime settings at startup.
 
     Pulls shared bits (log level, data dir, agent backend) from env, then
     appends frontend-specific fields via Frontend.describe(). Secrets are

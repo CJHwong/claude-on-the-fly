@@ -2,7 +2,7 @@
 
 Pure function: given a state_dir (heartbeat JSONs) and an optional
 schedule.yaml, produce a Snapshot describing every frontend's liveness, the
-scheduler's upcoming fires, and the background-job queue's depth. Every read
+cron's upcoming fires, and the background-job queue's depth. Every read
 here is read-only — the snapshot never creates or mutates what it describes.
 
 Liveness contract (must match heartbeat.HeartbeatWriter):
@@ -27,6 +27,8 @@ from typing import Literal
 
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
+from claude_on_the_fly.cron import load_config as load_cron_config
+from claude_on_the_fly.cron import next_fire as cron_next_fire
 from claude_on_the_fly.heartbeat import STATE_DIR
 from claude_on_the_fly.heartbeat import process_exists as heartbeat_process_exists
 from claude_on_the_fly.jobs.file_queue import (
@@ -36,22 +38,19 @@ from claude_on_the_fly.jobs.file_queue import (
     read_queue_depth,
     read_queue_rows,
 )
-from claude_on_the_fly.scheduler import load_config as load_schedule_config
-from claude_on_the_fly.scheduler import next_fire as scheduler_next_fire
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SCHEDULE_YAML = DATA_DIR / "schedule.yaml"
+DEFAULT_SCHEDULE_YAML = DATA_DIR / "cron.yaml"  # see cron.resolve_config_path
 # The background-job worker's maildir. A module constant, like STATE_DIR, so a
 # test can redirect it (snapshot() takes no jobs argument).
 DEFAULT_JOBS_DIR = DATA_DIR / "jobs"
 
-# Per-frontend staleness threshold (seconds). Symphony's poll cadence and Jira
+# Per-frontend staleness threshold (seconds). A poll cadence and a tracker
 # call latency can occasionally starve the heartbeat coroutine, so we give it
 # more headroom before we call it broken.
 STALENESS_S: dict[str, int] = {
     "default": 15,
-    "symphony": 60,
     "jobs": 30,
 }
 
@@ -87,7 +86,7 @@ class JobsQueueView:
 
     Read straight off the maildir rather than out of the worker's heartbeat, so
     queue depth still shows when the worker is stopped — the same reason the
-    scheduler tab reads schedule.yaml instead of asking the daemon.
+    cron tab reads cron.yaml instead of asking the daemon.
     """
 
     depth: QueueDepth
@@ -243,7 +242,7 @@ def _load_schedule_cached(path: Path):
     mtime = path.stat().st_mtime
     if _schedule_cache and _schedule_cache[0] == path and _schedule_cache[1] == mtime:
         return _schedule_cache[2]
-    specs = load_schedule_config(path)
+    specs = load_cron_config(path)
     _schedule_cache = (path, mtime, specs)
     return specs
 
@@ -315,14 +314,14 @@ def _jobs_from_schedule(
     except ValueError as exc:
         return [], str(exc)
 
-    # croniter wants a naive local datetime (matches scheduler.py behavior).
+    # croniter wants a naive local datetime (matches cron.py behavior).
     local_now = datetime.now()
     jobs = [
         JobInfo(
             name=s.name,
             cron=s.cron,
             kind=s.kind,
-            next_fire=scheduler_next_fire(s.cron, local_now),
+            next_fire=cron_next_fire(s.cron, local_now),
         )
         for s in specs
     ]
@@ -344,7 +343,7 @@ def snapshot(
     self_version: str | None = None,
     self_executable: str | None = None,
 ) -> Snapshot:
-    """Snapshot the current state of every supervisable frontend + scheduler.
+    """Snapshot the current state of every supervisable frontend + cron.
 
     self_version / self_executable default to the live TUI's values; tests
     can override either to simulate a fresh upgrade.

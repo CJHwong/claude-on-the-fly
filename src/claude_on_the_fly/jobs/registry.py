@@ -2,7 +2,7 @@
 
 `make_queue()` builds the `JobQueue` named by `JOBS_QUEUE_KIND` (default
 `file`). The producer (`slack.py`) and the worker (`cli.py`) both go through it,
-so they always agree on which queue they are talking to. Mirrors symphony's
+so they always agree on which queue they are talking to. Mirrors the
 `SUPPORTED_TRACKERS` seam.
 """
 
@@ -26,7 +26,7 @@ SUPPORTED_QUEUES: dict[str, Callable[[Path], JobQueue]] = {
 # `claude_on_the_fly.job_queues` would be loaded into SUPPORTED_QUEUES here so a
 # third-party adapter (e.g. a Desk-backed queue) can register its kind without
 # editing this file — then selected via JOBS_QUEUE_KIND. This is the upstream
-# plugin-registration seam; it mirrors symphony's tracker registry.
+# plugin-registration seam.
 
 
 def make_queue(root: Path | None = None) -> JobQueue:

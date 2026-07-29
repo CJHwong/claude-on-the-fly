@@ -66,7 +66,7 @@ def open_in_editor(
     """Open `$EDITOR` on `path`. Returns True if the file was created from
     `seed` (a template) because it didn't exist yet.
 
-    Used for editing config files (symphony.yaml) where we want a commented
+    Used for editing config files (cron.yaml) where we want a commented
     template on first open rather than an empty buffer.
     """
     created = False

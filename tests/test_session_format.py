@@ -1,4 +1,4 @@
-"""Tests for symphony.watch — JSONL tail loop and event formatter."""
+"""Tests for tui.session_format — JSONL tail loop and event formatter."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly.symphony import watch
-from claude_on_the_fly.symphony.watch import (
+from claude_on_the_fly.tui import session_format as watch
+from claude_on_the_fly.tui.session_format import (
     _first_line_with_count,
     _format_tool_args,
     _indent_body,

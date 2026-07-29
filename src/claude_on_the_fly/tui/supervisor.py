@@ -60,8 +60,7 @@ def _last_running_file() -> Path:
 _FRONTEND_MODULE: dict[str, str] = {
     "telegram": "claude_on_the_fly.telegram",
     "slack": "claude_on_the_fly.slack",
-    "schedule": "claude_on_the_fly.scheduler",
-    "symphony": "claude_on_the_fly.symphony.cli",
+    "cron": "claude_on_the_fly.cron",
     "jobs": "claude_on_the_fly.jobs.cli",
 }
 

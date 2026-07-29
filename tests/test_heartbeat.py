@@ -41,13 +41,13 @@ class TestWriteOnce:
 
     def test_extra_provider_embedded(self, tmp_path):
         writer = HeartbeatWriter(
-            "symphony",
+            "cron",
             state_dir=tmp_path,
             extra_provider=lambda: {"queue_depth": 3},
         )
         writer.write_once()
 
-        payload = json.loads((tmp_path / "symphony.json").read_text())
+        payload = json.loads((tmp_path / "cron.json").read_text())
         assert payload["extra"] == {"queue_depth": 3}
 
     def test_extra_provider_failure_does_not_kill_write(self, tmp_path):

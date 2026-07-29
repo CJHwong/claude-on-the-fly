@@ -2,8 +2,8 @@
 
 Decoupled from panel focus on purpose: editing config is a rare, deliberate
 action, so an explicit pick reads better than a key whose meaning shifts with
-whatever happens to be focused. Returns the chosen target id ("symphony" |
-"schedule" | "env") via dismiss(), or None on cancel.
+whatever happens to be focused. Returns the chosen target id (
+"cron" | "env") via dismiss(), or None on cancel.
 """
 
 from __future__ import annotations
@@ -38,8 +38,7 @@ class ConfigPickerScreen(ModalScreen[str | None]):
         with Vertical(id="config-picker"):
             yield Static("[bold]Edit which config?[/bold]", id="config-picker-title")
             yield OptionList(
-                Option("symphony.yaml   trackers, concurrency", id="symphony"),
-                Option("schedule.yaml   cron jobs", id="schedule"),
+                Option("cron.yaml       cron entries", id="cron"),
                 Option(".env            chat tokens, model, creds", id="env"),
                 id="config-picker-list",
             )

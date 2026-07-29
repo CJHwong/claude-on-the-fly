@@ -47,7 +47,18 @@ class DoctorScreen(OverlayScreen):
             yield Static(id="doctor-content")
         yield Footer()
 
-    def on_mount(self) -> None:
+    def on_screen_resume(self) -> None:
+        """Re-run the checks every time this screen becomes visible.
+
+        `on_mount` is not enough: the screen is registered in `App.SCREENS`, so
+        Textual builds one instance and re-pushes it, and mount fires only the
+        first time. A doctor that shows the verdict from the last time you looked
+        is worse than one that shows nothing — you fix the thing it complained
+        about, re-open it, and it tells you the fix did not work.
+
+        Resume rather than an interval: this is a point-in-time check, not a live
+        monitor, and it shells out to `which` for the binary checks.
+        """
         self._refresh()
 
     def action_refresh_now(self) -> None:

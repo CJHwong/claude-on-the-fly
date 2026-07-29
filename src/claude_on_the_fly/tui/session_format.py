@@ -1,5 +1,9 @@
 """Live-tail formatter for a Claude Code session JSONL.
 
+Lives in the TUI layer because that is who renders it. It carried no knowledge
+of trackers or tickets even when it sat under the tracker daemon that first used
+it — it takes a transcript event and returns a line.
+
 `tail()` polls a file and yields each appended NDJSON event as a dict.
 `format_event()` turns one event into a human-readable string with Rich markup
 (or None to skip). The CLI prints via a Rich Console so ANSI renders in a TTY;

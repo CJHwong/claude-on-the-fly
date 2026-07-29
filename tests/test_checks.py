@@ -506,28 +506,55 @@ class TestAggregators:
             "telegram", {"TELEGRAM_BOT_TOKEN": "t"}
         ) == check_telegram({"TELEGRAM_BOT_TOKEN": "t"})
 
-    def test_check_frontend_schedule_requires_yaml(self, monkeypatch, tmp_path):
-        # Point DATA_DIR somewhere empty; schedule.yaml absent → missing result.
+    def test_check_frontend_cron_requires_yaml(self, monkeypatch, tmp_path):
+        # Point DATA_DIR somewhere empty; cron.yaml absent → missing result.
         from claude_on_the_fly import agent
 
         monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
-        results = check_frontend("schedule", {})
-        assert any(r.status == "missing" and r.name == "schedule.yaml" for r in results)
+        results = check_frontend("cron", {})
+        assert any(r.status == "missing" and r.name == "cron.yaml" for r in results)
 
-    def test_check_frontend_schedule_ok_when_yaml_exists(self, monkeypatch, tmp_path):
+    def test_check_frontend_cron_ok_when_yaml_exists(self, monkeypatch, tmp_path):
         from claude_on_the_fly import agent
 
         monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
-        (tmp_path / "schedule.yaml").write_text("jobs: []")
-        results = check_frontend("schedule", {})
+        (tmp_path / "cron.yaml").write_text(
+            'entries:\n  - name: a\n    cron: "0 9 * * *"\n    prompt: "hi"\n'
+        )
+        results = check_frontend("cron", {})
         assert all(r.status == "ok" for r in results)
 
-    def test_check_frontend_symphony_requires_yaml(self, monkeypatch, tmp_path):
+    def test_check_frontend_cron_reports_a_config_that_will_not_load(
+        self, monkeypatch, tmp_path
+    ):
+        """Existence alone used to pass here, so doctor said a config was fine and
+        the daemon then refused to start on it."""
         from claude_on_the_fly import agent
 
         monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
-        results = check_frontend("symphony", {})
-        assert any(r.status == "missing" and r.name == "symphony.yaml" for r in results)
+        (tmp_path / "cron.yaml").write_text(
+            'entries:\n  - name: a\n    cron: "nonsense"\n    prompt: "hi"\n'
+        )
+        results = check_frontend("cron", {})
+        bad = [r for r in results if r.name == "cron.yaml"]
+        assert [r.status for r in bad] == ["invalid"]
+        assert "invalid cron" in bad[0].detail
+        from claude_on_the_fly.checks import is_blocking
+
+        assert is_blocking(bad[0])
+
+    def test_check_frontend_cron_reports_an_empty_entries_list(
+        self, monkeypatch, tmp_path
+    ):
+        """What the seeded example ships as, so the hint has to be actionable."""
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        (tmp_path / "cron.yaml").write_text("entries: []")
+        results = check_frontend("cron", {})
+        bad = [r for r in results if r.name == "cron.yaml"]
+        assert [r.status for r in bad] == ["invalid"]
+        assert "at least one entry" in bad[0].detail
 
     def test_check_frontend_unknown_raises(self):
         with pytest.raises(ValueError, match="unknown frontend"):
@@ -541,8 +568,7 @@ class TestAggregators:
         assert set(results) == {
             "telegram",
             "slack",
-            "schedule",
-            "symphony",
+            "cron",
             "jobs",
             "backend",
             "binaries",
@@ -578,9 +604,8 @@ class TestEnvVarDeclarations:
         assert "SLACK_ALLOWED_BOT_IDS" in vars_
         assert "SLACK_SILENT_SENDER_IDS" in vars_
 
-    def test_schedule_and_symphony_have_no_env_vars(self):
-        assert FRONTEND_ENV_VARS["schedule"] == ()
-        assert FRONTEND_ENV_VARS["symphony"] == ()
+    def test_cron_has_no_env_vars(self):
+        assert FRONTEND_ENV_VARS["cron"] == ()
 
 
 # ---------------------------------------------------------------------------

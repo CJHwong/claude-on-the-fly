@@ -15,7 +15,6 @@ from claude_on_the_fly.events import (
     EVENT_WORKER_FAILED,
     EventLog,
 )
-from claude_on_the_fly.tui.screens.config_preview import ConfigPreviewScreen
 from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 from claude_on_the_fly.tui.screens.doctor import DoctorScreen
 from claude_on_the_fly.tui.screens.history import HistoryScreen
@@ -116,7 +115,6 @@ class ClaudeTuiApp(App):
         "logs": LogsScreen,
         "doctor": DoctorScreen,
         "history": HistoryScreen,
-        "config": ConfigPreviewScreen,
     }
 
     # How many recent events a poll inspects. Generous so bursts of completions
@@ -126,7 +124,7 @@ class ClaudeTuiApp(App):
     def on_mount(self) -> None:
         self.push_screen("dashboard")
         # Watch the shared event log app-wide (not per-screen), so a finished
-        # symphony job toasts + bells no matter which screen is on top.
+        # job toasts + bells no matter which screen is on top.
         self._event_log = EventLog()
         self._last_event_sig = self._latest_event_sig()
         self.set_interval(2.0, self._poll_worker_events)
@@ -147,12 +145,12 @@ class ClaudeTuiApp(App):
     def _notify_worker_event(self, record: dict[str, Any]) -> None:
         identifier = record.get("identifier") or "?"
         if record.get("type") == EVENT_WORKER_FAILED:
-            self.notify(f"{identifier} failed", title="symphony job", severity="error")
+            self.notify(f"{identifier} failed", title="agent job", severity="error")
         else:
             reason = record.get("reason") or record.get("state") or "done"
             self.notify(
                 f"{identifier} — {reason}",
-                title="symphony job",
+                title="agent job",
                 severity="information",
             )
         self.bell()  # no-op when headless (tests); BEL to the terminal otherwise

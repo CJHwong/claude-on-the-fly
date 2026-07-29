@@ -1,14 +1,14 @@
 """Append-only JSONL audit log of AI-job lifecycle events.
 
-Every AI run, whether triggered by symphony, slack, or telegram,
+Every AI run, whether triggered by cron, slack, or telegram,
 emits its dispatch / complete / failure transitions here. Heartbeats tell
 the TUI what is currently running; this log tells it what *has happened*
 so users can find jobs that have aged out of the live pane and re-attach
 to them.
 
 Format: one JSON object per line. Required keys: ts (ISO-8601 UTC), type,
-source, identifier. `source` is the frontend ("symphony" | "telegram" |
-"slack" | "telegram"). For symphony rows, the tracker (jira | github) lives
+source, identifier. `source` is the frontend ("cron" | "telegram" |
+"slack" | "jobs"). For cron rows, the entry that produced the work lives
 in an optional `tracker` field. Optional everywhere: workspace,
 session_uuid, plus type-specific extras (state, reason, attempt, error).
 

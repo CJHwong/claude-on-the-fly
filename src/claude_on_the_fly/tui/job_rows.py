@@ -15,13 +15,14 @@ from datetime import datetime
 def _event_source(e: dict) -> str:
     """Return the frontend source for an event row.
 
-    Pre-unification symphony rows wrote the tracker name (jira / github) into
-    `source` directly. Treat any such legacy row as a symphony event so the
-    new filter vocabulary still surfaces it.
+    Older rows written by the tracker daemon put the tracker name (jira /
+    github) into `source` directly. They are read as `cron`, which is what
+    produces tracker work now, so an archive spanning the change still filters
+    as one thing rather than sprouting phantom sources.
     """
     src = str(e.get("source") or "")
     if src in ("jira", "github"):
-        return "symphony"
+        return "cron"
     return src
 
 
@@ -70,7 +71,7 @@ def _format_detail(e: dict) -> str:
         st = e.get("state") or ""
         return f"{reason} ({st})" if st else reason
     if t == "worker_done":
-        # Symphony rows carry reason (terminal/inactive) + state; chat rows
+        # Cron rows carry reason (terminal/inactive) + state; chat rows
         # carry cost + tokens. Render whichever is present.
         reason = e.get("reason") or ""
         st = e.get("state") or ""
@@ -87,7 +88,7 @@ def _format_detail(e: dict) -> str:
         attempt = e.get("attempt")
         return f"{kind} attempt={attempt}" if attempt else kind
     if t == "dispatched":
-        if source == "symphony":
+        if source == "cron":
             st = e.get("state") or ""
             attempt = e.get("failure_attempt")
             if attempt:
@@ -151,8 +152,8 @@ def _aggregate_by_job(events_newest_first: list[dict]) -> list[dict]:
                      latest event (None when no dispatch exists in window)
     - `last_event` : the full latest event dict — drives time, type, detail
     - `backend`    : backend recorded on the latest event
-    - `session_uuid`: latest event's session_uuid (or None for symphony rows,
-                     since symphony events don't include it on every type)
+    - `session_uuid`: latest event's session_uuid (None when no event in the
+                     window recorded one)
 
     Newest-first input keeps the first occurrence of each key as the latest,
     so we don't have to compare timestamps explicitly.

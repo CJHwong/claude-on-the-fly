@@ -97,7 +97,7 @@ def test_installer_success_but_binary_still_missing_fails() -> None:
 
 
 def test_auto_yes_env_var_skips_prompt() -> None:
-    """SYMPHONY_AUTO_INSTALL_PTY=1 bypasses consent (useful for CI)."""
+    """COTF_AUTO_INSTALL_PTY=1 bypasses consent (useful for CI)."""
     call_count = {"i": 0}
 
     def fake_is_installed() -> bool:
@@ -106,7 +106,7 @@ def test_auto_yes_env_var_skips_prompt() -> None:
 
     fake_proc = SimpleNamespace(returncode=0, stdout="", stderr="")
     with (
-        patch.dict("os.environ", {"SYMPHONY_AUTO_INSTALL_PTY": "1"}, clear=False),
+        patch.dict("os.environ", {"COTF_AUTO_INSTALL_PTY": "1"}, clear=False),
         patch.object(pty_install, "is_pty_installed", side_effect=fake_is_installed),
         patch.object(pty_install.shutil, "which", return_value="/usr/bin/x"),
     ):

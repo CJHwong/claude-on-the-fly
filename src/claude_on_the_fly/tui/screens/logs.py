@@ -3,7 +3,7 @@
 Complements the dashboard's inline log pane (which is glued to the highlighted
 frontend). This screen lets you browse every log file in the directory, newest
 first: one per (role, host, day), so it also lists earlier days and per-job
-scheduler logs (`schedule-<job>-<host>-<date>.log`).
+cron logs (`cron-<entry>-<host>-<date>.log`).
 """
 
 from __future__ import annotations

@@ -17,8 +17,8 @@ machine is the worst possible shape for this directory:
   slack daemon, and a second file to conflict over. Real pre-logging crash
   output (an import-time traceback) still lands there.
 
-`role` is which process wrote it: `slack` / `telegram` / `symphony` / `jobs` /
-`schedule`, plus `schedule-<job>` for a scheduled job's own output.
+`role` is which process wrote it: `slack` / `telegram` / `cron` / `jobs` /
+`cron`, plus `cron-<entry>` for a cron entry's own output.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ DEFAULT_KEEP_DAYS = 7
 
 # `<role>-<host>-<YYYY-MM-DD>`. Parsed from the right: the day always has two
 # dashes and the host tag never has any (see `host_tag`), so a role containing
-# dashes ("schedule-my-job") still resolves unambiguously.
+# dashes ("cron-my-entry") still resolves unambiguously.
 _NAME_RE = re.compile(r"^(?P<role>.+)-(?P<host>[^-]+)-(?P<day>\d{4}-\d{2}-\d{2})$")
 _HOST_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 

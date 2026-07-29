@@ -19,6 +19,22 @@ Single-filesystem assumption: `root` and its subdirs must live on one
 filesystem for the rename to stay atomic. The directory tree is created
 lazily on first use, so merely constructing the queue (e.g. inside a Slack
 frontend's `__init__`) has no filesystem side effect.
+
+Filenames in `new/` and `cur/` are `<id>.json` for an unkeyed job and
+`<id>__<entry>__<item>.json` for a keyed one (`keys.queue_filename`). The key is
+in the *name* so that `count_unfinished` can answer a producer's dedup and
+concurrency questions with two globs and zero file reads — it is asked on every
+poll, and reading every queued job to answer it would put the cost of the whole
+queue on every fire.
+
+The id is unchanged either way, and stays the first component, so `sorted()`
+remains oldest-first and `_enqueued_at` still reads the enqueue time straight out
+of the name. Anything wanting the id from a filename goes through
+`keys.job_id_from_filename`; `Path.stem` is the id *plus* its key on a keyed file.
+
+`done/` deliberately does not follow the scheme: `complete()` archives to a bare
+`<id>.json` so `undelivered()` can pair a job with its `<id>.result.json` by id
+alone. Keys matter while work is outstanding, which by then it is not.
 """
 
 from __future__ import annotations
@@ -32,6 +48,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from claude_on_the_fly.jobs.core import Delivery, Job, QueueRow, Result
+from claude_on_the_fly.jobs.keys import (
+    filename_glob,
+    job_id_from_filename,
+    queue_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +74,16 @@ PROMPT_PREVIEW_LIMIT = 500
 
 def _utcnow_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _optional(value: object, *types: type) -> bool:
+    """Whether `value` is None or one of `types`. `bool` never counts as a
+    number, so a `timeout` of `true` is poison rather than a one-second limit."""
+    if value is None:
+        return True
+    if isinstance(value, bool) and bool not in types:
+        return False
+    return isinstance(value, types)
 
 
 class FileInboxQueue:
@@ -83,10 +114,33 @@ class FileInboxQueue:
             "prompt": job.prompt,
             "origin": job.origin,
             "enqueued_at": _utcnow_iso(),
+            "key": job.key,
+            "session_key": job.session_key,
+            "timeout": job.timeout,
+            "platform": job.platform,
         }
-        staging = self._tmp / f"{job.id}.json"
+        name = queue_filename(job.id, job.key)
+        staging = self._tmp / name
         staging.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(staging, self._new / f"{job.id}.json")
+        os.replace(staging, self._new / name)
+
+    def count_unfinished(self, entry: str, item: str | None = None) -> int:
+        """How many of `entry`'s jobs are queued or in flight; one item's if given.
+
+        The producer's two admission questions in one call: `item` given answers
+        "is this one already here?" (skip it) and `item` omitted answers "how many
+        of mine are outstanding?" (respect the cap).
+
+        Answered by globbing the two directories, so the queue's own contents are
+        the only source of truth — no side file to drift out of step when a worker
+        is SIGKILLed mid-job, which is exactly when a producer must not conclude
+        that an item is still running forever.
+
+        Deliberately not memoized, unlike the observer reads below: this one gates
+        a write, and serving it a stale answer double-enqueues.
+        """
+        pattern = filename_glob(entry, item)
+        return _count(self._new, pattern) + _count(self._cur, pattern)
 
     # -- worker -------------------------------------------------------------
 
@@ -122,7 +176,10 @@ class FileInboxQueue:
         tmp.write_text(json.dumps(result_payload), encoding="utf-8")
         os.replace(tmp, result_path)
         try:
-            os.replace(self._cur / f"{job.id}.json", self._done / f"{job.id}.json")
+            os.replace(
+                self._cur / queue_filename(job.id, job.key),
+                self._done / f"{job.id}.json",
+            )
         except FileNotFoundError:
             logger.warning("jobs: complete: %s not in cur/ (already moved?)", job.id)
         self._prune_archive()
@@ -256,7 +313,19 @@ class FileInboxQueue:
         """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            job = Job(id=data["id"], prompt=data["prompt"], origin=data["origin"])
+            # The four dispatch fields are read with `.get` defaults rather than
+            # required: a job enqueued before they existed, or by a producer that
+            # does not care about any of them, is an ordinary unkeyed one-shot
+            # and not poison.
+            job = Job(
+                id=data["id"],
+                prompt=data["prompt"],
+                origin=data["origin"],
+                key=data.get("key"),
+                session_key=data.get("session_key"),
+                timeout=data.get("timeout"),
+                platform=data.get("platform") or "jobs",
+            )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("jobs: poison job file %s → failed/ (%s)", path.name, exc)
             self._quarantine(path)
@@ -265,15 +334,19 @@ class FileInboxQueue:
             not isinstance(job.id, str)
             or not isinstance(job.prompt, str)
             or not isinstance(job.origin, dict)
+            or not isinstance(job.platform, str)
+            or not _optional(job.key, str)
+            or not _optional(job.session_key, str)
+            or not _optional(job.timeout, int, float)
         ):
             logger.warning(
                 "jobs: malformed job %s → failed/ (bad field types)", path.name
             )
             self._quarantine(path)
             return None
-        if job.id != path.stem:
+        if job.id != job_id_from_filename(path.name):
             logger.warning(
-                "jobs: job id %r != filename %r → failed/", job.id, path.stem
+                "jobs: job id %r != filename %r → failed/", job.id, path.name
             )
             self._quarantine(path)
             return None
@@ -498,16 +571,17 @@ def _scan_rows(cur: Path, new: Path, limit: int) -> list[QueueRow]:
         for path in paths:
             if len(rows) >= limit:
                 return rows
-            if path.stem in seen:
+            job_id = job_id_from_filename(path.name)
+            if job_id in seen:
                 continue
-            seen.add(path.stem)
+            seen.add(job_id)
             prompt, origin = _read_row_fields(path)
             rows.append(
                 QueueRow(
-                    id=path.stem,
+                    id=job_id,
                     prompt=prompt,
                     origin=origin,
-                    enqueued_at=_enqueued_at(path.stem),
+                    enqueued_at=_enqueued_at(job_id),
                     in_flight=in_flight,
                 )
             )
