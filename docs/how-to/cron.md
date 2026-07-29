@@ -126,3 +126,23 @@ Two independent numbers:
   outstanding at once. Default 1.
 - `JOBS_CONCURRENCY` on the worker — how many agents *this machine* runs at once.
   Default 1.
+
+## Coming from `schedule.yaml`
+
+The first `claude-cron` start migrates an existing config for you: it writes
+`cron.yaml` and renames the original to `schedule.yaml.migrated`.
+
+The migration is a text move, not a rewrite. Exactly one line changes, the root
+`jobs:` key becoming `entries:`, and everything else survives byte for byte
+because your comments are the part of a config that cannot be regenerated. That
+also means a `script:` + `args:` pair is left exactly as you wrote it: it still
+loads (the two are read as one `command:`), and `command:` is simply the current
+spelling if you want to modernize it later.
+
+The flip side of preserving comments is preserving stale ones, so notes describing
+the old key names come across too. The migrated file says as much at the top. To
+start over from the fully commented current example, delete `cron.yaml` and open
+the config from the TUI, which re-seeds it.
+
+Nothing is destroyed and the migration is idempotent: it is a no-op once
+`cron.yaml` exists, so it will never overwrite a config you have since edited.

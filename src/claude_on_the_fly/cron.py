@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import time
@@ -77,32 +78,59 @@ MAX_PRODUCER_BYTES = 4 * 1024 * 1024
 _LIQUID_ENV = Environment(undefined=StrictUndefined)
 
 EXAMPLE_YAML = """\
-# Cron entries. Each fires on a schedule; output goes to
-# logs/cron-<name>-<host>-<date>.log. The file auto-reloads when you save it.
+# Cron entries. Each fires on a schedule; output (including the agent's reply)
+# goes to logs/cron-<name>-<host>-<date>.log. This file auto-reloads when saved.
 #
 # Every entry needs:
 #   name     letters, digits, '-' and '_' only
 #   cron     standard 5-field cron expression
-# and at least one of:
-#   prompt        text run through an agent (Liquid template)
-#   prompt_file   path to that text instead, read fresh on every fire so you can
-#                 edit it without touching this file. Relative to this file.
-#   command       shell command. WITH a prompt it is a producer: each line of its
-#                 stdout must be a JSON object, and each becomes its own job.
-#                 WITHOUT a prompt it just runs, for its side effects.
-# Optional:
+#
+# Then one of three shapes:
+#
+# 1. A PROMPT - one job per fire, fresh session each time.
+#      prompt        the text itself
+#      prompt_file   a path to it instead, re-read on EVERY fire, so you can edit
+#                    the brief without touching this file. Relative paths resolve
+#                    against this file's directory.
+#
+# 2. A PROMPT COMMAND (a "producer") - `command` plus a prompt. The command lists
+#    the work; each item it prints becomes its own job, and each item's session
+#    RESUMES across fires, so turn 2 continues turn 1 instead of starting over.
+#    This is how tracker polling is expressed, with no tracker code involved.
+#
+#    The command must print ONE JSON OBJECT PER LINE, each carrying a "key":
+#        {"key":"ACE-1","status":"In Progress","summary":"Fix the thing"}
+#    jq emits an array by default, so pipe through `jq -c '.[]'` to get lines.
+#    The key is what dedups (an item already queued is not queued again) and what
+#    the resumed session is tied to.
+#
+#    Emit a field that MOVES when the work moves. An item whose fields have not
+#    changed after max_fires fires is parked until they do, which is what stops an
+#    item the agent cannot advance from being worked forever. For Jira that field
+#    is `status`: note that `acli jira workitem search` rejects `updated` outright
+#    ("field 'updated' is not allowed"), so status is both what you can get and
+#    what actually moves as work progresses.
+#
+# 3. A COMMAND ALONE - runs for its side effects. No job, no agent.
+#
+# Optional on any entry:
 #   timeout          seconds for the agent run (or for a bare command); default
 #                    1800, max 86400
 #   max_concurrent   how many of THIS entry's items may be outstanding at once;
-#                    default 1. Only meaningful for a producer.
-#   max_fires        fires against an unchanged item before it is parked;
-#                    default 3, 0 disables
+#                    default 1. Needs a command - without one there is only ever
+#                    a single item, the entry itself.
+#   max_fires        fires against an unchanged item before parking; default 3,
+#                    0 disables
 #
-# A producer's JSON objects must each carry a "key" identifying the item, and
-# should carry a field that MOVES when the work moves (Jira's `updated`) — the
-# key parks after max_fires if nothing about it changes.
+# PROMPT TEMPLATES are Liquid. A producer's item arrives as `item`:
+#     Work on {{ item.key }}: {{ item.summary }}   (status: {{ item.status }})
+# Rendering is strict, so an item missing a field the template names is skipped
+# with a warning rather than silently rendering a hole. Give optional fields a
+# default in jq: `priority: (.fields.priority.name // "none")`. A plain entry has
+# no `item`, and referencing one is rejected when this file loads.
 #
-# Example:
+# Examples (uncomment and edit - a live entry starts firing immediately):
+#
 #   entries:
 #     - name: morning-digest
 #       cron: "0 9 * * *"
@@ -113,12 +141,17 @@ EXAMPLE_YAML = """\
 #       max_concurrent: 3
 #       prompt_file: ./prompts/jira.md
 #       command: |
-#         acli jira workitem search --jql 'assignee = currentUser() AND
-#           status not in (Done)' --json
-#           | jq -c '.[] | {key, title: .fields.summary,
-#                           status: .fields.status.name, updated: .fields.updated}'
+#         acli jira workitem search \\
+#           --jql 'assignee = currentUser() AND status not in (Done)' \\
+#           --fields key,status,summary --limit 20 --json \\
+#           | jq -c '.[] | {key, status: .fields.status.name,
+#                           summary: .fields.summary}'
+#
+#     - name: prune-logs
+#       cron: "0 4 * * *"
+#       command: ~/scripts/prune.sh --verbose
 
-entries: []  # add at least one entry — an empty list won't load
+entries: []  # add at least one entry - an empty list won't load
 """
 
 
@@ -370,25 +403,49 @@ def load_config(path: Path) -> list[CronEntry]:
     ]
 
 
+def _rename_root_key(text: str) -> tuple[str, bool]:
+    """Rewrite the root `jobs:` mapping key to `entries:`, touching nothing else.
+
+    Anchored at column 0 and applied once, so a `jobs:` inside a comment block or
+    nested under an entry is left alone. Returns the text and whether it changed.
+    """
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if re.match(r"^jobs:(\s|$)", line):
+            lines[index] = "entries:" + line[len("jobs:") :]
+            return "".join(lines), True
+    return text, False
+
+
 def migrate_legacy_config(
     legacy: Path | None = None, target: Path | None = None
 ) -> str | None:
-    """Rewrite a pre-rename config as `cron.yaml`. Returns a summary, or None.
+    """Move a pre-rename config to `cron.yaml`. Returns a summary, or None.
 
     A no-op unless `legacy` exists and `target` does not, so it runs once and is
-    safe to call on every start. The old file is renamed aside rather than deleted:
-    the translation is mechanical but the file is the operator's, and two files
-    with the same jobs is a worse outcome than one file plus a `.migrated` copy.
+    safe to call on every start.
 
-    Writes the translated *entries*, not the original text, so the `script`/`args`
-    to `command` rewrite is visible in the file the operator now edits rather than
-    happening invisibly on every load. Comments in the original are lost, which is
-    why it is kept next door.
+    The file is carried over as TEXT, with one line changed: the root `jobs:` key
+    becomes `entries:`. Everything else - comments, ordering, quoting, block
+    scalars, blank lines - survives byte for byte, because the operator's comments
+    are the part of a config a rewrite cannot reproduce and the part they would
+    most miss. Re-dumping the parsed entries would be tidier and would silently
+    delete all of them.
+
+    That is also why `script:`/`args:` entries are left as they were written
+    rather than folded into `command:`: `load_config` accepts them, so nothing is
+    broken, and rewriting them would mean re-dumping. The header points at the
+    current spelling, and the file is the operator's to modernize when they choose.
     """
     resolved_target, resolved_legacy = config_paths()
     target = resolved_target if target is None else target
     legacy = resolved_legacy if legacy is None else legacy
     if target.exists() or not legacy.is_file():
+        return None
+    try:
+        text = legacy.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("cron: cannot read %s (%s); leaving it in place", legacy, exc)
         return None
     try:
         entries = load_config(legacy)
@@ -398,34 +455,41 @@ def migrate_legacy_config(
         logger.warning("cron: cannot migrate %s (%s); leaving it in place", legacy, exc)
         return None
 
-    payload = {"entries": [_entry_to_dict(e) for e in entries]}
-    body = (
-        f"# Migrated from {legacy.name} by claude-cron.\n"
-        f"# The original is kept at {legacy.name}{LEGACY_SUFFIX} (comments included).\n"
-        f"# `jobs:` is now `entries:`; a `script:`+`args:` pair is now one `command:`.\n\n"
-    ) + yaml.safe_dump(payload, sort_keys=False, width=100)
-    target.write_text(body, encoding="utf-8")
+    body, renamed = _rename_root_key(text)
+    legacy_keys = sorted(
+        {"script/args"}
+        if any(e.command and not e.has_prompt for e in entries)
+        else set()
+    )
+    header = (
+        f"# Migrated from {legacy.name} by claude-cron. Your comments are intact.\n"
+        f"# The root key `jobs:` is now `entries:`"
+        + (" (renamed below).\n" if renamed else ".\n")
+        + "# New since then, and worth a look: `prompt_file:` for a brief kept in\n"
+        "# its own file, and `command:` plus a prompt to turn one entry into a\n"
+        "# producer whose printed items each become their own resumable job.\n"
+        "# See docs/how-to/cron.md, or delete cron.yaml to be re-seeded with the\n"
+        "# fully commented example.\n"
+    )
+    if legacy_keys:
+        header += (
+            "# A `script:`+`args:` pair still works and has been left as written;\n"
+            "# `command:` is the current spelling for the same thing.\n"
+        )
+    if any(line.lstrip().startswith("#") for line in body.splitlines()):
+        # Preserving comments verbatim means preserving stale ones. Say so, rather
+        # than leaving the reader to trust notes that describe renamed keys.
+        header += (
+            "# Heads up: the notes below are yours from before the rename, so some\n"
+            "# of them describe keys that have since changed.\n"
+        )
+    target.write_text(header + "\n" + body, encoding="utf-8")
     kept = legacy.with_name(legacy.name + LEGACY_SUFFIX)
     os.replace(legacy, kept)
-    return f"migrated {len(entries)} entry(s) from {legacy.name} to {target.name}; original kept as {kept.name}"
-
-
-def _entry_to_dict(entry: CronEntry) -> dict[str, object]:
-    """A CronEntry as the minimal mapping that reproduces it, defaults omitted."""
-    out: dict[str, object] = {"name": entry.name, "cron": entry.cron}
-    if entry.prompt is not None:
-        out["prompt"] = entry.prompt
-    if entry.prompt_file is not None:
-        out["prompt_file"] = str(entry.prompt_file)
-    if entry.command is not None:
-        out["command"] = entry.command
-    if entry.timeout != DEFAULT_TIMEOUT:
-        out["timeout"] = entry.timeout
-    if entry.max_concurrent != DEFAULT_MAX_CONCURRENT:
-        out["max_concurrent"] = entry.max_concurrent
-    if entry.max_fires != DEFAULT_MAX_FIRES:
-        out["max_fires"] = entry.max_fires
-    return out
+    return (
+        f"migrated {len(entries)} entry(s) from {legacy.name} to {target.name} "
+        f"with comments preserved; original kept as {kept.name}"
+    )
 
 
 def next_fire(cron_expr: str, now: datetime) -> datetime:

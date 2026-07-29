@@ -4,6 +4,7 @@ that decide what a fire actually hands to the queue."""
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -687,38 +688,92 @@ class TestMigration:
         assert not (tmp_path / "cron.yaml").exists()
         assert "cannot migrate" in caplog.text
 
-    def test_a_legacy_script_job_migrates_to_a_command(
+    def test_a_legacy_script_entry_is_carried_over_as_written(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """The translation lands in the file the operator now edits, rather than
-        happening invisibly on every load."""
+        """Left as `script:`/`args:` on purpose. Rewriting them into `command:`
+        would mean re-dumping the parsed entries, which deletes every comment, and
+        the loader accepts the old keys so nothing is broken by leaving them."""
         from claude_on_the_fly import agent
         from claude_on_the_fly.cron import migrate_legacy_config
 
         monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
         (tmp_path / "schedule.yaml").write_text(
-            yaml.safe_dump(
-                {
-                    "jobs": [
-                        {
-                            "name": "cleanup",
-                            "cron": "*/30 * * * *",
-                            "script": "/opt/cleanup.sh",
-                            "args": ["--verbose"],
-                        }
-                    ]
-                }
-            ),
+            "# keep me\n"
+            "jobs:\n"
+            "  - name: cleanup\n"
+            '    cron: "*/30 * * * *"\n'
+            "    script: /opt/cleanup.sh\n"
+            '    args: ["--verbose"]\n',
             encoding="utf-8",
         )
 
         migrate_legacy_config()
 
-        # Comment lines explain the rename, so assert on the YAML body alone.
-        full = (tmp_path / "cron.yaml").read_text()
-        body = "\n".join(
-            line for line in full.splitlines() if not line.lstrip().startswith("#")
+        body = (tmp_path / "cron.yaml").read_text()
+        assert "script: /opt/cleanup.sh" in body
+        assert 'args: ["--verbose"]' in body
+        assert "# keep me" in body
+        # And it still loads, translated in memory.
+        (entry,) = load_config(tmp_path / "cron.yaml")
+        assert entry.kind == "command"
+        assert entry.command == "/opt/cleanup.sh --verbose"
+
+    def test_every_comment_and_line_survives(self, tmp_path: Path, monkeypatch) -> None:
+        """The reason the migration is a text edit rather than a re-dump: an
+        operator's comments are the part of a config that cannot be regenerated."""
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        original = (
+            "# Top-of-file notes I wrote.\n"
+            "#\n"
+            "#   an indented example: jobs:\n"
+            "\n"
+            "jobs:\n"
+            "  # why this one exists\n"
+            "  - name: hello\n"
+            '    cron: "* * * * *"   # every minute, deliberately\n'
+            '    prompt: "say hello"\n'
+            "\n"
+            "  # a second one, commented out for now\n"
+            "  # - name: later\n"
+            '  #   cron: "0 9 * * *"\n'
+            '  #   prompt: "not yet"\n'
         )
-        assert "command: /opt/cleanup.sh --verbose" in body
-        assert "script:" not in body
-        assert "entries:" in body and "jobs:" not in body
+        (tmp_path / "schedule.yaml").write_text(original, encoding="utf-8")
+
+        migrate_legacy_config()
+
+        body = (tmp_path / "cron.yaml").read_text()
+        # Exactly one line differs from the original: the root key. Built with
+        # the same column-0 anchor the code uses, because a naive replace would
+        # hit the `jobs:` inside the comment above it (which is the bug this
+        # guards against).
+        expected = re.sub(r"^jobs:", "entries:", original, count=1, flags=re.MULTILINE)
+        assert expected in body, "everything but the root key must be byte-identical"
+        # The indented `jobs:` inside a comment is NOT the root key and stays put.
+        assert "#   an indented example: jobs:" in body
+        assert "  # why this one exists" in body
+        assert "# every minute, deliberately" in body
+        assert '#   prompt: "not yet"' in body
+
+    def test_the_header_points_at_what_is_new(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        (tmp_path / "schedule.yaml").write_text(
+            'jobs:\n  - name: hello\n    cron: "* * * * *"\n    prompt: "hi"\n',
+            encoding="utf-8",
+        )
+
+        migrate_legacy_config()
+
+        body = (tmp_path / "cron.yaml").read_text()
+        assert "prompt_file" in body, "the new template mechanism should be pointed at"
+        assert "producer" in body, "as should prompt commands"
+        assert "docs/how-to/cron.md" in body
