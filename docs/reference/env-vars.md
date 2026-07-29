@@ -41,3 +41,15 @@ command's own business (`acli auth login`, `gh auth login`, and so on).
 | `COTF_HOST_TAG` | no | Machine name in log filenames (`logs/<role>-<host>-<date>.log`). Defaults to the short hostname; dashes become underscores |
 | `COTF_LOG_KEEP_DAYS` | no | Days of logs to keep, pruned by the date in the filename (default: 7). `0` disables pruning |
 | `COTF_AUTO_COMPACT_PCT` | no | Compact a chat's history before answering, once the previous turn left the context at or above this share of the model's window (1-100). Unset (default) means compaction only happens when asked for with `$compact`. Live under claude `native`/`pty` and under codex; inert only under `CLAUDE_MODE=ollama`, where the claude CLI reports a context window for whichever model *it* thinks is answering rather than the one ollama routed to, so the reading is withheld. Preflight warns when it is set somewhere it cannot fire. Keep it well clear of the floor: the system prompt and tool schemas alone are ~7% of a 1M window and no compaction shrinks them |
+
+## Background jobs
+
+The worker that runs whatever cron and Slack queue. See [Cron](../how-to/cron.md).
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JOBS_CONCURRENCY` | no | How many jobs run at once (default `1`). A property of the machine, i.e. how many agent CLIs it can host, deliberately separate from a cron entry's own `max_concurrent`. Below 1 or unparseable falls back to 1 with a warning rather than refusing to start |
+| `JOBS_POLL_INTERVAL_S` | no | Idle wait between drain attempts (default `2.0`) |
+| `JOBS_TIMEOUT` | no | Per-job wall clock in seconds (default: the shared agent timeout). `0` or negative means no limit. A cron entry's `timeout` overrides it per job |
+| `JOBS_QUEUE_KIND` | no | Which queue adapter to build (default `file`). An unregistered value fails preflight for both the worker and Slack |
+| `JOBS_SLACK_TOKEN` | no | Token the worker posts replies with; falls back to `SLACK_TOKEN`. Set this to a **bot** (`xoxb-`) token if `SLACK_TOKEN` is a user token, or the worker posts as you and the Slack daemon re-ingests its own replies as new input |

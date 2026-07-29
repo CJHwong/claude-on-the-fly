@@ -41,6 +41,8 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-jobs  # runs 
 git clone https://github.com/CJHwong/claude-on-the-fly && cd claude-on-the-fly
 cp .env.example .env  # fill in your tokens
 uv sync
+uv run claude-tui    # supervisor TUI: start/stop daemons, tail logs, doctor
+# or run a daemon directly:
 uv run claude-slack  # or claude-telegram, claude-cron, claude-jobs
 ```
 

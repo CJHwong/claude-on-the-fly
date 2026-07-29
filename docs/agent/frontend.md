@@ -1,6 +1,6 @@
 # Frontends
 
-Messaging-platform adapters (Slack, Telegram, scheduler) implement the `Frontend` ABC at `src/claude_on_the_fly/protocol.py:11`. The shared session/queue/typing-indicator layer is `src/claude_on_the_fly/orchestrator.py`.
+Messaging-platform adapters (Slack, Telegram) implement the `Frontend` ABC at `src/claude_on_the_fly/protocol.py:11`. The shared session/queue/typing-indicator layer is `src/claude_on_the_fly/orchestrator.py`.
 
 ## Adding a new frontend
 
@@ -55,8 +55,6 @@ The automatic path fires **on the returning message, not during the idle window 
 Telegram reaches this through the same `Orchestrator.on_message`, so it compacts automatically too, and gets `/compact` as a real bot command — Telegram delivers slash commands everywhere, so Slack's `$` prefix (a workaround for slash commands being blocked in threads) buys nothing there.
 
 Two traps if you touch the threshold. `_due_for_compaction` **consumes** the reading, so a burst of messages queues one compaction rather than one each — the second would buy a full-context pass to be told there was nothing left to do. And the prompt has a floor: the system prompt and tool schemas are tens of thousands of tokens that no compaction touches, so a barely-used session already reads ~7% of a 1M window. A threshold set near that floor compacts constantly and saves nothing.
-
-## Scheduler is a frontend too
 
 ## Cron is NOT a frontend
 

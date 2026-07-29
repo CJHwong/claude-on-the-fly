@@ -10,7 +10,7 @@ entries:
   # 1. plain: one job per fire, fresh session each time
   - name: standup
     cron: "30 6 * * 1-5"          # Mon-Fri 06:30
-    prompt: "/gf-ops:daily mazu — post to the team channel. No confirmation."
+    prompt: "Summarise yesterday's merged PRs and post them to the team channel."
     timeout: 1800                 # optional, default 1800s, max 86400
 
   # 2. producer: the command lists work items, each becomes its own job
