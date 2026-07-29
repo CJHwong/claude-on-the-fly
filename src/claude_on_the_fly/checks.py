@@ -106,11 +106,11 @@ SUPERVISABLE_FRONTENDS: tuple[str, ...] = (
 def _config_files() -> dict[str, Path]:
     """Per-frontend required config files. Resolved lazily so DATA_DIR can be
     monkeypatched in tests."""
-    from claude_on_the_fly.agent import DATA_DIR
+    from claude_on_the_fly.cron import resolve_config_path
 
-    return {
-        "cron": DATA_DIR / "cron.yaml",
-    }
+    # Resolved, not hardcoded: an install that has not been migrated off
+    # `schedule.yaml` yet is configured, and doctor must not call it missing.
+    return {"cron": resolve_config_path()}
 
 
 def _config_validators() -> dict[str, Callable[[Path], object]]:

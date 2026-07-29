@@ -504,3 +504,221 @@ class TestStop:
         await cron.stop()
 
         assert not cron._command_tasks
+
+
+# ---------------------------------------------------------------------------
+# Pre-rename configs
+# ---------------------------------------------------------------------------
+
+
+class TestLegacySchema:
+    def test_the_jobs_key_still_loads(self, tmp_path: Path) -> None:
+        """`entries:` was `jobs:`. An install written before the rename must not
+        need editing to start."""
+        path = tmp_path / "schedule.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "jobs": [
+                        {"name": "hello", "cron": "* * * * *", "prompt": "say hello"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (entry,) = load_config(path)
+        assert entry.name == "hello"
+        assert entry.kind == "prompt"
+
+    def test_script_and_args_become_one_command(self, tmp_path: Path) -> None:
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "entries": [
+                        {
+                            "name": "cleanup",
+                            "cron": "*/30 * * * *",
+                            "script": "/opt/bin/cleanup.sh",
+                            "args": ["--verbose", "-n", "3"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (entry,) = load_config(path)
+        assert entry.kind == "command"
+        assert entry.command == "/opt/bin/cleanup.sh --verbose -n 3"
+
+    def test_script_parts_are_quoted(self, tmp_path: Path) -> None:
+        """`script` was exec'd with an argv list, so a space or a `;` was inert.
+        Through a shell it is not, and an unquoted translation would run two
+        commands where the original ran one."""
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "entries": [
+                        {
+                            "name": "risky",
+                            "cron": "* * * * *",
+                            "script": "/opt/my scripts/go.sh",
+                            "args": ["one; echo two"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (entry,) = load_config(path)
+        assert entry.command == "'/opt/my scripts/go.sh' 'one; echo two'"
+
+    def test_script_and_command_together_is_rejected(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {"name": "a", "cron": "* * * * *", "script": "/x.sh", "command": "echo hi"},
+        )
+        with pytest.raises(ValueError, match="not both"):
+            load_config(path)
+
+
+class TestConfigResolution:
+    def test_cron_yaml_wins_when_both_exist(self, tmp_path: Path, monkeypatch) -> None:
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import resolve_config_path
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        (tmp_path / "cron.yaml").write_text("entries: []", encoding="utf-8")
+        (tmp_path / "schedule.yaml").write_text("jobs: []", encoding="utf-8")
+
+        assert resolve_config_path() == tmp_path / "cron.yaml"
+
+    def test_falls_back_to_the_legacy_name(self, tmp_path: Path, monkeypatch) -> None:
+        """So doctor and the TUI read an unmigrated install as configured."""
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import resolve_config_path
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        (tmp_path / "schedule.yaml").write_text("jobs: []", encoding="utf-8")
+
+        assert resolve_config_path() == tmp_path / "schedule.yaml"
+
+    def test_names_the_new_file_when_neither_exists(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import resolve_config_path
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+
+        assert resolve_config_path() == tmp_path / "cron.yaml"
+
+    def test_explicit_path_is_taken_as_given(self, tmp_path: Path) -> None:
+        from claude_on_the_fly.cron import resolve_config_path
+
+        assert resolve_config_path(tmp_path / "mine.yaml") == tmp_path / "mine.yaml"
+
+
+class TestMigration:
+    def test_rewrites_the_legacy_file_and_keeps_the_original(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        legacy = tmp_path / "schedule.yaml"
+        legacy.write_text(
+            '# my notes\njobs:\n  - name: hello\n    cron: "* * * * *"\n'
+            '    prompt: "say hello"\n',
+            encoding="utf-8",
+        )
+
+        summary = migrate_legacy_config()
+
+        assert summary is not None
+        written = load_config(tmp_path / "cron.yaml")
+        assert [e.name for e in written] == ["hello"]
+        assert not legacy.exists(), "the old name must stop being loadable"
+        kept = tmp_path / "schedule.yaml.migrated"
+        assert "# my notes" in kept.read_text(), "the original is preserved verbatim"
+
+    def test_is_a_no_op_when_already_migrated(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """It runs on every start, so it has to be idempotent, and it must never
+        overwrite a cron.yaml somebody has since edited."""
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        current = tmp_path / "cron.yaml"
+        current.write_text("entries: [{name: mine, cron: '* * * * *', prompt: x}]\n")
+        (tmp_path / "schedule.yaml").write_text("jobs: []\n")
+
+        assert migrate_legacy_config() is None
+        assert "mine" in current.read_text()
+
+    def test_is_a_no_op_with_nothing_to_migrate(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        assert migrate_legacy_config() is None
+        assert not (tmp_path / "cron.yaml").exists()
+
+    def test_a_broken_legacy_file_is_left_alone(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """Rewriting a file we cannot parse would destroy it. Leave it and let the
+        normal config error explain itself."""
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        legacy = tmp_path / "schedule.yaml"
+        legacy.write_text("jobs:\n  - name: bad\n    cron: nonsense\n    prompt: x\n")
+
+        assert migrate_legacy_config() is None
+        assert legacy.exists()
+        assert not (tmp_path / "cron.yaml").exists()
+        assert "cannot migrate" in caplog.text
+
+    def test_a_legacy_script_job_migrates_to_a_command(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The translation lands in the file the operator now edits, rather than
+        happening invisibly on every load."""
+        from claude_on_the_fly import agent
+        from claude_on_the_fly.cron import migrate_legacy_config
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        (tmp_path / "schedule.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "jobs": [
+                        {
+                            "name": "cleanup",
+                            "cron": "*/30 * * * *",
+                            "script": "/opt/cleanup.sh",
+                            "args": ["--verbose"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        migrate_legacy_config()
+
+        # Comment lines explain the rename, so assert on the YAML body alone.
+        full = (tmp_path / "cron.yaml").read_text()
+        body = "\n".join(
+            line for line in full.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "command: /opt/cleanup.sh --verbose" in body
+        assert "script:" not in body
+        assert "entries:" in body and "jobs:" not in body

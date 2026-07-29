@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import os
+import shlex
 import sys
 import time
 from collections.abc import Iterable
@@ -56,6 +57,11 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path.home() / ".claude-on-the-fly"
 LOG_DIR = DATA_DIR / "logs"
 DEFAULT_CONFIG = DATA_DIR / "cron.yaml"
+# What this file was called, and the key it used, before the rename. Read so an
+# existing install keeps working, and migrated once on startup so nobody has to
+# keep two vocabularies in their head. See `migrate_legacy_config`.
+LEGACY_CONFIG = DATA_DIR / "schedule.yaml"
+LEGACY_SUFFIX = ".migrated"
 DEFAULT_TIMEOUT = 1800
 MAX_TIMEOUT = 86400
 DEFAULT_MAX_CONCURRENT = 1
@@ -174,6 +180,30 @@ def _positive_int(data: dict[str, object], field: str, default: int, where: str)
     return value
 
 
+def _translate_legacy_entry(data: dict[str, object], where: str) -> dict[str, object]:
+    """Accept the pre-rename entry shape: `script` plus an optional `args` list.
+
+    A legacy script job is a side-effect entry, so the two keys collapse into one
+    `command` string. Each part is quoted, because `script` was exec'd with an argv
+    list and never had to care that a path with a space, or an arg containing `;`,
+    becomes two commands once a shell sees it.
+    """
+    if "script" not in data:
+        return data
+    if "command" in data:
+        raise ValueError(f"{where}: specify 'command' or the legacy 'script', not both")
+    script = data["script"]
+    if not isinstance(script, str) or not script.strip():
+        raise ValueError(f"{where}: 'script' must be a non-empty string path")
+    raw_args = data.get("args", [])
+    if not isinstance(raw_args, list) or not all(isinstance(a, str) for a in raw_args):
+        raise ValueError(f"{where}: 'args' must be a list of strings")
+    parts = [os.path.expanduser(script), *(str(a) for a in raw_args)]
+    translated = {k: v for k, v in data.items() if k not in ("script", "args")}
+    translated["command"] = " ".join(shlex.quote(p) for p in parts)
+    return translated
+
+
 def _validate_entry(
     raw: object, index: int, seen: set[str], config_dir: Path
 ) -> CronEntry:
@@ -195,6 +225,8 @@ def _validate_entry(
         croniter(cron_expr, datetime.now())
     except (ValueError, KeyError) as exc:
         raise ValueError(f"{where}: invalid cron {cron_expr!r}: {exc}") from exc
+
+    data = _translate_legacy_entry(data, where)
 
     has_prompt = "prompt" in data
     has_file = "prompt_file" in data
@@ -275,8 +307,46 @@ def _validate_template(entry: CronEntry, where: str) -> None:
             ) from exc
 
 
+def config_paths() -> tuple[Path, Path]:
+    """`(cron.yaml, schedule.yaml)` under the *current* data dir.
+
+    Resolved per call against `agent.DATA_DIR` rather than baked in at import, so
+    redirecting the data dir redirects these too. The module constants above are
+    only the defaults shown in `--help`; reading them directly is what let a
+    redirected DATA_DIR silently keep pointing at the real home directory.
+    """
+    from claude_on_the_fly.agent import DATA_DIR as data_dir
+
+    return data_dir / "cron.yaml", data_dir / "schedule.yaml"
+
+
+def resolve_config_path(explicit: Path | None = None) -> Path:
+    """Which config file to use.
+
+    `cron.yaml` if present, else the pre-rename `schedule.yaml` if that is, else
+    `cron.yaml` so a "missing" message names the file to create. An explicit
+    `--config` is taken as given.
+
+    Callers that only read (doctor, the TUI's cron table) go through this so an
+    install that has not been migrated yet reads as configured rather than broken.
+    """
+    if explicit is not None:
+        return explicit
+    current, legacy = config_paths()
+    if current.is_file():
+        return current
+    if legacy.is_file():
+        return legacy
+    return current
+
+
 def load_config(path: Path) -> list[CronEntry]:
-    """Parse and validate a YAML config. Raises ValueError on any issue."""
+    """Parse and validate a YAML config. Raises ValueError on any issue.
+
+    Accepts the pre-rename `jobs:` key as well as `entries:`, so a config written
+    before the rename still loads. `migrate_legacy_config` is what stops that
+    being permanent.
+    """
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
@@ -285,17 +355,77 @@ def load_config(path: Path) -> list[CronEntry]:
         raise ValueError(f"cannot read {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError("config root must be a mapping with an 'entries' key")
-    entries_raw = cast(dict[str, object], raw).get("entries")
+    data = cast(dict[str, object], raw)
+    key = "entries" if "entries" in data else "jobs"
+    entries_raw = data.get(key)
     if not isinstance(entries_raw, list):
-        raise ValueError("'entries' must be a list")
+        raise ValueError(f"{key!r} must be a list")
     if not entries_raw:
-        raise ValueError("'entries' must contain at least one entry")
+        raise ValueError(f"{key!r} must contain at least one entry")
     seen: set[str] = set()
     config_dir = path.parent
     return [
         _validate_entry(item, index, seen, config_dir)
         for index, item in enumerate(entries_raw)
     ]
+
+
+def migrate_legacy_config(
+    legacy: Path | None = None, target: Path | None = None
+) -> str | None:
+    """Rewrite a pre-rename config as `cron.yaml`. Returns a summary, or None.
+
+    A no-op unless `legacy` exists and `target` does not, so it runs once and is
+    safe to call on every start. The old file is renamed aside rather than deleted:
+    the translation is mechanical but the file is the operator's, and two files
+    with the same jobs is a worse outcome than one file plus a `.migrated` copy.
+
+    Writes the translated *entries*, not the original text, so the `script`/`args`
+    to `command` rewrite is visible in the file the operator now edits rather than
+    happening invisibly on every load. Comments in the original are lost, which is
+    why it is kept next door.
+    """
+    resolved_target, resolved_legacy = config_paths()
+    target = resolved_target if target is None else target
+    legacy = resolved_legacy if legacy is None else legacy
+    if target.exists() or not legacy.is_file():
+        return None
+    try:
+        entries = load_config(legacy)
+    except ValueError as exc:
+        # A legacy file that does not load is not something to rewrite silently;
+        # leave it alone and let the normal config error explain itself.
+        logger.warning("cron: cannot migrate %s (%s); leaving it in place", legacy, exc)
+        return None
+
+    payload = {"entries": [_entry_to_dict(e) for e in entries]}
+    body = (
+        f"# Migrated from {legacy.name} by claude-cron.\n"
+        f"# The original is kept at {legacy.name}{LEGACY_SUFFIX} (comments included).\n"
+        f"# `jobs:` is now `entries:`; a `script:`+`args:` pair is now one `command:`.\n\n"
+    ) + yaml.safe_dump(payload, sort_keys=False, width=100)
+    target.write_text(body, encoding="utf-8")
+    kept = legacy.with_name(legacy.name + LEGACY_SUFFIX)
+    os.replace(legacy, kept)
+    return f"migrated {len(entries)} entry(s) from {legacy.name} to {target.name}; original kept as {kept.name}"
+
+
+def _entry_to_dict(entry: CronEntry) -> dict[str, object]:
+    """A CronEntry as the minimal mapping that reproduces it, defaults omitted."""
+    out: dict[str, object] = {"name": entry.name, "cron": entry.cron}
+    if entry.prompt is not None:
+        out["prompt"] = entry.prompt
+    if entry.prompt_file is not None:
+        out["prompt_file"] = str(entry.prompt_file)
+    if entry.command is not None:
+        out["command"] = entry.command
+    if entry.timeout != DEFAULT_TIMEOUT:
+        out["timeout"] = entry.timeout
+    if entry.max_concurrent != DEFAULT_MAX_CONCURRENT:
+        out["max_concurrent"] = entry.max_concurrent
+    if entry.max_fires != DEFAULT_MAX_FIRES:
+        out["max_fires"] = entry.max_fires
+    return out
 
 
 def next_fire(cron_expr: str, now: datetime) -> datetime:
@@ -713,7 +843,7 @@ def main() -> int:  # pragma: no cover
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
+        default=None,
         help=f"YAML config path (default: {DEFAULT_CONFIG})",
     )
     args = parser.parse_args()
@@ -721,16 +851,25 @@ def main() -> int:  # pragma: no cover
     load_dotenv()
     setup_daemon_logging("cron")
 
-    if not args.config.is_file():
-        raise SystemExit(f"config not found: {args.config}")
+    # Before resolving: an install that predates the rename gets its config
+    # rewritten once, so it is `cron.yaml` the operator edits from here on.
+    if args.config is None:
+        migrated = migrate_legacy_config()
+        if migrated:
+            logger.info("cron: %s", migrated)
+            print(f"cron: {migrated}", file=sys.stderr)
+
+    config = resolve_config_path(args.config)
+    if not config.is_file():
+        raise SystemExit(f"config not found: {config}")
     try:
-        load_config(args.config)
+        load_config(config)
     except ValueError as exc:
         raise SystemExit(f"config error: {exc}") from exc
 
     queue = make_queue()
     daemon = CronDaemon(
-        config_path=args.config,
+        config_path=config,
         queue=queue,
         key_state=KeyStateStore(DATA_DIR / "jobs"),
     )

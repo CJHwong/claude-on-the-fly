@@ -41,7 +41,7 @@ from claude_on_the_fly.jobs.file_queue import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SCHEDULE_YAML = DATA_DIR / "cron.yaml"
+DEFAULT_SCHEDULE_YAML = DATA_DIR / "cron.yaml"  # see cron.resolve_config_path
 # The background-job worker's maildir. A module constant, like STATE_DIR, so a
 # test can redirect it (snapshot() takes no jobs argument).
 DEFAULT_JOBS_DIR = DATA_DIR / "jobs"
