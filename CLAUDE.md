@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Experimental project that spawns Claude Code with `--permission-mode bypassPermissions` to give Slack/Telegram/scheduler/symphony frontends a Claude session. See [README.md](README.md) for human-facing overview.
+Experimental project that spawns Claude Code with `--permission-mode bypassPermissions` to give Slack/Telegram/cron frontends a Claude session. See [README.md](README.md) for human-facing overview.
 
 ## Stack
 
@@ -19,15 +19,18 @@ src/claude_on_the_fly/
   logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
   protocol.py          # Frontend protocol (add new interfaces here)
-  scheduler.py         # Cron-driven frontend
+  cron.py              # Cron producer daemon — runs shell, enqueues Jobs
   slack.py             # telegram.py
-  symphony/            # Jira-driven daemon (poll/claim/dispatch)
-    tracker/jira.py    # Tracker Protocol implementations live here
-    ...
   jobs/                # Background-job daemon (claim/run/notify)
+    core.py            # Job + the four ports the worker depends on
     file_queue.py      # JobQueue Protocol implementations live here
+    keys.py            # job key -> filename / workspace segment
+    key_state.py       # per-key backoff + no-progress memory
     ...
 ```
+
+Work reaches an agent one of two ways: a chat frontend through `orchestrator.py`,
+or `cron.py` -> the job queue -> `jobs/`. Nothing else calls `agent.run`.
 
 ## Verification
 
@@ -45,7 +48,7 @@ uv run pytest                  # tests in tests/
 Each subsystem has its own notes file. Read the relevant one before touching the area:
 
 - `docs/agent/backends.md` — when modifying or adding an agent backend
-- `docs/agent/symphony.md` — when modifying or adding a tracker, or changing the dispatch loop
+- `docs/agent/cron.md` — when touching the cron producer, its config schema, or key state
 - `docs/agent/frontend.md` — when adding a new frontend (Slack/Telegram-like)
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
 

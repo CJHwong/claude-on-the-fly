@@ -21,14 +21,11 @@
 | `SLACK_JOB_COMMAND` | no | Text prefix that queues a background job. Defaults to `$job`; set it to rename the trigger, or set it **empty** to turn background jobs off. A message starting with it is handed to the `claude-jobs` worker, which runs the rest in a fresh session and replies in the same thread when it finishes — so the task outlives the chat turn that asked for it. Sent on its own, with no task, it lists the jobs queued from that channel. Works under either token kind, and inside threads. A custom value should be punctuation-led: the trigger is matched against the head of every message, so a plain word swallows every message beginning with it. If `SLACK_TOKEN` is a user token, also set `JOBS_SLACK_TOKEN` to a bot token — otherwise the worker's replies post as you and this daemon re-ingests them as new input |
 | `SLACK_STATS_MODE` | no | Footer mode: `off`, `summary`, `detailed` (default: `summary`) |
 
-## Symphony
+## Cron
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `JIRA_EMAIL` | yes | Email associated with your Jira API token |
-| `JIRA_API_TOKEN` | yes | Atlassian API token (generate at id.atlassian.com → security → API tokens) |
-
-The `tracker.base_url`, `tracker.project_key`, and `tracker.jql_extra` live in `symphony.yaml`, not env vars.
+No env vars. Everything lives in `~/.claude-on-the-fly/cron.yaml` — see
+[Cron](../how-to/cron.md). Whatever credentials a producer `command` needs are the
+command's own business (`acli auth login`, `gh auth login`, and so on).
 
 ## Shared
 

@@ -1,0 +1,90 @@
+# Cron
+
+The producer half of the work loop. `cron.py` fires entries on a schedule and puts
+`Job`s in the queue; `jobs/` runs them. See [jobs.md](jobs.md) for the other half
+and [how-to/cron.md](../how-to/cron.md) for the config surface.
+
+**This daemon runs shell and nothing else.** It never calls `agent.run`. Work that
+needs an agent becomes a job. That split is the design, not an implementation
+detail: the daemon decides *what* to work on, the worker decides *how long* and
+*how many at once*.
+
+## Why there is no reconcile pass
+
+The daemon this replaced held a worker open per ticket across turns, which forced
+everything else it had: `is_active` / `is_terminal` predicates, a per-tick
+reconcile that cancelled workers mid-turn, terminal-state tracking, a retry queue.
+
+One fire equals one agent run, so none of that exists. A ticket that moved to Done
+stops matching the query, so it stops being enqueued, and that *is* the stop
+signal. If you find yourself wanting to cancel an in-flight job because its item
+changed, don't: let the run finish and let the next fire decide.
+
+## The three gates on an item
+
+`_admit` applies them cheapest first, and logs every rejection — a silent skip is
+indistinguishable from a producer that found nothing, which is the hardest kind of
+"why did this never run" to answer.
+
+1. **Already queued** — `queue.count_unfinished(entry, item)`. The queue's own
+   contents are the truth, so a worker killed mid-job cannot leave an item looking
+   permanently outstanding.
+2. **Over the entry's cap** — `count_unfinished(entry)` vs `max_concurrent`.
+3. **Held by its own history** — `KeyStateStore.should_skip`: backing off after a
+   failure, or parked for making no progress.
+
+## Key state is the only thing the queue cannot answer
+
+`jobs/key_state.py` holds one file per key: `{fingerprint, fires_since_change,
+failures, last_failed_at}`. It replaces a cursor store, a retry queue, `max_turns`
+and `max_no_progress_turns` with one file and one rule.
+
+The fingerprint is a hash of the emitted item, which generalizes the timestamp
+comparison it replaced: it needs no `updated` field from the source and works for
+any producer. The cost is a burden on the producer, documented in the how-to — an
+item whose emitted fields do not move will park.
+
+**The loop only closes because the worker reports back.** The producer records
+*attempts* at enqueue (`record_fire`); the worker records *outcomes* through the
+`OutcomeRecorder` port (`record_outcome`). Wire both or the backoff is dead code
+reading a `failures` count nothing increments — which is exactly how it shipped
+broken once, with unit tests passing because they called `record_outcome` directly.
+
+## Template rendering is strict
+
+`StrictUndefined`, deliberately. Lenient rendering would put a silent hole in a
+prompt when a producer omits a field, which is worse than a loud failure. Failures
+split by blast radius: every item failing is a config bug (ERROR once, skip the
+fire), some items failing is data variance (WARNING per item, run the rest).
+
+Templates are compiled at config load, and a *plain* entry is additionally
+dry-rendered against an empty context — that is what catches an entry referencing
+`item` with no producer to supply one.
+
+## Adding a config field
+
+`_validate_entry` is the schema. New fields go on `CronEntry` and get validated
+there; there is no separate schema file. Reject illegal *combinations* explicitly
+rather than ignoring them — `max_concurrent > 1` without a `command` is an error,
+because silently ignoring it would leave somebody waiting for parallelism that
+cannot happen.
+
+## Producer output
+
+`parse_items` is deliberately forgiving per line and unforgiving per contract: a
+bad line costs that line and logs it with the offending text. An array (the shape
+`jq` emits by default) is rejected with the fix named in the message. An item with
+no usable `key` is skipped, since it could be neither deduplicated nor resumed.
+
+Producer stdout is capped (`MAX_PRODUCER_BYTES`) so a command that accidentally
+streams a log file cannot exhaust memory, and its stderr is logged rather than
+swallowed.
+
+## Timeouts
+
+Two different limits, both spelled `timeout` in different places:
+
+- a producer command gets a fixed short `PRODUCER_TIMEOUT_S` — it only has to
+  print a work list
+- a side-effect command, and the agent run each item becomes, get the entry's own
+  `timeout`, which rides to the worker on `Job.timeout`

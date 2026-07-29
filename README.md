@@ -29,15 +29,10 @@ export SLACK_APP_TOKEN=xapp-...
 export SLACK_TOKEN=xoxb-...   # xoxp- replies as you, xoxb- replies as the app
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-slack
 
-# Scheduler
-# write ~/.claude-on-the-fly/schedule.yaml (see docs/how-to/scheduler.md)
-uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-schedule
-
-# Symphony (Jira-driven daemon)
-# templates: docs/how-to/symphony/*.example -> ~/.claude-on-the-fly/ (see docs/how-to/symphony.md)
-export JIRA_EMAIL=you@your-org.com
-export JIRA_API_TOKEN=...
-uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-symphony
+# Cron (scheduled prompts, and tracker polling via a shell producer)
+# write ~/.claude-on-the-fly/cron.yaml (see docs/how-to/cron.md)
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-cron
+uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-jobs  # runs what cron queues
 ```
 
 ## Local Development
@@ -46,11 +41,11 @@ uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-symphony
 git clone https://github.com/CJHwong/claude-on-the-fly && cd claude-on-the-fly
 cp .env.example .env  # fill in your tokens
 uv sync
-uv run claude-slack  # or claude-telegram, claude-symphony, claude-schedule, claude-jobs
+uv run claude-slack  # or claude-telegram, claude-cron, claude-jobs
 ```
 
 ## Documentation
 
-- [How-to guides](docs/how-to/) — setup for each channel: [Slack](docs/how-to/slack.md), [Telegram](docs/how-to/telegram.md), [Scheduler](docs/how-to/scheduler.md), [Symphony](docs/how-to/symphony.md)
+- [How-to guides](docs/how-to/) — setup for each channel: [Slack](docs/how-to/slack.md), [Telegram](docs/how-to/telegram.md), [Cron](docs/how-to/cron.md)
 - [Reference](docs/reference/) — [Environment variables](docs/reference/env-vars.md), [Persona (CLAUDE.md)](docs/reference/persona.md), [Response footer](docs/reference/footer.md)
-- `CLAUDE.md` — agent-only notes (backend quirks, architecture, Symphony internals)
+- `CLAUDE.md` — agent-only notes (backend quirks, architecture, subsystem internals)

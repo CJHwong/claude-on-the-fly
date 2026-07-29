@@ -1,6 +1,6 @@
 # Background jobs
 
-A single daemon that drains a durable queue: claim a job, run it through an agent, reply into wherever it came from. Where symphony polls a tracker for work, jobs waits for work someone handed it — a Slack user asking for something long-running, or `claude-jobs enqueue`.
+A single daemon that drains a durable queue: claim a job, run it through an agent, reply into wherever it came from. It takes work from two producers: `claude-cron`, which polls and enqueues (see [cron.md](cron.md)), and Slack, where a user asks for something long-running. `claude-jobs enqueue` is the third, for smoke tests.
 
 The Slack half is on by default under `$job`. `SLACK_JOB_COMMAND` renames it; setting it **empty** turns it off, and only then does the frontend build no queue — absent versus present-but-blank is the whole opt-out, resolved identically by `slack._resolve_job_command` and `checks.effective_job_command` (a drift test pins them together). With it off the queue is reachable from `claude-jobs enqueue` alone, which is why `claude-jobs doctor` says so rather than passing silently.
 
@@ -18,13 +18,15 @@ Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Po
 
 `jobs/worker.py` imports nothing but those ports plus `asyncio`/`logging`, so an adapter can be swapped with no change to the loop. `jobs/cli.py` is the composition root: it names `OrchestratorAgentRunner` and `SlackThreadNotifier` directly, and takes the queue from `registry.make_queue()` — `jobs/registry.py` is where `FileInboxQueue` is named.
 
+One worker drains both producers, so delivery fans back out by where a job came from: `notifiers.RoutingNotifier` dispatches on `origin["kind"]` to the Slack thread notifier or to `LogNotifier`, which appends a cron reply to that entry's own log. It raises on an unknown kind rather than returning, so a typo'd kind shows up as a stuck reply in `undelivered()` instead of one marked delivered to nowhere.
+
 A `Job` carries an opaque `origin` dict. The core, the queue, and the worker pass it through untouched; only the notifier reads it. That is what keeps vendor vocabulary (`channel`, `thread_ts`) out of the core.
 
 `JobQueue` also carries `mark_delivered`/`undelivered` (see delivery tracking below) and `list_unfinished(limit)`, the read half of the port, returning `QueueRow`s. A producer answering "what is already queued?" goes through it rather than reaching into `file_queue`, so the answer survives a swap to a broker-backed adapter. Rows carry `origin` for the same reason a `Job` does: the core cannot filter by channel, but the Slack frontend can.
 
 ## Adding a new queue adapter
 
-`SUPPORTED_QUEUES` in `jobs/registry.py` maps a kind name to a factory over a root directory; `make_queue()` picks one via `JOBS_QUEUE_KIND` (default `file`). Implement the `JobQueue` Protocol, register the kind, set the env var — no worker changes. This mirrors symphony's `SUPPORTED_TRACKERS`. The file also marks the attach point for a Python entry-points group, not built yet.
+`SUPPORTED_QUEUES` in `jobs/registry.py` maps a kind name to a factory over a root directory; `make_queue()` picks one via `JOBS_QUEUE_KIND` (default `file`). Implement the `JobQueue` Protocol, register the kind, set the env var — no worker changes. The file also marks the attach point for a Python entry-points group, not built yet.
 
 ## The maildir contract
 
@@ -42,10 +44,13 @@ Two properties everything else rests on:
 
 - **The claim is a `rename(2)` from `new/` to `cur/`.** Atomic within one filesystem, so two workers racing resolve to exactly one winner with no lock files. `root` and its subdirs must therefore live on one filesystem.
 - **Ids are `f"{time.time_ns()}-{uuid4().hex[:8]}"`.** Time-sortable, so `sorted(new/)` is FIFO — and the enqueue time is readable straight out of the name, with no `stat()` and no reliance on an mtime a copy or a `touch` would move.
+- **A keyed job's filename carries its key**: `<id>__<entry>__<item>.json` in `new/` and `cur/` (`keys.queue_filename`). Unkeyed jobs stay `<id>.json`. The key is in the *name* so `count_unfinished` can answer a producer's dedup and concurrency questions with two globs and zero file reads — it is asked on every poll, and reading every queued job to answer it would put the cost of the whole queue on every fire. The id stays the first component, so FIFO and `_enqueued_at` are unaffected. **Anything wanting the id from a filename goes through `keys.job_id_from_filename`**; `Path.stem` is the id *plus* its key on a keyed file. `done/` deliberately does not follow the scheme — `complete()` archives to a bare `<id>.json` so `undelivered()` pairs a job with its result by id alone. That is also why the key charset excludes `.`: a key containing one could mint an id whose job file is indistinguishable from another id's `.result.json`.
 
 **Delivery is tracked separately from completion.** `complete()` archives the result, and a `<id>.delivered.json` marker is written only once a notifier returns. A result with no marker is a reply somebody is still waiting for — the worker was cancelled between finishing and posting, or the post failed — and `redeliver_pending` re-posts it at the next start, before claiming new work. Only the *reply* is retried: the job's agent run already happened, and re-running it would repeat every side effect it had. Bounded by `DELIVERY_RETRY_WINDOW_S` (24h), so a permanently undeliverable result is not retried on every start until the archive prunes it.
 
 That is why `Notifier.notify` **raises** on a failed post rather than swallowing it: returning normally is what marks a result delivered, so an adapter that hides a failure turns a retryable miss into a reply nobody ever receives.
+
+**Outcomes are reported back to the producer.** `OutcomeRecorder` is the fourth port: the worker calls it once per completed job, after the result is durable and before delivery. Only a *producer* needs it — `cron.py` records attempts when it enqueues, and without the matching outcome its backoff reads a `failures` count nothing increments. It shipped broken exactly that way once, with unit tests green because they called the store directly, so the composition test now asserts the daemon's own wiring leaves a failure on record. Implementations must not raise, and the worker guards the call anyway: it sits between a durable result and its delivery, so a bookkeeping bug must not cost the reply.
 
 **Execution is at-least-once.** A crashed worker leaves its job in `cur/`; `recover_stale` moves it back to `new/` on the next start, and shutdown deliberately *cancels* an in-flight job rather than finishing it (so the process tree is reaped inside the supervisor's grace). A job must therefore be safe to re-run.
 
@@ -92,13 +97,13 @@ The sweep refuses to signal a group whose current command no longer matches what
 
 A queue deeper than the row cap gets a trailing `… N more` row, so the cap never truncates in silence. `N` is counted only when the page came back full — a shorter page means a job finished between the depth read and the row read, not a hidden row.
 
-The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#jobs-content` is a different widget** — the scheduler tab's cron table — and must not be reused.
+The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#cron-entries` is a different widget** — the cron tab's cron table — and must not be reused.
 
 There is no watch pane for a running job: that needs the worker to publish the running job's `session_uuid`, and the `run_id` in `agent_runner.py` is ephemeral and never persisted. Until it is, the daemon log takes the full width.
 
 ## Logging
 
-`preflight.setup_daemon_logging("jobs")` adds a midnight-rotating file handler (7 backups) beside the console, which `preflight._setup_logging` — console-only — does not: without it `logs/jobs.log` is never written and the tab's log pane has nothing to tail. Symphony uses the same helper. Console and file share one level: `basicConfig` sets the *root* logger from `LOG_LEVEL`, so the file handler's own `DEBUG` floor only bites when `LOG_LEVEL=DEBUG`.
+`preflight.setup_daemon_logging("jobs")` adds a midnight-rotating file handler (7 backups) beside the console, which `preflight._setup_logging` — console-only — does not: without it `logs/jobs.log` is never written and the tab's log pane has nothing to tail. Every supervised daemon uses the same helper. Console and file share one level: `basicConfig` sets the *root* logger from `LOG_LEVEL`, so the file handler's own `DEBUG` floor only bites when `LOG_LEVEL=DEBUG`.
 
 ## Config
 
@@ -106,7 +111,8 @@ There is no watch pane for a running job: that needs the worker to publish the r
 |---|---|---|
 | `JOBS_QUEUE_KIND` | `file` | Which `SUPPORTED_QUEUES` adapter to build |
 | `JOBS_POLL_INTERVAL_S` | `2.0` | Idle wait between drain attempts |
-| `JOBS_TIMEOUT` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit |
+| `JOBS_TIMEOUT` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit. A `Job.timeout` from a producer overrides it |
+| `JOBS_CONCURRENCY` | `1` | How many jobs run at once. A property of the machine, deliberately separate from a producer's own `max_concurrent` |
 | `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token |
 
 Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`) token from `SLACK_TOKEN` makes the worker post results as that user, and the Slack frontend — a separate process with its own dedup set — re-ingests them as new input, one spurious agent turn per job. `cli._notifier_loop_warning` warns about exactly this at startup.

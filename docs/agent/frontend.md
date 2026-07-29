@@ -58,8 +58,15 @@ Two traps if you touch the threshold. `_due_for_compaction` **consumes** the rea
 
 ## Scheduler is a frontend too
 
-`src/claude_on_the_fly/scheduler.py` implements `Frontend` to fire cron jobs through the same path as chat frontends. Look here if you're adding anything cron-shaped rather than chat-shaped — the existing pattern (jobs are prompts OR shell scripts, YAML config, mtime hot reload) is a useful template.
+## Cron is NOT a frontend
 
-## Symphony is NOT a frontend
+`cron.py` used to implement `Frontend`, because firing a scheduled prompt needed an
+agent run and the shared `Orchestrator` was the only thing that ran agents with
+sessions and workspaces. `jobs/` is that thing now, so the daemon dropped the
+protocol entirely: it runs shell and enqueues `Job`s, and never calls `agent.run`.
 
-Symphony is daemon-shaped (poll/claim/dispatch), not request/response. It bypasses `Frontend` and runs directly on `agent.run()`. If you're tempted to make your new thing a `Frontend`, ask first whether it's really request/response — if not, it's a new orchestrator kind and warrants its own pattern.
+The lesson generalizes. `Frontend` is for request/response — something asks, the
+agent answers, the answer goes back to the asker. If your new thing polls, or
+produces work whose reply belongs somewhere other than the caller, it is a
+producer: emit `Job`s and let the worker run them. Ask before making it a
+`Frontend`.
