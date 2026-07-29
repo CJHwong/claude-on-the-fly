@@ -875,3 +875,49 @@ class TestLogScrollPreservation:
                 render.restore_scroll(log, prev_y=prev_y)
             await pilot.pause()
             assert log.scroll_y == log.max_scroll_y
+
+
+@pytest.mark.asyncio
+async def test_doctor_re_reads_env_when_reopened(tmp_path, monkeypatch):
+    """Fix a value in .env, re-open doctor, and it must report the fixed value.
+
+    The screen is registered in App.SCREENS, so Textual builds one instance and
+    re-pushes it — `on_mount` fires only the first time. Refreshing on mount alone
+    left the previous verdict on screen, so fixing what doctor complained about and
+    looking again showed the same complaint, which reads as "my fix did nothing".
+    """
+    from claude_on_the_fly.tui import supervisor
+    from claude_on_the_fly.tui.screens import doctor as doctor_mod
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENT_BACKEND=pty\n", encoding="utf-8")
+    monkeypatch.setattr(supervisor, "DEFAULT_ENV_FILE", env_file)
+    monkeypatch.delenv("AGENT_BACKEND", raising=False)
+
+    reads: list[str | None] = []
+    real_refresh = doctor_mod.DoctorScreen._refresh
+
+    def _spy(self):
+        env = supervisor._load_env(supervisor.DEFAULT_ENV_FILE)
+        reads.append(env.get("AGENT_BACKEND"))
+        return real_refresh(self)
+
+    monkeypatch.setattr(doctor_mod.DoctorScreen, "_refresh", _spy)
+
+    app = ClaudeTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        assert reads == ["pty"]
+
+        # `pty` is a CLAUDE_MODE, not a backend — the mistake this reproduces.
+        env_file.write_text("AGENT_BACKEND=claude\n", encoding="utf-8")
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+
+    assert reads == ["pty", "claude"], (
+        "re-opening doctor must re-read .env, not show the previous render"
+    )
