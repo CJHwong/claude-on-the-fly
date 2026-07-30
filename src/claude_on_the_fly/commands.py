@@ -319,13 +319,21 @@ raise SystemExit(int(payload.get("rc", 1)))
 '''
 
 
-def leading_tokens(argv: list[str]) -> tuple[str, ...]:
+def leading_tokens(
+    argv: list[str], *, flags_take_values: bool = True
+) -> tuple[str, ...]:
     """The subcommand path: leading non-flag tokens, stopping at the first flag.
 
     `["pr", "view", "--json", "x"]` -> `("pr", "view")`. A flag's *value* is not
     a subcommand either, so `["--repo", "o/r", "auth", "token"]` -> `("auth",
     "token")` rather than `("o/r", "auth", "token")` — otherwise a readback match
     could be dodged by putting a global flag first.
+
+    Whether a bare flag consumes the next token cannot be known without the
+    tool's own flag table, so `flags_take_values=False` gives the other reading,
+    where every non-flag token is a subcommand candidate. `refuses_readback`
+    checks both, because assuming one of them is what lets `--verbose auth
+    logout` walk past a refusal for `auth logout`.
     """
     tokens: list[str] = []
     skip_value = False
@@ -335,18 +343,35 @@ def leading_tokens(argv: list[str]) -> tuple[str, ...]:
             continue
         if item.startswith("-"):
             # `--flag=value` carries its value; a bare flag may take the next arg.
-            skip_value = "=" not in item and item != "--"
+            skip_value = flags_take_values and "=" not in item and item != "--"
             continue
         tokens.append(item)
     return tuple(tokens)
 
 
 def refuses_readback(tool: ShimmedTool, argv: list[str]) -> bool:
-    """True if this invocation would hand the credential back to the caller."""
+    """True if this invocation would hand the credential back to the caller.
+
+    Both flag readings are tested and either one matching refuses. A boolean
+    global flag makes the value-consuming reading swallow the real subcommand
+    (`gh --help auth token` looked like `gh token`), so a single reading is a
+    bypass of the one refusal this broker has. Over-refusing the mirror case
+    costs an invocation whose flag value happens to spell a refused subcommand,
+    which is not a command anyone runs on purpose.
+    """
     if any(flag in tool.readback_flags for flag in argv):
         return True
-    tokens = leading_tokens(argv)
-    return any(tokens[: len(prefix)] == prefix for prefix in tool.readback)
+    if not tool.readback:
+        return False
+    readings = (
+        leading_tokens(argv),
+        leading_tokens(argv, flags_take_values=False),
+    )
+    return any(
+        tokens[: len(prefix)] == prefix
+        for tokens in readings
+        for prefix in tool.readback
+    )
 
 
 def _subprocess_env(tool: ShimmedTool) -> dict[str, str]:
@@ -372,20 +397,24 @@ async def _read_capped(stream) -> tuple[bytes, bool]:
 async def _terminate(proc) -> None:
     """Kill and reap, so a killed child never becomes a zombie or a hung wait.
 
-    The pipe transports are closed explicitly afterwards. Killing a child that is
-    still writing leaves its stdout transport holding buffered data, and asyncio
-    then closes it during loop teardown — which surfaces as a stray
-    "Event loop is closed" unraisable rather than anything actionable.
+    The pipe transports are closed *before* the wait, not after. Killing a child
+    that is still writing leaves its stdout transport holding buffered data, and
+    asyncio's `wait` does not return until every pipe connection is lost as well
+    as the process being reaped. Waiting first therefore always burned the full
+    timeout and logged "child did not exit after kill" for a child the kernel had
+    already reaped. Closing first also keeps the transport from being collected
+    during loop teardown, which surfaces as a stray "Event loop is closed"
+    unraisable rather than anything actionable.
     """
     if proc.returncode is None:
         proc.kill()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except TimeoutError:  # pragma: no cover - the kernel has not reaped it yet
-            logger.warning("commands: child did not exit after kill")
     transport = getattr(proc, "_transport", None)
     if transport is not None:
         transport.close()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except TimeoutError:  # pragma: no cover - the kernel has not reaped it yet
+        logger.warning("commands: child did not exit after kill")
 
 
 @dataclass
@@ -505,6 +534,16 @@ class CommandBroker:
         allowlist, so the agent can read and exec these but not rewrite them.
         """
         self._shim_dir.mkdir(parents=True, exist_ok=True)
+        # Stale shims are removed, not just left alone. This directory is on the
+        # agent's PATH ahead of the real binaries (sandbox._with_shims_on_path),
+        # so a shim for a tool that has since been dropped from commands.yaml or
+        # uninstalled does not fail over to the real binary -- it shadows it and
+        # answers "not brokered" with rc 127, permanently, until someone notices
+        # the file.
+        for stale in self._shim_dir.iterdir():
+            if stale.is_file() and stale.name not in self._tools:
+                logger.info("commands: removing stale shim %s", stale.name)
+                stale.unlink()
         for name in self._tools:
             path = self._shim_dir / name
             path.write_text(
@@ -646,6 +685,13 @@ class CommandBroker:
 
         Both streams are read concurrently. Draining stdout to the cap first would
         let stderr fill its pipe buffer and block the child forever.
+
+        The child is killed as soon as *either* stream caps, before the other is
+        awaited. Waiting for both to finish first deadlocks: the capped stream
+        stops being read, the child blocks writing into a full pipe, and so it
+        never exits and never closes the stream still being awaited. That turned
+        every over-long output into a `run_timeout` expiry, which reports a
+        timeout the command did not actually have.
         """
         if proc.stdin is not None:
             try:
@@ -654,13 +700,22 @@ class CommandBroker:
             except (BrokenPipeError, ConnectionResetError):
                 pass
             proc.stdin.close()
-        out, err = await asyncio.gather(
-            _read_capped(proc.stdout), _read_capped(proc.stderr)
-        )
-        # Past the cap the child may still be writing, so stop it rather than
-        # waiting on an exit that will not come.
-        if out[1] or err[1]:
-            await _terminate(proc)
-        else:
+        reads = [
+            asyncio.ensure_future(_read_capped(proc.stdout)),
+            asyncio.ensure_future(_read_capped(proc.stderr)),
+        ]
+        pending = set(reads)
+        capped = False
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            if any(task.result()[1] for task in done):
+                capped = True
+                # Frees the child from its full pipe, so the other read reaches
+                # EOF instead of waiting on an exit that will never come.
+                await _terminate(proc)
+        out, err = (task.result() for task in reads)
+        if not capped:
             await proc.wait()
-        return out[0], err[0], out[1] or err[1]
+        return out[0], err[0], capped

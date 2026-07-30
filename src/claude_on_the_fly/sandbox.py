@@ -136,7 +136,7 @@ egress policy", or an HTTP 451 means egress policy.
 Reads and writes have different scopes. Do not narrow reads to the write scope: \
 refusing a read you are actually permitted to make costs the user real work.
 - Reading: {reads}
-- Writing: the workspace ({project}) and your temp dir. Writes elsewhere fail.
+- Writing: {writes} Writes elsewhere fail.
 - Network: {net} Your model/API access is already routed through the broker via \
 *_BASE_URL, so it works without any key from you.
 
@@ -373,12 +373,32 @@ def agent_guidance(workspace: Path | None = None) -> str:
         return _ENV_GUIDANCE
     project = os.path.realpath(workspace) if workspace is not None else "the workspace"
     home = Path.home()
+    # Deferred like shim_dir(): agent imports this module, so a top-level import
+    # of DATA_DIR would be a cycle.
+    from claude_on_the_fly.agent import MEMORY_DIR
+
+    writes = (
+        f"the workspace ({project}), your memory ({MEMORY_DIR}), and your temp dir."
+    )
     if os.environ.get("COTF_SANDBOX_FS", "").lower() == "deny-most":
-        grants = [project, f"{home}/.claude", f"{home}/.cache/uv", *_extra_read_paths()]
+        # Must stay in step with the re-grants in fs-deny-most.sb. Under-listing
+        # is not harmless: the note below tells the agent not to narrow its reads,
+        # and a path missing here is one it will decline to try.
+        grants = [
+            project,
+            str(MEMORY_DIR),
+            f"{home}/.claude",
+            f"{home}/.claude.json",
+            f"{home}/.codex",
+            f"{home}/.cache/uv",
+            str(shim_dir()),
+            *_extra_read_paths(),
+        ]
         reads = (
             "You can read only these paths: "
             + ", ".join(grants)
-            + ". Reads elsewhere under your home directory are blocked."
+            + ", and your temp dir. Reads elsewhere under your home directory are "
+            "blocked."
         )
     else:
         reads = (
@@ -398,7 +418,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "pauses the request while the operator is asked to approve it, so a "
             "first call to a new host may take up to a minute."
         )
-    return _JAIL_GUIDANCE.format(project=project, reads=reads, net=net)
+    return _JAIL_GUIDANCE.format(reads=reads, writes=writes, net=net)
 
 
 def wrap(argv: list[str], workspace: Path) -> list[str]:
@@ -492,6 +512,54 @@ READABLE = "READABLE"
 BROKEN = "BROKEN"
 
 
+async def _probe_deny(spec: str, workspace: Path) -> str | None:
+    """Attempt one expected-denied read under the live profile. Outcome, or None
+    if the probe itself never ran and so says nothing either way."""
+    path = os.path.expanduser(spec)
+    argv = wrap(["/bin/cat", path], workspace)
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            *argv,
+            env=agent_env() or {},
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
+    except (OSError, TimeoutError) as exc:
+        logger.warning("sandbox: deny probe for %s failed to run: %s", spec, exc)
+        return None
+    message = err.decode("utf-8", "replace").lower()
+    if "sandbox-exec:" in message:
+        # The wrapper itself rejected the profile, so this probe says nothing
+        # about the boundary and neither will any other. Called out as its own
+        # outcome because the first version of this reported a profile that
+        # would not parse as six "absent" paths, which reads as benign.
+        logger.error(
+            "sandbox: probe %s could not run, the profile is broken: %s",
+            spec,
+            message.strip().splitlines()[0] if message.strip() else "?",
+        )
+        return BROKEN
+    if probe.returncode == 0:
+        logger.error(
+            "sandbox: PROBE FAIL %s is READABLE inside the jail; the profile "
+            "does not deny it",
+            spec,
+        )
+        return READABLE
+    if "not permitted" in message:
+        logger.info("sandbox: probe %s denied by the profile", spec)
+        return DENIED
+    # Most often "No such file or directory". Reported plainly rather than
+    # counted as a win, so an empty machine cannot look like a tested boundary.
+    logger.info(
+        "sandbox: probe %s not present, deny untested (%s)",
+        spec,
+        message.strip() or f"rc={probe.returncode}",
+    )
+    return ABSENT
+
+
 async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     """Probe each expected deny under the live profile; return path -> outcome.
 
@@ -512,53 +580,17 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     """
     if mode() != "jail":
         return {}
-    results: dict[str, str] = {}
-    for spec in _DENY_PROBES:
-        path = os.path.expanduser(spec)
-        argv = wrap(["/bin/cat", path], workspace or Path.cwd())
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                *argv,
-                env=agent_env() or {},
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
-        except (OSError, TimeoutError) as exc:
-            logger.warning("sandbox: deny probe for %s failed to run: %s", spec, exc)
-            continue
-        message = err.decode("utf-8", "replace").lower()
-        if "sandbox-exec:" in message:
-            # The wrapper itself rejected the profile, so this probe says nothing
-            # about the boundary and neither will any other. Called out as its own
-            # outcome because the first version of this reported a profile that
-            # would not parse as six "absent" paths, which reads as benign.
-            results[spec] = BROKEN
-            logger.error(
-                "sandbox: probe %s could not run, the profile is broken: %s",
-                spec,
-                message.strip().splitlines()[0] if message.strip() else "?",
-            )
-        elif probe.returncode == 0:
-            results[spec] = READABLE
-            logger.error(
-                "sandbox: PROBE FAIL %s is READABLE inside the jail; the profile "
-                "does not deny it",
-                spec,
-            )
-        elif "not permitted" in message:
-            results[spec] = DENIED
-            logger.info("sandbox: probe %s denied by the profile", spec)
-        else:
-            # Most often "No such file or directory". Reported plainly rather
-            # than counted as a win, so an empty machine cannot look like a
-            # tested boundary.
-            results[spec] = ABSENT
-            logger.info(
-                "sandbox: probe %s not present, deny untested (%s)",
-                spec,
-                message.strip() or f"rc={probe.returncode}",
-            )
+    # Concurrently: these are six independent subprocesses, each with its own
+    # 15s ceiling, and they sit on the daemon's startup path. Run in sequence the
+    # worst case was a minute and a half of a daemon that had not begun serving.
+    outcomes = await asyncio.gather(
+        *(_probe_deny(spec, workspace or Path.cwd()) for spec in _DENY_PROBES)
+    )
+    results: dict[str, str] = {
+        spec: outcome
+        for spec, outcome in zip(_DENY_PROBES, outcomes, strict=True)
+        if outcome is not None
+    }
     broken = [spec for spec, outcome in results.items() if outcome == BROKEN]
     leaked = [spec for spec, outcome in results.items() if outcome == READABLE]
     denied = [spec for spec, outcome in results.items() if outcome == DENIED]

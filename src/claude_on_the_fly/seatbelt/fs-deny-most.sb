@@ -51,6 +51,11 @@
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".
 (allow file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/shims")))
+;; The agent's persistent memory, which the system prompt has it read every turn.
+;; It lives outside the workspace, so deny-most makes it opaque along with the
+;; rest of $HOME unless it is granted back. Scoped to memory/ so the sibling .env
+;; and logs/ stay unreadable.
+(allow file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-read* (subpath (param "_TMPDIR")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
@@ -67,6 +72,7 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))

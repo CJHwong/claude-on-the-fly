@@ -202,6 +202,12 @@
 ;; Ollama: Needed to sync aliases, save configurations, and manage models/temporary files
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
+;; The agent's persistent memory. The system prompt tells it to update
+;; memory/users/<sender>/*.md and memory/knowledge/*.md every turn, and that path
+;; is outside the workspace, so without this every memory write fails with
+;; "Operation not permitted" and the feature is silently off under `jail`.
+;; Scoped to memory/ on purpose: the sibling .env and logs/ stay unreadable.
+(allow file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))

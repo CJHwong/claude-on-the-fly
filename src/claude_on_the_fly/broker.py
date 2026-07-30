@@ -78,6 +78,15 @@ _BLOCKED_NETS = tuple(
 
 _CHUNK = 64 * 1024
 
+# Largest request body the broker will relay. aiohttp's own default is 1 MiB,
+# which is far below what this proxy actually carries: a long conversation, a
+# pasted file, or an image attachment pushes a single /v1/messages POST past it,
+# and the agent then gets a 413 from its own credential proxy with no way to tell
+# that apart from an upstream rejection. Sized to Anthropic's documented 32 MB
+# request limit with headroom, and kept explicit rather than unlimited because
+# `_handle` buffers the body in memory before forwarding.
+_MAX_BODY_BYTES = 64 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class Route:
@@ -234,7 +243,7 @@ class Broker:
         self._session = ClientSession(
             timeout=ClientTimeout(total=None), auto_decompress=False
         )
-        app = web.Application()
+        app = web.Application(client_max_size=_MAX_BODY_BYTES)
         app.router.add_route("*", "/{tail:.*}", self._handle)
         self._runner = web.AppRunner(app)
         await self._runner.setup()

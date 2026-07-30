@@ -90,7 +90,11 @@ def _render_table(node: SyntaxTreeNode) -> str:
         for section in node.children
         for row in section.children
     ]
-    if not rows:
+    # No rows at all, or rows whose every cell is empty. A header-only table is
+    # the common source of the second case, and it used to render as a bare ```
+    # fence around a blank line, which reads as a broken reply rather than as an
+    # absent table.
+    if not any(cell.strip() for row in rows for cell in row):
         return ""
     ncols = max(len(row) for row in rows)
     rows = [row + [""] * (ncols - len(row)) for row in rows]
@@ -119,8 +123,11 @@ def _render_inline(node: SyntaxTreeNode) -> str:
         return f"`{node.content}`"
     if kind in ("softbreak", "hardbreak"):
         return "\n"
-    if kind in ("html_inline", "html_block"):
-        return node.content  # preserve raw Slack markup like <@U123>
+    if kind == "html_inline":
+        # Preserved rather than escaped: an agent writing raw Slack markup mid-
+        # sentence means it. Block-level HTML does not arrive here — it is a block
+        # node, so `_render_block` handles it, and its fallthrough drops it.
+        return node.content
     if kind == "strong":
         return f"*{_inline(node)}*"
     if kind == "em":

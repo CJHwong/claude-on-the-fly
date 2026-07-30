@@ -395,6 +395,38 @@ def _one_line(text: str) -> str:
     ) + "…"
 
 
+def _literal(text: str) -> str:
+    """Make `text` safe to drop inside a mrkdwn code span.
+
+    Slack has no general mrkdwn escape, so the only thing that keeps a code span
+    literal is denying it the character that ends it. Newlines go too: a span
+    cannot survive one, and the tail would render as ordinary mrkdwn.
+
+    Used for an approval subject, which is partly agent-reachable (a broker
+    route-scope request carries the path tail the agent asked for). Without this
+    the agent can close the span and style the operator's own prompt.
+    """
+    return " ".join(text.replace("`", "'").split())
+
+
+# Slack rejects a section text over 3000 characters, so a long detail has to be
+# cut somewhere. Leaves room for the marker below.
+_BLOCK_TEXT_LIMIT = 2900
+
+
+def _fit_block(text: str) -> str:
+    """`text` short enough for a Block Kit section, and honest when it was cut.
+
+    An approval detail is the one thing the operator has to read before granting,
+    so a silent truncation is the worst possible failure here: the tail is where
+    a suspicious path or an unexpected method would sit. Says so instead.
+    """
+    if len(text) <= _BLOCK_TEXT_LIMIT:
+        return text
+    dropped = len(text) - _BLOCK_TEXT_LIMIT
+    return f"{text[:_BLOCK_TEXT_LIMIT]}\n[{dropped} more characters, see the log]"
+
+
 def _skill_option_groups(skills: list[tuple[str, str]]) -> list[dict]:
     """Group (name, description) skills by plugin namespace into Block Kit
     option_groups (label = plugin, or 'user' for un-namespaced names).
@@ -892,7 +924,51 @@ class SlackFrontend(Frontend):
         nonce = uuid4().hex[:12]
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._pending_approvals[nonce] = future
-        posted = await self._app.client.chat_postMessage(
+        posted = await self._post_approval(channel, thread_ts, request, nonce)
+        granted = False
+        try:
+            granted = await future
+        finally:
+            # Also reached when the caller times out and cancels, so a stale
+            # nonce cannot linger and be answered later. The prompt is retired in
+            # here for the same reason: on the timeout path the cancellation used
+            # to skip it, leaving a spent card with live-looking buttons in the
+            # thread forever.
+            self._pending_approvals.pop(nonce, None)
+            try:
+                await self._retire_approval(channel, posted["ts"], request, granted)
+            except Exception:
+                # Never let a cosmetic edit change the answer, but never lose it
+                # either: `_retire_approval` already logs the Slack errors it
+                # expects, so anything arriving here is a surprise and the one
+                # place it would be visible is this log line.
+                logger.exception("slack: retiring the approval prompt failed")
+        return granted
+
+    async def _post_approval(
+        self,
+        channel: str,
+        thread_ts: str | None,
+        request: ApprovalRequest,
+        nonce: str,
+    ) -> AsyncSlackResponse:
+        """Post the approve/deny card. Pops the nonce if the post never lands."""
+        try:
+            return await self._post_approval_message(channel, thread_ts, request, nonce)
+        except Exception:
+            # Nothing will ever answer a card that was not posted, so the entry
+            # would sit in _pending_approvals for the life of the daemon.
+            self._pending_approvals.pop(nonce, None)
+            raise
+
+    async def _post_approval_message(
+        self,
+        channel: str,
+        thread_ts: str | None,
+        request: ApprovalRequest,
+        nonce: str,
+    ) -> AsyncSlackResponse:
+        return await self._app.client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
             # The detail names the host the agent asked for, so an unfurl would
@@ -907,13 +983,29 @@ class SlackFrontend(Frontend):
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": (
-                            f"*Permission request*\n`{request.subject}`\n\n"
-                            f"{request.detail}\n\n"
-                            f"Grant lasts {request.ttl_seconds / 60:.0f} min "
-                            "and dies on restart."
-                        ),
+                        "text": f"*Permission request*\n`{_literal(request.subject)}`",
                     },
+                },
+                {
+                    # plain_text, so Slack parses no mrkdwn in it. Parts of a
+                    # detail are agent-reachable -- a broker route-scope request
+                    # carries the path tail the agent asked for -- and mrkdwn here
+                    # would let the agent style the operator's own prompt, hiding
+                    # the real subject behind formatting or a fake verdict line.
+                    "type": "section",
+                    "text": {"type": "plain_text", "text": _fit_block(request.detail)},
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"Grant lasts {request.ttl_seconds / 60:.0f} min "
+                                "and dies on restart."
+                            ),
+                        }
+                    ],
                 },
                 {
                     "type": "actions",
@@ -936,14 +1028,6 @@ class SlackFrontend(Frontend):
                 },
             ],
         )
-        try:
-            granted = await future
-        finally:
-            # Also reached when the caller times out and cancels, so a stale
-            # nonce cannot linger and be answered later.
-            self._pending_approvals.pop(nonce, None)
-        await self._retire_approval(channel, posted["ts"], request, granted)
-        return granted
 
     async def _retire_approval(
         self, channel: str, ts: str, request: ApprovalRequest, granted: bool
@@ -969,7 +1053,8 @@ class SlackFrontend(Frontend):
                             {
                                 "type": "mrkdwn",
                                 "text": (
-                                    f"Permission *{verdict}*: `{request.subject}`"
+                                    f"Permission *{verdict}*: "
+                                    f"`{_literal(request.subject)}`"
                                 ),
                             }
                         ],

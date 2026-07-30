@@ -22,6 +22,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_markdown
 
 from claude_on_the_fly import logs
 from claude_on_the_fly.agent import DATA_DIR, Response, footer_parts
@@ -206,12 +207,20 @@ class TelegramFrontend(Frontend):
             ]
         )
         minutes = request.ttl_seconds / 60
+        # Escaped, not interpolated raw. Parts of a subject/detail are agent-
+        # reachable -- a broker route-scope request carries the path tail the agent
+        # asked for -- so unescaped Markdown here lets the agent style the operator's
+        # own prompt, hiding the real subject behind formatting or a fake verdict
+        # line. Escaping keeps the one text the operator must be able to trust
+        # literal.
+        subject = escape_markdown(request.subject, version=1)
+        detail = escape_markdown(request.detail, version=1)
         message = await self._app.bot.send_message(
             chat_id=chat_id,
             text=(
                 f"*Permission request*\n\n"
-                f"`{request.subject}`\n\n"
-                f"{request.detail}\n\n"
+                f"`{subject}`\n\n"
+                f"{detail}\n\n"
                 f"Grant lasts {minutes:.0f} min and dies on restart."
             ),
             parse_mode="Markdown",
@@ -222,14 +231,27 @@ class TelegramFrontend(Frontend):
             # pending request. Also keeps the buttons above the fold on a phone.
             disable_web_page_preview=True,
         )
+        granted = False
         try:
             granted = await future
         finally:
             # Reached on the caller's timeout cancellation too, so a stale
-            # nonce can never accumulate or be answered later.
+            # nonce can never accumulate or be answered later. The prompt is
+            # retired in here for the same reason: on the timeout path the
+            # cancellation used to skip it, leaving a spent card with a
+            # live-looking keyboard in the chat forever.
             self._pending_approvals.pop(nonce, None)
-        verdict = "APPROVED" if granted else "DENIED"
-        await self._retire_approval(chat_id, message.message_id, request, verdict)
+            verdict = "APPROVED" if granted else "DENIED"
+            try:
+                await self._retire_approval(
+                    chat_id, message.message_id, request, verdict
+                )
+            except Exception:
+                # Never let a cosmetic edit change the answer, but never lose it
+                # either: `_retire_approval` already logs the BadRequest it
+                # expects, so anything arriving here is a surprise and the one
+                # place it would be visible is this log line.
+                logger.exception("telegram: retiring the approval prompt failed")
         return granted
 
     async def _retire_approval(
@@ -242,7 +264,10 @@ class TelegramFrontend(Frontend):
             await self._app.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"*Permission {verdict}*\n\n`{request.subject}`",
+                text=(
+                    f"*Permission {verdict}*\n\n"
+                    f"`{escape_markdown(request.subject, version=1)}`"
+                ),
                 parse_mode="Markdown",
             )
         except BadRequest as exc:

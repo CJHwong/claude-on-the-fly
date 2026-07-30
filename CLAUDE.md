@@ -19,6 +19,9 @@ src/claude_on_the_fly/
   logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
   broker.py            # Loopback credential broker (keeps API keys out of the agent)
+  egress.py            # CONNECT proxy gating outbound HTTPS by destination host
+  commands.py          # Runs credentialed CLIs outside the sandbox via PATH shims
+  approvals.py         # Runtime permission grants (ask the operator, then widen)
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
   protocol.py          # Frontend protocol (add new interfaces here)
   cron.py              # Cron producer daemon — runs shell, enqueues Jobs

@@ -67,11 +67,16 @@ class Frontend(ABC):
         granting. Implementations must also return False when they have nowhere
         to ask.
 
-        Implementations must present request.detail verbatim: it states what
-        the sandbox actually observed, and it is the only text in the flow the
-        agent could not have authored. Whoever may *click* is a separate check
-        the implementation owns, and it must not be the whole audience of the
-        channel the prompt lands in.
+        Implementations must present request.detail verbatim, because it states
+        what the sandbox actually observed. Verbatim means *neutralised, not
+        reworded*: parts of a subject and detail are agent-reachable — a broker
+        route-scope request carries the path tail the agent asked for — so an
+        implementation rendering them as markup lets the agent restyle the
+        operator's own prompt and hide the real subject behind a fake verdict
+        line. Escape them, or put them somewhere the platform parses no markup.
+
+        Whoever may *click* is a separate check the implementation owns, and it
+        must not be the whole audience of the channel the prompt lands in.
         """
         return False
 

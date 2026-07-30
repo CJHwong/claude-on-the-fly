@@ -246,12 +246,18 @@ class ApprovalBroker:
 
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._in_flight[req.key] = future
+        granted = False
         try:
             granted = await self._invoke_gate(req)
         finally:
             self._in_flight.pop(req.key, None)
-        if not future.done():
-            future.set_result(granted)
+            # Resolved in the finally, not after the await, so the joiners always
+            # get an answer. When the first asker's turn is aborted mid-question
+            # this raises CancelledError, and settling the future only on the
+            # success path left every joined caller awaiting it forever — holding
+            # a live CONNECT open, since `check` has no timeout of its own.
+            if not future.done():
+                future.set_result(granted)
         return granted
 
     async def _invoke_gate(self, req: ApprovalRequest) -> bool:

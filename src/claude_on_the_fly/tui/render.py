@@ -174,8 +174,15 @@ def _fmt_uptime(started_at: str | None, now: datetime) -> str:
 def _fmt_next_fire(when: datetime, now: datetime) -> str:
     # cron.next_fire returns a naive local datetime; the caller-supplied
     # `now` may be tz-aware UTC. Convert both to naive local for the delta.
+    #
+    # `now` is used rather than a fresh datetime.now(): every row in the cron
+    # table should be measured from the same instant as the rest of the snapshot,
+    # and reading the clock again here made the parameter a lie and the function
+    # impossible to test.
     when_local = when.replace(tzinfo=None)
-    now_local = datetime.now().replace(microsecond=0)
+    now_local = (now.astimezone().replace(tzinfo=None) if now.tzinfo else now).replace(
+        microsecond=0
+    )
     delta = (when_local - now_local).total_seconds()
     when_str = when.strftime("%a %H:%M")
     if delta <= 0:

@@ -80,6 +80,23 @@ DEFAULT_ALLOWED_HOSTS = frozenset(
     }
 )
 
+
+def never_ask_subjects() -> frozenset[str]:
+    """DEFAULT_NEVER_ASK as ApprovalPolicy subject patterns.
+
+    An ApprovalRequest subject for a host is "<host>:<port>", so handing the bare
+    hostnames to `ApprovalPolicy(never_ask=...)` matched nothing at all and the
+    policy tier was silently dead. `ApprovalPolicy.refuses` treats a trailing "*"
+    as a prefix match, so the port-suffixed form is what actually refuses.
+
+    The EgressProxy checks DEFAULT_NEVER_ASK itself before it ever reaches the
+    broker, so this is the defense-in-depth copy: it is what stops any *other*
+    requester (or a proxy wired without a never-ask set) from offering a metadata
+    endpoint to an operator.
+    """
+    return frozenset(f"{host}:*" for host in DEFAULT_NEVER_ASK)
+
+
 _MAX_REQUEST_LINE = 8192
 _CHUNK = 64 * 1024
 _CONNECT_TIMEOUT_SECONDS = 30.0
@@ -269,7 +286,15 @@ class EgressProxy:
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        request_line = await reader.readline()
+        try:
+            request_line = await reader.readline()
+        except ValueError:
+            # A StreamReader raises rather than returning once its buffer limit is
+            # passed, so a request line over the stream limit never reached the
+            # length check below: it surfaced as an unhandled exception in
+            # _handle, with no response written to the client at all.
+            await self._refuse(writer, 414, "request line too long")
+            return
         if not request_line:
             return
         if len(request_line) > _MAX_REQUEST_LINE:
