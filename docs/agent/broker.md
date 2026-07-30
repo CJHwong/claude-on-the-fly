@@ -136,7 +136,6 @@ Package registries, `github.com`, telemetry, and self-update endpoints are
 deliberately excluded, because each is a decision worth making explicitly: a
 package install is arbitrary code execution, `github.com` grants writes, and
 telemetry is optional by definition.
-| `COTF_APPROVAL_CHAT_ID` | Telegram only: pins prompts to one chat. Unset routes them to the session's own chat. |
 
 ### Where the prompt lands, and who may answer
 
@@ -361,16 +360,26 @@ indistinguishable.
   jail, so its `api.github.com` calls never appear as CONNECTs. The argv is the
   record for that path.
 
-### Message content is redacted by default
+### Message content is redacted above DEBUG
 
-`COTF_LOG_CONTENT` is off. With it off, prompts and agent replies are logged as a
-length (`<412 chars redacted>`) and an over-long argv token is clipped
-(`'I have reviewed this and the approach seems wron…<+310>'`). The log directory
-is shaped for a file syncer, so anything written there should be assumed to leave
-the machine and to sit there for `COTF_LOG_KEEP_DAYS`; a prompt is the user's data
-rather than a diagnostic. Turn it on while working a message-handling bug, then
-turn it back off. Clipping is by token *length*, not by flag name, so a new
-content-carrying flag is covered without being enumerated.
+At `INFO` and higher, prompts and agent replies are logged as a length
+(`<412 chars redacted>`) and an over-long argv token is clipped
+(`'I have reviewed this and the approach seems wron…<+310>'`). At `LOG_LEVEL=DEBUG`
+both come through.
+
+The level is the control, not a separate switch, because `DEBUG` already carries
+message content by routes no redaction helper touches: `raw slack event` dumps the
+whole event including `text`, and slack_bolt logs full request and response
+payloads. A dedicated flag would have implied you could run at `DEBUG` without
+content in the file, which was never true. So the rule is simply: **a DEBUG log
+has everything in it and is not shareable**; an INFO log is.
+
+That matters because this directory is shaped for a file syncer, so anything
+written here should be assumed to leave the machine and to sit there for
+`COTF_LOG_KEEP_DAYS`. A prompt is the user's data rather than a diagnostic.
+
+Argv clipping is by token *length*, not by flag name, so a new content-carrying
+flag is covered without being enumerated.
 
 ## Scope and caveats
 

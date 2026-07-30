@@ -388,16 +388,6 @@ def test_env_editor_restarts_frontends_when_sandbox_vars_change():
         assert affected == {"telegram", "slack"}, f"{var} restarts {affected}"
 
 
-def test_env_editor_restarts_telegram_for_its_approval_override():
-    from claude_on_the_fly.tui.env_editor import EnvDiff, affected_daemons
-
-    # Telegram is the only frontend with a routing override; Slack always uses
-    # the session's own thread and denies when there isn't one.
-    assert affected_daemons(EnvDiff(added={"COTF_APPROVAL_CHAT_ID": "1"})) == {
-        "telegram"
-    }
-
-
 def test_guidance_warns_keychain_denial_is_not_an_eperm(monkeypatch, tmp_path):
     """Verified against a live run: a denied keychain read reports "item could
     not be found", not EPERM, so an agent taught EPERM-means-policy would read

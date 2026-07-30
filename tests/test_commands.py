@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from aiohttp import ClientSession
 
-from claude_on_the_fly import commands
+from claude_on_the_fly import commands, logs
 from claude_on_the_fly.commands import (
     ENDPOINT_ENV,
     MAX_STREAM_BYTES,
@@ -365,7 +365,7 @@ async def test_long_argv_token_is_clipped_by_default(
 ):
     """A `--body` blob is agent-authored prose, not an audit fact, so it must not
     ride into the log with the argv."""
-    monkeypatch.delenv("COTF_LOG_CONTENT", raising=False)
+    monkeypatch.setattr(logs, "log_content", lambda: False)
     prose = "x" * 400
     broker, port = await start(tmp_path, (echo_tool,))
     try:
@@ -382,7 +382,7 @@ async def test_long_argv_token_is_clipped_by_default(
 async def test_content_logging_opt_in_restores_full_argv(
     tmp_path, echo_tool, caplog, monkeypatch
 ):
-    monkeypatch.setenv("COTF_LOG_CONTENT", "1")
+    monkeypatch.setattr(logs, "log_content", lambda: True)
     prose = "y" * 200
     broker, port = await start(tmp_path, (echo_tool,))
     try:

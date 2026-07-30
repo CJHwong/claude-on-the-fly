@@ -37,21 +37,29 @@ _FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # Matches the retention the TimedRotatingFileHandler used to give (backupCount=7).
 DEFAULT_KEEP_DAYS = 7
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
 # How much of a redacted string survives when content logging is enabled.
 CONTENT_PREVIEW_CHARS = 80
 
 
 def log_content() -> bool:
-    """True when COTF_LOG_CONTENT permits message text in the log.
+    """True when the log is already verbose enough for message text to belong.
 
-    Off by default. These files live in a directory shaped for a file syncer
-    (see the module docstring), so anything written here should be assumed to
-    leave the machine and to sit there for the retention window. Prompts and
-    agent replies are the user's data and the agent's output, not diagnostics,
-    so they are not worth that by default.
+    Tied to the level rather than its own switch, because DEBUG already carries
+    content by several routes that no redaction helper controls: `raw slack
+    event` dumps the whole event including `text`, and slack_bolt logs full
+    request and response payloads. A separate knob implied you could run at DEBUG
+    without content in the file, which was never true.
+
+    So the rule is the level: at DEBUG the file has everything and should not be
+    treated as shareable; at INFO and above, prompts and agent replies are
+    reduced to their shape. That matters because these files live in a directory
+    shaped for a file syncer (see the module docstring), so anything written here
+    should be assumed to leave the machine and to sit there for the retention
+    window.
+
+    Reads the root logger, which is where `configure` puts LOG_LEVEL.
     """
-    return os.environ.get("COTF_LOG_CONTENT", "").lower() in _TRUTHY
+    return logging.getLogger().isEnabledFor(logging.DEBUG)
 
 
 def redact(text: str | None) -> str:

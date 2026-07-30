@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import mimetypes
-import os
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -170,22 +169,16 @@ class TelegramFrontend(Frontend):
     def _approval_chat(self, chat_id: int | None = None) -> int | None:
         """Where an approval prompt goes.
 
-        An explicit COTF_APPROVAL_CHAT_ID always wins, so an operator can pin
-        prompts somewhere specific. Otherwise the session's own chat, so the
-        question appears where the work is. Failing both (cron, the job queue),
-        the allowed user's DM -- a Telegram DM chat id equals the user id, so the
-        fallback is never a group.
+        The session's own chat, so the question appears where the work is. For
+        work with no conversation behind it (cron, the job queue), the allowed
+        user's DM -- a Telegram DM chat id equals the user id, so the fallback is
+        never a group.
+
+        There is deliberately no override: a prompt belongs with the work that
+        caused it, and routing it elsewhere only makes it harder to judge. Slack
+        goes further and denies for sessionless work rather than falling back at
+        all, because nobody is watching a cron job's thread.
         """
-        raw = os.environ.get("COTF_APPROVAL_CHAT_ID", "").strip()
-        if raw:
-            try:
-                return int(raw)
-            except ValueError:
-                logger.warning(
-                    "COTF_APPROVAL_CHAT_ID=%r is not an integer; approvals disabled",
-                    raw,
-                )
-                return None
         return chat_id if chat_id is not None else self._allowed_user_id
 
     async def ask_approval(
