@@ -442,3 +442,27 @@ class TestRowUrl:
             # A ticket key cannot become a URL without knowing its instance.
             s._row_url("ACES-1") is None
         )  # github tracker, no base_url path
+
+
+class TestEventDetailFallbacks:
+    """The detail column is the only place a row explains itself, so an event shape
+    with nothing to say must render blank rather than a stray repr."""
+
+    def test_a_worker_done_with_neither_reason_nor_cost_is_blank(self):
+        from claude_on_the_fly.tui.job_rows import _format_detail
+
+        assert _format_detail({"type": "worker_done", "source": "cron"}) == ""
+
+    def test_a_chat_dispatch_has_no_tracker_state_to_show(self):
+        """The identifier column already names the conversation."""
+        from claude_on_the_fly.tui.job_rows import _format_detail
+
+        assert _format_detail({"type": "dispatched", "source": "slack"}) == ""
+
+
+def test_an_unrecognised_event_type_has_no_detail():
+    """The event log is append-only and older daemons wrote types this build has
+    never heard of; a row for one still has to render."""
+    from claude_on_the_fly.tui.job_rows import _format_detail
+
+    assert _format_detail({"type": "some_future_event", "source": "cron"}) == ""

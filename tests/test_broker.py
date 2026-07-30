@@ -5,13 +5,14 @@ a real HTTP round-trip; only the keychain read is faked."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import ClientSession, web
 
 from claude_on_the_fly import broker
 from claude_on_the_fly.approvals import ApprovalBroker, RecordingGate
-from claude_on_the_fly.broker import Broker, Route, blocked_host
+from claude_on_the_fly.broker import _MAX_BODY_BYTES, Broker, Route, blocked_host
 
 
 async def _start(app: web.Application) -> tuple[web.AppRunner, int]:
@@ -610,3 +611,121 @@ async def test_gzipped_upstream_response_survives_the_broker(monkeypatch):
     finally:
         await broker.stop()
         await runner.cleanup()
+
+
+# --- request body size ---
+
+
+async def test_body_larger_than_aiohttps_default_cap_still_reaches_upstream(
+    fake_keychain,
+):
+    """aiohttp's own default is 1 MiB, far below what this proxy carries: a long
+    conversation, a pasted file, or an image attachment pushes a single
+    /v1/messages POST past it. Left at the default, the agent got a 413 from its
+    own credential proxy, indistinguishable from an upstream rejection."""
+    fake_keychain["svc"] = "key"
+    sizes: list[int] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        sizes.append(len(await request.read()))
+        return web.json_response({"ok": True})
+
+    app = web.Application(client_max_size=_MAX_BODY_BYTES)
+    app.router.add_post("/v1/messages", handler)
+    runner, up_port = await _start(app)
+    bro = Broker(
+        [
+            Route(
+                prefix="/anthropic",
+                upstream=f"http://localhost:{up_port}",
+                header="x-api-key",
+                keychain_service="svc",
+            )
+        ]
+    )
+    port = await bro.start()
+    try:
+        async with ClientSession() as client:
+            for size in (2 * 1024 * 1024, 8 * 1024 * 1024):
+                resp = await client.post(
+                    f"http://127.0.0.1:{port}/anthropic/v1/messages",
+                    data=b"x" * size,
+                )
+                assert resp.status == 200, await resp.text()
+    finally:
+        await bro.stop()
+        await runner.cleanup()
+    assert sizes == [2 * 1024 * 1024, 8 * 1024 * 1024]
+
+
+def test_body_cap_is_explicit_and_above_the_documented_provider_limit():
+    """Explicit rather than unlimited, because `_handle` buffers the body in
+    memory before forwarding; above Anthropic's documented 32 MB so a legitimate
+    request is never the thing that trips it."""
+    assert _MAX_BODY_BYTES > 32 * 1024 * 1024
+    assert _MAX_BODY_BYTES > 1024 * 1024, "must beat aiohttp's own default"
+
+
+# --- keychain access ---
+
+
+def test_read_keychain_returns_the_value_without_its_trailing_newline(monkeypatch):
+    """`security` prints a trailing newline, which would travel into the
+    Authorization header and be rejected upstream."""
+    monkeypatch.setattr(
+        broker.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout="secret-value\n"),
+    )
+    assert broker.read_keychain("cotf-anthropic") == "secret-value"
+
+
+def test_read_keychain_raises_keyerror_when_the_item_is_absent(monkeypatch):
+    """Loudly at broker start rather than on the agent's first request."""
+    monkeypatch.setattr(
+        broker.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=44, stdout=""),
+    )
+    with pytest.raises(KeyError, match="cotf-missing"):
+        broker.read_keychain("cotf-missing")
+
+
+def test_keychain_exists_reports_presence_without_reading_the_value(monkeypatch):
+    """The probe must not pass `-w`, or a presence check would pull the secret
+    into this process for no reason."""
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **_kw):
+        seen.append(argv)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(broker.subprocess, "run", fake_run)
+    assert broker.keychain_exists("cotf-anthropic") is True
+    assert "-w" not in seen[0]
+
+
+def test_keychain_exists_is_false_for_a_missing_item(monkeypatch):
+    monkeypatch.setattr(
+        broker.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=44, stdout=""),
+    )
+    assert broker.keychain_exists("cotf-missing") is False
+
+
+def test_port_before_start_raises_rather_than_returning_a_placeholder():
+    """A zero or None here would be published into ANTHROPIC_BASE_URL and the
+    agent would spend its turn talking to nothing."""
+    bro = Broker(
+        [
+            Route(
+                prefix="/anthropic",
+                upstream="https://api.anthropic.com",
+                header="x-api-key",
+                keychain_service="svc",
+            )
+        ]
+    )
+    with pytest.raises(RuntimeError, match="not started"):
+        _ = bro.port

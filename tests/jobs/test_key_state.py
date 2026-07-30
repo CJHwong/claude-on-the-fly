@@ -224,3 +224,40 @@ def test_the_recorder_ignores_unkeyed_jobs(tmp_path: Path) -> None:
     KeyStateOutcomeRecorder(store).record(_Job(None), _Result(ok=False))
 
     assert not store.dir.exists()
+
+
+def test_an_outcome_that_cannot_be_recorded_is_logged_not_raised(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """This closes cron's feedback loop, so losing a write costs a wrong backoff
+    decision on the next round — not the job whose work is already finished."""
+    from claude_on_the_fly.jobs.core import Job, Result
+    from claude_on_the_fly.jobs.key_state import KeyStateOutcomeRecorder
+
+    store = KeyStateStore(tmp_path)
+
+    def record_fails(*_args, **_kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(store, "record_outcome", record_fails)
+    recorder = KeyStateOutcomeRecorder(store)
+    job = Job(id="1", prompt="do it", origin={"kind": "cron"}, key="entry-a")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.key_state"):
+        recorder.record(job, Result(ok=True, text="done"))
+    assert "could not record outcome for entry-a" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_a_job_with_no_key_is_not_recorded(tmp_path: Path) -> None:
+    """Slack jobs have no cron key, and an empty-string key would collide every
+    keyless job into one backoff bucket."""
+    from claude_on_the_fly.jobs.core import Job, Result
+    from claude_on_the_fly.jobs.key_state import KeyStateOutcomeRecorder
+
+    store = KeyStateStore(tmp_path)
+    recorder = KeyStateOutcomeRecorder(store)
+    recorded: list[tuple] = []
+    store.record_outcome = lambda *a, **kw: recorded.append((a, kw))  # type: ignore[method-assign]
+    recorder.record(Job(id="1", prompt="x", origin={}), Result(ok=True, text="done"))
+    assert recorded == []

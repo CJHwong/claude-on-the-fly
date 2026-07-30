@@ -615,3 +615,203 @@ def test_operator_config_lives_outside_the_agents_write_scope():
     assert ".claude-on-the-fly" in str(path)
     # Same directory that holds the shims, which is read/exec but not writable.
     assert path.parent == sandbox.shim_dir().parent
+
+
+# --- the readback refusal cannot be dodged by a leading flag ---
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["auth", "token"],
+        # A *boolean* global flag: the value-consuming reading swallows "auth"
+        # and the invocation looked like `gh token`, which matches no refusal.
+        ["--help", "auth", "token"],
+        ["-q", "auth", "token"],
+        # And the value-consuming reading still has to work, so both must.
+        ["--repo", "o/r", "auth", "token"],
+        ["--repo=o/r", "auth", "token"],
+        ["--help", "auth", "status", "--show-token"],
+    ],
+)
+def test_leading_flag_cannot_smuggle_a_readback_past_the_refusal(argv):
+    """Whether a bare flag consumes the next token is unknowable without the
+    tool's own flag table, so both readings are checked and either one matching
+    refuses. Assuming a single reading is a bypass of the only refusal this
+    broker has."""
+    assert refuses_readback(GH, argv) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "view", "--json", "title"],
+        ["pr", "list"],
+        ["issue", "create", "--title", "auth", "--body", "token"],
+        ["api", "--method", "GET", "repos/o/r"],
+    ],
+)
+def test_ordinary_work_is_not_caught_by_the_second_reading(argv):
+    """The mirror cost of checking both readings is a flag *value* that spells a
+    refused subcommand, and only at the very front of the argv. Ordinary
+    invocations must stay allowed or the shim is useless."""
+    assert refuses_readback(GH, argv) is False
+
+
+def test_leading_tokens_second_reading_treats_every_bare_word_as_a_subcommand():
+    assert leading_tokens(["--json", "x", "pr", "list"]) == ("pr", "list")
+    assert leading_tokens(["--json", "x", "pr", "list"], flags_take_values=False) == (
+        "x",
+        "pr",
+        "list",
+    )
+
+
+def test_a_tool_with_no_readback_list_refuses_nothing():
+    plain = ShimmedTool(name="jq")
+    assert refuses_readback(plain, ["auth", "token"]) is False
+
+
+# --- stale shims ---
+
+
+async def test_dropping_a_tool_removes_its_shim(tmp_path, echo_tool):
+    """The shim dir goes on the agent's PATH ahead of the real binaries, so a
+    shim left behind for a tool that is no longer brokered does not fail over to
+    the real binary: it shadows it and answers "not brokered" with rc 127,
+    permanently."""
+    shim_dir = tmp_path / "shims"
+    first = CommandBroker(shim_dir, (echo_tool, ShimmedTool(name="cat")))
+    first.write_shims()
+    assert sorted(p.name for p in shim_dir.iterdir()) == ["cat", "echo"]
+
+    second = CommandBroker(shim_dir, (echo_tool,))
+    second.write_shims()
+    assert sorted(p.name for p in shim_dir.iterdir()) == ["echo"]
+
+
+async def test_stale_shim_removal_is_logged(tmp_path, echo_tool, caplog):
+    shim_dir = tmp_path / "shims"
+    CommandBroker(shim_dir, (echo_tool, ShimmedTool(name="cat"))).write_shims()
+    with caplog.at_level("INFO", logger="claude_on_the_fly.commands"):
+        CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    assert "removing stale shim cat" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+async def test_a_directory_in_the_shim_dir_is_left_alone(tmp_path, echo_tool):
+    """Only files are candidates. Deleting a directory here would need rmtree,
+    which is not a thing shim maintenance should be able to do."""
+    shim_dir = tmp_path / "shims"
+    shim_dir.mkdir(parents=True)
+    (shim_dir / "operator-notes").mkdir()
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    assert (shim_dir / "operator-notes").is_dir()
+
+
+# --- subprocess failure modes ---
+
+
+async def test_a_binary_that_cannot_be_executed_reports_127_not_a_traceback(
+    tmp_path, monkeypatch
+):
+    """An OSError from the spawn itself (a broken interpreter line, a corrupt
+    binary) has to come back as a command result, or the agent sees a 500 from the
+    broker and cannot tell what it did wrong.
+
+    Executable enough for `shutil.which` to resolve it, so it survives the
+    construction filter, and unexecutable enough for exec to fail.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    broken = bindir / "broken-shebang"
+    broken.write_text("#!/nonexistent/interpreter\n")
+    broken.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+    broker, port = await start(tmp_path, (ShimmedTool(name="broken-shebang"),))
+    try:
+        out = await post(port, {"tool": "broken-shebang", "argv": []})
+        assert out["rc"] == 127
+        assert "cannot run broken-shebang" in out["stderr"]
+    finally:
+        await broker.stop()
+
+
+async def test_output_past_the_cap_is_truncated_with_an_actionable_note(tmp_path):
+    """Capped while reading rather than truncated afterwards: an unbounded
+    producer would otherwise be buffered whole and turn any chatty command into a
+    daemon memory bomb."""
+    broker, port = await start(tmp_path, (ShimmedTool(name="head"),))
+    try:
+        out = await post(
+            port,
+            {"tool": "head", "argv": ["-c", str(MAX_STREAM_BYTES * 2), "/dev/zero"]},
+        )
+        assert len(out["stdout"].encode("utf-8", "replace")) <= MAX_STREAM_BYTES
+        assert "output truncated" in out["stderr"]
+        assert "write the full result to a file" in out["stderr"]
+    finally:
+        await broker.stop()
+
+
+async def test_truncation_is_logged(tmp_path, caplog):
+    broker, port = await start(tmp_path, (ShimmedTool(name="head"),))
+    try:
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.commands"):
+            await post(
+                port,
+                {
+                    "tool": "head",
+                    "argv": ["-c", str(MAX_STREAM_BYTES * 2), "/dev/zero"],
+                },
+            )
+    finally:
+        await broker.stop()
+    assert "output truncated at the cap" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+async def test_stdin_for_a_command_that_never_reads_it_does_not_fail_the_run(
+    tmp_path,
+):
+    """`true` exits without draining stdin, so the write races the exit and can
+    hit a broken pipe. That is the command working, not an error to surface."""
+    broker, port = await start(tmp_path, (ShimmedTool(name="true"),))
+    try:
+        # Comfortably past a 64 KiB pipe buffer so the write has to block,
+        # and comfortably under the broker's own 1 MiB request cap.
+        out = await post(port, {"tool": "true", "argv": [], "stdin": "x" * (1 << 19)})
+        assert out["rc"] == 0
+        assert out["stderr"] == ""
+    finally:
+        await broker.stop()
+
+
+async def test_read_capped_handles_an_absent_stream():
+    """A process spawned without a pipe has None for that stream."""
+    assert await commands._read_capped(None) == (b"", False)
+
+
+# --- config validation ---
+
+
+def test_a_scalar_where_a_list_belongs_is_named_not_coerced():
+    """A bare string is iterable, so coercing it would turn "--show-token" into a
+    set of 12 single-character flags that match nothing."""
+    with pytest.raises(ValueError, match="readback_flags must be a list, got str"):
+        commands.parse_tools(
+            {"tools": [{"name": "gh", "readback_flags": "--show-token"}]},
+            source="test",
+        )
+
+
+def test_an_empty_readback_entry_is_rejected_rather_than_matching_everything():
+    """An empty prefix is a prefix of every argv, so it would refuse every
+    invocation of the tool."""
+    with pytest.raises(ValueError, match="readback has an empty entry"):
+        commands.parse_tools(
+            {"tools": [{"name": "gh", "readback": ["  "]}]}, source="test"
+        )

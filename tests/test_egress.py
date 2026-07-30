@@ -9,6 +9,7 @@ branch was taken.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 
 import pytest
@@ -19,9 +20,11 @@ from claude_on_the_fly.approvals import (
     RecordingGate,
 )
 from claude_on_the_fly.egress import (
+    _MAX_REQUEST_LINE,
     DEFAULT_NEVER_ASK,
     EgressProxy,
     is_dns_safe_host,
+    never_ask_subjects,
     parse_connect_target,
 )
 
@@ -683,3 +686,158 @@ async def test_resolved_addresses_are_logged_for_rebinding_review(caplog):
         await proxy._resolve_public("localhost", 443)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "resolved to" in logged
+
+
+# --- request-line length ---
+
+
+async def test_over_long_request_line_gets_414_not_a_dropped_connection():
+    """A StreamReader raises once past its buffer limit rather than returning, so
+    the `len(request_line) > _MAX_REQUEST_LINE` check below it was unreachable at
+    the sizes that matter: the ValueError surfaced as an unhandled exception and
+    the client got no response at all."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)))
+    port = await proxy.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"CONNECT " + b"a" * 200_000 + b":443 HTTP/1.1\r\n\r\n")
+        with contextlib.suppress(ConnectionError):
+            await writer.drain()
+        status = await asyncio.wait_for(reader.read(64), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+    assert status.startswith(b"HTTP/1.1 414"), status
+
+
+async def test_request_line_just_over_the_limit_also_gets_414():
+    """The in-band check still has to work for a line long enough to matter but
+    short enough that the reader returns it normally."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)))
+    port = await proxy.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"CONNECT " + b"a" * (_MAX_REQUEST_LINE + 10) + b":443 HTTP/1.1\r\n"
+        )
+        await writer.drain()
+        status = await asyncio.wait_for(reader.read(64), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+    assert status.startswith(b"HTTP/1.1 414"), status
+
+
+# --- never-ask, as a policy subject ---
+
+
+def test_never_ask_subjects_match_the_subject_form_a_requester_actually_sends():
+    """An ApprovalRequest subject for a host is "<host>:<port>", so the bare
+    hostname set matched nothing and the policy tier was silently dead."""
+    policy = ApprovalPolicy(never_ask=never_ask_subjects())
+    for host in DEFAULT_NEVER_ASK:
+        assert policy.refuses(f"{host}:443"), host
+        assert policy.refuses(f"{host}:80"), host
+
+
+def test_bare_hostnames_are_not_a_working_never_ask_set():
+    """Pins the bug this replaced, so nobody wires the raw set back in."""
+    policy = ApprovalPolicy(never_ask=DEFAULT_NEVER_ASK)
+    assert policy.refuses("metadata.google.internal:443") is False
+
+
+def test_never_ask_subjects_do_not_overmatch_a_neighbouring_host():
+    policy = ApprovalPolicy(never_ask=never_ask_subjects())
+    assert policy.refuses("metadata.google.internal.evil.com:443") is False
+
+
+# --- malformed and truncated requests ---
+
+
+async def test_client_that_opens_and_closes_without_sending_gets_no_response():
+    """A health-check style probe (connect, close) must not log or reply."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)))
+    port = await proxy.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write_eof()
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(64), timeout=5) == b""
+        writer.close()
+    finally:
+        await proxy.stop()
+
+
+async def test_single_token_request_line_gets_400():
+    """`parts < 2` is a different shape from a malformed CONNECT target: there is
+    no target to report at all."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)))
+    port = await proxy.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"CONNECT\r\n")
+        await writer.drain()
+        status = await asyncio.wait_for(reader.read(128), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+    assert status.startswith(b"HTTP/1.1 400"), status
+    assert b"malformed request line" in status
+
+
+async def test_unexpected_handler_failure_is_logged_not_swallowed(monkeypatch, caplog):
+    """`_handle`'s catch-all exists so one bad connection cannot take the proxy
+    down, but a silent one would make the cause unfindable."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)))
+
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(proxy, "_serve", explode)
+    port = await proxy.start()
+    try:
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.egress"):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+            await writer.drain()
+            # The handler writes nothing and closes, so the read is as likely to
+            # reset as it is to return empty. Either way the log line is the point.
+            with contextlib.suppress(ConnectionError):
+                await asyncio.wait_for(reader.read(64), timeout=5)
+            writer.close()
+            await asyncio.sleep(0.05)
+    finally:
+        await proxy.stop()
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "connection handler failed" in logged
+
+
+async def test_resolution_returning_nothing_is_refused_with_a_reason(
+    monkeypatch, caplog
+):
+    """An empty getaddrinfo is not the same as a resolution error, and it must
+    not fall through to a connect against None."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))
+    loop = asyncio.get_running_loop()
+
+    async def resolve_nothing(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(loop, "getaddrinfo", resolve_nothing, raising=False)
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.egress"):
+        assert await proxy._resolve_public("example.com", 443) is None
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "no usable address" in logged
+
+
+async def test_pipe_survives_a_peer_that_vanishes_mid_stream():
+    """Half of a tunnel dying is ordinary, so `_pipe` must return rather than
+    raise into the handler and log a traceback for every closed connection."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"payload")
+
+    class ResettingWriter:
+        def write(self, _chunk: bytes) -> None:
+            raise ConnectionResetError("peer gone")
+
+    await EgressProxy._pipe(reader, ResettingWriter())  # type: ignore[arg-type]

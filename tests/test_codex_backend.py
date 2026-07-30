@@ -1093,3 +1093,267 @@ class TestCodexCompact:
 
         assert outcome is not None and outcome.ok is False
         assert "token usage" in outcome.error
+
+
+# ---------------------------------------------------------------------------
+# The exec wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestCodexExec:
+    """Everything the CLI can do wrong has to become a RuntimeError carrying the
+    most specific detail available, because that string is what the user reads."""
+
+    def _proc(self, stdout: bytes, stderr: bytes = b"", rc: int = 0):
+        from unittest.mock import MagicMock
+
+        proc = MagicMock()
+        proc.returncode = rc
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        return proc
+
+    async def _run(self, proc, **kwargs):
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(codex_mod.agent, "_kill_process_tree", new_callable=AsyncMock),
+        ):
+            return await codex_mod._run_codex_exec(
+                Path("/tmp"), ["codex"], kwargs.get("timeout")
+            )
+
+    async def test_a_clean_run_returns_the_parsed_stream(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "t-1"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        parsed = await self._run(self._proc(stdout))
+        assert parsed["thread_id"] == "t-1"
+        assert parsed["body"] == "hi"
+
+    async def test_a_timeout_names_the_limit(self) -> None:
+        from unittest.mock import MagicMock
+
+        proc = MagicMock()
+        proc.returncode = None
+
+        async def never(*_args, **_kwargs):
+            import asyncio
+
+            await asyncio.Event().wait()
+
+        proc.communicate = never
+        with pytest.raises(RuntimeError, match=r"timed out after 0\.01s"):
+            await self._run(proc, timeout=0.01)
+
+    async def test_cancellation_reaps_the_process_group(self) -> None:
+        """Frontends cancel a live turn to implement $stop, and codex spawns tool
+        subprocesses that must die with it rather than orphaning."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        started = asyncio.Event()
+
+        async def never_finishes():
+            started.set()
+            await asyncio.Event().wait()
+
+        proc = MagicMock()
+        proc.returncode = None
+        proc.communicate = never_finishes
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(
+                codex_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ) as kill,
+        ):
+            task = asyncio.create_task(
+                codex_mod._run_codex_exec(Path("/tmp"), ["codex"], None)
+            )
+            await asyncio.wait_for(started.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        kill.assert_awaited_once_with(proc)
+
+    async def test_a_turn_failure_in_the_stream_wins_over_the_exit_code(self) -> None:
+        """codex reports the real reason in `turn.failed`; the exit code is just a
+        number, so the stream's message is the better error."""
+        stdout = json.dumps(
+            {"type": "turn.failed", "error": {"message": "model refused"}}
+        ).encode()
+        with pytest.raises(RuntimeError, match="model refused"):
+            await self._run(self._proc(stdout, b"exit 1 noise", rc=1))
+
+    async def test_stderr_is_used_when_the_stream_says_nothing(self) -> None:
+        with pytest.raises(RuntimeError, match="command not found"):
+            await self._run(self._proc(b"", b"command not found: codex", rc=127))
+
+    async def test_a_bare_exit_code_is_reported_when_nothing_else_is_available(
+        self,
+    ) -> None:
+        with pytest.raises(RuntimeError, match="Exit code 3"):
+            await self._run(self._proc(b"", b"", rc=3))
+
+    async def test_a_turn_failure_on_a_zero_exit_still_raises(self) -> None:
+        """codex can exit 0 having failed the turn, so the stream has to be checked
+        even on a clean exit or the user gets an empty reply and no reason."""
+        stdout = json.dumps(
+            {"type": "turn.failed", "error": {"message": "context overflow"}}
+        ).encode()
+        with pytest.raises(RuntimeError, match="context overflow"):
+            await self._run(self._proc(stdout, rc=0))
+
+
+# ---------------------------------------------------------------------------
+# Prompt expansion edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestExpandCodexPromptFailures:
+    def test_a_template_that_cannot_be_read_leaves_the_prompt_alone(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Better to send the user's literal text than to swallow the turn."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        template = prompts / "review.md"
+        template.write_text("---\n---\nReview $ARGUMENTS")
+
+        def read_fails(self, *_args, **_kwargs):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "read_text", read_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.backends.codex"):
+            assert codex_mod._expand_codex_prompt("/review diff") == "/review diff"
+        assert "cannot read" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_bare_slash_is_not_a_command(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        assert codex_mod._expand_codex_prompt("/ something") == "/ something"
+
+    def test_unbalanced_quotes_fall_back_to_a_plain_split(self, tmp_path, monkeypatch):
+        """shlex raises on an unterminated quote, and a user typing one mid-sentence
+        should not lose the turn over it."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        (prompts / "ask.md").write_text("Q: $1")
+        assert codex_mod._expand_codex_prompt("/ask what's \"up") == "Q: what's"
+
+
+# ---------------------------------------------------------------------------
+# Prompt listing failures
+# ---------------------------------------------------------------------------
+
+
+class TestCodexListSkillsFailures:
+    async def test_an_unreadable_prompts_dir_yields_nothing(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        (tmp_path / "prompts").mkdir()
+
+        def glob_fails(self, _pattern):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "glob", glob_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.backends.codex"):
+            assert await CodexBackend().list_skills() == []
+        assert "cannot read" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_a_prompt_file_that_cannot_be_read_keeps_its_name(
+        self, tmp_path, monkeypatch
+    ):
+        """The name is what the picker needs; the description is a nicety."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        (prompts / "review.md").write_text("---\ndescription: Review it\n---\n")
+        real_read = Path.read_text
+
+        def read_fails(self, *args, **kwargs):
+            if self.name == "review.md":
+                raise OSError("permission denied")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_fails)
+        assert await CodexBackend().list_skills() == [("review", "")]
+
+
+def test_blank_lines_in_the_stream_are_skipped():
+    """codex's JSONL has trailing and interleaved blank lines; treating one as a
+    parse failure would log a warning per turn."""
+    stdout = (
+        b'\n{"type": "thread.started", "thread_id": "t-1"}\n\n   \n'
+        b'{"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}\n\n'
+    )
+    parsed = parse_codex_stream(stdout)
+    assert parsed["thread_id"] == "t-1"
+    assert parsed["body"] == "hi"
+    assert parsed["error"] is None
+
+
+class TestCodexContextReading:
+    """The absolutes the auto-compact gate thresholds on. Codex reports them in the
+    rollout rather than on stdout, so the reading is a second lookup and can be
+    absent."""
+
+    async def test_a_rollout_reading_reaches_the_response(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(thread_id="t-1"),
+            ),
+            patch.object(
+                codex_mod.transcript,
+                "extract_codex_prompt_tokens",
+                return_value=(650_000, 1_000_000),
+            ),
+        ):
+            resp = await CodexBackend().run(workspace, "s-1", "hi", "telegram")
+        assert resp.context_tokens == 650_000
+        assert resp.context_window_size == 1_000_000
+
+    async def test_no_rollout_yet_leaves_the_reading_unset(self, tmp_path: Path):
+        """None reads downstream as "no reading" rather than as an empty context, so
+        a first turn cannot make a large session look small."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(thread_id="t-1"),
+            ),
+            patch.object(
+                codex_mod.transcript, "extract_codex_prompt_tokens", return_value=None
+            ),
+        ):
+            resp = await CodexBackend().run(workspace, "s-1", "hi", "telegram")
+        assert resp.context_tokens is None
+        assert resp.context_window_size is None
+
+    async def test_a_window_of_zero_is_not_a_reading(self, tmp_path: Path):
+        """Dividing by it would raise, and reporting 0 would read as a full window."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(thread_id="t-1"),
+            ),
+            patch.object(
+                codex_mod.transcript,
+                "extract_codex_prompt_tokens",
+                return_value=(100, 0),
+            ),
+        ):
+            resp = await CodexBackend().run(workspace, "s-1", "hi", "telegram")
+        assert resp.context_tokens is None

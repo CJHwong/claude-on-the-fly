@@ -2195,7 +2195,7 @@ class SlackFrontend(Frontend):
         return names or ["unknown"]
 
 
-def main() -> None:  # pragma: no cover
+def main() -> None:
     import argparse
 
     from dotenv import load_dotenv

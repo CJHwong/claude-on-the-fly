@@ -893,7 +893,7 @@ class CronDaemon:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:  # pragma: no cover
+def main() -> int:
     import argparse
     import signal
 

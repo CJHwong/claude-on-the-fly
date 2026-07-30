@@ -8,6 +8,7 @@ accidentally grants is the whole risk of this feature existing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -428,3 +429,72 @@ async def test_gate_type_is_named_when_asking(caplog):
     with caplog.at_level("INFO", logger="claude_on_the_fly.approvals"):
         await broker.check(ApprovalRequest(kind="host", subject="x:443", detail="d"))
     assert any("via DenyAllGate" in r.getMessage() for r in caplog.records)
+
+
+# --- the collapsed question must always settle ---
+
+
+async def test_joined_caller_gets_an_answer_when_the_first_asker_is_cancelled():
+    """Concurrent requests for the same subject collapse onto one question, so the
+    joiners depend entirely on the first asker resolving the shared future. It
+    used to be set only on the success path: an operator aborting the turn
+    cancelled the asker and left every joiner awaiting forever, each holding a
+    live CONNECT open, because `check` has no timeout of its own."""
+    started = asyncio.Event()
+
+    class HangingGate:
+        async def request(self, req: ApprovalRequest) -> bool:
+            started.set()
+            await asyncio.sleep(3600)
+            return True
+
+    broker = ApprovalBroker(HangingGate())
+    req = ApprovalRequest(kind="host", subject="slow:443", detail="d")
+    first = asyncio.create_task(broker.check(req))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    joiner = asyncio.create_task(broker.check(req))
+    await asyncio.sleep(0.05)
+
+    first.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await first
+    # Fails closed: an aborted question is not an approval.
+    assert await asyncio.wait_for(joiner, timeout=2) is False
+
+
+async def test_joined_caller_gets_an_answer_when_the_gate_raises():
+    """Same contract for a gate that errors rather than being cancelled: the
+    joiner must not inherit the hang."""
+
+    class BrokenGate:
+        async def request(self, req: ApprovalRequest) -> bool:
+            await asyncio.sleep(0.05)
+            raise RuntimeError("frontend is down")
+
+    broker = ApprovalBroker(BrokenGate())
+    req = ApprovalRequest(kind="host", subject="broken:443", detail="d")
+    results = await asyncio.gather(
+        broker.check(req), broker.check(req), return_exceptions=True
+    )
+    assert all(r is False for r in results), results
+
+
+async def test_a_cancelled_question_leaves_no_grant_behind():
+    """An abort must not widen policy, or retrying the same host after an aborted
+    prompt would silently succeed."""
+    started = asyncio.Event()
+
+    class HangingGate:
+        async def request(self, req: ApprovalRequest) -> bool:
+            started.set()
+            await asyncio.sleep(3600)
+            return True
+
+    broker = ApprovalBroker(HangingGate())
+    req = ApprovalRequest(kind="host", subject="slow:443", detail="d")
+    asker = asyncio.create_task(broker.check(req))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    asker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asker
+    assert broker.allows("host:slow:443") is False

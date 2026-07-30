@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly import sandbox
+from claude_on_the_fly import agent, sandbox
 
 
 def test_mode_defaults_off(monkeypatch):
@@ -665,3 +667,225 @@ class TestInertWhenOff:
         monkeypatch.setattr(sandbox, "_BASE_PROFILE", tmp_path / "also-missing.sb")
         argv = ["claude", "-p", "hello"]
         assert sandbox.wrap(argv, tmp_path) == argv
+
+
+# --- probe outcomes that a real machine will not produce on demand ---
+
+
+async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
+    monkeypatch, tmp_path, caplog
+):
+    """Not an outcome: a probe that never ran is evidence about the probe, not
+    about the boundary, so it must not land in the results dict at all."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+
+    async def cannot_spawn(*_args, **_kwargs):
+        raise OSError("too many open files")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", cannot_spawn)
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        assert await sandbox.verify_denials(tmp_path) == {}
+    assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
+    monkeypatch, tmp_path, caplog
+):
+    """These run on the daemon's startup path, before it serves anything."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+
+    class HangingProbe:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(3600)
+            return b"", b""
+
+    async def spawn_hanging(*_args, **_kwargs):
+        return HangingProbe()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_hanging)
+    monkeypatch.setattr(asyncio, "wait_for", _immediate_timeout)
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        assert await sandbox.verify_denials(tmp_path) == {}
+    assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+async def _immediate_timeout(awaitable, timeout=None):
+    """Stand-in for asyncio.wait_for that always expires."""
+    task = asyncio.ensure_future(awaitable)
+    task.cancel()
+    raise TimeoutError
+
+
+async def test_a_readable_credential_path_is_an_error_not_a_pass(
+    monkeypatch, tmp_path, caplog
+):
+    """The one outcome that means the boundary is not in force. It cannot be
+    produced on a correctly configured machine, so it is faked here rather than
+    left untested: a silent READABLE is the whole failure this function exists to
+    catch."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+
+    class ReadableProbe:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def spawn_readable(*_args, **_kwargs):
+        return ReadableProbe()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_readable)
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        results = await sandbox.verify_denials(tmp_path)
+    assert set(results.values()) == {sandbox.READABLE}, results
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "PROBE FAIL" in logged
+    assert "credential path(s) READABLE inside the jail" in logged
+    # A leak must never be reported alongside a reassuring count.
+    assert "confirmed denied" not in logged
+
+
+async def test_probes_run_concurrently_not_one_after_another(monkeypatch, tmp_path):
+    """Six independent subprocesses, each with its own 15s ceiling, on the
+    daemon's startup path. In sequence the worst case was a minute and a half of a
+    daemon that had not begun serving."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    live = 0
+    peak = 0
+
+    class SlowProbe:
+        returncode = 1
+
+        async def communicate(self):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.05)
+            live -= 1
+            return b"", b"operation not permitted"
+
+    async def spawn_slow(*_args, **_kwargs):
+        return SlowProbe()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_slow)
+    results = await sandbox.verify_denials(tmp_path)
+    assert peak == len(sandbox._DENY_PROBES), f"peak concurrency was {peak}"
+    assert set(results.values()) == {sandbox.DENIED}
+
+
+# --- shim PATH routing ---
+
+
+def test_an_unreadable_shim_dir_leaves_path_alone(monkeypatch, tmp_path):
+    """Prepending a directory that cannot be listed would put an unusable entry
+    first on the agent's PATH."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    # Has to exist, or the is_dir() check short-circuits before any listing.
+    sandbox.shim_dir().mkdir(parents=True, exist_ok=True)
+
+    def cannot_list(_self):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "iterdir", cannot_list)
+    env = sandbox._with_shims_on_path({"PATH": "/usr/bin"})
+    assert env["PATH"] == "/usr/bin"
+
+
+# --- the agent's own memory has to survive the jail ---
+
+
+def _run_jailed(argv: list[str], workspace: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        sandbox.wrap(argv, workspace),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_memory_is_writable_under_the_jail(monkeypatch, tmp_path, fs_base):
+    """system_prompt.md points the agent at {memory_root}/users/<sender>/*.md and
+    tells it to keep them current. That path is outside the workspace, so without
+    an explicit grant every memory write failed with "Operation not permitted" and
+    the feature was silently off under `jail` — with nothing in the log, because
+    macOS cannot report a seatbelt denial."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    memory = agent.MEMORY_DIR / "users" / "someone"
+    memory.mkdir(parents=True, exist_ok=True)
+    target = memory / "profile.md"
+    done = _run_jailed(
+        ["/bin/sh", "-c", f"echo remembered > {target} && cat {target}"], tmp_path
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "remembered"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_memory_grant_is_scoped_to_memory_not_the_whole_data_dir(profile):
+    """The grant names memory/ rather than the data dir it sits in, because the
+    siblings are .env (SLACK_TOKEN and TELEGRAM_BOT_TOKEN, with which the agent
+    could answer its own approval prompts) and logs/ (every prior conversation).
+
+    Structural rather than a live probe: the tmpdir HOME the suite runs under sits
+    inside _TMPDIR, which the profile grants wholesale, so a live read there would
+    pass for the wrong reason. The live counterpart is below.
+    """
+    text = profile.read_text()
+    grants = re.findall(
+        r'\(allow file-(?:read|write)\*.*?\.claude-on-the-fly([^"]*)"', text
+    )
+    assert grants, "expected at least one data-dir grant"
+    for suffix in grants:
+        assert suffix.startswith("/memory") or suffix.startswith("/shims"), (
+            f"data-dir grant {suffix!r} is wider than memory/ and shims/"
+        )
+
+
+def test_the_daemons_own_env_file_is_unreadable_in_the_jail(
+    monkeypatch, tmp_path, original_home
+):
+    """The live counterpart, against the real home so the deny is the reason the
+    read fails rather than the file being absent. Reads only; never creates or
+    modifies anything under the real home."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    secrets = original_home / ".claude-on-the-fly" / ".env"
+    if not secrets.is_file():
+        pytest.skip("no real .env on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    done = _run_jailed(["/bin/cat", str(secrets)], tmp_path)
+    assert done.returncode != 0, ".env was readable inside the jail"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+
+
+def test_deny_most_guidance_lists_every_path_the_profile_grants(monkeypatch):
+    """The guidance also tells the agent not to narrow its reads, because
+    "refusing a read you are actually permitted to make costs the user real work".
+    A path missing from this list is one it will decline to try, so the list and
+    the profile have to move together."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    guidance = sandbox.agent_guidance(Path("/tmp/workspace"))
+
+    profile = sandbox._DENY_MOST_PROFILE.read_text()
+    granted = set(re.findall(r'\(allow file-read\*.*?_HOME"\)\s+"(/[^"]+)"', profile))
+    assert granted, "expected home-relative read grants in the profile"
+    for suffix in granted:
+        assert suffix in guidance, (
+            f"{suffix} is granted by fs-deny-most.sb but missing from the guidance"
+        )
+
+
+def test_guidance_names_memory_as_writable(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    guidance = sandbox.agent_guidance(Path("/tmp/workspace"))
+    assert str(agent.MEMORY_DIR) in guidance
+    assert "Writing:" in guidance

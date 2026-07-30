@@ -572,3 +572,130 @@ class TestMarkupSafety:
     def test_the_net_leaves_valid_markup_untouched(self):
         good = "[bold cyan]fine[/bold cyan]"
         assert watch._guarantee_parseable(good) == good
+
+
+class TestEmptyAndDegenerateBodies:
+    """Every one of these renders into a live transcript pane, so an empty or
+    whitespace-only body has to be skipped rather than drawn as a blank rule."""
+
+    def test_a_text_of_only_newlines_collapses_to_nothing(self):
+        assert _first_line_with_count("\n\n\n") == ""
+
+    def test_a_single_line_with_a_trailing_newline_gets_no_count(self):
+        assert _first_line_with_count("only line\n") == "only line"
+
+    def test_an_empty_body_indents_to_nothing(self):
+        assert watch._indent_body("   \n  ") == ""
+
+    def test_a_user_message_of_whitespace_is_skipped(self):
+        assert watch._format_user({"message": {"content": "   "}}, "12:00:00") is None
+
+    def test_a_user_message_whose_content_is_neither_string_nor_list_is_skipped(self):
+        assert watch._format_user({"message": {"content": 42}}, "12:00:00") is None
+
+    def test_a_tool_result_with_block_content_is_flattened(self):
+        """The CLI writes tool results either as a string or as a list of text
+        blocks, and dropping the list form loses the result entirely."""
+        out = watch._format_user(
+            {
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": [{"text": "first"}, {"text": "second"}],
+                        }
+                    ]
+                }
+            },
+            "12:00:00",
+        )
+        assert out is not None
+        assert "first second" in out
+
+    def test_non_tool_result_blocks_in_a_user_message_are_skipped(self):
+        assert (
+            watch._format_user(
+                {"message": {"content": [{"type": "text", "text": "hi"}]}}, "12:00:00"
+            )
+            is None
+        )
+
+    def test_an_assistant_message_with_non_list_content_is_skipped(self):
+        assert (
+            watch._format_assistant({"message": {"content": "plain"}}, "12:00:00")
+            is None
+        )
+
+    def test_non_dict_blocks_are_skipped(self):
+        assert (
+            watch._format_assistant(
+                {"message": {"content": ["not a dict"]}}, "12:00:00"
+            )
+            is None
+        )
+
+    def test_an_empty_text_block_is_skipped(self):
+        assert (
+            watch._format_assistant(
+                {"message": {"content": [{"type": "text", "text": "  "}]}}, "12:00:00"
+            )
+            is None
+        )
+
+    def test_an_empty_thinking_block_is_skipped(self):
+        assert (
+            watch._format_assistant(
+                {"message": {"content": [{"type": "thinking", "thinking": ""}]}},
+                "12:00:00",
+            )
+            is None
+        )
+
+    def test_a_result_event_with_no_body_still_shows_its_header(self):
+        """The header carries the cost and duration, which is the part somebody
+        scrolled to the bottom to read."""
+        out = watch.format_event(
+            {
+                "type": "result",
+                "subtype": "success",
+                "total_cost_usd": 0.12,
+                "duration_ms": 4200,
+                "result": "   ",
+            }
+        )
+        assert out is not None
+        assert "DONE" in out
+        assert "0.12" in out
+
+
+class TestCodexMessageText:
+    def test_a_plain_string_is_used_as_is(self):
+        assert watch._extract_message_text("hello") == "hello"
+
+    def test_a_non_list_non_string_yields_nothing(self):
+        assert watch._extract_message_text(42) == ""
+
+    def test_text_blocks_are_joined(self):
+        assert (
+            watch._extract_message_text(
+                [
+                    {"type": "input_text", "text": "a"},
+                    {"type": "output_text", "text": "b"},
+                ]
+            )
+            != ""
+        )
+
+
+def test_the_tail_skips_blank_lines_between_events(tmp_path):
+    """The CLI writes a trailing newline after each record, and a flush can land a
+    lone blank line mid-stream. Treating one as an event would put `None` in the
+    pane."""
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"type":"a"}\n\n   \nnot json\n{"type":"b"}\n')
+    events = []
+    for event in watch.tail(path, poll_s=0.01):
+        events.append(event)
+        if len(events) == 2:
+            break
+    assert [e["type"] for e in events] == ["a", "b"]

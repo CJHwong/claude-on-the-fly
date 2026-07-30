@@ -7,9 +7,11 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from claude_on_the_fly.jobs import file_queue
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.file_queue import (
     DELIVERY_RETRY_WINDOW_S,
@@ -771,3 +773,249 @@ def test_a_keyed_job_reports_its_bare_id_to_observers(tmp_path: Path) -> None:
 
     assert [row.id for row in rows] == ["100-a"]
     assert rows[0].enqueued_at is not None
+
+
+# ---------------------------------------------------------------------------
+# A queue on a filesystem another process is also touching
+# ---------------------------------------------------------------------------
+
+
+class TestRacesAndPermissionProblems:
+    """Every failure in this class is "log and carry on". The queue is a maildir on
+    a disk that a syncer, another worker, and the OS all touch, so a single bad file
+    must never stop the worker draining the rest."""
+
+    def test_completing_a_job_whose_file_is_already_gone_is_not_fatal(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        queue = FileInboxQueue(tmp_path)
+        job = _job("1")
+        queue.enqueue(job)
+        claimed = queue.claim()
+        assert claimed is not None
+        # A previous worker's recover_stale already moved it back to new/.
+        for stray in (tmp_path / "cur").glob("*.json"):
+            stray.unlink()
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.file_queue"):
+            queue.complete(claimed, Result(ok=True, text="done"))
+        assert "not in cur/" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_file_that_cannot_be_pruned_is_left_alone(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        queue = FileInboxQueue(tmp_path)
+        queue.enqueue(_job("1"))
+        claimed = queue.claim()
+        assert claimed is not None
+        queue.complete(claimed, Result(ok=True, text="done"))
+
+        # Genuinely old rather than a patched stat, so the prune decision itself is
+        # the real one and only the unlink fails.
+        ancient = time.time() - DONE_RETENTION_S - 3600
+        for archived in (tmp_path / "done").glob("*.json"):
+            os.utime(archived, (ancient, ancient))
+
+        def unlink_fails(self, *_args, **_kwargs):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "unlink", unlink_fails)
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.jobs.file_queue"):
+            queue._prune_archive()
+        assert "could not prune" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_delivery_marker_that_cannot_be_written_is_not_fatal(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """Worst case the reply is delivered twice after a restart, which beats
+        failing a job whose work is already done."""
+        queue = FileInboxQueue(tmp_path)
+
+        def write_fails(self, *_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "write_text", write_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.file_queue"):
+            queue.mark_delivered("1")
+        assert "could not mark 1 delivered" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_result_that_cannot_be_stated_is_skipped_by_undelivered(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        queue = FileInboxQueue(tmp_path)
+        queue.enqueue(_job("1"))
+        claimed = queue.claim()
+        assert claimed is not None
+        queue.complete(claimed, Result(ok=True, text="done"))
+        real_stat = Path.stat
+
+        def stat_fails(self, *args, **kwargs):
+            # Only the result file: the `.delivered.json` existence probe stats too,
+            # and it runs before the guarded block.
+            if self.name.endswith(".result.json"):
+                raise OSError("stale handle")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_fails)
+        assert queue.undelivered() == []
+
+    def test_a_corrupt_result_file_is_not_redelivered(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Redelivery reads the archived result, and half-written JSON there must not
+        take the worker down on startup."""
+        done = tmp_path / "done"
+        done.mkdir(parents=True)
+        # undelivered() keys off *.result.json, and the job file beside it is where
+        # the origin comes from.
+        (done / "1.result.json").write_text(
+            json.dumps({"ok": True, "text": "x"}), encoding="utf-8"
+        )
+        (done / "1.json").write_text("{not json", encoding="utf-8")
+        queue = FileInboxQueue(tmp_path)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.file_queue"):
+            assert queue.undelivered() == []
+        assert "cannot redeliver 1" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_result_whose_origin_is_not_a_mapping_is_not_redelivered(
+        self, tmp_path: Path
+    ) -> None:
+        """A non-dict origin has no channel to reply into, so the notifier would
+        raise on every retry forever."""
+        done = tmp_path / "done"
+        done.mkdir(parents=True)
+        (done / "1.result.json").write_text(
+            json.dumps({"ok": True, "text": "x"}), encoding="utf-8"
+        )
+        (done / "1.json").write_text(json.dumps({"origin": "C1"}), encoding="utf-8")
+        queue = FileInboxQueue(tmp_path)
+        assert queue.undelivered() == []
+
+    def test_recover_stale_skips_a_file_it_cannot_stat(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        queue = FileInboxQueue(tmp_path)
+        queue.enqueue(_job("1"))
+        assert queue.claim() is not None
+        real_stat = Path.stat
+
+        def stat_fails(self, *args, **kwargs):
+            if self.parent.name == "cur":
+                raise OSError("stale handle")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_fails)
+        assert queue.recover_stale(ttl_s=60) == 0
+
+    def test_recover_stale_logs_a_move_it_cannot_make(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        queue = FileInboxQueue(tmp_path)
+        queue.enqueue(_job("1"))
+        assert queue.claim() is not None
+
+        def replace_fails(_src, _dst):
+            raise OSError("cross-device link")
+
+        monkeypatch.setattr(os, "replace", replace_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.file_queue"):
+            assert queue.recover_stale(None) == 0
+        assert "recover_stale" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_poison_file_that_cannot_be_quarantined_is_logged(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        queue = FileInboxQueue(tmp_path)
+        new = tmp_path / "new"
+        new.mkdir(parents=True, exist_ok=True)
+        poison = new / "1.json"
+        poison.write_text("{not json", encoding="utf-8")
+
+        def replace_fails(_src, _dst):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(os, "replace", replace_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.file_queue"):
+            queue.claim()
+        assert "could not quarantine" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestReadOnlyObserversNeverRaise:
+    """The TUI polls these once a second. A queue directory that is being synced,
+    pruned, or has never existed must read as empty, not as a crashed dashboard."""
+
+    def test_depth_of_a_directory_that_cannot_be_listed_is_zero(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        def glob_fails(self, _pattern):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "glob", glob_fails)
+        depth = read_queue_depth(tmp_path)
+        assert (depth.new, depth.running, depth.done, depth.failed) == (0, 0, 0, 0)
+
+    def test_rows_from_a_directory_that_cannot_be_listed_are_empty(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        (tmp_path / "cur").mkdir(parents=True)
+        (tmp_path / "new").mkdir(parents=True)
+
+        def glob_fails(self, _pattern):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "glob", glob_fails)
+        assert read_queue_rows(tmp_path) == []
+
+    def test_a_row_file_that_cannot_be_read_still_lists(self, tmp_path: Path) -> None:
+        """The id comes from the filename, so a job with an unreadable body is still
+        worth showing: the operator can see something is queued."""
+        new = tmp_path / "new"
+        new.mkdir(parents=True)
+        (new / "1755000000000000000-abcdef12.json").write_text("{not json")
+        rows = read_queue_rows(tmp_path)
+        assert len(rows) == 1
+        assert not rows[0].prompt
+
+    def test_a_row_whose_json_is_not_a_mapping_still_lists(
+        self, tmp_path: Path
+    ) -> None:
+        new = tmp_path / "new"
+        new.mkdir(parents=True)
+        (new / "1755000000000000000-abcdef12.json").write_text('["a list"]')
+        rows = read_queue_rows(tmp_path)
+        assert len(rows) == 1
+        assert not rows[0].prompt
+
+
+class TestEnqueueTimeFromTheJobId:
+    """The enqueue time is already in the id, so the TUI needs no stat() syscall,
+    and unlike an mtime it survives a copy or a `touch`. Anything unparseable has to
+    read as "unknown" rather than raising into a dashboard refresh."""
+
+    def test_a_real_id_yields_its_timestamp(self) -> None:
+        parsed = file_queue._enqueued_at("1755000000000000000-abcdef12")
+        assert parsed is not None
+        assert parsed.tzinfo is UTC
+        assert parsed.year == 2025
+
+    def test_a_non_numeric_head_is_unknown(self) -> None:
+        assert file_queue._enqueued_at("notanumber-abcdef12") is None
+
+    def test_a_zero_or_negative_stamp_is_unknown(self) -> None:
+        """A 0 would render as 1970, which looks like real data."""
+        assert file_queue._enqueued_at("0-abcdef12") is None
+        assert file_queue._enqueued_at("-5-abcdef12") is None
+
+    def test_a_stamp_beyond_the_representable_range_is_unknown(self) -> None:
+        assert file_queue._enqueued_at(f"{10**30}-abcdef12") is None
+
+
+def test_list_unfinished_on_a_missing_maildir_reads_as_empty(tmp_path: Path) -> None:
+    """Unlike every write method here, this is a pure read: a missing maildir must
+    not be built on the spot just because someone opened the jobs tab."""
+    queue = FileInboxQueue(tmp_path / "never-created")
+    assert queue.list_unfinished() == []
+    assert not (tmp_path / "never-created").exists()

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from claude_on_the_fly.cron import (
     CronDaemon,
     CronEntry,
     load_config,
+    migrate_legacy_config,
     parse_items,
 )
 from claude_on_the_fly.jobs.core import Job
@@ -777,3 +779,584 @@ class TestMigration:
         assert "prompt_file" in body, "the new template mechanism should be pointed at"
         assert "producer" in body, "as should prompt commands"
         assert "docs/how-to/cron.md" in body
+
+
+# ---------------------------------------------------------------------------
+# Config validation messages
+# ---------------------------------------------------------------------------
+
+
+class TestConfigRejections:
+    """Every message names the entry and the field. A cron config is edited by hand
+    and reloaded live, so "invalid config" with no location is unactionable."""
+
+    @pytest.mark.parametrize(
+        ("entry", "fragment"),
+        [
+            ({"name": "", "cron": "* * * * *", "prompt": "x"}, "'name'"),
+            ({"name": "a", "cron": "", "prompt": "x"}, "'cron'"),
+            (
+                {"name": "a", "cron": "* * * * *", "prompt": "x", "timeout": -1},
+                "non-negative int",
+            ),
+            (
+                {"name": "a", "cron": "* * * * *", "prompt": "x", "max_concurrent": 0},
+                "at least 1",
+            ),
+        ],
+    )
+    def test_a_bad_field_is_named(self, tmp_path: Path, entry, fragment) -> None:
+        with pytest.raises(ValueError, match=re.escape(fragment)):
+            load_config(cfg(tmp_path, entry))
+
+    def test_an_entry_that_is_not_a_mapping_is_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump({"entries": ["just a string"]}), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="must be a mapping"):
+            load_config(path)
+
+    def test_a_non_mapping_root_is_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "cron.yaml"
+        path.write_text(yaml.safe_dump(["not", "a", "mapping"]), encoding="utf-8")
+        with pytest.raises(ValueError, match="root must be a mapping"):
+            load_config(path)
+
+    def test_unparseable_yaml_says_so(self, tmp_path: Path) -> None:
+        path = tmp_path / "cron.yaml"
+        path.write_text("entries: [unclosed", encoding="utf-8")
+        with pytest.raises(ValueError, match="YAML parse error"):
+            load_config(path)
+
+    def test_a_config_that_cannot_be_read_says_so(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="cannot read"):
+            load_config(tmp_path / "never-existed.yaml")
+
+    def test_the_legacy_script_form_needs_a_path(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'script' must be a non-empty string"):
+            load_config(cfg(tmp_path, {"name": "a", "cron": "* * * * *", "script": ""}))
+
+    def test_legacy_script_args_must_be_strings(self, tmp_path: Path) -> None:
+        """They are shell-quoted individually, so a non-string would become a
+        different command once a shell saw it."""
+        with pytest.raises(ValueError, match="'args' must be a list of strings"):
+            load_config(
+                cfg(
+                    tmp_path,
+                    {
+                        "name": "a",
+                        "cron": "* * * * *",
+                        "script": "poll.sh",
+                        "args": "not-a-list",
+                    },
+                )
+            )
+
+    def test_a_prompt_file_that_cannot_be_read_names_the_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """It exists at validate time and is re-read on every fire, so an
+        unreadable one has to fail with its own message rather than a bare OSError."""
+        unreadable = tmp_path / "prompt.md"
+        unreadable.write_text("hello {{ item.key }}", encoding="utf-8")
+        unreadable.chmod(0o000)
+        try:
+            with pytest.raises(ValueError, match="cannot read prompt_file"):
+                load_config(
+                    cfg(
+                        tmp_path,
+                        {
+                            "name": "a",
+                            "cron": "* * * * *",
+                            "prompt_file": str(unreadable),
+                        },
+                    )
+                )
+        finally:
+            unreadable.chmod(0o644)
+
+
+# ---------------------------------------------------------------------------
+# Per-entry logs
+# ---------------------------------------------------------------------------
+
+
+class TestAppendLog:
+    def test_a_log_that_cannot_be_written_does_not_drop_the_fire(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """The daemon log still has the story; losing the per-entry copy is not worth
+        dropping a fire over."""
+        from claude_on_the_fly import cron as cron_mod
+
+        monkeypatch.setattr(
+            cron_mod, "log_path", lambda _name: tmp_path / "nope" / "x.log"
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            cron_mod.append_log("nightly", "block\n")
+        assert "could not write its log" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+# ---------------------------------------------------------------------------
+# Live reload
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeReload:
+    def test_a_config_that_cannot_be_stated_is_logged_and_skipped(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        cron.reload()
+        monkeypatch.setattr(
+            Path, "stat", lambda self, *a, **k: (_ for _ in ()).throw(OSError("gone"))
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            cron._maybe_reload()
+        assert "config stat failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_an_unchanged_mtime_does_not_reload(self, tmp_path: Path) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        cron.reload()
+        reloaded: list[int] = []
+        cron.reload = lambda: (reloaded.append(1), ([], [], []))[1]  # type: ignore[method-assign]
+        cron._maybe_reload()
+        assert reloaded == []
+
+    def test_a_broken_edit_keeps_the_prior_entries(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A live-edited config with a typo must not empty the schedule: the daemon
+        keeps running what it already had."""
+        path = cfg(
+            tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "do the thing"}
+        )
+        cron = daemon(tmp_path, path, FakeQueue())
+        cron.reload()
+        before = dict(cron._state)
+        path.write_text("entries: [unclosed", encoding="utf-8")
+        import os as _os
+
+        _os.utime(path, (0, 0))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            cron._maybe_reload()
+        assert cron._state.keys() == before.keys()
+        assert "keeping prior entries" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_real_edit_is_applied_and_reported(self, tmp_path: Path, caplog) -> None:
+        path = cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"})
+        cron = daemon(tmp_path, path, FakeQueue())
+        cron.reload()
+        write_config(
+            path,
+            [
+                {"name": "a", "cron": "* * * * *", "prompt": "x"},
+                {"name": "b", "cron": "* * * * *", "prompt": "y"},
+            ],
+        )
+        import os as _os
+
+        _os.utime(path, (0, 0))
+        with caplog.at_level("INFO", logger="claude_on_the_fly.cron"):
+            cron._maybe_reload()
+        assert set(cron._state) == {"a", "b"}
+        assert "reloaded (+1 -0 ~0)" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+# ---------------------------------------------------------------------------
+# The daemon loop
+# ---------------------------------------------------------------------------
+
+
+class TestRunLoop:
+    async def test_a_due_entry_fires_and_gets_a_new_next_time(
+        self, tmp_path: Path
+    ) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+            await cron.stop()
+
+        cron._fire = record  # type: ignore[method-assign]
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+
+        async def immediately(self=cron):
+            return None
+
+        cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
+        cron.reload()
+        for state in cron._state.values():
+            state.next_fire = datetime(2000, 1, 1)
+        await asyncio.wait_for(cron.run(), timeout=5)
+        assert fired == ["a"]
+        assert all(s.next_fire.year > 2000 for s in cron._state.values())
+
+    async def test_a_stop_between_the_sleep_and_the_scan_ends_the_loop(
+        self, tmp_path: Path
+    ) -> None:
+        """Otherwise a shutdown fires every due entry one more time on its way out."""
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        fired: list[str] = []
+        cron._fire = lambda entry: fired.append(entry.name)  # type: ignore[method-assign]
+
+        async def sleep_then_stop():
+            cron._stop.set()
+
+        cron._sleep_to_next_minute = sleep_then_stop  # type: ignore[method-assign]
+        cron.reload()
+        for state in cron._state.values():
+            state.next_fire = datetime(2000, 1, 1)
+        await asyncio.wait_for(cron.run(), timeout=5)
+        assert fired == []
+
+    async def test_the_sleep_wakes_early_when_stopped(self, tmp_path: Path) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        cron._stop.set()
+        await asyncio.wait_for(cron._sleep_to_next_minute(), timeout=2)
+
+    async def test_a_broken_fire_is_logged_and_the_daemon_keeps_going(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        cron._enqueue_plain = lambda _entry: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("queue exploded")
+        )
+        entry = CronEntry(name="a", cron="* * * * *", prompt="x")
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            await cron._fire(entry)
+        assert "fire failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestSummary:
+    def test_an_empty_schedule_prints_only_the_header(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        cron._print_summary()
+        out = capsys.readouterr().err
+        assert "Cron started" in out
+        assert "0 entries" in out
+
+    def test_the_table_lines_up_on_the_longest_name(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {"name": "short", "cron": "* * * * *", "prompt": "x"},
+                {"name": "a-much-longer-name", "cron": "0 4 * * *", "prompt": "y"},
+            ),
+            FakeQueue(),
+        )
+        cron.reload()
+        cron._print_summary()
+        lines = [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if line.startswith("  ")
+        ]
+        assert len(lines) == 2
+        # Both rows pad the name to the longest one's width, so every later column
+        # starts at the same offset.
+        assert [line.index("next:") for line in lines].count(
+            lines[0].index("next:")
+        ) == 2
+
+
+class TestSideEffectCommandFailures:
+    async def test_a_command_that_cannot_start_is_logged_to_the_entry(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """A side-effect entry has no reply channel, so its own log is the only place
+        the operator will ever see this."""
+        from claude_on_the_fly import cron as cron_mod
+
+        written: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            cron_mod, "append_log", lambda name, block: written.append((name, block))
+        )
+
+        async def cannot_spawn(*_args, **_kwargs):
+            raise OSError("no such shell")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_shell", cannot_spawn)
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        entry = CronEntry(name="prune", cron="0 4 * * *", command="whatever", timeout=5)
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            await cron._run_side_effect(entry)
+        assert any("could not start" in block for _, block in written)
+        assert "command failed to start" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_command_that_overruns_is_killed_and_the_log_says_so(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import cron as cron_mod
+
+        written: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            cron_mod, "append_log", lambda name, block: written.append((name, block))
+        )
+        monkeypatch.setattr(cron_mod, "log_path", lambda _name: tmp_path / "out.log")
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        entry = CronEntry(name="slow", cron="0 4 * * *", command="sleep 30", timeout=1)
+        object.__setattr__(entry, "timeout", 1)
+        await cron._run_side_effect(entry)
+        assert any("timed out after" in block for _, block in written)
+
+    async def test_a_shutdown_mid_command_is_recorded_and_re_raised(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Re-raised so `stop()` still completes; recorded so the log does not end
+        mid-run with no explanation."""
+        from claude_on_the_fly import cron as cron_mod
+
+        written: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            cron_mod, "append_log", lambda name, block: written.append((name, block))
+        )
+        monkeypatch.setattr(cron_mod, "log_path", lambda _name: tmp_path / "out.log")
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        entry = CronEntry(name="slow", cron="0 4 * * *", command="sleep 30", timeout=60)
+        task = asyncio.create_task(cron._run_side_effect(entry))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert any("cancelled during shutdown" in block for _, block in written)
+
+
+class TestProducerWithNoItems:
+    async def test_an_empty_producer_enqueues_nothing(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Distinct from a failing producer: printing nothing is a legitimate "no
+        work right now"."""
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            queue,
+        )
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.cron"):
+            await cron._fire_producer(_producer_entry(command="true"))
+        assert queue.jobs == []
+        assert "emitted no items" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestRunCommand:
+    async def test_producer_stderr_is_surfaced(self, tmp_path: Path, caplog) -> None:
+        """Swallowing it is what makes "it just stopped finding tickets"
+        unanswerable."""
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            out, rc = await cron._run_command(
+                "echo oops >&2; echo fine", timeout=10, capture=True
+            )
+        assert out.strip() == "fine"
+        assert rc == 0
+        assert "producer stderr: oops" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_command_that_overruns_is_killed_and_reported(
+        self, tmp_path: Path
+    ) -> None:
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        out, rc = await cron._run_command("sleep 30", timeout=0.2, capture=True)
+        assert "timed out after 0.2s" in out
+        assert rc is None
+
+    async def test_output_past_the_cap_is_truncated_loudly(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """A runaway producer would otherwise be parsed in full and every line of it
+        admitted as an item."""
+        from claude_on_the_fly import cron as cron_mod
+
+        monkeypatch.setattr(cron_mod, "MAX_PRODUCER_BYTES", 32)
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            out, _rc = await cron._run_command(
+                "printf 'x%.0s' $(seq 1 200)", timeout=10, capture=True
+            )
+        assert len(out) == 32
+        assert "truncating to 32" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestRootKeyRename:
+    def test_a_root_jobs_key_is_renamed(self) -> None:
+        text, changed = cron_mod_rename("jobs:\n  - name: a\n")
+        assert changed is True
+        assert text.startswith("entries:")
+
+    def test_a_nested_or_commented_jobs_key_is_left_alone(self) -> None:
+        """Anchored at column 0 and applied once, so an operator's comment about
+        jobs, or a nested key, survives."""
+        original = "# jobs: the old name\nentries:\n  - name: a\n    jobs: 2\n"
+        text, changed = cron_mod_rename(original)
+        assert changed is False
+        assert text == original
+
+
+def cron_mod_rename(text: str):
+    from claude_on_the_fly.cron import _rename_root_key
+
+    return _rename_root_key(text)
+
+
+class TestMigrateLegacyConfig:
+    def test_a_legacy_file_that_cannot_be_read_is_left_in_place(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        legacy = tmp_path / "jobs.yaml"
+        legacy.write_text("jobs:\n  - name: a\n", encoding="utf-8")
+        legacy.chmod(0o000)
+        try:
+            with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+                assert (
+                    migrate_legacy_config(legacy=legacy, target=tmp_path / "cron.yaml")
+                    is None
+                )
+        finally:
+            legacy.chmod(0o644)
+        assert "leaving it in place" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_legacy_file_that_does_not_load_is_left_in_place(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Not something to rewrite silently: leave it and let the normal config
+        error explain itself."""
+        legacy = tmp_path / "jobs.yaml"
+        legacy.write_text("jobs: [unclosed", encoding="utf-8")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            assert (
+                migrate_legacy_config(legacy=legacy, target=tmp_path / "cron.yaml")
+                is None
+            )
+        assert "cannot migrate" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_nothing_to_do_when_the_target_already_exists(self, tmp_path: Path) -> None:
+        legacy = tmp_path / "jobs.yaml"
+        legacy.write_text("jobs:\n  - name: a\n", encoding="utf-8")
+        target = tmp_path / "cron.yaml"
+        target.write_text("entries: []\n", encoding="utf-8")
+        assert migrate_legacy_config(legacy=legacy, target=target) is None
+
+    def test_nothing_to_do_when_there_is_no_legacy_file(self, tmp_path: Path) -> None:
+        assert (
+            migrate_legacy_config(
+                legacy=tmp_path / "gone.yaml", target=tmp_path / "cron.yaml"
+            )
+            is None
+        )
+
+    def test_the_operators_comments_survive_the_migration(self, tmp_path: Path) -> None:
+        """Re-dumping the parsed entries would be tidier and would silently delete
+        every comment, which is the part of a config a rewrite cannot reproduce."""
+        legacy = tmp_path / "jobs.yaml"
+        legacy.write_text(
+            "# nightly sweep, do not remove\njobs:\n"
+            '  - name: a\n    cron: "0 4 * * *"\n    prompt: do it\n',
+            encoding="utf-8",
+        )
+        target = tmp_path / "cron.yaml"
+        summary = migrate_legacy_config(legacy=legacy, target=target)
+        assert summary is not None
+        body = target.read_text(encoding="utf-8")
+        assert "# nightly sweep, do not remove" in body
+        assert "entries:" in body
+        # The root key is renamed; the header the migration adds may still mention
+        # the old name, so check the key itself rather than the whole file.
+        assert not any(line.startswith("jobs:") for line in body.splitlines())
+
+
+class TestSideEffectFiresInTheBackground:
+    async def test_a_command_entry_does_not_block_the_minute_scan(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A side-effect command can run for minutes. Awaiting it inline would stall
+        every other entry's fire behind it, so `_fire` spawns and moves on — and the
+        task is tracked so `stop()` can cancel it."""
+        from claude_on_the_fly import cron as cron_mod
+
+        monkeypatch.setattr(cron_mod, "append_log", lambda _name, _block: None)
+        monkeypatch.setattr(cron_mod, "log_path", lambda _name: tmp_path / "out.log")
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
+            FakeQueue(),
+        )
+        entry = CronEntry(name="slow", cron="0 4 * * *", command="sleep 30", timeout=60)
+        await cron._fire(entry)
+        assert len(cron._command_tasks) == 1, "the fire waited for the command"
+        await cron.stop()
+        assert cron._command_tasks == set() or all(
+            t.done() for t in cron._command_tasks
+        )

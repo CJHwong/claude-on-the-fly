@@ -921,3 +921,29 @@ async def test_doctor_re_reads_env_when_reopened(tmp_path, monkeypatch):
     assert reads == ["pty", "claude"], (
         "re-opening doctor must re-read .env, not show the previous render"
     )
+
+
+async def test_an_empty_event_log_produces_no_notifications(tmp_path, monkeypatch):
+    """First run, before anything has been dispatched."""
+    from claude_on_the_fly.events import EventLog
+    from claude_on_the_fly.tui.tui_app import ClaudeTuiApp
+
+    app = ClaudeTuiApp()
+    app._event_log = EventLog(tmp_path / "events.jsonl")
+    notices: list[str] = []
+    app.notify = lambda msg, **kw: notices.append(msg)  # type: ignore[method-assign]
+    app._poll_worker_events()
+    assert notices == []
+
+
+def test_run_app_starts_the_application(monkeypatch):
+    """The `claude-tui` entry point with no subcommand lands here, so a wrong class
+    or a missing run() is a dead CLI."""
+    from claude_on_the_fly.tui import tui_app as tui_app_mod
+
+    started: list[str] = []
+    monkeypatch.setattr(
+        tui_app_mod.ClaudeTuiApp, "run", lambda self: started.append("ran")
+    )
+    tui_app_mod.run_app()
+    assert started == ["ran"]

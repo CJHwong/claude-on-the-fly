@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from claude_on_the_fly.jobs import orphans
 from claude_on_the_fly.jobs.orphans import ProcessLedger, _same_command
 
 
@@ -145,3 +146,104 @@ class TestSameCommand:
     def test_rejects_empty(self) -> None:
         assert not _same_command("", "claude")
         assert not _same_command("claude", "")
+
+
+class TestLedgerAndSweepSurviveAHostileFilesystem:
+    """The ledger exists so a killed worker's agent process groups get reaped. Every
+    failure here has to degrade rather than raise: a worker that cannot write its
+    ledger must still run jobs."""
+
+    def test_a_ps_that_cannot_be_run_reports_unknown(self, monkeypatch, caplog):
+        """Unknown is not "dead": killing on an unknown would let a permissions
+        problem take out a live process group."""
+
+        def run_fails(*_args, **_kwargs):
+            raise OSError("no /bin/ps")
+
+        monkeypatch.setattr(orphans.subprocess, "run", run_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.orphans"):
+            assert orphans._process_command(4242) is None
+        assert "could not ask ps" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_ps_timeout_reports_unknown(self, monkeypatch):
+        def run_times_out(*_args, **_kwargs):
+            raise orphans.subprocess.TimeoutExpired("ps", 1)
+
+        monkeypatch.setattr(orphans.subprocess, "run", run_times_out)
+        assert orphans._process_command(4242) is None
+
+    def test_a_ledger_that_cannot_be_written_is_logged_not_raised(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        ledger = orphans.ProcessLedger(tmp_path / "nested" / "ledger.jsonl")
+
+        def mkdir_fails(self, *_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "mkdir", mkdir_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.orphans"):
+            ledger.record(4242, "claude -p")
+        assert "could not record process group 4242" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_group_that_cannot_be_killed_does_not_stop_the_sweep(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        path = tmp_path / "ledger.jsonl"
+        path.write_text(
+            '{"pgid": 111, "command": "claude -p"}\n'
+            '{"pgid": 222, "command": "claude -p"}\n',
+            encoding="utf-8",
+        )
+        ledger = orphans.ProcessLedger(path)
+        monkeypatch.setattr(orphans, "_process_command", lambda _pid: "claude -p")
+        killed_pgids: list[int] = []
+
+        def killpg(pgid, _sig):
+            if pgid == 111:
+                raise PermissionError("not ours")
+            killed_pgids.append(pgid)
+
+        monkeypatch.setattr(orphans.os, "killpg", killpg)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.orphans"):
+            assert ledger.sweep() == 1
+        assert killed_pgids == [222], "one bad group stopped the sweep"
+        assert "could not kill orphaned group 111" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_blank_and_corrupt_ledger_lines_are_skipped(self, tmp_path, monkeypatch):
+        path = tmp_path / "ledger.jsonl"
+        path.write_text(
+            "\n  \nnot json\n"
+            '{"pgid": "notanint", "command": "x"}\n'
+            '{"command": "no pgid"}\n'
+            '{"pgid": 333, "command": "claude -p"}\n',
+            encoding="utf-8",
+        )
+        ledger = orphans.ProcessLedger(path)
+        monkeypatch.setattr(orphans, "_process_command", lambda _pid: "claude -p")
+        killed: list[int] = []
+        monkeypatch.setattr(
+            orphans.os, "killpg", lambda pgid, _sig: killed.append(pgid)
+        )
+        assert ledger.sweep() == 1
+        assert killed == [333]
+
+    def test_a_ledger_that_cannot_be_rewritten_is_logged(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        path = tmp_path / "ledger.jsonl"
+        path.write_text('{"pgid": 111, "command": "claude -p"}\n', encoding="utf-8")
+        ledger = orphans.ProcessLedger(path)
+
+        def write_fails(self, *_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "write_text", write_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.orphans"):
+            ledger.forget(111)
+        assert "could not rewrite the process ledger" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )

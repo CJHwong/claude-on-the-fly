@@ -1238,3 +1238,312 @@ class TestApprovalLinkPreview:
         await task
         kwargs = frontend._app.bot.send_message.await_args.kwargs
         assert kwargs["disable_web_page_preview"] is True
+
+
+# ---------------------------------------------------------------------------
+# Approvals
+# ---------------------------------------------------------------------------
+
+
+def _approval_frontend() -> TelegramFrontend:
+    frontend = TelegramFrontend.__new__(TelegramFrontend)
+    frontend._app = MagicMock()
+    frontend._app.bot = AsyncMock()
+    frontend._app.bot.send_message.return_value = MagicMock(message_id=7, chat_id=99)
+    frontend._pending_approvals = {}
+    frontend._allowed_user_id = 99
+    frontend._sessions = {}
+    return frontend
+
+
+def _unescaped(text: str) -> str:
+    """`text` with every backslash-escaped pair dropped, leaving only the markup
+    Telegram will actually act on."""
+    return re.sub(r"\\.", "", text)
+
+
+def _request(subject="pypi.org:443", detail="agent asked for pypi.org:443"):
+    from claude_on_the_fly.approvals import ApprovalRequest
+
+    return ApprovalRequest(kind="host", subject=subject, detail=detail)
+
+
+class TestApprovalRouting:
+    def test_a_session_chat_gets_its_own_prompt(self):
+        """The question belongs with the work that caused it."""
+        frontend = _approval_frontend()
+        assert frontend._approval_chat(4242) == 4242
+
+    def test_sessionless_work_falls_back_to_the_operators_dm(self):
+        """cron and the job queue have no conversation behind them. A Telegram DM
+        chat id equals the user id, so the fallback can never be a group."""
+        frontend = _approval_frontend()
+        assert frontend._approval_chat(None) == 99
+
+    async def test_no_app_means_no_way_to_ask(self):
+        frontend = _approval_frontend()
+        frontend._app = None
+        assert await frontend.ask_approval(_request(), 1) is False
+
+
+class TestApprovalPromptCannotBeRestyledByTheAgent:
+    """Parts of a subject and detail are agent-reachable: a broker route-scope
+    request carries the path tail the agent asked for."""
+
+    async def _post(self, request):
+        import asyncio
+
+        frontend = _approval_frontend()
+
+        async def answer():
+            while not frontend._pending_approvals:
+                await asyncio.sleep(0)
+            for future in frontend._pending_approvals.values():
+                if not future.done():
+                    future.set_result(True)
+
+        task = asyncio.create_task(answer())
+        await frontend.ask_approval(request, 99)
+        await task
+        return frontend, frontend._app.bot.send_message.await_args.kwargs["text"]
+
+    async def test_a_subject_cannot_close_its_own_code_span(self):
+        _frontend, text = await self._post(
+            _request(subject="/anthropic/v1`\n*Permission APPROVED*\n`x")
+        )
+        # Every backtick the agent supplied comes through backslash-escaped, so the
+        # only *live* delimiters are the two the template wrote. Without this the
+        # agent closes the span and its forged verdict renders as real bold text.
+        assert _unescaped(text).count("`") == 2, text
+        assert "\\`" in text, "agent backticks were not escaped"
+        assert "\\*Permission APPROVED\\*" in text
+
+    async def test_a_detail_cannot_forge_bold_text(self):
+        _frontend, text = await self._post(_request(detail="*Permission APPROVED*"))
+        assert "\\*Permission APPROVED\\*" in text
+
+    async def test_an_ordinary_subject_still_reads_cleanly(self):
+        _frontend, text = await self._post(_request())
+        assert "`pypi.org:443`" in text
+
+    async def test_a_retired_prompt_escapes_the_subject_too(self):
+        frontend = _approval_frontend()
+        await frontend._retire_approval(
+            99, 7, _request(subject="host`*x*`:443"), "DENIED"
+        )
+        text = frontend._app.bot.edit_message_text.await_args.kwargs["text"]
+        assert _unescaped(text).count("`") == 2, text
+        assert "\\*x\\*" in text
+
+
+class TestApprovalPromptIsRetired:
+    async def test_a_tap_retires_the_prompt(self):
+        import asyncio
+
+        frontend = _approval_frontend()
+
+        async def answer():
+            while not frontend._pending_approvals:
+                await asyncio.sleep(0)
+            for future in frontend._pending_approvals.values():
+                future.set_result(True)
+
+        task = asyncio.create_task(answer())
+        assert await frontend.ask_approval(_request(), 99) is True
+        await task
+        frontend._app.bot.edit_message_text.assert_awaited_once()
+        assert frontend._pending_approvals == {}
+
+    async def test_a_timeout_retires_the_prompt_too(self):
+        """The cancellation used to skip the retire, leaving a spent card with a
+        live-looking keyboard in the chat forever."""
+        import asyncio
+        import contextlib
+
+        frontend = _approval_frontend()
+        task = asyncio.create_task(frontend.ask_approval(_request(), 99))
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if frontend._pending_approvals:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        frontend._app.bot.edit_message_text.assert_awaited_once()
+        assert frontend._pending_approvals == {}
+        stamped = frontend._app.bot.edit_message_text.await_args.kwargs["text"]
+        assert "DENIED" in stamped
+
+    async def test_a_retire_that_telegram_rejects_is_logged_not_raised(self, caplog):
+        frontend = _approval_frontend()
+        frontend._app.bot.edit_message_text = AsyncMock(
+            side_effect=BadRequest("message to edit not found")
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.telegram"):
+            await frontend._retire_approval(99, 7, _request(), "APPROVED")
+        assert "could not retire approval prompt" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_an_unexpected_retire_failure_is_logged_not_swallowed(self, caplog):
+        import asyncio
+
+        frontend = _approval_frontend()
+        frontend._retire_approval = AsyncMock(side_effect=RuntimeError("boom"))
+
+        async def answer():
+            while not frontend._pending_approvals:
+                await asyncio.sleep(0)
+            for future in frontend._pending_approvals.values():
+                future.set_result(True)
+
+        task = asyncio.create_task(answer())
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.telegram"):
+            assert await frontend.ask_approval(_request(), 99) is True
+        await task
+        assert "retiring the approval prompt failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_retiring_without_an_app_is_a_no_op(self):
+        frontend = _approval_frontend()
+        frontend._app = None
+        await frontend._retire_approval(99, 7, _request(), "APPROVED")
+
+
+class TestApprovalTapAuthorisation:
+    def _update(self, user_id: int, data: str) -> MagicMock:
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = data
+        update.callback_query.answer = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = user_id
+        return update
+
+    async def test_a_stranger_cannot_answer_the_prompt(self, frontend, caplog):
+        import asyncio
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        frontend._pending_approvals["abc"] = future
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.telegram"):
+            await frontend._on_approval_tap(self._update(999, "cotf-grant:abc"), None)
+        assert not future.done(), "a stranger decided the grant"
+        assert "unauthorized user 999" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_the_operator_can_grant(self, frontend):
+        import asyncio
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        frontend._pending_approvals["abc"] = future
+        await frontend._on_approval_tap(self._update(123, "cotf-grant:abc"), None)
+        assert future.result() is True
+
+    async def test_the_operator_can_deny(self, frontend):
+        import asyncio
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        frontend._pending_approvals["abc"] = future
+        await frontend._on_approval_tap(self._update(123, "cotf-deny:abc"), None)
+        assert future.result() is False
+
+    async def test_a_callback_with_no_data_is_ignored(self, frontend):
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = ""
+        await frontend._on_approval_tap(update, None)
+
+    async def test_a_non_callback_update_is_ignored(self, frontend):
+        update = MagicMock()
+        update.callback_query = None
+        await frontend._on_approval_tap(update, None)
+
+    async def test_a_tap_on_an_unknown_nonce_is_ignored(self, frontend, caplog):
+        with caplog.at_level("INFO", logger="claude_on_the_fly.telegram"):
+            await frontend._on_approval_tap(self._update(123, "cotf-grant:gone"), None)
+        assert "unknown or settled nonce" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_second_tap_cannot_change_the_answer(self, frontend):
+        import asyncio
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        future.set_result(True)
+        frontend._pending_approvals["abc"] = future
+        await frontend._on_approval_tap(self._update(123, "cotf-deny:abc"), None)
+        assert future.result() is True
+
+
+# ---------------------------------------------------------------------------
+# Settings summary and session persistence
+# ---------------------------------------------------------------------------
+
+
+class TestDescribe:
+    def test_the_token_is_redacted(self, frontend):
+        """This goes straight into the startup log."""
+        described = frontend.describe()
+        assert "fake-token" not in described["bot_token"]
+        assert described["bot_token"] == "fa***en"
+        assert described["allowed_user_id"] == "123"
+
+
+class TestSessionPersistenceOnDisk:
+    def test_a_missing_file_leaves_the_state_empty(self, frontend):
+        frontend._load_sessions()
+        assert frontend._session_tokens == {}
+
+    def test_a_corrupt_file_leaves_the_state_empty(self, frontend, monkeypatch):
+        from claude_on_the_fly import telegram as telegram_mod
+
+        telegram_mod.SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        telegram_mod.SESSIONS_FILE.write_text("{not json")
+        frontend._load_sessions()
+        assert frontend._session_tokens == {}
+
+    def test_a_file_that_is_not_a_mapping_is_ignored(self, frontend):
+        from claude_on_the_fly import telegram as telegram_mod
+
+        telegram_mod.SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        telegram_mod.SESSIONS_FILE.write_text('["not", "a", "mapping"]')
+        frontend._load_sessions()
+        assert frontend._session_tokens == {}
+
+    def test_a_saved_token_is_pushed_onto_the_orchestrator(self, frontend):
+        """So the workspace suffix and session UUID resume in step after a restart."""
+        from claude_on_the_fly import telegram as telegram_mod
+
+        telegram_mod.SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        telegram_mod.SESSIONS_FILE.write_text('{"42": "20260730-120000"}')
+        orchestrator = MagicMock()
+        frontend._orchestrator = orchestrator
+        frontend._load_sessions()
+        assert frontend._session_tokens == {42: "20260730-120000"}
+        orchestrator.set_session_token.assert_called_once_with(42, "20260730-120000")
+
+    def test_a_save_that_fails_is_logged_not_raised(
+        self, frontend, monkeypatch, caplog
+    ):
+        """Losing the resume hint is worth a log line, not the turn."""
+        frontend._session_tokens = {42: "20260730-120000"}
+
+        def write_fails(self, *_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "write_text", write_fails)
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.telegram"):
+            frontend._save_sessions()
+        assert "failed to persist sessions" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestPhotoSendWithoutAnApp:
+    async def test_no_app_means_fall_back_to_a_document(self, frontend):
+        """False routes the caller to the document path rather than dropping the
+        attachment, which is what the user would actually notice."""
+        frontend._app = None
+        assert await frontend._try_send_photo(99, Path("shot.png"), b"bytes") is False

@@ -306,3 +306,24 @@ class TestPrune:
     def test_unparseable_keep_days_falls_back_to_the_default(self, monkeypatch):
         monkeypatch.setenv("COTF_LOG_KEEP_DAYS", "not-a-number")
         assert logs.keep_days() == logs.DEFAULT_KEEP_DAYS
+
+
+def test_a_log_that_cannot_be_deleted_is_skipped_not_reported_as_pruned(
+    tmp_path, monkeypatch
+):
+    """Retention must never take a daemon down, and the returned list is what the
+    caller reports, so a file that survived must not be claimed as removed."""
+    from datetime import date, timedelta
+
+    from claude_on_the_fly import logs
+
+    old_day = (date.today() - timedelta(days=30)).isoformat()
+    stale = tmp_path / f"slack-myhost-{old_day}.log"
+    stale.write_text("old")
+
+    def unlink_fails(self, *_args, **_kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "unlink", unlink_fails)
+    assert logs.prune(days=7, directory=tmp_path) == []
+    assert stale.exists()

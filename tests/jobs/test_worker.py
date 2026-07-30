@@ -8,6 +8,8 @@ import asyncio
 import contextlib
 from pathlib import Path
 
+import pytest
+
 import claude_on_the_fly.jobs.worker as worker
 from claude_on_the_fly.jobs.core import Delivery, Job, QueueRow, Result
 from claude_on_the_fly.jobs.file_queue import FileInboxQueue
@@ -595,3 +597,43 @@ async def test_run_loop_threads_the_recorder_through() -> None:
     await asyncio.wait_for(loop_task, timeout=1.0)
 
     assert recorder.recorded == [("jira/ACE-1", True)]
+
+
+async def test_one_failing_job_does_not_stop_the_others_in_the_batch(caplog) -> None:
+    """The batch is gathered, so an unhandled error inside one `run_once` must not
+    take the whole drain down with it: the other slots' work is already done and the
+    loop has to keep claiming."""
+
+    async def ok_task() -> bool:
+        return True
+
+    async def failing_task() -> bool:
+        raise RuntimeError("queue vanished mid-claim")
+
+    finished = [
+        asyncio.ensure_future(ok_task()),
+        asyncio.ensure_future(failing_task()),
+    ]
+    await asyncio.gather(*finished, return_exceptions=True)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.jobs.worker"):
+        assert worker._harvest(set(finished)) is True
+    assert "run_once failed (continuing)" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+async def test_a_cancelled_batch_member_propagates() -> None:
+    """Cancellation is how the loop stops. Swallowing it here would make a stop
+    request look like an ordinary failure and the loop would keep going."""
+
+    async def never() -> bool:
+        await asyncio.Event().wait()
+        return True
+
+    task = asyncio.ensure_future(never())
+    await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    with pytest.raises(asyncio.CancelledError):
+        worker._harvest({task})

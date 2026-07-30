@@ -2653,3 +2653,367 @@ class TestProcessListeners:
             agent_mod._process_listeners.clear()
 
         assert seen == [(777, "", False)]
+
+
+# ---------------------------------------------------------------------------
+# Outbox failure modes
+# ---------------------------------------------------------------------------
+
+
+class TestOutboxSurvivesAFilesystemThatSaysNo:
+    """Every failure here is skip-and-log, never raise: a broken attachment must
+    not cost the user the agent's actual answer."""
+
+    def test_a_file_that_cannot_be_stated_is_skipped(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        vanishing = outbox / "report.txt"
+        vanishing.write_text("body")
+        real_stat = Path.stat
+        seen = 0
+
+        def stat_then_vanish(self, *args, **kwargs):
+            # The realistic version of this: the file passes the is_file() check
+            # and the agent deletes it before the size is read.
+            nonlocal seen
+            if self.name == "report.txt":
+                seen += 1
+                if seen > 1:
+                    vanishing.unlink(missing_ok=True)
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_then_vanish)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
+            assert collect_outbox(tmp_path) == []
+        assert "cannot stat" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_an_unwritable_archive_dir_leaves_the_files_where_they_are(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Archiving is what stops a delivered file re-sending next turn. If it
+        cannot happen, the files must stay put rather than be deleted."""
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        delivered = outbox / "report.txt"
+        delivered.write_text("body")
+
+        def mkdir_fails(self, *args, **kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "mkdir", mkdir_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
+            archive_outbox(tmp_path, [delivered])
+        assert delivered.is_file(), "the file was lost"
+        assert "cannot create archive dir" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_move_that_fails_is_logged_per_file(self, tmp_path, monkeypatch, caplog):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        first = outbox / "one.txt"
+        first.write_text("a")
+        second = outbox / "two.txt"
+        second.write_text("b")
+
+        def move_fails(src, _dst):
+            if src.endswith("one.txt"):
+                raise OSError("cross-device link")
+
+        monkeypatch.setattr(agent_mod.shutil, "move", move_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
+            archive_outbox(tmp_path, [first, second])
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "failed to archive one.txt" in logged
+        # The second file is still attempted: one bad file is not the batch.
+        assert "two.txt" not in logged
+
+    def test_archiving_nothing_is_a_no_op(self, tmp_path):
+        archive_outbox(tmp_path, [])
+        assert not (tmp_path / OUTBOX_DIRNAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# Compaction summaries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("compaction", "expected"),
+    [
+        (
+            Compaction(ok=True, pre_tokens=0, post_tokens=0),
+            "Compacted the conversation.",
+        ),
+        (
+            # codex publishes no duration, and "in 0s" reads as a suspiciously
+            # fast compaction rather than as a missing figure.
+            Compaction(ok=True, pre_tokens=120_000, post_tokens=8_000),
+            "Compacted the conversation: 120,000 → 8,000 tokens.",
+        ),
+        (
+            Compaction(ok=True, pre_tokens=120_000, post_tokens=8_000, duration=42.4),
+            "Compacted the conversation: 120,000 → 8,000 tokens in 42s.",
+        ),
+    ],
+)
+def test_compaction_summary(compaction, expected):
+    assert compaction.summary() == expected
+
+
+# ---------------------------------------------------------------------------
+# Process listeners
+# ---------------------------------------------------------------------------
+
+
+def test_removing_an_unregistered_listener_is_silent():
+    """Callers unregister in a finally without tracking whether they registered."""
+    agent_mod.remove_process_listener(lambda *_args: None)
+
+
+def test_removing_a_registered_listener_stops_the_notifications():
+    seen: list[tuple] = []
+
+    def listener(*args):
+        seen.append(args)
+
+    agent_mod.add_process_listener(listener)
+    agent_mod.remove_process_listener(listener)
+    proc = MagicMock()
+    proc.pid = 4242
+    try:
+        agent_mod._announce_process(proc, "claude -p", running=True)
+    finally:
+        agent_mod._process_listeners.clear()
+    assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# Backend key resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"AGENT_BACKEND": "claude", "CLAUDE_MODE": "banana"}, "Unknown CLAUDE_MODE"),
+        ({"AGENT_BACKEND": "codex", "CODEX_MODE": "banana"}, "Unknown CODEX_MODE"),
+        ({"AGENT_BACKEND": "gemini"}, "Unknown AGENT_BACKEND"),
+        (
+            {"AGENT_BACKEND": "codex", "CODEX_MODE": "ollama", "OLLAMA_MODEL": ""},
+            "requires OLLAMA_MODEL",
+        ),
+    ],
+)
+def test_an_unusable_backend_config_fails_loudly(monkeypatch, env, message):
+    """The key names the transcript's own format, so a wrong one silently mixes
+    two backends' histories. Better to refuse at resolution time."""
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=message):
+        current_backend_key()
+
+
+def test_codex_native_without_a_model_says_default(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "native")
+    monkeypatch.delenv("CODEX_MODEL", raising=False)
+    assert current_backend_key() == "codex:native:default"
+
+
+def test_codex_ollama_key_names_the_model(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "ollama")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:8b")
+    assert current_backend_key() == "codex:ollama:qwen3:8b"
+
+
+def test_claude_pty_key_carries_the_model(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "claude")
+    monkeypatch.setenv("CLAUDE_MODE", "pty")
+    monkeypatch.setenv("CLAUDE_MODEL", "opus")
+    assert current_backend_key() == "claude:pty:opus"
+
+
+# ---------------------------------------------------------------------------
+# Compaction dispatch
+# ---------------------------------------------------------------------------
+
+
+async def test_compact_returns_none_when_the_backend_cannot_do_it(
+    monkeypatch, tmp_path
+):
+    """codex has no compaction, so the caller gets None rather than an error, and
+    reports "not supported" instead of "failed"."""
+    backend = MagicMock(spec=[])
+    monkeypatch.setattr(agent_mod, "get_backend", lambda: backend)
+    assert await agent_mod.compact(tmp_path, "session-uuid") is None
+
+
+async def test_compact_delegates_when_the_backend_supports_it(monkeypatch, tmp_path):
+    expected = Compaction(ok=True, pre_tokens=10, post_tokens=1)
+    backend = MagicMock()
+    backend.compact = AsyncMock(return_value=expected)
+    monkeypatch.setattr(agent_mod, "get_backend", lambda: backend)
+    assert await agent_mod.compact(tmp_path, "session-uuid", timeout=5) is expected
+    backend.compact.assert_awaited_once_with(tmp_path, "session-uuid", timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Process teardown races
+# ---------------------------------------------------------------------------
+
+
+async def test_a_process_group_that_is_already_gone_is_not_an_error(monkeypatch):
+    """`_kill_process_tree` runs from a finally on the abort path, so it races a
+    natural exit by construction. A raise here would replace the user's abort with
+    a traceback."""
+    proc = MagicMock()
+    proc.pid = 4242
+    proc.returncode = None
+    proc.wait = AsyncMock(return_value=0)
+
+    monkeypatch.setattr(agent_mod.os, "getpgid", lambda _pid: 4242)
+
+    def already_reaped(_pgid, _sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent_mod.os, "killpg", already_reaped)
+    await agent_mod._kill_process_tree(proc)
+    proc.kill.assert_not_called()
+
+
+async def test_a_pgid_lookup_that_fails_falls_back_to_a_plain_kill(monkeypatch):
+    """getpgid can fail if the child is mid-exit; killing the pid alone is worse
+    than the group but better than leaving it running."""
+    proc = MagicMock()
+    proc.pid = 4242
+    proc.returncode = None
+    proc.wait = AsyncMock(return_value=0)
+
+    def no_such_group(_pid):
+        raise OSError("no such process")
+
+    monkeypatch.setattr(agent_mod.os, "getpgid", no_such_group)
+    await agent_mod._kill_process_tree(proc)
+    proc.kill.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Front matter
+# ---------------------------------------------------------------------------
+
+
+def test_unparseable_front_matter_is_treated_as_absent():
+    """A hand-edited skill file with a broken block must not take the daemon down
+    on startup; the skill just loses its description."""
+    assert agent_mod.parse_frontmatter("---\ndescription: [unclosed\n---\nbody") == {}
+
+
+def test_front_matter_that_is_not_a_mapping_is_ignored():
+    assert agent_mod.parse_frontmatter("---\n- just\n- a list\n---\nbody") == {}
+
+
+def test_front_matter_is_parsed_as_real_yaml():
+    parsed = agent_mod.parse_frontmatter("---\ndescription: |\n  two\n  lines\n---\nx")
+    assert parsed["description"] == "two\nlines"
+
+
+# ---------------------------------------------------------------------------
+# Skills cache
+# ---------------------------------------------------------------------------
+
+
+class TestSkillsCache:
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        """Both layers. Leaving the on-disk one behind makes the next test in this
+        class read a warm cache and never reach the code it is aiming at."""
+        cache_dir = agent_mod.DATA_DIR / "cache"
+
+        def wipe():
+            agent_mod._skills_mem.clear()
+            for stale in cache_dir.glob("skills-*.json"):
+                stale.unlink()
+
+        wipe()
+        yield
+        wipe()
+
+    async def test_concurrent_misses_probe_the_cli_once(self, monkeypatch):
+        """Probing spawns the CLI (~0.8s), so a picker sending a query per
+        keystroke must not turn into a queue of CLI launches."""
+        probes = 0
+
+        class SlowBackend:
+            async def list_skills(self):
+                nonlocal probes
+                probes += 1
+                await asyncio.sleep(0.05)
+                return [("a", "first")]
+
+        backend = SlowBackend()
+        results = await asyncio.gather(
+            *(agent_mod.cached_skills(backend) for _ in range(5))
+        )
+        assert probes == 1, f"probed {probes} times"
+        assert all(r == [("a", "first")] for r in results)
+
+    async def test_a_cache_that_cannot_be_written_still_returns_the_skills(
+        self, monkeypatch, caplog
+    ):
+        """The disk layer is a speed-up, not the answer. A read-only DATA_DIR must
+        cost latency, not the feature."""
+
+        class Backend:
+            async def list_skills(self):
+                return [("a", "first")]
+
+        def write_fails(self, *_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "write_text", write_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
+            assert await agent_mod.cached_skills(Backend()) == [("a", "first")]
+        assert "skills cache: write failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_the_cache_can_be_turned_off(self, monkeypatch):
+        probes = 0
+
+        class Backend:
+            async def list_skills(self):
+                nonlocal probes
+                probes += 1
+                return []
+
+        monkeypatch.setattr(agent_mod, "SKILLS_CACHE_TTL", 0)
+        backend = Backend()
+        await agent_mod.cached_skills(backend)
+        await agent_mod.cached_skills(backend)
+        assert probes == 2
+
+
+# ---------------------------------------------------------------------------
+# Cross-backend session log lookup
+# ---------------------------------------------------------------------------
+
+
+def test_a_backend_that_raises_while_looking_is_skipped_not_fatal(
+    monkeypatch, tmp_path
+):
+    """The TUI calls this for whichever backend ran the job, which may not be the
+    one this process is configured for. A backend whose store is missing or
+    unreadable must not stop the next one from being tried."""
+    from claude_on_the_fly.backends import claude as claude_mod
+
+    def explode(self, _workspace, _uuid):
+        raise RuntimeError("no store on this machine")
+
+    monkeypatch.setattr(claude_mod.ClaudeBackend, "session_log_path", explode)
+    # codex is tried after claude and finds nothing here, so the answer is None
+    # rather than a propagated RuntimeError.
+    assert agent_mod.resolve_session_log(tmp_path, "some-uuid") is None

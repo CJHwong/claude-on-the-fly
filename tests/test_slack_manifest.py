@@ -300,3 +300,20 @@ class TestGenerateInteractive:
         monkeypatch.setattr(slack_manifest.sys, "stdin", FakeStdin())
         with pytest.raises(SystemExit):
             generate(mode=None, name=None, command=None, out=None)
+
+
+class TestConfirm:
+    def test_a_non_tty_never_confirms(self, monkeypatch):
+        """This gates a real Slack API write, so an unattended run (a pipe, CI) must
+        decline rather than proceed on nobody's behalf."""
+        monkeypatch.setattr(slack_manifest.sys.stdin, "isatty", lambda: False)
+        assert slack_manifest._confirm("Update the app?") is False
+
+    @pytest.mark.parametrize(
+        ("answer", "expected"),
+        [("y\n", True), ("Y\n", True), ("yes\n", True), ("n\n", False), ("\n", False)],
+    )
+    def test_only_an_explicit_yes_confirms(self, monkeypatch, answer, expected):
+        monkeypatch.setattr(slack_manifest.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(slack_manifest.sys.stdin, "readline", lambda: answer)
+        assert slack_manifest._confirm("Update the app?") is expected

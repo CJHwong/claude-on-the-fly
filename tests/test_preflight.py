@@ -610,3 +610,203 @@ class TestRunSlack:
         monkeypatch.delenv("SLACK_SILENT_SENDER_IDS", raising=False)
         *_, silent = run_slack()
         assert silent == set()
+
+
+class TestCloudOllamaModels:
+    def test_a_cloud_model_absent_from_ollama_list_is_accepted(self, caplog):
+        """`:cloud` models are API-only and never appear in `ollama list`, so the
+        availability check has to skip them or a valid config cannot start."""
+        with (
+            patch(
+                "subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="NAME\nqwen3:8b  x\n"),
+            ),
+            patch.dict(
+                "os.environ",
+                {"OLLAMA_MODEL": "deepseek-v4-flash:cloud", "AGENT_BACKEND": "claude"},
+                clear=False,
+            ),
+            caplog.at_level("INFO", logger="claude_on_the_fly.preflight"),
+        ):
+            check_ollama_mode("claude")
+        assert "relying on remote API" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_local_model_absent_from_ollama_list_still_exits(self):
+        with (
+            patch(
+                "subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="NAME\nqwen3:8b  x\n"),
+            ),
+            patch.dict(
+                "os.environ",
+                {"OLLAMA_MODEL": "not-pulled", "AGENT_BACKEND": "claude"},
+                clear=False,
+            ),
+            pytest.raises(SystemExit, match="ollama pull not-pulled"),
+        ):
+            check_ollama_mode("claude")
+
+
+class TestCheckPtyMode:
+    def _ok(self, name):
+        from claude_on_the_fly.checks import CheckResult
+
+        return CheckResult(name=name, status="ok", detail="fine")
+
+    def _warn(self, name, hint=""):
+        from claude_on_the_fly.checks import CheckResult
+
+        return CheckResult(name=name, status="warn", detail="incomplete", fix_hint=hint)
+
+    def test_an_absent_pty_binary_is_installed_first(self, caplog):
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch("claude_on_the_fly.pty_install.is_pty_installed", return_value=False),
+            patch(
+                "claude_on_the_fly.pty_install.ensure_pty_installed",
+                return_value=MagicMock(installed=True, message="installed 1.2.3"),
+            ),
+            patch(
+                "claude_on_the_fly.checks.check_pty_setup",
+                return_value=[self._ok("claude-pty")],
+            ),
+            caplog.at_level("INFO", logger="claude_on_the_fly.preflight"),
+        ):
+            preflight_mod.check_pty_mode()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "installed 1.2.3" in logged
+        assert "pty mode: ok" in logged
+
+    def test_a_failed_install_stops_startup(self):
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch("claude_on_the_fly.pty_install.is_pty_installed", return_value=False),
+            patch(
+                "claude_on_the_fly.pty_install.ensure_pty_installed",
+                return_value=MagicMock(installed=False, message="no network"),
+            ),
+            pytest.raises(SystemExit, match="no network"),
+        ):
+            preflight_mod.check_pty_mode()
+
+    def test_a_warning_is_surfaced_without_stopping_startup(self, caplog):
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch("claude_on_the_fly.pty_install.is_pty_installed", return_value=True),
+            patch(
+                "claude_on_the_fly.checks.check_pty_setup",
+                return_value=[self._warn("jq")],
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.preflight"),
+        ):
+            preflight_mod.check_pty_mode()
+        assert "incomplete" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestStalePtyHookRefresh:
+    def _warn_hooks(self, hint=""):
+        from claude_on_the_fly.checks import CheckResult
+
+        return CheckResult(
+            name="claude-pty hooks", status="warn", detail="incomplete", fix_hint=hint
+        )
+
+    def _ok_hooks(self):
+        from claude_on_the_fly.checks import CheckResult
+
+        return CheckResult(name="claude-pty hooks", status="ok", detail="wired")
+
+    def test_nothing_stale_means_no_refresh(self):
+        from claude_on_the_fly import preflight as preflight_mod
+
+        results = [self._ok_hooks()]
+        assert preflight_mod._refresh_stale_pty_hooks(results) is results
+
+    def test_the_refresh_can_be_turned_off(self, caplog):
+        """statusLine is the operator's own line, so an install that rewrites it is
+        something they must be able to decline."""
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch(
+                "claude_on_the_fly.pty_install.auto_refresh_enabled", return_value=False
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.preflight"),
+        ):
+            out = preflight_mod._refresh_stale_pty_hooks(
+                [self._warn_hooks("update claude-pty")]
+            )
+        assert out[0].status == "warn"
+        assert "disables the refresh" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_successful_refresh_rechecks_and_reports(self, caplog):
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch(
+                "claude_on_the_fly.pty_install.auto_refresh_enabled", return_value=True
+            ),
+            patch(
+                "claude_on_the_fly.pty_install.refresh_hooks",
+                return_value=(True, "hooks re-spliced"),
+            ),
+            patch(
+                "claude_on_the_fly.checks.check_pty_setup",
+                return_value=[self._ok_hooks()],
+            ),
+            caplog.at_level("INFO", logger="claude_on_the_fly.preflight"),
+        ):
+            out = preflight_mod._refresh_stale_pty_hooks([self._warn_hooks()])
+        assert out[0].status == "ok"
+        assert "hooks re-spliced" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_failed_refresh_says_so(self, caplog):
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch(
+                "claude_on_the_fly.pty_install.auto_refresh_enabled", return_value=True
+            ),
+            patch(
+                "claude_on_the_fly.pty_install.refresh_hooks",
+                return_value=(False, "permission denied"),
+            ),
+            patch(
+                "claude_on_the_fly.checks.check_pty_setup",
+                return_value=[self._warn_hooks()],
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.preflight"),
+        ):
+            preflight_mod._refresh_stale_pty_hooks([self._warn_hooks()])
+        assert "hook refresh failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_a_clean_install_that_still_lacks_the_hook_is_named_as_such(self, caplog):
+        """Otherwise the same warning reads as a failed write rather than as a
+        published claude-pty that predates the hook."""
+        from claude_on_the_fly import preflight as preflight_mod
+
+        with (
+            patch(
+                "claude_on_the_fly.pty_install.auto_refresh_enabled", return_value=True
+            ),
+            patch(
+                "claude_on_the_fly.pty_install.refresh_hooks",
+                return_value=(True, "installed"),
+            ),
+            patch(
+                "claude_on_the_fly.checks.check_pty_setup",
+                return_value=[self._warn_hooks()],
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.preflight"),
+        ):
+            preflight_mod._refresh_stale_pty_hooks([self._warn_hooks()])
+        assert "predates it" in "\n".join(r.getMessage() for r in caplog.records)

@@ -556,7 +556,7 @@ class TelegramFrontend(Frontend):
             logger.exception("Failed to process media group for chat %s", chat_id)
 
 
-def main() -> None:  # pragma: no cover
+def main() -> None:
     from dotenv import load_dotenv
 
     from claude_on_the_fly.orchestrator import run

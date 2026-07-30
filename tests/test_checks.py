@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_on_the_fly import checks as checks_mod
 from claude_on_the_fly.checks import (
     FRONTEND_ENV_VARS,
     SUPERVISABLE_FRONTENDS,
@@ -1078,3 +1079,104 @@ class TestAutoCompactCapability:
             }
         )
         assert first_failure(results) is None
+
+
+class TestJobTriggerCollidesWithCompact:
+    def test_a_bare_compact_trigger_is_refused(self):
+        """Same shape as $stop: exact-match and intercepted before the job branch, so
+        a bare "$compact" compacts while "$compact <task>" queues a job. One prefix,
+        two behaviours."""
+        status, why = checks_mod._job_command_error("$compact")
+        assert status == "invalid"
+        assert "$compact" in why
+
+    def test_the_compact_prefix_matches_the_slack_constant(self):
+        """The literal is duplicated here to keep slack_bolt out of every checks
+        import, so drift has to fail somewhere."""
+        from claude_on_the_fly.slack import COMPACT_COMMAND
+
+        assert checks_mod._job_command_error(COMPACT_COMMAND) is not None
+
+
+class TestPtySetupIsCheckedOnlyInPtyMode:
+    def test_pty_mode_pulls_in_the_pty_checks(self):
+        results = checks_mod.check_binaries(
+            {"AGENT_BACKEND": "claude", "CLAUDE_MODE": "pty"}
+        )
+        assert any(r.name == "claude-pty" for r in results)
+
+    def test_native_mode_does_not(self):
+        """A native install has no reason to be told jq is missing."""
+        results = checks_mod.check_binaries(
+            {"AGENT_BACKEND": "claude", "CLAUDE_MODE": "native"}
+        )
+        assert not any(r.name == "claude-pty" for r in results)
+
+    def test_a_missing_pty_binary_carries_its_install_hint(self, monkeypatch):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        monkeypatch.setattr(claude_mod, "resolve_pty_binary", lambda: None)
+        results = checks_mod.check_pty_setup()
+        pty = next(r for r in results if r.name == "claude-pty")
+        assert pty.status == "missing"
+        assert pty.fix_hint
+
+    def test_a_present_pty_binary_reports_its_path(self, monkeypatch):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        monkeypatch.setattr(
+            claude_mod, "resolve_pty_binary", lambda: "/usr/local/bin/claude-pty"
+        )
+        results = checks_mod.check_pty_setup()
+        pty = next(r for r in results if r.name == "claude-pty")
+        assert pty.status == "ok"
+        assert pty.detail == "/usr/local/bin/claude-pty"
+
+
+class TestHookScriptMatching:
+    def test_an_empty_command_matches_nothing(self):
+        """An empty hook value is not a wired hook, and treating it as one would let
+        a pty compaction hang forever waiting on an envelope."""
+        assert checks_mod._is_pty_shim("", checks_mod.PTY_TRIGGER_MARKER) is False
+        assert checks_mod._is_pty_shim("   ", checks_mod.PTY_TRIGGER_MARKER) is False
+
+
+class TestPostcompactHookProbe:
+    def test_an_unreadable_settings_file_fails_closed(self, tmp_path, monkeypatch):
+        """Refusing with a message beats an unbounded wait: without the hook a pty
+        compaction never returns an envelope and the frontends pass no timeout."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        assert checks_mod.pty_postcompact_hook_wired() is False
+
+    def test_malformed_settings_json_fails_closed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        (tmp_path / "settings.json").write_text("{not json")
+        assert checks_mod.pty_postcompact_hook_wired() is False
+
+    def test_a_wired_hook_is_detected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        hook = tmp_path / "postcompact_envelope.sh"
+        hook.write_text("#!/bin/sh\n# claude-pty postcompact envelope\n")
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PostCompact": [
+                            {"hooks": [{"type": "command", "command": str(hook)}]}
+                        ]
+                    }
+                }
+            )
+        )
+        assert isinstance(checks_mod.pty_postcompact_hook_wired(), bool)
+
+
+class TestHooksFileFailures:
+    def test_malformed_settings_json_is_reported_as_invalid(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        (tmp_path / "settings.json").write_text("{not json")
+        result = checks_mod.check_pty_hooks()
+        assert result.status == "invalid"
+        assert result.name == "claude-pty hooks"

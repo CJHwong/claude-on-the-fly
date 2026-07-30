@@ -46,6 +46,20 @@ uv run prek run --all-files    # ruff + ruff-format + ty + gitleaks + sanity
 uv run pytest                  # tests in tests/
 ```
 
+Coverage is 100% of statements and is enforced (`fail_under = 100`). It is not in
+pytest's `addopts` because it roughly triples the suite's wall clock, so run it
+explicitly when you add or change code:
+
+```bash
+uv run pytest --cov=claude_on_the_fly --cov-report=term-missing
+```
+
+New code needs a test that fails without it. If a line genuinely cannot run under
+test, `# pragma: no cover` with a comment saying why is the escape hatch. There
+are two of those outside the `if __name__ == "__main__"` guards, both on states a
+correctly-behaving OS will not produce: a child the kernel has not reaped after
+SIGKILL, and a binary that vanished between the construction filter and the run.
+
 `ty` covers the project — don't introduce mypy. `prek run --all-files` is the gate; never `--no-verify` on commit.
 
 ## Before working on…

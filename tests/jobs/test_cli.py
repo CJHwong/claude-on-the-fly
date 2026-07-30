@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from claude_on_the_fly.jobs import cli
 
 
@@ -127,3 +129,207 @@ def test_run_proceeds_when_no_worker_is_live(monkeypatch) -> None:
 
     assert cli._cmd_run() == 0
     assert ran == ["x"]
+
+
+def test_concurrency_below_one_falls_back_to_one(monkeypatch, caplog) -> None:
+    """A junk or non-positive value must not refuse to start: the worker running
+    slowly beats the worker not running."""
+    monkeypatch.setenv("JOBS_CONCURRENCY", "0")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
+        assert cli._concurrency() == 1
+    assert "below 1, using 1" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_concurrency_honours_a_sane_value(monkeypatch) -> None:
+    monkeypatch.setenv("JOBS_CONCURRENCY", "4")
+    assert cli._concurrency() == 4
+
+
+def test_run_without_a_token_refuses_and_names_both_vars(monkeypatch, capsys) -> None:
+    """The notifier is the only way a job's answer reaches anyone, so an install
+    with no token would run jobs whose results go nowhere."""
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(cli.checks, "resolve_jobs_token", lambda env: ("", ""))
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("started the worker with no notifier token")
+
+    monkeypatch.setattr(cli.asyncio, "run", _must_not_run)
+    assert cli._cmd_run() == 2
+    err = capsys.readouterr().err
+    assert "JOBS_SLACK_TOKEN" in err and "SLACK_TOKEN" in err
+
+
+def test_run_warns_about_an_inherited_user_token(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(
+        cli.checks, "resolve_jobs_token", lambda env: ("SLACK_TOKEN", "xoxp-user")
+    )
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro: coro.close())
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
+        assert cli._cmd_run() == 0
+    assert caplog.records, "an inherited user token deserves a warning"
+
+
+class TestDoctor:
+    def _result(self, name, status, detail="", fix_hint=""):
+        from claude_on_the_fly.checks import CheckResult
+
+        return CheckResult(name=name, status=status, detail=detail, fix_hint=fix_hint)
+
+    def test_all_ok_reports_success(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(
+            cli.checks, "check_frontend", lambda *_a: [self._result("token", "ok")]
+        )
+        monkeypatch.setattr(
+            cli.checks, "check_backend", lambda *_a: [self._result("cli", "ok")]
+        )
+        assert cli._cmd_doctor() == 0
+        assert "all checks passed" in capsys.readouterr().out
+
+    def test_a_blocking_failure_exits_nonzero_with_its_hint(
+        self, monkeypatch, capsys
+    ) -> None:
+        bad = self._result("token", "fail", "missing", "set JOBS_SLACK_TOKEN")
+        monkeypatch.setattr(cli.checks, "check_frontend", lambda *_a: [bad])
+        monkeypatch.setattr(cli.checks, "check_backend", lambda *_a: [])
+        monkeypatch.setattr(cli.checks, "is_blocking", lambda _r: True)
+        assert cli._cmd_doctor() == 1
+        out = capsys.readouterr().out
+        assert "1 check(s) failed" in out
+        assert "hint: set JOBS_SLACK_TOKEN" in out
+
+    def test_an_advisory_result_warns_without_failing(
+        self, monkeypatch, capsys
+    ) -> None:
+        """An enqueue-only worker is a legitimate install, not an error."""
+        advisory = self._result("worker", "warn", "no producer", "start one")
+        monkeypatch.setattr(cli.checks, "check_frontend", lambda *_a: [advisory])
+        monkeypatch.setattr(cli.checks, "check_backend", lambda *_a: [])
+        monkeypatch.setattr(cli.checks, "is_blocking", lambda _r: False)
+        assert cli._cmd_doctor() == 0
+        assert "all checks passed (1 warning(s))" in capsys.readouterr().out
+
+
+class TestMainDispatch:
+    def test_doctor_is_dispatched(self, monkeypatch) -> None:
+        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.sys, "argv", ["claude-jobs", "doctor"])
+        monkeypatch.setattr(cli, "_cmd_doctor", lambda: 7)
+        assert cli.main() == 7
+
+    def test_enqueue_is_dispatched_with_its_options(self, monkeypatch) -> None:
+        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(
+            cli.sys,
+            "argv",
+            [
+                "claude-jobs",
+                "enqueue",
+                "do it",
+                "--channel",
+                "C1",
+                "--thread-ts",
+                "1.1",
+            ],
+        )
+        seen: list[tuple] = []
+        monkeypatch.setattr(
+            cli, "_cmd_enqueue", lambda *args: (seen.append(args), 0)[1]
+        )
+        assert cli.main() == 0
+        assert seen == [("do it", "C1", "1.1")]
+
+    def test_a_bare_invocation_runs_the_worker(self, monkeypatch) -> None:
+        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.sys, "argv", ["claude-jobs"])
+        monkeypatch.setattr(cli, "_cmd_run", lambda: 3)
+        assert cli.main() == 3
+
+
+class TestRunLoopWiring:
+    async def test_orphans_are_reaped_before_anything_claims_work(
+        self, monkeypatch, caplog, tmp_path
+    ) -> None:
+        """run_loop's first act is recover_stale, and re-running a job whose earlier
+        copy is still executing is exactly what the sweep prevents."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        ledger = MagicMock()
+        ledger.sweep.return_value = 2
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+        )
+        order: list[str] = []
+        ledger.sweep.side_effect = lambda: (order.append("sweep"), 2)[1]
+
+        async def fake_run_loop(*_args, **_kwargs):
+            order.append("run_loop")
+
+        monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role: heartbeat)
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
+            await cli._run("xoxb-token")
+
+        assert order == ["sweep", "run_loop"]
+        assert "reaped 2 orphaned agent process group(s)" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_the_process_listener_is_removed_even_if_the_loop_raises(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Left registered, a dead worker's ledger keeps being handed live pids."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        ledger = MagicMock()
+        ledger.sweep.return_value = 0
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+        )
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("queue vanished")
+
+        monkeypatch.setattr(cli, "run_loop", boom)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role: heartbeat)
+        removed: list[object] = []
+        monkeypatch.setattr(
+            cli.agent, "remove_process_listener", lambda cb: removed.append(cb)
+        )
+
+        with pytest.raises(RuntimeError, match="queue vanished"):
+            await cli._run("xoxb-token")
+        assert removed == [ledger.on_process]
+
+
+def test_normalize_argv_treats_a_bare_flag_as_run_options() -> None:
+    """`claude-jobs --verbose` is somebody running the worker, not a typo'd
+    subcommand."""
+    assert cli._normalize_argv(["--verbose"]) == ["run", "--verbose"]
+
+
+def test_setup_logging_names_the_jobs_role(monkeypatch) -> None:
+    """The role picks the log filename, and a wrong one puts the worker's output in
+    another daemon's file where a syncer will conflict over it."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "setup_daemon_logging", lambda role: seen.append(role))
+    cli._setup_logging()
+    assert seen == ["jobs"]

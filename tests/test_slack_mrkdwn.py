@@ -90,3 +90,76 @@ def test_bold_inside_paragraph():
 
 def test_paragraphs_separated_by_blank_line():
     assert to_mrkdwn("first\n\nsecond") == "first\n\nsecond"
+
+
+def test_a_horizontal_rule_disappears():
+    """mrkdwn has no horizontal rule, and the literal `---` reads as a typo."""
+    assert to_mrkdwn("above\n\n---\n\nbelow") == "above\n\nbelow"
+
+
+def test_an_empty_table_renders_as_nothing():
+    """A header-only table has no rows to align, and an empty code fence is worse
+    than no table."""
+    assert to_mrkdwn("|  |\n|--|") == ""
+
+
+def test_raw_slack_markup_survives_untouched():
+    """`<@U123>` and `<#C123>` are Slack's own mention syntax. Escaping them would
+    turn a working mention into visible noise."""
+    assert to_mrkdwn("ping <@U123> in <#C1>") == "ping <@U123> in <#C1>"
+
+
+def test_an_image_becomes_its_url():
+    """Slack renders no inline images in mrkdwn, so the URL is the only thing that
+    still gets the reader to the picture."""
+    assert to_mrkdwn("![alt text](https://example.com/x.png)") == (
+        "https://example.com/x.png"
+    )
+
+
+def test_an_image_without_a_source_falls_back_to_its_alt_text():
+    assert to_mrkdwn("![just alt]()") == "just alt"
+
+
+def test_a_link_without_a_target_is_just_its_label():
+    assert to_mrkdwn("[label]()") == "label"
+
+
+def test_a_nested_container_renders_its_children():
+    """An unrecognised container still has to yield its contents rather than
+    swallowing them."""
+    out = to_mrkdwn("> - first\n> - second")
+    assert "first" in out and "second" in out
+
+
+def test_a_soft_line_break_inside_a_paragraph_is_kept():
+    """Slack renders the newline, and joining the lines would run two sentences
+    together."""
+    assert to_mrkdwn("first line\nsecond line") == "first line\nsecond line"
+
+
+def test_a_real_table_still_renders_aligned_in_a_fence():
+    """The guard against empty tables must not swallow a table with content."""
+    out = to_mrkdwn("| a | bb |\n|---|----|\n| 1 | 2 |")
+    assert out == "```\na | bb\n1 | 2\n```"
+
+
+def test_inline_html_survives_mid_sentence():
+    """An agent writing raw markup inside a sentence means it, and escaping it would
+    turn a working Slack mention into visible noise."""
+    assert to_mrkdwn("a <b>bold</b> c") == "a <b>bold</b> c"
+
+
+def test_a_block_of_raw_html_is_dropped():
+    """Pins current behaviour rather than blessing it: a raw HTML block is a block
+    node, so it falls through `_render_block` and contributes nothing. Slack would
+    render `<div>` as literal text, so dropping it is the tidier of the two."""
+    assert to_mrkdwn("<div>\nraw block\n</div>") == ""
+
+
+def test_slack_link_syntax_written_by_the_agent_survives():
+    """`<url|label>` is Slack's own form, and an agent that writes it directly must
+    not have it re-escaped into something Slack renders literally."""
+    assert to_mrkdwn("<https://example.com|click here>") == (
+        "<https://example.com|click here>"
+    )

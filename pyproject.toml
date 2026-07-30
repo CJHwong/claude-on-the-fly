@@ -69,6 +69,36 @@ ignore = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+# Coverage is deliberately NOT in `addopts`: it roughly triples the suite's wall
+# clock (~30s -> ~105s), and the inner loop runs `uv run pytest` constantly. Run
+# the gate explicitly instead:
+#
+#     uv run pytest --cov=claude_on_the_fly --cov-report=term-missing
+#
+# which fails below `fail_under` on its own.
+[tool.coverage.run]
+source = ["src/claude_on_the_fly"]
+omit = [
+    # Written by hatch-vcs at build time, git-ignored, and the file itself says
+    # "don't change, don't track in version control". Nothing in it is authored
+    # or testable: it is variable assignments and type annotations.
+    "src/claude_on_the_fly/_version.py",
+]
+
+[tool.coverage.report]
+# Statement coverage. Branch coverage sits a little under this (loop-exit and
+# `continue` arcs, mostly in the Slack block-flatteners); measure it with
+# `--cov-branch` when working on those, but the enforced gate is statements.
+fail_under = 100
+show_missing = true
+exclude_also = [
+    # Every one of these is paired with a comment saying why it cannot run under
+    # test. Grep for `pragma: no cover` to audit them; there are few.
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
 [tool.hatch.version]
 source = "vcs"
 
