@@ -652,7 +652,8 @@ class TestStart:
 
         assert frontend._on_message is on_message
         assert frontend._app is mock_app
-        assert mock_app.add_handler.call_count == 5
+        # 3 commands, 2 message handlers, 1 approval callback query
+        assert mock_app.add_handler.call_count == 6
         mock_app.initialize.assert_awaited_once()
         mock_app.start.assert_awaited_once()
         mock_updater.start_polling.assert_awaited_once()
@@ -1199,3 +1200,41 @@ class TestCmdCompact:
             if getattr(call.args[0], "commands", None)
         }
         assert registered == {"new", "status", "compact"}
+
+
+class TestApprovalLinkPreview:
+    """The approval detail names the gated host, so a preview would have the
+    operator's client fetch the destination being gated, before any decision."""
+
+    async def test_preview_is_disabled(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from claude_on_the_fly.approvals import ApprovalRequest
+        from claude_on_the_fly.telegram import TelegramFrontend
+
+        frontend = TelegramFrontend.__new__(TelegramFrontend)
+        frontend._app = MagicMock()
+        frontend._app.bot = AsyncMock()
+        frontend._app.bot.send_message.return_value = MagicMock(
+            message_id=7, chat_id=99
+        )
+        frontend._pending_approvals = {}
+        frontend._allowed_user_id = 99
+        frontend._sessions = {}
+
+        async def answer():
+            # Resolve whichever future ask_approval registered.
+            while not frontend._pending_approvals:
+                await asyncio.sleep(0)
+            for future in frontend._pending_approvals.values():
+                if not future.done():
+                    future.set_result(True)
+
+        task = asyncio.create_task(answer())
+        await frontend.ask_approval(
+            ApprovalRequest(kind="host", subject="pypi.org:443", detail="d"), 99
+        )
+        await task
+        kwargs = frontend._app.bot.send_message.await_args.kwargs
+        assert kwargs["disable_web_page_preview"] is True

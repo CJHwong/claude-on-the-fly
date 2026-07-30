@@ -37,6 +37,57 @@ _FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # Matches the retention the TimedRotatingFileHandler used to give (backupCount=7).
 DEFAULT_KEEP_DAYS = 7
 
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# How much of a redacted string survives when content logging is enabled.
+CONTENT_PREVIEW_CHARS = 80
+
+
+def log_content() -> bool:
+    """True when COTF_LOG_CONTENT permits message text in the log.
+
+    Off by default. These files live in a directory shaped for a file syncer
+    (see the module docstring), so anything written here should be assumed to
+    leave the machine and to sit there for the retention window. Prompts and
+    agent replies are the user's data and the agent's output, not diagnostics,
+    so they are not worth that by default.
+    """
+    return os.environ.get("COTF_LOG_CONTENT", "").lower() in _TRUTHY
+
+
+def redact(text: str | None) -> str:
+    """A loggable stand-in for message text.
+
+    With content logging off this is shape only: length and nothing else, which
+    is what actually gets diagnosed from (empty message, unexpectedly huge
+    prompt, truncation). With it on, the first CONTENT_PREVIEW_CHARS characters,
+    matching what these call sites logged before this existed.
+    """
+    if not text:
+        return "<empty>"
+    if log_content():
+        return text[:CONTENT_PREVIEW_CHARS]
+    return f"<{len(text)} chars redacted>"
+
+
+def redact_argv(argv: list[str], *, max_token: int = 48) -> list[str]:
+    """Argv with over-long elements clipped, so prose cannot ride along.
+
+    The argv of a brokered command is a real audit record and stays at WARNING
+    regardless: which subcommand, which flags, which repo. What does not belong
+    is the payload of `--body`, `--message`, or a heredoc, which can be a whole
+    comment the agent wrote. Clipping by length rather than by flag name keeps
+    this from becoming another enumerate-the-bad list that a new flag walks past.
+    """
+    if log_content():
+        return list(argv)
+    return [
+        token
+        if len(token) <= max_token
+        else f"{token[:max_token]}…<+{len(token) - max_token}>"
+        for token in argv
+    ]
+
+
 # `<role>-<host>-<YYYY-MM-DD>`. Parsed from the right: the day always has two
 # dashes and the host tag never has any (see `host_tag`), so a role containing
 # dashes ("cron-my-entry") still resolves unambiguously.

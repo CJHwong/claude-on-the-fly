@@ -23,7 +23,9 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
+from claude_on_the_fly import logs
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
+from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
@@ -710,6 +712,10 @@ class SlackFrontend(Frontend):
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
         self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
+        # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
+        # button's `value` stays opaque and a subject never has to be encoded
+        # into a client-supplied field.
+        self._pending_approvals: dict[str, asyncio.Future[bool]] = {}
         self._status_started: dict[int, float] = {}  # session -> turn start (mono)
         self._status_verbs: dict[int, list[str]] = {}  # session -> shuffled verbs
 
@@ -817,6 +823,11 @@ class SlackFrontend(Frontend):
         async def handle_run_skill_shortcut(ack, shortcut):
             await self._handle_run_skill_shortcut(ack, shortcut)
 
+        @app.action(re.compile(r"^cotf-(grant|deny)$"))
+        async def handle_approval_action(ack, body):
+            await ack()
+            await self._on_approval_action(body)
+
         logger.info(
             "slack: skill picker registered (slash command: %s)",
             SLASH_COMMAND or "off, use the message shortcut",
@@ -837,6 +848,156 @@ class SlackFrontend(Frontend):
         except Exception:
             logger.exception("slack: skill warm failed")
 
+    # --- Runtime permission approvals ---
+
+    def _approval_target(self, chat_id: int | None) -> tuple[str, str | None] | None:
+        """(channel, thread_ts) for an approval prompt, or None if nowhere to ask.
+
+        The session's own thread, or nothing. There is deliberately no configured
+        fallback channel: an approval is an interactive act, so work with no
+        conversation behind it (cron, the job queue) has nobody to ask and denies
+        instead. That keeps an unattended job from acquiring network access it
+        was never granted, which a fallback channel would quietly allow.
+
+        Landing in a shared channel is not a privilege leak: _on_approval_action
+        re-checks the clicker against the allowed senders, so bystanders can read
+        the prompt but cannot answer it.
+        """
+        if chat_id is None:
+            return None
+        session = self._sessions.get(chat_id)
+        if session is None:
+            return None
+        channel, thread_ts = session
+        return channel, thread_ts
+
+    async def ask_approval(
+        self, request: ApprovalRequest, chat_id: int | None = None
+    ) -> bool:
+        """Post Block Kit approve/deny buttons and wait for a click.
+
+        Requires a bot token: interaction payloads only reach a bot-token
+        install, so a user-token deployment has no way to receive the click and
+        denies instead of hanging until the caller's timeout.
+        """
+        target = self._approval_target(chat_id)
+        if target is None or not self._is_bot_token:
+            logger.warning(
+                "slack: approval denied (target=%s, bot_token=%s)",
+                target,
+                self._is_bot_token,
+            )
+            return False
+        channel, thread_ts = target
+        nonce = uuid4().hex[:12]
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_approvals[nonce] = future
+        posted = await self._app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            # The detail names the host the agent asked for, so an unfurl would
+            # have Slack fetch the very destination being gated, before any
+            # decision is made. It also pushes the buttons off the first screen
+            # on mobile, which is where these get answered.
+            unfurl_links=False,
+            unfurl_media=False,
+            text=f"Permission request: {request.subject}",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*Permission request*\n`{request.subject}`\n\n"
+                            f"{request.detail}\n\n"
+                            f"Grant lasts {request.ttl_seconds / 60:.0f} min "
+                            "and dies on restart."
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "action_id": "cotf-grant",
+                            "value": nonce,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Deny"},
+                            "style": "danger",
+                            "action_id": "cotf-deny",
+                            "value": nonce,
+                        },
+                    ],
+                },
+            ],
+        )
+        try:
+            granted = await future
+        finally:
+            # Also reached when the caller times out and cancels, so a stale
+            # nonce cannot linger and be answered later.
+            self._pending_approvals.pop(nonce, None)
+        await self._retire_approval(channel, posted["ts"], request, granted)
+        return granted
+
+    async def _retire_approval(
+        self, channel: str, ts: str, request: ApprovalRequest, granted: bool
+    ) -> None:
+        """Collapse the prompt to a one-line record of the decision.
+
+        Editing rather than deleting keeps the decision visible in the thread
+        where it was made. A `context` block rather than a `section` is what
+        stops it reading as a second reply: Slack renders context in small grey
+        text, so a spent card sits next to the answer as a status line instead of
+        competing with it. The buttons go, so the prompt cannot be reused.
+        """
+        verdict = "approved" if granted else "denied"
+        try:
+            await self._app.client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=f"Permission {verdict}: {request.subject}",
+                blocks=[
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"Permission *{verdict}*: `{request.subject}`"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            )
+        except SlackApiError as exc:
+            logger.warning("slack: could not retire approval prompt: %s", exc)
+
+    async def _on_approval_action(self, body: dict) -> None:
+        """Resolve a pending approval from a button click."""
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        sender_id = (body.get("user") or {}).get("id", "")
+        # Only an allowed sender may widen policy. Anyone else who can see the
+        # message in the channel must not be able to grant the agent a host.
+        if not self._is_allowed(sender_id):
+            logger.warning("slack: ignoring approval click from %s", sender_id)
+            return
+        action = actions[0]
+        nonce = action.get("value", "")
+        future = self._pending_approvals.get(nonce)
+        if future is None or future.done():
+            logger.info("slack: approval click for unknown or settled nonce %s", nonce)
+            return
+        future.set_result(action.get("action_id") == "cotf-grant")
+
     def _is_allowed(self, sender_id: str) -> bool:
         """Single dispatch gate: only allowed senders reach the agent.
 
@@ -851,7 +1012,9 @@ class SlackFrontend(Frontend):
         text = (command.get("text") or "").strip()
         channel = command.get("channel_id", "")
         user_id = command.get("user_id", "")
-        logger.info("slack: slash command text=%r channel=%s", text, channel)
+        logger.info(
+            "slack: slash command text=%s channel=%s", logs.redact(text), channel
+        )
         if not self._is_allowed(user_id):
             logger.info("slack: slash command from %s denied (not allowed)", user_id)
             await ack()
@@ -1397,7 +1560,7 @@ class SlackFrontend(Frontend):
                 thread_ts,
             )
             return response.attachments
-        logger.info("slack %s/%s => %s", channel, thread_ts, response.body[:80])
+        logger.info("slack %s/%s => %s", channel, thread_ts, logs.redact(response.body))
 
         blocks = _build_response_blocks(response.body, response)
 

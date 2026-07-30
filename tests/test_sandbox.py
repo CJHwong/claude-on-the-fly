@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 
@@ -127,7 +128,10 @@ def test_guidance_jail_covers_all_denial_scenarios(monkeypatch, tmp_path):
     # every denial category has a scenario + remedy
     assert "COTF_SANDBOX_EXTRA_PATHS" in text  # file-read remedy
     assert "write profile" in text  # file-write remedy
-    assert "broker route" in text  # network remedy
+    # Network remedy is now an approval, not a config change: the agent is told
+    # the request pauses for the operator and that a 403 means they declined.
+    assert "operator is asked" in text
+    assert "Do not retry in a loop" in text
     assert "security find-generic-password" in text  # keychain scenario
     # allow-most default describes secret reads as the blocked set
     assert "reads of secrets are blocked" in text
@@ -206,25 +210,329 @@ def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
 # --- Slice 3: loopback narrowing ---
 
 
+def _clear_loopback_env(monkeypatch):
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_BASE_URL",
+        "HTTPS_PROXY",
+        "COTF_CMD_ENDPOINT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 def test_loopback_open_by_default(monkeypatch):
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
-    assert sandbox._loopback_spec() == "localhost:*"
+    assert sandbox._loopback_specs() == ("localhost:*",) * 3
 
 
 def test_loopback_narrows_to_broker_port(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321/anthropic")
-    assert sandbox._loopback_spec() == "localhost:54321"
+    # Only the broker port is known, so spare slots repeat it rather than
+    # widening back to every loopback port.
+    assert sandbox._loopback_specs() == ("localhost:54321",) * 3
 
 
-def test_loopback_stays_open_when_no_broker_port(monkeypatch):
+def test_loopback_narrows_to_all_three_services(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    _clear_loopback_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321/anthropic")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:54322")
+    monkeypatch.setenv("COTF_CMD_ENDPOINT", "http://127.0.0.1:54323")
+    assert sandbox._loopback_specs() == (
+        "localhost:54321",
+        "localhost:54322",
+        "localhost:54323",
+    )
+
+
+def test_loopback_reads_the_per_session_env_not_just_os_environ(monkeypatch):
+    """Regression: per-session egress proxies publish HTTPS_PROXY into the
+    ContextVar, not os.environ. Reading os.environ narrowed the jail to the
+    broker port alone and locked the agent out of the proxy it was handed."""
+    monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    _clear_loopback_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:5001/anthropic")
+    token = sandbox.session_env(
+        {
+            "HTTPS_PROXY": "http://127.0.0.1:6002",
+            "COTF_CMD_ENDPOINT": "http://127.0.0.1:7003",
+        }
+    )
+    try:
+        assert sandbox._loopback_specs() == (
+            "localhost:5001",
+            "localhost:6002",
+            "localhost:7003",
+        )
+    finally:
+        sandbox.reset_session_env(token)
+
+
+def test_loopback_narrows_to_egress_port_alone(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    _clear_loopback_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:54322")
+    # A deployment with no credentialed provider still gets a narrowed jail.
+    assert sandbox._loopback_specs() == ("localhost:54322",) * 3
+
+
+def test_loopback_warns_rather_than_silently_dropping_a_service(monkeypatch, caplog):
+    """Guard for a future fourth loopback service. Unreachable through env today
+    (the broker serves every route on one port, so the three sources fill the
+    three slots exactly), so drive _loopback_ports directly."""
+    monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    monkeypatch.setattr(sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4"])
+    with caplog.at_level("WARNING"):
+        specs = sandbox._loopback_specs()
+    # Four services, three slots: the drop must be loud, never silent.
+    assert specs == ("localhost:1", "localhost:2", "localhost:3")
+    assert "unreachable" in caplog.text
+
+
+def test_loopback_ports_collapses_duplicate_ports(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    _clear_loopback_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9000/anthropic")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9000")
+    assert sandbox._loopback_ports() == ["9000"]
+
+
+def test_loopback_stays_open_when_no_service_is_known(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    _clear_loopback_env(monkeypatch)
     # Fail-safe: never lock the agent out of a broker it might need.
-    assert sandbox._loopback_spec() == "localhost:*"
+    assert sandbox._loopback_specs() == ("localhost:*",) * 3
 
 
-def test_broker_port_reads_any_base_url(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+def test_wrap_jail_passes_three_loopback_slots(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    out = sandbox.wrap(["claude"], tmp_path)
+    for param in ("_LOOPBACK=", "_LOOPBACK_ALT=", "_LOOPBACK_ALT2="):
+        assert any(a.startswith(param) for a in out), param
+
+
+def test_preapproved_hosts_parses_and_normalizes(monkeypatch):
+    monkeypatch.setenv("COTF_EGRESS_ALLOW", "GitHub.com, pypi.org ,,")
+    assert sandbox.preapproved_hosts() == frozenset({"github.com", "pypi.org"})
+
+
+def test_preapproved_hosts_empty_by_default(monkeypatch):
+    monkeypatch.delenv("COTF_EGRESS_ALLOW", raising=False)
+    assert sandbox.preapproved_hosts() == frozenset()
+
+
+def test_loopback_ports_reads_any_base_url(monkeypatch):
+    _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9911/openai")
-    assert sandbox._broker_port() == "9911"
+    assert sandbox._loopback_ports() == ["9911"]
+
+
+def test_session_env_layers_over_the_allowlist(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "should-be-dropped")
+    token = sandbox.session_env({"HTTPS_PROXY": "http://127.0.0.1:5555"})
+    try:
+        env = sandbox.agent_env() or {}
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:5555"
+        # Layering must not reopen the allowlist.
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+    finally:
+        sandbox.reset_session_env(token)
+
+
+def test_session_env_is_scoped_to_its_token(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    token = sandbox.session_env({"HTTPS_PROXY": "http://127.0.0.1:6666"})
+    sandbox.reset_session_env(token)
+    # After reset the override is gone, so one turn's proxy cannot bleed into
+    # the next turn's spawn.
+    assert "HTTPS_PROXY" not in (sandbox.agent_env() or {})
+
+
+async def test_session_env_does_not_leak_across_concurrent_tasks(monkeypatch):
+    """asyncio copies context per task, which is what makes a ContextVar safe
+    here: two chats running at once must not see each other's proxy."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    seen: dict[str, str | None] = {}
+
+    async def turn(name: str, port: int) -> None:
+        token = sandbox.session_env({"HTTPS_PROXY": f"http://127.0.0.1:{port}"})
+        try:
+            await asyncio.sleep(0)
+            seen[name] = (sandbox.agent_env() or {}).get("HTTPS_PROXY")
+        finally:
+            sandbox.reset_session_env(token)
+
+    await asyncio.gather(turn("a", 1111), turn("b", 2222))
+    assert seen == {
+        "a": "http://127.0.0.1:1111",
+        "b": "http://127.0.0.1:2222",
+    }
+
+
+def test_env_editor_restarts_frontends_when_sandbox_vars_change():
+    """Editing these in the TUI must prompt a restart, or the new policy
+    silently does not take effect: orchestrator.run reads them at startup."""
+    from claude_on_the_fly.checks import SANDBOX_ENV_VARS
+    from claude_on_the_fly.tui.env_editor import EnvDiff, affected_daemons
+
+    for var in SANDBOX_ENV_VARS:
+        affected = affected_daemons(EnvDiff(changed={var: ("off", "jail")}))
+        assert affected == {"telegram", "slack"}, f"{var} restarts {affected}"
+
+
+def test_env_editor_restarts_telegram_for_its_approval_override():
+    from claude_on_the_fly.tui.env_editor import EnvDiff, affected_daemons
+
+    # Telegram is the only frontend with a routing override; Slack always uses
+    # the session's own thread and denies when there isn't one.
+    assert affected_daemons(EnvDiff(added={"COTF_APPROVAL_CHAT_ID": "1"})) == {
+        "telegram"
+    }
+
+
+def test_guidance_warns_keychain_denial_is_not_an_eperm(monkeypatch, tmp_path):
+    """Verified against a live run: a denied keychain read reports "item could
+    not be found", not EPERM, so an agent taught EPERM-means-policy would read
+    it as "the credential does not exist" and hunt for it elsewhere."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert "could not be found" in text
+    assert "does not exist" in text
+
+
+def test_guidance_separates_read_scope_from_write_scope(monkeypatch, tmp_path):
+    """Regression from a real codex transcript: the agent refused to read
+    ~/.gitconfig, which the profile permits, because "Read and write the
+    workspace" led the allowed list and it took that as the boundary. Four turns,
+    zero tool calls, including one refusal of a permitted operation."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert "Reading:" in text and "Writing:" in text
+    # The conflating phrasing must not come back.
+    assert "Read and write the workspace" not in text
+    assert "different scopes" in text
+    # And it is told to try rather than pre-decline, or denials stay invisible
+    # and permitted operations get refused.
+    assert "rather than declining in advance" in text
+
+
+def test_guidance_write_scope_names_the_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert str(tmp_path.resolve()) in text
+
+
+# --- diagnostic logging ---
+
+
+def test_jail_spawn_is_logged(monkeypatch, tmp_path, caplog):
+    """The one positive record that the jail was applied. Without it, a run with
+    COTF_SANDBOX unset looks identical to a jailed one: both are free of denials,
+    and no denials also reads as success."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        sandbox.wrap(["/bin/echo", "hi"], tmp_path)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "sandbox: jailed echo" in logged
+    assert "fs=my.sb" in logged
+    assert str(tmp_path.resolve()) in logged
+
+
+def test_env_only_mode_logs_no_jail_line(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        sandbox.wrap(["/bin/echo", "hi"], tmp_path)
+    assert "jailed" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_curated_env_logs_names_never_values(monkeypatch, caplog):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-appear")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    with caplog.at_level("DEBUG", logger="claude_on_the_fly.sandbox"):
+        env = sandbox.agent_env() or {}
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "env curated" in logged
+    assert "'LANG'" in logged
+    # The record of "the secret did not reach the agent" must not itself leak it.
+    assert "sk-ant-must-not-appear" not in logged
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+async def test_verify_denials_is_inert_when_not_jailed(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    assert await sandbox.verify_denials() == {}
+
+
+async def test_verify_denials_reports_each_probe(
+    monkeypatch, tmp_path, caplog, original_home
+):
+    """Real sandbox-exec run against the real home.
+
+    conftest redirects HOME to a tmpdir, which would make every probe path absent
+    and the assertion below vacuous — it would pass because nothing is there, not
+    because the profile denies anything. So this one test reaches for the real
+    home on purpose.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        results = await sandbox.verify_denials(tmp_path)
+    assert results, "expected at least one probe"
+    assert sandbox.READABLE not in results.values(), f"leaked: {results}"
+    # At least one real deny must have been exercised, or the run proved nothing.
+    assert sandbox.DENIED in results.values(), f"nothing actually denied: {results}"
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "confirmed denied" in logged
+
+
+async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplog):
+    """An absent credential store is not evidence the boundary works.
+
+    conftest's tmpdir HOME gives exactly that situation, so this asserts the
+    honest outcome rather than a false pass.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        results = await sandbox.verify_denials(tmp_path)
+    assert set(results.values()) == {sandbox.ABSENT}, results
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "deny untested" in logged
+    assert "0/6 probed" in logged
+
+
+async def test_broken_profile_is_not_reported_as_absent(monkeypatch, tmp_path, caplog):
+    """A profile that will not parse is a hard failure, not a missing file.
+
+    The first version of verify_denials reported it as six "absent" paths, which
+    reads as benign. Found by deliberately breaking the profile, not by review.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    broken = tmp_path / "broken.sb"
+    broken.write_text("(version 1)\n(this-is-not-a-real-operation\n")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_JAIL_PROFILE", broken)
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        results = await sandbox.verify_denials(tmp_path)
+    assert set(results.values()) == {sandbox.BROKEN}, results
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "the profile is broken" in logged
+    assert "did not load" in logged
+    # Must not claim anything about the boundary.
+    assert "confirmed denied" not in logged
+    assert any(r.levelname == "ERROR" for r in caplog.records)

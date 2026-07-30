@@ -24,12 +24,25 @@
 (import (param "_BASE"))
 
 ;; -- Egress: internet denied, loopback allowed --
-;; _LOOPBACK is "localhost:*" by default (all loopback ports, so the agent's own
-;; dev servers and tests work). When COTF_SANDBOX_BROKER_ONLY_LOOPBACK is set the
-;; wrapper narrows it to "localhost:<broker-port>", closing the arbitrary-local-
-;; sink path so the only reachable endpoint is the broker.
+;; The three _LOOPBACK* params are all "localhost:*" by default (every loopback
+;; port, so the agent's own dev servers and tests work). When
+;; COTF_SANDBOX_BROKER_ONLY_LOOPBACK is set the wrapper narrows them to the
+;; local services the agent was actually handed -- credential broker, CONNECT
+;; egress proxy, command broker -- closing the arbitrary-local-sink path so those
+;; are the only reachable endpoints.
+;;
+;; Three params rather than one list because SBPL has no arrays. Spare slots
+;; repeat the first port, which is a harmless duplicate allow.
+;;
+;; Unix sockets are deliberately NOT permitted here. Verified against real
+;; sandbox-exec runs: of every candidate filter, only `(remote unix)` works, and
+;; it is not path-scoped -- it would open every unix socket on the machine,
+;; including the Docker socket and the ssh-agent this profile otherwise protects.
+;; A loopback port is scopeable; a unix socket allow is all-or-nothing.
 (deny network-outbound)
 (allow network-outbound (remote ip (param "_LOOPBACK")))
+(allow network-outbound (remote ip (param "_LOOPBACK_ALT")))
+(allow network-outbound (remote ip (param "_LOOPBACK_ALT2")))
 
 ;; -- Keychain: denied (the broker holds credentials) --
 (deny file-read* (subpath (string-append (param "_HOME") "/Library/Keychains")))

@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from claude_on_the_fly.approvals import ApprovalBroker, ApprovalRequest
+
 logger = logging.getLogger(__name__)
 
 # Caller-supplied auth headers stripped before forwarding: the broker injects
@@ -131,8 +133,12 @@ def keychain_exists(service: str) -> bool:
     return proc.returncode == 0
 
 
-def _blocked_host(host: str) -> bool:
-    """True if host is a literal IP inside a blocked range. Hostnames pass."""
+def blocked_host(host: str) -> bool:
+    """True if host is a literal IP inside a blocked range. Hostnames pass.
+
+    Public because egress.py applies the same never-ask judgement to CONNECT
+    targets; duplicating the CIDR list in two policy paths is how they drift.
+    """
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -142,11 +148,22 @@ def _blocked_host(host: str) -> bool:
 
 def _forward_request_headers(headers) -> dict[str, str]:
     """Copy request headers minus hop-by-hop and any caller-supplied auth."""
-    return {
+    kept = {
         key: value
         for key, value in headers.items()
         if key.lower() not in _HOP_BY_HOP and key.lower() not in _STRIP_REQUEST_HEADERS
     }
+    # Names only, never values. A stripped auth header means the agent sent a
+    # credential of its own, which is either a misconfigured SDK or a key an
+    # injected payload planted, and both are worth seeing. Logged at WARNING for
+    # that reason rather than folded into the debug stream.
+    stripped = [key for key in headers if key.lower() in _STRIP_REQUEST_HEADERS]
+    if stripped:
+        logger.warning(
+            "broker: stripped caller-supplied auth header(s) %s before forwarding",
+            stripped,
+        )
+    return kept
 
 
 def _forward_response_headers(headers) -> dict[str, str]:
@@ -165,12 +182,14 @@ class Broker:
     of the whole capability is just ``stop()``.
     """
 
-    def __init__(self, routes: list[Route]) -> None:
+    def __init__(
+        self, routes: list[Route], approvals: ApprovalBroker | None = None
+    ) -> None:
         if not routes:
             raise ValueError("Broker needs at least one route")
         for route in routes:
             host = urlsplit(route.upstream).hostname or ""
-            if _blocked_host(host):
+            if blocked_host(host):
                 raise ValueError(
                     f"route {route.prefix!r} upstream host {host!r} is in a blocked range"
                 )
@@ -180,6 +199,9 @@ class Broker:
         self._session: ClientSession | None = None
         self._runner: web.AppRunner | None = None
         self._port: int | None = None
+        # When present, a method/path scope miss becomes an operator question
+        # instead of a flat 403. None keeps the original deny-only behavior.
+        self._approvals = approvals
 
     @property
     def port(self) -> int:
@@ -235,6 +257,80 @@ class Broker:
                 return route
         return None
 
+    def add_route(self, route: Route) -> None:
+        """Insert a route into the live table and load its credential.
+
+        Lets an operator widen the broker without a restart. Ordering is
+        re-established on insert because _match relies on longest-prefix-first.
+        """
+        self._creds[route.keychain_service] = read_keychain(route.keychain_service)
+        self._routes = sorted(
+            [*self._routes, route], key=lambda r: len(r.prefix), reverse=True
+        )
+        logger.warning("broker: route %s added at runtime", route.prefix)
+
+    async def _scope_denial(
+        self, route: Route, method: str, tail: str
+    ) -> web.StreamResponse | None:
+        """None if the call is within the route's scope, else a 403 to return.
+
+        Both sub-scoping sets fail closed and only ever narrow: empty means "no
+        restriction", so an unscoped route behaves exactly as it did before
+        scoping existed. When an approval broker is wired in, a miss becomes an
+        operator question first and a 403 only if that question is declined.
+        """
+        if route.methods and method not in route.methods:
+            granted = await self._ask_scope(
+                route,
+                subject=f"{route.prefix} {method}",
+                detail=(
+                    f"The sandboxed agent tried {method} on broker route "
+                    f"{route.prefix}, which is scoped to "
+                    f"{sorted(route.methods)}. Approving lets it use {method} "
+                    f"with the route's injected credential."
+                ),
+            )
+            if not granted:
+                return web.Response(status=403, text=self._scope_body("method"))
+        if route.allowed_tails and tail not in route.allowed_tails:
+            granted = await self._ask_scope(
+                route,
+                subject=f"{route.prefix}/{tail}",
+                detail=(
+                    f"The sandboxed agent tried to reach {tail!r} on broker route "
+                    f"{route.prefix}, which is scoped to "
+                    f"{sorted(route.allowed_tails)}. Approving lets it call that "
+                    f"path with the route's injected credential."
+                ),
+            )
+            if not granted:
+                return web.Response(status=403, text=self._scope_body("path"))
+        return None
+
+    async def _ask_scope(self, route: Route, *, subject: str, detail: str) -> bool:
+        """Ask the operator to widen one route's scope. False without a gate."""
+        if self._approvals is None:
+            logger.warning("broker: deny %s (no approval channel)", subject)
+            return False
+        return await self._approvals.check(
+            ApprovalRequest(kind="route-scope", subject=subject, detail=detail)
+        )
+
+    @staticmethod
+    def _scope_body(dimension: str) -> str:
+        """403 body for a declined scope widening.
+
+        Deliberately does not say "retrying will not help": with an approval
+        channel attached a retry after the operator grants it *does* succeed,
+        and telling the agent otherwise would suppress the one useful action.
+        """
+        return (
+            f"[sandbox] egress policy: this route does not permit this {dimension}. "
+            "An operator was asked and did not approve it. Do not loop on this. "
+            "Tell the user exactly what you need and why, then continue with "
+            "whatever you can still do; if they approve, a later retry succeeds."
+        )
+
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         route = self._match(request.path)
         if route is None:
@@ -245,51 +341,35 @@ class Broker:
                 status=403,
                 text=(
                     "[sandbox] egress policy: no allowlisted broker route for this "
-                    "path, so this host cannot be reached. This is policy, not an "
-                    "outage; retrying will not help. If it is genuinely required, "
-                    "tell the user the operator must add a broker route for it."
+                    "path. The broker only serves providers it holds a credential "
+                    "for, and it cannot infer a host from an unmapped prefix, so "
+                    "retrying this path will not help. For an ordinary HTTPS host, "
+                    "use a normal https:// request instead: those go through the "
+                    "egress proxy, which can ask the operator to approve the host "
+                    "on the spot. If you genuinely need a new credentialed "
+                    "provider, tell the user the operator must add a broker route."
                 ),
             )
 
         tail = request.path[len(route.prefix) :].lstrip("/")
-        # Sub-scoping checks (fail-closed, and only ever narrow): an empty set
-        # means "no restriction" so an unscoped route behaves as before.
-        if route.methods and request.method not in route.methods:
-            logger.warning(
-                "broker: deny %s %s (method not allowed for route %s)",
-                request.method,
-                request.path,
-                route.prefix,
-            )
-            return web.Response(
-                status=403,
-                text=(
-                    f"[sandbox] egress policy: this route does not permit "
-                    f"{request.method}. This is policy, not an outage; retrying "
-                    "will not help. If it is genuinely required, tell the user the "
-                    "operator must widen the route's allowed methods."
-                ),
-            )
-        if route.allowed_tails and tail not in route.allowed_tails:
-            logger.warning(
-                "broker: deny %s %s (path not allowed for route %s)",
-                request.method,
-                request.path,
-                route.prefix,
-            )
-            return web.Response(
-                status=403,
-                text=(
-                    "[sandbox] egress policy: this route does not permit this path. "
-                    "This is policy, not an outage; retrying will not help. If it "
-                    "is genuinely required, tell the user the operator must add "
-                    "this path to the route's allowlist."
-                ),
-            )
+        denial = await self._scope_denial(route, request.method, tail)
+        if denial is not None:
+            return denial
         url = route.upstream.rstrip("/") + "/" + tail
         headers = _forward_request_headers(request.headers)
         headers[route.header] = route.value_prefix + self._creds[route.keychain_service]
         body = await request.read()
+        # Header *names* and the injection target, so a "why is upstream 401"
+        # question can be answered without the value ever being written down.
+        logger.debug(
+            "broker: %s -> %s, injecting %r from %s, forwarding headers %s, %d B body",
+            request.path,
+            url,
+            route.header,
+            route.keychain_service,
+            sorted(headers),
+            len(body),
+        )
 
         assert self._session is not None
         upstream_host = urlsplit(route.upstream).hostname
@@ -363,7 +443,9 @@ def routes_from_keychain(routes: list[Route]) -> list[Route]:
     return live
 
 
-async def start_default_broker() -> Broker | None:
+async def start_default_broker(
+    approvals: ApprovalBroker | None = None,
+) -> Broker | None:
     """Start a broker for whichever DEFAULT_ROUTES have keychain items, publish
     their base-urls into os.environ for agent_env to forward, and return it.
 
@@ -373,7 +455,7 @@ async def start_default_broker() -> Broker | None:
     if not routes:
         logger.warning("broker: no provisioned routes found; not starting")
         return None
-    broker = Broker(routes)
+    broker = Broker(routes, approvals=approvals)
     await broker.start()
     os.environ.update(broker.base_url_env())
     logger.info("broker: started with %d route(s)", len(routes))

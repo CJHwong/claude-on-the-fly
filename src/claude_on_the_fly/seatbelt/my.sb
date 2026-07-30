@@ -64,14 +64,28 @@
 (deny file-read* (subpath (string-append (param "_HOME") "/.docker")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.kube")))
 
-;; -- Version control tokens (Reasonable Access) --
-;; Allow reading gh settings but deny authentication hosts.
-(deny file-read*
-  (require-all
-    (subpath (string-append (param "_HOME") "/.config/gh"))
-    (require-not (literal (string-append (param "_HOME") "/.config/gh/config.yml")))
-  ))
-(deny file-read* (literal (string-append (param "_HOME") "/.config/gh/hosts.yml")))
+;; -- Credentials of brokered CLIs --
+;; These are denied because the agent does not need them: it reaches the tool
+;; through a shim that forwards to the command broker outside the sandbox, which
+;; holds the credential (commands.py). Denying the file used to cost the whole
+;; capability, which is why an earlier revision granted ~/.config/gh; with a shim
+;; the deny is free.
+;;
+;; A credential denied here without a matching shim breaks that tool under `jail`.
+;; That is the deliberate order: deny first, shim as each tool is added. `gh` is
+;; shimmed today; the rest are listed below and are currently unavailable under
+;; `jail` by choice.
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/gh")))
+
+;; -- Credentials with no shim yet (tool unavailable under jail) --
+;; Adopted after the original denylist was written, so they were readable by
+;; default until a probe caught it. An enumerate-the-bad list goes stale exactly
+;; this way; each addition here should come with a SHIMMED_TOOLS entry.
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/acli")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.local/share/acli")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/gws")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/gcloud")))
+(deny file-read* (literal (string-append (param "_HOME") "/.sentryclirc")))
 
 ;; -- Package manager tokens --
 (deny file-read* (literal (string-append (param "_HOME") "/.pypirc")))
@@ -100,6 +114,12 @@
 ;; ---------------------------------------------------------------------------
 (allow file-write* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
+;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
+;; dies at startup with "failed to initialize in-process app-server client:
+;; Operation not permitted" before it makes any network call, because its
+;; app-server and PATH aliases live under ~/.codex. Verified: adding this one
+;; line is the whole difference between codex failing and running under the jail.
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex")))
 ;; uv: Needed for caching packages and metadata
 (allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
 ;; Ollama: Needed to sync aliases, save configurations, and manage models/temporary files

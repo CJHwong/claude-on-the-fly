@@ -10,7 +10,8 @@ import pytest
 from aiohttp import ClientSession, web
 
 from claude_on_the_fly import broker
-from claude_on_the_fly.broker import Broker, Route
+from claude_on_the_fly.approvals import ApprovalBroker, RecordingGate
+from claude_on_the_fly.broker import Broker, Route, blocked_host
 
 
 async def _start(app: web.Application) -> tuple[web.AppRunner, int]:
@@ -279,7 +280,7 @@ async def test_start_default_broker_none_without_keychain(monkeypatch):
 # --- Slice 1: per-route method / path sub-scoping ---
 
 
-async def _scoped_broker(fake_keychain, received, **route_kwargs):
+async def _scoped_broker(fake_keychain, received, approvals=None, **route_kwargs):
     """Start a broker with a single scoped route pointed at an echo upstream."""
     fake_keychain["cotf-scoped"] = "REAL"
     up_runner, up_port = await _start(_echo_app(received))
@@ -292,7 +293,8 @@ async def _scoped_broker(fake_keychain, received, **route_kwargs):
                 keychain_service="cotf-scoped",
                 **route_kwargs,
             )
-        ]
+        ],
+        approvals=approvals,
     )
     port = await bro.start()
     return bro, up_runner, port
@@ -366,3 +368,182 @@ async def test_unscoped_route_allows_any_method_and_tail(fake_keychain):
         await bro.stop()
         await up_runner.cleanup()
     assert {r["path"] for r in received} == {"/anything", "/v9/wild"}
+
+
+# --- Runtime approval of a scope miss ---
+
+
+async def test_scope_miss_reaches_upstream_when_operator_approves(fake_keychain):
+    """An approved method widening injects the real credential, same as an
+    in-scope call: approval widens policy, it does not bypass the broker."""
+    received: list[dict] = []
+    gate = RecordingGate(default=True)
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain,
+        received,
+        approvals=ApprovalBroker(gate),
+        methods=frozenset({"POST"}),
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert received[0]["headers"]["x-api-key"] == "REAL"
+    assert gate.seen[0].kind == "route-scope"
+    # The operator is told the route and the method actually observed.
+    assert "GET" in gate.seen[0].detail
+
+
+async def test_scope_miss_still_403s_when_operator_declines(fake_keychain):
+    received: list[dict] = []
+    gate = RecordingGate(default=False)
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain,
+        received,
+        approvals=ApprovalBroker(gate),
+        methods=frozenset({"POST"}),
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            assert resp.status == 403
+            body = await resp.text()
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert received == []
+    # The stale "retrying will not help" is gone: with an approval channel a
+    # retry after a grant does succeed, and saying otherwise suppresses the one
+    # useful action the agent could take.
+    assert "retrying will not help" not in body
+    assert "Do not loop on this" in body
+
+
+async def test_approved_scope_is_cached_for_later_calls(fake_keychain):
+    received: list[dict] = []
+    gate = RecordingGate(default=True)
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain,
+        received,
+        approvals=ApprovalBroker(gate),
+        allowed_tails=frozenset({"v1/messages"}),
+    )
+    try:
+        async with ClientSession() as client:
+            for _ in range(3):
+                resp = await client.post(f"http://127.0.0.1:{port}/scoped/v1/admin")
+                assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert len(received) == 3
+    # Asked once, then served from the grant store.
+    assert len(gate.seen) == 1
+
+
+async def test_scope_miss_denies_without_an_approval_channel(fake_keychain):
+    """No gate wired in keeps the original deny-only behavior."""
+    received: list[dict] = []
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain, received, methods=frozenset({"POST"})
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            assert resp.status == 403
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert received == []
+
+
+async def test_in_scope_call_never_asks(fake_keychain):
+    received: list[dict] = []
+    gate = RecordingGate(default=True)
+    bro, up_runner, port = await _scoped_broker(
+        fake_keychain,
+        received,
+        approvals=ApprovalBroker(gate),
+        methods=frozenset({"POST"}),
+        allowed_tails=frozenset({"v1/messages"}),
+    )
+    try:
+        async with ClientSession() as client:
+            resp = await client.post(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert gate.seen == []
+
+
+async def test_add_route_widens_a_live_broker(fake_keychain):
+    received: list[dict] = []
+    fake_keychain["cotf-late"] = "LATE-KEY"
+    bro, up_runner, port = await _scoped_broker(fake_keychain, received)
+    up2_runner, up2_port = await _start(_echo_app(received))
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/late/v1/thing")
+            assert resp.status == 403
+            bro.add_route(
+                Route(
+                    prefix="/late",
+                    upstream=f"http://localhost:{up2_port}",
+                    header="x-api-key",
+                    keychain_service="cotf-late",
+                )
+            )
+            resp = await client.get(f"http://127.0.0.1:{port}/late/v1/thing")
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+        await up2_runner.cleanup()
+    assert received[-1]["headers"]["x-api-key"] == "LATE-KEY"
+
+
+async def test_blocked_host_is_public_and_catches_metadata():
+    # egress.py depends on this being importable rather than duplicating the
+    # CIDR list, which is how two policy paths drift apart.
+    assert blocked_host("169.254.169.254") is True
+    assert blocked_host("10.1.2.3") is True
+    assert blocked_host("127.0.0.1") is True
+    assert blocked_host("8.8.8.8") is False
+    assert blocked_host("api.anthropic.com") is False
+
+
+# --- diagnostic logging ---
+
+
+def test_stripped_auth_headers_are_reported(caplog):
+    """An agent sending its own credential is either a misconfigured SDK or a key
+    an injected payload planted, and both are worth seeing."""
+    from claude_on_the_fly.broker import _forward_request_headers
+
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.broker"):
+        kept = _forward_request_headers(
+            {
+                "x-api-key": "sk-planted-by-an-injection",
+                "authorization": "Bearer nope",
+                "content-type": "application/json",
+            }
+        )
+    assert kept == {"content-type": "application/json"}
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "stripped caller-supplied auth header" in logged
+    assert "x-api-key" in logged
+    # Names only: the record of a planted key must not republish it.
+    assert "sk-planted-by-an-injection" not in logged
+    assert "Bearer nope" not in logged
+
+
+def test_clean_request_logs_no_strip_warning(caplog):
+    from claude_on_the_fly.broker import _forward_request_headers
+
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.broker"):
+        _forward_request_headers({"content-type": "application/json"})
+    assert not [r for r in caplog.records if "stripped" in r.getMessage()]

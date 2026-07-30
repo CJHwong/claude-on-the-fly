@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from claude_on_the_fly.agent import Response
+from claude_on_the_fly.approvals import ApprovalRequest
 
 
 class Frontend(ABC):
@@ -50,6 +51,29 @@ class Frontend(ABC):
         Frontends can use this to clear a processing indicator (e.g. :eyes:)
         once the reply has been posted. No-op by default.
         """
+
+    async def ask_approval(
+        self, request: ApprovalRequest, chat_id: int | None = None
+    ) -> bool:
+        """Ask the operator to grant a runtime permission. True to grant.
+
+        `chat_id` is the session whose agent triggered the request, so the prompt
+        can land in the conversation that caused it. None means the request has no
+        session context (cron, the job queue), and the implementation should fall
+        back to a configured operator destination.
+
+        Default denies, so a frontend that hasn't implemented an approval UI
+        behaves exactly like one with no approval channel rather than silently
+        granting. Implementations must also return False when they have nowhere
+        to ask.
+
+        Implementations must present request.detail verbatim: it states what
+        the sandbox actually observed, and it is the only text in the flow the
+        agent could not have authored. Whoever may *click* is a separate check
+        the implementation owns, and it must not be the whole audience of the
+        channel the prompt lands in.
+        """
+        return False
 
     @abstractmethod
     async def stop(self) -> None:

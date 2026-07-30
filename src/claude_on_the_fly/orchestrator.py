@@ -12,13 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from claude_on_the_fly import agent, broker, sandbox
+from claude_on_the_fly import agent, broker, commands, egress, logs, sandbox
+from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
     ClaudeUnavailableError,
     Response,
     current_backend_key,
 )
+from claude_on_the_fly.approvals import ApprovalBroker
 from claude_on_the_fly.events import (
     EVENT_DISPATCHED,
     EVENT_WORKER_DONE,
@@ -55,13 +57,82 @@ class Turn:
     compact: bool = False
 
 
+class SessionEgress:
+    """One CONNECT proxy, with its own grant store, per session.
+
+    Per-session rather than one daemon-wide proxy for two reasons that are really
+    the same reason:
+
+    - **Attribution.** A CONNECT carries a hostname and nothing else, so a shared
+      proxy cannot tell which of several concurrently running chats made it. The
+      port is the only available label, so giving each session its own port is
+      what lets the approval prompt land in the conversation that caused it.
+    - **Grant scope.** A grant lives on an ApprovalBroker's store. Share the
+      broker and approving a host in one chat silently authorizes it for every
+      other chat and for cron. One store per session confines it.
+
+    A session is (chat_id, session_uuid), so `/new` earns a fresh proxy and drops
+    the previous session's grants rather than inheriting them.
+    """
+
+    def __init__(self, frontend: Frontend) -> None:
+        self._frontend = frontend
+        self._proxies: dict[int, tuple[str, egress.EgressProxy]] = {}
+
+    async def env_for(self, chat_id: int, session: str) -> dict[str, str]:
+        """Proxy env for this session, starting a proxy the first time."""
+        existing = self._proxies.get(chat_id)
+        if existing is not None and existing[0] == session:
+            return existing[1].proxy_env()
+        if existing is not None:
+            # Session changed under this chat: the old grants died with it.
+            await existing[1].stop()
+            logger.info("egress: chat %s session changed, grants dropped", chat_id)
+        # Both the proxy and its grant store carry the chat label, so every gate
+        # decision in the log names the conversation it belongs to. Without it two
+        # concurrent chats reaching the same host are indistinguishable, and the
+        # per-session confinement this class exists for cannot be verified.
+        label = f"chat {chat_id}"
+        approvals = ApprovalBroker(
+            approvals_mod.gate_from_frontend(self._frontend, chat_id),
+            policy=approvals_mod.ApprovalPolicy(never_ask=egress.DEFAULT_NEVER_ASK),
+            label=label,
+        )
+        proxy = egress.EgressProxy(
+            approvals, allowed_hosts=sandbox.preapproved_hosts(), label=label
+        )
+        await proxy.start()
+        self._proxies[chat_id] = (session, proxy)
+        logger.info(
+            "egress: chat %s -> 127.0.0.1:%d (own grant store, session %s)",
+            chat_id,
+            proxy.port,
+            session[:8],
+        )
+        return proxy.proxy_env()
+
+    async def close_all(self) -> None:
+        """Revoke every session's egress at once."""
+        for _session, proxy in list(self._proxies.values()):
+            await proxy.stop()
+        self._proxies.clear()
+
+    def ports(self) -> dict[int, int]:
+        """chat_id -> proxy port, for the startup summary and heartbeat."""
+        return {chat: proxy.port for chat, (_s, proxy) in self._proxies.items()}
+
+
 class Orchestrator:
     def __init__(
         self,
         frontend: Frontend,
         platform: str,
         event_log: EventLog | None = None,
+        egress_manager: SessionEgress | None = None,
     ) -> None:
+        # None when sandboxing is off: no proxy, no per-session env, and the
+        # spawn sites behave exactly as they did before any of this existed.
+        self._egress = egress_manager
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
@@ -148,7 +219,7 @@ class Orchestrator:
         return True
 
     async def on_message(self, chat_id: int, text: str) -> None:
-        logger.debug("on_message: chat_id=%s text=%s", chat_id, text[:80])
+        logger.debug("on_message: chat_id=%s text=%s", chat_id, logs.redact(text))
         if self._due_for_compaction(chat_id):
             # Ahead of the message, not during the idle window before it. An idle
             # thread may never be spoken to again, and compacting one that isn't
@@ -249,6 +320,16 @@ class Orchestrator:
             "session_uuid": session,
         }
 
+        # Point this turn's agent at its own egress proxy. Set here rather than
+        # passed down because the spawn is several frames below, inside a
+        # backend; asyncio copied this task's context at creation, so the value
+        # reaches that spawn and no other session's.
+        env_token = None
+        if self._egress is not None:
+            env_token = sandbox.session_env(
+                await self._egress.env_for(chat_id, session)
+            )
+
         # Startup notification performs frontend I/O and is therefore a
         # cancellation point. Keep it inside the lifecycle try/finally so an
         # abort while it is in progress still clears the in-flight slot and
@@ -336,6 +417,8 @@ class Orchestrator:
             self._in_flight.pop(chat_id, None)
             if typing_task is not None:
                 typing_task.cancel()
+            if env_token is not None:
+                sandbox.reset_session_env(env_token)
             await self._frontend.notify_complete(chat_id)
 
     async def _run_compaction(
@@ -449,16 +532,47 @@ async def run(frontend: Frontend, platform: str) -> None:
     # When sandboxing is enabled, the broker holds the real API keys and the
     # agent reaches them only through loopback. start_default_broker publishes
     # base-urls into os.environ that sandbox.agent_env forwards to the agent.
+    #
+    # The egress proxy covers everything the broker cannot: it gates ordinary
+    # HTTPS by destination host and, via the approval broker, can ask the
+    # operator to grant an unknown one mid-run instead of failing the task.
     broker_instance = None
+    session_egress = None
+    command_broker = None
     if sandbox.enabled():
-        broker_instance = await broker.start_default_broker()
+        # The broker is shared: its routes are operator config, not something a
+        # session earns, so one credential-holding proxy for the daemon is right.
+        # Egress is the opposite -- see SessionEgress for why it is per-session.
+        broker_instance = await broker.start_default_broker(
+            approvals=ApprovalBroker(
+                approvals_mod.gate_from_frontend(frontend),
+                policy=approvals_mod.ApprovalPolicy(
+                    never_ask=egress.DEFAULT_NEVER_ASK,
+                ),
+            )
+        )
+        session_egress = SessionEgress(frontend)
+        # Daemon-wide, unlike egress: a brokered command carries no per-session
+        # state to confine, and the credential it uses is the operator's either
+        # way. Publishing into os.environ (not the session ContextVar) for the
+        # same reason.
+        command_broker = commands.CommandBroker(sandbox.shim_dir())
+        await command_broker.start()
+        os.environ.update(command_broker.agent_env())
         logger.info(
-            "sandbox: mode=%s broker=%s",
+            "sandbox: mode=%s broker=%s egress=per-session commands=%s content_log=%s",
             sandbox.mode(),
             "on" if broker_instance else "none",
+            ",".join(command_broker.shimmed) or "none",
+            "on" if logs.log_content() else "redacted",
         )
+        # macOS cannot report a seatbelt denial, so the agent's own blocked reads
+        # are permanently invisible. Probing the denies here is the substitute: it
+        # records, per run, that the boundary was actually in force rather than
+        # inferring it from an absence of errors.
+        await sandbox.verify_denials()
 
-    orch = Orchestrator(frontend, platform)
+    orch = Orchestrator(frontend, platform, egress_manager=session_egress)
     frontend.set_orchestrator(orch)
 
     stop = asyncio.Event()
@@ -480,6 +594,11 @@ async def run(frontend: Frontend, platform: str) -> None:
     await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
     await orch.shutdown()
     await frontend.stop()
+    # Stopping these revokes every route out of the sandbox at once.
+    if session_egress is not None:
+        await session_egress.close_all()
+    if command_broker is not None:
+        await command_broker.stop()
     if broker_instance is not None:
         await broker_instance.stop()
     with contextlib.suppress(FileNotFoundError):

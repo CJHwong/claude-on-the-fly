@@ -2465,3 +2465,60 @@ class TestCompactResolvesTheWorkspace:
         await frontend._ingest_event(self._event())
 
         assert frontend.workspace_name(session) == from_message
+
+
+class TestRetiredApprovalCard:
+    """The spent permission card shares the thread with the answer, so it has to
+    read as a status line rather than a second reply."""
+
+    async def test_collapses_to_a_single_context_line(self, frontend):
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        frontend._app.client.chat_update = AsyncMock()
+        await frontend._retire_approval(
+            "C1",
+            "1785382860.1",
+            ApprovalRequest(kind="host", subject="pypi.org:443", detail="d"),
+            True,
+        )
+        blocks = frontend._app.client.chat_update.await_args.kwargs["blocks"]
+        assert len(blocks) == 1
+        # context renders small and grey; section competes with the real reply.
+        assert blocks[0]["type"] == "context"
+        text = blocks[0]["elements"][0]["text"]
+        assert text == "Permission *approved*: `pypi.org:443`"
+        # No buttons survive, so the prompt cannot be answered twice.
+        assert "actions" not in [b["type"] for b in blocks]
+
+    async def test_denial_reads_the_same_way(self, frontend):
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        frontend._app.client.chat_update = AsyncMock()
+        await frontend._retire_approval(
+            "C1",
+            "1785382860.1",
+            ApprovalRequest(kind="host", subject="evil.example:443", detail="d"),
+            False,
+        )
+        kwargs = frontend._app.client.chat_update.await_args.kwargs
+        assert kwargs["blocks"][0]["type"] == "context"
+        assert (
+            kwargs["blocks"][0]["elements"][0]["text"]
+            == "Permission *denied*: `evil.example:443`"
+        )
+        # The notification fallback stays readable on its own.
+        assert kwargs["text"] == "Permission denied: evil.example:443"
+
+    async def test_api_failure_does_not_raise(self, frontend):
+        """A retire failure must not propagate: the grant decision is already
+        made, and losing the cosmetic update is not worth failing the turn."""
+        from slack_sdk.errors import SlackApiError
+
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+        await frontend._retire_approval(
+            "C1", "1.1", ApprovalRequest(kind="host", subject="a:443", detail="d"), True
+        )
