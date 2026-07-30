@@ -59,10 +59,10 @@ Route(
 These knobs only take effect under `COTF_SANDBOX=jail` and each defaults to the current
 behavior when unset:
 
-- `COTF_SANDBOX_FS=deny-most` swaps the read-permissive base (`my.sb`) for `my.deny-most.sb`,
+- `COTF_SANDBOX_FS=deny-most` swaps the read-permissive base (`fs-allow-reads.sb`) for `fs-deny-most.sb`,
   which makes `$HOME` opaque and re-grants only the project dir, `~/.claude`, `~/.cache/uv`,
   and up to three operator paths. Reads outside `$HOME` (system libraries, the toolchain)
-  stay allowed so binaries run. This is coarser than `my.sb` by design: an agent that reads
+  stay allowed so binaries run. This is coarser than `fs-allow-reads.sb` by design: an agent that reads
   a home dotfile outside the granted set (e.g. `~/.gitconfig`) is denied. Note the agent's own
   binary and interpreters often live under `$HOME` (`~/.local/bin`, mise/nvm/npm paths); grant
   those via `COTF_SANDBOX_EXTRA_PATHS` or the agent cannot exec and the run fails to start.
@@ -77,7 +77,7 @@ behavior when unset:
 ## Seatbelt (jail mode)
 
 Nothing to install. The profiles live in `src/claude_on_the_fly/seatbelt/`
-(`my.sb` base + `my.jail.sb`, vendored from agent-seatbelt). `sandbox.wrap`
+(`jail.sb` plus a filesystem base, derived from agent-seatbelt). `sandbox.wrap`
 invokes `sandbox-exec` against them directly; the jail imports the base and
 overrides only egress + keychain. macOS only; on other platforms jail mode
 degrades to `env` (curation without the seatbelt). Re-vendor by copying the two
@@ -256,15 +256,53 @@ so `gh --repo o/r auth token` cannot dodge it.
 
 ### Adding a tool
 
-One `SHIMMED_TOOLS` entry plus a credential deny in `my.sb`. No new machinery. A
-tool whose binary is not on PATH is skipped rather than shimmed, so a missing
-binary stays "command not found".
+Config, not code. Vetted defaults ship as `commands.yaml` inside the package;
+operator additions go in `~/.claude-on-the-fly/commands.yaml`:
 
-Currently shimmed: `gh`. Denied but **not** shimmed, so unavailable under `jail`
-until someone adds the entry: `~/.config/acli`, `~/.local/share/acli`,
-`~/.config/gws`, `~/.config/gcloud`, `~/.sentryclirc`, plus the pre-existing
-`~/.aws/credentials`, `~/.kube`, `~/.docker`, ssh private keys. That order is
-deliberate: deny first, shim as needed.
+```yaml
+tools:
+  - name: kubectl
+    readback:
+      - config view          # also refuses `kubectl --context x config view`
+    readback_flags: [--token]
+    env_passthrough: [KUBECONFIG, NO_COLOR]
+```
+
+`readback` entries are the leading words of a command rather than nested lists,
+because this file's whole job is refusing the right commands and `[[config,
+view]]` is easy to get subtly wrong. Matching is against the leading non-flag
+tokens, so a global flag cannot push a refused pair out of the prefix.
+
+The operator file **merges by name** over the bundled entries, so adding one tool
+keeps the vetted refusals on the others. Overriding a bundled entry is allowed and
+logged; an override that *drops* a refusal the bundled entry had is logged at
+WARNING naming what is no longer refused, because that is the one edit here that
+hands the agent a credential. A malformed file falls back to the bundled defaults
+and logs at ERROR rather than starting with no tools at all, since silently losing
+every shim is what sends the agent looking for another route to the same
+capability.
+
+The file lives under `DATA_DIR`, which is not in the seatbelt write allowlist, so
+the agent can neither add itself a tool nor delete a refusal.
+
+A tool whose binary is not on the daemon's PATH is skipped rather than shimmed, so
+a missing binary stays "command not found" instead of becoming a confusing broker
+error. `snowsql` is an example: denied, not installed, so nothing to shim.
+
+Currently bundled: `gh` and `acli`. `acli` carries no token readback because
+`acli auth` has no token-printing subcommand at all (checked against
+`acli auth --help`); what it refuses is `auth logout` / `login` / `switch`, which
+change the operator's own auth state from inside an agent turn.
+
+Denied but **not** shimmed, so unavailable under `jail`: `~/.aws`, `~/.kube`,
+`~/.docker`, `~/.config/gcloud`, ssh private keys, `~/.config/gws`,
+`~/.sentryclirc`, and the infrastructure and PaaS stores listed in the profile.
+That order is deliberate: deny first, shim only what is needed. For `aws`,
+`kubectl`, `terraform`, and `vault` it is deliberate and permanent — the shim runs
+the binary outside the jail with the operator's full credential and no action
+policy, and `terraform apply` or `kubectl delete` against production is not a
+trade worth making for convenience. Use `COTF_SANDBOX=env` for a run that needs
+one of those.
 
 ### Why loopback and not a unix socket
 
@@ -293,8 +331,8 @@ adds the inputs behind each one. Diagnosing a run means reading these in order.
 
 | Question | Line | Level |
 |---|---|---|
-| Was the jail actually applied? | `sandbox: jailed sh (fs=my.sb, loopback=[...], project=...)` | INFO |
-| Were the credential denies in force? | `sandbox: 5/6 probed credential paths confirmed denied under my.sb (1 absent, untested)` | INFO |
+| Was the jail actually applied? | `sandbox: jailed sh (fs=fs-allow-reads.sb, loopback=[...], project=...)` | INFO |
+| Were the credential denies in force? | `sandbox: 5/6 probed credential paths confirmed denied under fs-allow-reads.sb (1 absent, untested)` | INFO |
 | Which env reached the agent? | `sandbox: env curated, 10 forwarded [...], 76 dropped by omission` | DEBUG |
 | Did the CLI go through the shim? | `commands: shim invocation gh argv0='/…/shims/gh' cwd='…'` | DEBUG |
 | What did it run, and as what? | `commands: RUN gh ['pr','list']` then `commands: gh runs /opt/homebrew/bin/gh with env [...]` | WARNING / DEBUG |
