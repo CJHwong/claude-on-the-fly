@@ -547,3 +547,66 @@ def test_clean_request_logs_no_strip_warning(caplog):
     with caplog.at_level("WARNING", logger="claude_on_the_fly.broker"):
         _forward_request_headers({"content-type": "application/json"})
     assert not [r for r in caplog.records if "stripped" in r.getMessage()]
+
+
+# --- response body integrity ---
+
+
+async def test_gzipped_upstream_response_survives_the_broker(monkeypatch):
+    """A gzipped upstream response must reach the agent intact.
+
+    aiohttp's ClientSession decompresses by default, and `content-encoding` was
+    not in the strip set, so the broker forwarded a decompressed body still
+    labelled `Content-Encoding: gzip`. Every client then failed with a zlib
+    error. Found with a live `claude` run against the broker: "Decompression
+    error: ZlibError". Essentially every real API gzips, so this path was broken
+    for all of them.
+    """
+    import gzip
+
+    from aiohttp import ClientSession, web
+
+    from claude_on_the_fly.broker import Broker, Route
+
+    payload = b'{"ok": true, "content": "' + b"x" * 4096 + b'"}'
+
+    async def upstream(request: web.Request) -> web.Response:
+        # Explicitly gzip with the header set, as a real API does.
+        return web.Response(
+            body=gzip.compress(payload),
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", upstream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    upstream_port = runner.addresses[0][1]
+
+    monkeypatch.setattr(
+        "claude_on_the_fly.broker.read_keychain", lambda _service: "real-key"
+    )
+    broker = Broker(
+        [
+            Route(
+                prefix="/up",
+                # A hostname, so the loopback guard (which only inspects IP
+                # literals) does not reject the test route.
+                upstream=f"http://localhost:{upstream_port}",
+                header="x-api-key",
+                keychain_service="svc",
+            )
+        ]
+    )
+    port = await broker.start()
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/up/v1/thing")
+            assert resp.status == 200
+            body = await resp.read()
+        assert body == payload, "body did not survive the broker intact"
+    finally:
+        await broker.stop()
+        await runner.cleanup()

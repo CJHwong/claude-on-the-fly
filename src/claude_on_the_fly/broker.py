@@ -225,7 +225,15 @@ class Broker:
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         for route in self._routes:
             self._creds[route.keychain_service] = read_keychain(route.keychain_service)
-        self._session = ClientSession(timeout=ClientTimeout(total=None))
+        # auto_decompress=False keeps this byte-transparent. aiohttp decompresses
+        # by default, which combined with forwarding the upstream's
+        # `Content-Encoding: gzip` handed every client a decompressed body still
+        # labelled compressed; they all failed with a zlib error. Passing the
+        # bytes through untouched keeps the header truthful and skips a
+        # decompress/recompress round trip a proxy has no reason to do.
+        self._session = ClientSession(
+            timeout=ClientTimeout(total=None), auto_decompress=False
+        )
         app = web.Application()
         app.router.add_route("*", "/{tail:.*}", self._handle)
         self._runner = web.AppRunner(app)
