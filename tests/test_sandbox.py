@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly import agent, sandbox
+from claude_on_the_fly import agent, egress, sandbox
 
 
 def test_mode_defaults_off(monkeypatch):
@@ -318,16 +318,6 @@ def test_wrap_jail_passes_three_loopback_slots(monkeypatch, tmp_path):
         assert any(a.startswith(param) for a in out), param
 
 
-def test_preapproved_hosts_parses_and_normalizes(monkeypatch):
-    monkeypatch.setenv("COTF_EGRESS_ALLOW", "GitHub.com, pypi.org ,,")
-    assert sandbox.preapproved_hosts() == frozenset({"github.com", "pypi.org"})
-
-
-def test_preapproved_hosts_empty_by_default(monkeypatch):
-    monkeypatch.delenv("COTF_EGRESS_ALLOW", raising=False)
-    assert sandbox.preapproved_hosts() == frozenset()
-
-
 def test_loopback_ports_reads_any_base_url(monkeypatch):
     _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9911/openai")
@@ -390,6 +380,21 @@ def test_env_editor_restarts_frontends_when_sandbox_vars_change():
         assert affected == {"telegram", "slack"}, f"{var} restarts {affected}"
 
 
+def test_guidance_teaches_the_403_shape_the_agent_will_actually_see(
+    monkeypatch, tmp_path
+):
+    """No client surfaces a CONNECT response body, so the reason phrase is the only
+    channel. Pointing the agent at the status line is what makes it readable at
+    all; without this it sees a bare proxy error and has nothing to report."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert "403 Forbidden by egress policy:" in text
+    # The exact prefix the proxy emits, so the two cannot drift apart.
+    assert egress._NEVER_ASK.hint.startswith("Forbidden by egress policy:")
+    assert egress._NEVER_ASK.hint in text
+
+
 def test_guidance_warns_keychain_denial_is_not_an_eperm(monkeypatch, tmp_path):
     """Verified against a live run: a denied keychain read reports "item could
     not be found", not EPERM, so an agent taught EPERM-means-policy would read
@@ -423,6 +428,59 @@ def test_guidance_write_scope_names_the_workspace(monkeypatch, tmp_path):
     monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
     text = sandbox.agent_guidance(tmp_path)
     assert str(tmp_path.resolve()) in text
+
+
+# --- brokered CLIs, and the remedy the agent relays for one that is not ---
+
+
+def test_guidance_names_the_brokered_commands(monkeypatch, tmp_path):
+    """An agent that knows which CLIs are brokered can tell a policy boundary from
+    a broken tool. Without the list it has to guess from the failure."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    monkeypatch.setattr(
+        "claude_on_the_fly.commands.shimmed_names", lambda: ["acli", "gh"]
+    )
+    text = sandbox.agent_guidance(tmp_path)
+    assert "work normally: acli, gh" in text
+
+
+def test_guidance_says_so_when_nothing_is_brokered(monkeypatch, tmp_path):
+    """A deployment with neither gh nor acli installed must not be told an empty
+    list of tools "work normally"."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    monkeypatch.setattr("claude_on_the_fly.commands.shimmed_names", lambda: [])
+    text = sandbox.agent_guidance(tmp_path)
+    assert "No credentialed CLI is brokered" in text
+    assert "work normally:" not in text
+
+
+def test_guidance_remedy_for_an_unbrokered_cli_is_the_settings_file(
+    monkeypatch, tmp_path
+):
+    """It used to point at COTF_SANDBOX_EXTRA_PATHS, which is the fix commands.py
+    documents as broken: granting the credential path either leaves the tool broken
+    or hands its token to the session. The remedy is the commands section."""
+    from claude_on_the_fly import settings
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert "adds the tool to the `commands:` section" in text
+    assert str(settings.operator_settings()) in text
+    assert "the remedy is NOT a read grant" in text
+
+
+def test_guidance_forbids_routing_around_an_unbrokered_cli(monkeypatch, tmp_path):
+    """The observed failure this whole subsystem exists for: denied gh, the agent
+    reached the same private repos through the model provider's own GitHub
+    integration instead of reporting the block."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert "do not reach the same service by another route" in text
+    assert "provider-side integration" in text
 
 
 # --- diagnostic logging ---
@@ -635,7 +693,6 @@ class TestInertWhenOff:
             "COTF_SANDBOX_FS",
             "COTF_SANDBOX_EXTRA_PATHS",
             "COTF_SANDBOX_BROKER_ONLY_LOOPBACK",
-            "COTF_EGRESS_ALLOW",
         ):
             monkeypatch.delenv(var, raising=False)
 
@@ -651,9 +708,6 @@ class TestInertWhenOff:
 
     async def test_no_deny_probes_run(self, tmp_path):
         assert await sandbox.verify_denials(tmp_path) == {}
-
-    def test_no_preapproved_hosts(self):
-        assert sandbox.preapproved_hosts() == frozenset()
 
     def test_nothing_is_logged(self, tmp_path, caplog):
         """No spawn record, no probe lines, no curation line."""

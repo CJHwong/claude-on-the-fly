@@ -131,7 +131,10 @@ your allowed set).
 - "Permission denied" (EACCES) means a genuine file-permission problem, not the \
 sandbox.
 - A network call that cannot connect or resolve, an error tagged "[sandbox] ... \
-egress policy", or an HTTP 451 means egress policy.
+egress policy", or an HTTP 451 means egress policy. For HTTPS the message arrives \
+as a proxy/tunnel error whose status line carries the reason, e.g. "403 Forbidden \
+by egress policy: host permanently blocked, cannot be approved" — read that line, \
+it says which of these happened and whether retrying can ever help.
 
 Reads and writes have different scopes. Do not narrow reads to the write scope: \
 refusing a read you are actually permitted to make costs the user real work.
@@ -159,7 +162,16 @@ to the same host.
 reports as "The specified item could not be found" rather than "Operation not \
 permitted". Do not read that as "the credential does not exist" and do not go \
 looking for it elsewhere: the item may well exist and you are simply not \
-permitted to see it. You do not need it; credentials are injected by the broker."""
+permitted to see it. You do not need it; credentials are injected by the broker.
+- {brokered} A credentialed CLI that is not on that list will fail on its own \
+config or token file, because the sandbox denies credential stores. That is \
+policy, not a broken install, and the remedy is NOT a read grant: adding the \
+credential path would either leave the tool broken or hand its token to this \
+session. Remedy to relay: the operator adds the tool to the `commands:` section \
+of {settings_path}. Report which command you needed and stop there — do not look \
+for the credential yourself, and do not reach the same service by another route \
+(a different host, another tool's token, a provider-side integration). Doing that \
+launders the boundary rather than respecting it."""
 
 
 def mode() -> str:
@@ -251,18 +263,6 @@ def _fs_base_profile() -> Path:
     if os.environ.get("COTF_SANDBOX_FS", "").lower() == "deny-most":
         return _DENY_MOST_PROFILE
     return _BASE_PROFILE
-
-
-def preapproved_hosts() -> frozenset[str]:
-    """Hosts the egress proxy allows without asking, from COTF_EGRESS_ALLOW.
-
-    Comma-separated bare hostnames, e.g. "github.com,pypi.org,files.pythonhosted.org".
-    This is how an operator front-loads the hosts a job is known to need so the
-    run doesn't stop for an approval it would always grant. Empty means every
-    host is asked about.
-    """
-    raw = os.environ.get("COTF_EGRESS_ALLOW", "")
-    return frozenset(host.strip().lower() for host in raw.split(",") if host.strip())
 
 
 def _port_from_url(value: str) -> str | None:
@@ -374,8 +374,18 @@ def agent_guidance(workspace: Path | None = None) -> str:
     project = os.path.realpath(workspace) if workspace is not None else "the workspace"
     home = Path.home()
     # Deferred like shim_dir(): agent imports this module, so a top-level import
-    # of DATA_DIR would be a cycle.
+    # of DATA_DIR would be a cycle. commands is deferred for the same reason, one
+    # hop further out (commands -> settings -> agent -> sandbox).
+    from claude_on_the_fly import commands, settings
     from claude_on_the_fly.agent import MEMORY_DIR
+
+    shimmed = commands.shimmed_names()
+    brokered = (
+        "These commands run outside the sandbox through a broker, with the "
+        f"operator's real credentials, and work normally: {', '.join(shimmed)}."
+        if shimmed
+        else "No credentialed CLI is brokered in this deployment."
+    )
 
     writes = (
         f"the workspace ({project}), your memory ({MEMORY_DIR}), and your temp dir."
@@ -418,7 +428,13 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "pauses the request while the operator is asked to approve it, so a "
             "first call to a new host may take up to a minute."
         )
-    return _JAIL_GUIDANCE.format(reads=reads, writes=writes, net=net)
+    return _JAIL_GUIDANCE.format(
+        reads=reads,
+        writes=writes,
+        net=net,
+        brokered=brokered,
+        settings_path=settings.operator_settings(),
+    )
 
 
 def wrap(argv: list[str], workspace: Path) -> list[str]:

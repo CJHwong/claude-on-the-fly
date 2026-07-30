@@ -1200,6 +1200,38 @@ class TestStartSandbox:
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
 
+    async def test_the_policy_file_is_seeded_and_checked_before_anything_reads_it(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """The loaders below fall back per section, so a typo left unreported here
+        surfaces later as a host prompt or a missing shim, nowhere near the edit."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setattr(
+            orchestrator_mod.broker, "start_default_broker", AsyncMock()
+        )
+        command_broker = MagicMock()
+        command_broker.start = AsyncMock()
+        command_broker.shimmed = []
+        command_broker.agent_env = dict
+        monkeypatch.setattr(
+            orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+        )
+        assert not operator_settings.exists()
+        await orchestrator_mod._start_sandbox(frontend)
+        assert operator_settings.is_file()
+
+    async def test_sandboxing_off_does_not_seed_a_policy_file(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """Nothing reads the policy when sandboxing is off, so writing a file about
+        it would be noise in the operator's directory."""
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        await orchestrator_mod._start_sandbox(frontend)
+        assert not operator_settings.exists()
+
 
 # ---------------------------------------------------------------------------
 # Startup summary

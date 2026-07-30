@@ -14,6 +14,7 @@ import socket
 
 import pytest
 
+from claude_on_the_fly import egress, settings
 from claude_on_the_fly.approvals import (
     ApprovalBroker,
     ApprovalPolicy,
@@ -21,8 +22,9 @@ from claude_on_the_fly.approvals import (
 )
 from claude_on_the_fly.egress import (
     _MAX_REQUEST_LINE,
-    DEFAULT_NEVER_ASK,
     EgressProxy,
+    default_allowed_hosts,
+    default_never_ask,
     is_dns_safe_host,
     never_ask_subjects,
     parse_connect_target,
@@ -85,7 +87,7 @@ def test_dns_safe_rejects_smuggling_vectors(host):
 
 
 def test_default_never_ask_covers_metadata_hostnames():
-    assert "metadata.google.internal" in DEFAULT_NEVER_ASK
+    assert "metadata.google.internal" in default_never_ask()
 
 
 # --- harness ---
@@ -282,7 +284,7 @@ async def test_dns_failure_is_refused_without_asking(monkeypatch):
 
 
 async def test_preapproved_host_skips_the_private_address_check():
-    """An operator naming localhost in COTF_EGRESS_ALLOW means it: that is a
+    """An operator naming localhost in `egress.allow` means it: that is a
     config act, not something the agent can induce."""
     echo_port, echo = await start_echo_server()
     gate = RecordingGate(default=False)
@@ -558,8 +560,6 @@ async def test_sessions_get_distinct_ports():
 
 
 def test_default_allowed_hosts_cover_every_backend_model_api():
-    from claude_on_the_fly.egress import DEFAULT_ALLOWED_HOSTS
-
     # Without these the agent cannot complete a turn, so gating them would stop
     # every fresh deployment on its own first LLM call.
     for host in (
@@ -568,12 +568,10 @@ def test_default_allowed_hosts_cover_every_backend_model_api():
         "chatgpt.com",
         "ab.chatgpt.com",
     ):
-        assert host in DEFAULT_ALLOWED_HOSTS
+        assert host in default_allowed_hosts()
 
 
 def test_defaults_exclude_hosts_that_are_real_decisions():
-    from claude_on_the_fly.egress import DEFAULT_ALLOWED_HOSTS
-
     # A package registry grants arbitrary code execution via install; github.com
     # grants writes; telemetry is optional by definition. Operator's call.
     for host in (
@@ -584,7 +582,7 @@ def test_defaults_exclude_hosts_that_are_real_decisions():
         "api.github.com",
         "downloads.claude.ai",
     ):
-        assert host not in DEFAULT_ALLOWED_HOSTS
+        assert host not in default_allowed_hosts()
 
 
 async def test_model_api_tunnels_without_asking(monkeypatch):
@@ -620,6 +618,99 @@ async def test_operator_hosts_are_unioned_with_the_defaults():
     )
     assert "pypi.org" in proxy._allowed
     assert "api.anthropic.com" in proxy._allowed
+
+
+# --- host lists come from the settings file ---
+
+
+def test_operator_file_adds_an_allowed_host(operator_settings):
+    operator_settings.write_text("egress:\n  allow:\n    - pypi.org  # uv installs\n")
+    hosts = default_allowed_hosts()
+    assert "pypi.org" in hosts
+    # Bundled entries survive: adding a host must not cost you the model APIs.
+    assert "api.anthropic.com" in hosts
+
+
+def test_operator_file_adds_a_never_ask_host(operator_settings):
+    operator_settings.write_text("egress:\n  never_ask:\n    - internal.corp.example\n")
+    assert "internal.corp.example" in default_never_ask()
+
+
+def test_the_operator_cannot_remove_a_bundled_never_ask_host(operator_settings):
+    """The bundled entries are the cloud metadata endpoints, which hand instance
+    credentials to anything that reaches them. The merge is a union on purpose, so
+    no config edit can re-open one."""
+    operator_settings.write_text("egress:\n  never_ask:\n    - only.this.example\n")
+    assert "metadata.google.internal" in default_never_ask()
+
+
+def test_hosts_are_lowercased_and_stripped(operator_settings):
+    operator_settings.write_text('egress:\n  allow:\n    - "  PyPI.ORG  "\n')
+    assert "pypi.org" in default_allowed_hosts()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://pypi.org",  # a URL, not a hostname
+        "pypi.org:443",  # port belongs in the CONNECT target, not here
+        "pypi org",  # whitespace
+        "",  # empty
+    ],
+)
+def test_a_bad_host_is_rejected_at_load_not_at_connect_time(operator_settings, entry):
+    """A silently dead entry would surface months later as an approval prompt for
+    a host the operator believes they already allowed."""
+    operator_settings.write_text(f'egress:\n  allow:\n    - "{entry}"\n')
+    with pytest.raises(ValueError, match="is not a hostname"):
+        egress.parse_hosts({"allow": [entry]}, "allow", source=str(operator_settings))
+    # And the loader falls back rather than propagating.
+    assert "api.anthropic.com" in default_allowed_hosts()
+
+
+def test_a_malformed_egress_section_falls_back_to_bundled(operator_settings, caplog):
+    operator_settings.write_text('egress:\n  allow: "not-a-list"\n')
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.egress"):
+        hosts = default_allowed_hosts()
+    assert hosts == egress.parse_hosts(
+        settings.bundled("egress"), "allow", source="bundled"
+    )
+    assert "bundled hosts only" in caplog.text
+
+
+def test_parse_hosts_rejects_a_section_that_is_not_a_mapping():
+    with pytest.raises(ValueError, match="must be a mapping"):
+        egress.parse_hosts([], "allow", source="test.yaml")
+
+
+def test_a_missing_key_is_an_empty_set_not_an_error():
+    assert egress.parse_hosts({}, "allow", source="test.yaml") == frozenset()
+
+
+def test_a_caller_can_still_front_load_hosts(operator_settings):
+    """`allowed_hosts` is the constructor's injection seam, unioned with the file.
+    Nothing in production passes it now that the env var is gone; the tunnel tests
+    are its users, and it is how any future caller would front-load a host."""
+    operator_settings.write_text("egress:\n  allow:\n    - from-file.example\n")
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=False)),
+        allowed_hosts=frozenset({"From-Caller.Example"}),
+    )
+    assert {
+        "from-file.example",
+        "from-caller.example",
+        "api.anthropic.com",
+    } <= proxy._allowed
+
+
+def test_an_explicit_never_ask_argument_still_wins(operator_settings):
+    """The parameter is what lets a caller wire a proxy with a narrower policy;
+    resolving from the file must only be the default."""
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=False)),
+        never_ask=frozenset({"Only.This.Example"}),
+    )
+    assert proxy._never_ask == frozenset({"only.this.example"})
 
 
 # --- diagnostic logging ---
@@ -670,6 +761,103 @@ async def test_refusal_reasons_are_distinct():
     declined = await proxy._permitted("example.com", 443)
     assert declined.address is None
     assert declined.because == "operator declined or gate denied"
+
+
+# --- what the agent is told, per cause ---
+
+
+async def test_only_an_operator_decline_says_an_operator_declined():
+    """The bug this pins: every 403 used to claim a human had said no, including
+    for hosts no human is ever offered. An agent told that will reasonably retry
+    or look for another route, which is what these messages exist to prevent."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)))
+    declined = await proxy._permitted("example.com", 443)
+    assert "an operator declined it" in declined.refusal.hint
+
+    for host, port in (("bad_host!", 443), ("metadata.google.internal", 80)):
+        other = await proxy._permitted(host, port)
+        assert "operator declined" not in other.refusal.hint, host
+        assert "operator was asked and did not approve" not in other.refusal.body, host
+
+
+async def test_a_never_ask_host_is_told_it_can_never_be_approved():
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))
+    decision = await proxy._permitted("metadata.google.internal", 80)
+    assert "cannot be approved" in decision.refusal.hint
+    assert "do not look for another route" in decision.refusal.body
+
+
+async def test_a_malformed_host_is_told_it_is_a_request_problem():
+    """Distinct action: fix the URL, not report a policy block to the user."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))
+    decision = await proxy._permitted("bad_host!", 443)
+    assert "not a valid hostname" in decision.refusal.hint
+    assert "problem with the request" in decision.refusal.body
+
+
+async def test_an_unresolvable_host_is_told_retrying_will_not_help(monkeypatch):
+    loop = asyncio.get_running_loop()
+
+    async def fail(*_a, **_kw):
+        raise OSError("nodename nor servname provided")
+
+    monkeypatch.setattr(loop, "getaddrinfo", fail, raising=False)
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))
+    decision = await proxy._permitted("nowhere.invalid", 443)
+    assert decision.because == "no usable public address"
+    assert "retrying will not help" in decision.refusal.hint
+    assert "No operator was asked" in decision.refusal.body
+
+
+async def test_the_cause_reaches_the_client_in_the_reason_phrase():
+    """The load-bearing one. No client surfaces a CONNECT response body -- curl,
+    httpx and urllib all report the status line and discard the rest -- so the
+    reason phrase is the only channel to the agent. If this regresses, every
+    refusal becomes a bare "403 Forbidden" again."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))
+    port = await proxy.start()
+    try:
+        status, body = await connect_through(port, "metadata.google.internal:80")
+        assert status.startswith(b"HTTP/1.1 403 Forbidden by egress policy:")
+        assert b"cannot be approved" in status.split(b"\r\n")[0]
+        # The body still carries the long form for anything that does read it.
+        assert b"do not look for another route" in body
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        egress._DENIED,
+        egress._NEVER_ASK,
+        egress._MALFORMED_HOST,
+        egress._NO_PUBLIC_ADDRESS,
+    ],
+)
+def test_every_hint_is_a_legal_reason_phrase(refusal):
+    """A CR or LF here would be header injection, and a non-ASCII byte is obs-text
+    that clients are free to mangle. Also checks the two things the agent's own
+    guidance keys off: the phrase opens with the status word and carries the tag."""
+    assert "\r" not in refusal.hint and "\n" not in refusal.hint
+    assert refusal.hint.isascii()
+    assert refusal.hint.startswith("Forbidden")
+    assert "egress policy" in refusal.hint
+    # Verified: 204 chars arrived intact on curl, httpx and urllib. Well inside it.
+    assert len(refusal.hint) < 120
+
+
+def test_a_refusal_without_a_message_is_a_programming_error():
+    """A bare 403 is the same "no information" failure in a new shape, so a new
+    refusal site cannot forget it."""
+    with pytest.raises(ValueError, match="must carry what the agent is shown"):
+        egress._Decision(None, "some new reason")
+
+
+def test_an_allow_needs_no_refusal():
+    assert (
+        egress._Decision("203.0.113.7", "pre-approved host").refusal is egress._ALLOWED
+    )
 
 
 async def test_label_tags_every_line(caplog):
@@ -744,14 +932,14 @@ def test_never_ask_subjects_match_the_subject_form_a_requester_actually_sends():
     """An ApprovalRequest subject for a host is "<host>:<port>", so the bare
     hostname set matched nothing and the policy tier was silently dead."""
     policy = ApprovalPolicy(never_ask=never_ask_subjects())
-    for host in DEFAULT_NEVER_ASK:
+    for host in default_never_ask():
         assert policy.refuses(f"{host}:443"), host
         assert policy.refuses(f"{host}:80"), host
 
 
 def test_bare_hostnames_are_not_a_working_never_ask_set():
     """Pins the bug this replaced, so nobody wires the raw set back in."""
-    policy = ApprovalPolicy(never_ask=DEFAULT_NEVER_ASK)
+    policy = ApprovalPolicy(never_ask=default_never_ask())
     assert policy.refuses("metadata.google.internal:443") is False
 
 

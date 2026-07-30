@@ -97,11 +97,39 @@ failed run.
 
 ```
 agent ──CONNECT api.github.com:443──▶ egress proxy
-                                        │  in COTF_EGRESS_ALLOW? ──▶ tunnel
+                                        │  in egress.allow? ────────▶ tunnel
                                         │  never-ask / private? ────▶ 403
                                         └─ else ask operator ──┬─ approve ─▶ tunnel
                                                                └─ deny ────▶ 403
 ```
+
+### A refusal has to fit in the status line
+
+**No client surfaces a CONNECT response body.** Verified against curl, httpx and
+stdlib urllib: each reads the status line and discards the rest, so `curl` reports
+only `(56) CONNECT tunnel failed, response 403`. A carefully worded body reaches
+nobody.
+
+The reason phrase does get through, and httpx and urllib put it straight into the
+exception text an agent reads. So each of the four causes carries a short phrase
+saying which one it was and whether retrying can help:
+
+| Cause | What the agent sees |
+|---|---|
+| never-ask host | `403 Forbidden by egress policy: host permanently blocked, cannot be approved` |
+| operator declined | `403 Forbidden by egress policy: host not approved, an operator declined it` |
+| DNS failed, or resolves private | `403 Forbidden by egress policy: no usable public address, retrying will not help` |
+| not a valid hostname | `403 Forbidden by egress policy: not a valid hostname, check the URL you built` |
+
+Only "operator declined" involved a human, which is the distinction that matters:
+an agent told a human said no will reasonably retry or look for another route, and
+for the other three there is nothing to retry and no other route to find. The full
+instruction still goes in the body for anything that does read one.
+
+The phrase never interpolates the requested host — they are module constants, so no
+agent-controlled bytes reach the status line where a CR/LF would be header
+injection. A 204-character phrase arrived intact on all three clients, so the
+one-line forms above are well inside what works.
 
 **No TLS interception, deliberately.** Gating a host needs only the CONNECT
 line. Reading the body would need a private CA, a synthesized leaf per host, and
@@ -122,15 +150,12 @@ approval writes a scoped grant the requester consults from then on. Two
 requesters use it: the egress proxy (unknown host) and the broker (a
 `methods`/`allowed_tails` scope miss).
 
-| Env | Effect |
-|-----|--------|
-| `COTF_EGRESS_ALLOW` | *Extra* hosts tunnelled without asking, on top of the built-ins. Front-load what the job needs. |
-
-`egress.DEFAULT_ALLOWED_HOSTS` is always allowed: `api.anthropic.com`,
-`api.openai.com`, `chatgpt.com`, `ab.chatgpt.com`. The criterion is narrow — a
-host earns a place only if a supported backend cannot complete a turn without it,
-so the model APIs and nothing else. Gating those would stop every fresh
-deployment on an approval for the agent's own first LLM call.
+The `egress.allow` list in the policy file (see "The policy file" below) is
+tunnelled without asking. Bundled: `api.anthropic.com`, `api.openai.com`,
+`chatgpt.com`, `ab.chatgpt.com`. The criterion is narrow — a host earns a place
+only if a supported backend cannot complete a turn without it, so the model APIs
+and nothing else. Gating those would stop every fresh deployment on an approval
+for the agent's own first LLM call.
 
 Package registries, `github.com`, telemetry, and self-update endpoints are
 deliberately excluded, because each is a decision worth making explicitly: a
@@ -198,15 +223,62 @@ Every failure path denies: timeout, a frontend exception, no configured channel,
 no `ask_approval` on the frontend. Concurrent duplicate requests collapse onto
 one question so a retrying agent can't spam the operator.
 
-The `COTF_EGRESS_ALLOW` list is checked *before* the private-address guard, so
-naming `localhost` there reaches the agent's own dev server. That is a config
-act; the approval path can never grant private space.
+`egress.allow` is checked *before* the private-address guard, so naming
+`localhost` there reaches the agent's own dev server. That is a config act; the
+approval path can never grant private space.
 
 ### Bootstrapping the allowlist
 
 Run permissive and read the log. Every decision is logged at INFO through
 `logs.py`, which is the grant ledger, so a week of real work tells you the host
-set to put in `COTF_EGRESS_ALLOW` instead of guessing it up front.
+set to put in `egress.allow` instead of guessing it up front.
+
+## The policy file
+
+Both host lists and the brokered-command list live in one file:
+
+```
+~/.claude-on-the-fly/sandbox.yaml
+```
+
+It is seeded from a commented template (`settings.py`, `sandbox.yaml` inside the
+package) the first time a sandboxed daemon starts, so the first thing you open
+explains its own schema. `settings.check_operator_settings` runs at startup and
+names anything wrong with it — including a misspelled section, which YAML accepts
+happily and which would otherwise do nothing with no diagnostic anywhere.
+
+```yaml
+egress:
+  allow:
+    - pypi.org               # uv installs
+    - files.pythonhosted.org # ...and the wheels they fetch
+  never_ask:
+    - internal.corp.example
+commands:
+  tools:
+    - name: kubectl
+      readback: [config view]
+```
+
+Three properties worth knowing:
+
+- **Merged per section, not per file.** A malformed `egress:` block logs an ERROR
+  naming itself and falls back to the bundled hosts, while `commands:` still
+  loads. Whole-file fallback would have been simpler and wrong: a typo in a host
+  list would silently revoke a brokered tool, and the only clue would be a CLI
+  that stopped working for reasons nothing connects to the edit.
+- **`never_ask` is a union, never a subtraction.** Your entries are added; you
+  cannot remove a bundled one. The bundled entries are the cloud metadata
+  endpoints, which hand instance credentials to anything that reaches them, so no
+  config edit — and no agent that somehow gets a write — can re-open one.
+- **Hosts are validated at load.** A URL, a `host:port`, or anything that is not a
+  hostname is an error naming the file, not a silently dead entry that resurfaces
+  months later as an approval prompt for a host you believe you already allowed.
+
+The file lives under `DATA_DIR`, which is deliberately absent from the seatbelt
+write allowlist. It decides what runs outside the sandbox holding real credentials
+and which hosts skip the operator prompt, so an agent that could write it would
+make the whole thing a suggestion.
 
 ## Command broker: credentialed CLIs run outside the sandbox
 
@@ -255,16 +327,16 @@ so `gh --repo o/r auth token` cannot dodge it.
 
 ### Adding a tool
 
-Config, not code. Vetted defaults ship as `commands.yaml` inside the package;
-operator additions go in `~/.claude-on-the-fly/commands.yaml`:
+Config, not code. Add it under `commands:` in the policy file:
 
 ```yaml
-tools:
-  - name: kubectl
-    readback:
-      - config view          # also refuses `kubectl --context x config view`
-    readback_flags: [--token]
-    env_passthrough: [KUBECONFIG, NO_COLOR]
+commands:
+  tools:
+    - name: kubectl
+      readback:
+        - config view        # also refuses `kubectl --context x config view`
+      readback_flags: [--token]
+      env_passthrough: [KUBECONFIG, NO_COLOR]
 ```
 
 `readback` entries are the leading words of a command rather than nested lists,
@@ -272,21 +344,33 @@ because this file's whole job is refusing the right commands and `[[config,
 view]]` is easy to get subtly wrong. Matching is against the leading non-flag
 tokens, so a global flag cannot push a refused pair out of the prefix.
 
-The operator file **merges by name** over the bundled entries, so adding one tool
-keeps the vetted refusals on the others. Overriding a bundled entry is allowed and
-logged; an override that *drops* a refusal the bundled entry had is logged at
-WARNING naming what is no longer refused, because that is the one edit here that
-hands the agent a credential. A malformed file falls back to the bundled defaults
-and logs at ERROR rather than starting with no tools at all, since silently losing
-every shim is what sends the agent looking for another route to the same
-capability.
-
-The file lives under `DATA_DIR`, which is not in the seatbelt write allowlist, so
-the agent can neither add itself a tool nor delete a refusal.
+Your entries **merge by name** over the bundled ones, so adding one tool keeps the
+vetted refusals on the others. Overriding a bundled entry is allowed and logged; an
+override that *drops* a refusal the bundled entry had is logged at WARNING naming
+what is no longer refused, because that is the one edit here that hands the agent a
+credential. A malformed section falls back to the bundled defaults and logs at
+ERROR rather than starting with no tools at all, since silently losing every shim
+is what sends the agent looking for another route to the same capability.
 
 A tool whose binary is not on the daemon's PATH is skipped rather than shimmed, so
 a missing binary stays "command not found" instead of becoming a confusing broker
 error. `snowsql` is an example: denied, not installed, so nothing to shim.
+
+### What happens to a CLI you have *not* listed
+
+It is not shimmed, so PATH inside the jail resolves to the real binary. It runs,
+and then fails on its own credential store, because the profile denies about 48 of
+them. That is the intended outcome — but it is also indistinguishable, from the
+agent's side, from a broken install.
+
+So the sandbox note in the system prompt names the tools that *are* brokered, and
+gives the remedy for one that is not: add it to the `commands:` section. It
+explicitly says the remedy is **not** a read grant, because granting the credential
+path is the fix that either leaves the tool broken or hands its token to the
+session — the failure this whole subsystem exists to undo. It also tells the agent
+not to reach the same service another way, which is the observed failure mode: a
+denied `gh` once became a provider-side GitHub integration, over an approved host,
+with a credential this project never held.
 
 Currently bundled: `gh` and `acli`. `acli` carries no token readback because
 `acli auth` has no token-printing subcommand at all (checked against

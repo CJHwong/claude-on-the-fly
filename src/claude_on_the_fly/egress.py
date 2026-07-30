@@ -32,6 +32,7 @@ import re
 import socket
 from dataclasses import dataclass
 
+from claude_on_the_fly import settings
 from claude_on_the_fly.approvals import ApprovalBroker, ApprovalRequest
 
 logger = logging.getLogger(__name__)
@@ -44,74 +45,175 @@ logger = logging.getLogger(__name__)
 # IDNs are rejected as a documented consequence.
 _DNS_SAFE_HOST = re.compile(r"\A[A-Za-z0-9.\-]+\Z")
 
-# Hosts refused without asking. Cloud metadata endpoints hand out instance
-# credentials to anything that can reach them, and no legitimate agent task
-# needs them, so they are not worth an operator prompt. IP-literal metadata
-# addresses are covered separately by broker.blocked_host.
-DEFAULT_NEVER_ASK = frozenset(
-    {
-        "metadata.google.internal",
-        "metadata.goog",
-        "instance-data",
-        "metadata",
-    }
-)
 
-# Always tunnelled without asking. The criterion is narrow on purpose: a host
-# earns a place here only if a supported backend cannot function at all without
-# it, so the model API and nothing else. Gating these would stop every fresh
-# deployment on an approval for the agent's own LLM call.
-#
-# Deliberately NOT here, because each is a real decision an operator should make:
-# package registries (pypi, npm) grant arbitrary code execution via install;
-# github.com grants writes; telemetry and self-update endpoints are optional by
-# definition. Put those in COTF_EGRESS_ALLOW.
-DEFAULT_ALLOWED_HOSTS = frozenset(
-    {
-        # claude backend, API-key auth (the broker covers this when a key is
-        # provisioned; listed for the OAuth case, where it cannot).
-        "api.anthropic.com",
-        # codex backend, API-key auth
-        "api.openai.com",
-        # codex backend, ChatGPT login. Verified against a live run: codex
-        # reaches both of these and cannot complete a turn without them.
-        "chatgpt.com",
-        "ab.chatgpt.com",
-    }
-)
+def parse_hosts(section: object, key: str, *, source: str) -> frozenset[str]:
+    """One host list out of an `egress:` section, lowercased. Raises ValueError.
+
+    Hosts are validated here rather than at CONNECT time so a typo is a startup
+    error naming the file, not a silently dead entry that turns into an approval
+    prompt months later for a host the operator believes they already allowed.
+    """
+    if not isinstance(section, dict):
+        raise ValueError(f"{source}: the egress section must be a mapping")
+    value = section.get(key)
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise ValueError(f"{source}: egress.{key} must be a list")
+    hosts = set()
+    for item in value:
+        host = str(item).strip().lower()
+        if not is_dns_safe_host(host):
+            raise ValueError(f"{source}: egress.{key} entry {item!r} is not a hostname")
+        hosts.add(host)
+    return frozenset(hosts)
+
+
+def _egress_hosts(key: str) -> frozenset[str]:
+    """Bundled hosts for `key`, unioned with the operator's own.
+
+    Union, never a subtraction, and that matters most for `never_ask`: the bundled
+    entries are the cloud metadata endpoints, which hand instance credentials to
+    anything that can reach them. Letting a config edit remove one would make the
+    only unconditional refusal in the system optional.
+
+    A malformed operator section falls back to bundled-only and logs at ERROR,
+    matching `commands.load_tools`: the operator loses their additions, loudly,
+    rather than the whole policy silently emptying.
+    """
+    bundled = parse_hosts(
+        settings.bundled("egress"), key, source=str(settings.BUNDLED_SETTINGS)
+    )
+    section = settings.operator("egress")
+    if not section:
+        return bundled
+    path = settings.operator_settings()
+    try:
+        return bundled | parse_hosts(section, key, source=str(path))
+    except ValueError as exc:
+        logger.error(
+            "egress: ignoring egress.%s from %s (%s); bundled hosts only",
+            key,
+            path,
+            exc,
+        )
+        return bundled
+
+
+def default_allowed_hosts() -> frozenset[str]:
+    """Hosts always tunnelled without asking, from `egress.allow`.
+
+    The bundled criterion is narrow on purpose: a host earns a place only if a
+    supported backend cannot function at all without it, so the model APIs and
+    nothing else. Gating those would stop every fresh deployment on an approval
+    for the agent's own LLM call. Package registries, github.com, and telemetry
+    are deliberately absent because each is a real decision an operator makes.
+    """
+    return _egress_hosts("allow")
+
+
+def default_never_ask() -> frozenset[str]:
+    """Hosts refused without asking, from `egress.never_ask`.
+
+    IP-literal metadata addresses are covered separately by `broker.blocked_host`.
+    """
+    return _egress_hosts("never_ask")
 
 
 def never_ask_subjects() -> frozenset[str]:
-    """DEFAULT_NEVER_ASK as ApprovalPolicy subject patterns.
+    """`default_never_ask()` as ApprovalPolicy subject patterns.
 
     An ApprovalRequest subject for a host is "<host>:<port>", so handing the bare
     hostnames to `ApprovalPolicy(never_ask=...)` matched nothing at all and the
     policy tier was silently dead. `ApprovalPolicy.refuses` treats a trailing "*"
     as a prefix match, so the port-suffixed form is what actually refuses.
 
-    The EgressProxy checks DEFAULT_NEVER_ASK itself before it ever reaches the
+    The EgressProxy checks the never-ask set itself before it ever reaches the
     broker, so this is the defense-in-depth copy: it is what stops any *other*
     requester (or a proxy wired without a never-ask set) from offering a metadata
     endpoint to an operator.
     """
-    return frozenset(f"{host}:*" for host in DEFAULT_NEVER_ASK)
+    return frozenset(f"{host}:*" for host in default_never_ask())
 
 
 _MAX_REQUEST_LINE = 8192
 _CHUNK = 64 * 1024
 _CONNECT_TIMEOUT_SECONDS = 30.0
 
-_DENIED_BODY = (
+
+@dataclass(frozen=True)
+class _Refusal:
+    """What a refused CONNECT tells the agent. Two texts, because they differ in
+    reach.
+
+    **No client surfaces a CONNECT response body.** Verified against curl, httpx,
+    and stdlib urllib: each reports the status line and discards everything after
+    it (`curl: (56) CONNECT tunnel failed, response 403`). So a body alone reaches
+    nobody, which is why the elaborate one this module used to send was invisible
+    regardless of what it said.
+
+    The *reason phrase* does get through, on all three, and httpx and urllib put it
+    straight into the exception text an agent reads:
+
+        ProxyError | 403 Forbidden by egress policy: host permanently blocked...
+
+    So `hint` is the reason phrase and carries the part that must arrive. It opens
+    with "Forbidden" so the status line still reads correctly, and contains "egress
+    policy" so it matches the tag the sandbox guidance teaches the agent to look
+    for. `body` keeps the full instruction for a raw reader and a packet capture;
+    it costs one write and is the only place there is room to say *why*.
+
+    Neither text ever interpolates the requested host. They are module constants,
+    so no agent-controlled bytes reach the status line, where a CR/LF would be
+    header injection.
+
+    Length is not a constraint at this size: a 204-character phrase arrived intact
+    on all three clients.
+    """
+
+    hint: str
+    body: str
+
+
+# One per cause, and each tells the agent something different to *do* — that is
+# the only reason to have more than one.
+_DENIED = _Refusal(
+    "Forbidden by egress policy: host not approved, an operator declined it",
     "[sandbox] egress policy: this host is not approved for this session. "
     "An operator was asked and did not approve it. This is policy, not an "
     "outage. If it is genuinely required, tell the user which host you need "
-    "and why, and let them approve it."
+    "and why, and let them approve it.",
 )
-_REFUSED_BODY = (
+_NEVER_ASK = _Refusal(
+    "Forbidden by egress policy: host permanently blocked, cannot be approved",
     "[sandbox] egress policy: this host is permanently blocked and cannot be "
     "approved. Do not retry and do not look for another route to it; tell the "
-    "user what you were trying to do instead."
+    "user what you were trying to do instead.",
 )
+_MALFORMED_HOST = _Refusal(
+    "Forbidden by egress policy: not a valid hostname, check the URL you built",
+    "[sandbox] egress policy: that is not a valid hostname, so it was refused "
+    "without being looked up. This is a problem with the request rather than a "
+    "policy block: check the URL you built. IPv6 literals and non-ASCII domain "
+    "names are not supported here.",
+)
+_NO_PUBLIC_ADDRESS = _Refusal(
+    "Forbidden by egress policy: no usable public address, retrying will not help",
+    "[sandbox] egress policy: that host does not resolve to a usable public "
+    "address — either the lookup failed, or it points into private address space, "
+    "which is refused so a sandboxed agent cannot reach services on the host "
+    "machine. No operator was asked, and retrying will not change it. Say what you "
+    "were trying to reach.",
+)
+
+# Stands in for "this decision is not a refusal". A sentinel rather than `None` so
+# the field is never optional: with `_Refusal | None`, every use site had to narrow
+# a type the class already guarantees, and the obvious guard (`if refusal is not
+# None`) stopped narrowing `address` for the allow path.
+_ALLOWED = _Refusal("", "")
+
+# Not a CONNECT, so this one is an ordinary HTTP response and its body does reach
+# the client. No hint needed.
 _PLAIN_HTTP_BODY = (
     "[sandbox] egress policy: this proxy only tunnels HTTPS via CONNECT. "
     "Retry the same request over https://."
@@ -120,16 +222,30 @@ _PLAIN_HTTP_BODY = (
 
 @dataclass(frozen=True)
 class _Decision:
-    """One gate outcome and the reason for it.
+    """One gate outcome, the reason for it, and what the agent is told.
 
-    The reason exists for the log. "allow" alone cannot be reviewed: a
-    pre-approved host, a standing grant, and a decision an operator just made
-    are three different facts about a run, and only one of them means a human
-    was in the loop.
+    `because` exists for the log. "allow" alone cannot be reviewed: a pre-approved
+    host, a standing grant, and a decision an operator just made are three
+    different facts about a run, and only one of them means a human was in the loop.
+
+    The agent-facing `refusal` lives here rather than at the refusal site, because
+    that split *was* a bug: the site that knew why a host was refused was not the
+    site that chose the message, so every 403 claimed an operator had declined —
+    for never-ask hosts and unresolvable names alike, which no operator is ever
+    offered. An agent told a human said no will reasonably retry or look for
+    another route, which is the behaviour these messages exist to prevent.
     """
 
     address: str | None
     because: str
+    refusal: _Refusal = _ALLOWED
+
+    def __post_init__(self) -> None:
+        # Belt to the docstring's braces: a refusal with nothing to say would send
+        # a bare 403, which is the same "no information" failure in a new shape.
+        # Cheaper to make impossible than to review for.
+        if self.address is None and self.refusal is _ALLOWED:
+            raise ValueError("a refusal must carry what the agent is shown")
 
 
 def is_dns_safe_host(host: str) -> bool:
@@ -166,7 +282,7 @@ class EgressProxy:
         approvals: ApprovalBroker,
         *,
         allowed_hosts: frozenset[str] = frozenset(),
-        never_ask: frozenset[str] = DEFAULT_NEVER_ASK,
+        never_ask: frozenset[str] | None = None,
         grant_ttl_seconds: float = 3600.0,
         label: str = "",
     ) -> None:
@@ -176,12 +292,17 @@ class EgressProxy:
         # protocol carries a hostname and nothing else, and two chats reaching
         # the same host are otherwise indistinguishable in the log.
         self._label = label
-        # Pre-approved hosts skip the operator entirely: DEFAULT_ALLOWED_HOSTS
-        # (the model APIs, without which no backend works) plus whatever the
-        # operator front-loaded via COTF_EGRESS_ALLOW.
-        self._allowed = DEFAULT_ALLOWED_HOSTS | frozenset(
+        # Pre-approved hosts skip the operator entirely: `egress.allow` from the
+        # settings file (the model APIs, plus whatever the operator added) unioned
+        # with anything the caller front-loaded.
+        self._allowed = default_allowed_hosts() | frozenset(
             host.lower() for host in allowed_hosts
         )
+        # None rather than a frozenset default so the settings file is read per
+        # instance instead of once at import, which is what lets an operator edit
+        # take effect on the next session rather than on the next daemon restart.
+        if never_ask is None:
+            never_ask = default_never_ask()
         self._never_ask = frozenset(host.lower() for host in never_ask)
         self._ttl = grant_ttl_seconds
         self._server: asyncio.Server | None = None
@@ -339,7 +460,9 @@ class EgressProxy:
         host, port = parsed
         decision = await self._permitted(host, port)
         if decision.address is None:
-            await self._refuse(writer, 403, _DENIED_BODY)
+            await self._refuse(
+                writer, 403, decision.refusal.body, hint=decision.refusal.hint
+            )
             return
         target = decision.address
         try:
@@ -374,8 +497,8 @@ class EgressProxy:
 
         Order matters. The operator allowlist wins first and is returned by name
         without a private-address check: an operator writing `localhost` into
-        COTF_EGRESS_ALLOW so the agent can hit its own dev server means it, and
-        that is a deliberate config act rather than something the agent induced.
+        `egress.allow` so the agent can hit its own dev server means it, and that
+        is a deliberate config act rather than something the agent induced.
 
         Everything else must clear the never-ask tier *and* resolve entirely to
         public addresses, and is then pinned to the address we validated.
@@ -383,15 +506,15 @@ class EgressProxy:
         lowered = host.lower()
         if not is_dns_safe_host(host):
             logger.warning("%s: refuse %r (host is not DNS-safe)", self._tag, host)
-            return _Decision(None, "host is not DNS-safe")
+            return _Decision(None, "host is not DNS-safe", _MALFORMED_HOST)
         if lowered in self._allowed:
             return _Decision(host, "pre-approved host")
         if lowered in self._never_ask:
             logger.warning("%s: refuse %s:%d (never-ask policy)", self._tag, host, port)
-            return _Decision(None, "never-ask policy")
+            return _Decision(None, "never-ask policy", _NEVER_ASK)
         pinned = await self._resolve_public(lowered, port)
         if pinned is None:
-            return _Decision(None, "no usable public address")
+            return _Decision(None, "no usable public address", _NO_PUBLIC_ADDRESS)
         subject = f"{lowered}:{port}"
         # Asked before deciding so the log distinguishes a standing grant from a
         # fresh operator decision; check() itself cannot report which it was.
@@ -410,7 +533,7 @@ class EgressProxy:
             )
         )
         if not granted:
-            return _Decision(None, "operator declined or gate denied")
+            return _Decision(None, "operator declined or gate denied", _DENIED)
         return _Decision(pinned, "standing grant" if already else "operator approved")
 
     async def _resolve_public(self, host: str, port: int) -> str | None:
@@ -469,8 +592,17 @@ class EgressProxy:
         return pinned
 
     @staticmethod
-    async def _refuse(writer: asyncio.StreamWriter, status: int, message: str) -> None:
-        reason = {
+    async def _refuse(
+        writer: asyncio.StreamWriter, status: int, message: str, hint: str = ""
+    ) -> None:
+        """Write a refusal. `hint` replaces the reason phrase when given.
+
+        Only the CONNECT gate passes one, and it has to: a client discards a CONNECT
+        response body, so the reason phrase is the sole channel to the agent (see
+        `_Refusal`). Every other status here answers an ordinary HTTP request, whose
+        body the client does read, so they keep the plain phrase.
+        """
+        reason = hint or {
             400: "Bad Request",
             403: "Forbidden",
             405: "Method Not Allowed",

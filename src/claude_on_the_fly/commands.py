@@ -30,6 +30,9 @@ The one thing that *is* refused is **credential readback** — a command whose
 output is the secret itself. That is not policy, it is closing the door this
 broker opens: forwarding `gh auth token` would place the token straight into the
 sandbox and defeat the entire design.
+
+Which tools are shimmed comes from the `commands:` section of the sandbox policy
+file; see `settings.py` for where that lives and why.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from claude_on_the_fly import logs
+from claude_on_the_fly import logs, settings
 
 logger = logging.getLogger(__name__)
 
@@ -96,23 +99,6 @@ class ShimmedTool:
     env_passthrough: frozenset[str] = frozenset()
 
 
-# Vetted defaults, shipped in the package next to the seatbelt profiles.
-BUNDLED_CONFIG = Path(__file__).parent / "commands.yaml"
-
-
-def operator_config() -> Path:
-    """Where an operator's own tool list lives, if they wrote one.
-
-    Under DATA_DIR, which is deliberately not in the seatbelt write allowlist:
-    this file decides what runs outside the sandbox with real credentials, so the
-    agent must not be able to add itself a tool or drop a readback refusal.
-    Resolved per call rather than bound at import so tests can redirect DATA_DIR.
-    """
-    from claude_on_the_fly.agent import DATA_DIR
-
-    return DATA_DIR / "commands.yaml"
-
-
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
     """Build one ShimmedTool from a config entry. Raises ValueError if malformed.
 
@@ -159,9 +145,9 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
 
 
 def parse_tools(raw: object, *, source: str) -> tuple[ShimmedTool, ...]:
-    """Parse a loaded config document. Raises ValueError if malformed."""
+    """Parse a `commands:` section. Raises ValueError if malformed."""
     if not isinstance(raw, dict):
-        raise ValueError(f"{source}: top level must be a mapping with a 'tools' key")
+        raise ValueError(f"{source}: the commands section must be a mapping")
     # cast, not annotate: dict is invariant in its key type, so a narrowed
     # dict[Unknown, Unknown] will not assign to dict[str, Any].
     document = cast("dict[str, Any]", raw)
@@ -181,44 +167,36 @@ def parse_tools(raw: object, *, source: str) -> tuple[ShimmedTool, ...]:
     return tuple(tools)
 
 
-def _read_config(path: Path) -> tuple[ShimmedTool, ...]:
-    import yaml
-
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        # Normalised to ValueError so callers have one exception type to handle.
-        # A YAMLError is not a ValueError, so without this an unparseable operator
-        # file took the daemon down at startup instead of falling back.
-        raise ValueError(f"{path}: not valid YAML ({exc.__class__.__name__})") from None
-    return parse_tools(raw, source=str(path))
-
-
-def load_tools(override: Path | None = None) -> tuple[ShimmedTool, ...]:
-    """Bundled tools, with an operator file merged over them by name.
+def load_tools() -> tuple[ShimmedTool, ...]:
+    """Bundled tools, with the operator's `commands:` section merged over by name.
 
     Merge rather than replace so an operator adding one tool keeps the vetted
     readback refusals for the others. An override that drops a refusal the
     bundled entry had is legal but warned about loudly, because that is the one
     edit here that hands the agent a credential.
 
-    A malformed operator file falls back to the bundled defaults and logs at
-    ERROR. The failure mode of ignoring it entirely would be silent loss of every
-    shim, which sends the agent looking for another route to the same capability
-    (see the module docstring); the failure mode of falling back is that an
-    operator's *additions* are missing, which the error message names.
+    A malformed section falls back to the bundled defaults and logs at ERROR. The
+    failure mode of ignoring it entirely would be silent loss of every shim, which
+    sends the agent looking for another route to the same capability (see the
+    module docstring); the failure mode of falling back is that an operator's
+    *additions* are missing, which the error message names.
     """
-    tools = {tool.name: tool for tool in _read_config(BUNDLED_CONFIG)}
-    path = override if override is not None else operator_config()
-    if not path.is_file():
+    tools = {
+        tool.name: tool
+        for tool in parse_tools(
+            settings.bundled("commands"), source=str(settings.BUNDLED_SETTINGS)
+        )
+    }
+    section = settings.operator("commands")
+    if not section:
         return tuple(tools.values())
+    path = settings.operator_settings()
     try:
-        extra = _read_config(path)
-    except (ValueError, OSError) as exc:
+        extra = parse_tools(section, source=str(path))
+    except ValueError as exc:
         logger.error(
-            "commands: ignoring %s (%s); using bundled tools only, so any tool you "
-            "added there is unavailable",
-            path,
+            "commands: ignoring the commands section (%s); using bundled tools only, "
+            "so any tool you added there is unavailable",
             exc,
         )
         return tuple(tools.values())
@@ -239,6 +217,28 @@ def load_tools(override: Path | None = None) -> tuple[ShimmedTool, ...]:
             )
         tools[tool.name] = tool
     return tuple(tools.values())
+
+
+def installed(
+    tools: tuple[ShimmedTool, ...],
+) -> tuple[dict[str, ShimmedTool], list[str]]:
+    """Split configured tools into the shimmable ones and the names not on PATH.
+
+    Only tools actually installed are shimmed; shimming an absent binary would
+    turn "command not found" into a confusing broker error.
+    """
+    present = {tool.name: tool for tool in tools if shutil.which(tool.name) is not None}
+    return present, [tool.name for tool in tools if tool.name not in present]
+
+
+def shimmed_names() -> list[str]:
+    """Names of the tools that would be brokered on this host.
+
+    Exposed so the agent's sandbox guidance can name them. An agent that knows
+    `gh` is brokered and `aws` is not can tell a policy boundary from a broken
+    tool, and relay the remedy that actually works.
+    """
+    return sorted(installed(load_tools())[0])
 
 
 # Env the real binary always gets. Deliberately short: the broker runs unjailed
@@ -465,12 +465,7 @@ class CommandBroker:
         if tools is None:
             tools = load_tools()
         self._shim_dir = shim_dir
-        # Only tools actually installed are shimmed; shimming an absent binary
-        # would turn "command not found" into a confusing broker error.
-        self._tools = {
-            tool.name: tool for tool in tools if shutil.which(tool.name) is not None
-        }
-        self._absent = [tool.name for tool in tools if tool.name not in self._tools]
+        self._tools, self._absent = installed(tools)
         self._run_timeout = run_timeout
         # aiohttp is imported lazily inside start() so this module stays importable
         # from the shim-generation path without pulling the web stack in.
@@ -536,7 +531,7 @@ class CommandBroker:
         self._shim_dir.mkdir(parents=True, exist_ok=True)
         # Stale shims are removed, not just left alone. This directory is on the
         # agent's PATH ahead of the real binaries (sandbox._with_shims_on_path),
-        # so a shim for a tool that has since been dropped from commands.yaml or
+        # so a shim for a tool that has since been dropped from the config or
         # uninstalled does not fail over to the real binary -- it shadows it and
         # answers "not brokered" with rc 127, permanently, until someone notices
         # the file.

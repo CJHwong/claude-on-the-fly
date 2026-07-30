@@ -44,7 +44,6 @@ SANDBOX_ENV_VARS: tuple[str, ...] = (
     "COTF_SANDBOX_FS",
     "COTF_SANDBOX_EXTRA_PATHS",
     "COTF_SANDBOX_BROKER_ONLY_LOOPBACK",
-    "COTF_EGRESS_ALLOW",
 )
 
 TELEGRAM_ENV_VARS: tuple[str, ...] = (

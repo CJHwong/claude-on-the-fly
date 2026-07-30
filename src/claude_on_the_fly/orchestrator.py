@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from claude_on_the_fly import agent, broker, commands, egress, logs, sandbox
+from claude_on_the_fly import agent, broker, commands, egress, logs, sandbox, settings
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
@@ -98,9 +98,7 @@ class SessionEgress:
             policy=approvals_mod.ApprovalPolicy(never_ask=egress.never_ask_subjects()),
             label=label,
         )
-        proxy = egress.EgressProxy(
-            approvals, allowed_hosts=sandbox.preapproved_hosts(), label=label
-        )
+        proxy = egress.EgressProxy(approvals, label=label)
         await proxy.start()
         self._proxies[chat_id] = (session, proxy)
         logger.info(
@@ -534,6 +532,11 @@ async def _start_sandbox(
     """
     if not sandbox.enabled():
         return None, None, None
+    # Before anything reads the policy: seed the operator's file if it is missing,
+    # and name any problem with it now. The loaders below fall back per section, so
+    # without this a typo surfaces as a host prompt or a missing shim much later,
+    # nowhere near the edit that caused it.
+    settings.check_operator_settings()
     broker_instance = None
     command_broker = None
     try:
