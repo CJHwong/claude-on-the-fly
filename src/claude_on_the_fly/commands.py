@@ -43,7 +43,7 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from claude_on_the_fly import logs
 
@@ -96,16 +96,150 @@ class ShimmedTool:
     env_passthrough: frozenset[str] = frozenset()
 
 
-# Only `gh` for now. Adding a tool is one entry plus denying its credential in
-# the seatbelt profile; no new machinery. See docs/agent/broker.md.
-SHIMMED_TOOLS: tuple[ShimmedTool, ...] = (
-    ShimmedTool(
-        name="gh",
-        readback=frozenset({("auth", "token")}),
-        readback_flags=frozenset({"--show-token"}),
-        env_passthrough=frozenset({"GH_HOST", "GH_REPO", "GH_PAGER", "NO_COLOR"}),
-    ),
-)
+# Vetted defaults, shipped in the package next to the seatbelt profiles.
+BUNDLED_CONFIG = Path(__file__).parent / "commands.yaml"
+
+
+def operator_config() -> Path:
+    """Where an operator's own tool list lives, if they wrote one.
+
+    Under DATA_DIR, which is deliberately not in the seatbelt write allowlist:
+    this file decides what runs outside the sandbox with real credentials, so the
+    agent must not be able to add itself a tool or drop a readback refusal.
+    Resolved per call rather than bound at import so tests can redirect DATA_DIR.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    return DATA_DIR / "commands.yaml"
+
+
+def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
+    """Build one ShimmedTool from a config entry. Raises ValueError if malformed.
+
+    `readback` entries are written as the leading words of a command ("auth
+    token") rather than as YAML lists of lists, which is unreadable and easy to
+    get subtly wrong in a file whose whole job is refusing the right commands.
+    """
+    name = str(entry.get("name") or "").strip()
+    if not name:
+        raise ValueError("a tool entry has no name")
+    if any(character.isspace() for character in name):
+        raise ValueError(f"tool name {name!r} contains whitespace")
+
+    def words(value: object, field: str) -> tuple[tuple[str, ...], ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ValueError(
+                f"{name}.{field} must be a list, got {type(value).__name__}"
+            )
+        prefixes = []
+        for item in value:
+            parts = tuple(str(item).split())
+            if not parts:
+                raise ValueError(f"{name}.{field} has an empty entry")
+            prefixes.append(parts)
+        return tuple(prefixes)
+
+    def names(value: object, field: str) -> frozenset[str]:
+        if value is None:
+            return frozenset()
+        if not isinstance(value, list):
+            raise ValueError(
+                f"{name}.{field} must be a list, got {type(value).__name__}"
+            )
+        return frozenset(str(item) for item in value)
+
+    return ShimmedTool(
+        name=name,
+        readback=frozenset(words(entry.get("readback"), "readback")),
+        readback_flags=names(entry.get("readback_flags"), "readback_flags"),
+        env_passthrough=names(entry.get("env_passthrough"), "env_passthrough"),
+    )
+
+
+def parse_tools(raw: object, *, source: str) -> tuple[ShimmedTool, ...]:
+    """Parse a loaded config document. Raises ValueError if malformed."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"{source}: top level must be a mapping with a 'tools' key")
+    # cast, not annotate: dict is invariant in its key type, so a narrowed
+    # dict[Unknown, Unknown] will not assign to dict[str, Any].
+    document = cast("dict[str, Any]", raw)
+    entries = document.get("tools")
+    if entries is None:
+        raise ValueError(f"{source}: no 'tools' key")
+    if not isinstance(entries, list):
+        raise ValueError(f"{source}: 'tools' must be a list")
+    tools = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f"{source}: every tool entry must be a mapping")
+        try:
+            tools.append(_tool_from_entry(entry))
+        except ValueError as exc:
+            raise ValueError(f"{source}: {exc}") from None
+    return tuple(tools)
+
+
+def _read_config(path: Path) -> tuple[ShimmedTool, ...]:
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        # Normalised to ValueError so callers have one exception type to handle.
+        # A YAMLError is not a ValueError, so without this an unparseable operator
+        # file took the daemon down at startup instead of falling back.
+        raise ValueError(f"{path}: not valid YAML ({exc.__class__.__name__})") from None
+    return parse_tools(raw, source=str(path))
+
+
+def load_tools(override: Path | None = None) -> tuple[ShimmedTool, ...]:
+    """Bundled tools, with an operator file merged over them by name.
+
+    Merge rather than replace so an operator adding one tool keeps the vetted
+    readback refusals for the others. An override that drops a refusal the
+    bundled entry had is legal but warned about loudly, because that is the one
+    edit here that hands the agent a credential.
+
+    A malformed operator file falls back to the bundled defaults and logs at
+    ERROR. The failure mode of ignoring it entirely would be silent loss of every
+    shim, which sends the agent looking for another route to the same capability
+    (see the module docstring); the failure mode of falling back is that an
+    operator's *additions* are missing, which the error message names.
+    """
+    tools = {tool.name: tool for tool in _read_config(BUNDLED_CONFIG)}
+    path = override if override is not None else operator_config()
+    if not path.is_file():
+        return tuple(tools.values())
+    try:
+        extra = _read_config(path)
+    except (ValueError, OSError) as exc:
+        logger.error(
+            "commands: ignoring %s (%s); using bundled tools only, so any tool you "
+            "added there is unavailable",
+            path,
+            exc,
+        )
+        return tuple(tools.values())
+    for tool in extra:
+        previous = tools.get(tool.name)
+        if previous is None:
+            logger.info("commands: %s adds tool %r", path, tool.name)
+        else:
+            lost = (previous.readback - tool.readback) | frozenset(
+                (flag,) for flag in previous.readback_flags - tool.readback_flags
+            )
+            level = logger.warning if lost else logger.info
+            level(
+                "commands: %s overrides bundled tool %r%s",
+                path,
+                tool.name,
+                f"; it no longer refuses {sorted(lost)}" if lost else "",
+            )
+        tools[tool.name] = tool
+    return tuple(tools.values())
+
 
 # Env the real binary always gets. Deliberately short: the broker runs unjailed
 # with the full daemon environment available, so anything not listed here stays
@@ -293,10 +427,14 @@ class CommandBroker:
     def __init__(
         self,
         shim_dir: Path,
-        tools: tuple[ShimmedTool, ...] = SHIMMED_TOOLS,
+        tools: tuple[ShimmedTool, ...] | None = None,
         *,
         run_timeout: float = _RUN_TIMEOUT_SECONDS,
     ) -> None:
+        # None means "read the config", resolved here rather than as a default
+        # argument so the file is read per instance instead of once at import.
+        if tools is None:
+            tools = load_tools()
         self._shim_dir = shim_dir
         # Only tools actually installed are shimmed; shimming an absent binary
         # would turn "command not found" into a confusing broker error.

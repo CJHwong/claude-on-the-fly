@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from pathlib import Path
 
 import pytest
 from aiohttp import ClientSession
@@ -24,7 +25,7 @@ from claude_on_the_fly.commands import (
     refuses_readback,
 )
 
-GH = commands.SHIMMED_TOOLS[0]
+GH = next(t for t in commands.load_tools() if t.name == "gh")
 
 
 # --- argv parsing: the basis of every refusal ---
@@ -460,3 +461,157 @@ async def test_shim_still_forwards_real_piped_stdin(tmp_path, monkeypatch):
         assert out.decode() == "piped through the shim"
     finally:
         await broker.stop()
+
+
+# --- acli ---
+
+ACLI = next(t for t in commands.load_tools() if t.name == "acli")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["auth", "logout"],
+        ["auth", "login"],
+        ["auth", "switch"],
+        ["--site", "x", "auth", "logout"],
+    ],
+)
+def test_acli_credential_state_changes_are_refused(argv):
+    assert refuses_readback(ACLI, argv) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["auth", "status"],
+        ["jira", "workitem", "view", "ACE-1"],
+        ["jira", "workitem", "search", "--jql", "project = ACE"],
+        [],
+    ],
+)
+def test_acli_ordinary_work_is_forwarded(argv):
+    assert refuses_readback(ACLI, argv) is False
+
+
+def test_acli_has_no_token_readback_because_none_exists():
+    """`acli auth` offers login/logout/status/switch and no token print, so the
+    absence of a token entry here is deliberate, not an oversight."""
+    assert not any("token" in pair for pair in ACLI.readback)
+    assert ACLI.readback_flags == frozenset()
+
+
+# --- YAML config ---
+
+
+def test_bundled_config_parses_and_ships_gh_and_acli():
+    tools = {t.name: t for t in commands.load_tools(override=Path("/nonexistent"))}
+    assert "gh" in tools and "acli" in tools
+    assert ("auth", "token") in tools["gh"].readback
+
+
+def test_bundled_config_is_in_the_package():
+    """It sits beside the seatbelt profiles, so it must survive a wheel build the
+    same way they do."""
+    assert commands.BUNDLED_CONFIG.is_file()
+    assert commands.BUNDLED_CONFIG.parent.name == "claude_on_the_fly"
+
+
+def test_readback_is_written_as_words_not_nested_lists(tmp_path):
+    """ "auth token" is far easier to get right than [[auth, token]] in a file
+    whose whole job is refusing the correct commands."""
+    config = tmp_path / "commands.yaml"
+    config.write_text("tools:\n  - name: echo\n    readback:\n      - secret thing\n")
+    tools = {t.name: t for t in commands.load_tools(override=config)}
+    assert ("secret", "thing") in tools["echo"].readback
+    assert refuses_readback(tools["echo"], ["secret", "thing", "--flag"]) is True
+    assert refuses_readback(tools["echo"], ["secret"]) is False
+
+
+def test_operator_file_adds_a_tool_without_touching_the_others(tmp_path, caplog):
+    config = tmp_path / "commands.yaml"
+    config.write_text("tools:\n  - name: kubectl\n    readback:\n      - config view\n")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.commands"):
+        tools = {t.name: t for t in commands.load_tools(override=config)}
+    assert "kubectl" in tools
+    # The bundled entries survive, refusals intact.
+    assert ("auth", "token") in tools["gh"].readback
+    assert any("adds tool 'kubectl'" in r.getMessage() for r in caplog.records)
+
+
+def test_override_that_drops_a_refusal_warns_loudly(tmp_path, caplog):
+    """The one edit here that hands the agent a credential, so it must be visible
+    rather than silently accepted."""
+    config = tmp_path / "commands.yaml"
+    config.write_text("tools:\n  - name: gh\n")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.commands"):
+        tools = {t.name: t for t in commands.load_tools(override=config)}
+    assert tools["gh"].readback == frozenset()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "dropping a readback refusal must warn"
+    message = warnings[0].getMessage()
+    assert "no longer refuses" in message
+    assert "auth" in message and "token" in message
+
+
+def test_override_keeping_refusals_does_not_warn(tmp_path, caplog):
+    config = tmp_path / "commands.yaml"
+    config.write_text(
+        "tools:\n  - name: gh\n    readback:\n      - auth token\n"
+        "    readback_flags:\n      - --show-token\n"
+        "    env_passthrough: [GH_HOST]\n"
+    )
+    with caplog.at_level("INFO", logger="claude_on_the_fly.commands"):
+        commands.load_tools(override=config)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_malformed_operator_file_falls_back_to_bundled(tmp_path, caplog):
+    """Ignoring it outright would silently remove every shim, which sends the
+    agent looking for another route to the same capability."""
+    config = tmp_path / "commands.yaml"
+    config.write_text("tools: not-a-list\n")
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.commands"):
+        tools = {t.name: t for t in commands.load_tools(override=config)}
+    assert "gh" in tools and ("auth", "token") in tools["gh"].readback
+    errors = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ignoring" in errors and "unavailable" in errors
+
+
+def test_unparseable_yaml_falls_back(tmp_path, caplog):
+    config = tmp_path / "commands.yaml"
+    config.write_text("tools:\n  - name: [unclosed\n")
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.commands"):
+        tools = commands.load_tools(override=config)
+    assert any(t.name == "gh" for t in tools)
+
+
+@pytest.mark.parametrize(
+    ("document", "fragment"),
+    [
+        ("[]", "must be a mapping"),
+        ("other: 1", "no 'tools' key"),
+        ("tools:\n  - 'just a string'", "must be a mapping"),
+        ("tools:\n  - name: ''", "no name"),
+        ("tools:\n  - name: 'two words'", "whitespace"),
+        ("tools:\n  - name: gh\n    readback: nope", "must be a list"),
+        ("tools:\n  - name: gh\n    readback:\n      - '  '", "empty entry"),
+    ],
+)
+def test_malformed_entries_are_named_precisely(document, fragment):
+    import yaml
+
+    with pytest.raises(ValueError, match=fragment):
+        commands.parse_tools(yaml.safe_load(document), source="test.yaml")
+
+
+def test_operator_config_lives_outside_the_agents_write_scope():
+    """This file decides what runs outside the sandbox with real credentials, so
+    the agent must not be able to edit it."""
+    from claude_on_the_fly import sandbox
+
+    path = commands.operator_config()
+    assert path.name == "commands.yaml"
+    assert ".claude-on-the-fly" in str(path)
+    # Same directory that holds the shims, which is read/exec but not writable.
+    assert path.parent == sandbox.shim_dir().parent
