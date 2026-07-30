@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 from pathlib import Path
 
@@ -444,7 +445,7 @@ def test_jail_spawn_is_logged(monkeypatch, tmp_path, caplog):
         sandbox.wrap(["/bin/echo", "hi"], tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "sandbox: jailed echo" in logged
-    assert "fs=my.sb" in logged
+    assert "fs=fs-allow-reads.sb" in logged
     assert str(tmp_path.resolve()) in logged
 
 
@@ -536,3 +537,141 @@ async def test_broken_profile_is_not_reported_as_absent(monkeypatch, tmp_path, c
     # Must not claim anything about the boundary.
     assert "confirmed denied" not in logged
     assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_home_param_is_realpathed(monkeypatch, tmp_path):
+    """Seatbelt matches resolved paths, so an unresolved _HOME matches nothing.
+
+    On a host whose home is behind a symlink the base profile's credential denies
+    would all no-op while the profile still loaded and the log still said
+    "jailed". _TMPDIR and _PROJECT_DIR were already realpath'd; _HOME was not.
+    """
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home)
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(linked_home))
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    argv = sandbox.wrap(["/bin/echo", "hi"], tmp_path)
+    home_param = next(arg for arg in argv if arg.startswith("_HOME="))
+    assert home_param == f"_HOME={real_home}"
+    assert str(linked_home) not in home_param
+
+
+async def test_credential_denies_fire_under_a_symlinked_home(monkeypatch, tmp_path):
+    """End-to-end version of the above: a real sandbox-exec run proves the deny
+    matches when home is reached through a symlink."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    real_home = Path(os.path.realpath(tmp_path)) / "home"
+    (real_home / ".aws").mkdir(parents=True)
+    (real_home / ".aws" / "credentials").write_text("CANARY\n")
+    linked = Path(os.path.realpath(tmp_path)) / "home-link"
+    linked.symlink_to(real_home)
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(linked))
+    argv = sandbox.wrap(["/bin/cat", str(linked / ".aws" / "credentials")], tmp_path)
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        env={"HOME": str(linked), "PATH": "/usr/bin:/bin"},
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert b"CANARY" not in out, "credential deny did not fire through the symlink"
+    assert b"not permitted" in err.lower()
+
+
+async def test_daemon_env_file_is_denied_to_the_agent(monkeypatch, tmp_path):
+    """Env curation strips SLACK_TOKEN / TELEGRAM_BOT_TOKEN from the agent's
+    environment. Leaving the file that holds them readable defeated that, and it
+    was readable until a probe checked.
+
+    With the Slack user token a hijacked agent could post as the operator, which
+    means answering its own approval prompts: the gate re-checks the sender, and
+    the sender would have been legitimate.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    home = Path(os.path.realpath(tmp_path)) / "home"
+    data = home / ".claude-on-the-fly"
+    (data / "logs").mkdir(parents=True)
+    (data / "memory").mkdir()
+    (data / "shims").mkdir()
+    (data / ".env").write_text("SLACK_TOKEN=xoxb-CANARY\nTELEGRAM_BOT_TOKEN=CANARY\n")
+    (data / "logs" / "slack.log").write_text("CANARY-CONVERSATION\n")
+    (data / "memory" / "note.md").write_text("ordinary agent memory\n")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(home))
+
+    async def read(path: Path) -> tuple[int, bytes]:
+        argv = sandbox.wrap(["/bin/cat", str(path)], tmp_path)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _err = await proc.communicate()
+        return proc.returncode or 0, out
+
+    rc, out = await read(data / ".env")
+    assert b"CANARY" not in out, "the daemon's own tokens are readable"
+    assert rc != 0
+
+    rc, out = await read(data / "logs" / "slack.log")
+    assert b"CANARY-CONVERSATION" not in out, "prior conversations are readable"
+
+    # Memory must stay reachable: the agent is meant to read it.
+    rc, out = await read(data / "memory" / "note.md")
+    assert rc == 0 and b"ordinary agent memory" in out
+
+
+class TestInertWhenOff:
+    """ "zero change for anyone who hasn't opted in" is a stated design goal in this
+    module's docstring, so it gets a test rather than a promise."""
+
+    @pytest.fixture(autouse=True)
+    def _sandbox_off(self, monkeypatch):
+        for var in (
+            "COTF_SANDBOX",
+            "COTF_SANDBOX_FS",
+            "COTF_SANDBOX_EXTRA_PATHS",
+            "COTF_SANDBOX_BROKER_ONLY_LOOPBACK",
+            "COTF_EGRESS_ALLOW",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_env_is_inherited_unchanged(self):
+        # None is what create_subprocess_exec treats as "inherit os.environ".
+        assert sandbox.agent_env() is None
+
+    def test_argv_is_not_wrapped(self, tmp_path):
+        argv = ["claude", "-p", "hello"]
+        assert (
+            sandbox.wrap(argv, tmp_path) is argv or sandbox.wrap(argv, tmp_path) == argv
+        )
+
+    async def test_no_deny_probes_run(self, tmp_path):
+        assert await sandbox.verify_denials(tmp_path) == {}
+
+    def test_no_preapproved_hosts(self):
+        assert sandbox.preapproved_hosts() == frozenset()
+
+    def test_nothing_is_logged(self, tmp_path, caplog):
+        """No spawn record, no probe lines, no curation line."""
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.sandbox"):
+            sandbox.agent_env()
+            sandbox.wrap(["claude"], tmp_path)
+        assert caplog.records == []
+
+    def test_guidance_is_empty_so_the_prompt_is_untouched(self, tmp_path):
+        assert sandbox.agent_guidance(tmp_path) == ""
+
+    def test_profiles_are_not_read(self, tmp_path, monkeypatch):
+        """A missing or broken profile must not matter when the sandbox is off."""
+        monkeypatch.setattr(sandbox, "_JAIL_PROFILE", tmp_path / "does-not-exist.sb")
+        monkeypatch.setattr(sandbox, "_BASE_PROFILE", tmp_path / "also-missing.sb")
+        argv = ["claude", "-p", "hello"]
+        assert sandbox.wrap(argv, tmp_path) == argv

@@ -1,13 +1,16 @@
-;; my.deny-most.sb: least-privilege read profile (opt-in via COTF_SANDBOX_FS=deny-most).
+;; fs-deny-most.sb: least-privilege filesystem base (COTF_SANDBOX_FS=deny-most).
 ;;
-;; Same shape as my.sb, but the home directory is opaque by default. Where my.sb
+;; Derived from agent-seatbelt's my.deny-most.sb. Keep the rule order and
+;; structure aligned with upstream so its changes stay diffable.
+;;
+;; Same shape as fs-allow-reads.sb, but the home directory is opaque by default. Where fs-allow-reads.sb
 ;; does a global (allow file-read*) with a secret denylist, this denies every
 ;; read under _HOME and then re-grants only what the agent needs, plus up to
 ;; three operator-named paths (_EXTRA_1.._EXTRA_3, from COTF_SANDBOX_EXTRA_PATHS).
 ;; Reads outside _HOME (system libraries, the toolchain) stay allowed so the
 ;; binaries the agent runs still start.
 ;;
-;; This is coarser than my.sb by design: an agent that reads dotfiles outside
+;; This is coarser than fs-allow-reads.sb by design: an agent that reads dotfiles outside
 ;; the re-granted set (e.g. ~/.gitconfig, ~/.npmrc) will be denied. Grant those
 ;; explicitly via COTF_SANDBOX_EXTRA_PATHS if a run needs them.
 ;;
@@ -17,7 +20,7 @@
 (version 1)
 (deny default)
 
-;; -- Process & system essentials (mirrors my.sb) --
+;; -- Process & system essentials (mirrors fs-allow-reads.sb) --
 (allow process-exec)
 (allow process-fork)
 (allow process-info*)
@@ -56,10 +59,10 @@
 (allow file-read* (subpath (param "_EXTRA_2")))
 (allow file-read* (subpath (param "_EXTRA_3")))
 
-;; -- Writes: identical allowlist to my.sb --
+;; -- Writes: identical allowlist to fs-allow-reads.sb --
 (allow file-write* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
-;; codex needs this to start at all; see the note in my.sb.
+;; codex needs this to start at all; see the note in fs-allow-reads.sb.
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
@@ -70,7 +73,7 @@
 (allow file-write* (subpath "/private/tmp/"))
 (allow file-write* (subpath "/dev/"))
 
-;; -- Mandatory write denies within allowed areas (mirrors my.sb) --
+;; -- Mandatory write denies within allowed areas (mirrors fs-allow-reads.sb) --
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.git/hooks")))
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.git/config")))
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))

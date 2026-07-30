@@ -94,9 +94,9 @@ def reset_session_env(token: Token[dict[str, str] | None]) -> None:
 # Seatbelt profiles vendored from agent-seatbelt (see docs/agent/broker.md).
 # The jail profile imports the base via the _BASE param.
 _SEATBELT_DIR = Path(__file__).parent / "seatbelt"
-_BASE_PROFILE = _SEATBELT_DIR / "my.sb"
-_DENY_MOST_PROFILE = _SEATBELT_DIR / "my.deny-most.sb"
-_JAIL_PROFILE = _SEATBELT_DIR / "my.jail.sb"
+_BASE_PROFILE = _SEATBELT_DIR / "fs-allow-reads.sb"
+_DENY_MOST_PROFILE = _SEATBELT_DIR / "fs-deny-most.sb"
+_JAIL_PROFILE = _SEATBELT_DIR / "jail.sb"
 
 # SBPL has no arrays, so operator read grants are a fixed, documented cap.
 _MAX_EXTRA_PATHS = 3
@@ -246,8 +246,8 @@ def _with_shims_on_path(env: dict[str, str]) -> dict[str, str]:
 
 
 def _fs_base_profile() -> Path:
-    """Base profile the jail imports. COTF_SANDBOX_FS=deny-most swaps my.sb for
-    the least-privilege read profile; anything else keeps my.sb (default)."""
+    """Filesystem base that jail.sb imports. COTF_SANDBOX_FS=deny-most selects
+    fs-deny-most.sb; anything else keeps fs-allow-reads.sb (the default)."""
     if os.environ.get("COTF_SANDBOX_FS", "").lower() == "deny-most":
         return _DENY_MOST_PROFILE
     return _BASE_PROFILE
@@ -428,7 +428,14 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     loopback, loopback_2, loopback_3 = _loopback_specs()
     params = [
         "-D",
-        f"_HOME={Path.home()}",
+        # realpath, like _TMPDIR and _PROJECT_DIR below. Seatbelt matches the
+        # resolved path, so an unresolved param silently matches nothing: on any
+        # host whose home is behind a symlink (network homes, a relocated macOS
+        # home, /home/x -> /System/Volumes/Data/home/x) every credential deny in
+        # the base profile would no-op while the profile still loaded and the log
+        # still said "jailed". The write grants under $HOME would fail the same
+        # way, which is what makes this a correctness bug and not only a leak.
+        f"_HOME={os.path.realpath(Path.home())}",
         "-D",
         f"_PROJECT_DIR={project}",
         "-D",
@@ -442,8 +449,8 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         "-D",
         f"_LOOPBACK_ALT2={loopback_3}",
     ]
-    # my.sb does not reference _EXTRA_*; only deny-most does, so only pass them
-    # there. Pad unused slots with the project dir (already granted, a no-op).
+    # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
+    # so only pass them there. Pad unused slots with the project dir (a no-op).
     if base == _DENY_MOST_PROFILE:
         extra = _extra_read_paths()
         extra += [project] * (_MAX_EXTRA_PATHS - len(extra))
@@ -465,12 +472,16 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
 
 # Credential stores the profile is expected to deny. Probed at startup so the
 # log carries a positive record that each deny was in force for this run.
+# Every entry must be a *file*, never a directory: `cat` on a directory fails
+# with "is a directory" on an unjailed host, which this would classify as ABSENT
+# and quietly under-report. A file gives a clean three-way split between denied,
+# missing, and readable.
 _DENY_PROBES = (
     "~/.config/gh/hosts.yml",
     "~/.aws/credentials",
     "~/.ssh/id_rsa",
     "~/.docker/config.json",
-    "~/.config/gcloud",
+    "~/.config/gcloud/credentials.db",
     "~/.sentryclirc",
 )
 

@@ -1,6 +1,9 @@
-;; my.jail.sb: strict lockdown profile (opt-in via `sb -j`).
+;; jail.sb: the profile passed to `sandbox-exec -f`. Selected by COTF_SANDBOX=jail.
 ;;
-;; Imports the permissive my.sb as its base, then overrides two things for an
+;; Derived from agent-seatbelt's my.jail.sb. Keep the rule order and structure
+;; aligned with upstream so its changes stay diffable against this file.
+;;
+;; Imports a filesystem base (fs-allow-reads.sb by default) as its base, then overrides two things for an
 ;; autonomous agent that receives its credentials from a broker rather than from
 ;; the environment or the keychain:
 ;;
@@ -13,7 +16,7 @@
 ;;      authenticated-action-via-credential-helper path the permissive profile
 ;;      leaves open by design.
 ;;
-;; Parameters (injected by the wrapper): _BASE (absolute path to my.sb), plus
+;; Parameters (injected by the wrapper): _BASE (absolute path to the filesystem base profile), plus
 ;; the base profile's own _HOME / _PROJECT_DIR / _TMPDIR.
 ;;
 ;; SBPL is last-match-wins, so these overrides take effect over the imported
