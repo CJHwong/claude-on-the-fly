@@ -613,7 +613,13 @@ class TestRunSlack:
 
 
 class TestCloudOllamaModels:
-    def test_a_cloud_model_absent_from_ollama_list_is_accepted(self, caplog):
+    # Both CLIs stubbed present: this class is about the model-availability rule, and
+    # relying on the dev machine having claude and ollama installed made these pass
+    # locally and fail on a CI runner that has neither.
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x")
+    def test_a_cloud_model_absent_from_ollama_list_is_accepted(
+        self, _mock_which, caplog
+    ):
         """`:cloud` models are API-only and never appear in `ollama list`, so the
         availability check has to skip them or a valid config cannot start."""
         with (
@@ -633,7 +639,8 @@ class TestCloudOllamaModels:
             r.getMessage() for r in caplog.records
         )
 
-    def test_a_local_model_absent_from_ollama_list_still_exits(self):
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/x")
+    def test_a_local_model_absent_from_ollama_list_still_exits(self, _mock_which):
         with (
             patch(
                 "subprocess.run",

@@ -433,6 +433,10 @@ def test_jail_spawn_is_logged(monkeypatch, tmp_path, caplog):
     COTF_SANDBOX unset looks identical to a jailed one: both are free of denials,
     and no denials also reads as success."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    # Stubbed rather than skipped off macOS: the line under test is the log record,
+    # not sandbox-exec's presence, so there is no reason for this one to be
+    # platform-gated.
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         sandbox.wrap(["/bin/echo", "hi"], tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)

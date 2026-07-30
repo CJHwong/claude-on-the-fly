@@ -638,7 +638,16 @@ async def test_allow_line_names_why_preapproved(caplog):
     assert gate.seen == []
 
 
-async def test_allow_line_distinguishes_fresh_grant_from_standing_one():
+async def test_allow_line_distinguishes_fresh_grant_from_standing_one(monkeypatch):
+    # Resolution is pinned. Both calls used to hit real DNS and the test asserted
+    # they agreed, which is a property of the resolver rather than of this code:
+    # example.com sits behind a round-robin, so CI got two different addresses.
+    loop = asyncio.get_running_loop()
+
+    async def resolve_fixed(_host, port, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.7", port))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", resolve_fixed, raising=False)
     gate = RecordingGate(answers={"example.com:443": True})
     broker = ApprovalBroker(gate)
     proxy = EgressProxy(broker)
