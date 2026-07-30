@@ -432,3 +432,182 @@ class TestCodexBillingUnchanged:
         with patch.object(pricing, "_fetch", return_value=None):
             cost = pricing.cost_for("m", 1000, 100)
         assert cost == pytest.approx(1000 * 1e-06 + 100 * 2e-06)
+
+
+class TestFetchFailures:
+    """Every failure returns None so the caller falls back to a stale cache or to
+    no pricing, rather than poisoning the cache with junk."""
+
+    def test_a_network_error_is_not_fatal(self, caplog):
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=pricing.urllib.error.URLError("no route"),
+            ),
+            caplog.at_level("DEBUG", logger="claude_on_the_fly.pricing"),
+        ):
+            assert pricing._fetch() is None
+        assert "fetch failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_timeout_is_not_fatal(self):
+        with patch("urllib.request.urlopen", side_effect=TimeoutError):
+            assert pricing._fetch() is None
+
+    def _respond(self, body: bytes):
+        class FakeResponse:
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        return patch("urllib.request.urlopen", return_value=FakeResponse())
+
+    def test_invalid_json_is_reported_loudly(self, caplog):
+        """Louder than a network error: this means the endpoint changed or something
+        is intercepting it, which the operator can act on."""
+        with (
+            self._respond(b"<html>proxy error</html>"),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.pricing"),
+        ):
+            assert pricing._fetch() is None
+        assert "invalid" in "\n".join(r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "body", [b'{"data": {}}', b'{"models": []}', b"[]", b'"a string"']
+    )
+    def test_an_unexpected_shape_is_refused(self, body, caplog):
+        with (
+            self._respond(body),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.pricing"),
+        ):
+            assert pricing._fetch() is None
+        assert "unexpected shape" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_a_well_formed_payload_comes_back(self):
+        with self._respond(b'{"data": [{"id": "x", "pricing": {}}]}'):
+            assert pricing._fetch() == {"data": [{"id": "x", "pricing": {}}]}
+
+
+class TestIndexBuilderSkipsJunkEntries:
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "not a dict",
+            {"pricing": {"prompt": "1"}},  # no id
+            {"id": "", "pricing": {"prompt": "1"}},  # empty id
+            {"id": 42, "pricing": {"prompt": "1"}},  # non-string id
+            {"id": "x"},  # no pricing block
+            {"id": "x", "pricing": "not a dict"},
+        ],
+    )
+    def test_a_junk_entry_is_skipped_not_fatal(self, entry):
+        """~340 entries come from a third party; one malformed row must not cost the
+        whole table."""
+        assert pricing._build_index({"data": [entry]}) == {}
+
+    def test_a_junk_entry_does_not_stop_the_good_ones(self):
+        index = pricing._build_index(
+            {
+                "data": [
+                    "junk",
+                    {"id": "vendor/good", "pricing": {"prompt": "0.000003"}},
+                ]
+            }
+        )
+        assert "good" in index
+
+    def test_a_corrupt_cache_write_rate_keeps_the_entry(self):
+        """Unlike a corrupt prompt rate: falling back to the prompt rate leaves the
+        model priced as it was before cache rates were read at all, which beats
+        losing the entry over a field only recently consulted. Falling back to zero
+        would make the largest term on a cold thread free."""
+        index = pricing._build_index(
+            {
+                "data": [
+                    {
+                        "id": "vendor/m",
+                        "pricing": {
+                            "prompt": "0.000003",
+                            "completion": "0.000015",
+                            "input_cache_read": "0.0000003",
+                            "input_cache_write": "not-a-number",
+                        },
+                    }
+                ]
+            }
+        )
+        assert index["m"].prompt == pytest.approx(0.000003)
+        assert index["m"].cache_write == pytest.approx(0.000003), "prompt rate"
+        assert index["m"].cache_read == pytest.approx(0.0000003)
+
+    def test_a_corrupt_cache_read_rate_keeps_the_entry(self):
+        index = pricing._build_index(
+            {
+                "data": [
+                    {
+                        "id": "vendor/m",
+                        "pricing": {
+                            "prompt": "0.000003",
+                            "input_cache_read": "junk",
+                        },
+                    }
+                ]
+            }
+        )
+        assert index["m"].cache_read == pytest.approx(0.000003), "prompt rate"
+
+    def test_a_payload_whose_data_is_not_a_list_yields_an_empty_index(self):
+        assert pricing._build_index({"data": "nope"}) == {}
+
+
+class TestCacheWriteFailures:
+    def test_a_cache_that_cannot_be_stated_still_memoizes(self, monkeypatch):
+        """The mtime is only the memo's freshness key, so a failed stat costs a
+        slightly early re-read, not the run's pricing."""
+        payload = {"data": [{"id": "vendor/m", "pricing": {"prompt": "0.000003"}}]}
+        real_stat = Path.stat
+
+        def stat_fails(self, *args, **kwargs):
+            if self.name == "openrouter.json":
+                raise OSError("stale handle")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_fails)
+        pricing._write_cache(payload)
+        assert pricing._memo[1] is not None
+        assert "m" in pricing._memo[1]
+
+    def test_an_unwritable_cache_dir_still_prices_this_run(self, monkeypatch, caplog):
+        payload = {"data": [{"id": "vendor/m", "pricing": {"prompt": "0.000003"}}]}
+
+        def write_fails(self, *_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "write_text", write_fails)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.pricing"):
+            pricing._write_cache(payload)
+        assert "failed to write cache" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+        assert pricing._memo[1] is not None and "m" in pricing._memo[1]
+
+
+class TestCostIsNeverAnException:
+    def test_an_index_resolution_that_blows_up_returns_no_cost(
+        self, monkeypatch, caplog
+    ):
+        """Cost is a footer line. Raising here would cost the user the reply."""
+        monkeypatch.setattr(
+            pricing,
+            "_get_index",
+            lambda: (_ for _ in ()).throw(RuntimeError("index blew up")),
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.pricing"):
+            assert pricing.cost_for("some-model", 100, 50) is None
+        assert "unexpected error resolving price index" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )

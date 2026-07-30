@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from slack_sdk.errors import SlackApiError
 
+from claude_on_the_fly import slack as slack_mod
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
@@ -2465,3 +2468,1198 @@ class TestCompactResolvesTheWorkspace:
         await frontend._ingest_event(self._event())
 
         assert frontend.workspace_name(session) == from_message
+
+
+class TestRetiredApprovalCard:
+    """The spent permission card shares the thread with the answer, so it has to
+    read as a status line rather than a second reply."""
+
+    async def test_collapses_to_a_single_context_line(self, frontend):
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        frontend._app.client.chat_update = AsyncMock()
+        await frontend._retire_approval(
+            "C1",
+            "1785382860.1",
+            ApprovalRequest(kind="host", subject="pypi.org:443", detail="d"),
+            True,
+        )
+        blocks = frontend._app.client.chat_update.await_args.kwargs["blocks"]
+        assert len(blocks) == 1
+        # context renders small and grey; section competes with the real reply.
+        assert blocks[0]["type"] == "context"
+        text = blocks[0]["elements"][0]["text"]
+        assert text == "Permission *approved*: `pypi.org:443`"
+        # No buttons survive, so the prompt cannot be answered twice.
+        assert "actions" not in [b["type"] for b in blocks]
+
+    async def test_denial_reads_the_same_way(self, frontend):
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        frontend._app.client.chat_update = AsyncMock()
+        await frontend._retire_approval(
+            "C1",
+            "1785382860.1",
+            ApprovalRequest(kind="host", subject="evil.example:443", detail="d"),
+            False,
+        )
+        kwargs = frontend._app.client.chat_update.await_args.kwargs
+        assert kwargs["blocks"][0]["type"] == "context"
+        assert (
+            kwargs["blocks"][0]["elements"][0]["text"]
+            == "Permission *denied*: `evil.example:443`"
+        )
+        # The notification fallback stays readable on its own.
+        assert kwargs["text"] == "Permission denied: evil.example:443"
+
+    async def test_api_failure_does_not_raise(self, frontend):
+        """A retire failure must not propagate: the grant decision is already
+        made, and losing the cosmetic update is not worth failing the turn."""
+        from slack_sdk.errors import SlackApiError
+
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+        await frontend._retire_approval(
+            "C1", "1.1", ApprovalRequest(kind="host", subject="a:443", detail="d"), True
+        )
+
+
+# ---------------------------------------------------------------------------
+# The approval card end to end
+# ---------------------------------------------------------------------------
+
+
+def _request(subject="pypi.org:443", detail="agent asked for pypi.org:443", **kwargs):
+    from claude_on_the_fly.approvals import ApprovalRequest
+
+    return ApprovalRequest(kind="host", subject=subject, detail=detail, **kwargs)
+
+
+class TestAskApprovalRefusals:
+    async def test_no_session_means_nobody_to_ask(self, frontend, caplog):
+        """Sessionless work (cron, the job queue) has nobody watching its thread, so
+        it denies instead of falling back to a channel a fallback would quietly
+        grant network access in."""
+        frontend._is_bot_token = True
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert await frontend.ask_approval(_request(), chat_id=None) is False
+        assert "approval denied" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_an_unknown_chat_is_refused(self, frontend):
+        frontend._is_bot_token = True
+        assert await frontend.ask_approval(_request(), chat_id=999) is False
+
+    async def test_a_user_token_install_cannot_receive_the_click(self, frontend):
+        """Interaction payloads only reach a bot-token install, so asking would hang
+        until the caller's timeout and then deny anyway."""
+        frontend._is_bot_token = False
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        assert await frontend.ask_approval(_request(), chat_id=1) is False
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+
+class TestAskApprovalHappyPath:
+    def _wire(self, frontend):
+        frontend._is_bot_token = True
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1785382999.1"}
+        )
+        frontend._app.client.chat_update = AsyncMock()
+
+    async def _answer(self, frontend, granted: bool):
+        """Click the posted card the way Slack would."""
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if frontend._pending_approvals:
+                break
+        nonce = next(iter(frontend._pending_approvals))
+        await frontend._on_approval_action(
+            {
+                "user": {"id": "U_ALLOWED"},
+                "actions": [
+                    {
+                        "action_id": "cotf-grant" if granted else "cotf-deny",
+                        "value": nonce,
+                    }
+                ],
+            }
+        )
+
+    async def test_a_grant_click_resolves_the_wait(self, frontend):
+        self._wire(frontend)
+        task = asyncio.create_task(frontend.ask_approval(_request(), chat_id=1))
+        await self._answer(frontend, True)
+        assert await asyncio.wait_for(task, timeout=2) is True
+        assert frontend._pending_approvals == {}
+
+    async def test_a_deny_click_resolves_the_wait(self, frontend):
+        self._wire(frontend)
+        task = asyncio.create_task(frontend.ask_approval(_request(), chat_id=1))
+        await self._answer(frontend, False)
+        assert await asyncio.wait_for(task, timeout=2) is False
+
+    async def test_the_card_is_retired_after_the_click(self, frontend):
+        self._wire(frontend)
+        task = asyncio.create_task(frontend.ask_approval(_request(), chat_id=1))
+        await self._answer(frontend, True)
+        await asyncio.wait_for(task, timeout=2)
+        frontend._app.client.chat_update.assert_awaited_once()
+
+    async def test_a_timeout_retires_the_card_too(self, frontend):
+        """The cancellation used to skip the retire, leaving a spent card with
+        live-looking Approve/Deny buttons in the thread forever: tapping either then
+        logged "unknown or settled nonce" and did nothing."""
+        self._wire(frontend)
+        task = asyncio.create_task(frontend.ask_approval(_request(), chat_id=1))
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if frontend._pending_approvals:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        frontend._app.client.chat_update.assert_awaited_once()
+        # And the nonce is gone, so a late click cannot be answered.
+        assert frontend._pending_approvals == {}
+
+    async def test_a_post_that_never_lands_leaves_no_pending_nonce(self, frontend):
+        """Nothing will ever answer a card that was not posted, so the entry would
+        sit in _pending_approvals for the life of the daemon."""
+        from slack_sdk.errors import SlackApiError
+
+        self._wire(frontend)
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "channel_not_found"})
+        )
+        with pytest.raises(SlackApiError):
+            await frontend.ask_approval(_request(), chat_id=1)
+        assert frontend._pending_approvals == {}
+
+    async def test_an_unexpected_retire_failure_is_logged_not_swallowed(
+        self, frontend, caplog
+    ):
+        """`_retire_approval` already logs the Slack errors it expects, so anything
+        arriving at the outer handler is a surprise and this line is the only place
+        it would be visible."""
+        self._wire(frontend)
+        frontend._retire_approval = AsyncMock(side_effect=RuntimeError("boom"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            task = asyncio.create_task(frontend.ask_approval(_request(), chat_id=1))
+            await self._answer(frontend, True)
+            assert await asyncio.wait_for(task, timeout=2) is True
+        assert "retiring the approval prompt failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestApprovalCardCannotBeRestyledByTheAgent:
+    """Parts of a subject and detail are agent-reachable: a broker route-scope
+    request carries the path tail the agent asked for. Rendered as mrkdwn, the agent
+    can close the code span and forge a verdict line above the real subject."""
+
+    def _blocks(self, frontend, request):
+        frontend._is_bot_token = True
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1785382999.1"}
+        )
+        asyncio.get_event_loop()
+        return request
+
+    async def test_a_subject_cannot_close_its_own_code_span(self, frontend):
+        injected = "/anthropic/v1`\n*Permission APPROVED*\n`x"
+        frontend._is_bot_token = True
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1785382999.1"}
+        )
+        frontend._app.client.chat_update = AsyncMock()
+        task = asyncio.create_task(
+            frontend.ask_approval(_request(subject=injected), chat_id=1)
+        )
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if frontend._app.client.chat_postMessage.await_args:
+                break
+        blocks = frontend._app.client.chat_postMessage.await_args.kwargs["blocks"]
+        headline = blocks[0]["text"]["text"]
+        # Exactly the two that open and close the span the template writes. The
+        # injected text stays inside it and renders as literal characters, so the
+        # forged verdict is visibly part of the subject rather than a line of its
+        # own above it.
+        assert headline.count("`") == 2, headline
+        # And no newline, or the tail would escape the span and render as mrkdwn.
+        assert headline.count("\n") == 1, headline
+        assert headline.startswith("*Permission request*\n`")
+        assert headline.endswith("`")
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_the_detail_is_posted_where_slack_parses_no_markup(self, frontend):
+        frontend._is_bot_token = True
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1785382999.1"}
+        )
+        frontend._app.client.chat_update = AsyncMock()
+        task = asyncio.create_task(
+            frontend.ask_approval(
+                _request(detail="GET /anthropic/v1/*bold*\n>quote"), chat_id=1
+            )
+        )
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if frontend._app.client.chat_postMessage.await_args:
+                break
+        blocks = frontend._app.client.chat_postMessage.await_args.kwargs["blocks"]
+        detail_block = blocks[1]
+        assert detail_block["text"]["type"] == "plain_text"
+        # Verbatim, because it states what the sandbox actually observed.
+        assert detail_block["text"]["text"] == "GET /anthropic/v1/*bold*\n>quote"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_a_retired_card_escapes_the_subject_too(self, frontend):
+        frontend._app.client.chat_update = AsyncMock()
+        await frontend._retire_approval(
+            "C1", "1.1", _request(subject="host`*fake*`:443"), True
+        )
+        text = frontend._app.client.chat_update.await_args.kwargs["blocks"][0][
+            "elements"
+        ][0]["text"]
+        assert "`*fake*`" not in text
+        assert text == "Permission *approved*: `host'*fake*':443`"
+
+
+class TestFitBlock:
+    def test_short_text_is_untouched(self):
+        assert slack_mod._fit_block("GET /v1/messages") == "GET /v1/messages"
+
+    def test_an_over_long_detail_says_it_was_cut(self):
+        """The detail is the one thing the operator has to read before granting, and
+        the tail is where a suspicious path or an unexpected method would sit. A
+        silent truncation is the worst possible failure here."""
+        detail = "x" * 4000
+        fitted = slack_mod._fit_block(detail)
+        assert len(fitted) < 3000, "must fit Slack's section limit"
+        assert "more characters" in fitted
+        assert "1100" in fitted
+
+    def test_exactly_at_the_limit_is_not_marked(self):
+        assert "more characters" not in slack_mod._fit_block("x" * 2900)
+
+
+class TestLiteral:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("pypi.org:443", "pypi.org:443"),
+            ("host`x`:443", "host'x':443"),
+            ("multi\nline", "multi line"),
+            ("  padded  ", "padded"),
+        ],
+    )
+    def test_a_code_span_stays_a_code_span(self, raw, expected):
+        assert slack_mod._literal(raw) == expected
+
+
+class TestApprovalClickAuthorisation:
+    async def test_a_bystander_cannot_answer_the_prompt(self, frontend, caplog):
+        """Landing in a shared channel is only safe because the clicker is
+        re-checked: bystanders may read the prompt but must not grant the agent a
+        host."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        frontend._pending_approvals["abc"] = future
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_approval_action(
+                {
+                    "user": {"id": "U_STRANGER"},
+                    "actions": [{"action_id": "cotf-grant", "value": "abc"}],
+                }
+            )
+        assert not future.done(), "a bystander decided the grant"
+        assert "ignoring approval click from U_STRANGER" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_payload_with_no_actions_is_ignored(self, frontend):
+        await frontend._on_approval_action({"user": {"id": "U_ALLOWED"}})
+
+    async def test_a_click_on_an_unknown_nonce_is_ignored(self, frontend, caplog):
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_approval_action(
+                {
+                    "user": {"id": "U_ALLOWED"},
+                    "actions": [{"action_id": "cotf-grant", "value": "gone"}],
+                }
+            )
+        assert "unknown or settled nonce" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_second_click_on_a_settled_prompt_is_ignored(self, frontend):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        future.set_result(True)
+        frontend._pending_approvals["abc"] = future
+        await frontend._on_approval_action(
+            {
+                "user": {"id": "U_ALLOWED"},
+                "actions": [{"action_id": "cotf-deny", "value": "abc"}],
+            }
+        )
+        assert future.result() is True, "the answer changed after settling"
+
+
+class TestApprovalCardDoesNotUnfurl:
+    async def test_the_destination_being_gated_is_not_fetched(self, frontend):
+        """An unfurl would have Slack fetch the very host being gated, before any
+        decision is made."""
+        frontend._is_bot_token = True
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1785382999.1"}
+        )
+        frontend._app.client.chat_update = AsyncMock()
+        task = asyncio.create_task(frontend.ask_approval(_request(), chat_id=1))
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if frontend._app.client.chat_postMessage.await_args:
+                break
+        kwargs = frontend._app.client.chat_postMessage.await_args.kwargs
+        assert kwargs["unfurl_links"] is False
+        assert kwargs["unfurl_media"] is False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+# ---------------------------------------------------------------------------
+# Degrading rather than failing
+# ---------------------------------------------------------------------------
+
+
+class TestJobQueueConstruction:
+    def test_an_unrecognised_queue_kind_disables_jobs_not_slack(
+        self, monkeypatch, caplog
+    ):
+        """`make_queue()` raises on an unrecognised JOBS_QUEUE_KIND. Now that the
+        trigger is on by default, that must degrade to "no background jobs" rather
+        than "no Slack"."""
+        monkeypatch.setattr(
+            slack_mod, "make_queue", lambda: (_ for _ in ()).throw(ValueError("nope"))
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert slack_mod._build_job_queue() is None
+        assert "background jobs disabled" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_no_queue_means_nothing_to_list(self, frontend):
+        frontend._job_queue = None
+        assert frontend._read_unfinished_jobs() == []
+
+    def test_a_queue_read_error_degrades_to_nothing_to_show(self, frontend, caplog):
+        """A listing is a courtesy: the queue lives on a filesystem a chat turn has
+        no business failing over."""
+        frontend._job_queue = MagicMock()
+        frontend._job_queue.list_unfinished.side_effect = OSError("nfs timeout")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert frontend._read_unfinished_jobs() == []
+        assert "could not read the job queue" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestRichTextFlattening:
+    def test_nested_element_groups_are_flattened(self):
+        """A rich_text_section can nest further groups, and dropping them loses the
+        message body the agent is meant to read."""
+        assert (
+            slack_mod._flatten_rich_elements(
+                [
+                    {"type": "text", "text": "see "},
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "this "},
+                            {"type": "user", "user_id": "U1"},
+                        ],
+                    },
+                ]
+            )
+            == "see this <@U1>"
+        )
+
+    def test_unknown_leaf_types_contribute_nothing(self):
+        assert (
+            slack_mod._flatten_rich_elements([{"type": "emoji", "name": "wave"}]) == ""
+        )
+
+
+class TestForwardExtraction:
+    def test_an_attachment_with_only_blocks_still_yields_its_text(self):
+        """Share-message payloads sometimes carry the body in blocks rather than in
+        the flat `text` field."""
+        forwards = slack_mod._extract_forwards(
+            {
+                "attachments": [
+                    {
+                        "channel_id": "C9",
+                        "ts": "1785382860.1",
+                        "blocks": [
+                            {
+                                "type": "section",
+                                "text": {"type": "mrkdwn", "text": "forwarded body"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        assert [f["text"] for f in forwards] == ["forwarded body"]
+
+    def test_a_rich_text_quote_is_a_forward(self):
+        forwards = slack_mod._extract_forwards(
+            {
+                "blocks": [
+                    {
+                        "type": "rich_text",
+                        "elements": [
+                            {
+                                "type": "rich_text_quote",
+                                "elements": [{"type": "text", "text": "quoted body"}],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        assert [f["text"] for f in forwards] == ["quoted body"]
+
+    def test_an_empty_quote_is_not_a_forward(self):
+        assert (
+            slack_mod._extract_forwards(
+                {
+                    "blocks": [
+                        {
+                            "type": "rich_text",
+                            "elements": [{"type": "rich_text_quote", "elements": []}],
+                        }
+                    ]
+                }
+            )
+            == []
+        )
+
+    def test_a_non_quote_element_is_skipped(self):
+        assert (
+            slack_mod._extract_forwards(
+                {
+                    "blocks": [
+                        {
+                            "type": "rich_text",
+                            "elements": [
+                                {
+                                    "type": "rich_text_section",
+                                    "elements": [{"type": "text", "text": "ordinary"}],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+            == []
+        )
+
+
+class TestDescribe:
+    def test_the_app_token_is_redacted(self, frontend):
+        """This goes straight into the startup log."""
+        described = frontend.describe()
+        assert "xapp-tok" not in described["app_token"]
+        assert described["token_kind"] == "user"
+        assert described["user_id"] == "U_SELF"
+        # The self user id is added at construction so the operator can always
+        # reach their own bot.
+        assert described["allowed_users"] == "U_ALLOWED,U_SELF"
+
+    def test_allow_all_is_shown_as_a_star(self, frontend):
+        frontend._allow_all_senders = True
+        assert frontend.describe()["allowed_users"] == "*"
+
+    def test_no_allowed_users_reads_as_none(self, frontend):
+        frontend._allow_all_senders = False
+        frontend._allowed_user_ids = set()
+        assert frontend.describe()["allowed_users"] == "<none>"
+
+
+class TestChannelType:
+    async def test_a_cached_kind_is_not_refetched(self, frontend):
+        frontend._channel_types["C1"] = "im"
+        assert await frontend._channel_type("C1") == "im"
+        frontend._app.client.conversations_info.assert_not_awaited()
+
+    async def test_a_lookup_failure_is_an_empty_kind(self, frontend, caplog):
+        frontend._app.client.conversations_info = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "channel_not_found"})
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert await frontend._channel_type("C1") == ""
+        assert "channel_type: failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        ("flags", "expected"),
+        [
+            ({"is_im": True}, "im"),
+            ({"is_mpim": True}, "mpim"),
+            ({"is_group": True}, "group"),
+            ({"is_private": True}, "group"),
+            ({}, "channel"),
+        ],
+    )
+    async def test_every_conversation_shape_gets_a_kind(
+        self, frontend, flags, expected
+    ):
+        frontend._app.client.conversations_info = AsyncMock(
+            return_value={"channel": flags}
+        )
+        assert await frontend._channel_type("C1") == expected
+        # Cached, so a busy channel costs one API call rather than one per message.
+        assert frontend._channel_types["C1"] == expected
+
+
+class TestIsBotConversation:
+    async def test_a_cached_answer_is_not_refetched(self, frontend):
+        frontend._own_dm["D1"] = False
+        assert await frontend._is_bot_conversation("D1") is False
+        frontend._app.client.conversations_info.assert_not_awaited()
+
+    async def test_an_unexpected_error_fails_open(self, frontend, caplog):
+        """Only a definitive not-a-member error is False, so a transport hiccup can
+        never drop the bot's own DMs."""
+        frontend._app.client.conversations_info = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert await frontend._is_bot_conversation("D1") is True
+        assert "is_bot_conversation" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("code", ["channel_not_found", "not_in_channel"])
+    async def test_a_definitive_not_a_member_error_is_false(self, frontend, code):
+        frontend._app.client.conversations_info = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": code})
+        )
+        assert await frontend._is_bot_conversation("D1") is False
+
+
+class TestSkillPickerModal:
+    async def test_no_trigger_id_means_no_modal(self, frontend):
+        await frontend._open_skill_picker("", "C1", "U_ALLOWED")
+        frontend._app.client.views_open.assert_not_called()
+
+    async def test_a_skill_probe_failure_still_opens_the_modal(self, frontend, caplog):
+        """An empty menu beats a modal that never appears."""
+        frontend._app.client.views_open = AsyncMock()
+        with (
+            patch.object(
+                slack_mod,
+                "cached_skills",
+                AsyncMock(side_effect=RuntimeError("cli gone")),
+            ),
+            caplog.at_level("ERROR", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._open_skill_picker("T1", "C1", "U_ALLOWED")
+        frontend._app.client.views_open.assert_awaited_once()
+        assert "failed to load skills" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_views_open_failure_is_logged_not_raised(self, frontend, caplog):
+        frontend._app.client.views_open = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "expired_trigger_id"})
+        )
+        with (
+            patch.object(slack_mod, "cached_skills", AsyncMock(return_value=[])),
+            caplog.at_level("ERROR", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._open_skill_picker("T1", "C1", "U_ALLOWED")
+        assert "views_open failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestWarmSkills:
+    async def test_a_warm_failure_does_not_take_the_daemon_down(self, frontend, caplog):
+        """Slack gives an options request 3s, so warming is what stops the first
+        picker showing an empty menu. Failing it is a slow first picker, not a dead
+        frontend."""
+        with (
+            patch.object(
+                slack_mod, "cached_skills", AsyncMock(side_effect=RuntimeError("boom"))
+            ),
+            caplog.at_level("ERROR", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._warm_skills()
+        assert "skill warm failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_a_successful_warm_reports_the_count(self, frontend, caplog):
+        with (
+            patch.object(
+                slack_mod, "cached_skills", AsyncMock(return_value=[("a", "b")])
+            ),
+            caplog.at_level("INFO", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._warm_skills()
+        assert "warmed 1 skills" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Skill picker option groups
+# ---------------------------------------------------------------------------
+
+
+class TestOneLine:
+    def test_whitespace_is_collapsed(self):
+        assert slack_mod._one_line("two\n  lines   here") == "two lines here"
+
+    def test_a_short_description_is_untouched(self):
+        assert slack_mod._one_line("short") == "short"
+
+    def test_a_long_description_is_cut_at_a_word_boundary(self):
+        """Slack renders these in a menu, so a mid-word cut reads as corruption."""
+        text = " ".join(["word"] * 40)
+        out = slack_mod._one_line(text)
+        assert out.endswith("…")
+        assert len(out) <= slack_mod.SKILL_DESC_MAXLEN + 1
+        assert "wor…" not in out, "cut mid-word"
+
+    def test_a_single_unbroken_word_is_cut_anyway(self):
+        out = slack_mod._one_line("x" * 200)
+        assert out == "x" * slack_mod.SKILL_DESC_MAXLEN + "…"
+
+
+class TestSkillOptionGroups:
+    def test_unnamespaced_skills_group_under_user(self):
+        groups = slack_mod._skill_option_groups([("review", "Review a diff")])
+        assert groups[0]["label"]["text"] == "user"
+        assert groups[0]["options"][0]["value"] == "review"
+        assert groups[0]["options"][0]["text"]["text"] == "review"
+
+    def test_a_namespaced_skill_groups_under_its_plugin(self):
+        """The value stays the full `plugin:skill` name so the forward matches what
+        the agent expects, while the label drops the namespace noise."""
+        groups = slack_mod._skill_option_groups([("gf-github:pr-create", "Open a PR")])
+        assert groups[0]["label"]["text"] == "gf-github"
+        assert groups[0]["options"][0]["text"]["text"] == "pr-create"
+        assert groups[0]["options"][0]["value"] == "gf-github:pr-create"
+
+    def test_a_description_becomes_the_option_subtitle(self):
+        groups = slack_mod._skill_option_groups([("review", "Review a diff")])
+        assert groups[0]["options"][0]["description"]["text"] == "Review a diff"
+
+    def test_a_skill_without_a_description_gets_no_subtitle(self):
+        groups = slack_mod._skill_option_groups([("review", "")])
+        assert "description" not in groups[0]["options"][0]
+
+    def test_groups_and_options_are_sorted(self):
+        groups = slack_mod._skill_option_groups([("z:b", ""), ("a:y", ""), ("a:x", "")])
+        assert [g["label"]["text"] for g in groups] == ["a", "z"]
+        assert [o["text"]["text"] for o in groups[0]["options"]] == ["x", "y"]
+
+    def test_options_are_capped_at_slacks_limit(self):
+        """Slack caps a static_select at 100 options per group and 100 groups."""
+        groups = slack_mod._skill_option_groups(
+            [(f"p:s{i:03d}", "") for i in range(150)]
+        )
+        assert len(groups[0]["options"]) == 100
+
+    def test_groups_are_capped_too(self):
+        groups = slack_mod._skill_option_groups(
+            [(f"p{i:03d}:s", "") for i in range(150)]
+        )
+        assert len(groups) == 100
+
+    def test_long_names_are_truncated_to_slacks_field_limit(self):
+        groups = slack_mod._skill_option_groups([("p:" + "x" * 200, "")])
+        assert len(groups[0]["options"][0]["text"]["text"]) == 75
+        assert len(groups[0]["options"][0]["value"]) == 75
+
+
+# ---------------------------------------------------------------------------
+# Registered Slack handlers
+# ---------------------------------------------------------------------------
+
+
+class TestRegisteredHandlers:
+    """The decorated callbacks are thin adapters, but an adapter wired to the wrong
+    method is invisible until a real Slack event arrives."""
+
+    async def test_the_message_handler_forwards_to_ingest(self, frontend):
+        frontend._ingest_event = AsyncMock()
+        frontend._handler = MagicMock()
+        with patch.object(slack_mod, "AsyncSocketModeHandler") as handler_cls:
+            handler_cls.return_value.start_async = AsyncMock()
+            await frontend.start(AsyncMock())
+        # `event(...)` returns the same mock decorator for every registration, so
+        # take the first call: the message handler is registered before "hello".
+        registered = frontend._app.event.return_value.call_args_list[0][0][0]
+        await registered({"type": "message", "text": "hi"})
+        frontend._ingest_event.assert_awaited_once_with(
+            {"type": "message", "text": "hi"}
+        )
+
+    async def test_the_bot_token_surface_is_registered_and_wired(self, frontend):
+        """Slash commands, the picker, the shortcut, and the approval buttons only
+        reach a bot-token install, so a user token must not register them."""
+        frontend._is_bot_token = True
+        frontend._handle_slash_command = AsyncMock()
+        frontend._handle_picker_submit = AsyncMock()
+        frontend._handle_run_skill_shortcut = AsyncMock()
+        frontend._on_approval_action = AsyncMock()
+        with patch.object(slack_mod, "SLASH_COMMAND", "/cotf"):
+            frontend._register_app_interactions()
+
+        command_cb = frontend._app.command.return_value.call_args[0][0]
+        await command_cb("ack", "command", "body", "respond")
+        frontend._handle_slash_command.assert_awaited_once()
+
+        view_cb = frontend._app.view.return_value.call_args[0][0]
+        await view_cb("ack", "view")
+        frontend._handle_picker_submit.assert_awaited_once()
+
+        shortcut_cb = frontend._app.shortcut.return_value.call_args[0][0]
+        await shortcut_cb("ack", "shortcut")
+        frontend._handle_run_skill_shortcut.assert_awaited_once()
+
+        action_cb = frontend._app.action.return_value.call_args[0][0]
+        ack = AsyncMock()
+        await action_cb(ack, {"user": {"id": "U_ALLOWED"}})
+        ack.assert_awaited_once()
+        frontend._on_approval_action.assert_awaited_once()
+
+    def test_the_slash_command_is_opt_in(self, frontend):
+        """It is workspace-global, so registering it unasked would collide with
+        another install."""
+        frontend._is_bot_token = True
+        with patch.object(slack_mod, "SLASH_COMMAND", ""):
+            frontend._register_app_interactions()
+        frontend._app.command.assert_not_called()
+
+
+class TestIngestSubtypeFiltering:
+    async def test_an_unhandled_subtype_is_dropped(self, frontend, caplog):
+        """channel_join, message_changed and friends are not user messages, and
+        forwarding them would have the agent answer Slack's own bookkeeping."""
+        frontend._on_message = AsyncMock()
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            await frontend._ingest_event(
+                {"type": "message", "subtype": "channel_join", "user": "U_ALLOWED"}
+            )
+        frontend._on_message.assert_not_awaited()
+        assert "skipped: subtype=channel_join" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestSetStatusWithoutAThread:
+    async def test_a_session_with_no_thread_gets_no_status(self, frontend):
+        """assistant.threads.setStatus needs a thread to attach to."""
+        frontend._is_bot_token = True
+        frontend._sessions[1] = ("C1", None)
+        frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await frontend._set_status(1, "is thinking…")
+        frontend._app.client.assistant_threads_setStatus.assert_not_awaited()
+
+    async def test_an_unknown_session_gets_no_status(self, frontend):
+        frontend._is_bot_token = True
+        frontend._app.client.assistant_threads_setStatus = AsyncMock()
+        await frontend._set_status(999, "is thinking…")
+        frontend._app.client.assistant_threads_setStatus.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Delivery failures
+# ---------------------------------------------------------------------------
+
+
+class TestSendFallsBackToDm:
+    """A reply the user never sees is the worst outcome here, so a channel the bot
+    was removed from or that got archived falls back to a DM rather than dropping the
+    turn's whole answer."""
+
+    def _wire(self, frontend):
+        frontend._sessions[1] = ("C1", "1785382860.1")
+        frontend._session_sender_ids[1] = "U_ALLOWED"
+        frontend._app.client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D1"}}
+        )
+
+    @pytest.mark.parametrize(
+        "code", ["not_in_channel", "is_archived", "channel_not_found"]
+    )
+    async def test_a_fallback_error_reroutes_to_the_dm(self, frontend, code):
+        self._wire(frontend)
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if kwargs["channel"] == "C1":
+                raise SlackApiError("nope", {"error": code})
+            return {"ok": True, "ts": "1785382999.1"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+        assert await frontend.send(1, Response(body="the answer")) == []
+        assert [p["channel"] for p in posts] == ["C1", "D1"]
+        assert "couldn't post my reply" in posts[1]["text"]
+        assert "the answer" in posts[1]["text"]
+
+    async def test_a_non_fallback_error_is_just_logged(self, frontend, caplog):
+        """A rate limit or a bad payload is not a routing problem, and DMing on
+        every error would double-post whenever the channel post was fine."""
+        self._wire(frontend)
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "ratelimited"})
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend.send(1, Response(body="x")) == []
+        assert "slack api error ratelimited" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_an_unexpected_exception_is_logged_not_raised(self, frontend, caplog):
+        self._wire(frontend)
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend.send(1, Response(body="x")) == []
+        assert "failed to post message" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_not_ok_response_also_falls_back(self, frontend):
+        """Slack can answer 200 with ok:false, which is the same problem as raising."""
+        self._wire(frontend)
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if kwargs["channel"] == "C1":
+                return {"ok": False, "error": "not_in_channel"}
+            return {"ok": True, "ts": "1785382999.1"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+        await frontend.send(1, Response(body="x"))
+        assert [p["channel"] for p in posts] == ["C1", "D1"]
+
+    async def test_a_not_ok_response_that_is_not_reroutable_returns_nothing(
+        self, frontend
+    ):
+        self._wire(frontend)
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": False, "error": "invalid_blocks"}
+        )
+        assert await frontend.send(1, Response(body="x")) == []
+
+
+class TestFallbackDm:
+    async def test_a_session_with_no_known_sender_loses_the_reply(
+        self, frontend, caplog
+    ):
+        """Nothing else identifies who to DM, and the log line is the only record
+        the answer existed."""
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert await frontend._fallback_dm(1, Response(body="x"), "C1", "e") == []
+        assert "response lost" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_a_dm_that_cannot_be_opened_returns_nothing(self, frontend):
+        frontend._session_sender_ids[1] = "U_ALLOWED"
+        frontend._app.client.conversations_open = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "user_not_found"})
+        )
+        assert await frontend._fallback_dm(1, Response(body="x"), "C1", "e") == []
+
+    async def test_a_dm_post_failure_returns_nothing(self, frontend, caplog):
+        frontend._session_sender_ids[1] = "U_ALLOWED"
+        frontend._app.client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D1"}}
+        )
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend._fallback_dm(1, Response(body="x"), "C1", "e") == []
+        assert "DM to U_ALLOWED failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_not_ok_dm_returns_nothing(self, frontend, caplog):
+        frontend._session_sender_ids[1] = "U_ALLOWED"
+        frontend._app.client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D1"}}
+        )
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": False, "error": "invalid_blocks"}
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend._fallback_dm(1, Response(body="x"), "C1", "e") == []
+        assert "DM post failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_a_successful_dm_hands_back_the_attachments(self, frontend, tmp_path):
+        """The return value is what the orchestrator archives, so claiming a handoff
+        that did not happen would make the outbox re-send next turn."""
+        attachment = tmp_path / "report.txt"
+        attachment.write_text("body")
+        frontend._session_sender_ids[1] = "U_ALLOWED"
+        frontend._app.client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D1"}}
+        )
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1785382999.1"}
+        )
+        frontend._upload_attachments = AsyncMock()
+        handed = await frontend._fallback_dm(
+            1, Response(body="x", attachments=[attachment]), "C1", "e"
+        )
+        assert handed == [attachment]
+        frontend._upload_attachments.assert_awaited_once()
+
+
+class TestOpenDmChannel:
+    async def test_the_channel_id_is_cached(self, frontend):
+        frontend._app.client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D1"}}
+        )
+        assert await frontend._open_dm_channel("U1") == "D1"
+        assert await frontend._open_dm_channel("U1") == "D1"
+        frontend._app.client.conversations_open.assert_awaited_once()
+
+    async def test_a_failure_is_none_not_an_exception(self, frontend, caplog):
+        frontend._app.client.conversations_open = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend._open_dm_channel("U1") is None
+        assert "cannot open DM with U1" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestUploadFailures:
+    async def test_one_bad_file_does_not_drop_the_rest(
+        self, frontend, tmp_path, caplog
+    ):
+        good = tmp_path / "good.txt"
+        good.write_text("a")
+        bad = tmp_path / "bad.txt"
+        bad.write_text("b")
+        uploaded: list[str] = []
+
+        async def upload(**kwargs):
+            # `file` carries the bytes; `filename` is the name.
+            name = kwargs["filename"]
+            if name == "bad.txt":
+                raise RuntimeError("socket reset")
+            uploaded.append(name)
+            return {"ok": True, "files": []}
+
+        frontend._app.client.files_upload_v2 = AsyncMock(side_effect=upload)
+        frontend._notify_upload_failure = AsyncMock()
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            await frontend._upload_attachments("C1", None, [bad, good])
+        assert uploaded == ["good.txt"]
+        assert "failed to send bad.txt" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+        # One in-thread heads-up, so the user is not left guessing.
+        frontend._notify_upload_failure.assert_awaited_once()
+
+    async def test_the_failure_notice_that_cannot_be_posted_is_logged(
+        self, frontend, caplog
+    ):
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            await frontend._notify_upload_failure("C1", None, ["a.txt"])
+        assert "failed to post failure notice" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestReplyLimitWarning:
+    async def test_a_warning_that_cannot_be_posted_is_logged(self, frontend, caplog):
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            await frontend._warn_reply_limit("C1", None)
+        assert "failed to post warning" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_posted_warning_records_its_own_ts(self, frontend):
+        """Otherwise the bot re-ingests its own warning as an inbound message."""
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1785382999.1"}
+        )
+        await frontend._warn_reply_limit("C1", None)
+        assert "1785382999.1" in frontend._our_sent_timestamps
+
+
+class TestAnchorPost:
+    async def test_a_failed_anchor_is_none(self, frontend, caplog):
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=RuntimeError("socket reset")
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend._post_anchor("C1", "Running review") is None
+        assert "anchor: failed to post" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_not_ok_anchor_is_none(self, frontend):
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": False, "error": "invalid_blocks"}
+        )
+        assert await frontend._post_anchor("C1", "Running review") is None
+
+    async def test_a_posted_anchor_returns_its_ts_and_records_it(self, frontend):
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1785382999.1"}
+        )
+        assert await frontend._post_anchor("C1", "Running review") == "1785382999.1"
+        assert "1785382999.1" in frontend._our_sent_timestamps
+
+
+class TestJobQueueAcknowledgement:
+    """The reply must not promise something nothing can deliver: with the trigger on
+    by default, an install that never started the worker would otherwise be told
+    "I'll reply here when it's done" on a job nothing will ever run, which is a
+    failure that looks exactly like success."""
+
+    def _wire(self, frontend):
+        frontend._job_queue = MagicMock()
+        frontend._job_command = "job"
+        frontend._orchestrator = MagicMock()
+        frontend._post_notice = AsyncMock()
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1785382999.1"}
+        )
+        frontend._app.client.reactions_add = AsyncMock()
+        return {
+            "type": "message",
+            "text": "job go and do the thing",
+            "user": "U_ALLOWED",
+            "ts": "1785382860.1",
+            "channel": "C1",
+        }
+
+    async def test_a_live_worker_gets_the_confident_promise(self, frontend):
+        event = self._wire(frontend)
+        with patch.object(slack_mod, "live_pid", lambda _role: 4242):
+            await frontend._ingest_event(event)
+        notice = frontend._post_notice.await_args[0][2]
+        assert "I'll reply here when it's done" in notice
+
+    async def test_no_worker_says_so_and_names_the_fix(self, frontend):
+        event = self._wire(frontend)
+        with patch.object(slack_mod, "live_pid", lambda _role: None):
+            await frontend._ingest_event(event)
+        notice = frontend._post_notice.await_args[0][2]
+        assert "no worker is running" in notice
+        assert "claude-tui start jobs" in notice, "must name the fix"
+
+
+class TestThreadContext:
+    async def test_an_api_failure_degrades_to_no_context(self, frontend, caplog):
+        frontend._app.client.conversations_replies = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "thread_not_found"})
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert await frontend._fetch_thread_context("C1", "1.1", "2.2") == ""
+        assert "conversations.replies failed" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_an_empty_thread_yields_nothing(self, frontend):
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": []}
+        )
+        assert await frontend._fetch_thread_context("C1", "1.1", "2.2") == ""
+
+    async def test_the_current_message_is_not_included(self, frontend):
+        """It is about to be sent as the prompt, so repeating it as context would
+        have the agent read the same question twice."""
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {"ts": "1.1", "text": "earlier question", "user": "U_ALLOWED"},
+                    {"ts": "2.2", "text": "the current one", "user": "U_ALLOWED"},
+                ]
+            }
+        )
+        frontend._resolve_message_author = AsyncMock(return_value="hoss")
+        out = await frontend._fetch_thread_context("C1", "1.1", "2.2")
+        assert "earlier question" in out
+        assert "the current one" not in out
+
+    async def test_a_message_with_no_usable_text_is_skipped(self, frontend):
+        """A bare file share or a reaction-only message contributes nothing, and an
+        empty <message> element is noise in the prompt."""
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {"ts": "1.1", "text": "", "user": "U_ALLOWED"},
+                    {"ts": "1.2", "text": "real content", "user": "U_ALLOWED"},
+                ]
+            }
+        )
+        frontend._resolve_message_author = AsyncMock(return_value="hoss")
+        out = await frontend._fetch_thread_context("C1", "1.1", "9.9")
+        assert out.count("<message") == 1
+        assert "real content" in out
+
+    async def test_a_thread_of_only_empty_messages_yields_nothing(self, frontend):
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": [{"ts": "1.1", "text": "", "user": "U_ALLOWED"}]}
+        )
+        frontend._resolve_message_author = AsyncMock(return_value="hoss")
+        assert await frontend._fetch_thread_context("C1", "1.1", "9.9") == ""
+
+    async def test_block_content_is_folded_in_alongside_the_text(self, frontend):
+        """An app-bot post carries its body in section blocks, with `text` holding
+        only a degraded fallback. rich_text blocks are deliberately not folded in:
+        for an ordinary user message they just duplicate `text`.
+        """
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {
+                        "ts": "1.1",
+                        "text": "see this",
+                        "user": "U_ALLOWED",
+                        "blocks": [
+                            {
+                                "type": "section",
+                                "text": {"type": "mrkdwn", "text": "quoted body"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        frontend._resolve_message_author = AsyncMock(return_value="hoss")
+        out = await frontend._fetch_thread_context("C1", "1.1", "9.9")
+        assert "see this" in out
+        assert "quoted body" in out

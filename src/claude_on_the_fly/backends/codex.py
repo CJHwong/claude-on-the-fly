@@ -11,7 +11,7 @@ import shlex
 import time
 from pathlib import Path
 
-from claude_on_the_fly import agent, pricing, transcript
+from claude_on_the_fly import agent, pricing, sandbox, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
@@ -99,6 +99,7 @@ async def _run_codex_exec(
     workspace: Path, cmd: list[str], timeout: float | None
 ) -> dict:
     """Run codex, collect stdout, parse JSONL. Raises RuntimeError on failure."""
+    cmd = sandbox.wrap(cmd, workspace)
     logger.debug("codex exec: cwd=%s cmd=%s", workspace, " ".join(cmd[:8]) + "...")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -106,6 +107,7 @@ async def _run_codex_exec(
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
         start_new_session=True,
+        env=sandbox.agent_env(),
     )
     agent.track_agent_process(proc, cmd)
     try:

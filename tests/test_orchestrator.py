@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -983,3 +984,403 @@ class TestContextIsForgottenOnSessionChange:
         orch.reset_session(7)
 
         assert orch._context.get(8) == (650_000, 1_000_000)
+
+
+# ---------------------------------------------------------------------------
+# Per-session egress
+# ---------------------------------------------------------------------------
+
+
+class TestSessionEgress:
+    """Egress is per-session, not per-daemon, and the reasons are in the class
+    docstring: a shared proxy would let one chat's approval authorize every other
+    chat and cron, and a `/new` would inherit grants it never earned."""
+
+    async def test_each_chat_gets_its_own_proxy(self, frontend: StubFrontend) -> None:
+        manager = orchestrator_mod.SessionEgress(frontend)
+        try:
+            first = await manager.env_for(1, "session-a")
+            second = await manager.env_for(2, "session-b")
+            assert first["HTTPS_PROXY"] != second["HTTPS_PROXY"]
+        finally:
+            await manager.close_all()
+
+    async def test_the_same_session_reuses_its_proxy(
+        self, frontend: StubFrontend
+    ) -> None:
+        manager = orchestrator_mod.SessionEgress(frontend)
+        try:
+            first = await manager.env_for(1, "session-a")
+            again = await manager.env_for(1, "session-a")
+            assert first == again
+        finally:
+            await manager.close_all()
+
+    async def test_a_new_session_drops_the_previous_grants(
+        self, frontend: StubFrontend, caplog
+    ) -> None:
+        """`/new` earns a fresh proxy with a fresh grant store. Inheriting the old
+        store would carry approvals across a boundary the user drew on purpose."""
+        manager = orchestrator_mod.SessionEgress(frontend)
+        try:
+            with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+                before = await manager.env_for(1, "session-a")
+                after = await manager.env_for(1, "session-b")
+            assert before["HTTPS_PROXY"] != after["HTTPS_PROXY"]
+            assert "grants dropped" in "\n".join(r.getMessage() for r in caplog.records)
+        finally:
+            await manager.close_all()
+
+    async def test_close_all_revokes_every_session(
+        self, frontend: StubFrontend
+    ) -> None:
+        manager = orchestrator_mod.SessionEgress(frontend)
+        await manager.env_for(1, "session-a")
+        await manager.env_for(2, "session-b")
+        await manager.close_all()
+        assert manager._proxies == {}
+
+    async def test_close_all_is_safe_with_nothing_started(
+        self, frontend: StubFrontend
+    ) -> None:
+        await orchestrator_mod.SessionEgress(frontend).close_all()
+
+    async def test_the_never_ask_tier_is_live_on_a_session_proxy(
+        self, frontend: StubFrontend
+    ) -> None:
+        """Wired with bare hostnames this matched nothing, because a host subject
+        is "<host>:<port>". A dead never-ask tier means a metadata endpoint gets
+        offered to the operator as an ordinary choice."""
+        manager = orchestrator_mod.SessionEgress(frontend)
+        try:
+            await manager.env_for(1, "session-a")
+            _session, proxy = manager._proxies[1]
+            assert proxy._approvals._policy.refuses("metadata.google.internal:443")
+        finally:
+            await manager.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Turn lifecycle when egress itself fails
+# ---------------------------------------------------------------------------
+
+
+class TestEgressStartupFailure:
+    async def test_a_proxy_that_cannot_start_still_completes_the_turn_lifecycle(
+        self, frontend: StubFrontend
+    ) -> None:
+        """Set outside the lifecycle try, this failure escaped _process entirely:
+        the in-flight slot leaked so the heartbeat reported a phantom running job
+        forever, notify_complete never ran so the frontend kept its typing
+        indicator, and the drain task died with turns still queued."""
+        egress_manager = MagicMock()
+        egress_manager.env_for = AsyncMock(side_effect=OSError("address in use"))
+        orch = Orchestrator(frontend, "test", egress_manager=egress_manager)
+
+        await orch._process(1, Turn(text="hello"))
+
+        assert orch._in_flight == {}, "in-flight slot leaked"
+        assert frontend.complete_notifications == [1], "frontend left thinking"
+        # Reported to the user rather than swallowed: a turn that produced nothing
+        # with no message is indistinguishable from the daemon being asleep.
+        assert "address in use" in frontend.sent[-1][1].body
+
+    async def test_the_drain_loop_survives_it(self, frontend: StubFrontend) -> None:
+        """The queue must keep draining: one failed turn is not a reason to strand
+        every message behind it."""
+        egress_manager = MagicMock()
+        egress_manager.env_for = AsyncMock(side_effect=OSError("address in use"))
+        orch = Orchestrator(frontend, "test", egress_manager=egress_manager)
+        await orch.on_message(1, "first")
+        await orch.on_message(1, "second")
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if len(frontend.complete_notifications) >= 2:
+                break
+        assert len(frontend.complete_notifications) >= 2, (
+            f"drain stopped after {frontend.complete_notifications}"
+        )
+        await orch.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Sandbox startup
+# ---------------------------------------------------------------------------
+
+
+class TestStartSandbox:
+    async def test_all_none_when_sandboxing_is_off(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        """Zero change for anyone who has not opted in: the spawn sites see
+        exactly what they saw before any of this existed."""
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        assert await orchestrator_mod._start_sandbox(frontend) == (None, None, None)
+
+    async def test_a_command_broker_that_cannot_start_revokes_the_credentials(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        """Without the teardown the credential broker stayed listening with every
+        route's key loaded in memory and ANTHROPIC_BASE_URL still published, for a
+        daemon that was on its way to exiting."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        credential_broker = MagicMock()
+        credential_broker.stop = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.broker,
+            "start_default_broker",
+            AsyncMock(return_value=credential_broker),
+        )
+        command_broker = MagicMock()
+        command_broker.start = AsyncMock(side_effect=OSError("port in use"))
+        command_broker.stop = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+        )
+
+        with pytest.raises(OSError, match="port in use"):
+            await orchestrator_mod._start_sandbox(frontend)
+
+        credential_broker.stop.assert_awaited_once()
+        command_broker.stop.assert_awaited_once()
+
+    async def test_a_credential_broker_that_cannot_start_needs_no_teardown(
+        self, frontend: StubFrontend, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setattr(
+            orchestrator_mod.broker,
+            "start_default_broker",
+            AsyncMock(side_effect=KeyError("keychain item not found")),
+        )
+        with (
+            caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"),
+            pytest.raises(KeyError),
+        ):
+            await orchestrator_mod._start_sandbox(frontend)
+        assert "revoking what already started" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_successful_start_publishes_the_shim_endpoint(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        credential_broker = MagicMock()
+        credential_broker.stop = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.broker,
+            "start_default_broker",
+            AsyncMock(return_value=credential_broker),
+        )
+        command_broker = MagicMock()
+        command_broker.start = AsyncMock()
+        command_broker.stop = AsyncMock()
+        command_broker.shimmed = ["gh"]
+        command_broker.agent_env = lambda: {
+            "COTF_COMMAND_ENDPOINT": "http://127.0.0.1:1"
+        }
+        monkeypatch.setattr(
+            orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+        )
+
+        (
+            got_broker,
+            egress_manager,
+            got_commands,
+        ) = await orchestrator_mod._start_sandbox(frontend)
+        try:
+            assert got_broker is credential_broker
+            assert got_commands is command_broker
+            assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
+            assert os.environ["COTF_COMMAND_ENDPOINT"] == "http://127.0.0.1:1"
+        finally:
+            os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_the_policy_file_is_seeded_and_checked_before_anything_reads_it(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """The loaders below fall back per section, so a typo left unreported here
+        surfaces later as a host prompt or a missing shim, nowhere near the edit."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setattr(
+            orchestrator_mod.broker, "start_default_broker", AsyncMock()
+        )
+        command_broker = MagicMock()
+        command_broker.start = AsyncMock()
+        command_broker.shimmed = []
+        command_broker.agent_env = dict
+        monkeypatch.setattr(
+            orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+        )
+        assert not operator_settings.exists()
+        await orchestrator_mod._start_sandbox(frontend)
+        assert operator_settings.is_file()
+
+    async def test_sandboxing_off_does_not_seed_a_policy_file(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """Nothing reads the policy when sandboxing is off, so writing a file about
+        it would be noise in the operator's directory."""
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        await orchestrator_mod._start_sandbox(frontend)
+        assert not operator_settings.exists()
+
+
+# ---------------------------------------------------------------------------
+# Startup summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("", "<unset>"),
+        ("ab", "***"),
+        ("abcd", "***"),
+        ("xoxb-secret-value", "xo***ue"),
+    ],
+)
+def test_redact_token(token, expected):
+    assert orchestrator_mod._redact_token(token) == expected
+
+
+def test_settings_summary_names_the_backend_mode_variable(
+    frontend: StubFrontend, monkeypatch, caplog
+):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "ollama")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:8b")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+        orchestrator_mod._log_settings_summary("telegram", frontend)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "agent_backend   = codex" in logged
+    assert "codex_mode" in logged
+    assert "qwen3:8b" in logged
+
+
+class TestSessionEnvIsScopedToTheTurn:
+    async def test_the_session_env_is_reset_when_the_turn_ends(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        """The proxy env is set on a ContextVar so it reaches a spawn several
+        frames down without touching os.environ. Left set, the next turn in this
+        task would inherit the previous session's proxy."""
+        egress_manager = MagicMock()
+        egress_manager.env_for = AsyncMock(return_value={"HTTPS_PROXY": "http://x:1"})
+        orch = Orchestrator(frontend, "test", egress_manager=egress_manager)
+        with patch.object(
+            orchestrator_mod.agent, "run", AsyncMock(return_value=Response(body="ok"))
+        ):
+            await orch._process(1, Turn(text="hello"))
+        # The ContextVar is back to its default, so the next turn cannot inherit
+        # this session's proxy.
+        assert orchestrator_mod.sandbox._SESSION_ENV.get() is None
+
+
+class TestAbortDrainsTheQueue:
+    async def test_a_queue_that_empties_under_the_drain_loop_is_not_an_error(
+        self, frontend: StubFrontend
+    ) -> None:
+        """`empty()` and `get_nowait()` are two separate observations, so the drain
+        has to tolerate the queue being emptied between them rather than raising
+        into the abort path."""
+        orch = Orchestrator(frontend, "test")
+
+        class LyingQueue:
+            def empty(self) -> bool:
+                return False
+
+            def get_nowait(self):
+                raise asyncio.QueueEmpty
+
+        orch._queues[1] = LyingQueue()  # type: ignore[assignment]
+        assert await orch.abort(1) is False
+
+
+class TestRunTeardown:
+    async def test_shutdown_revokes_every_sandbox_capability(
+        self, frontend: StubFrontend, monkeypatch, tmp_path
+    ) -> None:
+        """Each of these is a live route out of the sandbox. A daemon that exits
+        without stopping them leaves a listener holding credentials behind."""
+        credential_broker = MagicMock()
+        credential_broker.stop = AsyncMock()
+        command_broker = MagicMock()
+        command_broker.stop = AsyncMock()
+        session_egress = MagicMock()
+        session_egress.close_all = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(credential_broker, session_egress, command_broker)),
+        )
+
+        stub = MagicMock()
+        stub.describe = lambda: {"bot_token": "ab***yz"}
+        stub.set_orchestrator = MagicMock()
+        stub.stop = AsyncMock()
+
+        async def start_then_stop(_on_message):
+            # Stands in for the signal handler: run() blocks on this event.
+            await asyncio.sleep(3600)
+
+        stub.start = start_then_stop
+        original_wait = asyncio.Event.wait
+
+        async def stop_immediately(self):
+            self.set()
+            return await original_wait(self)
+
+        monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
+        await orchestrator_mod.run(stub, "test")
+
+        session_egress.close_all.assert_awaited_once()
+        command_broker.stop.assert_awaited_once()
+        credential_broker.stop.assert_awaited_once()
+
+
+def test_settings_summary_includes_the_frontends_own_fields(monkeypatch, caplog):
+    """Secrets are redacted by the frontend before they get here, so this only has
+    to print what it is handed."""
+    stub = MagicMock()
+    stub.describe = lambda: {"bot_token": "xo***ue", "allowed_user_id": "42"}
+    monkeypatch.delenv("AGENT_BACKEND", raising=False)
+    with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+        orchestrator_mod._log_settings_summary("telegram", stub)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "bot_token" in logged and "xo***ue" in logged
+    assert "allowed_user_id" in logged
+
+
+class TestFrontendApprovalDefault:
+    async def test_a_frontend_without_an_approval_ui_denies(
+        self, frontend: StubFrontend
+    ) -> None:
+        """The default must deny, so a frontend that has not implemented an approval
+        UI behaves exactly like one with no approval channel rather than silently
+        granting every host the agent asks for."""
+        from claude_on_the_fly.approvals import ApprovalRequest
+
+        request = ApprovalRequest(kind="host", subject="evil.example:443", detail="d")
+        assert await frontend.ask_approval(request, chat_id=1) is False
+
+    async def test_the_default_queued_notice_is_a_plain_message(self) -> None:
+        """Frontends with cheaper signals (an emoji reaction) override this, but the
+        base has to say something: a queued message that looks ignored gets resent."""
+
+        class MinimalFrontend(StubFrontend):
+            pass
+
+        # StubFrontend overrides notify_queued for assertions, so call the base
+        # implementation directly to exercise the protocol default.
+        frontend = MinimalFrontend()
+        await Frontend.notify_queued(frontend, 1, 3)
+        assert frontend.sent[0][0] == 1
+        assert "Queued (3 pending)" in frontend.sent[0][1].body

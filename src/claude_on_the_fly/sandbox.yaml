@@ -1,0 +1,111 @@
+# Sandbox policy: which hosts the agent may reach, and which credentialed CLIs
+# it may run through the command broker.
+#
+# This copy ships inside the package and is replaced on upgrade. Edit your own at
+# ~/.claude-on-the-fly/sandbox.yaml, which is seeded from this file on first run.
+# Yours is merged over these defaults one section at a time, so a typo in
+# `egress:` cannot cost you your `commands:` additions -- the broken section logs
+# an ERROR naming itself and falls back, the other still loads.
+#
+# That path is deliberately NOT in the seatbelt write allowlist. This file decides
+# what runs outside the sandbox holding real credentials, and which hosts skip the
+# operator prompt, so a sandboxed agent must not be able to grant itself either.
+
+egress:
+  # Hosts tunnelled without asking the operator.
+  #
+  # The bundled criterion is narrow on purpose: a host earns a place here only if
+  # a supported backend cannot complete a turn without it, so the model APIs and
+  # nothing else. Gating those would stop every fresh deployment on an approval
+  # for the agent's own first LLM call.
+  #
+  # Everything else is a decision worth making explicitly, which is why the
+  # obvious candidates are missing: a package install is arbitrary code execution,
+  # github.com grants writes, and telemetry and self-update endpoints are optional
+  # by definition. Add what your jobs actually need, and say why:
+  #
+  #   allow:
+  #     - pypi.org               # uv/pip installs
+  #     - files.pythonhosted.org # ...and the sdists/wheels they fetch
+  #     - github.com             # git clone/push. Grants writes.
+  #
+  # A host here is reached without a prompt for the whole session, and the proxy
+  # does not inspect what crosses it (no TLS interception -- see
+  # docs/agent/broker.md), so each entry is a covert channel you are accepting.
+  allow:
+    # claude backend, API-key auth. The credential broker covers this when a key
+    # is provisioned; listed for the OAuth case, where it cannot.
+    - api.anthropic.com
+    # codex backend, API-key auth
+    - api.openai.com
+    # codex backend, ChatGPT login. Verified against a live run: codex reaches
+    # both of these and cannot complete a turn without them.
+    - chatgpt.com
+    - ab.chatgpt.com
+
+  # Hosts refused outright, never offered to the operator. Cloud metadata
+  # endpoints hand instance credentials to anything that can reach them, and no
+  # legitimate agent task needs them, so they are not worth a prompt.
+  #
+  # Your entries are added to this list and cannot remove one. The merge is
+  # one-way on purpose: no config edit, and no agent that somehow gets a write
+  # here, can re-open a metadata endpoint.
+  never_ask:
+    - metadata.google.internal
+    - metadata.goog
+    - instance-data
+    - metadata
+
+commands:
+  # CLIs the sandboxed agent reaches through the command broker.
+  #
+  # A shimmed tool runs OUTSIDE the sandbox with your real credential and only its
+  # output crosses back, so adding an entry grants a capability. Read the trade in
+  # docs/agent/broker.md first.
+  #
+  # A tool NOT listed here is not shimmed, which means the agent runs the real
+  # binary inside the jail, where the seatbelt denies its credential store. It
+  # fails on its own config file. That is the intended outcome, not a bug -- but
+  # it is also why an unlisted-and-needed tool looks like a broken tool.
+  #
+  # Fields, all optional except `name`:
+  #   name             command name shimmed onto the agent's PATH. Must be on the
+  #                    daemon's PATH or it is skipped (a shim for a missing binary
+  #                    would turn "command not found" into a confusing broker
+  #                    error).
+  #   readback         subcommands that must never cross into the sandbox, written
+  #                    as the leading words of the command. Matched against the
+  #                    leading non-flag tokens, so "auth token" also refuses
+  #                    `gh --repo o/r auth token`.
+  #   readback_flags   flags that make any subcommand print the secret.
+  #   env_passthrough  extra env names the real binary needs. Kept narrow: the
+  #                    broker runs unjailed, so anything not listed stays out of
+  #                    the subprocess.
+  #
+  # There is deliberately no allow/deny policy beyond readback. `gh api --method
+  # DELETE` defeats any subcommand denylist, so a parser here would be a boundary
+  # that can be walked around. Scope the *token* instead: a fine-grained PAT
+  # limited to what the agent needs bounds it far more reliably than argv
+  # inspection.
+  tools:
+    - name: gh
+      # `gh auth token` and `--show-token` print the credential itself.
+      # Forwarding either would place the token in the sandbox and defeat the
+      # whole design.
+      readback:
+        - auth token
+      readback_flags:
+        - --show-token
+      env_passthrough: [GH_HOST, GH_REPO, GH_PAGER, NO_COLOR]
+
+    - name: acli
+      # Atlassian CLI. `acli auth` offers login / logout / status / switch and no
+      # token-printing subcommand at all, checked against `acli auth --help`, so
+      # there is no readback to refuse. What is refused is the auth *state*
+      # changing: `logout` would sign you out globally from inside an agent turn,
+      # and `login` / `switch` are interactive and would only hang the broker.
+      readback:
+        - auth logout
+        - auth login
+        - auth switch
+      env_passthrough: [ACLI_SITE, NO_COLOR]

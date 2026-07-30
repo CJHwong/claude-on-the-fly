@@ -426,3 +426,352 @@ class TestResume:
         path.write_text("{ not json")
 
         assert supervisor.read_last_running() == []
+
+
+# ---------------------------------------------------------------------------
+# Error messages
+# ---------------------------------------------------------------------------
+
+
+def _result(name, status, detail="", hint=""):
+    from claude_on_the_fly.checks import CheckResult
+
+    return CheckResult(name=name, status=status, detail=detail, fix_hint=hint)
+
+
+class TestPreflightFailedMessage:
+    def test_the_first_blocking_check_is_the_headline(self):
+        """A spawn refused for four reasons still has one to lead with, and it has to
+        be a blocking one rather than whichever came first."""
+        exc = supervisor.PreflightFailed(
+            "slack",
+            [
+                _result("advisory", "warn", "no worker running"),
+                _result("SLACK_TOKEN", "missing", "not set"),
+            ],
+        )
+        assert "SLACK_TOKEN" in str(exc)
+        assert "not set" in str(exc)
+
+    def test_no_blocking_check_still_says_which_frontend(self):
+        """Reachable when every failure is advisory, and a bare "preflight failed"
+        with no name is unactionable in a stop-all/resume log."""
+        exc = supervisor.PreflightFailed(
+            "slack", [_result("advisory", "warn", "no worker running")]
+        )
+        assert str(exc) == "preflight failed for slack"
+
+
+class TestSpawnTimeoutMessage:
+    def test_a_child_that_died_reports_its_exit_code(self):
+        """ "Exited rc=1" and "started but never heartbeated" are different problems,
+        and the message is where an operator learns which one they have."""
+        exc = supervisor.SpawnTimeout(
+            frontend="slack",
+            pid=42,
+            log_path=Path("/logs/slack.stdout"),
+            log_tail="Traceback...\nImportError: slack_bolt\n",
+            exited=True,
+            returncode=1,
+        )
+        message = str(exc)
+        assert "exited (rc=1) before heartbeat" in message
+        assert "/logs/slack.stdout" in message
+        # The tail is the whole reason this exception carries one.
+        assert "ImportError: slack_bolt" in message
+
+    def test_a_child_that_hung_says_so(self):
+        exc = supervisor.SpawnTimeout(
+            frontend="slack", pid=42, log_path=Path("/logs/slack.stdout")
+        )
+        message = str(exc)
+        assert "did not heartbeat within timeout" in message
+        assert "last lines" not in message, "no tail, so no empty tail section"
+
+
+# ---------------------------------------------------------------------------
+# Reading pids and heartbeats off disk
+# ---------------------------------------------------------------------------
+
+
+class TestReadPid:
+    def test_a_corrupt_heartbeat_falls_back_to_the_pid_file(self, isolated_state):
+        state = isolated_state / "state"
+        (state / "slack.json").write_text("{not json")
+        (state / "slack.pid").write_text("4242\n")
+        assert supervisor._resolve_pid("slack") == 4242
+
+    def test_a_heartbeat_without_an_integer_pid_falls_back(self, isolated_state):
+        state = isolated_state / "state"
+        (state / "slack.json").write_text(json.dumps({"pid": "not-an-int"}))
+        (state / "slack.pid").write_text("4242\n")
+        assert supervisor._resolve_pid("slack") == 4242
+
+    def test_a_corrupt_pid_file_reads_as_nothing_running(self, isolated_state):
+        (isolated_state / "state" / "slack.pid").write_text("not-a-number")
+        assert supervisor._resolve_pid("slack") is None
+
+    def test_neither_file_reads_as_nothing_running(self):
+        assert supervisor._resolve_pid("slack") is None
+
+
+class TestHeartbeatFreshness:
+    def test_a_missing_file_is_not_fresh(self):
+        assert supervisor._heartbeat_fresh("slack") is False
+
+    def test_a_recent_heartbeat_is_fresh(self, isolated_state):
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (isolated_state / "state" / "slack.json").write_text(
+            json.dumps({"last_heartbeat": now})
+        )
+        assert supervisor._heartbeat_fresh("slack") is True
+
+    def test_an_old_heartbeat_is_not_fresh(self, isolated_state):
+        """A SIGKILLed daemon leaves its file behind, so age is the only thing that
+        distinguishes it from a live one."""
+        from datetime import UTC, datetime, timedelta
+
+        long_ago = (datetime.now(UTC) - timedelta(hours=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        (isolated_state / "state" / "slack.json").write_text(
+            json.dumps({"last_heartbeat": long_ago})
+        )
+        assert supervisor._heartbeat_fresh("slack") is False
+
+    def test_a_non_string_timestamp_is_not_fresh(self, isolated_state):
+        (isolated_state / "state" / "slack.json").write_text(
+            json.dumps({"last_heartbeat": 1785382860})
+        )
+        assert supervisor._heartbeat_fresh("slack") is False
+
+    def test_an_unparseable_timestamp_is_not_fresh(self, isolated_state):
+        (isolated_state / "state" / "slack.json").write_text(
+            json.dumps({"last_heartbeat": "yesterday"})
+        )
+        assert supervisor._heartbeat_fresh("slack") is False
+
+    def test_corrupt_json_is_not_fresh(self, isolated_state):
+        (isolated_state / "state" / "slack.json").write_text("{not json")
+        assert supervisor._heartbeat_fresh("slack") is False
+
+
+class TestTailFile:
+    def test_a_missing_file_tails_to_nothing(self, tmp_path):
+        """The tail decorates a SpawnTimeout, so a missing log must not raise inside
+        the exception that is already reporting a failure."""
+        assert supervisor._tail_file(tmp_path / "gone.stdout") == ""
+
+    def test_the_last_lines_come_back(self, tmp_path):
+        path = tmp_path / "slack.stdout"
+        path.write_text("".join(f"line {i}\n" for i in range(50)))
+        tail = supervisor._tail_file(path, n_lines=3)
+        assert tail.splitlines() == ["line 47", "line 48", "line 49"]
+
+
+class TestLastRunningRecord:
+    def test_a_corrupt_record_resumes_nothing(self, isolated_state):
+        (isolated_state / "state" / "last_running.json").write_text("{not json")
+        assert supervisor.read_last_running() == []
+
+    def test_a_record_that_is_not_a_list_resumes_nothing(self, isolated_state):
+        (isolated_state / "state" / "last_running.json").write_text(
+            json.dumps({"frontends": "slack"})
+        )
+        assert supervisor.read_last_running() == []
+
+    def test_unknown_frontends_are_filtered_out(self, isolated_state):
+        """The record is a file on disk; a stale or hand-edited name must not be
+        handed to spawn."""
+        (isolated_state / "state" / "last_running.json").write_text(
+            json.dumps({"frontends": ["slack", "not-a-frontend", 42]})
+        )
+        assert supervisor.read_last_running() == ["slack"]
+
+
+# ---------------------------------------------------------------------------
+# Waiting for the first heartbeat
+# ---------------------------------------------------------------------------
+
+
+TELEGRAM_ENV = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALLOWED_USER_ID": "1"}
+
+
+class TestSpawnWaitsForAHeartbeat:
+    """Returning a pid the moment Popen succeeds is what made `claude-tui start`
+    report success for a daemon that then died on an ImportError. The wait is what
+    turns that into an actionable failure."""
+
+    def test_a_daemon_that_heartbeats_returns_its_pid(
+        self, isolated_state, monkeypatch
+    ):
+        from datetime import UTC, datetime
+
+        proc = MagicMock(pid=4242)
+        proc.poll.return_value = None
+
+        def heartbeat_now(_frontend):
+            (supervisor.STATE_DIR / "telegram.json").write_text(
+                json.dumps(
+                    {"last_heartbeat": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                )
+            )
+            return True
+
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", heartbeat_now)
+        pid = supervisor.spawn(
+            "telegram",
+            env=TELEGRAM_ENV,
+            popen_factory=MagicMock(return_value=proc),
+            wait_for_heartbeat=True,
+        )
+        assert pid == 4242
+
+    def test_a_daemon_that_dies_first_reports_its_exit_code_and_log(
+        self, isolated_state, monkeypatch
+    ):
+        proc = MagicMock(pid=4242)
+        proc.poll.return_value = 1
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
+        stdout = supervisor.LOG_DIR / "telegram.stdout"
+        stdout.write_text("Traceback...\nImportError: no module named telegram\n")
+        monkeypatch.setattr(supervisor, "_stdout_file", lambda _f: stdout)
+
+        with pytest.raises(supervisor.SpawnTimeout) as caught:
+            supervisor.spawn(
+                "telegram",
+                env=TELEGRAM_ENV,
+                popen_factory=MagicMock(return_value=proc),
+                wait_for_heartbeat=True,
+            )
+        assert caught.value.exited is True
+        assert caught.value.returncode == 1
+        assert "ImportError" in caught.value.log_tail
+        # The stale pid file must not survive a failed spawn, or `stop` would
+        # signal a pid the OS has already recycled.
+        assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+
+    def test_a_daemon_that_hangs_is_killed_and_reported(
+        self, isolated_state, monkeypatch
+    ):
+        """Still running but never heartbeating: leaving it would mean a process
+        holding the queue that nothing will ever manage."""
+        proc = MagicMock(pid=4242)
+        proc.poll.return_value = None
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(supervisor.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            supervisor.os, "killpg", lambda pgid, sig: killed.append((pgid, sig))
+        )
+
+        with pytest.raises(supervisor.SpawnTimeout) as caught:
+            supervisor.spawn(
+                "telegram",
+                env=TELEGRAM_ENV,
+                popen_factory=MagicMock(return_value=proc),
+                wait_for_heartbeat=True,
+                spawn_timeout_s=0.01,
+            )
+        assert caught.value.exited is False
+        assert killed == [(4242, signal.SIGTERM)]
+        assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+
+    def test_a_kill_that_fails_does_not_mask_the_timeout(
+        self, isolated_state, monkeypatch
+    ):
+        """The timeout is the thing the operator needs to hear about; a failed
+        cleanup signal on top of it is not."""
+        proc = MagicMock(pid=4242)
+        proc.poll.return_value = None
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(
+            supervisor.os,
+            "getpgid",
+            lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+        )
+        with pytest.raises(supervisor.SpawnTimeout):
+            supervisor.spawn(
+                "telegram",
+                env=TELEGRAM_ENV,
+                popen_factory=MagicMock(return_value=proc),
+                wait_for_heartbeat=True,
+                spawn_timeout_s=0.01,
+            )
+
+
+class TestStopSignalFailures:
+    def test_a_sigterm_that_fails_still_escalates(self, isolated_state, monkeypatch):
+        """The pid may have exited between the liveness check and the signal, and
+        SIGKILL on an already-dead pid is harmless."""
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=4242)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda _p: True)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+        sent: list[int] = []
+
+        def kill(_pid, sig):
+            sent.append(sig)
+            if sig == signal.SIGTERM:
+                raise OSError("no such process")
+
+        monkeypatch.setattr(supervisor.os, "kill", kill)
+        assert supervisor.stop("telegram", grace_s=0.01) == 4242
+        assert signal.SIGKILL in sent
+
+    def test_a_sigkill_that_fails_is_logged_not_raised(
+        self, isolated_state, monkeypatch, caplog
+    ):
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=4242)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda _p: True)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(
+            supervisor.os,
+            "kill",
+            lambda _pid, _sig: (_ for _ in ()).throw(OSError("permission denied")),
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.tui.supervisor"):
+            assert supervisor.stop("telegram", grace_s=0.01) == 4242
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SIGTERM" in logged and "SIGKILL" in logged
+
+    def test_a_process_that_dies_during_the_second_wait_breaks_early(
+        self, isolated_state, monkeypatch
+    ):
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=4242)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+        killed = {"sigkill": False}
+
+        def kill(_pid, sig):
+            if sig == signal.SIGKILL:
+                killed["sigkill"] = True
+
+        monkeypatch.setattr(supervisor.os, "kill", kill)
+        # Alive for the whole grace window, gone the moment SIGKILL lands. Keyed off
+        # the signal rather than a call count, because the grace loop's iteration
+        # count depends on wall-clock and would make a counter flaky.
+        monkeypatch.setattr(
+            supervisor, "_process_exists", lambda _pid: not killed["sigkill"]
+        )
+        assert supervisor.stop("telegram", grace_s=0.01) == 4242
+        assert killed["sigkill"] is True
+
+
+class TestStopAllSkipsWhatVanishes:
+    def test_a_daemon_that_exits_between_the_check_and_the_stop_is_skipped(
+        self, isolated_state, monkeypatch
+    ):
+        """`is_running` and `stop` are two separate observations, and a daemon that
+        exits in between must not turn stop-all into an error."""
+        monkeypatch.setattr(supervisor, "is_running", lambda name: name == "telegram")
+        monkeypatch.setattr(
+            supervisor,
+            "stop",
+            lambda _name, **_kw: (_ for _ in ()).throw(
+                supervisor.NotRunning("gone already")
+            ),
+        )
+        assert supervisor.stop_all() == []

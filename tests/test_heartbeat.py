@@ -174,3 +174,89 @@ class TestLivePid:
         payload format and the reader cannot drift apart."""
         HeartbeatWriter("jobs", state_dir=tmp_path).write_once()
         assert heartbeat.live_pid("jobs", state_dir=tmp_path) == os.getpid()
+
+
+class TestPackageVersion:
+    def test_an_uninstalled_package_reports_unknown(self, monkeypatch):
+        """The heartbeat is read by the TUI, and a raise here would take the
+        dashboard down over a cosmetic field."""
+        from importlib.metadata import PackageNotFoundError
+
+        from claude_on_the_fly import heartbeat as heartbeat_mod
+
+        def not_found(_name):
+            raise PackageNotFoundError("claude-on-the-fly")
+
+        monkeypatch.setattr(heartbeat_mod, "version", not_found)
+        assert heartbeat_mod._package_version() == "unknown"
+
+
+class TestProcessLiveness:
+    def test_a_pid_that_does_not_exist_is_not_alive(self):
+        from claude_on_the_fly.heartbeat import process_exists
+
+        # 2**22 is above the default pid_max on both macOS and Linux.
+        assert process_exists(4_194_303) is False
+
+    def test_our_own_pid_is_alive(self):
+        import os
+
+        from claude_on_the_fly.heartbeat import process_exists
+
+        assert process_exists(os.getpid()) is True
+
+
+class TestLivePidRejectsAnUnusableHeartbeat:
+    def test_a_non_integer_pid_is_refused(self, tmp_path):
+        """A string pid would be handed to os.kill and raise, so it has to be
+        rejected before the liveness probe."""
+        import json
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly import heartbeat as heartbeat_mod
+
+        path = tmp_path / "slack.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "pid": "not-an-int",
+                    "last_heartbeat": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+        )
+        assert heartbeat_mod.live_pid("slack", state_dir=tmp_path) is None
+
+    def test_a_stale_heartbeat_is_refused(self, tmp_path):
+        """A daemon that was SIGKILLed leaves its file behind, and the timestamp is
+        the only thing that distinguishes it from a live one."""
+        import json
+        import os
+        from datetime import UTC, datetime, timedelta
+
+        from claude_on_the_fly import heartbeat as heartbeat_mod
+
+        long_ago = datetime.now(UTC) - timedelta(hours=1)
+        path = tmp_path / "slack.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "last_heartbeat": long_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+        )
+        assert (
+            heartbeat_mod.live_pid("slack", state_dir=tmp_path, liveness_window_s=60)
+            is None
+        )
+
+
+def test_the_writer_exposes_the_path_it_owns(tmp_path):
+    """`run()`'s callers unlink this on shutdown, so it has to be the same file the
+    writer actually writes."""
+    from claude_on_the_fly.heartbeat import HeartbeatWriter
+
+    writer = HeartbeatWriter("slack", state_dir=tmp_path)
+    writer.write_once()
+    assert writer.path == tmp_path / "slack.json"
+    assert writer.path.is_file()

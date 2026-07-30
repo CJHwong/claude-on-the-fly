@@ -600,3 +600,283 @@ class TestOllamaCostUsesCacheRates:
 
         cost_for.assert_not_called()
         assert response.cost == 999.0
+
+
+# ---------------------------------------------------------------------------
+# Skill probing
+# ---------------------------------------------------------------------------
+
+
+class TestProbeSkills:
+    """The probe launches the real CLI and reads one line. Every failure mode has
+    to degrade to an empty list, because a broken probe must cost the skill picker
+    its contents and nothing else."""
+
+    def _proc(self, line: bytes) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = None
+        proc.stdout = MagicMock()
+        proc.stdout.readline = AsyncMock(return_value=line)
+        return proc
+
+    async def test_an_init_event_yields_names_and_plugins(self) -> None:
+        event = {
+            "type": "system",
+            "subtype": "init",
+            "skills": ["review", "commit"],
+            "plugins": [{"name": "gf", "path": "/plugins/gf"}, "not-a-dict"],
+        }
+        with (
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=self._proc(json.dumps(event).encode()),
+            ),
+            patch.object(
+                claude_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ),
+        ):
+            names, plugins = await claude_mod._probe_skills([], ["claude"])
+        assert names == ["commit", "review"]
+        assert plugins == [{"name": "gf", "path": "/plugins/gf"}]
+
+    async def test_a_cli_that_never_answers_gives_up(self, caplog) -> None:
+        proc = MagicMock()
+        proc.returncode = None
+        proc.stdout = MagicMock()
+
+        async def never(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        proc.stdout.readline = never
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(
+                claude_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ) as kill,
+            patch.object(claude_mod.asyncio, "wait_for", side_effect=TimeoutError),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.backends.claude"),
+        ):
+            assert await claude_mod._probe_skills([], ["claude"]) == ([], [])
+        # Reaped even on the give-up path, or the probe leaks a CLI per query.
+        kill.assert_awaited_once()
+        assert "timed out waiting for init event" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"not json at all\n",
+            b"",
+            b'{"type": "system", "subtype": "other"}\n',
+            b'{"type": "assistant"}\n',
+        ],
+    )
+    async def test_anything_other_than_an_init_event_yields_nothing(self, line) -> None:
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=self._proc(line)),
+            patch.object(
+                claude_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ),
+        ):
+            assert await claude_mod._probe_skills([], ["claude"]) == ([], [])
+
+
+class TestSkillDescriptions:
+    """Descriptions come from SKILL.md front-matter because the init event does not
+    carry them, so this walks real directories and every read can fail."""
+
+    def test_user_and_plugin_skills_are_both_scanned(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        user_skill = tmp_path / "config" / "skills" / "review" / "SKILL.md"
+        user_skill.parent.mkdir(parents=True)
+        user_skill.write_text("---\nname: review\ndescription: Review a diff\n---\n")
+        plugin_skill = tmp_path / "plugin" / "skills" / "deploy" / "SKILL.md"
+        plugin_skill.parent.mkdir(parents=True)
+        plugin_skill.write_text("---\ndescription: Ship it\n---\n")
+
+        out = claude_mod._skill_descriptions(
+            [{"name": "gf", "path": str(tmp_path / "plugin")}]
+        )
+        assert out["review"] == "Review a diff"
+        # No name in the front matter, so the directory name stands in.
+        assert out["deploy"] == "Ship it"
+
+    def test_a_root_that_cannot_be_globbed_is_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+
+        def glob_fails(self, _pattern):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "glob", glob_fails)
+        assert claude_mod._skill_descriptions([]) == {}
+
+    def test_a_skill_file_that_cannot_be_read_is_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        first = tmp_path / "config" / "skills" / "broken" / "SKILL.md"
+        first.parent.mkdir(parents=True)
+        first.write_text("---\ndescription: unreadable\n---\n")
+        second = tmp_path / "config" / "skills" / "fine" / "SKILL.md"
+        second.parent.mkdir(parents=True)
+        second.write_text("---\ndescription: readable\n---\n")
+        real_read = Path.read_text
+
+        def read_fails(self, *args, **kwargs):
+            if self.parent.name == "broken":
+                raise OSError("permission denied")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_fails)
+        out = claude_mod._skill_descriptions([])
+        assert "broken" not in out
+        assert out["fine"] == "readable"
+
+    def test_a_plugin_without_a_path_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        assert claude_mod._skill_descriptions([{"name": "gf"}]) == {}
+
+    def test_the_first_definition_of_a_name_wins(self, tmp_path, monkeypatch):
+        """User skills are scanned first on purpose: an operator's own version of a
+        name should not be relabelled by a plugin that ships the same name."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        mine = tmp_path / "config" / "skills" / "review" / "SKILL.md"
+        mine.parent.mkdir(parents=True)
+        mine.write_text("---\nname: review\ndescription: Mine\n---\n")
+        theirs = tmp_path / "plugin" / "skills" / "review" / "SKILL.md"
+        theirs.parent.mkdir(parents=True)
+        theirs.write_text("---\nname: review\ndescription: Theirs\n---\n")
+        out = claude_mod._skill_descriptions(
+            [{"name": "gf", "path": str(tmp_path / "plugin")}]
+        )
+        assert out["review"] == "Mine"
+
+
+# ---------------------------------------------------------------------------
+# pty envelope failures
+# ---------------------------------------------------------------------------
+
+
+class TestPtyEnvelopeFailures:
+    def _proc(self, stdout: bytes, stderr: bytes = b"", rc: int = 0) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = rc
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        return proc
+
+    async def _run(self, proc, **kwargs):
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(
+                claude_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ),
+        ):
+            return await claude_mod._exec_pty(Path("/tmp"), ["claude-pty"], **kwargs)
+
+    async def test_a_timeout_names_the_limit_it_hit(self) -> None:
+        proc = MagicMock()
+        proc.returncode = None
+
+        async def never(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        proc.communicate = never
+        with pytest.raises(RuntimeError, match=r"timed out after 0\.01s"):
+            await self._run(proc, timeout=0.01)
+
+    async def test_a_nonzero_exit_with_no_envelope_is_classified(self) -> None:
+        """`_classify` is what turns a raw CLI complaint into the right exception
+        type, so the frontend can tell "not installed" from "the model refused"."""
+        proc = self._proc(b"", b"Credit balance is too low", rc=1)
+        with pytest.raises(Exception) as caught:
+            await self._run(proc)
+        assert "Credit balance" in str(caught.value)
+
+    async def test_silence_points_at_the_stop_hook(self) -> None:
+        """The most common cause is a Claude Code upgrade breaking pty's hook, and
+        the error has to say so or the operator has nothing to act on."""
+        with pytest.raises(RuntimeError, match="troubleshooting"):
+            await self._run(self._proc(b"", b"", rc=0))
+
+    async def test_malformed_json_shows_the_first_bytes(self) -> None:
+        """Without the excerpt this is unfixable: the whole question is what the
+        wrapper printed instead of an envelope."""
+        with pytest.raises(RuntimeError, match="malformed JSON"):
+            await self._run(self._proc(b"<html>error page</html>"))
+
+    async def test_an_error_envelope_is_classified_not_returned(self) -> None:
+        envelope = {"is_error": True, "result": "usage limit reached"}
+        with pytest.raises(Exception) as caught:
+            await self._run(self._proc(json.dumps(envelope).encode()))
+        assert "usage limit" in str(caught.value)
+
+    async def test_an_error_subtype_is_classified_too(self) -> None:
+        envelope = {"subtype": "error_during_execution", "result": "tool blew up"}
+        with pytest.raises(Exception) as caught:
+            await self._run(self._proc(json.dumps(envelope).encode()))
+        assert "tool blew up" in str(caught.value)
+
+    async def test_a_good_envelope_gets_the_count_defaults(self) -> None:
+        """Downstream indexes these unconditionally."""
+        envelope = await self._run(self._proc(b'{"result": "done"}'))
+        assert envelope["tool_counts"] == {}
+        assert envelope["skill_counts"] == {}
+
+
+# ---------------------------------------------------------------------------
+# pty statusline -> Response
+# ---------------------------------------------------------------------------
+
+
+class TestStatuslineResponseFields:
+    def test_an_empty_statusline_yields_nothing(self) -> None:
+        """native and ollama publish no statusline, and Response's own defaults
+        must stand rather than being overwritten with zeros."""
+        assert claude_mod._statusline_response_fields({}) == {}
+
+    def test_the_absolutes_the_compaction_gate_reads_are_carried(self) -> None:
+        """A bare percentage is not enough: `total_input_tokens` is the whole
+        prompt, so it never drops below the system prompt and tool schemas however
+        hard the conversation is compacted. The gate needs the window size next to
+        it to know where the floor is."""
+        fields = claude_mod._statusline_response_fields(
+            {
+                "context_window": {
+                    "used_percentage": 65,
+                    "total_input_tokens": 650_000,
+                    "context_window_size": 1_000_000,
+                }
+            }
+        )
+        assert fields == {
+            "context_window_pct": 65,
+            "context_tokens": 650_000,
+            "context_window_size": 1_000_000,
+        }
+
+    def test_a_partial_context_window_only_reports_what_it_has(self) -> None:
+        """A missing key must stay missing rather than becoming a zero the gate
+        would read as an empty context."""
+        fields = claude_mod._statusline_response_fields(
+            {"context_window": {"total_input_tokens": 650_000}}
+        )
+        assert fields == {"context_tokens": 650_000}
+
+    def test_rate_limits_and_flags_come_through(self) -> None:
+        fields = claude_mod._statusline_response_fields(
+            {
+                "rate_limits": {
+                    "five_hour": {"used_percentage": 12, "resets_at": 1000},
+                    "seven_day": {"used_percentage": 80, "resets_at": 2000},
+                },
+                "exceeds_200k_tokens": True,
+                "fast_mode": False,
+            }
+        )
+        assert fields == {
+            "rate_limits_5h_pct": 12,
+            "rate_limits_5h_resets_at": 1000,
+            "rate_limits_7d_pct": 80,
+            "rate_limits_7d_resets_at": 2000,
+            "exceeds_200k": True,
+            "fast_mode": False,
+        }

@@ -6,22 +6,27 @@ import asyncio
 import json
 import logging
 import mimetypes
+import secrets
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_markdown
 
+from claude_on_the_fly import logs
 from claude_on_the_fly.agent import DATA_DIR, Response, footer_parts
+from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.protocol import Frontend
 
 if TYPE_CHECKING:
@@ -57,6 +62,11 @@ class TelegramFrontend(Frontend):
         # session (no suffix). Tokens are unique and never recycle, so pruning
         # old workspaces can't make a future session collide with a stale one.
         self._session_tokens: dict[int, str] = {}
+        # nonce -> future awaiting an approve/deny tap. Keyed by nonce because
+        # Telegram caps callback_data at 64 bytes, too small for a host plus
+        # port plus scope, and short enough that a subject would get truncated
+        # into ambiguity.
+        self._pending_approvals: dict[str, asyncio.Future[bool]] = {}
 
     def set_orchestrator(self, orchestrator: object) -> None:
         from claude_on_the_fly.orchestrator import Orchestrator
@@ -138,6 +148,9 @@ class TelegramFrontend(Frontend):
                 self._on_unsupported,
             )
         )
+        self._app.add_handler(
+            CallbackQueryHandler(self._on_approval_tap, pattern=r"^cotf-(grant|deny):")
+        )
         await self._app.initialize()
         await self._app.start()
         if not self._app.updater:
@@ -152,6 +165,137 @@ class TelegramFrontend(Frontend):
             await self._app.stop()
             await self._app.shutdown()
 
+    # --- Runtime permission approvals ---
+
+    def _approval_chat(self, chat_id: int | None = None) -> int | None:
+        """Where an approval prompt goes.
+
+        The session's own chat, so the question appears where the work is. For
+        work with no conversation behind it (cron, the job queue), the allowed
+        user's DM -- a Telegram DM chat id equals the user id, so the fallback is
+        never a group.
+
+        There is deliberately no override: a prompt belongs with the work that
+        caused it, and routing it elsewhere only makes it harder to judge. Slack
+        goes further and denies for sessionless work rather than falling back at
+        all, because nobody is watching a cron job's thread.
+        """
+        return chat_id if chat_id is not None else self._allowed_user_id
+
+    async def ask_approval(
+        self, request: ApprovalRequest, chat_id: int | None = None
+    ) -> bool:
+        """Post an approve/deny keyboard and wait for a tap.
+
+        The caller (approvals.ApprovalBroker) owns the timeout and treats any
+        exception as a denial, so this only has to resolve or raise.
+        """
+        chat_id = self._approval_chat(chat_id)
+        if not self._app or chat_id is None:
+            return False
+        nonce = secrets.token_urlsafe(8)
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_approvals[nonce] = future
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Approve", callback_data=f"cotf-grant:{nonce}"
+                    ),
+                    InlineKeyboardButton("Deny", callback_data=f"cotf-deny:{nonce}"),
+                ]
+            ]
+        )
+        minutes = request.ttl_seconds / 60
+        # Escaped, not interpolated raw. Parts of a subject/detail are agent-
+        # reachable -- a broker route-scope request carries the path tail the agent
+        # asked for -- so unescaped Markdown here lets the agent style the operator's
+        # own prompt, hiding the real subject behind formatting or a fake verdict
+        # line. Escaping keeps the one text the operator must be able to trust
+        # literal.
+        subject = escape_markdown(request.subject, version=1)
+        detail = escape_markdown(request.detail, version=1)
+        message = await self._app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"*Permission request*\n\n"
+                f"`{subject}`\n\n"
+                f"{detail}\n\n"
+                f"Grant lasts {minutes:.0f} min and dies on restart."
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+            # The detail names the host the agent asked for, so a preview would
+            # fetch the very destination being gated -- from the operator's client,
+            # before any decision, which is both noise and a small leak of the
+            # pending request. Also keeps the buttons above the fold on a phone.
+            disable_web_page_preview=True,
+        )
+        granted = False
+        try:
+            granted = await future
+        finally:
+            # Reached on the caller's timeout cancellation too, so a stale
+            # nonce can never accumulate or be answered later. The prompt is
+            # retired in here for the same reason: on the timeout path the
+            # cancellation used to skip it, leaving a spent card with a
+            # live-looking keyboard in the chat forever.
+            self._pending_approvals.pop(nonce, None)
+            verdict = "APPROVED" if granted else "DENIED"
+            try:
+                await self._retire_approval(
+                    chat_id, message.message_id, request, verdict
+                )
+            except Exception:
+                # Never let a cosmetic edit change the answer, but never lose it
+                # either: `_retire_approval` already logs the BadRequest it
+                # expects, so anything arriving here is a surprise and the one
+                # place it would be visible is this log line.
+                logger.exception("telegram: retiring the approval prompt failed")
+        return granted
+
+    async def _retire_approval(
+        self, chat_id: int, message_id: int, request: ApprovalRequest, verdict: str
+    ) -> None:
+        """Strip the buttons and stamp the outcome so the prompt can't be reused."""
+        if self._app is None:
+            return
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=(
+                    f"*Permission {verdict}*\n\n"
+                    f"`{escape_markdown(request.subject, version=1)}`"
+                ),
+                parse_mode="Markdown",
+            )
+        except BadRequest as exc:
+            logger.warning("could not retire approval prompt: %s", exc)
+
+    async def _on_approval_tap(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Resolve a pending approval from a button tap."""
+        query = update.callback_query
+        if query is None or not query.data:
+            return
+        await query.answer()
+        # Only the configured operator may widen policy. Without this any user
+        # who can see the message could grant the agent a new host.
+        if not self._allowed(update):
+            logger.warning(
+                "ignoring approval tap from unauthorized user %s",
+                update.effective_user.id if update.effective_user else "unknown",
+            )
+            return
+        action, _, nonce = query.data.partition(":")
+        future = self._pending_approvals.get(nonce)
+        if future is None or future.done():
+            logger.info("approval tap for unknown or settled nonce %s", nonce)
+            return
+        future.set_result(action == "cotf-grant")
+
     # --- Sending ---
 
     async def send(self, chat_id: int, response: Response) -> list[Path] | None:
@@ -163,7 +307,7 @@ class TelegramFrontend(Frontend):
             text = f"{text}\n\n_{stats}_"
         if tools:
             text = f"{text}\n_{tools}_"
-        logger.info("chat %s => %s", chat_id, text[:80])
+        logger.info("chat %s => %s", chat_id, logs.redact(text))
         await self._send_chunked(chat_id, text)
         await self._send_attachments(chat_id, response.attachments)
         return response.attachments
@@ -268,7 +412,7 @@ class TelegramFrontend(Frontend):
         if text:
             sender = self._chat_names.get(chat_id, "unknown")
             text = f"[from: {sender}] {text}"
-            logger.info("chat %s: %s", chat_id, text[:80])
+            logger.info("chat %s: %s", chat_id, logs.redact(text))
             if self._on_message:
                 await self._on_message(chat_id, text)
 
@@ -405,14 +549,14 @@ class TelegramFrontend(Frontend):
             )
             sender = self._chat_names.get(chat_id, "unknown")
             text = f"[from: {sender}] {text}"
-            logger.info("chat %s: %s", chat_id, text[:80])
+            logger.info("chat %s: %s", chat_id, logs.redact(text))
             if self._on_message:
                 await self._on_message(chat_id, text)
         except Exception:
             logger.exception("Failed to process media group for chat %s", chat_id)
 
 
-def main() -> None:  # pragma: no cover
+def main() -> None:
     from dotenv import load_dotenv
 
     from claude_on_the_fly.orchestrator import run

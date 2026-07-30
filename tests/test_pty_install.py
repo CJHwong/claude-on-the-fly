@@ -203,3 +203,135 @@ class TestHooksOnlyRefresh:
         pty_install.run_installer(runner=runner)
 
         assert "CLAUDE_PTY_NO_STATUSLINE" not in captured["env"]
+
+
+class TestIsPtyInstalled:
+    def test_a_binary_on_path_is_enough(self, monkeypatch):
+        monkeypatch.setattr(
+            pty_install.shutil, "which", lambda _n: "/usr/local/bin/claude-pty"
+        )
+        assert pty_install.is_pty_installed() is True
+
+    def test_the_project_install_location_also_counts(self, monkeypatch):
+        """Matches resolve_pty_binary's own semantics, so the doctor and the
+        preflight agree about what "installed" means."""
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        monkeypatch.setattr(pty_install.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(
+            claude_mod, "resolve_pty_binary", lambda: "/opt/pty/bin/claude-pty"
+        )
+        assert pty_install.is_pty_installed() is True
+
+    def test_neither_means_not_installed(self, monkeypatch):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        monkeypatch.setattr(pty_install.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(claude_mod, "resolve_pty_binary", lambda: None)
+        assert pty_install.is_pty_installed() is False
+
+
+class TestStdinIsTty:
+    def test_both_streams_must_be_terminals(self, monkeypatch):
+        """The consent prompt writes to stderr and reads stdin, so one redirected
+        stream is enough to make it unanswerable."""
+        monkeypatch.setattr(
+            pty_install.sys, "stdin", SimpleNamespace(isatty=lambda: True)
+        )
+        monkeypatch.setattr(
+            pty_install.sys, "stderr", SimpleNamespace(isatty=lambda: False)
+        )
+        assert pty_install._stdin_is_tty() is False
+
+    def test_two_terminals_is_interactive(self, monkeypatch):
+        monkeypatch.setattr(
+            pty_install.sys, "stdin", SimpleNamespace(isatty=lambda: True)
+        )
+        monkeypatch.setattr(
+            pty_install.sys, "stderr", SimpleNamespace(isatty=lambda: True)
+        )
+        assert pty_install._stdin_is_tty() is True
+
+    def test_a_stream_that_raises_is_treated_as_not_a_tty(self, monkeypatch):
+        """A daemonized run can have a closed stdin, where isatty() itself raises."""
+
+        def raises():
+            raise ValueError("I/O operation on closed file")
+
+        monkeypatch.setattr(pty_install.sys, "stdin", SimpleNamespace(isatty=raises))
+        assert pty_install._stdin_is_tty() is False
+
+
+class TestInstallerFailures:
+    def _runner(self, **result):
+        return lambda *_a, **_kw: SimpleNamespace(**result)
+
+    def test_an_installer_that_overruns_is_reported(self, monkeypatch):
+        monkeypatch.setattr(pty_install.shutil, "which", lambda _n: "/bin/x")
+
+        def times_out(*_a, **_kw):
+            raise pty_install.subprocess.TimeoutExpired("curl", 180)
+
+        ok, message = pty_install.run_installer(runner=times_out)
+        assert ok is False
+        assert "timed out after 180s" in message
+
+    def test_a_nonzero_exit_carries_the_installers_stderr(self, monkeypatch):
+        """That text is the only thing the operator can act on."""
+        monkeypatch.setattr(pty_install.shutil, "which", lambda _n: "/bin/x")
+        ok, message = pty_install.run_installer(
+            runner=self._runner(returncode=1, stderr="404 not found")
+        )
+        assert ok is False
+        assert "404 not found" in message
+
+    def test_a_silent_failure_falls_back_to_the_exit_code(self, monkeypatch):
+        monkeypatch.setattr(pty_install.shutil, "which", lambda _n: "/bin/x")
+        ok, message = pty_install.run_installer(
+            runner=self._runner(returncode=7, stderr="")
+        )
+        assert ok is False
+        assert "exit 7" in message
+
+    def test_a_clean_run_returns_what_it_did(self, monkeypatch):
+        monkeypatch.setattr(pty_install.shutil, "which", lambda _n: "/bin/x")
+        ok, message = pty_install.run_installer(
+            runner=self._runner(returncode=0, stderr=""), what="installed claude-pty"
+        )
+        assert ok is True
+        assert message == "installed claude-pty"
+
+
+def test_an_import_error_reaching_the_backend_reads_as_not_installed(monkeypatch):
+    """`is_pty_installed` runs on the preflight path, before the backend module is
+    necessarily importable, and a raise there would be a startup crash rather than an
+    install prompt."""
+    import builtins
+
+    monkeypatch.setattr(pty_install.shutil, "which", lambda _n: None)
+    real_import = builtins.__import__
+
+    def fail_backend(name, *args, **kwargs):
+        if name == "claude_on_the_fly.backends.claude":
+            raise ImportError("slack_bolt missing")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_backend)
+    assert pty_install.is_pty_installed() is False
+
+
+def test_a_missing_bash_stops_the_installer(monkeypatch):
+    """The script is piped through bash, so its absence is a different fix from a
+    missing curl and has to say which."""
+    monkeypatch.setattr(
+        pty_install.shutil,
+        "which",
+        lambda name: "/bin/curl" if name == "curl" else None,
+    )
+
+    def must_not_run(*_a, **_kw):
+        raise AssertionError("shelled out without bash")
+
+    ok, message = pty_install.run_installer(runner=must_not_run)
+    assert ok is False
+    assert "bash not on PATH" in message

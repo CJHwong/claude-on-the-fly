@@ -35,10 +35,22 @@ class CheckResult:
 # Env var declarations — used by env_editor to map changes to daemons.
 # ---------------------------------------------------------------------------
 
+# Read by orchestrator.run, so they belong to whichever chat frontend is
+# hosting it. Listed against both frontends below rather than in a group of
+# their own, because env_editor maps a changed key to the daemons that must
+# restart, and both of them must.
+SANDBOX_ENV_VARS: tuple[str, ...] = (
+    "COTF_SANDBOX",
+    "COTF_SANDBOX_FS",
+    "COTF_SANDBOX_EXTRA_PATHS",
+    "COTF_SANDBOX_BROKER_ONLY_LOOPBACK",
+)
+
 TELEGRAM_ENV_VARS: tuple[str, ...] = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER_ID",
     "TELEGRAM_STATS_MODE",
+    *SANDBOX_ENV_VARS,
 )
 SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_APP_TOKEN",
@@ -52,6 +64,7 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     # restart when it changes.
     "SLACK_JOB_COMMAND",
     "SLACK_STATS_MODE",
+    *SANDBOX_ENV_VARS,
     # Deprecated aliases (still honored; see SLACK_LEGACY).
     "SLACK_USER_TOKEN",
     "SLACK_BOT_TOKEN",

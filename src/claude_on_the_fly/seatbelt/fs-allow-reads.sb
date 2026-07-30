@@ -1,0 +1,241 @@
+;; fs-allow-reads.sb: the default filesystem base, imported by jail.sb.
+;;
+;; Derived from agent-seatbelt's my.sb. Keep the rule order and structure
+;; aligned with upstream so its changes stay diffable against this file.
+;;
+;; Policy: deny-default → allow reads globally → deny reads on secrets → allowlist writes only
+;;
+;; Parameters (injected by wrapper):
+;;   _HOME        — user home directory
+;;   _PROJECT_DIR — resolved project working directory
+;;   _TMPDIR      — macOS per-user temp directory
+
+(version 1)
+(deny default)
+
+;; ---------------------------------------------------------------------------
+;; Process & system essentials
+;; ---------------------------------------------------------------------------
+(allow process-exec)
+(allow process-fork)
+(allow process-info*)
+(allow signal)
+(allow mach*)
+(allow sysctl*)
+(allow ipc-posix-shm*)
+(allow ipc-posix-sem*)
+(allow iokit-open)
+(allow system-socket)
+(allow system-fsctl)
+(allow pseudo-tty)
+(allow user-preference-read)
+(allow file-ioctl)
+
+;; ---------------------------------------------------------------------------
+;; Network — fully allowed
+;; ---------------------------------------------------------------------------
+(allow network*)
+
+;; ---------------------------------------------------------------------------
+;; Read access — global allow, then deny secrets
+;; ---------------------------------------------------------------------------
+(allow file-read*)
+
+;; -- Cryptographic keys --
+;; Allows ssh config, known_hosts, and public keys; blocks private keys.
+(deny file-read*
+  (require-all
+    (subpath (string-append (param "_HOME") "/.ssh"))
+    (require-not (literal (string-append (param "_HOME") "/.ssh/config")))
+    (require-not (literal (string-append (param "_HOME") "/.ssh/known_hosts")))
+    (require-not (literal (string-append (param "_HOME") "/.ssh/known_hosts.old")))
+    (require-not (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.ssh/.*\\.pub$")))
+  ))
+
+(deny file-read* (subpath (string-append (param "_HOME") "/.gnupg")))
+
+;; -- Cloud providers (Reasonable Access) --
+;; Allow reading configs (profiles/regions) but deny credentials.
+(deny file-read*
+  (require-all
+    (subpath (string-append (param "_HOME") "/.aws"))
+    (require-not (literal (string-append (param "_HOME") "/.aws/config")))
+  ))
+(deny file-read* (literal (string-append (param "_HOME") "/.aws/credentials")))
+
+;; -- Container & orchestration --
+(deny file-read* (subpath (string-append (param "_HOME") "/.docker")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.kube")))
+
+;; -- Credentials of brokered CLIs --
+;; These are denied because the agent does not need them: it reaches the tool
+;; through a shim that forwards to the command broker outside the sandbox, which
+;; holds the credential (commands.py). Denying the file used to cost the whole
+;; capability, which is why an earlier revision granted ~/.config/gh; with a shim
+;; the deny is free.
+;;
+;; A credential denied here without a matching shim breaks that tool under `jail`.
+;; That is the deliberate order: deny first, shim as each tool is added. `gh` is
+;; shimmed today; the rest are listed below and are currently unavailable under
+;; `jail` by choice.
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/gh")))
+
+;; -- Credentials with no shim yet (tool unavailable under jail) --
+;; Adopted after the original denylist was written, so they were readable by
+;; default until a probe caught it. An enumerate-the-bad list goes stale exactly
+;; this way; each addition here should come with a SHIMMED_TOOLS entry.
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/acli")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.local/share/acli")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/gws")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/gcloud")))
+(deny file-read* (literal (string-append (param "_HOME") "/.sentryclirc")))
+
+;; -- Package manager and build tokens --
+(deny file-read* (literal (string-append (param "_HOME") "/.pypirc")))
+(deny file-read* (literal (string-append (param "_HOME") "/.npmrc")))
+(deny file-read* (literal (string-append (param "_HOME") "/.cargo/credentials.toml")))
+(deny file-read* (literal (string-append (param "_HOME") "/.netrc")))
+(deny file-read* (literal (string-append (param "_HOME") "/.gem/credentials")))
+(deny file-read* (literal (string-append (param "_HOME") "/.config/pip/pip.conf")))
+(deny file-read* (literal (string-append (param "_HOME") "/.m2/settings.xml")))
+(deny file-read* (literal (string-append (param "_HOME") "/.gradle/gradle.properties")))
+
+;; -- Stores not present on the machine this list was written on --
+;; Denied ahead of need, because the failure mode of this list is a store that
+;; nobody thought about being readable by default on someone else's machine. A
+;; deny for an absent path costs nothing; the same deny added after the fact
+;; costs whatever the agent read in between. As above, denying one makes its CLI
+;; unusable under jail until it earns a SHIMMED_TOOLS entry.
+
+;; Remaining clouds (aws/gcloud handled above).
+(deny file-read* (subpath (string-append (param "_HOME") "/.azure")))
+(deny file-read* (literal (string-append (param "_HOME") "/.oci/config")))
+
+;; Forges and plaintext git credentials. ~/.gitconfig stays readable on purpose
+;; (git needs it, and the agent is told it may read it), so a credential helper
+;; configured there is a deliberate remaining exposure.
+(deny file-read* (literal (string-append (param "_HOME") "/.git-credentials")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/glab-cli")))
+(deny file-read* (literal (string-append (param "_HOME") "/.config/hub")))
+
+;; Container registries beyond docker.
+(deny file-read* (literal (string-append (param "_HOME") "/.config/containers/auth.json")))
+
+;; Infrastructure and secret managers.
+(deny file-read* (literal (string-append (param "_HOME") "/.terraform.d/credentials.tfrc.json")))
+(deny file-read* (literal (string-append (param "_HOME") "/.vault-token")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/1Password")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.op")))
+
+;; Data warehouses and databases. Credentials sit in the same file as the config
+;; for all of these, so unlike aws there is no config/credential split to keep.
+(deny file-read* (subpath (string-append (param "_HOME") "/.snowflake")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.snowsql")))
+(deny file-read* (literal (string-append (param "_HOME") "/.databrickscfg")))
+(deny file-read* (literal (string-append (param "_HOME") "/.pgpass")))
+(deny file-read* (literal (string-append (param "_HOME") "/.my.cnf")))
+
+;; Object storage and sync tools.
+(deny file-read* (literal (string-append (param "_HOME") "/.config/rclone/rclone.conf")))
+(deny file-read* (literal (string-append (param "_HOME") "/.s3cfg")))
+(deny file-read* (literal (string-append (param "_HOME") "/.boto")))
+
+;; PaaS deploy tokens: each of these can push code straight to production.
+(deny file-read* (subpath (string-append (param "_HOME") "/.wrangler")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.vercel")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.config/netlify")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.fly")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.heroku")))
+
+;; -- Deliberately NOT denied: the agent's own credential --
+;; ~/.codex/auth.json and ~/.claude/.credentials.json hold the backend's own
+;; OAuth tokens, and the agent process must read them to authenticate. Verified:
+;; denying ~/.codex/auth.json makes codex exit with "Operation not permitted"
+;; before it makes any network call. A jailed agent can therefore always read the
+;; credential it runs on, and a hijacked one can exfiltrate it through the
+;; already-approved model host. This is structural, not an oversight; see
+;; "The architectural limit" in docs/agent/broker.md.
+
+;; -- Privacy & Secrets --
+;; Simplified history block using regex
+(deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\..*_history$")))
+(deny file-read* (literal (string-append (param "_HOME") "/.env")))
+
+;; -- This daemon's own secrets --
+;; The whole point of env curation is that SLACK_TOKEN / TELEGRAM_BOT_TOKEN never
+;; reach the agent. Leaving the file that holds them readable defeats that
+;; entirely, and it was readable: a jailed agent could list every var in it. With
+;; the Slack user token a hijacked agent could also post as the operator, which
+;; means clicking its own approval buttons -- the approval gate re-checks the
+;; sender, and the sender would have been legitimate.
+;;
+;; Scoped to the secrets rather than the whole directory, because the agent's
+;; workspace (workspaces/) and its memory (memory/) live under here too and are
+;; meant to be reachable, and shims/ must stay executable.
+(deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.claude-on-the-fly/\\.env")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/logs")))
+(deny file-read* (literal (string-append (param "_HOME") "/.zhistory")))
+(deny file-read* (subpath (string-append (param "_HOME") "/.zsh")))
+
+;; -- macOS Sensitive Data --
+;; Allowed to enable macOS Security framework (Keychain) for tool authentication (e.g., Claude login)
+(allow file-read* (subpath (string-append (param "_HOME") "/Library/Keychains")))
+(deny file-read* (subpath (string-append (param "_HOME") "/Library/Safari")))
+
+;; -- Browser profiles --
+(deny file-read* (subpath (string-append (param "_HOME") "/Library/Application Support/Google/Chrome")))
+(deny file-read* (subpath (string-append (param "_HOME") "/Library/Application Support/Zen")))
+
+;; ---------------------------------------------------------------------------
+;; Write access — deny-default, explicit allowlist only
+;; ---------------------------------------------------------------------------
+(allow file-write* (subpath (string-append (param "_HOME") "/.claude")))
+(allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
+;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
+;; dies at startup with "failed to initialize in-process app-server client:
+;; Operation not permitted" before it makes any network call, because its
+;; app-server and PATH aliases live under ~/.codex. Verified: adding this one
+;; line is the whole difference between codex failing and running under the jail.
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex")))
+;; uv: Needed for caching packages and metadata
+(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
+;; Ollama: Needed to sync aliases, save configurations, and manage models/temporary files
+(allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
+;; The agent's persistent memory. The system prompt tells it to update
+;; memory/users/<sender>/*.md and memory/knowledge/*.md every turn, and that path
+;; is outside the workspace, so without this every memory write fails with
+;; "Operation not permitted" and the feature is silently off under `jail`.
+;; Scoped to memory/ on purpose: the sibling .env and logs/ stay unreadable.
+(allow file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
+(allow file-write* (subpath (param "_PROJECT_DIR")))
+(allow file-write* (subpath (param "_TMPDIR")))
+(allow file-write* (subpath "/private/var/folders/"))
+(allow file-write* (subpath "/private/tmp/"))
+(allow file-write* (subpath "/dev/"))
+
+;; ---------------------------------------------------------------------------
+;; Mandatory write denies — defense-in-depth (HOME)
+;; ---------------------------------------------------------------------------
+(deny file-write* (subpath (string-append (param "_HOME") "/.ssh")))
+(deny file-write* (subpath (string-append (param "_HOME") "/.gnupg")))
+(deny file-write* (literal (string-append (param "_HOME") "/.gitconfig")))
+(deny file-write* (literal (string-append (param "_HOME") "/.zshrc")))
+(deny file-write* (literal (string-append (param "_HOME") "/.bashrc")))
+(deny file-write* (literal (string-append (param "_HOME") "/.profile")))
+(deny file-write* (literal (string-append (param "_HOME") "/.zprofile")))
+(deny file-write* (literal (string-append (param "_HOME") "/.zshenv")))
+(deny file-write* (literal (string-append (param "_HOME") "/.zlogout")))
+(deny file-write* (literal (string-append (param "_HOME") "/.bash_profile")))
+
+;; ---------------------------------------------------------------------------
+;; Mandatory write denies — defense-in-depth (PROJECT)
+;; ---------------------------------------------------------------------------
+(deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.git/hooks")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.git/config")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.bashrc")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.zshrc")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.gitconfig")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))
+(deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.vscode")))
+(deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.idea")))

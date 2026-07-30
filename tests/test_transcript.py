@@ -881,3 +881,404 @@ class TestExtractCodexPromptTokens:
     def test_no_token_count_events_returns_none(self, tmp_path, monkeypatch):
         self._rollout(tmp_path, monkeypatch)
         assert transcript.extract_codex_prompt_tokens("thread-1") is None
+
+
+# ---------------------------------------------------------------------------
+# Every reader here runs against files another process owns
+# ---------------------------------------------------------------------------
+
+
+class TestUnreadableFilesAreSkippedNotFatal:
+    """A rollout or session log can vanish or become unreadable mid-read: codex and
+    claude own these files, not this process. Handoff is a nicety, so every failure
+    degrades to "no transcript" rather than losing the user's turn."""
+
+    def test_a_jsonl_that_cannot_be_read_yields_no_records(self, tmp_path: Path):
+        missing = tmp_path / "gone.jsonl"
+        assert list(transcript._iter_jsonl(missing)) == []
+
+    def test_blank_and_malformed_lines_are_skipped(self, tmp_path: Path):
+        path = tmp_path / "mixed.jsonl"
+        path.write_bytes(b'\n  \n{"a": 1}\nnot json\n{"b": 2}\n')
+        assert list(transcript._iter_jsonl(path)) == [{"a": 1}, {"b": 2}]
+
+    def test_a_first_line_that_cannot_be_read_is_none(self, tmp_path: Path):
+        assert transcript._read_first_jsonl(tmp_path / "gone.jsonl") is None
+
+    def test_a_first_line_that_is_not_json_is_none(self, tmp_path: Path):
+        path = tmp_path / "bad.jsonl"
+        path.write_bytes(b"not json\n")
+        assert transcript._read_first_jsonl(path) is None
+
+    def test_a_first_line_that_is_not_a_mapping_is_none(self, tmp_path: Path):
+        path = tmp_path / "list.jsonl"
+        path.write_bytes(b"[1, 2, 3]\n")
+        assert transcript._read_first_jsonl(path) is None
+
+    def test_a_session_mapping_that_cannot_be_read_returns_none(
+        self, tmp_path: Path, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        (workspace / ".codex_sessions").mkdir(parents=True)
+        mapping = workspace / ".codex_sessions" / "u1"
+        mapping.write_text("thread-abc")
+
+        def read_fails(self, *_args, **_kwargs):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "read_text", read_fails)
+        assert extract_codex(workspace, "u1") is None
+
+
+class TestFindCodexRolloutByCwd:
+    """Used for *live* tailing: codex only reveals its thread id after the first
+    turn finishes, so a fresh session has no mapping and the cwd is the only handle.
+    Bounded because a 1Hz caller pays for every stat."""
+
+    def _rollout(self, root: Path, name: str, cwd: str, *, age_s: float = 0.0) -> Path:
+        rollout_dir = root / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        path = rollout_dir / f"rollout-2026-07-30T12-00-00-{name}.jsonl"
+        path.write_bytes(
+            json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}).encode()
+            + b"\n"
+        )
+        if age_s:
+            stamp = time.time() - age_s
+            import os
+
+            os.utime(path, (stamp, stamp))
+        return path
+
+    def test_an_empty_cwd_never_matches(self, codex_sessions_dir):
+        """Otherwise a caller with no workspace would adopt an unrelated session."""
+        assert transcript._find_codex_rollout_by_cwd("") is None
+
+    def test_no_rollouts_at_all_is_none(self, codex_sessions_dir):
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
+    def test_the_freshest_rollout_is_matched_by_cwd(self, codex_sessions_dir):
+        self._rollout(codex_sessions_dir, "old", "/ws", age_s=10)
+        expected = self._rollout(codex_sessions_dir, "new", "/ws")
+        assert transcript._find_codex_rollout_by_cwd("/ws") == expected
+
+    def test_a_stale_rollout_is_not_opened(self, codex_sessions_dir):
+        """A live run keeps its mtime current, so anything older than the window is
+        a finished session and reading it would attach to the wrong thread."""
+        self._rollout(codex_sessions_dir, "stale", "/ws", age_s=1000)
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
+    def test_the_freshest_rollout_belonging_to_another_workspace_is_refused(
+        self, codex_sessions_dir
+    ):
+        """Only the freshest candidate is read, so a match for a different cwd means
+        no answer rather than falling back to an older rollout: attaching to another
+        workspace's session is worse than attaching to none."""
+        self._rollout(codex_sessions_dir, "mine", "/ws", age_s=10)
+        self._rollout(codex_sessions_dir, "theirs", "/other")
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
+    def test_a_rollout_that_cannot_be_stated_is_skipped(
+        self, codex_sessions_dir, monkeypatch
+    ):
+        self._rollout(codex_sessions_dir, "vanishing", "/ws")
+        real_stat = Path.stat
+
+        def stat_fails(self, *args, **kwargs):
+            if self.name.startswith("rollout-"):
+                raise OSError("stale handle")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_fails)
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
+    def test_a_first_line_that_is_not_session_meta_is_refused(self, codex_sessions_dir):
+        rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-2026-07-30T12-00-00-x.jsonl").write_bytes(
+            json.dumps({"type": "event_msg"}).encode() + b"\n"
+        )
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
+
+class TestCodexRolloutScannersSkipIrrelevantRecords:
+    def _rollout(self, root: Path, *records: dict) -> Path:
+        rollout_dir = root / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        path = rollout_dir / "rollout-2026-07-30T12-00-00-thread-abc.jsonl"
+        path.write_bytes(b"\n".join(json.dumps(r).encode() for r in records) + b"\n")
+        return path
+
+    def test_extract_codex_ignores_non_event_records(
+        self, tmp_path: Path, codex_sessions_dir
+    ):
+        workspace = tmp_path / "ws"
+        (workspace / ".codex_sessions").mkdir(parents=True)
+        (workspace / ".codex_sessions" / "u1").write_text("thread-abc")
+        self._rollout(
+            codex_sessions_dir,
+            {"type": "session_meta", "payload": {"cwd": "/ws"}},
+            {"type": "turn_context", "payload": {"model": "gpt-5"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "hello"},
+            },
+        )
+        turns = extract_codex(workspace, "u1")
+        assert turns is not None
+        assert [t.text for t in turns] == ["hello"]
+
+    def test_a_rollout_with_no_turn_context_has_no_model(self, codex_sessions_dir):
+        self._rollout(codex_sessions_dir, {"type": "event_msg", "payload": {}})
+        assert extract_codex_model("thread-abc") is None
+
+    def test_a_blank_model_string_is_not_a_model(self, codex_sessions_dir):
+        """Native mode without CODEX_MODEL writes an empty string, and reporting it
+        would label the run with nothing instead of falling back."""
+        self._rollout(
+            codex_sessions_dir, {"type": "turn_context", "payload": {"model": ""}}
+        )
+        assert extract_codex_model("thread-abc") is None
+
+    def test_cumulative_tokens_skips_records_that_are_not_token_counts(
+        self, codex_sessions_dir
+    ):
+        self._rollout(
+            codex_sessions_dir,
+            {"type": "turn_context", "payload": {"model": "gpt-5"}},
+            {"type": "event_msg", "payload": {"type": "user_message"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 7}},
+                },
+            },
+        )
+        assert extract_codex_cumulative_tokens("thread-abc") == {"input_tokens": 7}
+
+    def test_prompt_tokens_skips_records_that_are_not_token_counts(
+        self, codex_sessions_dir
+    ):
+        self._rollout(
+            codex_sessions_dir,
+            {"type": "turn_context", "payload": {"model": "gpt-5"}},
+            {"type": "event_msg", "payload": {"type": "user_message"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 900},
+                        "model_context_window": 400_000,
+                    },
+                },
+            },
+        )
+        assert transcript.extract_codex_prompt_tokens("thread-abc") == (900, 400_000)
+
+
+class TestListCodexSessionFiles:
+    def test_no_sessions_dir_is_an_empty_list(self, tmp_path: Path):
+        assert transcript._list_codex_session_files(tmp_path) == []
+
+    def test_a_subdirectory_is_not_a_mapping(self, tmp_path: Path, codex_sessions_dir):
+        sessions = tmp_path / ".codex_sessions"
+        sessions.mkdir()
+        (sessions / "somedir").mkdir()
+        assert transcript._list_codex_session_files(tmp_path) == []
+
+    def test_a_mapping_that_cannot_be_read_is_skipped(
+        self, tmp_path: Path, codex_sessions_dir, monkeypatch
+    ):
+        sessions = tmp_path / ".codex_sessions"
+        sessions.mkdir()
+        (sessions / "u1").write_text("thread-abc")
+
+        def read_fails(self, *_args, **_kwargs):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "read_text", read_fails)
+        assert transcript._list_codex_session_files(tmp_path) == []
+
+    def test_a_mapping_whose_rollout_is_gone_is_skipped(
+        self, tmp_path: Path, codex_sessions_dir
+    ):
+        """A pruned rollout leaves the mapping behind; offering it as a handoff
+        candidate would make the caller extract nothing and stop looking."""
+        sessions = tmp_path / ".codex_sessions"
+        sessions.mkdir()
+        (sessions / "u1").write_text("thread-vanished")
+        assert transcript._list_codex_session_files(tmp_path) == []
+
+    def test_a_rollout_that_cannot_be_stated_is_skipped(
+        self, tmp_path: Path, codex_sessions_dir, monkeypatch
+    ):
+        sessions = tmp_path / ".codex_sessions"
+        sessions.mkdir()
+        (sessions / "u1").write_text("thread-abc")
+        rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-2026-07-30T12-00-00-thread-abc.jsonl").write_bytes(b"")
+        real_stat = Path.stat
+        seen = 0
+
+        def stat_fails(self, *args, **kwargs):
+            nonlocal seen
+            if self.name.startswith("rollout-"):
+                seen += 1
+                if seen > 1:
+                    raise OSError("stale handle")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_fails)
+        assert transcript._list_codex_session_files(tmp_path) == []
+
+    def test_a_claude_log_that_cannot_be_stated_is_skipped(
+        self, tmp_path: Path, claude_projects_dir, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        project_dir = claude_projects_dir / transcript._workspace_to_claude_hash(
+            workspace
+        )
+        project_dir.mkdir(parents=True)
+        (project_dir / "u1.jsonl").write_bytes(b"")
+        real_stat = Path.stat
+
+        def stat_fails(self, *args, **kwargs):
+            # Only the log file: the enclosing dir still has to stat, or the
+            # is_dir() guard above returns before the loop is reached.
+            if self.suffix == ".jsonl":
+                raise OSError("stale handle")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_fails)
+        assert transcript._list_claude_session_files(workspace) == []
+
+
+class TestFindLatestPriorExcludesTheCurrentSession:
+    def test_the_excluded_uuid_is_not_a_candidate_on_either_backend(
+        self, tmp_path: Path, codex_sessions_dir, monkeypatch
+    ):
+        """Without this the handoff would forward the session's own turns back into
+        itself, doubling the context it was meant to carry across."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            transcript,
+            "_list_claude_session_files",
+            lambda _ws: [(Path("/x"), "current", 100.0)],
+        )
+        monkeypatch.setattr(
+            transcript,
+            "_list_codex_session_files",
+            lambda _ws: [(Path("/y"), "current", 200.0)],
+        )
+        assert (
+            transcript.find_latest_prior_transcript(workspace, exclude_uuid="current")
+            is None
+        )
+
+
+class TestPrependLatestHandoff:
+    def test_a_scan_that_raises_starts_clean(self, tmp_path: Path, monkeypatch, caplog):
+        """The user still gets a reply, just without handoff context."""
+        monkeypatch.setattr(
+            transcript,
+            "find_latest_prior_transcript",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("scan blew up")),
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.transcript"):
+            assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+        assert "starting clean" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_nothing_prior_leaves_the_prompt_alone(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            transcript, "find_latest_prior_transcript", lambda *_a, **_kw: None
+        )
+        assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+
+    def test_turns_that_format_to_nothing_leave_the_prompt_alone(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            transcript,
+            "find_latest_prior_transcript",
+            lambda *_a, **_kw: ([], "claude"),
+        )
+        assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+
+    def test_a_real_handoff_is_prefixed(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            transcript,
+            "find_latest_prior_transcript",
+            lambda *_a, **_kw: ([Turn(role="user", text="earlier")], "codex"),
+        )
+        out = transcript.prepend_latest_handoff(tmp_path, "now")
+        assert out.endswith("now")
+        assert "earlier" in out
+
+
+class TestOneBadExtractorDoesNotStopTheSearch:
+    def test_the_next_candidate_is_tried_after_a_failure(
+        self, tmp_path: Path, monkeypatch, caplog
+    ):
+        """Candidates are ordered newest first, so a corrupt recent log would
+        otherwise hide every older one behind it."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            transcript,
+            "_list_claude_session_files",
+            lambda _ws: [(Path("/x"), "newest", 200.0), (Path("/y"), "older", 100.0)],
+        )
+        monkeypatch.setattr(transcript, "_list_codex_session_files", lambda _ws: [])
+
+        def extract(_workspace, uuid):
+            if uuid == "newest":
+                raise ValueError("corrupt log")
+            return [Turn(role="user", text="from the older one")]
+
+        monkeypatch.setattr(transcript, "extract_claude", extract)
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.transcript"):
+            found = transcript.find_latest_prior_transcript(workspace)
+        assert found is not None
+        turns, backend = found
+        assert backend == "claude"
+        assert turns[0].text == "from the older one"
+        assert "trying next" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_every_candidate_failing_yields_none(self, tmp_path: Path, monkeypatch):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            transcript,
+            "_list_claude_session_files",
+            lambda _ws: [(Path("/x"), "only", 200.0)],
+        )
+        monkeypatch.setattr(transcript, "_list_codex_session_files", lambda _ws: [])
+        monkeypatch.setattr(
+            transcript,
+            "extract_claude",
+            lambda *_a: (_ for _ in ()).throw(ValueError("corrupt")),
+        )
+        assert transcript.find_latest_prior_transcript(workspace) is None
+
+
+class TestPrependHandoffFormatsToNothing:
+    def test_turns_that_format_to_an_empty_handoff_leave_the_prompt_alone(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """format_handoff drops turns with no usable text, so a non-empty turn list
+        can still produce nothing to prepend."""
+        monkeypatch.setattr(transcript, "format_handoff", lambda *_a, **_kw: "")
+        assert (
+            transcript.prepend_handoff(
+                tmp_path,
+                "uuid",
+                "hi",
+                from_backend="claude",
+                extractor=lambda *_a: [Turn(role="user", text="")],
+            )
+            == "hi"
+        )

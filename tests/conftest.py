@@ -75,6 +75,22 @@ def isolate_env_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def operator_settings(tmp_path, monkeypatch):
+    """Path to a per-test operator `sandbox.yaml`, with DATA_DIR redirected to it.
+
+    DATA_DIR is redirected rather than the file written into the already-redirected
+    home, so each test gets its own directory. The loaders read the file on every
+    call by design (an operator edit takes effect on the next session, not the next
+    restart), so a leftover from one test would otherwise decide another's policy.
+    Returns the still-absent path; a test that wants a policy just writes it.
+    """
+    data = tmp_path / "cotf-data"
+    data.mkdir()
+    monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+    return data / "sandbox.yaml"
+
+
+@pytest.fixture
 def clear_backend_env(monkeypatch):
     """Strip backend-selection env vars so tests start from a clean slate."""
     for var in (

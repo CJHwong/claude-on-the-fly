@@ -473,3 +473,121 @@ class TestJobsQueueView:
         isolate_env_file.write_text("JOBS_QUEUE_KIND=redis\n", encoding="utf-8")
         snap = snapshot(empty_state, None, process_check=alive_check)
         assert snap.jobs_queue is None
+
+
+class TestTuiVersion:
+    def test_an_uninstalled_package_reports_unknown(self, monkeypatch):
+        """The version sits in the dashboard header; a raise there would take the
+        whole TUI down over a cosmetic field."""
+        from importlib.metadata import PackageNotFoundError
+
+        from claude_on_the_fly.tui import state as state_mod
+
+        def not_found(_name):
+            raise PackageNotFoundError("claude-on-the-fly")
+
+        monkeypatch.setattr(state_mod, "_pkg_version", not_found)
+        assert state_mod.tui_version() == "unknown"
+
+
+class TestUnusableHeartbeats:
+    def test_a_bad_timestamp_reads_as_stopped_with_the_reason(self, tmp_path):
+        """ "Stopped, because the timestamp is unreadable" is actionable; a crashed
+        dashboard is not."""
+        import json
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly.tui import state as state_mod
+
+        path = tmp_path / "slack.json"
+        path.write_text(json.dumps({"pid": 4242, "last_heartbeat": "yesterday"}))
+        status = state_mod._frontend_status_from_heartbeat(
+            "slack",
+            state_dir=tmp_path,
+            now=datetime.now(UTC),
+            process_check=lambda _pid: True,
+            self_version="0.1.0",
+            self_executable="/usr/bin/python",
+        )
+        assert status.state == "stopped"
+        assert "bad heartbeat timestamp" in (status.error or "")
+
+
+class TestScheduleCache:
+    def test_an_unchanged_file_is_not_reparsed(self, tmp_path, monkeypatch):
+        """The dashboard ticks once a second, and reparsing the YAML every tick is
+        pure waste when the file has not moved."""
+        import yaml
+
+        from claude_on_the_fly.tui import state as state_mod
+
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {"entries": [{"name": "a", "cron": "* * * * *", "prompt": "x"}]}
+            )
+        )
+        monkeypatch.setattr(state_mod, "_schedule_cache", None)
+        parses = {"n": 0}
+        real_load = state_mod.load_cron_config
+
+        def counting_load(p):
+            parses["n"] += 1
+            return real_load(p)
+
+        monkeypatch.setattr(state_mod, "load_cron_config", counting_load)
+        first = state_mod._load_schedule_cached(path)
+        second = state_mod._load_schedule_cached(path)
+        assert parses["n"] == 1
+        assert first is second
+
+    def test_a_touched_file_is_reparsed(self, tmp_path, monkeypatch):
+        import os
+
+        import yaml
+
+        from claude_on_the_fly.tui import state as state_mod
+
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {"entries": [{"name": "a", "cron": "* * * * *", "prompt": "x"}]}
+            )
+        )
+        monkeypatch.setattr(state_mod, "_schedule_cache", None)
+        state_mod._load_schedule_cached(path)
+        os.utime(path, (0, 0))
+        parses = {"n": 0}
+        real_load = state_mod.load_cron_config
+
+        def counting_load(p):
+            parses["n"] += 1
+            return real_load(p)
+
+        monkeypatch.setattr(state_mod, "load_cron_config", counting_load)
+        state_mod._load_schedule_cached(path)
+        assert parses["n"] == 1
+
+
+def test_the_queue_kind_is_cached_until_the_env_file_changes(tmp_path, monkeypatch):
+    """Read on every dashboard tick, and each miss re-reads and re-parses the env
+    file for a value that almost never changes."""
+    from claude_on_the_fly.tui import state as state_mod
+    from claude_on_the_fly.tui import supervisor as supervisor_mod
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("JOBS_QUEUE_KIND=file\n")
+    monkeypatch.setattr(supervisor_mod, "DEFAULT_ENV_FILE", env_file)
+    monkeypatch.setattr(state_mod, "_queue_kind_cache", None)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+    reads = {"n": 0}
+    real_load = supervisor_mod._load_env
+
+    def counting_load(path):
+        reads["n"] += 1
+        return real_load(path)
+
+    monkeypatch.setattr(supervisor_mod, "_load_env", counting_load)
+    assert state_mod._queue_kind() == "file"
+    assert state_mod._queue_kind() == "file"
+    assert reads["n"] == 1
