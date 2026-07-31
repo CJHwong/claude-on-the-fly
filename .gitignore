@@ -26,3 +26,7 @@ workspaces/
 
 # hatch-vcs writes the resolved version here at build time
 src/claude_on_the_fly/_version.py
+
+# Scratch git worktrees. Scoped to worktrees/ rather than all of .claude/ so
+# project-level agent config stays committable if it ever lands there.
+.claude/worktrees/
