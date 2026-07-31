@@ -55,7 +55,13 @@ _PASSTHROUGH_SUFFIXES = ("_BASE_URL",)
 # because the approval shim runs inside the sandbox and reads it to find the
 # daemon; without the passthrough every gated call would fail closed on a
 # missing endpoint, which looks exactly like a denial.
-_PASSTHROUGH_ENDPOINTS = frozenset({"COTF_CMD_ENDPOINT", "COTF_APPROVE_URL"})
+_PASSTHROUGH_ENDPOINTS = frozenset(
+    {"COTF_CMD_ENDPOINT", "COTF_APPROVE_URL", "COTF_APPROVE_NOTIFY_URL"}
+)
+# claude-pty reads this for its tmux session name. The daemon sets it so it knows
+# which pane to type an approval into; claude-pty's own default is PID-based and
+# therefore unpredictable from outside.
+_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION"})
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -214,6 +220,7 @@ def _is_passthrough(key: str) -> bool:
         key in _PASSTHROUGH
         or key in _PROXY_VARS
         or key in _PASSTHROUGH_ENDPOINTS
+        or key in _PASSTHROUGH_PTY
         or key.startswith(_PASSTHROUGH_PREFIXES)
         or key.endswith(_PASSTHROUGH_SUFFIXES)
     )

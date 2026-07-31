@@ -317,3 +317,70 @@ def test_an_unexpected_failure_in_the_mcp_path_denies(monkeypatch):
     body = _call_tool(tool_name="Bash", input={"command": "ls"})
     assert body["behavior"] == "deny"
     assert "RuntimeError" in body["message"]
+
+
+# --- pty notify mode ---
+
+
+def test_notify_forwards_only_a_permission_prompt(monkeypatch):
+    """The same hook event also fires for idle and task-complete notifications.
+    Relaying those would send the daemon hunting for a dialog nobody drew."""
+    posted: list[dict] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        posted.append(json.loads(request.data.decode()))
+        return FakeResponse()
+
+    monkeypatch.setenv(cotf_approve.NOTIFY_ENV, "http://127.0.0.1:9/notify")
+    monkeypatch.setattr(cotf_approve.urllib.request, "urlopen", fake_urlopen)
+
+    assert (
+        cotf_approve.run_notify(
+            json.dumps(
+                {
+                    "notification_type": "permission_prompt",
+                    "session_id": "s1",
+                    "transcript_path": "/tmp/t.jsonl",
+                }
+            )
+        )
+        == ""
+    )
+    assert posted == [{"session_id": "s1", "transcript_path": "/tmp/t.jsonl"}]
+
+    posted.clear()
+    for other in ("idle_prompt", "task_complete", None):
+        cotf_approve.run_notify(json.dumps({"notification_type": other}))
+    assert posted == []
+
+
+@pytest.mark.parametrize(
+    "stdin_text", ["", "not json", "[]", '{"notification_type":"permission_prompt"}']
+)
+def test_notify_never_fails_the_hook(monkeypatch, stdin_text):
+    """A Notification hook cannot approve or refuse anything -- claude is blocked on
+    the dialog it drew, not on this -- so there is no outcome a non-zero exit could
+    improve, and crashing would just add noise to the pane."""
+    monkeypatch.setenv(cotf_approve.NOTIFY_ENV, "http://127.0.0.1:1/notify")
+    assert cotf_approve.run_notify(stdin_text) == ""
+
+
+def test_notify_is_a_no_op_without_an_endpoint(monkeypatch):
+    monkeypatch.delenv(cotf_approve.NOTIFY_ENV, raising=False)
+    assert cotf_approve.run_notify('{"notification_type":"permission_prompt"}') == ""
+
+
+def test_notify_mode_is_reachable_from_the_entry_point(monkeypatch, capsys):
+    import io
+
+    monkeypatch.delenv(cotf_approve.NOTIFY_ENV, raising=False)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"notification_type":"idle_prompt"}'))
+    assert cotf_approve.main(["notify"]) == 0
+    assert capsys.readouterr().out == ""

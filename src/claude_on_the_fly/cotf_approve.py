@@ -35,6 +35,11 @@ import urllib.request
 # which denies rather than allows.
 ENDPOINT_ENV = "COTF_APPROVE_URL"
 
+# Where a pty Notification hook posts. Distinct from the decide endpoint because
+# nothing is waiting on the answer here: claude is parked on its own dialog, and the
+# daemon types the reply into the pane out of band.
+NOTIFY_ENV = "COTF_APPROVE_NOTIFY_URL"
+
 # Bounded because the caller is holding a turn open. The daemon runs its own,
 # longer operator timeout and answers before this fires; this only catches a
 # daemon that has stopped answering at all.
@@ -74,6 +79,46 @@ def _ask(payload: dict) -> tuple[bool, str]:
         return False, "the approval service returned something unreadable"
     allowed = answer.get("behavior") == "allow"
     return allowed, str(answer.get("message") or DENY_MESSAGE)
+
+
+def run_notify(stdin_text: str) -> str:
+    """claude Notification hook: tell the daemon a permission dialog is up.
+
+    Prints nothing and always succeeds. A Notification hook cannot approve or refuse
+    anything -- claude is blocked on the dialog it drew, not on this -- so the only
+    job here is to hand over the transcript path and get out of the way. Failing
+    loudly would be worse than useless: a non-zero exit teaches nobody anything and
+    claude carries on waiting either way.
+
+    Only `permission_prompt` is forwarded. The same hook also fires for idle and
+    task-complete notifications, and relaying those would have the daemon hunting for
+    a dialog that was never drawn.
+    """
+    endpoint = os.environ.get(NOTIFY_ENV, "").strip()
+    if not endpoint:
+        return ""
+    try:
+        event = json.loads(stdin_text or "{}")
+        if not isinstance(event, dict):
+            return ""
+        if event.get("notification_type") != "permission_prompt":
+            return ""
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "session_id": str(event.get("session_id") or ""),
+                    "transcript_path": str(event.get("transcript_path") or ""),
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30):
+            pass
+    except Exception:
+        pass
+    return ""
 
 
 def _payload(tool_name: str, tool_input: dict, tool_use_id: str, source: str) -> dict:
@@ -267,10 +312,13 @@ def main(argv: list[str] | None = None) -> int:
         if answer:
             sys.stdout.write(answer + "\n")
         return 0
+    if mode == "notify":
+        run_notify(sys.stdin.read())
+        return 0
     if mode == "mcp":
         run_mcp()
         return 0
-    sys.stderr.write("usage: cotf-approve {mcp|hook}\n")
+    sys.stderr.write("usage: cotf-approve {mcp|hook|notify}\n")
     return 2
 
 

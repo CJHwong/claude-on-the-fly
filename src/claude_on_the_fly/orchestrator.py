@@ -154,10 +154,7 @@ class SessionPermissions:
             return {}
         existing = self._services.get(chat_id)
         if existing is not None and existing[0] == session:
-            return {
-                cotf_approve.ENDPOINT_ENV: existing[1].base_url
-                + permissions.DECIDE_PATH
-            }
+            return self._env(existing[1])
         if existing is not None:
             await existing[1].stop()
             # The replacement service starts its count at zero, so a stale
@@ -175,16 +172,32 @@ class SessionPermissions:
             workspace=workspace,
             ttl_seconds=resolved.ttl_seconds,
             label=label,
+            tmux_session=permissions.tmux_session_name(chat_id, session),
         )
         await service.start()
         self._services[chat_id] = (session, service)
         logger.info(
-            "permissions: chat %s -> 127.0.0.1:%d (own grant store, session %s)",
+            "permissions: chat %s -> 127.0.0.1:%d (own grant store, session %s, "
+            "pane %s)",
             chat_id,
             service.port,
             session[:8],
+            service.tmux_session,
         )
-        return {cotf_approve.ENDPOINT_ENV: service.base_url + permissions.DECIDE_PATH}
+        return self._env(service)
+
+    @staticmethod
+    def _env(service: permissions.PermissionService) -> dict[str, str]:
+        """What a spawned agent needs to reach this service.
+
+        The pane name is published too, because claude-pty picks its own otherwise
+        and the daemon has to know where an approval keystroke goes.
+        """
+        return {
+            cotf_approve.ENDPOINT_ENV: service.base_url + permissions.DECIDE_PATH,
+            cotf_approve.NOTIFY_ENV: service.base_url + permissions.NOTIFY_PATH,
+            permissions.TMUX_SESSION_ENV: service.tmux_session,
+        }
 
     def check_turn(self, chat_id: int, response: Response, backend: str) -> None:
         """Report a turn that used tools without the gate ever being asked.
@@ -701,6 +714,7 @@ async def _start_sandbox(
     if permissions.configured().enabled:
         permissions.write_shim()
         permissions.write_mcp_config()
+        permissions.write_pty_settings()
     return broker_instance, SessionEgress(frontend), command_broker
 
 

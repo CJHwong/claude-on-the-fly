@@ -570,6 +570,7 @@ class ClaudeBackend:
         return [
             self._pty_path,
             *permissions.claude_argv(pty=True),
+            *permissions.pty_argv(),
             *model_args,
         ]
 

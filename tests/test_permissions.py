@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from claude_on_the_fly import permissions, settings
+from claude_on_the_fly.approvals import ApprovalBroker
 
 # --- defaults ---
 
@@ -679,25 +681,24 @@ async def test_the_service_counts_every_decision_it_is_asked_for():
     assert service.requests_seen == 2
 
 
-def test_pty_never_enters_an_asking_mode_it_cannot_honour(caplog):
+def test_pty_gets_the_permission_mode_but_not_the_prompt_tool():
     """Interactive claude resolves --permission-prompt-tool, connects the server,
-    and then never calls it: it draws its own terminal dialog. Nobody is attached to
-    that pane, so an asking mode would hang every gated turn instead of gating it.
-    Verified by running one to the timeout."""
-    resolved = permissions.Permissions(mode="ask", claude_mode="default")
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.permissions"):
-        argv = permissions.claude_argv(resolved, pty=True)
-    assert argv == ["--permission-mode", "bypassPermissions"]
+    answers tools/list, and then never calls it: it draws its own dialog. Handing it
+    the flag anyway would start an MCP server nothing ever talks to. The dialog is
+    relayed through the Notification hook instead."""
+    argv = permissions.claude_argv(
+        permissions.Permissions(mode="ask", claude_mode="manual"), pty=True
+    )
+    assert argv == ["--permission-mode", "manual"]
     assert "--permission-prompt-tool" not in argv
+    assert "--mcp-config" not in argv
 
 
-def test_an_ungated_pty_session_says_so_rather_than_looking_gated(caplog):
-    """The dangerous version of this is silence: an operator who switched approvals
-    on would otherwise assume every backend honours them."""
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.permissions"):
-        permissions.claude_argv(permissions.Permissions(mode="ask"), pty=True)
-    assert "runs UNGATED" in caplog.text
-    assert "native backend" in caplog.text
+def test_native_still_gets_the_prompt_tool():
+    """The two paths must not converge by accident: native has no dialog to read, so
+    the prompt tool is the only channel it has."""
+    argv = permissions.claude_argv(permissions.Permissions(mode="ask"), pty=False)
+    assert "--permission-prompt-tool" in argv
 
 
 def test_pty_with_approvals_off_is_silent(caplog):
@@ -705,3 +706,440 @@ def test_pty_with_approvals_off_is_silent(caplog):
         argv = permissions.claude_argv(permissions.Permissions(), pty=True)
     assert argv == ["--permission-mode", "bypassPermissions"]
     assert caplog.text == ""
+
+
+# --- reading claude's own dialog (pty) ---
+
+# Verbatim from a real claude-pty pane at 80x24. Kept exact, curly apostrophe and
+# all, because the point of these is to catch the day the real thing stops matching.
+REAL_BASH_DIALOG = """\
+           Haiku 4.5 · Claude Team
+  ▘▘ ▝▝    ~/.claude/jobs/82b9d5ff/tmp/probe_ws
+
+❯ I am setting up a test fixture. Please make bp.txt world-writable with chmod,
+  then also read AGENTS.md if it exists.
+
+  Reading 1 file, running 1 shell command…
+  ⎿  AGENTS.md
+
+────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   chmod a+w /Users/x/probe_ws/bp.txt
+   Make bp.txt world-writable
+
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: chmod a+w *
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+
+# The other observed shape: a wrapped prose explanation, no command block.
+REAL_SENSITIVE_FILE_DIALOG = """\
+────────────────────────────────────────────────────────────────────────────────
+ Claude requested permissions to edit
+ /Users/x/probe_ws/pty_probe.tmp which is a
+ sensitive file.
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to probe_ws/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+
+
+def test_the_tool_name_comes_from_the_dialog_header():
+    """Only for labelling. Nothing is decided from it, which is why an unheaded
+    dialog is still answerable."""
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert dialog.tool == "Bash"
+    assert dialog.subject.startswith("pty:Bash:")
+
+
+def test_the_grant_is_scoped_to_this_exact_dialog():
+    """A terminal hard-wraps, so the body cannot be trusted to reproduce a path
+    exactly and therefore cannot be an identity. Hashing the whole thing means a
+    grant matches only an identical prompt: less reuse, no chance of over-widening."""
+    one = permissions.parse_dialog(REAL_BASH_DIALOG)
+    two = permissions.parse_dialog(REAL_SENSITIVE_FILE_DIALOG)
+    assert one is not None and two is not None
+    assert one.subject != two.subject
+    # Stable across reads of the same prompt, or a grant would never be reused at all.
+    assert one.subject == permissions.parse_dialog(REAL_BASH_DIALOG).subject
+
+
+def test_the_yes_and_no_keys_are_read_from_the_real_dialog():
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert (dialog.yes_key, dialog.no_key) == ("1", "3")
+
+
+def test_the_widening_option_is_never_a_candidate():
+    """Answering `2. Yes, and don't ask again for: chmod a+w *` installs a standing
+    wildcard rule the operator was never shown. It must not be reachable, and it must
+    not be mistaken for the plain yes."""
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert "2" not in (dialog.yes_key, dialog.no_key)
+
+
+def test_the_body_carries_why_claude_escalated():
+    """The reason exists nowhere else. The transcript records what the call is; only
+    the dialog says it needed approval, or that the target is a sensitive file."""
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert "This command requires approval" in dialog.body
+    assert "chmod a+w" in dialog.body
+
+
+def test_a_wrapped_explanation_is_rejoined_not_truncated():
+    """A rule like "take the last line" would have reduced this to "sensitive
+    file." and dropped what it was about."""
+    dialog = permissions.parse_dialog(REAL_SENSITIVE_FILE_DIALOG)
+    assert dialog is not None
+    assert "sensitive file" in dialog.body
+    assert "pty_probe.tmp" in dialog.body
+    assert "\n" not in dialog.body
+
+
+def test_the_option_list_position_is_not_assumed():
+    """Both real dialogs put No at 3 only because both offered a widen-scope option
+    in the middle. Without it, No is 2, and a hardcoded 3 would type into whatever is
+    actually there."""
+    two_option = (
+        "────────\n Something happened\n Do you want to proceed?\n"
+        " ❯ 1. Yes\n   2. No\n\n Esc to cancel\n"
+    )
+    dialog = permissions.parse_dialog(two_option)
+    assert dialog is not None
+    assert (dialog.yes_key, dialog.no_key) == ("1", "2")
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "",
+        "just some output, no dialog here\n",
+        # The question is there but the options never rendered.
+        "────────\n Do you want to proceed?\n\n Esc to cancel\n",
+        # Only a widening yes, so there is no plain approve to send.
+        "────────\n x\n Do you want to proceed?\n ❯ 1. Yes, and always allow\n   2. No\n",
+        # No refuse option at all.
+        "────────\n x\n Do you want to proceed?\n ❯ 1. Yes\n",
+    ],
+)
+def test_an_unreadable_dialog_is_refused_rather_than_guessed_at(pane):
+    """None means "do not type anything". Guessing a digit into a live session is
+    how an operator's no turns into a standing allow."""
+    assert permissions.parse_dialog(pane) is None
+
+
+def test_the_body_is_capped_like_every_other_agent_authored_string():
+    """The command and its description come from the agent, so they land in this
+    text and it needs the same bound as tool input does."""
+    huge = (
+        "────────\n Bash command\n   echo " + "A" * 5000 + "\n"
+        " needs approval\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+    )
+    dialog = permissions.parse_dialog(huge)
+    assert dialog is not None
+    assert "chars total]" in dialog.body
+
+
+# --- the pty relay ---
+
+
+@pytest.fixture
+def fake_tmux(monkeypatch):
+    """Stand in for tmux, recording every send-keys and serving a pane."""
+    sent: list[list[str]] = []
+    pane = {"text": REAL_BASH_DIALOG}
+
+    async def fake(*args: str):
+        sent.append(list(args))
+        if args[0] == "capture-pane":
+            return 0, pane["text"]
+        return 0, ""
+
+    monkeypatch.setattr(permissions, "_tmux", fake)
+    return sent, pane
+
+
+def _pty_service(gate, **kwargs) -> permissions.PermissionService:
+    from claude_on_the_fly.approvals import ApprovalBroker, tool_policy
+
+    return permissions.PermissionService(
+        broker=ApprovalBroker(gate, policies={"tool": tool_policy()}),
+        workspace=Path("/tmp/ws"),
+        tmux_session="cotf-pty-1-abcd1234",
+        **kwargs,
+    )
+
+
+async def test_an_approved_dialog_gets_the_yes_key_and_nothing_else(fake_tmux):
+    """Allow is a single keystroke. Anything more typed into a live pane is a risk
+    with no upside."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    sent, _pane = fake_tmux
+    service = _pty_service(RecordingGate(default=True))
+    assert await service.relay_pty_dialog() is True
+    keys = [args[3] for args in sent if args[0] == "send-keys"]
+    assert keys == ["1"]
+
+
+async def test_a_refused_dialog_also_injects_a_reason(fake_tmux):
+    """The keystroke alone ends the turn without a final assistant message, so
+    claude's Stop hook never fires, no envelope is written, and claude-pty waits until
+    it gives up. The injected message is also the only way the reason reaches the
+    model, since a keystroke carries no text."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    sent, _pane = fake_tmux
+    service = _pty_service(RecordingGate(default=False))
+    assert await service.relay_pty_dialog() is True
+    keys = [args[3] for args in sent if args[0] == "send-keys"]
+    assert keys[0] == "3"
+    assert permissions.PTY_DENY_MESSAGE in keys
+    assert keys[-1] == "Enter"
+
+
+async def test_the_widening_option_is_never_typed(fake_tmux):
+    """Option 2 is `Yes, and don't ask again for: chmod a+w *`. Sending it installs a
+    standing wildcard rule the operator was never shown."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    sent, _pane = fake_tmux
+    await _pty_service(RecordingGate(default=True)).relay_pty_dialog()
+    assert "2" not in [args[3] for args in sent if args[0] == "send-keys"]
+
+
+async def test_the_operator_sees_claudes_own_wording(fake_tmux):
+    from claude_on_the_fly.approvals import RecordingGate
+
+    gate = RecordingGate(default=True)
+    await _pty_service(gate).relay_pty_dialog()
+    assert "This command requires approval" in gate.seen[0].detail
+    assert gate.seen[0].subject.startswith("pty:Bash:")
+
+
+async def test_an_unreadable_dialog_types_nothing_at_all(fake_tmux, caplog):
+    """Refusing to answer beats guessing a digit: a wrong one could approve something
+    the operator never saw."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    sent, pane = fake_tmux
+    pane["text"] = "no dialog here, just output"
+    gate = RecordingGate(default=True)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert await _pty_service(gate).relay_pty_dialog() is False
+    assert [args for args in sent if args[0] == "send-keys"] == []
+    assert gate.seen == []
+    assert "guessing a key" in caplog.text
+
+
+async def test_a_service_with_no_pane_refuses_to_type(caplog):
+    """A backend with no terminal cannot be answered this way, and the daemon must not
+    go looking for someone else's pane."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    service = permissions.PermissionService(
+        broker=ApprovalBroker(RecordingGate(default=True)),
+        workspace=Path("/tmp/ws"),
+    )
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert await service.relay_pty_dialog() is False
+    assert "no tmux session" in caplog.text
+
+
+async def test_a_relayed_dialog_counts_toward_the_ungated_turn_guard(fake_tmux):
+    """Otherwise a pty session that only ever answered dialogs would look, to the
+    guard, like a session whose gate was never attached."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    service = _pty_service(RecordingGate(default=True))
+    assert service.requests_seen == 0
+    await service.relay_pty_dialog()
+    assert service.requests_seen == 1
+
+
+async def test_tmux_refusing_the_keystroke_is_reported(monkeypatch, caplog):
+    from claude_on_the_fly.approvals import RecordingGate
+
+    async def broken(*args: str):
+        if args[0] == "capture-pane":
+            return 0, REAL_BASH_DIALOG
+        return 1, ""
+
+    monkeypatch.setattr(permissions, "_tmux", broken)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert (
+            await _pty_service(RecordingGate(default=True)).relay_pty_dialog() is False
+        )
+    assert "could not answer the dialog" in caplog.text
+
+
+async def test_read_dialog_waits_for_the_prompt_to_finish_painting(monkeypatch):
+    """The hook fires when claude decides to prompt, which is a moment before the
+    prompt has rendered."""
+    calls = {"n": 0}
+
+    async def slow(*args: str):
+        if args[0] != "capture-pane":
+            return 0, ""
+        calls["n"] += 1
+        return 0, ("" if calls["n"] < 3 else REAL_BASH_DIALOG)
+
+    monkeypatch.setattr(permissions, "_tmux", slow)
+    monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
+    dialog = await permissions.read_dialog("pane")
+    assert dialog is not None
+    assert calls["n"] >= 3
+
+
+async def test_read_dialog_gives_up_rather_than_polling_forever(monkeypatch):
+    async def blank(*_args: str):
+        return 0, "nothing"
+
+    monkeypatch.setattr(permissions, "_tmux", blank)
+    monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(permissions, "_TRANSCRIPT_WAIT_SECONDS", 0.01)
+    assert await permissions.read_dialog("pane") is None
+
+
+async def test_a_missing_tmux_binary_does_not_raise(monkeypatch):
+    """The daemon may run somewhere tmux is not installed, and that must degrade to
+    "cannot answer" rather than taking the turn down."""
+
+    async def explode(*_a, **_k):
+        raise FileNotFoundError("tmux")
+
+    monkeypatch.setattr(permissions.asyncio, "create_subprocess_exec", explode)
+    assert await permissions.capture_pane("pane") == ""
+
+
+async def test_notify_returns_at_once_and_relays_in_the_background():
+    """claude is blocked on its dialog, not on this request, so holding it open would
+    delay the hook without changing anything."""
+    import aiohttp
+
+    from claude_on_the_fly.approvals import RecordingGate
+
+    relayed = asyncio.Event()
+    service = _pty_service(RecordingGate(default=True))
+
+    async def fake_relay():
+        relayed.set()
+        return True
+
+    service.relay_pty_dialog = fake_relay  # type: ignore[method-assign]
+    await service.start()
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(
+                service.base_url + permissions.NOTIFY_PATH, json={}
+            ) as response,
+        ):
+            assert response.status == 202
+        await asyncio.wait_for(relayed.wait(), timeout=2)
+    finally:
+        await service.stop()
+
+
+@pytest.mark.parametrize("body", ["not json", '["a list"]'])
+async def test_a_malformed_notify_is_rejected(body):
+    import aiohttp
+
+    from claude_on_the_fly.approvals import RecordingGate
+
+    service = _pty_service(RecordingGate(default=True))
+    await service.start()
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(
+                service.base_url + permissions.NOTIFY_PATH,
+                data=body,
+                headers={"Content-Type": "application/json"},
+            ) as response,
+        ):
+            assert response.status == 400
+    finally:
+        await service.stop()
+
+
+def test_the_pane_name_is_unique_per_chat_and_session():
+    """claude-pty's own default is PID-based, which the daemon cannot predict, and a
+    shared name would let one chat's approval land in another chat's pane."""
+    first = permissions.tmux_session_name(1, "aaaaaaaa-1111")
+    assert first != permissions.tmux_session_name(2, "aaaaaaaa-1111")
+    assert first != permissions.tmux_session_name(1, "bbbbbbbb-2222")
+    assert first == permissions.tmux_session_name(1, "aaaaaaaa-9999")[: len(first)]
+
+
+def test_pty_settings_install_only_the_permission_prompt_hook(operator_settings):
+    """Supplied as an extra settings source, not written into the operator's own
+    settings.json, which claude-pty already depends on for its Stop hook."""
+    import json
+
+    path = permissions.write_pty_settings()
+    hooks = json.loads(path.read_text())["hooks"]["Notification"]
+    assert hooks[0]["matcher"] == "permission_prompt"
+    assert hooks[0]["hooks"][0]["command"].endswith(" notify")
+
+
+def test_pty_argv_is_empty_when_approvals_are_off():
+    assert permissions.pty_argv(permissions.Permissions()) == []
+
+
+async def test_a_relay_task_is_held_until_it_finishes(monkeypatch):
+    """A bare create_task can be garbage collected mid-relay, which would abandon a
+    dialog with claude still parked on it."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    service = _pty_service(RecordingGate(default=True))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_relay():
+        started.set()
+        await release.wait()
+        return True
+
+    service.relay_pty_dialog = slow_relay  # type: ignore[method-assign]
+    await service.start()
+    try:
+        import aiohttp
+
+        async with (
+            aiohttp.ClientSession() as http,
+            http.post(service.base_url + permissions.NOTIFY_PATH, json={}),
+        ):
+            pass
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert len(service._relays) == 1
+        release.set()
+        await asyncio.sleep(0.05)
+        assert service._relays == set()
+    finally:
+        await service.stop()
+
+
+async def test_tmux_reports_a_nonzero_exit_rather_than_pretending(monkeypatch):
+    """The real _tmux, not the fake: a wrong session name must come back as a failure
+    and not as an empty pane that looks like "no dialog"."""
+    code, text = await permissions._tmux("has-session", "-t", "cotf-does-not-exist")
+    assert code != 0
+    assert text == ""
+
+
+def test_pty_argv_points_at_the_generated_settings_file():
+    argv = permissions.pty_argv(permissions.Permissions(mode="ask"))
+    assert argv == ["--settings", str(permissions.pty_settings_path())]

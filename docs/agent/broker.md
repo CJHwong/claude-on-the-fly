@@ -598,7 +598,7 @@ know, and it is not a design preference: it is what each CLI actually exposes.
 | Backend | Mechanism | Whose question | cotf classifies? |
 |---|---|---|---|
 | claude native | `--permission-prompt-tool` via a stdio MCP shim | claude's own | no |
-| claude pty | **ungated**; see below | — | — |
+| claude pty | `Notification` hook, answered as a keystroke | claude's own | no |
 | codex | `PreToolUse` hook injected with `-c` | **cotf's** | yes |
 
 For claude, the CLI decides what deserves a human and cotf forwards it. Measured on
@@ -617,26 +617,50 @@ the first word stop predicting what runs, which is why compound commands are ref
 outright rather than parsed. The boundary is unchanged and elsewhere: the seatbelt
 profile, the CONNECT proxy, and the credential broker.
 
-### pty is not gated, and says so
+### pty is gated through its own dialog
 
 Interactive claude accepts `--permission-prompt-tool`, resolves it, starts the server
 and answers `tools/list` on it, and then never calls it: it draws its own terminal
-dialog instead. Verified by running one to the timeout. Nobody is attached to that pane,
-so putting pty into an asking mode would hang every turn that touched a gated tool
-rather than gating it.
+dialog instead. So pty gets the permission mode but not the prompt tool, and the dialog
+is relayed instead.
 
-So under `mode: ask` the pty backend keeps `bypassPermissions` and logs a warning per
-session saying the turn runs ungated and to use the native backend for gated work. The
-silent version of this would be the dangerous one.
+1. cotf sets `CLAUDE_PTY_TMUX_SESSION` to a name it chooses, because claude-pty's own
+   default is PID-based and unpredictable from outside. That is how the daemon knows
+   which pane it may type into.
+2. A `Notification` hook with matcher `permission_prompt`, installed via `--settings`,
+   posts to the daemon and returns. It cannot decide anything: claude is blocked on the
+   dialog, not on the hook.
+3. The daemon captures the pane, parses the dialog, asks the operator, and types the
+   answer back.
 
-The fix exists and is measured: claude emits a `Notification` hook with
-`notification_type: "permission_prompt"`, the pending `tool_use` is recoverable from
-`transcript_path` (id, name and input, exactly what the prompt tool receives), and the
-answer round-trips as a keystroke into the pane. A full loop was proven by hand,
-including that a denial needs the keystroke *plus* an injected reason message or no
-envelope is produced and claude-pty exits 1. It is not wired here because the hook and
-the keystroke belong inside claude-pty, which owns the tmux session and is a different
-repository.
+**The dialog is the only source of what is being asked.** The obvious alternative does
+not exist: at the moment the dialog is up, claude's transcript contains no `tool_use`
+record at all (measured at 12 lines, none of them a tool call, while finished
+transcripts in the same directory hold two). The assistant message is written after the
+permission resolves.
+
+That has two consequences.
+
+**Grant scope is the exact dialog**, keyed as `pty:<tool>:<sha256(body)[:12]>`. A
+terminal hard-wraps, and one real capture broke a file path across two lines, so the
+body cannot be trusted as an identity and program-level scoping like `bash:git` is not
+available here. Hashing the whole prompt means a grant matches only an identical one:
+less reuse than the other backends, and no way to over-widen. The operator reads the
+full text; only the digest reaches the grant log.
+
+**The option digits are read, never assumed.** Two real dialogs put No at 3 only because
+both offered a widen-scope option in the middle; one without it puts No at 2. A "Yes"
+whose label carries an "and also" clause is rejected outright, so
+`2. Yes, and don't ask again for: chmod a+w *` can never be typed. If the option list
+cannot be resolved unambiguously, cotf types nothing at all and says so, because a
+guessed digit could approve something the operator never saw.
+
+**A refusal costs an extra model turn.** Pressing the refuse option ends the turn with no
+final assistant message, so claude's Stop hook never fires, no envelope is written, and
+claude-pty waits until it gives up (measured: `PTY_EXIT=1` after the full timeout).
+cotf therefore sends the keystroke *and* injects a short fixed message, which lets the
+turn end normally and is also the only way the reason reaches the model. The wording is
+fixed rather than operator-supplied, since that text is injected into a live session.
 
 ### claude_mode is the volume knob
 
@@ -731,3 +755,6 @@ add one.
 `codex` does not start at all under `COTF_SANDBOX_FS=deny-most`; it fails with
 `Operation not permitted` before any network call. That is pre-existing and unrelated to
 approvals, verified against a baseline with the permission changes stashed.
+
+pty needs `tmux` on the daemon's PATH. Without it the pane cannot be read and every
+dialog goes unanswered, which shows up as a turn that stalls until its timeout.

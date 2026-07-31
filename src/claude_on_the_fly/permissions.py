@@ -29,7 +29,9 @@ config that quietly means the opposite of what it says is worse than a refusal.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -430,6 +432,11 @@ def worth_asking(call: ToolCall) -> bool:
 # question and the service decides who filtered it.
 DECIDE_PATH = "/decide"
 
+# Where a pty session reports that claude has drawn a dialog. Separate from
+# /decide because nothing is waiting on the reply: the answer goes back as
+# keystrokes, out of band.
+NOTIFY_PATH = "/notify"
+
 # Who raised the question, which decides whether cotf filters it.
 #
 #   "claude"  the CLI's own permission system did, and it only calls out for the
@@ -462,6 +469,11 @@ class PermissionService:
     # anyway, so a turn that made tool calls and asked nothing is the signature of
     # a gate that is not attached. Nothing else can see that.
     requests_seen: int = 0
+    # The tmux session claude-pty was told to use, or "" for backends that have no
+    # pane. Set by the daemon, never by anything the agent can reach: it decides
+    # where a keystroke lands.
+    tmux_session: str = ""
+    _relays: set = field(default_factory=set, repr=False)
     _runner: object = field(default=None, repr=False)
     _port: int | None = field(default=None, repr=False)
 
@@ -533,6 +545,7 @@ class PermissionService:
 
         app = web.Application()
         app.router.add_post(DECIDE_PATH, self._handle)  # ty: ignore[invalid-argument-type]
+        app.router.add_post(NOTIFY_PATH, self._handle_notify)  # ty: ignore[invalid-argument-type]
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host, port)
@@ -549,6 +562,70 @@ class PermissionService:
             await self._runner.cleanup()
         self._runner = None
         self._port = None
+
+    async def relay_pty_dialog(self) -> bool:
+        """Forward the dialog claude is parked on, then type the answer back.
+
+        Returns True when an answer was delivered. An unreadable dialog refuses to
+        answer at all rather than proceeding, because the alternative is typing a
+        guessed digit into a live session and a wrong digit can install a standing
+        allow rule.
+
+        The split of authority: the parsed option list decides the *keystrokes*,
+        because their numbering moves between dialog shapes. The dialog body is what
+        the operator reads and what the grant is keyed on, since nothing else knows
+        what is being asked -- see Dialog for why the transcript cannot help.
+        """
+        if not self.tmux_session:
+            logger.error(
+                "permissions[%s]: a pty dialog needs answering but no tmux session "
+                "was recorded; leaving it alone",
+                self.label,
+            )
+            return False
+        dialog = await read_dialog(self.tmux_session)
+        if dialog is None:
+            logger.error(
+                "permissions[%s]: could not read the permission dialog in %s; not "
+                "answering it, because guessing a key could approve something the "
+                "operator never saw",
+                self.label,
+                self.tmux_session,
+            )
+            return False
+        self.requests_seen += 1
+        granted = await self.broker.check(
+            ApprovalRequest(
+                kind="tool",
+                subject=dialog.subject,
+                detail=f"{SOURCE_CLAUDE} asked: {dialog.body}",
+                ttl_seconds=self.ttl_seconds,
+            )
+        )
+        return await answer_dialog(self.tmux_session, dialog, allowed=granted)
+
+    async def _handle_notify(self, request: object) -> object:
+        """A pty session reporting that claude is asking. Answers out of band.
+
+        Returns at once and relays in the background: the hook that posted this is
+        not what claude is waiting on -- the dialog is -- so holding the request open
+        would only delay the hook without changing anything.
+        """
+        from aiohttp import web
+
+        assert isinstance(request, web.Request)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "body must be JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be an object"}, status=400)
+        task = asyncio.create_task(self.relay_pty_dialog())
+        # Held so the task is not garbage collected mid-relay, and discarded on
+        # completion so a long session does not accumulate them.
+        self._relays.add(task)
+        task.add_done_callback(self._relays.discard)
+        return web.json_response({"status": "relaying"}, status=202)
 
 
 # --------------------------------------------------------------------------
@@ -641,24 +718,16 @@ def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> li
     only correct together: under bypassPermissions claude asks nothing and the
     prompt tool is never called, which is why `claude_mode` refuses that value.
 
-    **pty stays ungated, deliberately.** Interactive claude accepts
-    --permission-prompt-tool, resolves it, connects the server, and then never
-    calls it: it draws its own terminal dialog instead. Verified by running one to
-    the timeout. Nobody is attached to that pane, so putting pty into an asking
-    mode would hang every turn that touched a gated tool rather than gating it. The
-    relay that fixes this needs a Notification hook inside claude-pty, which is a
-    different repository. Until then pty keeps the old flags and says so, because
-    an operator who enabled approvals must not be left assuming pty honours them.
+    **pty is gated differently.** Interactive claude accepts
+    --permission-prompt-tool, resolves it, connects the server, and then never calls
+    it: it draws its own terminal dialog instead. So pty gets the permission mode but
+    not the prompt tool, and the dialog is relayed through the Notification hook
+    instead -- see `relay_pty_dialog`. Handing it the prompt tool as well would only
+    start an MCP server nothing ever calls.
     """
     resolved = configured() if resolved is None else resolved
     if resolved.enabled and pty:
-        logger.warning(
-            "permissions: approvals are ON but claude-pty cannot forward them; "
-            "interactive claude ignores --permission-prompt-tool and draws its own "
-            "dialog, which would hang an unattended pane. This pty session runs "
-            "UNGATED. Use the native backend for gated turns."
-        )
-        return ["--permission-mode", "bypassPermissions"]
+        return ["--permission-mode", resolved.claude_mode]
     if not resolved.enabled:
         return ["--permission-mode", "bypassPermissions"]
     return [
@@ -718,3 +787,282 @@ def warn_if_ungated(tool_calls: int, requests_seen: int, *, backend: str) -> boo
         tool_calls,
     )
     return True
+
+
+# --------------------------------------------------------------------------
+# Reading claude's own permission dialog (pty only)
+# --------------------------------------------------------------------------
+
+# The line that separates the dialog's explanation from its option list. Anchored
+# on because it is the one string that appears in every shape of this dialog seen
+# so far, and because everything before it is prose and everything after it is
+# choices.
+_DIALOG_QUESTION = "Do you want to proceed?"
+
+# `❯ 1. Yes`, `   3. No`. The marker is stripped first; the digit is what gets
+# typed, and it is read rather than assumed because it moves. Two real dialogs put
+# No at 3 only because both offered a widen-scope option in the middle; one without
+# that option puts No at 2, and a hardcoded 3 would then hit whatever is there.
+_OPTION_RE = re.compile(r"^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$")
+
+# A "Yes" that also widens scope for the future -- "Yes, and don't ask again
+# for: chmod a+w *", "Yes, and always allow access to probe_ws/". Never a
+# candidate: answering one installs a standing rule the operator was not asked
+# about. Matched on the joining word rather than the rest of the label, since the
+# label is agent-influenced and the apostrophe in "don't" is a curly one.
+_WIDENING = re.compile(r"^(yes|no)\b.*\band\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class Dialog:
+    """claude's own permission prompt, as read off the terminal.
+
+    This is the *only* source for what a pty session is asking about. The obvious
+    alternative does not exist: at dialog time claude's transcript contains no
+    tool_use record at all (measured -- 12 lines, none of them a tool call, while
+    finished transcripts from the same directory hold two). The assistant message is
+    written after the permission resolves, not before it, so there is nothing on disk
+    to read.
+
+    :param tool: the tool name from the dialog header, e.g. "Bash". "" if unheaded.
+    :param body: the whole explanation, flattened. Carries what the call is *and*
+        why claude escalated it ("This command requires approval", "which is a
+        sensitive file").
+    :param yes_key: the digit that approves. Read, never assumed.
+    :param no_key: the digit that refuses.
+    """
+
+    tool: str
+    body: str
+    yes_key: str
+    no_key: str
+
+    @property
+    def subject(self) -> str:
+        """Grant scope: this exact dialog and no other.
+
+        A terminal hard-wraps, so the body cannot be trusted to reproduce a path or a
+        command exactly -- one real capture broke a path across two lines. Anything
+        derived from it would therefore be an unreliable *identity*, which rules out
+        the usual program-level scoping. Hashing the whole thing instead makes a
+        grant match only an identical prompt, which costs reuse and cannot
+        over-widen. The operator still sees the full text on the card; the digest is
+        what ends up in the grant log.
+        """
+        import hashlib
+
+        digest = hashlib.sha256(self.body.encode()).hexdigest()[:12]
+        return f"pty:{self.tool or 'tool'}:{digest}"
+
+
+def parse_dialog(pane: str) -> Dialog | None:
+    """Read a permission dialog out of a captured tmux pane, or None.
+
+    None means "do not answer this". A dialog whose options cannot be resolved
+    unambiguously is one where typing a digit is a guess, and guessing into a live
+    session is how an operator's "no" becomes a standing allow rule.
+
+    The pane is *only* used for the keystroke mapping and for the decorative body.
+    The grant subject comes from the transcript, because a terminal hard-wraps: one
+    real capture broke a file path across two lines mid-sentence, which makes this
+    text unusable for anything that has to be exact.
+    """
+    lines = pane.splitlines()
+    try:
+        question = next(
+            index for index, line in enumerate(lines) if _DIALOG_QUESTION in line
+        )
+    except StopIteration:
+        return None
+
+    options: dict[str, str] = {}
+    for line in lines[question + 1 :]:
+        match = _OPTION_RE.match(line)
+        if match is None:
+            # The option list is contiguous; the first non-option line after it is
+            # the footer ("Esc to cancel..."), so stop rather than scanning on into
+            # unrelated screen content.
+            if options:
+                break
+            continue
+        options[match.group(1)] = match.group(2)
+
+    yes_key = no_key = ""
+    for key, label in options.items():
+        if _WIDENING.match(label):
+            continue
+        lowered = label.lower()
+        if lowered.startswith("yes") and not yes_key:
+            yes_key = key
+        elif lowered.startswith("no") and not no_key:
+            no_key = key
+    if not yes_key or not no_key:
+        return None
+
+    # Everything between the dialog's own header and the question. Deliberately not
+    # cleverer than that: a rule like "just the last line" would have dropped two
+    # thirds of a wrapped sensitive-file explanation.
+    start = 0
+    for index in range(question - 1, -1, -1):
+        if set(lines[index].strip()) <= {"─", ""} and lines[index].strip():
+            start = index + 1
+            break
+    explanation = lines[start:question]
+    # The header is the dialog's first line, e.g. " Bash command" or " Claude
+    # requested permissions to edit". Only the leading word is useful, and only for
+    # labelling; nothing is decided from it.
+    header = _flatten(explanation[0]) if explanation else ""
+    tool = header.split()[0] if header else ""
+    body = _capped(_flatten(" ".join(explanation)))
+    return Dialog(tool=tool, body=body, yes_key=yes_key, no_key=no_key)
+
+
+# How long to keep re-reading the transcript for the pending tool call, and how
+# often. The Notification hook fires the moment the dialog is drawn, which is not
+# quite the moment the assistant message reaches disk: a first read found nothing
+# where the finished file had it. Short, because claude is parked on the dialog and
+# the operator is waiting.
+_TRANSCRIPT_WAIT_SECONDS = 5.0
+_POLL_INTERVAL_SECONDS = 0.25
+
+# What the agent is told after the operator refuses. Fixed wording on purpose. This
+# text is injected into a live session as a user message, so letting an operator
+# type it freely would make the approval card a way to prompt the agent.
+PTY_DENY_MESSAGE = (
+    "The operator declined that action. Do not retry it. Say in one line what you "
+    "would need instead, or continue with the rest of the task."
+)
+
+
+async def _tmux(*args: str) -> tuple[int, str]:
+    """Run tmux and return (returncode, stdout). Never raises."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _err = await proc.communicate()
+    except (OSError, ValueError) as exc:
+        logger.warning("permissions: tmux %s failed (%s)", args[0], exc)
+        return 1, ""
+    return proc.returncode or 0, out.decode(errors="replace")
+
+
+async def capture_pane(session: str) -> str:
+    """The visible pane of `session`, or "" when it cannot be read."""
+    code, text = await _tmux("capture-pane", "-p", "-t", session)
+    return text if code == 0 else ""
+
+
+async def read_dialog(session: str) -> Dialog | None:
+    """Wait briefly for a readable permission dialog in `session`.
+
+    Polls because the hook fires when claude decides to prompt, which is a moment
+    before the prompt has finished painting.
+    """
+    deadline = _POLL_INTERVAL_SECONDS
+    waited = 0.0
+    while waited <= _TRANSCRIPT_WAIT_SECONDS:
+        dialog = parse_dialog(await capture_pane(session))
+        if dialog is not None:
+            return dialog
+        await asyncio.sleep(deadline)
+        waited += deadline
+    return None
+
+
+async def answer_dialog(session: str, dialog: Dialog, *, allowed: bool) -> bool:
+    """Type the operator's answer into `session`. True if tmux accepted it.
+
+    A refusal needs the keystroke *and* a follow-up message. Pressing the refuse
+    option ends the turn without a final assistant message, so claude's Stop hook
+    never fires, no envelope is written, and claude-pty waits until it gives up
+    (measured: PTY_EXIT=1 after the full timeout). Injecting a message lets the turn
+    end normally -- and is also the only way the reason reaches the model, since a
+    keystroke carries no text.
+    """
+    key = dialog.yes_key if allowed else dialog.no_key
+    code, _ = await _tmux("send-keys", "-t", session, key)
+    if code != 0:
+        logger.error("permissions: could not answer the dialog in %s", session)
+        return False
+    if allowed:
+        return True
+    await asyncio.sleep(_POLL_INTERVAL_SECONDS * 4)
+    await _tmux("send-keys", "-t", session, PTY_DENY_MESSAGE)
+    await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+    await _tmux("send-keys", "-t", session, "Enter")
+    return True
+
+
+# tmux session name claude-pty is told to use. Deterministic because the daemon has
+# to know which pane to type into, and claude-pty's own default is PID-based
+# (`claude-pty-$$`), which the daemon cannot predict.
+TMUX_SESSION_PREFIX = "cotf-pty"
+
+# Env var claude-pty reads for its session name.
+TMUX_SESSION_ENV = "CLAUDE_PTY_TMUX_SESSION"
+
+
+def tmux_session_name(chat_id: int, session: str) -> str:
+    """A pane name unique to one chat's current session.
+
+    Includes the session discriminator so `/new` cannot inherit a pane, and is short
+    because tmux session names appear in every `tmux ls` the operator runs.
+    """
+    return f"{TMUX_SESSION_PREFIX}-{chat_id}-{session[:8]}"
+
+
+def pty_settings_path() -> Path:
+    from claude_on_the_fly.agent import DATA_DIR
+
+    return DATA_DIR / "approve-pty-settings.json"
+
+
+def write_pty_settings() -> Path:
+    """The --settings file installing the Notification hook claude-pty needs.
+
+    Supplied as an extra settings source rather than written into the operator's own
+    ~/.claude/settings.json, which is theirs and which claude-pty already depends on
+    for its Stop hook. Verified that both load together: the hook fired and the
+    envelope still landed.
+
+    Matched to `permission_prompt` only. The same event also covers idle and
+    task-complete notifications, and forwarding those would send the daemon looking
+    for a dialog that was never drawn.
+    """
+    import json
+
+    path = pty_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Notification": [
+                        {
+                            "matcher": "permission_prompt",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"{shim_path()} notify",
+                                    "timeout": 30,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    return path
+
+
+def pty_argv(resolved: Permissions | None = None) -> list[str]:
+    """The extra claude-pty flags approvals need, or none when off."""
+    resolved = configured() if resolved is None else resolved
+    if not resolved.enabled:
+        return []
+    return ["--settings", str(pty_settings_path())]
