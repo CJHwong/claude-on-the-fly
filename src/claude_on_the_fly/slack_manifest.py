@@ -9,7 +9,7 @@ depend on choices only the installer can make:
 - **Slash command.** Slack does not namespace slash commands: install an app
   using a command another app already registered and the newest install wins
   workspace-wide, silently breaking the older one. So the command is opt-in and
-  named per install, matching `SLACK_SLASH_COMMAND` in the daemon's env.
+  named per install, matching `slack.slash_command` in the daemon's config.
 
 `slack_manifest.json` next to this module is the single template; render() prunes
 it down to the blocks a given install actually uses.
@@ -221,8 +221,6 @@ def _next_steps(mode: str, command: str | None, out: str | None) -> None:
     source = f"the contents of {out}" if out else "the JSON above"
     token = "xoxb-" if mode == "bot" else "xoxp-"
     env = ["SLACK_APP_TOKEN=xapp-...", f"SLACK_TOKEN={token}..."]
-    if command:
-        env.append(f"SLACK_SLASH_COMMAND={command}")
     _err(
         "\nNext steps\n"
         "  1. https://api.slack.com/apps -> Create New App -> From a manifest\n"
@@ -232,8 +230,18 @@ def _next_steps(mode: str, command: str | None, out: str | None) -> None:
         "  4. Basic Information -> App-Level Tokens -> create one with "
         "connections:write\n"
         "  5. Install App -> Install to Workspace\n"
-        "\nThen put these in .env (see docs/how-to/slack.md for the rest):\n"
+        "\nThen put these in ~/.claude-on-the-fly/.env "
+        "(see docs/how-to/slack.md for the rest):\n"
         + "".join(f"  {line}\n" for line in env)
+        + (
+            # The command is not a credential, so it lives with the rest of the
+            # settings. Printing it as an env var next to two tokens taught the
+            # opposite, at the exact moment someone is setting the app up.
+            "\nand this in ~/.claude-on-the-fly/config.yaml:\n"
+            f"  slack:\n    slash_command: {command}\n"
+            if command
+            else ""
+        )
     )
 
 

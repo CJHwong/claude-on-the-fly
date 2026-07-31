@@ -16,7 +16,7 @@ import subprocess
 
 import httpx
 
-from claude_on_the_fly import checks
+from claude_on_the_fly import checks, settings
 from claude_on_the_fly.checks import CheckResult
 
 logger = logging.getLogger(__name__)
@@ -92,9 +92,9 @@ def check_backend() -> None:
     (default `native`). Native mode runs the agent-specific live check;
     ollama mode skips it and validates the ollama wrap instead.
     """
-    backend_name = os.environ.get("AGENT_BACKEND", "claude").lower()
+    backend_name = settings.get("AGENT_BACKEND", "claude").lower()
     if backend_name == "claude":
-        mode = os.environ.get("CLAUDE_MODE", "native").lower()
+        mode = settings.get("CLAUDE_MODE", "native").lower()
         if mode == "native":
             check_claude_cli()
             return
@@ -106,7 +106,7 @@ def check_backend() -> None:
             return
         raise _exit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")
     if backend_name == "codex":
-        mode = os.environ.get("CODEX_MODE", "native").lower()
+        mode = settings.get("CODEX_MODE", "native").lower()
         if mode == "native":
             check_codex_cli()
             return
@@ -132,7 +132,7 @@ def check_ollama_mode(agent_name: str = "claude") -> None:
         )
     if not shutil.which("ollama"):
         raise _exit("ollama CLI not found. Install it: https://ollama.com")
-    model = os.environ.get("OLLAMA_MODEL", "").strip()
+    model = settings.get("OLLAMA_MODEL").strip()
     if not model:
         env_var = f"{agent_name.upper()}_MODE"
         raise _exit(f"{env_var}=ollama requires OLLAMA_MODEL to be set")
@@ -338,37 +338,51 @@ def setup_daemon_logging(platform: str) -> None:
 
 
 def run_telegram() -> tuple[str, int]:
-    """Validate env vars and tokens. Returns (token, allowed_user_id)."""
+    """Validate the config and the token. Returns (token, allowed_user_id)."""
     _setup_logging()
-    _raise_on_failures(checks.check_telegram(os.environ))
+    _raise_on_failures(checks.check_telegram(settings.environment()))
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    allowed_user_id = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
+    # From the resolved mapping, not os.environ: `check_telegram` above validated it
+    # there, so reading a different source here could pass the check and then raise a
+    # KeyError on the very next line.
+    allowed_user_id = int(settings.environment()["TELEGRAM_ALLOWED_USER_ID"])
     check_backend()
     asyncio.run(check_telegram(token))
     return token, allowed_user_id
 
 
-def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], set[str]]:
-    """Validate env vars and tokens.
+def run_slack() -> tuple[str, str, str]:
+    """Validate the config and the tokens. Returns (app_token, token, user_id).
 
-    Returns (app_token, token, user_id, allowed_user_ids, blocked_senders,
-    allowed_bot_ids, silent_sender_ids). SLACK_ALLOWED_SENDER_IDS is split into
-    user vs bot sets by id prefix; `token` is resolved from SLACK_TOKEN. user_id
-    is resolved from Slack auth.test — no need to pass it via env.
+    `token` is resolved from SLACK_TOKEN; user_id comes from Slack auth.test, so it
+    never needs to be configured.
+
+    The sender lists are validated and logged here but deliberately *not* returned.
+    They used to be, and `SlackFrontend` was constructed with them pinned -- which
+    meant adding an allowed sender took a restart, and the resolution existed in two
+    places that could disagree. The frontend now reads them per message through the
+    same `checks.resolve_slack_ids`, so this function's job is to fail loudly at
+    startup on a list that cannot work, not to own the answer.
     """
     _setup_logging()
-    _raise_on_failures(checks.check_slack(os.environ))
+    _raise_on_failures(checks.check_slack(settings.environment()))
     app_token = os.environ["SLACK_APP_TOKEN"]
-    _, token = checks.resolve_slack_token(os.environ)
-    for legacy, preferred in checks.slack_deprecations(os.environ):
+    _, token = checks.resolve_slack_token(settings.environment())
+    for legacy, preferred in checks.slack_deprecations(settings.environment()):
         logger.warning("Slack env %s is deprecated; use %s", legacy, preferred)
     # One "allowed senders" list; ids route by Slack prefix. Bot ids (B…) get the
     # trusted-bot path (bypass @mention); everything else (U…/W…/"*") is a human.
-    allowed = checks.resolve_slack_ids(os.environ, "SLACK_ALLOWED_SENDER_IDS")
+    allowed = checks.resolve_slack_ids(
+        settings.environment(), "SLACK_ALLOWED_SENDER_IDS"
+    )
     allowed_bot_ids = {sid for sid in allowed if sid.startswith("B")}
     allowed_user_ids = allowed - allowed_bot_ids
-    blocked_senders = checks.resolve_slack_ids(os.environ, "SLACK_BLOCKED_SENDER_IDS")
-    silent_sender_ids = checks.resolve_slack_ids(os.environ, "SLACK_SILENT_SENDER_IDS")
+    blocked_senders = checks.resolve_slack_ids(
+        settings.environment(), "SLACK_BLOCKED_SENDER_IDS"
+    )
+    silent_sender_ids = checks.resolve_slack_ids(
+        settings.environment(), "SLACK_SILENT_SENDER_IDS"
+    )
     check_backend()
     user_id = asyncio.run(check_slack(app_token, token))
     logger.debug(
@@ -379,12 +393,4 @@ def run_slack() -> tuple[str, str, str, set[str], set[str], set[str], set[str]]:
         blocked_senders,
         silent_sender_ids,
     )
-    return (
-        app_token,
-        token,
-        user_id,
-        allowed_user_ids,
-        blocked_senders,
-        allowed_bot_ids,
-        silent_sender_ids,
-    )
+    return app_token, token, user_id

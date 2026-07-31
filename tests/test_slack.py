@@ -12,13 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from slack_sdk.errors import SlackApiError
 
+from claude_on_the_fly import settings
 from claude_on_the_fly import slack as slack_mod
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
     DEFAULT_JOB_COMMAND,
+    DEFAULT_REPLY_SOFT_LIMIT,
     JOB_LIST_LIMIT,
-    SLACK_REPLY_SOFT_LIMIT,
     SlackFrontend,
     _render_job_list,
     _session_key,
@@ -306,7 +307,7 @@ class TestIngestEvent:
         frontend._on_message.assert_not_awaited()
 
     async def test_channel_allows_any_sender_with_wildcard(self, frontend):
-        frontend._allow_all_senders = True
+        frontend._pinned_allowed_user_ids = {"*"}
         event = {
             "ts": "4.1",
             "text": "<@U_SELF> hello",
@@ -318,8 +319,8 @@ class TestIngestEvent:
         frontend._on_message.assert_awaited_once()
 
     async def test_blocklist_wins_over_wildcard(self, frontend):
-        frontend._allow_all_senders = True
-        frontend._blocked_senders = {"U_BANNED"}
+        frontend._pinned_allowed_user_ids = {"*"}
+        frontend._pinned_blocked_senders = {"U_BANNED"}
         event = {
             "ts": "4.2",
             "text": "<@U_SELF> hello",
@@ -402,7 +403,7 @@ class TestIngestEvent:
         frontend._on_message.assert_not_awaited()
 
     async def test_dm_allows_any_sender_with_wildcard(self, frontend):
-        frontend._allow_all_senders = True
+        frontend._pinned_allowed_user_ids = {"*"}
         event = {
             "ts": "8.3",
             "text": "hello from dm",
@@ -1254,7 +1255,7 @@ class TestReplySoftLimit:
 
     async def test_gates_inbound_when_over_limit(self, frontend):
         session_id = _session_key("D1", "200.0")
-        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
         frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.0"}
 
         await frontend._ingest_event(self._dm_event("200.0", "another question"))
@@ -1265,7 +1266,7 @@ class TestReplySoftLimit:
 
     async def test_under_limit_processes_normally(self, frontend):
         session_id = _session_key("D1", "201.0")
-        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT - 1
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT - 1
 
         await frontend._ingest_event(self._dm_event("201.0", "still going"))
 
@@ -1273,7 +1274,7 @@ class TestReplySoftLimit:
 
     async def test_continue_resets_and_processes_remainder(self, frontend):
         session_id = _session_key("D1", "202.0")
-        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
 
         await frontend._ingest_event(
             self._dm_event("202.0", f"{CONTINUE_COMMAND} now do X")
@@ -1287,7 +1288,7 @@ class TestReplySoftLimit:
 
     async def test_bare_continue_resets_and_drops(self, frontend):
         session_id = _session_key("D1", "203.0")
-        frontend._reply_counts[session_id] = SLACK_REPLY_SOFT_LIMIT
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
 
         await frontend._ingest_event(self._dm_event("203.0", CONTINUE_COMMAND))
 
@@ -1323,7 +1324,7 @@ class TestSessionEviction:
         return event
 
     async def test_evicts_oldest_over_cap(self, frontend):
-        with patch("claude_on_the_fly.slack.SLACK_SESSION_CAP", 2):
+        with patch("claude_on_the_fly.slack.session_cap", lambda: 2):
             for ts in ("300.0", "301.0", "302.0"):
                 await frontend._ingest_event(self._dm_event(ts))
 
@@ -1337,7 +1338,7 @@ class TestSessionEviction:
         assert oldest not in frontend._reply_counts
 
     async def test_recent_activity_protects_session(self, frontend):
-        with patch("claude_on_the_fly.slack.SLACK_SESSION_CAP", 2):
+        with patch("claude_on_the_fly.slack.session_cap", lambda: 2):
             await frontend._ingest_event(self._dm_event("400.0"))
             await frontend._ingest_event(self._dm_event("401.0"))
             # Touch the first thread again with a reply, moving it to the back.
@@ -1398,18 +1399,18 @@ class TestAppInteractionRegistration:
     command is workspace-global and therefore opt-in."""
 
     def test_registers_the_command_when_set(self, bot_frontend):
-        with patch("claude_on_the_fly.slack.SLASH_COMMAND", "/cof-hoss"):
+        with patch("claude_on_the_fly.slack.slash_command", lambda: "/cof-hoss"):
             bot_frontend._register_app_interactions()
         bot_frontend._app.command.assert_called_once_with("/cof-hoss")
 
     def test_skips_the_command_when_unset(self, bot_frontend):
-        with patch("claude_on_the_fly.slack.SLASH_COMMAND", None):
+        with patch("claude_on_the_fly.slack.slash_command", lambda: None):
             bot_frontend._register_app_interactions()
         bot_frontend._app.command.assert_not_called()
 
     @pytest.mark.parametrize("command", ["/cof-hoss", None])
     def test_picker_and_shortcut_register_either_way(self, bot_frontend, command):
-        with patch("claude_on_the_fly.slack.SLASH_COMMAND", command):
+        with patch("claude_on_the_fly.slack.slash_command", lambda: command):
             bot_frontend._register_app_interactions()
         bot_frontend._app.view.assert_called_once_with("cof_picker")
         bot_frontend._app.shortcut.assert_called_once_with("cof_run_skill")
@@ -1857,8 +1858,7 @@ class TestStatusIndicator:
 
 class TestAllowlistGate:
     async def test_slash_command_denied_for_unlisted_user(self, bot_frontend):
-        bot_frontend._allow_all_senders = False
-        bot_frontend._allowed_user_ids = {"U_OK"}
+        bot_frontend._pinned_allowed_user_ids = {"U_OK"}
         ack, respond = AsyncMock(), AsyncMock()
         command = {"text": "simplify", "channel_id": "D1", "user_id": "U_BAD"}
         await bot_frontend._handle_slash_command(
@@ -1869,7 +1869,7 @@ class TestAllowlistGate:
 
     async def test_blocked_sender_denied_even_with_wildcard(self, bot_frontend):
         # bot_frontend allows "*"; a blocked id must still be refused.
-        bot_frontend._blocked_senders = {"U_BAD"}
+        bot_frontend._pinned_blocked_senders = {"U_BAD"}
         ack, respond = AsyncMock(), AsyncMock()
         command = {"text": "simplify", "channel_id": "D1", "user_id": "U_BAD"}
         await bot_frontend._handle_slash_command(
@@ -1879,8 +1879,7 @@ class TestAllowlistGate:
         bot_frontend._on_message.assert_not_awaited()
 
     async def test_shortcut_denied_for_unlisted_user(self, bot_frontend):
-        bot_frontend._allow_all_senders = False
-        bot_frontend._allowed_user_ids = {"U_OK"}
+        bot_frontend._pinned_allowed_user_ids = {"U_OK"}
         ack = AsyncMock()
         shortcut = {
             "trigger_id": "t",
@@ -1892,8 +1891,7 @@ class TestAllowlistGate:
         bot_frontend._app.client.views_open.assert_not_awaited()
 
     async def test_picker_submit_denied_for_unlisted_user(self, bot_frontend):
-        bot_frontend._allow_all_senders = False
-        bot_frontend._allowed_user_ids = {"U_OK"}
+        bot_frontend._pinned_allowed_user_ids = {"U_OK"}
         ack = AsyncMock()
         view = {
             "private_metadata": "D1:U_BAD:",
@@ -3058,13 +3056,177 @@ class TestDescribe:
         assert described["allowed_users"] == "U_ALLOWED,U_SELF"
 
     def test_allow_all_is_shown_as_a_star(self, frontend):
-        frontend._allow_all_senders = True
+        frontend._pinned_allowed_user_ids = {"*"}
         assert frontend.describe()["allowed_users"] == "*"
 
-    def test_no_allowed_users_reads_as_none(self, frontend):
-        frontend._allow_all_senders = False
-        frontend._allowed_user_ids = set()
+    def test_an_empty_allowlist_still_carries_the_tokens_own_id(self, frontend):
+        """The gotcha this makes visible: with a bot token that id is the BOT's, so an
+        operator whose list is empty has allowed nobody but the app, and their own DMs
+        do not get through. `describe` says so at startup rather than leaving it to be
+        discovered."""
+        frontend._pinned_allowed_user_ids = set()
+        assert frontend.describe()["allowed_users"] == "U_SELF"
+
+    def test_a_blank_user_id_reads_as_none(self, frontend):
+        """`user_id` comes from Slack auth.test, so this is unreachable in a real
+        deployment -- but it is the one path that makes the field empty, and the
+        `<none>` placeholder is there so a missing value never renders as a blank."""
+        frontend._pinned_allowed_user_ids = set()
+        frontend._user_id = ""
         assert frontend.describe()["allowed_users"] == "<none>"
+
+
+class TestNumericLimits:
+    """Read per use, so an edit lands without a restart."""
+
+    def test_unset_is_the_default(self, operator_settings, monkeypatch):
+        monkeypatch.delenv("SLACK_SESSION_CAP", raising=False)
+        monkeypatch.delenv("SLACK_REPLY_SOFT_LIMIT", raising=False)
+        assert slack_mod.session_cap() == slack_mod.DEFAULT_SESSION_CAP
+        assert slack_mod.reply_soft_limit() == slack_mod.DEFAULT_REPLY_SOFT_LIMIT
+
+    def test_a_configured_value_is_used(self, operator_settings):
+        operator_settings.write_text("slack:\n  session_cap: 7\n")
+        assert slack_mod.session_cap() == 7
+
+    def test_junk_falls_back_and_says_so(self, operator_settings, caplog):
+        """A memory bound is not worth refusing to serve a message over, but a typo
+        that silently reverted to 1000 would look like a working setting."""
+        operator_settings.write_text("slack:\n  session_cap: lots\n")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert slack_mod.session_cap() == slack_mod.DEFAULT_SESSION_CAP
+        assert "is not a number" in caplog.text
+
+    def test_zero_or_negative_falls_back_and_says_so(self, operator_settings, caplog):
+        """A cap of 0 would evict every session the moment it was created, which is a
+        daemon that appears to have no memory at all."""
+        operator_settings.write_text("slack:\n  session_cap: 0\n")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert slack_mod.session_cap() == slack_mod.DEFAULT_SESSION_CAP
+        assert "must be positive" in caplog.text
+
+
+class TestJobCommand:
+    def test_absent_means_the_default(self, operator_settings, monkeypatch):
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert slack_mod._resolve_job_command() == slack_mod.DEFAULT_JOB_COMMAND
+
+    def test_empty_means_off(self, operator_settings):
+        """The opt-out. Absent and present-but-blank have to stay distinguishable, or
+        an install cannot say "no background jobs" at all."""
+        operator_settings.write_text("slack:\n  job_command: ''\n")
+        assert slack_mod._resolve_job_command() is None
+
+    def test_a_value_renames_the_trigger(self, operator_settings):
+        operator_settings.write_text("slack:\n  job_command: '!bg'\n")
+        assert slack_mod._resolve_job_command() == "!bg"
+
+
+class TestSlashCommand:
+    def test_unset_registers_none(self, operator_settings, monkeypatch):
+        """The skill picker is reached from a message's "..." shortcut instead."""
+        monkeypatch.delenv("SLACK_SLASH_COMMAND", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert slack_mod.slash_command() is None
+
+    def test_a_configured_command_is_returned(self, operator_settings):
+        operator_settings.write_text("slack:\n  slash_command: /cotf\n")
+        assert slack_mod.slash_command() == "/cotf"
+
+    def test_it_is_in_the_restart_required_set(self):
+        """Registering it is a handshake with Slack, so a live reload would point the
+        daemon at a command nothing is listening for."""
+        assert "slack.slash_command" in settings.RESTART_REQUIRED
+
+
+class TestSenderLists:
+    """Access control, read per message so an edit needs no restart.
+
+    This coverage used to live on `preflight.run_slack`, which resolved the lists at
+    startup and handed them to the frontend pinned. It moved here with the behaviour.
+    """
+
+    @pytest.fixture
+    def live(self, frontend, monkeypatch, operator_settings):
+        """A frontend with nothing pinned, so every list reads from the config."""
+        for var in (
+            "SLACK_ALLOWED_SENDER_IDS",
+            "SLACK_BLOCKED_SENDER_IDS",
+            "SLACK_SILENT_SENDER_IDS",
+            "SLACK_ALLOWED_USER_IDS",
+            "SLACK_BLOCKED_USER_IDS",
+            "SLACK_ALLOWED_BOT_IDS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        frontend._pinned_allowed_user_ids = None
+        frontend._pinned_blocked_senders = None
+        frontend._pinned_allowed_bot_ids = None
+        frontend._pinned_silent_sender_ids = None
+        return frontend
+
+    def test_one_list_splits_by_slack_id_prefix(self, live, operator_settings):
+        operator_settings.write_text(
+            "slack:\n  allowed_senders: [U1, B2, W3, B4]\n  blocked_senders: [U9, B8]\n"
+        )
+        assert live._allowed_user_ids == {"U1", "W3", "U_SELF"}
+        assert live._allowed_bot_ids == {"B2", "B4"}
+        assert live._blocked_senders == {"U9", "B8"}
+
+    def test_a_wildcard_allows_any_human(self, live, operator_settings):
+        operator_settings.write_text("slack:\n  allowed_senders: ['*']\n")
+        assert live._allow_all_senders is True
+
+    def test_absent_lists_are_empty_but_for_the_tokens_own_id(
+        self, live, operator_settings
+    ):
+        operator_settings.write_text("slack: {}\n")
+        assert live._allowed_user_ids == {"U_SELF"}
+        assert live._allowed_bot_ids == set()
+        assert live._blocked_senders == set()
+        assert live._silent_sender_ids == set()
+        assert live._allow_all_senders is False
+
+    def test_an_empty_list_is_empty(self, live, operator_settings):
+        operator_settings.write_text("slack:\n  allowed_senders: []\n")
+        assert live._allowed_user_ids == {"U_SELF"}
+
+    def test_deprecated_split_lists_still_merge(self, live, monkeypatch):
+        """The old user/bot allowlists combine into the one list, so an install that
+        predates the merge keeps working."""
+        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U1, U2")
+        monkeypatch.setenv("SLACK_ALLOWED_BOT_IDS", "B1")
+        assert live._allowed_user_ids == {"U1", "U2", "U_SELF"}
+        assert live._allowed_bot_ids == {"B1"}
+
+    def test_the_new_name_wins_over_the_deprecated_one(
+        self, live, monkeypatch, operator_settings
+    ):
+        operator_settings.write_text("slack:\n  allowed_senders: [U1]\n")
+        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U_OLD")
+        assert live._allowed_user_ids == {"U1", "U_SELF"}
+
+    def test_an_env_var_still_wins_over_the_file(
+        self, live, monkeypatch, operator_settings
+    ):
+        """.env backward compatibility: an operator who never edits the yaml keeps
+        exactly the access control they configured."""
+        operator_settings.write_text("slack:\n  allowed_senders: [U_FILE]\n")
+        monkeypatch.setenv("SLACK_ALLOWED_SENDER_IDS", "U_ENV")
+        assert live._allowed_user_ids == {"U_ENV", "U_SELF"}
+
+    def test_adding_a_sender_needs_no_restart(self, live, operator_settings):
+        """The point of the whole change."""
+        operator_settings.write_text("slack:\n  allowed_senders: [U1]\n")
+        assert live._allowed_user_ids == {"U1", "U_SELF"}
+        operator_settings.write_text("slack:\n  allowed_senders: [U1, U2]\n")
+        assert live._allowed_user_ids == {"U1", "U2", "U_SELF"}
+
+    def test_a_pinned_list_ignores_the_file(self, frontend, operator_settings):
+        """Every other test in this module pins its lists at construction, and that
+        has to keep meaning what it says."""
+        operator_settings.write_text("slack:\n  allowed_senders: [U_FILE]\n")
+        assert frontend._allowed_user_ids == {"U_ALLOWED", "U_SELF"}
 
 
 class TestChannelType:
@@ -3292,7 +3454,7 @@ class TestRegisteredHandlers:
         frontend._handle_picker_submit = AsyncMock()
         frontend._handle_run_skill_shortcut = AsyncMock()
         frontend._on_approval_action = AsyncMock()
-        with patch.object(slack_mod, "SLASH_COMMAND", "/cotf"):
+        with patch.object(slack_mod, "slash_command", lambda: "/cotf"):
             frontend._register_app_interactions()
 
         command_cb = frontend._app.command.return_value.call_args[0][0]
@@ -3317,7 +3479,7 @@ class TestRegisteredHandlers:
         """It is workspace-global, so registering it unasked would collide with
         another install."""
         frontend._is_bot_token = True
-        with patch.object(slack_mod, "SLASH_COMMAND", ""):
+        with patch.object(slack_mod, "slash_command", lambda: None):
             frontend._register_app_interactions()
         frontend._app.command.assert_not_called()
 

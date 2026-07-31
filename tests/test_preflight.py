@@ -514,102 +514,28 @@ class TestRunSlack:
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_returns_tokens_and_ids(self, _mock_claude, _mock_arun, monkeypatch):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U1, U2 ,U3")
-        monkeypatch.setenv("SLACK_BLOCKED_USER_IDS", "U9, U8")
-        monkeypatch.setenv("SLACK_ALLOWED_BOT_IDS", "B1, B2")
-        monkeypatch.setenv("SLACK_SILENT_SENDER_IDS", "B1, U7")
-        app, user, uid, allowed, blocked, bots, silent = run_slack()
-        assert app == "xapp-abc"
-        assert user == "xoxp-abc"
-        assert uid == "U123"
-        assert allowed == {"U1", "U2", "U3"}
-        assert blocked == {"U9", "U8"}
-        assert bots == {"B1", "B2"}
-        assert silent == {"B1", "U7"}
-
-    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_allowed_sender_ids_split_by_prefix(
+    def test_returns_the_tokens_and_the_resolved_user_id(
         self, _mock_claude, _mock_arun, monkeypatch
     ):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
-        monkeypatch.setenv("SLACK_TOKEN", "xoxb-abc")
-        monkeypatch.setenv("SLACK_ALLOWED_SENDER_IDS", "U1, B2, W3, B4")
-        monkeypatch.setenv("SLACK_BLOCKED_SENDER_IDS", "U9, B8")
-        _, _, _, allowed_users, blocked, bots, _ = run_slack()
-        assert allowed_users == {"U1", "W3"}
-        assert bots == {"B2", "B4"}
-        assert blocked == {"U9", "B8"}
-
-    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_new_names_win_over_legacy(self, _mock_claude, _mock_arun, monkeypatch):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
-        monkeypatch.setenv("SLACK_TOKEN", "xoxb-abc")
-        monkeypatch.setenv("SLACK_ALLOWED_SENDER_IDS", "U1")
-        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U_OLD")
-        monkeypatch.setenv("SLACK_ALLOWED_BOT_IDS", "B_OLD")
-        _, _, _, allowed_users, _, bots, _ = run_slack()
-        assert allowed_users == {"U1"}
-        assert bots == set()
-
-    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_empty_allowed_ids_yields_empty_set(
-        self, _mock_claude, _mock_arun, monkeypatch
-    ):
+        """The sender lists are deliberately not returned any more -- the frontend
+        reads them per message so an edit needs no restart. Their resolution is
+        covered in test_slack's TestSenderLists, at the place that now owns it."""
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "")
-        _, _, _, allowed, _, _, _ = run_slack()
-        assert allowed == set()
+        assert run_slack() == ("xapp-abc", "xoxp-abc", "U123")
 
     @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
     @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_missing_allowed_ids_yields_empty_set(
-        self, _mock_claude, _mock_arun, monkeypatch
+    def test_a_deprecated_alias_is_warned_about(
+        self, _mock_claude, _mock_arun, monkeypatch, caplog
     ):
+        """Still honored, so the only signal an operator gets is this line."""
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.delenv("SLACK_ALLOWED_USER_IDS", raising=False)
-        _, _, _, allowed, _, _, _ = run_slack()
-        assert allowed == set()
-
-    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_missing_blocked_ids_yields_empty_set(
-        self, _mock_claude, _mock_arun, monkeypatch
-    ):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.delenv("SLACK_BLOCKED_USER_IDS", raising=False)
-        _, _, _, _, blocked, _, _ = run_slack()
-        assert blocked == set()
-
-    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_missing_bot_ids_yields_empty_set(
-        self, _mock_claude, _mock_arun, monkeypatch
-    ):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.delenv("SLACK_ALLOWED_BOT_IDS", raising=False)
-        _, _, _, _, _, bots, _ = run_slack()
-        assert bots == set()
-
-    @patch("claude_on_the_fly.preflight.asyncio.run", return_value="U123")
-    @patch("claude_on_the_fly.preflight.check_claude_cli")
-    def test_missing_silent_ids_yields_empty_set(
-        self, _mock_claude, _mock_arun, monkeypatch
-    ):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-abc")
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-abc")
-        monkeypatch.delenv("SLACK_SILENT_SENDER_IDS", raising=False)
-        *_, silent = run_slack()
-        assert silent == set()
+        monkeypatch.setenv("SLACK_ALLOWED_USER_IDS", "U1")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.preflight"):
+            run_slack()
+        assert "SLACK_ALLOWED_USER_IDS is deprecated" in caplog.text
 
 
 class TestCloudOllamaModels:

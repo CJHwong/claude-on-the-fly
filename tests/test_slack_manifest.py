@@ -188,13 +188,17 @@ class TestGenerateFlagMode:
     def test_env_block_carries_the_chosen_command(self, capsys):
         generate(mode="bot", name="COF", command="/cof-x", out=None)
         err = capsys.readouterr().err
-        assert "SLACK_SLASH_COMMAND=/cof-x" in err
+        # Not as an env var: it is not a credential, and printing it beside two
+        # tokens taught the opposite at setup time.
+        assert "SLACK_SLASH_COMMAND=" not in err
+        assert "slash_command: /cof-x" in err
+        assert "config.yaml" in err
         assert "SLACK_TOKEN=xoxb-" in err
 
     def test_user_mode_env_block_has_no_command(self, capsys):
         generate(mode="user", name="COF", command=None, out=None)
         err = capsys.readouterr().err
-        assert "SLACK_SLASH_COMMAND" not in err
+        assert "slash_command" not in err
         assert "SLACK_TOKEN=xoxp-" in err
 
     def test_writes_to_out_path(self, tmp_path, capsys):
