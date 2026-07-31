@@ -268,12 +268,69 @@ def test_an_unrecognised_tool_gets_one_subject_per_tool():
 # --- the operator-facing detail ---
 
 
-def test_detail_names_who_raised_the_question():
+def test_who_raised_the_question_is_on_the_card():
     """claude asking and cotf deciding to ask mean different things about how much
-    thought went into the question, so the operator sees which."""
+    thought went into the question, so the operator sees which. It rides in `origin`
+    rather than in front of the detail, so the command stays on the first line."""
     call = _call("Bash", command="rm -f x")
-    assert permissions.detail_for(call, asked_by="claude").startswith("claude asked:")
-    assert permissions.detail_for(call, asked_by="cotf").startswith("cotf asked:")
+    # Only claude escalating is worth the width. Naming cotf says nothing: cotf is
+    # the thing showing the card.
+    assert permissions.origin_label("Bash", "claude") == "Bash, asked by claude"
+    assert permissions.origin_label("Bash", "cotf") == "Bash"
+    for asked_by in ("claude", "cotf"):
+        request = permissions.request_for(call, Path("/ws"), asked_by=asked_by)
+        # The detail leads with the command now, not with a restatement of the
+        # headline. On a phone the old prefix cost the whole first line.
+        assert request.detail.startswith("rm -f x")
+    assert (
+        "cotf" not in permissions.request_for(call, Path("/ws"), asked_by="cotf").origin
+    )
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        (
+            permissions.ToolCall("Bash", {"command": "chmod 700 /ws"}),
+            "bash:chmod 700 /ws",
+        ),
+        (
+            permissions.ToolCall("Write", {"file_path": "/etc/hosts"}),
+            "write:/etc/hosts",
+        ),
+        (
+            permissions.ToolCall("WebFetch", {"url": "https://x.example/a"}),
+            "webfetch:https://x.example/a",
+        ),
+        (permissions.ToolCall("NoInput"), ""),
+    ],
+)
+def test_the_scope_carries_arguments_the_grant_key_does_not(call, expected):
+    """A subject is scoped to the program so one approval covers a turn of work,
+    which is why it reads `bash:chmod`. That makes it a useless record of what was
+    approved, so the scope spells the call out."""
+    assert permissions.scope_for(call) == expected
+
+
+def test_the_grant_key_stays_program_scoped():
+    """The point of the split: widening the record must not widen the grant."""
+    call = permissions.ToolCall("Bash", {"command": "chmod 700 /ws"})
+    assert permissions.subject_for(call, WS) == "bash:chmod"
+    assert permissions.scope_for(call) == "bash:chmod 700 /ws"
+
+
+def test_an_unheaded_dialog_still_gets_a_headline():
+    """origin is what replaced the digest in the headline, so it must never be empty
+    -- a card headed just "Permission request" would say less than before."""
+    assert permissions.origin_label("", "cotf") == "tool"
+    assert permissions.origin_label("", "claude") == "tool, asked by claude"
+
+
+def test_an_unnamed_tool_still_says_something():
+    """A call with no input and no describable field would otherwise render an empty
+    detail block, which reads as a card that failed to load."""
+    detail = permissions.detail_for(permissions.ToolCall("NoInput"), asked_by="cotf")
+    assert detail == "cotf asked: NoInput"
 
 
 def test_detail_flattens_newlines_out_of_agent_authored_input():
@@ -381,7 +438,6 @@ def test_detail_describes_every_tool_shape_not_just_bash(call, expected_fragment
     operator is never shown a bare tool name for a call that has a target."""
     detail = permissions.detail_for(call, asked_by="claude")
     assert expected_fragment in detail
-    assert detail.startswith("claude asked:")
 
 
 # --- the loopback decision service ---
@@ -751,6 +807,120 @@ REAL_SENSITIVE_FILE_DIALOG = """\
 
  Esc to cancel · Tab to amend · ctrl+e to explain
 """
+
+
+# Verbatim from a real pane that cotf refused to answer, leaving the turn parked
+# forever. Option 2's label is too long for the width, so the terminal wraps the
+# path onto its own line -- a line with no `N.` prefix, sitting *between* two
+# options. Kept exact, wrapping and curly apostrophe and all.
+REAL_WRAPPED_OPTION_DIALOG = """\
+────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   chmod 700
+   /Users/hoss/.claude-on-the-fly/workspaces/slack/dm-hoss-1785501201 && ls
+   -ld /Users/hoss/.claude-on-the-fly/workspaces/slack/dm-hoss-1785501201
+   Set dir mode to 700 and verify
+
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: chmod 700
+      /Users/hoss/.claude-on-the-fly/workspaces/slack/dm-hoss-1785501201
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+
+
+def test_a_wrapped_option_label_does_not_hide_the_options_below_it():
+    """The bug this fixture is taken from: "stop at the first non-option line"
+    treated a wrapped label as the footer, so `3. No` was never read, no_key stayed
+    empty, and parse_dialog returned None. Refusing to answer is the safe outcome,
+    but the turn then sat at the dialog until someone noticed.
+    """
+    dialog = permissions.parse_dialog(REAL_WRAPPED_OPTION_DIALOG)
+    assert dialog is not None
+    assert dialog.yes_key == "1"
+    assert dialog.no_key == "3"
+
+
+def test_a_pure_label_header_is_dropped_so_the_command_leads():
+    """ "Bash command" only repeats what the card's headline already says, and it cost
+    the first line of the body -- the line holding the command."""
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert dialog.tool == "Bash"
+    assert dialog.body.startswith("chmod a+w ")
+    assert "Bash command" not in dialog.body
+
+
+def test_the_scope_is_the_command_in_the_shape_the_other_backends_use():
+    """`pty:Bash:f5771755993b` in the footer said nothing about scope. This is what
+    replaced it: the same `bash:<command>` shape a native or codex subject has."""
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert dialog.scope.startswith("bash:chmod a+w /Users/x/probe_ws/bp.txt")
+
+
+def test_the_escalation_notice_is_not_part_of_the_scope():
+    """ "This command requires approval" is why the operator is being asked, not what
+    they are approving. claude indents it back at the header's level, which is how it
+    is told apart from the command."""
+    dialog = permissions.parse_dialog(REAL_BASH_DIALOG)
+    assert dialog is not None
+    assert "requires approval" not in dialog.scope
+    # Still on the card, in the detail block, because it is the reason.
+    assert "requires approval" in dialog.body
+
+
+def test_a_wrapped_command_is_rejoined_whole_in_the_scope():
+    """The case that made the footer useless: a command long enough to wrap. Every
+    continuation sits at the same indent, so all of it comes back."""
+    dialog = permissions.parse_dialog(REAL_WRAPPED_OPTION_DIALOG)
+    assert dialog is not None
+    assert dialog.scope == (
+        "bash:chmod 700 /Users/hoss/.claude-on-the-fly/workspaces/slack/"
+        "dm-hoss-1785501201 && ls -ld /Users/hoss/.claude-on-the-fly/workspaces/"
+        "slack/dm-hoss-1785501201 Set dir mode to 700 and verify"
+    )
+
+
+def test_an_unheaded_dialog_gets_no_guessed_prefix():
+    """The sensitive-file shape has no tool label, so prefixing it `claude:` would be
+    inventing a scope syntax that means nothing."""
+    dialog = permissions.parse_dialog(REAL_SENSITIVE_FILE_DIALOG)
+    assert dialog is not None
+    assert not dialog.scope.startswith("claude:")
+    assert "pty_probe.tmp" in dialog.scope
+
+
+def test_a_dialog_with_nothing_but_a_question_has_no_scope():
+    """Nothing to say beats a footer claiming a scope that was never read."""
+    dialog = permissions.parse_dialog(
+        "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel\n"
+    )
+    assert dialog is not None
+    assert dialog.scope == ""
+
+
+def test_a_header_that_carries_meaning_is_kept():
+    """ "Claude requested permissions to edit" is the verb of the sentence its next
+    line completes. Dropping it would leave a bare path and no statement of what
+    would be done to it."""
+    dialog = permissions.parse_dialog(REAL_SENSITIVE_FILE_DIALOG)
+    assert dialog is not None
+    assert dialog.body.startswith("Claude requested permissions to edit")
+
+
+def test_a_wrapped_widening_option_is_still_recognised_as_widening():
+    """The continuation carries the path, so the joined label must still match the
+    widen-scope pattern. If it did not, option 2 could be picked as plain "Yes" and
+    approving once would install a standing rule the operator never saw."""
+    dialog = permissions.parse_dialog(REAL_WRAPPED_OPTION_DIALOG)
+    assert dialog is not None
+    assert dialog.yes_key != "2"
 
 
 def test_the_tool_name_comes_from_the_dialog_header():

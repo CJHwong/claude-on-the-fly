@@ -83,16 +83,46 @@ class ApprovalRequest:
     :param detail: Mechanical context for the operator: what tried to do what.
         Never agent-authored prose.
     :param ttl_seconds: How long an approval lasts.
+    :param origin: Optional cotf-authored headline, e.g. "Bash, asked by claude".
+        Set it when the subject is a digest rather than something a human reads --
+        a pty grant key is `pty:Bash:f5771755993b`, which as a headline says
+        nothing. Frontends lead with this and move the subject to the footer. Left
+        empty by requesters whose subject *is* the readable thing (a host, a
+        command), so their cards are unchanged.
+    :param scope: Optional human-readable statement of what a grant here would
+        cover, for the same reason: a digest subject says nothing about scope. Shown
+        in full, not truncated -- the operator is deciding on the whole command, and
+        a tail cut off the end is exactly where an unexpected path would sit. The
+        requester bounds the length before setting it. Display and log text only:
+        `key` stays the identity, because the text a pty dialog yields is
+        wrap-damaged and cannot be trusted to reproduce a command exactly.
     """
 
     kind: str
     subject: str
     detail: str
     ttl_seconds: float = DEFAULT_TTL_SECONDS
+    origin: str = ""
+    scope: str = ""
 
     @property
     def key(self) -> str:
         return f"{self.kind}:{self.subject}"
+
+
+def _covers(req: ApprovalRequest) -> str:
+    """ " covers <scope>" for a log line, or "" when the key already says it.
+
+    The GRANTED and denied lines used to print the key alone, which for a pty grant
+    is `tool:pty:Bash:f5771755993b` -- unmatchable against anything without going
+    back to the ask line further up the log. Full text, not `scope_display`: a log
+    is read with a pager, not on a phone.
+
+    Last on the line, after the durations, because the scope is free text: with the
+    duration behind it a line ended "...This command requires approval for 1800s",
+    which reads as the approval lasting 1800s rather than the grant.
+    """
+    return f", covers {req.scope}" if req.scope else ""
 
 
 class ApprovalGate(Protocol):
@@ -326,15 +356,20 @@ class ApprovalBroker:
                 self._clock() + self._policy.deny_cooldown_seconds
             )
             logger.info(
-                "%s: operator denied %s (not asking again for %.0fs)",
+                "%s: operator denied %s (not asking again for %.0fs)%s",
                 self._tag,
                 req.key,
                 self._policy.deny_cooldown_seconds,
+                _covers(req),
             )
             return False
         self._store.grant(req.key, req.ttl_seconds)
         logger.warning(
-            "%s: operator GRANTED %s for %.0fs", self._tag, req.key, req.ttl_seconds
+            "%s: operator GRANTED %s for %.0fs%s",
+            self._tag,
+            req.key,
+            req.ttl_seconds,
+            _covers(req),
         )
         return True
 

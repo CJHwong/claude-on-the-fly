@@ -354,6 +354,35 @@ def subject_for(call: ToolCall, workspace: Path) -> str:
     return f"tool:{call.name}"
 
 
+def _call_text(call: ToolCall) -> str:
+    """The one field of `call` that says what it would actually do.
+
+    Per tool shape, because a bare tool name is not a decision an operator can make:
+    a Bash call is its command, a write is its path, a fetch is its URL. Unknown
+    tools fall back to the whole input rather than to nothing.
+    """
+    if call.name == "Bash":
+        return _flatten(call.text("command"))
+    if call.name in _WRITE_TOOLS:
+        return _flatten(call.text("file_path") or call.text("command"))
+    if call.name in _FETCH_TOOLS:
+        return _flatten(call.text("url"))
+    return _flatten(str(call.input)) if call.input else ""
+
+
+def scope_for(call: ToolCall) -> str:
+    """What a grant covers, spelled out, in the same shape a pty dialog's scope has.
+
+    Deliberately not `subject_for`. A subject is the grant *key*, scoped to the
+    program so approving `git` once covers a turn of git work -- which is why it
+    reads `bash:chmod` with no arguments. That makes it useless as a record of what
+    was approved: "Permission approved: bash:chmod" does not say which file. This
+    carries the arguments; the key stays program-scoped.
+    """
+    body = _capped(_call_text(call))
+    return f"{call.name.lower()}:{body}" if body else ""
+
+
 def detail_for(call: ToolCall, *, asked_by: str) -> str:
     """Operator-facing description of `call`. Flattened and capped; not escaped.
 
@@ -362,21 +391,29 @@ def detail_for(call: ToolCall, *, asked_by: str) -> str:
         decided this was worth interrupting for. The two mean different things
         about how much thought went into the question, so the operator sees which.
     """
-    if call.name == "Bash":
-        body = _flatten(call.text("command"))
-    elif call.name in _WRITE_TOOLS:
-        body = _flatten(call.text("file_path") or call.text("command"))
-    elif call.name in _FETCH_TOOLS:
-        body = _flatten(call.text("url"))
-    else:
-        body = _flatten(str(call.input)) if call.input else ""
+    body = _call_text(call)
     described = _flatten(call.text("description"))
-    parts = [f"{asked_by} asked: {call.name}"]
-    if body:
-        parts.append(_capped(body))
+    # The tool name and who asked used to be a prefix here. They moved to the card's
+    # headline (`origin`), because repeating them in front of the command pushed the
+    # command itself off the first line on a phone -- and the command is the one
+    # thing the operator is actually deciding about.
+    parts = [_capped(body)] if body else []
     if described:
         parts.append(f"({_capped(described)})")
-    return " ".join(parts)
+    return " ".join(parts) or f"{asked_by} asked: {call.name}"
+
+
+def origin_label(tool: str, asked_by: str) -> str:
+    """The card's headline suffix: which tool, and who escalated it.
+
+    "asked by claude" is worth a card's width because it means the CLI's own
+    permission system raised this and cotf is forwarding it verbatim. "asked by
+    cotf" is not: cotf is the thing showing you the card, so naming it says nothing
+    the operator did not already know. Only the informative half is printed.
+    """
+    if asked_by == SOURCE_COTF:
+        return tool or "tool"
+    return f"{tool or 'tool'}, asked by {asked_by}"
 
 
 def request_for(
@@ -392,6 +429,8 @@ def request_for(
         subject=subject_for(call, workspace),
         detail=detail_for(call, asked_by=asked_by),
         ttl_seconds=ttl_seconds,
+        origin=origin_label(call.name, asked_by),
+        scope=scope_for(call),
     )
 
 
@@ -619,8 +658,10 @@ class PermissionService:
             ApprovalRequest(
                 kind="tool",
                 subject=dialog.subject,
-                detail=f"{SOURCE_CLAUDE} asked: {dialog.body}",
+                detail=dialog.body,
                 ttl_seconds=self.ttl_seconds,
+                origin=origin_label(dialog.tool, SOURCE_CLAUDE),
+                scope=dialog.scope,
             )
         )
         return await answer_dialog(self.tmux_session, dialog, allowed=granted)
@@ -833,6 +874,11 @@ _OPTION_RE = re.compile(r"^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$")
 # label is agent-influenced and the apostrophe in "don't" is a curly one.
 _WIDENING = re.compile(r"^(yes|no)\b.*\band\b", re.IGNORECASE)
 
+# A dialog header that is only a label for the tool, e.g. "Bash command". Anchored
+# and two words wide on purpose: it must not match a header that is the opening of a
+# sentence, like "Claude requested permissions to edit".
+_HEADER_IS_JUST_A_LABEL = re.compile(r"^\w+ command$")
+
 
 @dataclass(frozen=True)
 class Dialog:
@@ -849,6 +895,14 @@ class Dialog:
     :param body: the whole explanation, flattened. Carries what the call is *and*
         why claude escalated it ("This command requires approval", "which is a
         sensitive file").
+    :param command: just the call itself, without the escalation notice. claude
+        indents the command deeper than the notice below it, so this is the
+        deepest-indented run of the explanation. Display only, like `scope`.
+    :param labelled: whether the header was a bare tool label ("Bash command"). Kept
+        as a fact read off the pane rather than re-derived from `tool`: "Claude
+        command" also matches the label pattern, so rebuilding the header from the
+        tool name would call the sensitive-file dialog labelled and prefix its scope
+        `claude:`.
     :param yes_key: the digit that approves. Read, never assumed.
     :param no_key: the digit that refuses.
     """
@@ -857,6 +911,22 @@ class Dialog:
     body: str
     yes_key: str
     no_key: str
+    command: str = ""
+    labelled: bool = False
+
+    @property
+    def scope(self) -> str:
+        """What a grant here covers, in the shape the other backends' subjects use.
+
+        `bash:chmod 700 /path` rather than a digest, because a footer reading
+        `pty:Bash:f5771755993b` told the operator nothing about scope. Prefixed only
+        for a labelled dialog; anything else gets the text alone rather than a
+        prefix that would imply a scope syntax it does not have.
+        """
+        text = self.command or self.body
+        if not text:
+            return ""
+        return f"{self.tool.lower()}:{text}" if self.labelled else text
 
     @property
     def subject(self) -> str:
@@ -897,16 +967,27 @@ def parse_dialog(pane: str) -> Dialog | None:
         return None
 
     options: dict[str, str] = {}
+    last_key = ""
     for line in lines[question + 1 :]:
         match = _OPTION_RE.match(line)
-        if match is None:
-            # The option list is contiguous; the first non-option line after it is
-            # the footer ("Esc to cancel..."), so stop rather than scanning on into
-            # unrelated screen content.
-            if options:
-                break
+        if match is not None:
+            last_key = match.group(1)
+            options[last_key] = match.group(2)
             continue
-        options[match.group(1)] = match.group(2)
+        if not options:
+            continue
+        # A blank line ends the list. The footer ("Esc to cancel...") follows one,
+        # so this stops before it without having to recognise its wording.
+        if not line.strip():
+            break
+        # Otherwise this is the previous option's label wrapped onto a second
+        # line, which the terminal does for a long one: a widen-scope option
+        # naming a full path is the common case. Treating it as the end of the
+        # list -- which is what "stop at the first non-option line" did -- dropped
+        # every option after it, so `No` went missing and the whole dialog became
+        # unanswerable. Measured on a real pane: `2. Yes, and don't ask again
+        # for: chmod 700 <path>` wrapped, and `3. No` below it was never read.
+        options[last_key] = f"{options[last_key]} {line.strip()}"
 
     yes_key = no_key = ""
     for key, label in options.items():
@@ -934,8 +1015,53 @@ def parse_dialog(pane: str) -> Dialog | None:
     # labelling; nothing is decided from it.
     header = _flatten(explanation[0]) if explanation else ""
     tool = header.split()[0] if header else ""
-    body = _capped(_flatten(" ".join(explanation)))
-    return Dialog(tool=tool, body=body, yes_key=yes_key, no_key=no_key)
+    # Drop the header only when it is *nothing but* a label, i.e. "Bash command".
+    # The tool name is on the card's headline now, so repeating it cost the first
+    # line of the body -- which is where the command is. Any other header carries
+    # meaning ("Claude requested permissions to edit" is the verb of the sentence
+    # its next line completes) and is kept, or the body would lose its subject.
+    labelled = _HEADER_IS_JUST_A_LABEL.match(header) is not None
+    said = explanation[1:] if labelled else explanation
+    body = _capped(_flatten(" ".join(said)))
+    return Dialog(
+        tool=tool,
+        body=body,
+        command=_deepest_indented(said),
+        labelled=labelled,
+        yes_key=yes_key,
+        no_key=no_key,
+    )
+
+
+def _deepest_indented(lines: list[str]) -> str:
+    """The most-indented run of `lines`, flattened. "" if there is nothing to take.
+
+    claude draws the command indented under the dialog header and the escalation
+    notice back at the header's own level, so indentation is what separates "what
+    would run" from "why you are being asked". Measured on both observed Bash shapes,
+    single-line and wrapped: the command sits at four columns and
+    `This command requires approval` at one.
+
+    Not a split into command-versus-description: claude puts its own one-line
+    description at the *same* indent as the command, and a dialog without a
+    description is indistinguishable from one whose command wrapped. Cutting the last
+    line to drop a description that was not there would truncate the command itself,
+    which on a security card is the one error worth avoiding. So the description
+    stays, and only the notice goes.
+    """
+    indents = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
+    if not indents:
+        return ""
+    deepest = max(indents)
+    return _capped(
+        _flatten(
+            " ".join(
+                line
+                for line in lines
+                if line.strip() and len(line) - len(line.lstrip()) == deepest
+            )
+        )
+    )
 
 
 # How long to keep re-reading the transcript for the pending tool call, and how

@@ -391,6 +391,47 @@ async def test_label_identifies_the_session_store(caplog):
     )
 
 
+async def test_the_grant_log_says_what_a_digest_key_covers(caplog):
+    """`tool:pty:Bash:f5771755993b` alone cannot be matched against anything without
+    scrolling back to the ask line. The scope goes last on the line, after the
+    duration, because it is free text: ahead of it a line ended "...requires approval
+    for 1800s", which reads as the approval lasting that long."""
+    broker = ApprovalBroker(RecordingGate(default=True), label="chat 7")
+    req = ApprovalRequest(
+        kind="tool",
+        subject="pty:Bash:f5771755993b",
+        detail="chmod 700 /tmp/x",
+        scope="chmod 700 /tmp/x && ls -ld /tmp/x",
+    )
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
+        assert await broker.check(req) is True
+    line = next(r.getMessage() for r in caplog.records if "GRANTED" in r.getMessage())
+    assert line.endswith(", covers chmod 700 /tmp/x && ls -ld /tmp/x")
+
+
+async def test_a_denial_log_names_the_scope_too(caplog):
+    """A denied pty call is the one an operator is most likely to come back to."""
+    broker = ApprovalBroker(RecordingGate(default=False), label="chat 7")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.approvals"):
+        await broker.check(
+            ApprovalRequest(
+                kind="tool", subject="pty:Bash:abc", detail="d", scope="rm -rf /tmp/x"
+            )
+        )
+    assert any("covers rm -rf /tmp/x" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_readable_key_gets_no_covers_clause(caplog):
+    """An egress subject already *is* the scope, so repeating it would be noise in
+    every line of the grant ledger."""
+    broker = ApprovalBroker(RecordingGate(default=True), label="chat 7")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
+        await broker.check(
+            ApprovalRequest(kind="host", subject="pypi.org:443", detail="d")
+        )
+    assert not any("covers" in r.getMessage() for r in caplog.records)
+
+
 async def test_rate_limit_line_shows_the_active_grants(caplog):
     """Diagnosing a rate-limit deny needs to distinguish a probing agent from a
     session that legitimately needed many hosts."""
