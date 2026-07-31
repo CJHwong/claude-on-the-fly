@@ -38,6 +38,48 @@ def test_agent_env_none_when_off(monkeypatch):
     assert sandbox.agent_env() is None
 
 
+def test_session_overrides_reach_the_agent_with_the_sandbox_off(monkeypatch):
+    """Sandboxing and approvals are independent settings, so `off` must not eat the
+    session env. It used to: agent_env() returned None before the overrides were
+    read, which dropped the approval service's own endpoint and left claude-pty
+    naming its tmux session after its pid -- a turn stuck at a dialog whose pane
+    the daemon could not find. The values are ephemeral-port loopback URLs, so
+    there is no static default that could stand in for them.
+    """
+    monkeypatch.delenv("COTF_SANDBOX", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-curated-in-this-mode")
+    token = sandbox.session_env(
+        {
+            "COTF_APPROVE_URL": "http://127.0.0.1:56188/decide",
+            "COTF_APPROVE_NOTIFY_URL": "http://127.0.0.1:56188/notify",
+            "CLAUDE_PTY_TMUX_SESSION": "cotf-pty-42-abcd1234",
+            "CLAUDE_PTY_NO_TMUX": "0",
+        }
+    )
+    try:
+        env = sandbox.agent_env()
+    finally:
+        sandbox.reset_session_env(token)
+
+    assert env is not None
+    assert env["COTF_APPROVE_URL"] == "http://127.0.0.1:56188/decide"
+    assert env["COTF_APPROVE_NOTIFY_URL"] == "http://127.0.0.1:56188/notify"
+    assert env["CLAUDE_PTY_TMUX_SESSION"] == "cotf-pty-42-abcd1234"
+    assert env["CLAUDE_PTY_NO_TMUX"] == "0"
+    # Off means off: this mode withholds nothing, so the daemon env is inherited
+    # whole rather than rebuilt from the passthrough allowlist.
+    assert env["ANTHROPIC_API_KEY"] == "sk-not-curated-in-this-mode"
+
+
+def test_a_session_override_does_not_outlive_its_token(monkeypatch):
+    """The ContextVar is per turn. If a reset left the value behind, the next
+    session would inherit the previous one's approval endpoint."""
+    monkeypatch.delenv("COTF_SANDBOX", raising=False)
+    token = sandbox.session_env({"COTF_APPROVE_URL": "http://127.0.0.1:1/decide"})
+    sandbox.reset_session_env(token)
+    assert sandbox.agent_env() is None
+
+
 def test_agent_env_drops_secrets_keeps_essentials(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX", "env")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")

@@ -229,16 +229,36 @@ def _is_passthrough(key: str) -> bool:
 def agent_env() -> dict[str, str] | None:
     """Environment for a spawned agent, or None to inherit the parent's unchanged.
 
-    None when sandboxing is off, which makes the spawn sites behave exactly as
-    before (create_subprocess_exec(env=None) inherits os.environ). When on, only
-    the passthrough allowlist is forwarded, so secrets in the daemon env do not
-    reach the agent, then any per-session overrides are layered on top.
+    None only when there is nothing to add: sandboxing off *and* no per-session
+    overrides. That keeps the spawn sites behaving exactly as before
+    (create_subprocess_exec(env=None) inherits os.environ). When sandboxing is on,
+    only the passthrough allowlist is forwarded, so secrets in the daemon env do
+    not reach the agent, then any per-session overrides are layered on top.
+
+    Sandboxing off *with* overrides still returns a dict, because the two settings
+    are independent: `permissions.mode` does not imply a sandbox mode, and the
+    approval service publishes its loopback endpoints through `_SESSION_ENV` like
+    the egress proxy does. Returning None there dropped COTF_APPROVE_URL and
+    CLAUDE_PTY_TMUX_SESSION on the floor, so the shim had nowhere to ask and
+    claude-pty named its own tmux session -- a turn that parked at a permission
+    dialog no one could answer.
     """
+    overrides = _SESSION_ENV.get() or {}
     if not enabled():
-        return None
+        if not overrides:
+            return None
+        # Inherit and layer, not curate: nothing is being withheld in this mode,
+        # so building the env from an allowlist would break every spawn that
+        # needs a var the allowlist happens not to name.
+        logger.debug(
+            "sandbox: off, inheriting the daemon env with %d session override(s) %s",
+            len(overrides),
+            sorted(overrides),
+        )
+        return {**os.environ, **overrides}
     env = {key: value for key, value in os.environ.items() if _is_passthrough(key)}
     dropped = len(os.environ) - len(env)
-    env.update(_SESSION_ENV.get() or {})
+    env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
     # reach the agent", so it must not itself become the leak. A dropped *count*
