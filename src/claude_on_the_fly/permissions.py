@@ -38,6 +38,7 @@ import asyncio
 import logging
 import re
 import shlex
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -517,6 +518,11 @@ class PermissionService:
     # pane. Set by the daemon, never by anything the agent can reach: it decides
     # where a keystroke lands.
     tmux_session: str = ""
+    # Sends a plain notice to the conversation this service belongs to. Optional so
+    # a service can be built without a frontend (tests, probes), and used only for
+    # the failures an operator cannot otherwise see: an ERROR in a log file is no
+    # use to someone watching a spinner on a phone.
+    notify: Callable[[str], Awaitable[None]] | None = None
     _relays: set = field(default_factory=set, repr=False)
     _runner: object = field(default=None, repr=False)
     _port: int | None = field(default=None, repr=False)
@@ -629,30 +635,7 @@ class PermissionService:
             return False
         dialog = await read_dialog(self.tmux_session)
         if dialog is None:
-            # Two very different causes, and the operator needs to be told which.
-            # A missing session means claude-pty took its `script` backend, where
-            # there is no pane at all and no pty turn will ever be answerable; a
-            # present one means the prompt did not render as expected, which is a
-            # parser problem.
-            alive, _ = await _tmux("has-session", "-t", self.tmux_session)
-            if alive != 0:
-                logger.error(
-                    "permissions[%s]: tmux session %s does not exist, so claude-pty "
-                    "fell back to its script backend and no permission dialog can "
-                    "be answered. Install tmux and unset CLAUDE_PTY_NO_TMUX, or set "
-                    'permissions.mode to "off" for pty runs.',
-                    self.label,
-                    self.tmux_session,
-                )
-            else:
-                logger.error(
-                    "permissions[%s]: could not read the permission dialog in %s; "
-                    "not answering it, because guessing a key could approve "
-                    "something the operator never saw",
-                    self.label,
-                    self.tmux_session,
-                )
-            return False
+            return await self._refuse_unreadable()
         self.requests_seen += 1
         granted = await self.broker.check(
             ApprovalRequest(
@@ -665,6 +648,56 @@ class PermissionService:
             )
         )
         return await answer_dialog(self.tmux_session, dialog, allowed=granted)
+
+    async def _refuse_unreadable(self) -> bool:
+        """Refuse a dialog that could not be read, and say so where it will be seen.
+
+        Two causes, and they need different handling rather than one message. A
+        missing session means claude-pty took its `script` backend: there is no pane,
+        so nothing can be sent and every prompt this session will fail the same way.
+        A present session means the prompt did not render as this parser expects,
+        which is cotf's problem and is recoverable -- Escape refuses that one call and
+        the turn carries on.
+        """
+        alive, _ = await _tmux("has-session", "-t", self.tmux_session)
+        if alive != 0:
+            logger.error(
+                "permissions[%s]: tmux session %s does not exist, so claude-pty "
+                "fell back to its script backend and no permission dialog can "
+                "be answered. Install tmux and unset CLAUDE_PTY_NO_TMUX, or set "
+                'permissions.mode to "off" for pty runs.',
+                self.label,
+                self.tmux_session,
+            )
+            await self._tell_operator(NO_PANE_NOTICE)
+            return False
+        logger.error(
+            "permissions[%s]: could not read the permission dialog in %s; "
+            "cancelling it rather than picking one of its options, since guessing a "
+            "key could approve something the operator never saw",
+            self.label,
+            self.tmux_session,
+        )
+        await self._tell_operator(UNREADABLE_DIALOG_NOTICE)
+        return await cancel_dialog(self.tmux_session)
+
+    async def _tell_operator(self, text: str) -> None:
+        """Send `text` to this service's conversation. Never raises.
+
+        A frontend failure must not change what happens to the tool call: the
+        refusal below this is the safety-relevant half, and losing the notice is
+        strictly better than turning a delivery error into an unanswered dialog.
+        """
+        if self.notify is None:
+            return
+        try:
+            await self.notify(text)
+        except Exception:
+            logger.exception(
+                "permissions[%s]: could not tell the operator about a dialog it "
+                "could not read",
+                self.label,
+            )
 
     async def _handle_notify(self, request: object) -> object:
         """A pty session reporting that claude is asking. Answers out of band.
@@ -1080,6 +1113,30 @@ PTY_DENY_MESSAGE = (
     "would need instead, or continue with the rest of the task."
 )
 
+# What dismisses a dialog without answering it. Taken from the dialog's own footer
+# ("Esc to cancel"), not guessed, and safe precisely because it is the one key that
+# can never approve.
+_CANCEL_KEY = "Escape"
+
+# Told to the operator when a dialog could not be read. Says what happened to the
+# call, because "cotf could not parse it" on its own leaves them wondering whether
+# the agent is stuck, waiting on them, or already past it.
+UNREADABLE_DIALOG_NOTICE = (
+    "claude asked for permission in a form I could not read, so I refused the call "
+    "rather than guess an answer. The turn continued. If it should have been "
+    "allowed, ask again and I will forward the next prompt."
+)
+
+# Told to the operator when there is no pane at all. A different problem with a
+# different fix, so it does not share the wording above: nothing in this session
+# will ever be answerable until the deployment changes.
+NO_PANE_NOTICE = (
+    "claude asked for permission but this run has no terminal I can reach, so the "
+    "call was refused and every other prompt this session will be too. claude-pty "
+    "fell back to its non-tmux backend: install tmux and unset CLAUDE_PTY_NO_TMUX, "
+    'or set permissions.mode to "off" for pty runs.'
+)
+
 
 async def _tmux(*args: str) -> tuple[int, str]:
     """Run tmux and return (returncode, stdout). Never raises."""
@@ -1137,10 +1194,45 @@ async def answer_dialog(session: str, dialog: Dialog, *, allowed: bool) -> bool:
         return False
     if allowed:
         return True
+    await _deliver_refusal(session)
+    return True
+
+
+async def _deliver_refusal(session: str) -> None:
+    """Type the refusal reason into `session` so the turn can end.
+
+    Shared by the two ways a call gets refused, because both need it for the same
+    reason: dismissing the dialog ends the turn without a final assistant message,
+    claude's Stop hook never fires, no envelope is written, and claude-pty waits
+    until it gives up. A keystroke also carries no text, so this is the only route
+    by which the reason reaches the model.
+    """
     await asyncio.sleep(_POLL_INTERVAL_SECONDS * 4)
     await _tmux("send-keys", "-t", session, PTY_DENY_MESSAGE)
     await asyncio.sleep(_POLL_INTERVAL_SECONDS)
     await _tmux("send-keys", "-t", session, "Enter")
+
+
+async def cancel_dialog(session: str) -> bool:
+    """Refuse a dialog cotf could not read, without picking one of its options.
+
+    The alternative was to leave it alone, which is what used to happen: an ERROR in
+    the log and a turn parked on the prompt until someone noticed. Escape is not the
+    key-guessing that would be dangerous here -- it is in the dialog's own footer,
+    and it cannot approve anything, so an unparseable prompt degrades to a denial
+    instead of a dead thread. That also stops the parser being load-bearing: a
+    future change to claude's layout costs a refused call, not a hung session.
+
+    Measured on a live pane: Escape dismissed the dialog and left the file
+    unmodified, and Escape plus `_deliver_refusal` ended the turn normally (exit 0,
+    envelope written, terminal_reason=completed) with the model explaining what it
+    would have needed.
+    """
+    code, _ = await _tmux("send-keys", "-t", session, _CANCEL_KEY)
+    if code != 0:
+        logger.error("permissions: could not cancel the dialog in %s", session)
+        return False
+    await _deliver_refusal(session)
     return True
 
 

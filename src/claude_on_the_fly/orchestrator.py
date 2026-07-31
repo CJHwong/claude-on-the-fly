@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -173,6 +174,7 @@ class SessionPermissions:
             ttl_seconds=resolved.ttl_seconds,
             label=label,
             tmux_session=permissions.tmux_session_name(chat_id, session),
+            notify=self._notifier(chat_id),
         )
         await service.start()
         self._services[chat_id] = (session, service)
@@ -185,6 +187,19 @@ class SessionPermissions:
             service.tmux_session,
         )
         return self._env(service)
+
+    def _notifier(self, chat_id: int) -> Callable[[str], Awaitable[None]]:
+        """How a permission service reaches the conversation it belongs to.
+
+        A plain message rather than an approval card: these are reports of a gate
+        that could not function, not questions, and offering buttons for something
+        already decided would only invite a tap that does nothing.
+        """
+
+        async def send(text: str) -> None:
+            await self._frontend.send(chat_id, Response(body=text))
+
+        return send
 
     @staticmethod
     def _env(service: permissions.PermissionService) -> dict[str, str]:

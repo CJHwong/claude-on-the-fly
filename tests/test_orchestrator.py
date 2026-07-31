@@ -1453,6 +1453,25 @@ async def test_session_permissions_hands_the_agent_its_endpoint(operator_setting
         await manager.close_all()
 
 
+async def test_the_service_can_reach_the_conversation_it_belongs_to(operator_settings):
+    """A gate that cannot function has to say so where the operator is looking. The
+    ERROR alone left a stuck turn looking like a slow one."""
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    frontend = StubFrontend()
+    manager = orchestrator_mod.SessionPermissions(frontend)
+    try:
+        await manager.env_for(11, "sess-a", Path("/tmp/ws"))
+        service = manager._services[11][1]
+        assert service.notify is not None
+        await service.notify(permissions_mod.UNREADABLE_DIALOG_NOTICE)
+    finally:
+        await manager.close_all()
+    # The session's own chat, not a fallback: the notice belongs with the work.
+    assert [(chat_id, r.body) for chat_id, r in frontend.sent] == [
+        (11, permissions_mod.UNREADABLE_DIALOG_NOTICE)
+    ]
+
+
 async def test_a_new_session_drops_the_previous_grants(operator_settings, caplog):
     """/new has to mean what it says. Reusing the service would carry every
     approval from the conversation the operator just abandoned."""

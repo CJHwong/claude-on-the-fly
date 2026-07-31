@@ -1099,19 +1099,118 @@ async def test_the_operator_sees_claudes_own_wording(fake_tmux):
     assert gate.seen[0].subject.startswith("pty:Bash:")
 
 
-async def test_an_unreadable_dialog_types_nothing_at_all(fake_tmux, caplog):
-    """Refusing to answer beats guessing a digit: a wrong one could approve something
-    the operator never saw."""
+async def test_an_unreadable_dialog_is_cancelled_not_left_alone(fake_tmux, caplog):
+    """Leaving it alone is what parked a real turn on the prompt until someone
+    noticed. Escape refuses without picking an option, so the turn ends."""
     from claude_on_the_fly.approvals import RecordingGate
 
     sent, pane = fake_tmux
     pane["text"] = "no dialog here, just output"
     gate = RecordingGate(default=True)
     with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
-        assert await _pty_service(gate).relay_pty_dialog() is False
-    assert [args for args in sent if args[0] == "send-keys"] == []
+        assert await _pty_service(gate).relay_pty_dialog() is True
+    keys = [args[-1] for args in sent if args[0] == "send-keys"]
+    assert keys[0] == "Escape"
+    # And the reason, or the turn never ends: dismissing the dialog leaves claude
+    # with no final message, so its Stop hook never fires.
+    assert permissions.PTY_DENY_MESSAGE in keys
+    assert keys[-1] == "Enter"
+    # No digit, ever. That is the part that could have approved something.
+    assert not any(key.isdigit() for key in keys)
+    # The operator was never asked, because there was no question to show them.
     assert gate.seen == []
     assert "guessing a key" in caplog.text
+
+
+async def test_an_unreadable_dialog_tells_the_operator(fake_tmux):
+    """The ERROR lands in a log file, which is no use to someone watching a spinner
+    on a phone. That is how a stuck turn went unnoticed."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    _sent, pane = fake_tmux
+    pane["text"] = "no dialog here, just output"
+    told: list[str] = []
+
+    async def notify(text: str) -> None:
+        told.append(text)
+
+    service = _pty_service(RecordingGate(default=True), notify=notify)
+    assert await service.relay_pty_dialog() is True
+    assert told == [permissions.UNREADABLE_DIALOG_NOTICE]
+    # Says what happened to the call, not just that parsing failed.
+    assert "refused" in told[0]
+
+
+async def test_a_frontend_failure_does_not_change_the_verdict(fake_tmux, caplog):
+    """The refusal is the safety-relevant half. Losing the notice is better than
+    letting a delivery error leave the dialog unanswered."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    sent, pane = fake_tmux
+    pane["text"] = "no dialog here, just output"
+
+    async def broken(_text: str) -> None:
+        raise RuntimeError("slack is down")
+
+    service = _pty_service(RecordingGate(default=True), notify=broken)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert await service.relay_pty_dialog() is True
+    assert "Escape" in [args[-1] for args in sent if args[0] == "send-keys"]
+    assert "could not tell the operator" in caplog.text
+
+
+async def test_a_service_with_no_notifier_still_cancels(fake_tmux):
+    """A service can be built without a frontend (probes, tests), and that must not
+    turn the refusal off."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    sent, pane = fake_tmux
+    pane["text"] = "no dialog here, just output"
+    assert await _pty_service(RecordingGate(default=True)).relay_pty_dialog() is True
+    assert "Escape" in [args[-1] for args in sent if args[0] == "send-keys"]
+
+
+async def test_a_cancel_that_tmux_rejects_is_reported(monkeypatch, caplog):
+    """If the keystroke does not land there is nothing more cotf can do, and the
+    return value must not claim the dialog was dealt with."""
+
+    async def refusing(*args: str):
+        if args[0] == "send-keys":
+            return 1, ""
+        return 0, ""
+
+    monkeypatch.setattr(permissions, "_tmux", refusing)
+    monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert await permissions.cancel_dialog("cotf-pty-1-abcd1234") is False
+    assert "could not cancel the dialog" in caplog.text
+
+
+async def test_a_missing_pane_tells_the_operator_how_to_fix_it(monkeypatch, caplog):
+    """This one is not recoverable: with no pane there is nothing to send Escape to,
+    and every prompt for the rest of the session fails the same way. So the notice
+    names the deployment fix rather than reporting a one-off refusal."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    async def dead(*args: str):
+        if args[0] == "has-session":
+            return 1, ""
+        return 0, "just ordinary output"
+
+    monkeypatch.setattr(permissions, "_tmux", dead)
+    monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(permissions, "_TRANSCRIPT_WAIT_SECONDS", 0.01)
+    told: list[str] = []
+
+    async def notify(text: str) -> None:
+        told.append(text)
+
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        service = _pty_service(RecordingGate(default=True), notify=notify)
+        assert await service.relay_pty_dialog() is False
+    assert told == [permissions.NO_PANE_NOTICE]
+    assert "CLAUDE_PTY_NO_TMUX" in told[0]
+    assert told[0] != permissions.UNREADABLE_DIALOG_NOTICE
 
 
 async def test_a_service_with_no_pane_refuses_to_type(caplog):
@@ -1365,9 +1464,16 @@ async def test_a_live_pane_with_no_dialog_is_reported_differently(monkeypatch, c
     monkeypatch.setattr(permissions, "_tmux", alive_but_blank)
     monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
     monkeypatch.setattr(permissions, "_TRANSCRIPT_WAIT_SECONDS", 0.01)
+    told: list[str] = []
+
+    async def notify(text: str) -> None:
+        told.append(text)
+
     with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
-        assert (
-            await _pty_service(RecordingGate(default=True)).relay_pty_dialog() is False
-        )
+        service = _pty_service(RecordingGate(default=True), notify=notify)
+        # A live pane is recoverable: Escape refuses this one call and the turn
+        # carries on, which is why it returns True where the no-pane case cannot.
+        assert await service.relay_pty_dialog() is True
     assert "could not read the permission dialog" in caplog.text
     assert "script backend" not in caplog.text
+    assert told == [permissions.UNREADABLE_DIALOG_NOTICE]
