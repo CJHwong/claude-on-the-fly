@@ -197,6 +197,7 @@ class SessionPermissions:
             cotf_approve.ENDPOINT_ENV: service.base_url + permissions.DECIDE_PATH,
             cotf_approve.NOTIFY_ENV: service.base_url + permissions.NOTIFY_PATH,
             permissions.TMUX_SESSION_ENV: service.tmux_session,
+            **permissions.pty_env(),
         }
 
     def check_turn(self, chat_id: int, response: Response, backend: str) -> None:

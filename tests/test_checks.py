@@ -1180,3 +1180,52 @@ class TestHooksFileFailures:
         result = checks_mod.check_pty_hooks()
         assert result.status == "invalid"
         assert result.name == "claude-pty hooks"
+
+
+# --- pty approvals need the tmux backend ---
+
+
+def test_pty_tmux_check_passes_when_approvals_are_off(operator_settings):
+    """The script backend is fine when nothing is gated, so this must not fail a
+    deployment that never asked for approvals."""
+    from claude_on_the_fly.checks import check_pty_tmux_for_approvals
+
+    result = check_pty_tmux_for_approvals()
+    assert result.status == "ok"
+    assert "approvals off" in result.detail
+
+
+def test_pty_tmux_check_refuses_a_forced_script_backend(operator_settings, monkeypatch):
+    """CLAUDE_PTY_NO_TMUX=1 leaves no pane to read a dialog from, and the symptom is a
+    turn that stalls to its timeout rather than an error, so it is worth catching at
+    boot where the fix is one line."""
+    from claude_on_the_fly.checks import PTY_NO_TMUX_ENV, check_pty_tmux_for_approvals
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.setenv(PTY_NO_TMUX_ENV, "1")
+    result = check_pty_tmux_for_approvals()
+    assert result.status == "missing"
+    assert PTY_NO_TMUX_ENV in result.detail
+
+
+def test_pty_tmux_check_refuses_when_tmux_is_absent(operator_settings, monkeypatch):
+    from claude_on_the_fly import checks as checks_mod
+    from claude_on_the_fly.checks import PTY_NO_TMUX_ENV, check_pty_tmux_for_approvals
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.delenv(PTY_NO_TMUX_ENV, raising=False)
+    monkeypatch.setattr(checks_mod.shutil, "which", lambda _name: None)
+    result = check_pty_tmux_for_approvals()
+    assert result.status == "missing"
+    assert "tmux is not on PATH" in result.detail
+    assert result.fix_hint is not None
+
+
+def test_pty_tmux_check_passes_when_tmux_is_available(operator_settings, monkeypatch):
+    from claude_on_the_fly import checks as checks_mod
+    from claude_on_the_fly.checks import PTY_NO_TMUX_ENV, check_pty_tmux_for_approvals
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.delenv(PTY_NO_TMUX_ENV, raising=False)
+    monkeypatch.setattr(checks_mod.shutil, "which", lambda _name: "/usr/bin/tmux")
+    assert check_pty_tmux_for_approvals().status == "ok"

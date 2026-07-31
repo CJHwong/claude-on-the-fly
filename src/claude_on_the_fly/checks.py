@@ -771,7 +771,49 @@ def check_pty_setup() -> list[CheckResult]:
 
     results.append(check_pty_hooks())
     results.append(check_pty_hook_paths())
+    results.append(check_pty_tmux_for_approvals())
     return results
+
+
+def check_pty_tmux_for_approvals() -> CheckResult:
+    """Approvals under pty require claude-pty's tmux backend, not its script one.
+
+    pty is gated by reading claude's own permission dialog off the terminal and
+    typing the answer back, which needs a tmux pane the daemon can address.
+    claude-pty picks tmux only when tmux is on PATH and CLAUDE_PTY_NO_TMUX is not
+    "1"; otherwise it falls back to `script`, where there is no pane to read.
+
+    A missing pane does not fail loudly on its own. The dialog simply goes
+    unanswered and the turn stalls until its timeout, which looks like the agent
+    hanging rather than like a misconfiguration -- so it is worth catching at
+    startup, where the fix is one line.
+
+    Reports ok when approvals are off, since the script backend is perfectly fine
+    then.
+    """
+    from claude_on_the_fly import permissions
+
+    if not permissions.configured().enabled:
+        return CheckResult(
+            name="pty tmux backend", status="ok", detail="not needed (approvals off)"
+        )
+    if os.environ.get(PTY_NO_TMUX_ENV, "0") == "1":
+        return CheckResult(
+            name="pty tmux backend",
+            status="missing",
+            detail=f"{PTY_NO_TMUX_ENV}=1 forces the script backend, which has no "
+            "pane to read a permission dialog from",
+            fix_hint=f'unset {PTY_NO_TMUX_ENV}, or set permissions.mode to "off"',
+        )
+    if shutil.which("tmux") is None:
+        return CheckResult(
+            name="pty tmux backend",
+            status="missing",
+            detail="tmux is not on PATH, so claude-pty falls back to its script "
+            "backend and no permission dialog can be answered",
+            fix_hint="brew install tmux",
+        )
+    return CheckResult(name="pty tmux backend", status="ok", detail="tmux available")
 
 
 # Environment variables the two shims are built around: the statusline shim
@@ -779,6 +821,10 @@ def check_pty_setup() -> list[CheckResult]:
 # pty's "turn done" signal. A script that names one is that shim; a script that
 # does not cannot satisfy the contract whatever it is called or wherever it
 # lives.
+# Set to "1" this forces claude-pty onto its script backend, which approvals
+# cannot use: there is no addressable pane to read a dialog from.
+PTY_NO_TMUX_ENV = "CLAUDE_PTY_NO_TMUX"
+
 PTY_SIDECAR_MARKER = "CLAUDE_PTY_SIDECAR"
 PTY_ENVELOPE_MARKER = "CLAUDE_PTY_ENVELOPE"
 # The PostCompact writer must gate on the compaction's trigger; see

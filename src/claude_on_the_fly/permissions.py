@@ -585,13 +585,29 @@ class PermissionService:
             return False
         dialog = await read_dialog(self.tmux_session)
         if dialog is None:
-            logger.error(
-                "permissions[%s]: could not read the permission dialog in %s; not "
-                "answering it, because guessing a key could approve something the "
-                "operator never saw",
-                self.label,
-                self.tmux_session,
-            )
+            # Two very different causes, and the operator needs to be told which.
+            # A missing session means claude-pty took its `script` backend, where
+            # there is no pane at all and no pty turn will ever be answerable; a
+            # present one means the prompt did not render as expected, which is a
+            # parser problem.
+            alive, _ = await _tmux("has-session", "-t", self.tmux_session)
+            if alive != 0:
+                logger.error(
+                    "permissions[%s]: tmux session %s does not exist, so claude-pty "
+                    "fell back to its script backend and no permission dialog can "
+                    "be answered. Install tmux and unset CLAUDE_PTY_NO_TMUX, or set "
+                    'permissions.mode to "off" for pty runs.',
+                    self.label,
+                    self.tmux_session,
+                )
+            else:
+                logger.error(
+                    "permissions[%s]: could not read the permission dialog in %s; "
+                    "not answering it, because guessing a key could approve "
+                    "something the operator never saw",
+                    self.label,
+                    self.tmux_session,
+                )
             return False
         self.requests_seen += 1
         granted = await self.broker.check(
@@ -1066,3 +1082,23 @@ def pty_argv(resolved: Permissions | None = None) -> list[str]:
     if not resolved.enabled:
         return []
     return ["--settings", str(pty_settings_path())]
+
+
+def pty_env(resolved: Permissions | None = None) -> dict[str, str]:
+    """Env forcing claude-pty onto the one backend approvals can use.
+
+    claude-pty chooses tmux only when tmux is on PATH *and* CLAUDE_PTY_NO_TMUX is
+    not "1"; otherwise it runs claude under `script`, where there is no addressable
+    pane and no dialog can be answered. An operator with that variable exported for
+    their own use would otherwise silently lose approvals on every pty turn, and the
+    symptom is a turn that stalls to its timeout rather than an error.
+
+    Overriding it here rather than only warning at startup, because the daemon's
+    environment can change under a long-running process and this is cheap.
+    checks.check_pty_tmux_for_approvals still refuses at boot when tmux is absent,
+    which this cannot fix.
+    """
+    resolved = configured() if resolved is None else resolved
+    if not resolved.enabled:
+        return {}
+    return {"CLAUDE_PTY_NO_TMUX": "0"}

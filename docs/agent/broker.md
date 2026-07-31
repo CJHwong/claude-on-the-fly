@@ -756,5 +756,17 @@ add one.
 `Operation not permitted` before any network call. That is pre-existing and unrelated to
 approvals, verified against a baseline with the permission changes stashed.
 
-pty needs `tmux` on the daemon's PATH. Without it the pane cannot be read and every
-dialog goes unanswered, which shows up as a turn that stalls until its timeout.
+pty approvals need claude-pty's **tmux** backend, not its `script` one, because the
+script backend has no addressable pane. claude-pty picks tmux only when tmux is on PATH
+and `CLAUDE_PTY_NO_TMUX` is not `1`.
+
+cotf handles both halves. It sets `CLAUDE_PTY_NO_TMUX=0` in the spawn environment, so an
+operator who exports that variable for their own use does not silently lose approvals,
+and `check_pty_tmux_for_approvals` refuses at startup when tmux is missing, which cotf
+cannot fix for you. If a pane is missing anyway, the relay says so explicitly rather
+than stalling in silence, and distinguishes "the session does not exist, so claude-pty
+took the script backend" from "the session is live but the prompt did not render as
+expected", since those need different fixes.
+
+The check reports ok when approvals are off. The script backend is perfectly fine when
+nothing is being gated.

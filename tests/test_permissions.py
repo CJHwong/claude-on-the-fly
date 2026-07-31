@@ -1143,3 +1143,61 @@ async def test_tmux_reports_a_nonzero_exit_rather_than_pretending(monkeypatch):
 def test_pty_argv_points_at_the_generated_settings_file():
     argv = permissions.pty_argv(permissions.Permissions(mode="ask"))
     assert argv == ["--settings", str(permissions.pty_settings_path())]
+
+
+# --- forcing the one backend approvals can use ---
+
+
+def test_pty_env_forces_the_tmux_backend():
+    """claude-pty picks tmux only when CLAUDE_PTY_NO_TMUX is not "1". An operator with
+    that exported for their own use would otherwise lose approvals on every pty turn,
+    and the symptom is a turn that stalls to its timeout rather than an error."""
+    assert permissions.pty_env(permissions.Permissions(mode="ask")) == {
+        "CLAUDE_PTY_NO_TMUX": "0"
+    }
+
+
+def test_pty_env_is_empty_when_approvals_are_off():
+    """The script backend is perfectly fine when nothing is being gated, so this must
+    not change how an ungated deployment runs."""
+    assert permissions.pty_env(permissions.Permissions()) == {}
+
+
+async def test_a_missing_pane_is_reported_as_the_script_fallback(monkeypatch, caplog):
+    """The two causes need different fixes, so the log has to say which one happened:
+    no session at all means claude-pty never used tmux."""
+    from claude_on_the_fly.approvals import RecordingGate
+
+    async def no_session(*args: str):
+        if args[0] == "has-session":
+            return 1, ""
+        return 0, "no dialog on this pane"
+
+    monkeypatch.setattr(permissions, "_tmux", no_session)
+    monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(permissions, "_TRANSCRIPT_WAIT_SECONDS", 0.01)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert (
+            await _pty_service(RecordingGate(default=True)).relay_pty_dialog() is False
+        )
+    assert "fell back to its script backend" in caplog.text
+    assert "CLAUDE_PTY_NO_TMUX" in caplog.text
+
+
+async def test_a_live_pane_with_no_dialog_is_reported_differently(monkeypatch, caplog):
+    from claude_on_the_fly.approvals import RecordingGate
+
+    async def alive_but_blank(*args: str):
+        if args[0] == "has-session":
+            return 0, ""
+        return 0, "just ordinary output"
+
+    monkeypatch.setattr(permissions, "_tmux", alive_but_blank)
+    monkeypatch.setattr(permissions, "_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(permissions, "_TRANSCRIPT_WAIT_SECONDS", 0.01)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+        assert (
+            await _pty_service(RecordingGate(default=True)).relay_pty_dialog() is False
+        )
+    assert "could not read the permission dialog" in caplog.text
+    assert "script backend" not in caplog.text

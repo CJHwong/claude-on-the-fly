@@ -61,7 +61,7 @@ _PASSTHROUGH_ENDPOINTS = frozenset(
 # claude-pty reads this for its tmux session name. The daemon sets it so it knows
 # which pane to type an approval into; claude-pty's own default is PID-based and
 # therefore unpredictable from outside.
-_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION"})
+_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION", "CLAUDE_PTY_NO_TMUX"})
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
