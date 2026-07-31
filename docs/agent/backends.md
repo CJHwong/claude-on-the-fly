@@ -20,7 +20,7 @@ These are the differences that *downstream* code (footer, orchestrator, TUI) has
 ### Cost
 
 - **claude** (`backends/claude.py`): native CLI emits cost in the JSONL — use it as-is.
-- **codex** (`backends/codex.py:370`): no cost field. Pricing layer at `src/claude_on_the_fly/pricing.py` looks up models in OpenRouter's registry, multiplies by tokens. Cache at `~/.claude-on-the-fly/pricing/openrouter.json`, TTL 7 days (`COTF_PRICING_TTL_SECONDS`).
+- **codex** (`backends/codex.py:370`): no cost field. Pricing layer at `src/claude_on_the_fly/pricing.py` looks up models in OpenRouter's registry, multiplies by tokens. Cache at `~/.claude-on-the-fly/pricing/openrouter.json`, TTL 7 days (`agent.pricing_ttl_seconds`).
 - **claude under `ollama`**: also priced from that registry, because the CLI's `total_cost_usd` comes from Anthropic's table for a model Anthropic isn't serving.
 
 `cost_for` prices four **non-overlapping** buckets: plain input, output, cache reads, cache writes. The cache arguments default to 0, which is what keeps codex (no prompt caching at all) billing identically. Don't feed it `Response.tokens_in` — that folds cache reads in for the footer's `↑N`, so passing it alongside `cache_read_tokens` bills those twice at the dearer rate. `_billable_usage` in the claude backend exists to keep the two apart.
@@ -72,7 +72,7 @@ Warm resumes are faster than these cold numbers and skip the first-turn system-p
 
 ### ollama launch
 
-Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementation: `OllamaLauncher` at `src/claude_on_the_fly/agent.py:636`. Triggered by `CLAUDE_MODE=ollama` / `CODEX_MODE=ollama`. Requires `ollama` installed and target model pulled (`ollama pull <name>`). Session resume, tool use, and Skills behave identically to native mode — only the model provider changes. For claude, the footer cost reflects Ollama's billing (`:cloud` models) or `$0` (local).
+Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementation: `OllamaLauncher` at `src/claude_on_the_fly/agent.py:636`. Triggered by `agent.claude.mode: ollama` / `agent.codex.mode: ollama`. Requires `ollama` installed and target model pulled (`ollama pull <name>`). Session resume, tool use, and Skills behave identically to native mode — only the model provider changes. For claude, the footer cost reflects Ollama's billing (`:cloud` models) or `$0` (local).
 
 ### pty (claude only)
 

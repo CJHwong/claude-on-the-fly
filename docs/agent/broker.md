@@ -4,7 +4,8 @@ Keeps API keys out of the agent. A bypassPermissions agent that gets prompt-inje
 will exfiltrate any secret it can reach, so the defense is architectural: the key
 value never enters the agent process, and a local broker injects it at the point of use.
 
-Two layers, both opt-in via `COTF_SANDBOX` (default `off`):
+Two layers, both opt-in via `sandbox.mode` in `~/.claude-on-the-fly/config.yaml`
+(default `off`; the `COTF_SANDBOX` environment variable still works and still wins):
 
 | mode   | env curation | seatbelt jail | platform |
 |--------|--------------|---------------|----------|
@@ -56,20 +57,20 @@ Route(
 
 ## Narrowing the filesystem and loopback (jail mode)
 
-These knobs only take effect under `COTF_SANDBOX=jail` and each defaults to the current
+These knobs only take effect under `sandbox.mode: jail` and each defaults to the current
 behavior when unset:
 
-- `COTF_SANDBOX_FS=deny-most` swaps the read-permissive base (`fs-allow-reads.sb`) for `fs-deny-most.sb`,
+- `sandbox.fs: deny-most` swaps the read-permissive base (`fs-allow-reads.sb`) for `fs-deny-most.sb`,
   which makes `$HOME` opaque and re-grants only the project dir, `~/.claude`, `~/.cache/uv`,
   and up to three operator paths. Reads outside `$HOME` (system libraries, the toolchain)
   stay allowed so binaries run. This is coarser than `fs-allow-reads.sb` by design: an agent that reads
   a home dotfile outside the granted set (e.g. `~/.gitconfig`) is denied. Note the agent's own
   binary and interpreters often live under `$HOME` (`~/.local/bin`, mise/nvm/npm paths); grant
-  those via `COTF_SANDBOX_EXTRA_PATHS` or the agent cannot exec and the run fails to start.
-- `COTF_SANDBOX_EXTRA_PATHS` (colon-separated, capped at 3) are extra read grants for
+  those via `sandbox.extra_paths` or the agent cannot exec and the run fails to start.
+- `sandbox.extra_paths` (a YAML list, capped at 3) are extra read grants for
   deny-most. Seatbelt has no arrays, so a fourth path is dropped with a warning; nest under
   a shared parent or edit the profile if you need more.
-- `COTF_SANDBOX_BROKER_ONLY_LOOPBACK=1` narrows egress from all loopback ports to just the
+- `sandbox.broker_only_loopback: true` narrows egress from all loopback ports to just the
   broker's port (read from the published `*_BASE_URL`), closing the arbitrary-local-sink
   path. If no broker base-url is present it leaves loopback open, so the agent is never
   locked out of a broker it needs.
@@ -238,14 +239,25 @@ set to put in `egress.allow` instead of guessing it up front.
 Both host lists and the brokered-command list live in one file:
 
 ```
-~/.claude-on-the-fly/sandbox.yaml
+~/.claude-on-the-fly/config.yaml
 ```
 
-It is seeded from a commented template (`settings.py`, `sandbox.yaml` inside the
-package) the first time a sandboxed daemon starts, so the first thing you open
-explains its own schema. `settings.check_operator_settings` runs at startup and
-names anything wrong with it — including a misspelled section, which YAML accepts
-happily and which would otherwise do nothing with no diagnostic anywhere.
+It is seeded from a commented template (`settings.py`, `config.yaml` inside the
+package) the first time any daemon starts, so the first thing you open explains its
+own schema. `settings.check_operator_settings` runs at startup and names anything
+wrong with it — including a misspelled section, which YAML accepts happily and
+which would otherwise do nothing with no diagnostic anywhere.
+
+**Saving it is enough.** `settings.py` re-parses on a change to the file's mtime or
+size, so an edit lands at the next read rather than the next restart — which for the
+allowlist means the next CONNECT, and for `permissions.ttl_seconds` the next grant.
+The exceptions are the fields read once at startup, where acting on the new value
+means binding a socket, rewriting the agent's PATH, or constructing a service that
+was never built: `commands:` and `permissions.mode`. Those are listed in
+`settings.RESTART_REQUIRED`, and changing one gets you a message on the frontend
+naming it, on the next turn. Reporting instead of applying is deliberate — tearing
+down a credential-holding broker mid-turn trades a config annoyance for a class of
+mid-turn failure, and both fields are set once per deployment.
 
 ```yaml
 egress:
@@ -384,7 +396,7 @@ That order is deliberate: deny first, shim only what is needed. For `aws`,
 `kubectl`, `terraform`, and `vault` it is deliberate and permanent — the shim runs
 the binary outside the jail with the operator's full credential and no action
 policy, and `terraform apply` or `kubectl delete` against production is not a
-trade worth making for convenience. Use `COTF_SANDBOX=env` for a run that needs
+trade worth making for convenience. Use `sandbox.mode: env` for a run that needs
 one of those.
 
 ### Why loopback and not a unix socket
@@ -395,7 +407,7 @@ A unix socket was the first choice and it does not work. Verified against real
 `(remote unix)` permits the connect, and it is not path-scoped — it opens *every*
 unix socket on the machine, including the Docker socket and the ssh-agent this
 profile otherwise protects. A loopback port can be scoped to one endpoint
-(`COTF_SANDBOX_BROKER_ONLY_LOOPBACK`); a unix socket allow cannot.
+(`sandbox.broker_only_loopback`); a unix socket allow cannot.
 
 Loopback carries no authentication, which is not a new exposure: the credential
 files the broker reads are already readable by any same-UID process on the host.
@@ -460,7 +472,7 @@ has everything in it and is not shareable**; an INFO log is.
 
 That matters because this directory is shaped for a file syncer, so anything
 written here should be assumed to leave the machine and to sit there for
-`COTF_LOG_KEEP_DAYS`. A prompt is the user's data rather than a diagnostic.
+`logs.keep_days`. A prompt is the user's data rather than a diagnostic.
 
 Argv clipping is by token *length*, not by flag name, so a new content-carrying
 flag is covered without being enumerated.
@@ -469,7 +481,7 @@ flag is covered without being enumerated.
 
 - **Wired into the chat orchestrator** (`orchestrator.run`: telegram/slack/gmail). Symphony
   and scheduler share the spawn-site env curation but do **not** auto-start the broker. Do
-  not set `COTF_SANDBOX` for them until the broker is started in their run loops too,
+  not set `sandbox.mode` for them until the broker is started in their run loops too,
   or curation removes the key with no base-url to replace it and breaks LLM auth.
 - **Auth model:** the broker only covers a backend that authenticates with an
   injectable key *header* it can be pointed at via a base-url. That is narrower
@@ -519,7 +531,7 @@ tunnel this project cannot read and must not block.
 
 This is not one gap to be patched. It is the shape of the thing, and it has at
 least two distinct channels. Both were observed live on 2026-07-30 under
-`COTF_SANDBOX=jail`:
+`sandbox.mode: jail`:
 
 **1. Server-side tool connectors (MCP).** Asked for recent open PRs, codex called
 `mcp__codex_apps__github` → `_search_prs` and got real private PRs from private org
@@ -587,7 +599,7 @@ out of scope for this sandbox.
 
 ## Tool permissions
 
-Off by default (`permissions.mode: off` in `~/.claude-on-the-fly/sandbox.yaml`).
+Off by default (`permissions.mode: off` in `~/.claude-on-the-fly/config.yaml`).
 With it off, argv is byte-identical to a build without this feature, `--permission-mode
 bypassPermissions` included. Switching it to `ask` routes permission questions to
 whichever frontend owns the session, with approve/deny buttons.
@@ -768,11 +780,11 @@ a command you were not shown.
 
 ### Also worth knowing
 
-Seeding never overwrites, so an existing `~/.claude-on-the-fly/sandbox.yaml` will not
+Seeding never overwrites, so an existing `~/.claude-on-the-fly/config.yaml` will not
 grow a `permissions:` block on upgrade. Defaults apply and approvals stay off until you
 add one.
 
-`codex` does not start at all under `COTF_SANDBOX_FS=deny-most`; it fails with
+`codex` does not start at all under `sandbox.fs: deny-most`; it fails with
 `Operation not permitted` before any network call. That is pre-existing and unrelated to
 approvals, verified against a baseline with the permission changes stashed.
 

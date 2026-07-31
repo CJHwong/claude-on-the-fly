@@ -2,7 +2,7 @@
 
 A single daemon that drains a durable queue: claim a job, run it through an agent, reply into wherever it came from. It takes work from two producers: `claude-cron`, which polls and enqueues (see [cron.md](cron.md)), and Slack, where a user asks for something long-running. `claude-jobs enqueue` is the third, for smoke tests.
 
-The Slack half is on by default under `$job`. `SLACK_JOB_COMMAND` renames it; setting it **empty** turns it off, and only then does the frontend build no queue — absent versus present-but-blank is the whole opt-out, resolved identically by `slack._resolve_job_command` and `checks.effective_job_command` (a drift test pins them together). With it off the queue is reachable from `claude-jobs enqueue` alone, which is why `claude-jobs doctor` says so rather than passing silently.
+The Slack half is on by default under `$job`. `slack.job_command` renames it; setting it **empty** turns it off, and only then does the frontend build no queue — absent versus present-but-blank is the whole opt-out, resolved identically by `slack._resolve_job_command` and `checks.effective_job_command` (a drift test pins them together). With it off the queue is reachable from `claude-jobs enqueue` alone, which is why `claude-jobs doctor` says so rather than passing silently.
 
 Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Ports and data types: `jobs/core.py`.
 
@@ -26,7 +26,7 @@ A `Job` carries an opaque `origin` dict. The core, the queue, and the worker pas
 
 ## Adding a new queue adapter
 
-`SUPPORTED_QUEUES` in `jobs/registry.py` maps a kind name to a factory over a root directory; `make_queue()` picks one via `JOBS_QUEUE_KIND` (default `file`). Implement the `JobQueue` Protocol, register the kind, set the env var — no worker changes. The file also marks the attach point for a Python entry-points group, not built yet.
+`SUPPORTED_QUEUES` in `jobs/registry.py` maps a kind name to a factory over a root directory; `make_queue()` picks one via `jobs.queue_kind` (default `file`). Implement the `JobQueue` Protocol, register the kind, set the key — no worker changes. The file also marks the attach point for a Python entry-points group, not built yet.
 
 ## The maildir contract
 
@@ -77,8 +77,8 @@ Three ways a jobs setup fails quietly, each caught before a daemon starts rather
 
 | Condition | Status | Why |
 |---|---|---|
-| `SLACK_JOB_COMMAND` set empty | `warn` on `jobs` | The worker runs, but only `claude-jobs enqueue` can reach it. Advisory, not blocking — an enqueue-only install (cron, a git hook) is legitimate. |
-| `JOBS_QUEUE_KIND` not registered | `invalid` on `jobs` **and** `slack` | `make_queue()` raises on an unknown kind and the Slack frontend calls it while building the producer, so a jobs-side typo kills *Slack*. Only added to `check_slack` when the trigger is set, since that is the only time a queue is constructed. |
+| `slack.job_command` set empty | `warn` on `jobs` | The worker runs, but only `claude-jobs enqueue` can reach it. Advisory, not blocking — an enqueue-only install (cron, a git hook) is legitimate. |
+| `jobs.queue_kind` not registered | `invalid` on `jobs` **and** `slack` | `make_queue()` raises on an unknown kind and the Slack frontend calls it while building the producer, so a jobs-side typo kills *Slack*. Only added to `check_slack` when the trigger is set, since that is the only time a queue is constructed. |
 | Trigger live, no worker running | `warn` on `slack` | Advisory: the worker may start after the frontend. The ack itself also tells the truth at runtime — with no worker it says the job stays queued rather than promising a reply. |
 
 `warn` is non-blocking by construction — `checks.is_blocking` is what every caller counting problems should use, so a `doctor` run reports the advice and still exits 0.
@@ -107,12 +107,12 @@ There is no watch pane for a running job: that needs the worker to publish the r
 
 ## Config
 
-| Env var | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
-| `JOBS_QUEUE_KIND` | `file` | Which `SUPPORTED_QUEUES` adapter to build |
-| `JOBS_POLL_INTERVAL_S` | `2.0` | Idle wait between drain attempts |
-| `JOBS_TIMEOUT` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit. A `Job.timeout` from a producer overrides it |
-| `JOBS_CONCURRENCY` | `1` | How many jobs run at once. A property of the machine, deliberately separate from a producer's own `max_concurrent` |
-| `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token |
+| `jobs.queue_kind` | `file` | Which `SUPPORTED_QUEUES` adapter to build |
+| `jobs.poll_interval_s` | `2.0` | Idle wait between drain attempts |
+| `jobs.timeout` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit. A `Job.timeout` from a producer overrides it |
+| `jobs.concurrency` | `1` | How many jobs run at once. A property of the machine, deliberately separate from a producer's own `max_concurrent` |
+| `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token. Stays in `.env`: it is a credential |
 
 Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`) token from `SLACK_TOKEN` makes the worker post results as that user, and the Slack frontend — a separate process with its own dedup set — re-ingests them as new input, one spurious agent turn per job. `cli._notifier_loop_warning` warns about exactly this at startup.
