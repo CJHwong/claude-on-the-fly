@@ -183,8 +183,8 @@ class TestMetadataAccessors:
     @patch("claude_on_the_fly.slack.AsyncApp")
     def test_workspace_name_cached(self, mock_app_cls):
         fe = SlackFrontend("xapp", "xoxp", "U1")
-        fe._workspace_names[42] = "dm-hoss-123"
-        assert fe.workspace_name(42) == "slack/dm-hoss-123"
+        fe._workspace_names[42] = "dm-user-123"
+        assert fe.workspace_name(42) == "slack/dm-user-123"
 
     @patch("claude_on_the_fly.slack.AsyncApp")
     def test_sender_name_default(self, mock_app_cls):
@@ -2732,9 +2732,9 @@ class TestApprovalCardCannotBeRestyledByTheAgent:
         from claude_on_the_fly.slack import _decided_text
 
         request = _request(
-            subject="bash:chmod", scope="bash:chmod 700 /Users/hoss/ws", origin="Bash"
+            subject="bash:chmod", scope="bash:chmod 700 /Users/user/ws", origin="Bash"
         )
-        assert _decided_text(request) == "bash:chmod 700 /Users/hoss/ws"
+        assert _decided_text(request) == "bash:chmod 700 /Users/user/ws"
 
     def test_a_retired_card_falls_back_to_the_subject(self):
         """An egress subject is already the whole decision, so it needs no scope and

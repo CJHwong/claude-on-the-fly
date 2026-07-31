@@ -818,8 +818,8 @@ REAL_WRAPPED_OPTION_DIALOG = """\
  Bash command
 
    chmod 700
-   /Users/hoss/.claude-on-the-fly/workspaces/slack/dm-hoss-1785501201 && ls
-   -ld /Users/hoss/.claude-on-the-fly/workspaces/slack/dm-hoss-1785501201
+   /Users/user/.claude-on-the-fly/workspaces/slack/dm-user-1785501201 && ls
+   -ld /Users/user/.claude-on-the-fly/workspaces/slack/dm-user-1785501201
    Set dir mode to 700 and verify
 
  This command requires approval
@@ -827,7 +827,7 @@ REAL_WRAPPED_OPTION_DIALOG = """\
  Do you want to proceed?
  ❯ 1. Yes
    2. Yes, and don’t ask again for: chmod 700
-      /Users/hoss/.claude-on-the-fly/workspaces/slack/dm-hoss-1785501201
+      /Users/user/.claude-on-the-fly/workspaces/slack/dm-user-1785501201
    3. No
 
  Esc to cancel · Tab to amend · ctrl+e to explain
@@ -881,9 +881,9 @@ def test_a_wrapped_command_is_rejoined_whole_in_the_scope():
     dialog = permissions.parse_dialog(REAL_WRAPPED_OPTION_DIALOG)
     assert dialog is not None
     assert dialog.scope == (
-        "bash:chmod 700 /Users/hoss/.claude-on-the-fly/workspaces/slack/"
-        "dm-hoss-1785501201 && ls -ld /Users/hoss/.claude-on-the-fly/workspaces/"
-        "slack/dm-hoss-1785501201 Set dir mode to 700 and verify"
+        "bash:chmod 700 /Users/user/.claude-on-the-fly/workspaces/slack/"
+        "dm-user-1785501201 && ls -ld /Users/user/.claude-on-the-fly/workspaces/"
+        "slack/dm-user-1785501201 Set dir mode to 700 and verify"
     )
 
 
