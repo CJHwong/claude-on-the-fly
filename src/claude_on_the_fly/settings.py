@@ -40,7 +40,7 @@ BUNDLED_SETTINGS = Path(__file__).parent / "sandbox.yaml"
 # Top-level keys the loader understands. A hand-edited file's likeliest failure is
 # a misspelled section, which YAML accepts happily and which would otherwise do
 # nothing at all with no diagnostic; `check_operator_settings` names them instead.
-SECTIONS = ("egress", "commands")
+SECTIONS = ("egress", "commands", "permissions")
 
 
 def operator_settings() -> Path:

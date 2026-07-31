@@ -20,6 +20,7 @@ from claude_on_the_fly.approvals import (
     GrantStore,
     RecordingGate,
     gate_from_frontend,
+    tool_policy,
 )
 
 
@@ -498,3 +499,72 @@ async def test_a_cancelled_question_leaves_no_grant_behind():
     with contextlib.suppress(asyncio.CancelledError):
         await asker
     assert broker.allows("host:slow:443") is False
+
+
+# --- per-kind policy ---
+
+
+def _tool_request(subject: str) -> ApprovalRequest:
+    return ApprovalRequest(kind="tool", subject=subject, detail="cotf asked: Bash")
+
+
+async def test_tool_prompts_do_not_spend_the_egress_budget():
+    """The load-bearing case for splitting the budgets. The egress ceiling exists
+    because a burst of distinct hosts is itself the signal; a supervised turn asks
+    about tools far more often than that, and sharing one budget meant the turn
+    silently auto-denied every host it needed afterwards."""
+    gate = RecordingGate(default=True)
+    broker = ApprovalBroker(
+        gate,
+        policy=ApprovalPolicy(rate_limit=3),
+        policies={"tool": tool_policy()},
+    )
+    for index in range(20):
+        await broker.check(_tool_request(f"bash:prog{index}"))
+    # The host budget is untouched by all of that.
+    assert await broker.check(make_request("a.example:443")) is True
+    assert await broker.check(make_request("b.example:443")) is True
+    assert await broker.check(make_request("c.example:443")) is True
+    assert await broker.check(make_request("d.example:443")) is False
+
+
+async def test_the_egress_budget_still_bites_on_its_own_kind():
+    """Regression guard: splitting the budgets must not have loosened the one that
+    was there for a reason."""
+    gate = RecordingGate(default=True)
+    broker = ApprovalBroker(gate, policy=ApprovalPolicy(rate_limit=2))
+    for index in range(4):
+        await broker.check(make_request(f"host{index}.example:443"))
+    assert len(gate.seen) == 2
+
+
+async def test_a_kind_with_no_override_uses_the_shared_default():
+    broker = ApprovalBroker(RecordingGate(), policy=ApprovalPolicy(rate_limit=7))
+    assert broker.policy_for("host").rate_limit == 7
+    assert broker.policy_for("anything-else").rate_limit == 7
+
+
+def test_the_tool_policy_never_refuses_a_subject_outright():
+    """The egress never-ask tier covers subjects no legitimate task needs and an
+    operator could be talked into approving. Tool calls have no equivalent set, and
+    inventing one would be a denylist pretending to be a boundary."""
+    assert tool_policy().never_ask == frozenset()
+    assert not tool_policy().refuses("bash:curl")
+
+
+def test_the_tool_ceiling_is_looser_than_the_egress_one():
+    assert tool_policy().rate_limit > ApprovalPolicy().rate_limit
+
+
+async def test_the_rate_limit_log_names_the_kind_that_ran_out(caplog):
+    """Two budgets means a rate-limit line that does not say which one was spent is
+    unactionable."""
+    broker = ApprovalBroker(
+        RecordingGate(default=True),
+        policy=ApprovalPolicy(rate_limit=1),
+        policies={"tool": ApprovalPolicy(rate_limit=1)},
+    )
+    await broker.check(_tool_request("bash:ls"))
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
+        assert await broker.check(_tool_request("bash:cat")) is False
+    assert "tool requests" in caplog.text

@@ -12,7 +12,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from claude_on_the_fly import agent, broker, commands, egress, logs, sandbox, settings
+from claude_on_the_fly import (
+    agent,
+    broker,
+    commands,
+    cotf_approve,
+    egress,
+    logs,
+    permissions,
+    sandbox,
+    settings,
+)
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
@@ -116,6 +126,98 @@ class SessionEgress:
         self._proxies.clear()
 
 
+class SessionPermissions:
+    """One approval service, with its own grant store, per session.
+
+    Mirrors SessionEgress, for the same two reasons: a grant must not leak into
+    another chat, and the prompt has to land in the conversation that caused it.
+    Separate from SessionEgress rather than folded into it because a deployment can
+    run either without the other -- egress gating is COTF_SANDBOX, tool approvals
+    are `permissions.mode`, and neither implies the other.
+    """
+
+    def __init__(self, frontend: Frontend) -> None:
+        self._frontend = frontend
+        self._services: dict[int, tuple[str, permissions.PermissionService]] = {}
+        # chat_id -> the service's request total as of the end of the last turn.
+        # The guard needs a per-turn delta, not a lifetime count: a session that
+        # asked once and then lost its gate would otherwise pass every later check
+        # on the strength of that one early request.
+        self._asked_before_turn: dict[int, int] = {}
+
+    async def env_for(
+        self, chat_id: int, session: str, workspace: Path
+    ) -> dict[str, str]:
+        """Approval env for this session, starting a service the first time."""
+        resolved = permissions.configured()
+        if not resolved.enabled:
+            return {}
+        existing = self._services.get(chat_id)
+        if existing is not None and existing[0] == session:
+            return {
+                cotf_approve.ENDPOINT_ENV: existing[1].base_url
+                + permissions.DECIDE_PATH
+            }
+        if existing is not None:
+            await existing[1].stop()
+            # The replacement service starts its count at zero, so a stale
+            # baseline here would make the first turn's delta negative.
+            self._asked_before_turn.pop(chat_id, None)
+            logger.info("permissions: chat %s session changed, grants dropped", chat_id)
+        label = f"chat {chat_id}"
+        service = permissions.PermissionService(
+            broker=ApprovalBroker(
+                approvals_mod.gate_from_frontend(self._frontend, chat_id),
+                policies={"tool": approvals_mod.tool_policy()},
+                timeout_seconds=resolved.timeout_seconds,
+                label=label,
+            ),
+            workspace=workspace,
+            ttl_seconds=resolved.ttl_seconds,
+            label=label,
+        )
+        await service.start()
+        self._services[chat_id] = (session, service)
+        logger.info(
+            "permissions: chat %s -> 127.0.0.1:%d (own grant store, session %s)",
+            chat_id,
+            service.port,
+            session[:8],
+        )
+        return {cotf_approve.ENDPOINT_ENV: service.base_url + permissions.DECIDE_PATH}
+
+    def check_turn(self, chat_id: int, response: Response, backend: str) -> None:
+        """Report a turn that used tools without the gate ever being asked.
+
+        codex runs the command when its hook is untrusted or crashes, so that
+        failure is invisible from the outside: the operator sees an ordinary turn
+        and assumes it was supervised. Comparing the turn's own tool count against
+        what the service was asked is the only place the two facts meet.
+
+        Compares a per-turn delta rather than the service's lifetime total. With the
+        total, a session that asked about one thing early and then lost its gate
+        would pass every subsequent check forever on the strength of that one
+        request -- which is the failure mode most worth catching, since a gate that
+        never worked at all is far more likely to be noticed.
+        """
+        entry = self._services.get(chat_id)
+        if entry is None:
+            return
+        total = entry[1].requests_seen
+        asked_this_turn = total - self._asked_before_turn.get(chat_id, 0)
+        self._asked_before_turn[chat_id] = total
+        permissions.warn_if_ungated(
+            sum(response.tool_counts.values()),
+            asked_this_turn,
+            backend=backend,
+        )
+
+    async def close_all(self) -> None:
+        for _session, service in list(self._services.values()):
+            await service.stop()
+        self._services.clear()
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -123,10 +225,13 @@ class Orchestrator:
         platform: str,
         event_log: EventLog | None = None,
         egress_manager: SessionEgress | None = None,
+        permissions_manager: SessionPermissions | None = None,
     ) -> None:
         # None when sandboxing is off: no proxy, no per-session env, and the
         # spawn sites behave exactly as they did before any of this existed.
         self._egress = egress_manager
+        # None when approvals are off, which keeps the spawn env untouched.
+        self._permissions = permissions_manager
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
@@ -330,10 +435,15 @@ class Orchestrator:
             # exhausted fd table). Outside it, that failure escaped _process
             # entirely: the in-flight slot set just above leaked, notify_complete
             # never ran, and the whole drain task died with turns still queued.
+            session_overrides: dict[str, str] = {}
             if self._egress is not None:
-                env_token = sandbox.session_env(
-                    await self._egress.env_for(chat_id, session)
+                session_overrides.update(await self._egress.env_for(chat_id, session))
+            if self._permissions is not None:
+                session_overrides.update(
+                    await self._permissions.env_for(chat_id, session, workspace)
                 )
+            if session_overrides:
+                env_token = sandbox.session_env(session_overrides)
             await self._frontend.notify_start(chat_id)
             typing_task = asyncio.create_task(self._typing_loop(chat_id))
             if turn.compact:
@@ -349,6 +459,14 @@ class Orchestrator:
                     user_name=self._frontend.sender_name(chat_id),
                     channel_context=self._frontend.channel_context(chat_id),
                     timeout=self._frontend.timeout_for(chat_id),
+                )
+            if self._permissions is not None:
+                # After the turn, because the tool count only exists once it is
+                # over. Reporting late beats not reporting: an ungated turn is
+                # exactly what an operator who enabled approvals must never
+                # discover by accident.
+                self._permissions.check_turn(
+                    chat_id, response, os.environ.get("AGENT_BACKEND", "claude")
                 )
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
@@ -537,6 +655,7 @@ async def _start_sandbox(
     # without this a typo surfaces as a host prompt or a missing shim much later,
     # nowhere near the edit that caused it.
     settings.check_operator_settings()
+    permissions.check()
     broker_instance = None
     command_broker = None
     try:
@@ -577,6 +696,11 @@ async def _start_sandbox(
     # per run, that the boundary was actually in force rather than inferring it
     # from an absence of errors.
     await sandbox.verify_denials()
+    # The shim and its MCP config are rewritten every startup so the
+    # interpreter path cannot go stale across a venv move or an upgrade.
+    if permissions.configured().enabled:
+        permissions.write_shim()
+        permissions.write_mcp_config()
     return broker_instance, SessionEgress(frontend), command_broker
 
 
@@ -599,7 +723,17 @@ async def run(frontend: Frontend, platform: str) -> None:
     # operator to grant an unknown one mid-run instead of failing the task.
     broker_instance, session_egress, command_broker = await _start_sandbox(frontend)
 
-    orch = Orchestrator(frontend, platform, egress_manager=session_egress)
+    # Approvals are independent of COTF_SANDBOX, so this is built whenever the
+    # config asks for it rather than only inside the sandbox branch.
+    session_permissions = (
+        SessionPermissions(frontend) if permissions.configured().enabled else None
+    )
+    orch = Orchestrator(
+        frontend,
+        platform,
+        egress_manager=session_egress,
+        permissions_manager=session_permissions,
+    )
     frontend.set_orchestrator(orch)
 
     stop = asyncio.Event()
@@ -624,6 +758,8 @@ async def run(frontend: Frontend, platform: str) -> None:
     # Stopping these revokes every route out of the sandbox at once.
     if session_egress is not None:
         await session_egress.close_all()
+    if session_permissions is not None:
+        await session_permissions.close_all()
     if command_broker is not None:
         await command_broker.stop()
     if broker_instance is not None:

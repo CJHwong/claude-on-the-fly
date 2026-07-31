@@ -109,3 +109,63 @@ commands:
         - auth login
         - auth switch
       env_passthrough: [ACLI_SITE, NO_COLOR]
+
+permissions:
+  # Whether a tool call the agent wants to make can reach you for approval.
+  #
+  #   off  (default)  Nothing is gated. Byte-identical to the behaviour before
+  #                   this feature existed, including --permission-mode
+  #                   bypassPermissions.
+  #   ask             Permission questions arrive on whichever frontend the
+  #                   session belongs to, with approve/deny buttons.
+  #
+  # What you are asked is NOT the same on every backend, and the difference is
+  # worth knowing before you turn this on:
+  #
+  #   claude (native)  claude's own question, forwarded. It decides what needs
+  #                    asking; cotf classifies nothing.
+  #   claude (pty)     claude's own question, forwarded out of its terminal
+  #                    dialog. Same as above. Note a denial costs one extra
+  #                    model turn, because the refusal has to be delivered as a
+  #                    message for the turn to end.
+  #   codex            cotf's question. `codex exec` never asks anyone anything,
+  #                    so there is nothing to forward and cotf decides what is
+  #                    worth interrupting you for. That decision is a
+  #                    convenience filter, not a security boundary.
+  #
+  # Cron and the background job queue always stay on bypass. Nobody is watching
+  # a cron thread, so gating it would just fail every tool call.
+  #
+  # Quoted because YAML reads a bare `off` as the boolean false. Writing it bare
+  # still works (the loader treats false as off), but `on` is refused rather than
+  # guessed at, since it is not one of the two names.
+  mode: "off"
+
+  # --permission-mode handed to the claude backends when mode is `ask`. This is
+  # what decides how much you get asked about, so it is the volume knob.
+  #
+  #   default      claude asks about the interesting calls and stays quiet about
+  #                reads and inspection. Measured: it asked about chmod,
+  #                find -delete, sudo, curl and git init, and did not ask about
+  #                ls, cat, echo, git status or Read.
+  #   acceptEdits  as default, minus prompts for file edits.
+  #   manual       asks about more.
+  #   auto         hands the decision to a model instead of to you. Measured on
+  #                sonnet 5: it approved all six of a deliberately nasty set
+  #                (sudo, a write into /etc, chmod -R 777, find -delete,
+  #                ls ~/.ssh, curl) without asking once, at 2.6-3.1s and one
+  #                model call each. Pick it if you want fewer interruptions;
+  #                do not pick it expecting a safety net. Unavailable on some
+  #                models, which silently fall back.
+  #
+  # bypassPermissions and dontAsk are refused here: both were measured at zero
+  # prompts, so pairing either with `ask` produces a deployment that looks gated
+  # and is not.
+  claude_mode: default
+
+  # How long one approval lasts, and how long you have to answer before the gate
+  # gives up and denies. Grants are held in memory and die with the daemon.
+  # The 300s answer window is deliberate: claude tolerated a 205s wait and still
+  # ran the approved call, so the real limit is your patience, not the CLI's.
+  ttl_seconds: 1800
+  timeout_seconds: 300

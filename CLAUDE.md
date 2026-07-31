@@ -22,6 +22,8 @@ src/claude_on_the_fly/
   egress.py            # CONNECT proxy gating outbound HTTPS by destination host
   commands.py          # Runs credentialed CLIs outside the sandbox via PATH shims
   approvals.py         # Runtime permission grants (ask the operator, then widen)
+  permissions.py       # Tool-call approvals: config, subjects, per-backend wiring
+  cotf_approve.py      # Shim a sandboxed backend runs to ask (MCP or hook)
   settings.py          # ~/.claude-on-the-fly/sandbox.yaml (hosts + brokered CLIs)
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
   protocol.py          # Frontend protocol (add new interfaces here)

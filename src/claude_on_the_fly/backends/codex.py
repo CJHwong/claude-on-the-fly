@@ -11,7 +11,7 @@ import shlex
 import time
 from pathlib import Path
 
-from claude_on_the_fly import agent, pricing, sandbox, transcript
+from claude_on_the_fly import agent, permissions, pricing, sandbox, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
@@ -32,6 +32,14 @@ COMPACT_TOKEN_LIMIT = 2000
 # cannot be a standalone operation the way claude's `/compact` is. Keep the reply
 # tiny: it lands in the conversation the compaction just summarized.
 COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
+
+
+# item.completed types that are not tool calls. "reasoning" never was; "error"
+# joined the list when permissions mode `ask` started passing
+# --dangerously-bypass-hook-trust, which codex announces as an error item -- and
+# counting it produced a phantom tool named "error" in the response footer of every
+# gated codex turn.
+_NON_TOOL_ITEMS = frozenset({"reasoning", "error"})
 
 
 def _merge_codex_results(first: dict, second: dict) -> dict:
@@ -83,7 +91,7 @@ def parse_codex_stream(stdout: bytes) -> dict:
                 text = item.get("text") or ""
                 if text:
                     body = text
-            elif item_type and item_type != "reasoning":
+            elif item_type and item_type not in _NON_TOOL_ITEMS:
                 tool_counts[item_type] = tool_counts.get(item_type, 0) + 1
         elif kind == "turn.completed":
             usage = msg.get("usage") or {}
@@ -429,6 +437,10 @@ class CodexBackend:
         binary = [] if self.launcher else ["codex"]
         model_env = os.environ.get("CODEX_MODEL", "").strip()
         model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
+        # --yolo stays whether approvals are on or not. codex exec overrides
+        # approval_policy to `never` regardless (measured: request untrusted, get
+        # never), so there is no CLI-side gate to leave enabled -- the PreToolUse
+        # hook in permissions.codex_argv is the entire gate.
         return [
             *prefix,
             *binary,
@@ -436,6 +448,7 @@ class CodexBackend:
             "--json",
             "--skip-git-repo-check",
             "--yolo",
+            *permissions.codex_argv(),
             "-C",
             str(workspace),
             *model_args,

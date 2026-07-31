@@ -71,6 +71,13 @@ _STDIN_WAIT_SECONDS = 0.25
 # environment via sandbox._PASSTHROUGH, and the generated shims read it.
 ENDPOINT_ENV = "COTF_CMD_ENDPOINT"
 
+# Files in the shim directory that are not command shims and must survive the
+# stale sweep. The permission-approval shim shares the directory because
+# fs-deny-most.sb re-grants reads there and nowhere else under DATA_DIR; without
+# this the sweep would delete it on the next startup and every gated tool call
+# would fail on a missing interpreter.
+RESERVED_SHIM_NAMES = frozenset({"cotf-approve"})
+
 _REFUSAL_TEXT = (
     "[sandbox] this command returns a credential, which is exactly what the "
     "command broker exists to keep out of the sandbox. The tool itself works "
@@ -536,6 +543,12 @@ class CommandBroker:
         # answers "not brokered" with rc 127, permanently, until someone notices
         # the file.
         for stale in self._shim_dir.iterdir():
+            if stale.name in RESERVED_SHIM_NAMES:
+                # Not a tool shim and not ours to sweep. It lives here because
+                # fs-deny-most.sb re-grants reads on this directory and nothing
+                # else under DATA_DIR, so it is the one place a sandboxed agent can
+                # exec a generated helper from.
+                continue
             if stale.is_file() and stale.name not in self._tools:
                 logger.info("commands: removing stale shim %s", stale.name)
                 stale.unlink()

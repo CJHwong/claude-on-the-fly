@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from claude_on_the_fly import orchestrator as orchestrator_mod
+from claude_on_the_fly import permissions as permissions_mod
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import Orchestrator, Turn
@@ -1345,6 +1346,46 @@ class TestRunTeardown:
         command_broker.stop.assert_awaited_once()
         credential_broker.stop.assert_awaited_once()
 
+    async def test_shutdown_also_revokes_the_approval_services(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """Each approval service is a listening socket holding a session's grants.
+        Leaving one up past shutdown would keep answering for a daemon that is
+        gone."""
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(None, None, None)),
+        )
+        closed: list[str] = []
+
+        class SpyPermissions(orchestrator_mod.SessionPermissions):
+            async def close_all(self) -> None:
+                closed.append("closed")
+                await super().close_all()
+
+        monkeypatch.setattr(orchestrator_mod, "SessionPermissions", SpyPermissions)
+
+        stub = MagicMock()
+        stub.describe = lambda: {}
+        stub.set_orchestrator = MagicMock()
+        stub.stop = AsyncMock()
+
+        async def never_returns(_on_message):
+            await asyncio.sleep(3600)
+
+        stub.start = never_returns
+        original_wait = asyncio.Event.wait
+
+        async def stop_immediately(self):
+            self.set()
+            return await original_wait(self)
+
+        monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
+        await orchestrator_mod.run(stub, "test")
+        assert closed == ["closed"]
+
 
 def test_settings_summary_includes_the_frontends_own_fields(monkeypatch, caplog):
     """Secrets are redacted by the frontend before they get here, so this only has
@@ -1384,3 +1425,241 @@ class TestFrontendApprovalDefault:
         await Frontend.notify_queued(frontend, 1, 3)
         assert frontend.sent[0][0] == 1
         assert "Queued (3 pending)" in frontend.sent[0][1].body
+
+
+# --- per-session approval services ---
+
+
+async def test_session_permissions_is_inert_when_approvals_are_off(operator_settings):
+    """Off is the default, so this is the path almost every deployment takes: no
+    service, no env, nothing added to the spawn."""
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    assert await manager.env_for(1, "sess-a", Path("/tmp/ws")) == {}
+
+
+async def test_session_permissions_hands_the_agent_its_endpoint(operator_settings):
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        env = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
+        url = env[cotf_approve.ENDPOINT_ENV]
+        assert url.startswith("http://127.0.0.1:")
+        assert url.endswith(permissions_mod.DECIDE_PATH)
+        # Same session, same service: a new port per turn would drop grants mid-run.
+        assert await manager.env_for(7, "sess-a", Path("/tmp/ws")) == env
+    finally:
+        await manager.close_all()
+
+
+async def test_a_new_session_drops_the_previous_grants(operator_settings, caplog):
+    """/new has to mean what it says. Reusing the service would carry every
+    approval from the conversation the operator just abandoned."""
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        first = await manager.env_for(9, "sess-a", Path("/tmp/ws"))
+        with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+            second = await manager.env_for(9, "sess-b", Path("/tmp/ws"))
+        assert first[cotf_approve.ENDPOINT_ENV] != second[cotf_approve.ENDPOINT_ENV]
+        assert "grants dropped" in caplog.text
+    finally:
+        await manager.close_all()
+
+
+async def test_each_chat_gets_its_own_grant_store(operator_settings):
+    """A grant approved in one conversation must not authorise another. The port is
+    the only label a request carries, so one service per chat is what confines it."""
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        one = await manager.env_for(1, "s", Path("/tmp/ws"))
+        two = await manager.env_for(2, "s", Path("/tmp/ws"))
+        assert one[cotf_approve.ENDPOINT_ENV] != two[cotf_approve.ENDPOINT_ENV]
+    finally:
+        await manager.close_all()
+
+
+async def test_check_turn_is_silent_for_a_chat_with_no_service(operator_settings):
+    """A chat that never started a service cannot have been gated, and there is
+    nothing to compare against."""
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager.check_turn(404, Response(body="x", tool_counts={"Bash": 2}), "codex")
+
+
+async def test_check_turn_reports_a_turn_that_never_reached_the_gate(
+    operator_settings, caplog
+):
+    """The whole point of the guard: codex treats an untrusted hook as no opinion
+    and runs the command, so an ungated turn is otherwise indistinguishable from a
+    supervised one."""
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        await manager.env_for(3, "s", Path("/tmp/ws"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(3, Response(body="x", tool_counts={"Bash": 2}), "codex")
+        assert "ran UNSUPERVISED" in caplog.text
+    finally:
+        await manager.close_all()
+
+
+async def test_the_spawn_env_carries_both_egress_and_approval_routing(
+    operator_settings, monkeypatch, tmp_path
+):
+    """Both managers publish into the same per-session ContextVar. An earlier
+    revision assigned rather than merged, so whichever ran second silently dropped
+    the other's routing."""
+    from claude_on_the_fly import cotf_approve, sandbox
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    frontend = StubFrontend()
+    egress_manager = MagicMock()
+    egress_manager.env_for = AsyncMock(
+        return_value={"HTTPS_PROXY": "http://127.0.0.1:1"}
+    )
+    permissions_manager = orchestrator_mod.SessionPermissions(frontend)
+    orch = Orchestrator(
+        frontend,
+        "test",
+        egress_manager=egress_manager,
+        permissions_manager=permissions_manager,
+    )
+    seen: dict[str, str] = {}
+
+    async def fake_run(*_args, **_kwargs):
+        current = sandbox._SESSION_ENV.get() or {}
+        seen.update(current)
+        return Response(body="done")
+
+    monkeypatch.setattr(orchestrator_mod.agent, "run", fake_run)
+    monkeypatch.setattr(orch, "_workspace_for", lambda _chat: tmp_path, raising=False)
+    try:
+        await orch._process(1, Turn(text="hi"))
+    finally:
+        await permissions_manager.close_all()
+    assert seen.get("HTTPS_PROXY") == "http://127.0.0.1:1"
+    assert cotf_approve.ENDPOINT_ENV in seen
+
+
+async def test_start_sandbox_writes_the_approval_shim_when_approvals_are_on(
+    monkeypatch, operator_settings
+):
+    """The shim and its MCP config are rewritten every startup so the interpreter
+    path cannot go stale across a venv move or an upgrade, and so a wheel build
+    never has to carry an exec bit."""
+    from claude_on_the_fly import permissions as perms
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    credential_broker = MagicMock()
+    credential_broker.stop = AsyncMock()
+    monkeypatch.setattr(
+        orchestrator_mod.broker,
+        "start_default_broker",
+        AsyncMock(return_value=credential_broker),
+    )
+    command_broker = MagicMock()
+    command_broker.start = AsyncMock()
+    command_broker.stop = AsyncMock()
+    command_broker.shimmed = []
+    command_broker.agent_env = lambda: {}
+    monkeypatch.setattr(
+        orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+    )
+    monkeypatch.setattr(
+        orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+    )
+    written: list[str] = []
+    monkeypatch.setattr(perms, "write_shim", lambda: written.append("shim"))
+    monkeypatch.setattr(perms, "write_mcp_config", lambda: written.append("config"))
+
+    await orchestrator_mod._start_sandbox(StubFrontend())
+    assert written == ["shim", "config"]
+
+
+async def test_start_sandbox_writes_no_shim_when_approvals_are_off(
+    monkeypatch, operator_settings
+):
+    from claude_on_the_fly import permissions as perms
+
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    credential_broker = MagicMock()
+    credential_broker.stop = AsyncMock()
+    monkeypatch.setattr(
+        orchestrator_mod.broker,
+        "start_default_broker",
+        AsyncMock(return_value=credential_broker),
+    )
+    command_broker = MagicMock()
+    command_broker.start = AsyncMock()
+    command_broker.stop = AsyncMock()
+    command_broker.shimmed = []
+    command_broker.agent_env = lambda: {}
+    monkeypatch.setattr(
+        orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+    )
+    monkeypatch.setattr(
+        orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        perms, "write_shim", lambda: pytest.fail("wrote a shim with approvals off")
+    )
+    await orchestrator_mod._start_sandbox(StubFrontend())
+
+
+async def test_the_guard_catches_a_gate_that_breaks_after_working_once(
+    operator_settings, caplog
+):
+    """The bug this replaced: comparing the service's lifetime total meant one early
+    request bought a permanent pass. A gate that worked on turn one and then
+    detached would never be reported again -- and that is the case most worth
+    catching, since a gate that never worked at all gets noticed on the first turn.
+    """
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        await manager.env_for(5, "s", Path("/tmp/ws"))
+        service = manager._services[5][1]
+
+        # Turn one: the gate is attached and answers a question.
+        service.requests_seen = 1
+        caplog.clear()
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(5, Response(body="a", tool_counts={"Bash": 1}), "codex")
+        assert "ran UNSUPERVISED" not in caplog.text, (
+            "a working turn must not be reported"
+        )
+
+        # Turn two: tools ran, the gate was never asked. Under the old lifetime
+        # comparison this passed, because the total was still 1.
+        caplog.clear()
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(5, Response(body="b", tool_counts={"Bash": 4}), "codex")
+        assert "ran UNSUPERVISED" in caplog.text
+    finally:
+        await manager.close_all()
+
+
+async def test_a_new_session_resets_the_guards_baseline(operator_settings, caplog):
+    """The replacement service counts from zero, so a stale baseline would make the
+    first turn's delta negative and silently pass."""
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        await manager.env_for(6, "first", Path("/tmp/ws"))
+        manager._services[6][1].requests_seen = 7
+        manager.check_turn(6, Response(body="a", tool_counts={"Bash": 1}), "codex")
+
+        await manager.env_for(6, "second", Path("/tmp/ws"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(6, Response(body="b", tool_counts={"Bash": 2}), "codex")
+        assert "ran UNSUPERVISED" in caplog.text
+    finally:
+        await manager.close_all()

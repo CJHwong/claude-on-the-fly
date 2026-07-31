@@ -1514,3 +1514,21 @@ class TestCodexContextReading:
         ):
             resp = await CodexBackend().run(workspace, "s-1", "hi", "telegram")
         assert resp.context_tokens is None
+
+
+def test_an_error_item_is_not_counted_as_a_tool():
+    """Permissions mode `ask` passes --dangerously-bypass-hook-trust, which codex
+    announces as an error item. Counting it produced a phantom tool named "error"
+    in the response footer of every gated codex turn."""
+    from claude_on_the_fly.backends.codex import parse_codex_stream
+
+    stream = b"\n".join(
+        [
+            b'{"type":"item.completed","item":{"id":"i1","type":"error",'
+            b'"message":"`--dangerously-bypass-hook-trust` is enabled."}}',
+            b'{"type":"item.completed","item":{"id":"i2",'
+            b'"type":"command_execution","command":"ls"}}',
+            b'{"type":"item.completed","item":{"id":"i3","type":"reasoning"}}',
+        ]
+    )
+    assert parse_codex_stream(stream)["tool_counts"] == {"command_execution": 1}
