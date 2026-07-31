@@ -1,11 +1,18 @@
 # Sandbox policy: which hosts the agent may reach, and which credentialed CLIs
 # it may run through the command broker.
 #
-# This copy ships inside the package and is replaced on upgrade. Edit your own at
-# ~/.claude-on-the-fly/sandbox.yaml, which is seeded from this file on first run.
-# Yours is merged over these defaults one section at a time, so a typo in
-# `egress:` cannot cost you your `commands:` additions -- the broken section logs
-# an ERROR naming itself and falls back, the other still loads.
+# There are two copies of this file. The one inside the package holds the defaults
+# and is replaced on upgrade; the one at ~/.claude-on-the-fly/sandbox.yaml is yours
+# to edit and is never overwritten, not even by an upgrade. If you are reading this
+# from your own copy, you are in the right place.
+#
+# Yours is merged over the defaults one section at a time, so a typo in `egress:`
+# cannot cost you your `commands:` additions -- the broken section logs an ERROR
+# naming itself and falls back, and the others still load.
+#
+# Because your copy is never overwritten, a new section added by an upgrade will not
+# appear in it on its own. `[g]` in the TUI opens yours; the defaults above are the
+# reference for anything missing.
 #
 # That path is deliberately NOT in the seatbelt write allowlist. This file decides
 # what runs outside the sandbox holding real credentials, and which hosts skip the

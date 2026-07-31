@@ -17,6 +17,8 @@ class _Host(App):
 
 
 async def test_selecting_an_option_returns_its_id():
+    """The first row is .env, because a deployment cannot run without credentials and
+    that is what someone opening this is most likely to want."""
     app = _Host()
     async with app.run_test() as pilot:
         answers: list[object] = []
@@ -24,7 +26,7 @@ async def test_selecting_an_option_returns_its_id():
         await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
-    assert answers == ["cron"]
+    assert answers == ["env"]
 
 
 async def test_the_second_option_is_reachable():
@@ -36,7 +38,7 @@ async def test_the_second_option_is_reachable():
         await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause()
-    assert answers == ["env"]
+    assert answers == ["sandbox"]
 
 
 async def test_escape_returns_nothing():
@@ -60,7 +62,7 @@ async def test_the_list_takes_focus_so_arrow_keys_work():
         assert app.screen.query_one(OptionList).has_focus
 
 
-async def test_the_sandbox_option_is_reachable():
+async def test_the_last_option_is_reachable():
     app = _Host()
     async with app.run_test() as pilot:
         answers: list[object] = []
@@ -70,19 +72,19 @@ async def test_the_sandbox_option_is_reachable():
         await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause()
-    assert answers == ["sandbox"]
+    assert answers == ["cron"]
 
 
-async def test_the_existing_options_keep_their_positions():
-    """The new row was appended rather than slotted in, so anyone who reaches .env by
-    pressing down-once still gets .env."""
+async def test_the_order_follows_how_a_deployment_is_set_up():
+    """Credentials, then what the agent may reach and do, then the optional scheduled
+    work. Alphabetical or newest-last would both read as arbitrary."""
     app = _Host()
     async with app.run_test() as pilot:
         await app.push_screen(ConfigPickerScreen())
         await pilot.pause()
         options = app.screen.query_one(OptionList)
         ids = [options.get_option_at_index(i).id for i in range(options.option_count)]
-    assert ids == ["cron", "env", "sandbox"]
+    assert ids == ["env", "sandbox", "cron"]
 
 
 async def test_every_option_names_the_file_it_edits():

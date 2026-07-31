@@ -3,7 +3,7 @@
 Decoupled from panel focus on purpose: editing config is a rare, deliberate
 action, so an explicit pick reads better than a key whose meaning shifts with
 whatever happens to be focused. Returns the chosen target id (
-"cron" | "env" | "sandbox") via dismiss(), or None on cancel.
+"env" | "sandbox" | "cron") via dismiss(), or None on cancel.
 """
 
 from __future__ import annotations
@@ -37,12 +37,18 @@ class ConfigPickerScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="config-picker"):
             yield Static("[bold]Edit which config?[/bold]", id="config-picker-title")
+            # Ordered the way a deployment is actually set up: credentials first,
+            # because nothing runs without them; then what the agent is allowed to
+            # reach and do; then the optional scheduled work. Alphabetical, or
+            # newest-last, would both read as arbitrary to someone opening this for
+            # the first time.
             yield OptionList(
-                Option("cron.yaml       cron entries", id="cron"),
                 Option(".env            chat tokens, model, creds", id="env"),
-                # Appended rather than slotted in, so the two existing rows keep
-                # the positions anyone's muscle memory already knows.
-                Option("sandbox.yaml    hosts, brokered CLIs, approvals", id="sandbox"),
+                Option(
+                    "sandbox.yaml    egress hosts, brokered CLIs, approvals",
+                    id="sandbox",
+                ),
+                Option("cron.yaml       scheduled runs", id="cron"),
                 id="config-picker-list",
             )
 

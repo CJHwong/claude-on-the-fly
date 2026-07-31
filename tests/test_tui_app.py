@@ -426,11 +426,11 @@ class TestDashboardLayout:
                 app, "push_screen", lambda *a, **k: calls.append(("screen", a[0]))
             )
             # The dialog dismisses with one of these ids (or None on cancel).
-            screen._open_config_target("cron")
             screen._open_config_target("env")
             screen._open_config_target("sandbox")
+            screen._open_config_target("cron")
             screen._open_config_target(None)  # cancel → no-op
-            assert calls == ["cron", "env", "sandbox"]
+            assert calls == ["env", "sandbox", "cron"]
 
     @pytest.mark.asyncio
     @pytest.mark.asyncio
