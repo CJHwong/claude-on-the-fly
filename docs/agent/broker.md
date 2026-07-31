@@ -605,11 +605,31 @@ For claude, the CLI decides what deserves a human and cotf forwards it. Measured
 2.1.220: it asked about `chmod`, `find -delete`, `sudo`, `curl` and `git init`, and did
 not ask about `ls`, `cat`, `echo`, `git status` or `Read`.
 
-For codex there is nothing to forward. `codex exec` overrides `approval_policy` to
-`never` whatever you pass, its `PermissionRequest` hook is observe-only and fires
-*after* the only hook that can block, and `approvals_reviewer=user` emits no event at
-all. So cotf decides what is worth interrupting you for, in `permissions.worth_asking`.
-The approval card says which: `claude asked:` versus `cotf asked:`.
+For codex there is nothing forwardable, which is not the same as codex having no
+approval system. It has one; under `codex exec` none of it reaches a human.
+
+- `codex exec` overrides `approval_policy` to `never` whatever you pass. Measured:
+  request `untrusted`, codex reports `never`.
+- Set `approvals_reviewer` and approvals do fire, and the `PermissionRequest` hook
+  arrives carrying codex's own wording, e.g. *"Allow curl network access to check the
+  HTTP status code from example.com?"*.
+- But the reviewer is a model. `approvals_reviewer` accepts `user`, `auto_review` and
+  `guardian_subagent`; `user` is inert under exec (no event at all, the sandbox simply
+  denies), and the other two each spawn a guardian subagent that answers
+  `{"outcome":"allow"}`.
+- And that hook cannot be answered. `block`, `denied` and `approved` were all ignored
+  and the command ran. It also fires 25ms *after* `PreToolUse`, the only hook that can
+  block:
+
+  ```
+  13:29:00.026  PreToolUse         can block, does not yet know approval is wanted
+  13:29:00.051  PermissionRequest  knows, cannot block
+  ```
+
+So the gate has to sit where codex has not yet formed an opinion, and cotf decides what
+is worth interrupting you for, in `permissions.worth_asking`. That ordering is the whole
+reason the two backends differ; it is not a preference. The approval card says which:
+`claude asked:` versus `cotf asked:`.
 
 **That classifier is a convenience filter, not a boundary.** It exists so a turn of
 `ls` and `git status` does not cost twenty taps. It is defeated by anything that makes

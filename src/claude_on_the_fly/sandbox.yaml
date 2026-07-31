@@ -135,10 +135,14 @@ permissions:
   #                    dialog. Same as above. Note a denial costs one extra
   #                    model turn, because the refusal has to be delivered as a
   #                    message for the turn to end.
-  #   codex            cotf's question. `codex exec` never asks anyone anything,
-  #                    so there is nothing to forward and cotf decides what is
-  #                    worth interrupting you for. That decision is a
-  #                    convenience filter, not a security boundary.
+  #   codex            cotf's question, not codex's. codex does have an approval
+  #                    system, but under `codex exec` there is no way for a human
+  #                    to answer it: the policy you pass is overridden to `never`,
+  #                    and the reviewer that does run is a model, whose verdict
+  #                    cotf cannot intercept. The one hook that can block a call
+  #                    also runs *before* codex decides it wants approval. So cotf
+  #                    decides what is worth interrupting you for, and that
+  #                    decision is a convenience filter, not a security boundary.
   #
   # Cron and the background job queue always stay on bypass. Nobody is watching
   # a cron thread, so gating it would just fail every tool call.

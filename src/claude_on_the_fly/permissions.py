@@ -13,12 +13,17 @@ same thing.
 - claude under pty ignores that flag and draws its own terminal dialog instead,
   but announces it through a `Notification` hook, so the question is still
   claude's and still forwardable.
-- `codex exec` never asks. Its `approval_policy` does nothing on its own, its
-  `PermissionRequest` hook is observe-only and fires *after* the only hook that
-  can block, and `approvals_reviewer=user` emits no event at all. So for codex
-  there is no question to forward, and cotf has to decide what is worth
-  interrupting an operator for. That is `worth_asking` below, and it is a
-  convenience filter rather than a boundary -- see its docstring.
+- codex asks, but never a human, and never in time. `codex exec` overrides
+  `approval_policy` to `never` whatever you pass (measured: request `untrusted`,
+  get `never`). Set `approvals_reviewer` and approvals do happen -- the
+  `PermissionRequest` hook fires carrying codex's own wording -- but the reviewer
+  is a model (`auto_review` and `guardian_subagent` both spawn a guardian
+  subagent; `user` is inert under exec), that hook is observe-only (`block`,
+  `denied` and `approved` were all ignored and the command ran), and it fires
+  25ms *after* `PreToolUse`, the only hook that can block. So the gate has to sit
+  where codex has not yet formed an opinion, which is why cotf decides for itself
+  here and merely relays for claude. That decision is `worth_asking` below, and it
+  is a convenience filter rather than a boundary -- see its docstring.
 
 **Why `bypassPermissions` is refused rather than warned about.** Under it, claude
 asks nothing, so the prompt tool is never called: measured at zero invocations.
