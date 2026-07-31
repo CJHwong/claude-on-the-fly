@@ -101,7 +101,7 @@ async def test_every_option_names_the_file_it_edits():
         ]
     assert any("cron.yaml" in label for label in labels)
     assert any(".env" in label for label in labels)
-    assert any("sandbox.yaml" in label for label in labels)
+    assert any("config.yaml" in label for label in labels)
 
 
 async def test_no_option_label_is_truncated():

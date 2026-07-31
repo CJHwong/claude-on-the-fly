@@ -31,7 +31,7 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, settings
 
 _FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # Matches the retention the TimedRotatingFileHandler used to give (backupCount=7).
@@ -109,7 +109,7 @@ def host_tag() -> str:
     Dashes collapse to underscores so `<role>-<host>-<date>` stays parseable
     from the right even when the role itself contains dashes.
     """
-    raw = os.environ.get("COTF_HOST_TAG") or socket.gethostname().split(".")[0]
+    raw = settings.get("COTF_HOST_TAG") or socket.gethostname().split(".")[0]
     tag = _HOST_UNSAFE.sub("_", raw.replace("-", "_")).strip("_")
     return tag or "unknown"
 
@@ -249,7 +249,7 @@ def configure(
 
 def keep_days() -> int:
     """Retention window in days (`COTF_LOG_KEEP_DAYS`). 0 disables pruning."""
-    raw = os.environ.get("COTF_LOG_KEEP_DAYS")
+    raw = settings.get("COTF_LOG_KEEP_DAYS")
     if not raw:
         return DEFAULT_KEEP_DAYS
     try:

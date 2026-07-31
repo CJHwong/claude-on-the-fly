@@ -76,18 +76,27 @@ def isolate_env_file(tmp_path, monkeypatch):
 
 @pytest.fixture
 def operator_settings(tmp_path, monkeypatch):
-    """Path to a per-test operator `sandbox.yaml`, with DATA_DIR redirected to it.
+    """Path to a per-test operator `config.yaml`, with DATA_DIR redirected to it.
 
     DATA_DIR is redirected rather than the file written into the already-redirected
     home, so each test gets its own directory. The loaders read the file on every
     call by design (an operator edit takes effect on the next session, not the next
     restart), so a leftover from one test would otherwise decide another's policy.
     Returns the still-absent path; a test that wants a policy just writes it.
+
+    The parsed-document cache and the restart baseline are module state, so both
+    are cleared: a stale entry for a path a later test happens to reuse would hand
+    it another test's policy, which is the exact bug the per-test directory exists
+    to prevent.
     """
+    from claude_on_the_fly import settings
+
     data = tmp_path / "cotf-data"
     data.mkdir()
     monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
-    return data / "sandbox.yaml"
+    monkeypatch.setattr(settings, "_DOCUMENTS", {})
+    monkeypatch.setattr(settings, "_RESTART_STATE", {})
+    return data / settings.FILENAME
 
 
 @pytest.fixture

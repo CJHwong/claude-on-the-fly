@@ -448,7 +448,7 @@ def worth_asking(call: ToolCall) -> bool:
     attention", so that a turn of `ls` and `git status` does not cost twenty taps.
     It is defeated by anything that makes the first word stop predicting what
     runs, which is why `_segments` refuses compound commands outright rather than
-    trying to parse them -- the same reason `sandbox.yaml` declines to police
+    trying to parse them -- the same reason `config.yaml` declines to police
     `gh api --method DELETE` by argv and says to scope the token instead.
 
     The boundary is elsewhere and unchanged: the seatbelt profile, the CONNECT

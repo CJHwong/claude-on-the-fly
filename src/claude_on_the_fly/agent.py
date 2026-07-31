@@ -24,7 +24,7 @@ from typing import Protocol
 
 import yaml
 
-from claude_on_the_fly import sandbox
+from claude_on_the_fly import sandbox, settings
 
 logger = logging.getLogger(__name__)
 
@@ -158,13 +158,13 @@ STATS_MODES = ("off", "summary", "detailed")
 
 
 def stats_mode(platform: str) -> str:
-    """Read the reply-footer mode for a given frontend from its env var.
+    """Read the reply-footer mode for a given frontend from its own config key.
 
     Returns one of STATS_MODES. Defaults to "summary" for unknown or unset.
     Platform "telegram" reads TELEGRAM_STATS_MODE, and so on.
     """
     env_name = f"{platform.upper()}_STATS_MODE"
-    mode = os.environ.get(env_name, "summary").lower()
+    mode = settings.get(env_name, "summary").lower()
     return mode if mode in STATS_MODES else "summary"
 
 
@@ -734,8 +734,32 @@ class OllamaLauncher:
 
 # Skill list changes only when plugins/prompts change, and probing spawns the
 # CLI (~0.8s), so cache it with a TTL (default 1h). Set <= 0 to disable the
-# cache and probe every query. Overridable via env.
-SKILLS_CACHE_TTL = float(os.environ.get("SKILLS_CACHE_TTL_SECONDS", "3600"))
+# cache and probe every query.
+DEFAULT_SKILLS_CACHE_TTL = 3600.0
+
+
+def skills_cache_ttl() -> float:
+    """The skill-cache TTL, read per call rather than bound at import.
+
+    It used to be a module constant, which could not see a value `load_dotenv()`
+    put in the environment after this module was imported, and cannot see a
+    config-file edit at all. A junk value falls back to the default: this is a
+    latency optimisation, not something worth refusing to start over.
+    """
+    raw = settings.get("SKILLS_CACHE_TTL_SECONDS").strip()
+    if not raw:
+        return DEFAULT_SKILLS_CACHE_TTL
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "SKILLS_CACHE_TTL_SECONDS=%r is not a number; using %.0fs",
+            raw,
+            DEFAULT_SKILLS_CACHE_TTL,
+        )
+        return DEFAULT_SKILLS_CACHE_TTL
+
+
 _skills_mem: dict[str, tuple[float, list[tuple[str, str]]]] = {}
 _skills_cache_lock = asyncio.Lock()
 
@@ -745,7 +769,7 @@ async def cached_skills(
 ) -> list[tuple[str, str]]:
     """Return `backend.list_skills()` behind a TTL cache shared by all queries.
 
-    Two layers, both TTL-governed by SKILLS_CACHE_TTL: an in-memory entry (so
+    Two layers, both TTL-governed by `skills_cache_ttl()`: an in-memory entry (so
     per-keystroke picker queries don't touch disk) and a JSON file under
     DATA_DIR/cache (so a picker opened before startup warm finishes is still
     instant rather than paying the cold CLI probe). A single lock collapses
@@ -756,24 +780,25 @@ async def cached_skills(
     installed/updated skills (the cache alone would otherwise mask changes for
     up to the TTL, even across restarts).
     """
-    if SKILLS_CACHE_TTL <= 0:  # cache disabled: probe every query
+    ttl = skills_cache_ttl()
+    if ttl <= 0:  # cache disabled: probe every query
         return await backend.list_skills()
-    key = os.environ.get("AGENT_BACKEND", "claude").lower()
+    key = settings.get("AGENT_BACKEND", "claude").lower()
     path = DATA_DIR / "cache" / f"skills-{key}.json"
     now = time.time()
     if not force:
         entry = _skills_mem.get(key)
-        if entry and now - entry[0] < SKILLS_CACHE_TTL:
+        if entry and now - entry[0] < ttl:
             return entry[1]
     async with _skills_cache_lock:
         if not force:
             entry = _skills_mem.get(key)
-            if entry and time.time() - entry[0] < SKILLS_CACHE_TTL:
+            if entry and time.time() - entry[0] < ttl:
                 return entry[1]
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 stamp = float(data["cached_at"])
-                if time.time() - stamp < SKILLS_CACHE_TTL:
+                if time.time() - stamp < ttl:
                     skills = [(str(n), str(d)) for n, d in data["skills"]]
                     _skills_mem[key] = (stamp, skills)
                     return skills
@@ -794,8 +819,8 @@ async def cached_skills(
 
 
 def get_backend() -> AgentBackend:
-    """Pick a backend from env vars. Raises ValueError on misconfiguration."""
-    name = os.environ.get("AGENT_BACKEND", "claude").lower()
+    """Pick a backend from the `agent:` config. Raises ValueError on misconfiguration."""
+    name = settings.get("AGENT_BACKEND", "claude").lower()
     if name == "claude":
         return _build_claude_backend()
     if name == "codex":
@@ -843,29 +868,27 @@ def current_backend_key() -> str:
     Raises ValueError on the same misconfigurations as `get_backend()` so
     callers fail loudly instead of silently colliding sessions.
     """
-    name = os.environ.get("AGENT_BACKEND", "claude").lower()
+    name = settings.get("AGENT_BACKEND", "claude").lower()
     if name == "claude":
-        mode = os.environ.get("CLAUDE_MODE", "native").lower()
+        mode = settings.get("CLAUDE_MODE", "native").lower()
         if mode == "native":
-            return f"claude:native:{os.environ.get('CLAUDE_MODEL', '').strip()}"
+            return f"claude:native:{settings.get('CLAUDE_MODEL').strip()}"
         if mode == "ollama":
-            model = os.environ.get("OLLAMA_MODEL", "").strip()
+            model = settings.get("OLLAMA_MODEL").strip()
             if not model:
                 raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"claude:ollama:{model}"
         if mode == "pty":
-            return f"claude:pty:{os.environ.get('CLAUDE_MODEL', '').strip()}"
+            return f"claude:pty:{settings.get('CLAUDE_MODEL').strip()}"
         raise ValueError(
             f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)"
         )
     if name == "codex":
-        mode = os.environ.get("CODEX_MODE", "native").lower()
+        mode = settings.get("CODEX_MODE", "native").lower()
         if mode == "native":
-            return (
-                f"codex:native:{os.environ.get('CODEX_MODEL', '').strip() or 'default'}"
-            )
+            return f"codex:native:{settings.get('CODEX_MODEL').strip() or 'default'}"
         if mode == "ollama":
-            model = os.environ.get("OLLAMA_MODEL", "").strip()
+            model = settings.get("OLLAMA_MODEL").strip()
             if not model:
                 raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"codex:ollama:{model}"
@@ -876,11 +899,11 @@ def current_backend_key() -> str:
 def _build_claude_backend() -> AgentBackend:
     from claude_on_the_fly.backends.claude import ClaudeBackend
 
-    mode = os.environ.get("CLAUDE_MODE", "native").lower()
+    mode = settings.get("CLAUDE_MODE", "native").lower()
     if mode == "native":
         return ClaudeBackend()
     if mode == "ollama":
-        model = os.environ.get("OLLAMA_MODEL", "").strip()
+        model = settings.get("OLLAMA_MODEL").strip()
         if not model:
             raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
         return ClaudeBackend(launcher=OllamaLauncher(model=model))
@@ -892,11 +915,11 @@ def _build_claude_backend() -> AgentBackend:
 def _build_codex_backend() -> AgentBackend:
     from claude_on_the_fly.backends.codex import CodexBackend
 
-    mode = os.environ.get("CODEX_MODE", "native").lower()
+    mode = settings.get("CODEX_MODE", "native").lower()
     if mode == "native":
         return CodexBackend()
     if mode == "ollama":
-        model = os.environ.get("OLLAMA_MODEL", "").strip()
+        model = settings.get("OLLAMA_MODEL").strip()
         if not model:
             raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
         return CodexBackend(launcher=OllamaLauncher(model=model))

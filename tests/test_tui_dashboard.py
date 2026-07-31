@@ -1608,7 +1608,7 @@ class TestRefreshNowKey:
 
         target, seed = opened[0]
         assert target == settings.operator_settings()
-        assert target.name == "sandbox.yaml"
+        assert target.name == "config.yaml"
         # The bundled template, comments and all -- that is the point of seeding it.
         assert "egress:" in str(seed) and "permissions:" in str(seed)
         assert str(seed).count("#") > 40
@@ -1625,4 +1625,4 @@ class TestRefreshNowKey:
             notices = _capture(screen)
             screen._edit_sandbox_config()
             await pilot.pause()
-        assert any("sandbox.yaml" in str(note) for note in notices)
+        assert any("config.yaml" in str(note) for note in notices)

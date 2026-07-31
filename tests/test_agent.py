@@ -2545,13 +2545,35 @@ class TestListSkills:
 # ---------------------------------------------------------------------------
 
 
+class TestSkillsCacheTtl:
+    """Read per call, not bound at import: a module constant could not see a value
+    `load_dotenv()` put in the environment afterwards, nor a config edit at all."""
+
+    def test_unset_is_the_default(self, monkeypatch):
+        monkeypatch.delenv("SKILLS_CACHE_TTL_SECONDS", raising=False)
+        assert agent_mod.skills_cache_ttl() == agent_mod.DEFAULT_SKILLS_CACHE_TTL
+
+    def test_a_configured_value_is_used(self, monkeypatch):
+        monkeypatch.setenv("SKILLS_CACHE_TTL_SECONDS", "45")
+        assert agent_mod.skills_cache_ttl() == 45.0
+
+    def test_junk_falls_back_and_says_so(self, monkeypatch, caplog):
+        """This is a latency optimisation, not something worth refusing to start
+        over -- but a typo that silently reverted to an hour would look like a
+        working setting."""
+        monkeypatch.setenv("SKILLS_CACHE_TTL_SECONDS", "an hour")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
+            assert agent_mod.skills_cache_ttl() == agent_mod.DEFAULT_SKILLS_CACHE_TTL
+        assert "is not a number" in caplog.text
+
+
 class TestCachedSkills:
     def _reset(self, monkeypatch, tmp_path, ttl):
         from claude_on_the_fly import agent
 
         monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
         monkeypatch.setattr(agent, "_skills_mem", {})
-        monkeypatch.setattr(agent, "SKILLS_CACHE_TTL", ttl)
+        monkeypatch.setattr(agent, "skills_cache_ttl", lambda: ttl)
         monkeypatch.setenv("AGENT_BACKEND", "claude")
         return agent
 
@@ -2990,7 +3012,7 @@ class TestSkillsCache:
                 probes += 1
                 return []
 
-        monkeypatch.setattr(agent_mod, "SKILLS_CACHE_TTL", 0)
+        monkeypatch.setattr(agent_mod, "skills_cache_ttl", lambda: 0)
         backend = Backend()
         await agent_mod.cached_skills(backend)
         await agent_mod.cached_skills(backend)

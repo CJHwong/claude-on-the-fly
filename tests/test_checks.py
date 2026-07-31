@@ -1229,3 +1229,36 @@ def test_pty_tmux_check_passes_when_tmux_is_available(operator_settings, monkeyp
     monkeypatch.delenv(PTY_NO_TMUX_ENV, raising=False)
     monkeypatch.setattr(checks_mod.shutil, "which", lambda _name: "/usr/bin/tmux")
     assert check_pty_tmux_for_approvals().status == "ok"
+
+
+class TestFixHint:
+    """Where a checker tells you to set something.
+
+    Derived from `settings.FIELDS` rather than written per call site, because three
+    checkers once sent an operator to `.env` for a value the config file had taken
+    over. A diagnostic that is confidently wrong is worse than none.
+    """
+
+    def test_a_credential_points_at_dotenv(self):
+        assert checks_mod.fix_hint("SLACK_TOKEN") == checks_mod.DOTENV_HINT
+        assert checks_mod.fix_hint("TELEGRAM_BOT_TOKEN") == checks_mod.DOTENV_HINT
+
+    def test_a_migrated_setting_points_at_its_config_key(self):
+        hint = checks_mod.fix_hint("TELEGRAM_ALLOWED_USER_ID")
+        assert "config.yaml" in hint
+        assert "telegram.allowed_user_id" in hint
+
+    def test_every_migrated_setting_gets_a_config_hint(self):
+        """The drift guard: a new FIELDS entry cannot quietly keep the .env hint."""
+        from claude_on_the_fly import settings
+
+        for path, field in settings.FIELDS.items():
+            hint = checks_mod.fix_hint(field.env)
+            assert hint != checks_mod.DOTENV_HINT, field.env
+            assert path in hint, path
+
+    def test_a_missing_migrated_value_reports_the_config_key(self):
+        """Through a real checker, not just the helper."""
+        results = checks_mod.check_telegram({"TELEGRAM_BOT_TOKEN": "t"})
+        missing = [r for r in results if r.name == "TELEGRAM_ALLOWED_USER_ID"]
+        assert missing and "telegram.allowed_user_id" in (missing[0].fix_hint or "")

@@ -9,7 +9,15 @@ import os
 import shutil
 from pathlib import Path
 
-from claude_on_the_fly import agent, checks, permissions, pricing, sandbox, transcript
+from claude_on_the_fly import (
+    agent,
+    checks,
+    permissions,
+    pricing,
+    sandbox,
+    settings,
+    transcript,
+)
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     Compaction,
@@ -475,7 +483,7 @@ class ClaudeBackend:
         binary = [] if self.launcher else ["claude"]
         # Empty/unset CLAUDE_MODEL → omit --model and let the claude CLI use
         # its own default (don't pin sonnet).
-        model = "" if self.launcher else os.environ.get("CLAUDE_MODEL", "").strip()
+        model = "" if self.launcher else settings.get("CLAUDE_MODEL").strip()
         model_args = ["--model", model] if model else []
         # Permission flags rather than a hardcoded bypassPermissions. With
         # approvals off this returns exactly the old pair, so argv is unchanged.
@@ -561,7 +569,7 @@ class ClaudeBackend:
         """claude-pty argv minus the prompt and --system-prompt; the caller appends
         --system-prompt only when (re-)establishing a session."""
         assert self._pty_path is not None  # set in __init__ when pty=True
-        model = os.environ.get("CLAUDE_MODEL", "").strip()
+        model = settings.get("CLAUDE_MODEL").strip()
         model_args = ["--model", model] if model else []
         # claude-pty forwards every flag to claude verbatim, so the same argv
         # works here. What differs is which of them claude honours: interactive

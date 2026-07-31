@@ -47,8 +47,9 @@ logger = logging.getLogger(__name__)
 # is preceded by a compaction. Unset or 0 disables it, which is the default:
 # compaction is a full-context pass, so firing it unasked costs real money.
 #
-# Read per-instance rather than at import because load_dotenv() runs after this
-# module is imported. Only pty mode can supply the reading it compares against
+# Read per-instance rather than at import: `load_dotenv()` runs after this module is
+# imported, and the config file can change under a running daemon either way. Only pty
+# mode can supply the reading it compares against
 # (see `Response.context_tokens`), so in native mode this is inert however it is
 # set — the manual trigger is the whole feature there.
 AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
@@ -279,6 +280,9 @@ class Orchestrator:
         # Populated at dispatch, cleared on completion. Drives the heartbeat
         # `running_jobs` slot consumed by the TUI's Active AI jobs pane.
         self._in_flight: dict[int, dict] = {}
+        # Restart-required config fields already reported. Compared as a set rather
+        # than a flag so a second edit is reported too, and reverting one clears it.
+        self._restarts_reported: tuple[str, ...] = ()
 
     def session_uuid(self, chat_id: int) -> str:
         counter = self._session_counters.get(chat_id, 0)
@@ -421,8 +425,46 @@ class Orchestrator:
             await self._frontend.send_typing(chat_id)
             await asyncio.sleep(4)
 
+    async def _report_config_restarts(self, chat_id: int) -> None:
+        """Name any config edit that this turn will not honour.
+
+        Checked per turn, and reported into the conversation the operator is
+        already in, because that is where they will be right after saving the file:
+        most of `config.yaml` takes effect on the next read, so the only edits
+        worth interrupting for are the ones where saving is *not* enough.
+
+        Reported once per distinct set. `settings.check_reload` compares against
+        the startup baseline and so keeps returning the same answer until a
+        restart, which sending every turn would turn into noise nobody reads.
+
+        Frontend failures are swallowed on purpose. A missed notice is a worse log
+        line; an exception here would kill the drain task with turns still queued.
+        """
+        changed = settings.check_reload()
+        if changed == self._restarts_reported:
+            return
+        self._restarts_reported = changed
+        if not changed:
+            return
+        logger.warning(
+            "settings: %s changed in %s and needs a daemon restart to take effect",
+            ", ".join(changed),
+            settings.operator_settings(),
+        )
+        body = (
+            f"Config change to {', '.join(changed)} needs a restart. The rest of "
+            f"{settings.FILENAME} is picked up on its own, but this part is read "
+            "once at startup, so this turn and the ones after it still run the old "
+            "value."
+        )
+        try:
+            await self._frontend.send(chat_id, Response(body=body))
+        except Exception:
+            logger.exception("settings: could not report the restart-required change")
+
     async def _process(self, chat_id: int, turn: Turn) -> None:
         text = turn.text
+        await self._report_config_restarts(chat_id)
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
         if self._platform in agent.ATTACHMENT_PLATFORMS:
@@ -495,7 +537,7 @@ class Orchestrator:
                 # exactly what an operator who enabled approvals must never
                 # discover by accident.
                 self._permissions.check_turn(
-                    chat_id, response, os.environ.get("AGENT_BACKEND", "claude")
+                    chat_id, response, settings.get("AGENT_BACKEND", "claude")
                 )
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
@@ -611,7 +653,7 @@ def _auto_compact_pct() -> int:
     is a cost optimization, not something worth refusing to start over. The
     value is logged so a typo doesn't look like a silently working setting.
     """
-    raw = os.environ.get(AUTO_COMPACT_PCT_VAR, "").strip()
+    raw = settings.get(AUTO_COMPACT_PCT_VAR).strip()
     if not raw:
         return 0
     try:
@@ -641,15 +683,16 @@ def _redact_token(token: str) -> str:
 def _log_settings_summary(platform: str, frontend: Frontend) -> None:
     """Dump the resolved runtime settings at startup.
 
-    Pulls shared bits (log level, data dir, agent backend) from env, then
+    Pulls shared bits (log level, data dir, agent backend) from the resolved
+    settings, then
     appends frontend-specific fields via Frontend.describe(). Secrets are
     expected to be redacted by the frontend before being returned.
     """
     import os
 
-    backend = os.environ.get("AGENT_BACKEND", "claude").lower()
+    backend = settings.get("AGENT_BACKEND", "claude").lower()
     mode_var = f"{backend.upper()}_MODE"
-    mode = os.environ.get(mode_var, "native").lower()
+    mode = settings.get(mode_var, "native").lower()
 
     logger.info("%s settings:", platform)
     logger.info("  platform        = %s", platform)
@@ -658,7 +701,7 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
     logger.info("  agent_backend   = %s", backend)
     logger.info("  %-15s = %s", mode_var.lower(), mode)
     if mode == "ollama":
-        logger.info("  ollama_model    = %s", os.environ.get("OLLAMA_MODEL", "<unset>"))
+        logger.info("  ollama_model    = %s", settings.get("OLLAMA_MODEL", "<unset>"))
 
     for label, value in frontend.describe().items():
         logger.info("  %-15s = %s", label, value)
@@ -679,11 +722,6 @@ async def _start_sandbox(
     """
     if not sandbox.enabled():
         return None, None, None
-    # Before anything reads the policy: seed the operator's file if it is missing,
-    # and name any problem with it now. The loaders below fall back per section, so
-    # without this a typo surfaces as a host prompt or a missing shim much later,
-    # nowhere near the edit that caused it.
-    settings.check_operator_settings()
     permissions.check()
     broker_instance = None
     command_broker = None
@@ -743,6 +781,17 @@ async def run(frontend: Frontend, platform: str) -> None:
     (DATA_DIR / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
 
     _log_settings_summary(platform, frontend)
+
+    # Before anything reads the policy: seed the operator's file if it is missing,
+    # name any problem with it now, and record what the restart-required fields
+    # were, so a later edit to one can be reported rather than silently ignored.
+    #
+    # Unconditional, where this used to sit inside the sandbox branch. The file
+    # holds more than sandbox policy now, and `permissions:` in particular is read
+    # with the sandbox off -- so gating the seeding and the validation on
+    # `sandbox.enabled()` meant the one deployment shape that most needs the
+    # diagnostics was the shape that never got them.
+    settings.check_operator_settings()
 
     # When sandboxing is enabled, the broker holds the real API keys and the
     # agent reaches them only through loopback. start_default_broker publishes

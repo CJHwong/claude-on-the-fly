@@ -1,10 +1,23 @@
-# Sandbox policy: which hosts the agent may reach, and which credentialed CLIs
-# it may run through the command broker.
+# claude-on-the-fly settings: which hosts the agent may reach, which credentialed
+# CLIs it may run through the command broker, and whether tool calls are gated.
+# Credentials are the one thing that does NOT live here -- tokens stay in .env,
+# where a secret scanner expects them.
+#
+# Saving this file is enough. It is re-read when its timestamp changes, so an edit
+# takes effect at the next read rather than the next restart. The exceptions are
+# named for you: change something that was read once at startup (a bound socket, a
+# PATH shim, whether a service exists at all) and the next turn tells you a restart
+# is needed, instead of quietly running the old value.
 #
 # There are two copies of this file. The one inside the package holds the defaults
-# and is replaced on upgrade; the one at ~/.claude-on-the-fly/sandbox.yaml is yours
+# and is replaced on upgrade; the one at ~/.claude-on-the-fly/config.yaml is yours
 # to edit and is never overwritten, not even by an upgrade. If you are reading this
 # from your own copy, you are in the right place.
+#
+# Settings that used to be COTF_SANDBOX* / AGENT_BACKEND / CLAUDE_MODE and friends
+# live here now, under `sandbox:` and `agent:`. The environment variables still work
+# and still win, so nothing breaks by leaving them in .env -- but they are no longer
+# documented and will not gain new options. Credentials stay in .env.
 #
 # Yours is merged over the defaults one section at a time, so a typo in `egress:`
 # cannot cost you your `commands:` additions -- the broken section logs an ERROR
@@ -180,3 +193,113 @@ permissions:
   # ran the approved call, so the real limit is your patience, not the CLI's.
   ttl_seconds: 1800
   timeout_seconds: 300
+
+# The sections below moved out of .env. Every key is commented out on purpose: the
+# defaults live in the code that reads them, so an absent key means "whatever this
+# build does" rather than "whatever this template happened to say". Uncomment what
+# you want to pin.
+#
+# The reasoning behind each one -- what it trades, what it has been measured doing --
+# is in docs/reference/settings.md rather than repeated here.
+
+sandbox:
+  # Whether the agent process ever holds a real credential.
+  #   off (default) inherit the full environment
+  #   env           drop every *_API_KEY / *_TOKEN, route models via the broker
+  #   jail          as env, plus a seatbelt denying egress and keychain reads (macOS)
+  # mode: "off"
+
+  # jail mode only. deny-most makes $HOME opaque; grant the agent's own interpreter
+  # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3.
+  # fs: deny-most
+  # extra_paths:
+  #   - /opt/homebrew
+
+  # Narrow egress to the broker's loopback port and the egress proxy's, nothing else.
+  # broker_only_loopback: true
+
+agent:
+  # backend: claude (default) | codex
+  # Per-backend mode: native | ollama; claude also has pty, the only mode that
+  # reports a context reading and can forward claude's own permission dialog.
+  # Leave a model unset to let the CLI pick its own.
+  # backend: claude
+  # claude:
+  #   mode: native
+  #   model: sonnet
+  # codex:
+  #   mode: native
+  #   model: o3
+  # ollama:
+  #   model: deepseek-v4-flash:cloud
+
+  # Compact before answering once the previous turn left the context at or above
+  # this share of the window. Unset means compaction only on $compact.
+  # auto_compact_pct: 80
+
+  # Caches. skills_cache_ttl_seconds <= 0 probes the CLI every query;
+  # pricing_ttl_seconds of 0 always refreshes, negative never expires.
+  # skills_cache_ttl_seconds: 3600
+  # pricing_ttl_seconds: 21600
+
+  # claude-pty, used by claude's pty mode.
+  # pty:
+  #   auto_install: false
+  #   auto_refresh: true
+
+slack:
+  # Who may reach the agent. Read on every message, so adding a sender takes effect
+  # on their next one without a restart.
+  #
+  # One list, routed by Slack id prefix: B... is a bot and bypasses the @mention
+  # gate, anything else (U.../W.../"*") is a human. Empty is fail-closed except for
+  # the token's own id -- under a bot token that is the BOT's, not yours, so list
+  # your own U... id or your DMs are dropped. The startup log shows what is live.
+  # allowed_senders: [U012ABCDEF, B07JPABE2]
+  # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
+  # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
+
+  # Reply footer: off | summary | detailed
+  # stats: summary
+
+  # Slash command to register. Must match the app manifest; needs a restart.
+  # slash_command: /cotf
+
+  # Background-job trigger. Absent means $job; set it empty ("") to turn jobs off.
+  # job_command: "$job"
+
+  # Threads retained before LRU eviction, and replies per thread before inbound
+  # messages are gated ($continue resets the counter).
+  # session_cap: 1000
+  # reply_soft_limit: 10
+
+telegram:
+  # One bot, one operator. There is no list.
+  # allowed_user_id: 123456789
+  # stats: summary
+
+jobs:
+  # Queue adapter shared by the worker and the producers. Needs a restart: the
+  # worker is a separate process started with the old value.
+  # queue_kind: file
+
+  # concurrency is how many agent CLIs this machine hosts, separate from a cron
+  # entry's own max_concurrent. timeout of 0 or less means no limit.
+  # concurrency: 1
+  # poll_interval_s: 2.0
+  # timeout: 3600
+
+  # JOBS_SLACK_TOKEN stays in .env: it is a credential. Set it to a bot (xoxb-)
+  # token when SLACK_TOKEN is a user token, or the worker posts replies as you and
+  # the Slack daemon re-ingests its own output.
+
+logs:
+  # Retention in days for ~/.claude-on-the-fly/logs; 0 disables pruning. Assume
+  # anything written there leaves the machine and sits for this long.
+  # keep_days: 7
+
+  # Machine name in <role>-<host>-<date>.log. Defaults to the short hostname.
+  # host_tag: laptop
+
+  # LOG_LEVEL stays an environment variable: logging is configured before this file
+  # can be parsed, so a complaint about the file needs somewhere to go.

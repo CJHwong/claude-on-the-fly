@@ -23,6 +23,23 @@ Status = Literal["ok", "missing", "invalid", "warn"]
 DOTENV_HINT = "set in ~/.claude-on-the-fly/.env"
 
 
+def fix_hint(name: str) -> str:
+    """Where to set `name`, by its environment-variable spelling.
+
+    Derived from `settings.FIELDS` rather than written out per call site, so a
+    setting that moves to the config file cannot leave a hint pointing at `.env`
+    behind. That was not hypothetical: three checkers sent an operator to `.env` for
+    a value the file had taken over, which is the worst kind of stale doc -- a
+    diagnostic that is confidently wrong at the moment someone needs it.
+    """
+    from claude_on_the_fly import settings
+
+    for path, field in settings.FIELDS.items():
+        if field.env == name:
+            return f"set `{path}` in ~/.claude-on-the-fly/{settings.FILENAME}"
+    return DOTENV_HINT
+
+
 @dataclass(frozen=True)
 class CheckResult:
     name: str
@@ -185,7 +202,7 @@ def _require(env: Mapping[str, str], name: str, hint: str | None = None) -> Chec
             name=name,
             status="missing",
             detail="not set",
-            fix_hint=hint or DOTENV_HINT,
+            fix_hint=hint or fix_hint(name),
         )
     return CheckResult(name=name, status="ok", detail="set")
 
@@ -205,7 +222,7 @@ def check_telegram(env: Mapping[str, str]) -> list[CheckResult]:
                 name="TELEGRAM_ALLOWED_USER_ID",
                 status="missing",
                 detail="not set",
-                fix_hint=DOTENV_HINT,
+                fix_hint=fix_hint("TELEGRAM_ALLOWED_USER_ID"),
             )
         )
     else:
@@ -428,7 +445,7 @@ def _check_slack_bearer(env: Mapping[str, str]) -> CheckResult:
             name="SLACK_TOKEN",
             status="missing",
             detail="set SLACK_TOKEN to an xoxp- (user) or xoxb- (bot) token",
-            fix_hint=DOTENV_HINT,
+            fix_hint=fix_hint("SLACK_TOKEN"),
         )
     if not token.startswith(("xoxp-", "xoxb-")):
         return CheckResult(
@@ -641,7 +658,7 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
                     name="OLLAMA_MODEL",
                     status="missing",
                     detail=f"required when {mode_var}=ollama",
-                    fix_hint=DOTENV_HINT,
+                    fix_hint=fix_hint("OLLAMA_MODEL"),
                 )
             )
         else:

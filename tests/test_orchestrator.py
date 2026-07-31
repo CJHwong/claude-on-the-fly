@@ -13,6 +13,7 @@ import pytest
 
 from claude_on_the_fly import orchestrator as orchestrator_mod
 from claude_on_the_fly import permissions as permissions_mod
+from claude_on_the_fly import settings
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import Orchestrator, Turn
@@ -1201,11 +1202,12 @@ class TestStartSandbox:
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
 
-    async def test_the_policy_file_is_seeded_and_checked_before_anything_reads_it(
+    async def test_start_sandbox_no_longer_seeds_the_policy_file(
         self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
-        """The loaders below fall back per section, so a typo left unreported here
-        surfaces later as a host prompt or a missing shim, nowhere near the edit."""
+        """Seeding moved up to `run`, which is the only place that reaches every
+        deployment shape. Asserted here so it cannot quietly move back and leave two
+        callers racing to create the same file."""
         monkeypatch.setenv("COTF_SANDBOX", "jail")
         monkeypatch.setattr(
             orchestrator_mod.broker, "start_default_broker", AsyncMock()
@@ -1220,16 +1222,6 @@ class TestStartSandbox:
         monkeypatch.setattr(
             orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
         )
-        assert not operator_settings.exists()
-        await orchestrator_mod._start_sandbox(frontend)
-        assert operator_settings.is_file()
-
-    async def test_sandboxing_off_does_not_seed_a_policy_file(
-        self, frontend: StubFrontend, monkeypatch, operator_settings
-    ) -> None:
-        """Nothing reads the policy when sandboxing is off, so writing a file about
-        it would be noise in the operator's directory."""
-        monkeypatch.delenv("COTF_SANDBOX", raising=False)
         await orchestrator_mod._start_sandbox(frontend)
         assert not operator_settings.exists()
 
@@ -1385,6 +1377,149 @@ class TestRunTeardown:
         monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
         await orchestrator_mod.run(stub, "test")
         assert closed == ["closed"]
+
+
+class TestPolicyFileAtStartup:
+    """`run` seeds and validates the settings file, whatever the sandbox mode."""
+
+    @staticmethod
+    async def _run_once(monkeypatch) -> None:
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(None, None, None)),
+        )
+        stub = MagicMock()
+        stub.describe = lambda: {}
+        stub.set_orchestrator = MagicMock()
+        stub.stop = AsyncMock()
+
+        async def never_returns(_on_message):
+            await asyncio.sleep(3600)
+
+        stub.start = never_returns
+        original_wait = asyncio.Event.wait
+
+        async def stop_immediately(self):
+            self.set()
+            return await original_wait(self)
+
+        monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
+        await orchestrator_mod.run(stub, "test")
+
+    async def test_the_file_is_seeded_with_the_sandbox_off(
+        self, monkeypatch, operator_settings
+    ) -> None:
+        """This used to be gated on `sandbox.enabled()`, which meant the shape that
+        most needs the diagnostics -- sandbox off, approvals on -- was the one shape
+        that never got them, and never saw the commented template either."""
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        assert not operator_settings.exists()
+        await self._run_once(monkeypatch)
+        assert operator_settings.is_file()
+
+
+class TestConfigRestartNotice:
+    """Most of the file is re-read; the rest is reported rather than ignored."""
+
+    @staticmethod
+    def _orchestrator(frontend: StubFrontend) -> orchestrator_mod.Orchestrator:
+        return orchestrator_mod.Orchestrator(frontend, "test")
+
+    async def test_a_restart_required_edit_is_named_in_the_conversation(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """Reported where the operator already is, because that is where they will be
+        right after saving the file."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+
+        await self._orchestrator(frontend)._report_config_restarts(7)
+
+        assert len(frontend.sent) == 1
+        body = frontend.sent[0][1].body
+        assert "permissions.mode" in body
+        assert "needs a restart" in body
+        assert settings.FILENAME in body
+
+    async def test_a_live_edit_is_not_reported(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """An allowlist edit takes effect on the next read, so telling anyone to
+        restart for it would be a lie that trains them to ignore the notice."""
+        operator_settings.write_text("egress:\n  allow: [a.example]\n")
+        settings.check_operator_settings()
+        operator_settings.write_text("egress:\n  allow: [a.example, b.example]\n")
+
+        await self._orchestrator(frontend)._report_config_restarts(7)
+
+        assert frontend.sent == []
+
+    async def test_the_same_change_is_reported_once(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """check_reload compares against the startup baseline, so it keeps returning
+        the same answer until a restart. Sending it every turn is noise."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+
+        orch = self._orchestrator(frontend)
+        for _ in range(3):
+            await orch._report_config_restarts(7)
+
+        assert len(frontend.sent) == 1
+
+    async def test_a_second_change_is_reported_again(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        orch = self._orchestrator(frontend)
+
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        await orch._report_config_restarts(7)
+        operator_settings.write_text(
+            "permissions:\n  mode: ask\ncommands:\n  tools: []\n"
+        )
+        await orch._report_config_restarts(7)
+
+        assert len(frontend.sent) == 2
+        assert "commands" in frontend.sent[1][1].body
+
+    async def test_reverting_the_edit_clears_the_notice(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """So the next real change is reported, rather than swallowed by a flag that
+        was never lowered."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        orch = self._orchestrator(frontend)
+
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        await orch._report_config_restarts(7)
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        await orch._report_config_restarts(7)
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        await orch._report_config_restarts(7)
+
+        assert len(frontend.sent) == 2
+
+    async def test_a_frontend_failure_does_not_kill_the_turn(
+        self, frontend: StubFrontend, operator_settings, caplog
+    ) -> None:
+        """A missed notice is a log line. An exception here would take down the drain
+        task with turns still queued."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+
+        orch = self._orchestrator(frontend)
+        frontend.send = AsyncMock(side_effect=RuntimeError("slack is down"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"):
+            await orch._report_config_restarts(7)
+        assert "could not report" in caplog.text
 
 
 def test_settings_summary_includes_the_frontends_own_fields(monkeypatch, caplog):

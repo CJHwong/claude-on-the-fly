@@ -11,7 +11,7 @@ import shlex
 import time
 from pathlib import Path
 
-from claude_on_the_fly import agent, permissions, pricing, sandbox, transcript
+from claude_on_the_fly import agent, permissions, pricing, sandbox, settings, transcript
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
@@ -359,7 +359,7 @@ class CodexBackend:
         configured_label = (
             self.launcher.model
             if self.launcher
-            else (os.environ.get("CODEX_MODEL", "").strip() or "codex")
+            else (settings.get("CODEX_MODEL").strip() or "codex")
         )
         thread_for_lookup = result.get("thread_id") or existing_thread
         model_label = (
@@ -435,7 +435,7 @@ class CodexBackend:
         # subcommand. Skip the binary when the launcher is set.
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
-        model_env = os.environ.get("CODEX_MODEL", "").strip()
+        model_env = settings.get("CODEX_MODEL").strip()
         model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
         # --yolo stays whether approvals are on or not. codex exec overrides
         # approval_policy to `never` regardless (measured: request untrusted, get

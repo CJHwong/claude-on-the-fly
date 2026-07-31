@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+from claude_on_the_fly import settings
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ _memo: tuple[float | None, dict[str, ModelPrice] | None] = (None, None)
 
 def _ttl_seconds() -> int:
     """TTL in seconds. 0 = always refresh, negative = never expire."""
-    raw = os.environ.get("COTF_PRICING_TTL_SECONDS")
+    raw = settings.lookup("COTF_PRICING_TTL_SECONDS")
     if raw is None:
         return DEFAULT_TTL_SECONDS
     try:

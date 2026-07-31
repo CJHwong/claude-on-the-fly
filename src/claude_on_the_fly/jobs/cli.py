@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
-from claude_on_the_fly import agent, checks
+from claude_on_the_fly import agent, checks, settings
 from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
 from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
 from claude_on_the_fly.jobs.core import (
@@ -60,9 +60,9 @@ def _setup_logging() -> None:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read a float from env var `name`, falling back to `default` when it is
-    unset, blank, or unparseable."""
-    raw = os.environ.get(name, "").strip()
+    """Read a float setting, falling back to `default` when it is unset, blank, or
+    unparseable. Reads config.yaml as well as the environment."""
+    raw = settings.get(name).strip()
     if not raw:
         return default
     try:
@@ -243,9 +243,8 @@ def _cmd_run() -> int:
 
 
 def _cmd_doctor() -> int:
-    results = checks.check_frontend("jobs", os.environ) + checks.check_backend(
-        os.environ
-    )
+    env = settings.environment()
+    results = checks.check_frontend("jobs", env) + checks.check_backend(env)
     failed = 0
     warned = 0
     for r in results:

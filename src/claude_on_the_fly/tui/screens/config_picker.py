@@ -4,6 +4,10 @@ Decoupled from panel focus on purpose: editing config is a rare, deliberate
 action, so an explicit pick reads better than a key whose meaning shifts with
 whatever happens to be focused. Returns the chosen target id (
 "env" | "sandbox" | "cron") via dismiss(), or None on cancel.
+
+The "sandbox" id outlived the file's rename to config.yaml. It is internal, the
+dashboard resolves the real path through `settings.operator_settings()`, and
+churning it through every caller and test to match a label buys nothing.
 """
 
 from __future__ import annotations
@@ -52,7 +56,7 @@ class ConfigPickerScreen(ModalScreen[str | None]):
                 Option(".env            tokens, model, credentials", id="env"),
                 # Names the top-level keys rather than describing them, which is both
                 # shorter and more useful: it tells you what you will be looking at.
-                Option("sandbox.yaml    egress, commands, permissions", id="sandbox"),
+                Option("config.yaml     egress, commands, permissions", id="sandbox"),
                 Option("cron.yaml       scheduled runs", id="cron"),
                 id="config-picker-list",
             )
