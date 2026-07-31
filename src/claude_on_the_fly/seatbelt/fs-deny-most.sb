@@ -68,7 +68,44 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
 ;; codex needs this to start at all; see the note in fs-allow-reads.sb.
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex")))
+;; codex needs to write under ~/.codex or it will not start, but the directory also
+;; holds everything that decides what codex *executes* and what it is *told*. So this
+;; is deny-default with an explicit re-grant, rather than a grant with a denylist of
+;; the dangerous files.
+;;
+;; The denylist came first and was already incomplete: hooks.json, config.toml and
+;; rules/ were denied while plugins/, history.jsonl and AGENTS.md stayed writable --
+;; and AGENTS.md is standing instructions codex reads on every later run, so an
+;; injected agent could leave itself orders that outlive the session. Enumerating the
+;; dangerous files means losing that race every time codex adds one.
+;;
+;; The grants below are measured, not guessed: they are what a real `codex exec` turn
+;; touched under this directory. Two of them are execution-adjacent and cannot be
+;; closed, which is a known limit rather than an oversight:
+;;   shell_snapshots/  a shell script codex writes and then sources
+;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
+;;                     manifest at the plugins/ root stays denied
+(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/sessions")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
+(allow file-write*
+  (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
+(allow file-write* (literal (string-append (param "_HOME") "/.codex/models_cache.json")))
+(allow file-write* (literal (string-append (param "_HOME") "/.codex/version.json")))
+(allow file-write* (literal (string-append (param "_HOME") "/.codex/installation_id")))
+;; The agent's own OAuth credential. Denying the *write* protects nothing: the read
+;; is already permitted by design (see "Deliberately NOT denied" above), so an agent
+;; that wanted the token already has it. What denying would cost is token refresh --
+;; codex persists a refreshed ChatGPT token here, and a deployment that cannot would
+;; break the first time one expired.
+(allow file-write* (literal (string-append (param "_HOME") "/.codex/auth.json")))
+;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
+(allow file-write*
+  (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))

@@ -27,12 +27,13 @@
 (import (param "_BASE"))
 
 ;; -- Egress: internet denied, loopback allowed --
-;; The three _LOOPBACK* params are all "localhost:*" by default (every loopback
+;; The four _LOOPBACK* params are all "localhost:*" by default (every loopback
 ;; port, so the agent's own dev servers and tests work). When
 ;; COTF_SANDBOX_BROKER_ONLY_LOOPBACK is set the wrapper narrows them to the
 ;; local services the agent was actually handed -- credential broker, CONNECT
-;; egress proxy, command broker -- closing the arbitrary-local-sink path so those
-;; are the only reachable endpoints.
+;; egress proxy, command broker, and the approval service when permissions mode is
+;; `ask` -- closing the arbitrary-local-sink path so those are the only reachable
+;; endpoints.
 ;;
 ;; Three params rather than one list because SBPL has no arrays. Spare slots
 ;; repeat the first port, which is a harmless duplicate allow.
@@ -46,6 +47,7 @@
 (allow network-outbound (remote ip (param "_LOOPBACK")))
 (allow network-outbound (remote ip (param "_LOOPBACK_ALT")))
 (allow network-outbound (remote ip (param "_LOOPBACK_ALT2")))
+(allow network-outbound (remote ip (param "_LOOPBACK_ALT3")))
 
 ;; -- Keychain: denied (the broker holds credentials) --
 (deny file-read* (subpath (string-append (param "_HOME") "/Library/Keychains")))

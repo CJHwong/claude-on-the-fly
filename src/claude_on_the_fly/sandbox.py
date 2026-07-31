@@ -51,7 +51,11 @@ _PASSTHROUGH_PREFIXES = ("XDG_", "LC_")
 _PASSTHROUGH_SUFFIXES = ("_BASE_URL",)
 # Locates the command broker for the generated shims. Not a secret: it is a
 # loopback endpoint the agent is meant to reach (see commands.py).
-_PASSTHROUGH_ENDPOINTS = frozenset({"COTF_CMD_ENDPOINT"})
+# Loopback endpoints the agent is deliberately handed. COTF_APPROVE_URL is here
+# because the approval shim runs inside the sandbox and reads it to find the
+# daemon; without the passthrough every gated call would fail closed on a
+# missing endpoint, which looks exactly like a denial.
+_PASSTHROUGH_ENDPOINTS = frozenset({"COTF_CMD_ENDPOINT", "COTF_APPROVE_URL"})
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -104,7 +108,12 @@ _MAX_EXTRA_PATHS = 3
 _DEFAULT_LOOPBACK = "localhost:*"
 # Fixed loopback allow slots in the jail profile, since SBPL has no arrays. One
 # each for the credential broker, the egress proxy, and the command broker.
-_LOOPBACK_SLOTS = 3
+# Four because SBPL has no arrays: each loopback grant is a separate parameter, so
+# the profile has to declare a fixed number of slots. The services are the
+# credential broker, the command broker, the CONNECT egress proxy, and -- when
+# permissions mode is `ask` -- the approval service the backends ask about tool
+# calls. A fifth service would need a fifth slot here and in both profiles.
+_LOOPBACK_SLOTS = 4
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # Backend-agnostic sandbox note appended to the system prompt (see
@@ -175,9 +184,25 @@ launders the boundary rather than respecting it."""
 
 
 def mode() -> str:
-    """Resolved COTF_SANDBOX mode: 'off', 'env', or 'jail' (default 'off')."""
-    value = os.environ.get("COTF_SANDBOX", "off").lower()
-    return value if value in _MODES else "off"
+    """Resolved COTF_SANDBOX mode: 'off', 'env', or 'jail' (default 'off').
+
+    An unrecognised value still resolves to 'off', because refusing to start would
+    turn a typo into an outage. But it no longer does so in silence: a misspelled
+    `jial` used to read as "no sandbox at all" with nothing anywhere to say so,
+    which is the most expensive possible way to be wrong about this variable.
+    """
+    raw = os.environ.get("COTF_SANDBOX", "off").strip()
+    value = raw.lower()
+    if value in _MODES:
+        return value
+    if raw:
+        logger.error(
+            "COTF_SANDBOX=%r is not one of %s; running with NO sandbox. Fix the "
+            "value or unset it to choose that deliberately.",
+            raw,
+            list(_MODES),
+        )
+    return "off"
 
 
 def enabled() -> bool:
@@ -289,7 +314,9 @@ def _loopback_ports() -> list[str]:
 
     Order is stable so the emitted profile is deterministic: credential broker
     (any published `*_BASE_URL`), then the egress proxy (`HTTPS_PROXY`), then the
-    command broker (`COTF_CMD_ENDPOINT`). Duplicates are collapsed.
+    command broker (`COTF_CMD_ENDPOINT`), then the approval service
+    (`COTF_APPROVE_URL`, present only when permissions mode is `ask`). Duplicates
+    are collapsed.
     """
     env = _spawn_env()
     found: list[str] = []
@@ -299,7 +326,7 @@ def _loopback_ports() -> list[str]:
             if port is not None:
                 found.append(port)
                 break
-    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT"):
+    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT", "COTF_APPROVE_URL"):
         port = _port_from_url(env.get(key, ""))
         if port is not None:
             found.append(port)
@@ -307,7 +334,7 @@ def _loopback_ports() -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def _loopback_specs() -> tuple[str, str, str]:
+def _loopback_specs() -> tuple[str, str, str, str]:
     """The remote-ip values for the jail's loopback allows, one per slot.
 
     Narrows to just the local services the agent was handed when
@@ -321,14 +348,15 @@ def _loopback_specs() -> tuple[str, str, str]:
     loudly instead — the same fixed-slot trade as COTF_SANDBOX_EXTRA_PATHS.
     """
     if os.environ.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "").lower() not in _TRUTHY:
-        return _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK
+        return (_DEFAULT_LOOPBACK,) * _LOOPBACK_SLOTS  # ty: ignore[invalid-return-type]
     ports = _loopback_ports()
     if not ports:
         logger.warning(
             "COTF_SANDBOX_BROKER_ONLY_LOOPBACK set but no broker base-url, "
-            "HTTPS_PROXY, or COTF_CMD_ENDPOINT in env; leaving loopback open"
+            "HTTPS_PROXY, COTF_CMD_ENDPOINT, or COTF_APPROVE_URL in env; "
+            "leaving loopback open"
         )
-        return _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK
+        return (_DEFAULT_LOOPBACK,) * _LOOPBACK_SLOTS  # ty: ignore[invalid-return-type]
     if len(ports) > _LOOPBACK_SLOTS:
         logger.warning(
             "%d loopback services but only %d profile slots; %s would be "
@@ -339,7 +367,7 @@ def _loopback_specs() -> tuple[str, str, str]:
         )
     specs = [f"localhost:{port}" for port in ports[:_LOOPBACK_SLOTS]]
     specs += [specs[0]] * (_LOOPBACK_SLOTS - len(specs))
-    return specs[0], specs[1], specs[2]
+    return specs[0], specs[1], specs[2], specs[3]
 
 
 def _extra_read_paths() -> list[str]:
@@ -461,7 +489,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     tmpdir = os.path.realpath(os.environ.get("TMPDIR", "/tmp"))
     project = os.path.realpath(workspace)
     base = _fs_base_profile()
-    loopback, loopback_2, loopback_3 = _loopback_specs()
+    loopback, loopback_2, loopback_3, loopback_4 = _loopback_specs()
     params = [
         "-D",
         # realpath, like _TMPDIR and _PROJECT_DIR below. Seatbelt matches the
@@ -484,6 +512,8 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         f"_LOOPBACK_ALT={loopback_2}",
         "-D",
         f"_LOOPBACK_ALT2={loopback_3}",
+        "-D",
+        f"_LOOPBACK_ALT3={loopback_4}",
     ]
     # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
     # so only pass them there. Pad unused slots with the project dir (a no-op).
