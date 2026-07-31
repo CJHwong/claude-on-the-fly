@@ -172,7 +172,14 @@
 ;; Scoped to the secrets rather than the whole directory, because the agent's
 ;; workspace (workspaces/) and its memory (memory/) live under here too and are
 ;; meant to be reachable, and shims/ must stay executable.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.claude-on-the-fly/\\.env")))
+;;
+;; `.env` is matched at ANY depth under the directory, not just at its root. The
+;; root-only form left a copy one level down readable, which is not hypothetical: a
+;; backup taken before editing the file lands in exactly that shape, and so does
+;; anything a syncer drops beside it (`.env.sync-conflict-...`). A deny list that
+;; covers the canonical path and not its neighbours protects the file an operator
+;; thinks about and misses the ones they do not.
+(deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.claude-on-the-fly/(.*/)?\\.env")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/logs")))
 (deny file-read* (literal (string-append (param "_HOME") "/.zhistory")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.zsh")))

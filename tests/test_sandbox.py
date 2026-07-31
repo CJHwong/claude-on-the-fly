@@ -171,7 +171,9 @@ def test_guidance_jail_covers_all_denial_scenarios(monkeypatch, tmp_path):
     assert "Operation not permitted" in text and "Permission denied" in text
     assert "451" in text
     # every denial category has a scenario + remedy
-    assert "COTF_SANDBOX_EXTRA_PATHS" in text  # file-read remedy
+    assert (
+        "sandbox.extra_paths" in text
+    )  # file-read remedy, named as the operator sets it
     assert "write profile" in text  # file-write remedy
     # Network remedy is now an approval, not a config change: the agent is told
     # the request pauses for the operator and that a 403 means they declined.
@@ -619,7 +621,7 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     assert set(results.values()) == {sandbox.ABSENT}, results
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "deny untested" in logged
-    assert "0/6 probed" in logged
+    assert f"0/{len(sandbox._DENY_PROBES)} probed" in logged
 
 
 async def test_broken_profile_is_not_reported_as_absent(monkeypatch, tmp_path, caplog):
@@ -1000,6 +1002,33 @@ _CODEX_MUST_NOT_WRITE = (
     "plugins/manifest.toml",
     "a-config-codex-has-not-invented-yet.toml",
 )
+
+
+def test_the_cotf_env_deny_covers_any_depth():
+    """The tokens must not be readable from a copy one directory down.
+
+    `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and memory
+    live under it -- so the tokens are covered by a regex rather than a subpath deny.
+    The regex used to be anchored at the directory root, which left
+    `pre-migration-backup-*/.env` and a syncer's `sub/.env` readable while the file an
+    operator actually thinks about was protected. Asserted on the profile text because
+    the suite's HOME is a tmpdir the profile grants wholesale, so a live read there
+    would succeed for the wrong reason.
+    """
+    text = sandbox._BASE_PROFILE.read_text()
+    rule = next(
+        line
+        for line in text.splitlines()
+        if "deny file-read*" in line and "claude-on-the-fly" in line and ".env" in line
+    )
+    assert "(.*/)?" in rule, rule
+
+
+def test_the_cotf_env_is_a_verified_denial():
+    """A regex deny is the kind that can be narrowed by accident and stay quiet about
+    it, and macOS cannot report a seatbelt denial. Probing it per run is the substitute
+    for trusting it."""
+    assert "~/.claude-on-the-fly/.env" in sandbox._DENY_PROBES
 
 
 @pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
