@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -176,6 +176,93 @@ class TestParseCodexStream:
         )
         out = parse_codex_stream(stream)
         assert out["body"] == "real"
+
+
+# ---------------------------------------------------------------------------
+# _run_codex_exec
+# ---------------------------------------------------------------------------
+
+
+def _agent_message(text: str) -> dict:
+    return {
+        "type": "item.completed",
+        "item": {"id": "i1", "type": "agent_message", "text": text},
+    }
+
+
+def _exec_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    return proc
+
+
+async def _run_exec(proc, tmp_path: Path):
+    with (
+        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        patch.object(codex_mod.agent, "track_agent_process"),
+        patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()),
+    ):
+        return await codex_mod._run_codex_exec(
+            tmp_path, ["codex", "exec"], timeout=None
+        )
+
+
+class TestRunCodexExec:
+    async def test_nonzero_exit_after_completed_turn_still_returns_body(
+        self, tmp_path: Path
+    ):
+        """codex can deadlock at exit with its reply already on stdout; the
+        turn is finished, so the reply must survive being killed."""
+        proc = _exec_proc(
+            -9,
+            _ndjson(
+                {"type": "thread.started", "thread_id": "t1"},
+                _agent_message("PR #804 is merged."),
+            ),
+            stderr=b"ERROR codex_core::tools::router: stale noise",
+        )
+        out = await _run_exec(proc, tmp_path)
+        assert out["body"] == "PR #804 is merged."
+        assert out["thread_id"] == "t1"
+
+    async def test_nonzero_exit_without_body_raises_stderr(self, tmp_path: Path):
+        proc = _exec_proc(1, b"", stderr=b"codex: command not found")
+        with pytest.raises(RuntimeError, match="command not found"):
+            await _run_exec(proc, tmp_path)
+
+    async def test_nonzero_exit_without_body_or_stderr_raises_exit_code(
+        self, tmp_path: Path
+    ):
+        proc = _exec_proc(-15, b"")
+        with pytest.raises(RuntimeError, match="Exit code -15"):
+            await _run_exec(proc, tmp_path)
+
+    async def test_turn_failed_raises_even_with_a_body(self, tmp_path: Path):
+        """turn.failed is terminal: a partial body must not mask it."""
+        proc = _exec_proc(
+            0,
+            _ndjson(
+                _agent_message("partial"),
+                {"type": "turn.failed", "error": {"message": "context exhausted"}},
+            ),
+        )
+        with pytest.raises(RuntimeError, match="context exhausted"):
+            await _run_exec(proc, tmp_path)
+
+    async def test_turn_failed_wins_over_stderr_on_nonzero_exit(self, tmp_path: Path):
+        proc = _exec_proc(
+            1,
+            _ndjson({"type": "turn.failed", "error": {"message": "rate limited"}}),
+            stderr=b"noisy teardown",
+        )
+        with pytest.raises(RuntimeError, match="rate limited"):
+            await _run_exec(proc, tmp_path)
+
+    async def test_clean_exit_returns_parsed(self, tmp_path: Path):
+        proc = _exec_proc(0, _ndjson(_agent_message("done")))
+        out = await _run_exec(proc, tmp_path)
+        assert out["body"] == "done"
 
 
 # ---------------------------------------------------------------------------

@@ -124,15 +124,29 @@ async def _run_codex_exec(
         await agent._kill_process_tree(proc)
 
     parsed = parse_codex_stream(stdout_bytes)
+    if parsed.get("error"):
+        raise RuntimeError(parsed["error"])
     if proc.returncode != 0:
+        # A non-zero exit *after* codex emitted its final agent_message means the
+        # turn's work is done and only codex's own teardown failed. That happens:
+        # codex can deadlock at exit (main thread parked in pthread_join on a
+        # runtime thread that never finishes), leaving a process that has already
+        # written its complete reply to stdout but never exits, until something
+        # kills it. Raising here would discard a reply we are holding in `parsed`
+        # and post an exit code to the chat instead, so deliver it and log the
+        # exit. No body means nothing was salvageable — still an error.
+        if parsed.get("body"):
+            logger.warning(
+                "codex exec: exit %s after a completed turn; "
+                "delivering the parsed reply anyway",
+                proc.returncode,
+            )
+            return parsed
         detail = (
-            parsed.get("error")
-            or stderr_bytes.decode(errors="replace").strip()
+            stderr_bytes.decode(errors="replace").strip()
             or f"Exit code {proc.returncode}"
         )
         raise RuntimeError(detail)
-    if parsed.get("error"):
-        raise RuntimeError(parsed["error"])
     return parsed
 
 
