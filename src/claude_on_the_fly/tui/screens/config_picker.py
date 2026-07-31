@@ -21,7 +21,13 @@ class ConfigPickerScreen(ModalScreen[str | None]):
         align: center middle;
     }
     #config-picker {
-        width: 60;
+        /* Sized to the longest label rather than left at a round number: at 60 the
+           sandbox row was cut mid-word (54 chars of label into 50 of content).
+           `width: auto` is not the fix -- it fills the available space, ballooning to
+           102 columns on a wide terminal while still truncating on a narrow one.
+           max-width keeps a small terminal shrinking rather than overflowing. */
+        width: 58;
+        max-width: 100%;
         height: auto;
         padding: 1 2;
         border: round $accent;
@@ -43,11 +49,10 @@ class ConfigPickerScreen(ModalScreen[str | None]):
             # newest-last, would both read as arbitrary to someone opening this for
             # the first time.
             yield OptionList(
-                Option(".env            chat tokens, model, creds", id="env"),
-                Option(
-                    "sandbox.yaml    egress hosts, brokered CLIs, approvals",
-                    id="sandbox",
-                ),
+                Option(".env            tokens, model, credentials", id="env"),
+                # Names the top-level keys rather than describing them, which is both
+                # shorter and more useful: it tells you what you will be looking at.
+                Option("sandbox.yaml    egress, commands, permissions", id="sandbox"),
                 Option("cron.yaml       scheduled runs", id="cron"),
                 id="config-picker-list",
             )

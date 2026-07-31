@@ -102,3 +102,47 @@ async def test_every_option_names_the_file_it_edits():
     assert any("cron.yaml" in label for label in labels)
     assert any(".env" in label for label in labels)
     assert any("sandbox.yaml" in label for label in labels)
+
+
+async def test_no_option_label_is_truncated():
+    """The regression this exists for: at width 60 the sandbox row was 54 characters
+    of label in 50 of content, so it rendered cut off mid-word. A label an operator
+    cannot read is worse than no label, and the failure is silent -- nothing errors,
+    the text just stops."""
+    app = _Host()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.push_screen(ConfigPickerScreen())
+        await pilot.pause()
+        options = app.screen.query_one(OptionList)
+        labels = [
+            str(options.get_option_at_index(i).prompt)
+            for i in range(options.option_count)
+        ]
+        content_width = options.size.width
+
+    too_long = [label for label in labels if len(label) > content_width]
+    assert not too_long, (
+        f"{too_long} exceed the {content_width}-column content area; widen "
+        f"#config-picker or shorten the description"
+    )
+
+
+async def test_the_modal_does_not_balloon_on_a_wide_terminal():
+    """`width: auto` was the obvious fix and the wrong one: it fills the available
+    space, reaching 102 columns on a 120-column terminal while still truncating on a
+    narrow one. A modal should be the size of its content, not of the screen."""
+    app = _Host()
+    async with app.run_test(size=(200, 40)) as pilot:
+        await app.push_screen(ConfigPickerScreen())
+        await pilot.pause()
+        assert app.screen.query_one("#config-picker").size.width < 80
+
+
+async def test_a_narrow_terminal_shrinks_the_modal_rather_than_overflowing():
+    """Truncation is unavoidable below a certain width; running off the screen is
+    not."""
+    app = _Host()
+    async with app.run_test(size=(44, 20)) as pilot:
+        await app.push_screen(ConfigPickerScreen())
+        await pilot.pause()
+        assert app.screen.query_one("#config-picker").size.width <= 44
