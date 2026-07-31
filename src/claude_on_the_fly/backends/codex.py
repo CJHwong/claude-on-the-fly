@@ -52,13 +52,17 @@ def _merge_codex_results(first: dict, second: dict) -> dict:
 def parse_codex_stream(stdout: bytes) -> dict:
     """Parse the JSONL emitted by `codex exec --json`.
 
-    Returns a dict with `thread_id`, `body`, `usage`, `tool_counts`, and
-    `error` keys. `error` is set only when codex emits `turn.failed`.
+    Returns a dict with `thread_id`, `body`, `usage`, `completed`,
+    `tool_counts`, and `error` keys. `error` is set only when codex emits
+    `turn.failed`. `completed` says codex emitted `turn.completed`, which it
+    does after the turn's final `agent_message` — the only in-band proof that
+    a `body` is the whole reply rather than one the stream was cut short of.
     """
     thread_id: str | None = None
     body = ""
     usage: dict = {}
     error: str | None = None
+    completed = False
     tool_counts: dict[str, int] = {}
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -83,6 +87,7 @@ def parse_codex_stream(stdout: bytes) -> dict:
                 tool_counts[item_type] = tool_counts.get(item_type, 0) + 1
         elif kind == "turn.completed":
             usage = msg.get("usage") or {}
+            completed = True
         elif kind == "turn.failed":
             error = (msg.get("error") or {}).get("message") or "codex turn failed"
         # "error" events are reconnect noise; only turn.failed is terminal
@@ -91,6 +96,7 @@ def parse_codex_stream(stdout: bytes) -> dict:
         "body": body,
         "usage": usage,
         "error": error,
+        "completed": completed,
         "tool_counts": tool_counts,
     }
 
@@ -127,26 +133,28 @@ async def _run_codex_exec(
     if parsed.get("error"):
         raise RuntimeError(parsed["error"])
     if proc.returncode != 0:
-        # A non-zero exit *after* codex emitted its final agent_message means the
-        # turn's work is done and only codex's own teardown failed. That happens:
-        # codex can deadlock at exit (main thread parked in pthread_join on a
-        # runtime thread that never finishes), leaving a process that has already
-        # written its complete reply to stdout but never exits, until something
-        # kills it. Raising here would discard a reply we are holding in `parsed`
-        # and post an exit code to the chat instead, so deliver it and log the
-        # exit. No body means nothing was salvageable — still an error.
-        if parsed.get("body"):
+        stderr_text = stderr_bytes.decode(errors="replace").strip()
+        # A non-zero exit *after* `turn.completed` means the turn's work is done
+        # and only codex's own teardown failed. That happens: codex can deadlock
+        # at exit (main thread parked in pthread_join on a runtime thread that
+        # never finishes), leaving a process that has already written its
+        # complete reply to stdout but never exits, until something kills it.
+        # Raising here would discard a reply we are holding in `parsed` and post
+        # an exit code to the chat instead, so deliver it and log the exit.
+        #
+        # `body` alone would not be enough to gate on: codex overwrites it on
+        # every agent_message, so a turn killed mid-work leaves an intermediate
+        # message sitting there that reads exactly like a final answer. Only
+        # `turn.completed` distinguishes "finished, then died" from "died".
+        if parsed.get("completed") and parsed.get("body"):
             logger.warning(
-                "codex exec: exit %s after a completed turn; "
-                "delivering the parsed reply anyway",
+                "codex exec: exit %s after turn.completed; delivering the "
+                "parsed reply anyway. stderr: %s",
                 proc.returncode,
+                stderr_text[:500] or "(empty)",
             )
             return parsed
-        detail = (
-            stderr_bytes.decode(errors="replace").strip()
-            or f"Exit code {proc.returncode}"
-        )
-        raise RuntimeError(detail)
+        raise RuntimeError(stderr_text or f"Exit code {proc.returncode}")
     return parsed
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -190,6 +191,10 @@ def _agent_message(text: str) -> dict:
     }
 
 
+def _turn_completed(**usage: int) -> dict:
+    return {"type": "turn.completed", "usage": usage}
+
+
 def _exec_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     proc = MagicMock()
     proc.returncode = returncode
@@ -210,7 +215,7 @@ async def _run_exec(proc, tmp_path: Path):
 
 class TestRunCodexExec:
     async def test_nonzero_exit_after_completed_turn_still_returns_body(
-        self, tmp_path: Path
+        self, tmp_path: Path, caplog
     ):
         """codex can deadlock at exit with its reply already on stdout; the
         turn is finished, so the reply must survive being killed."""
@@ -219,12 +224,42 @@ class TestRunCodexExec:
             _ndjson(
                 {"type": "thread.started", "thread_id": "t1"},
                 _agent_message("PR #804 is merged."),
+                _turn_completed(input_tokens=100, output_tokens=5),
             ),
             stderr=b"ERROR codex_core::tools::router: stale noise",
         )
-        out = await _run_exec(proc, tmp_path)
+        with caplog.at_level(logging.WARNING):
+            out = await _run_exec(proc, tmp_path)
         assert out["body"] == "PR #804 is merged."
         assert out["thread_id"] == "t1"
+        # The deadlock is un-root-caused upstream; stderr is the only artifact
+        # that can explain a given instance, so it has to reach the log.
+        assert "codex_core::tools::router" in caplog.text
+
+    async def test_nonzero_exit_mid_turn_raises_instead_of_shipping_a_fragment(
+        self, tmp_path: Path
+    ):
+        """A turn killed mid-work leaves an intermediate agent_message that
+        looks exactly like a final answer. Without turn.completed it is not
+        one, and delivering it would be a silently wrong reply."""
+        proc = _exec_proc(
+            -9,
+            _ndjson(
+                {"type": "thread.started", "thread_id": "t1"},
+                _agent_message("Let me check the tests first, then I'll open the PR"),
+            ),
+            stderr=b"killed mid-turn",
+        )
+        with pytest.raises(RuntimeError, match="killed mid-turn"):
+            await _run_exec(proc, tmp_path)
+
+    async def test_nonzero_exit_after_completed_turn_without_body_raises(
+        self, tmp_path: Path
+    ):
+        """turn.completed with nothing to say is not a reply worth delivering."""
+        proc = _exec_proc(-9, _ndjson(_turn_completed()), stderr=b"empty turn")
+        with pytest.raises(RuntimeError, match="empty turn"):
+            await _run_exec(proc, tmp_path)
 
     async def test_nonzero_exit_without_body_raises_stderr(self, tmp_path: Path):
         proc = _exec_proc(1, b"", stderr=b"codex: command not found")
@@ -315,6 +350,41 @@ class TestCodexBackendRun:
         assert session_file.exists()
         assert session_file.read_text() == "codex-thread-xyz"
         assert resp.body == "hello"
+
+    async def test_killed_first_turn_still_delivers_reply_and_persists_thread(
+        self, tmp_path: Path
+    ):
+        """The whole point of the non-zero-exit path, end to end: a turn that
+        finished and then died reaches the caller as an ordinary Response, its
+        thread survives for the next turn, and its tokens are still counted.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        proc = _exec_proc(
+            -9,
+            _ndjson(
+                {"type": "thread.started", "thread_id": "codex-thread-killed"},
+                _agent_message("PR #804 is merged."),
+                _turn_completed(input_tokens=100, output_tokens=5),
+            ),
+            stderr=b"stale teardown noise",
+        )
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            patch.object(codex_mod.agent, "track_agent_process"),
+            patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()),
+        ):
+            resp = await CodexBackend().run(
+                workspace, "killed-session", "hi", "telegram"
+            )
+
+        assert resp.body == "PR #804 is merged."
+        # turn.completed carries the usage, so gating on it also keeps the
+        # fallback token count honest instead of billing the turn as free.
+        assert resp.tokens_in == 100
+        assert resp.tokens_out == 5
+        session_file = workspace / ".codex_sessions" / "killed-session"
+        assert session_file.read_text() == "codex-thread-killed"
 
     async def test_second_call_resumes_persisted_thread(self, tmp_path: Path):
         workspace = tmp_path / "ws"
