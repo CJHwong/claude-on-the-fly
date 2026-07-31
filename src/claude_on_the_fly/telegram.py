@@ -215,14 +215,22 @@ class TelegramFrontend(Frontend):
         # literal.
         subject = escape_markdown(request.subject, version=1)
         detail = escape_markdown(request.detail, version=1)
+        # Same split as the Slack card: an `origin` requester has a digest for a
+        # subject, so the readable label leads and the digest drops to the footer
+        # where it is still available for matching against the grant log.
+        # The footer is the lifetime and nothing else. Repeating the subject, or the
+        # scope in front of it, said the same thing the detail block already says --
+        # see slack._approval_footer for the card that made that obvious.
+        foot = f"Grant lasts {minutes:.0f} min and dies on restart."
+        if request.origin:
+            head = (
+                f"*Permission request* ({escape_markdown(request.origin, version=1)})"
+            )
+        else:
+            head = f"*Permission request*\n\n`{subject}`"
         message = await self._app.bot.send_message(
             chat_id=chat_id,
-            text=(
-                f"*Permission request*\n\n"
-                f"`{subject}`\n\n"
-                f"{detail}\n\n"
-                f"Grant lasts {minutes:.0f} min and dies on restart."
-            ),
+            text=f"{head}\n\n{detail}\n\n{foot}",
             parse_mode="Markdown",
             reply_markup=keyboard,
             # The detail names the host the agent asked for, so a preview would
@@ -260,13 +268,16 @@ class TelegramFrontend(Frontend):
         """Strip the buttons and stamp the outcome so the prompt can't be reused."""
         if self._app is None:
             return
+        # The scope, not the subject: a subject is the grant key, scoped to the
+        # program, so this read "Permission approved / bash:chmod" -- a record that
+        # does not say which file. The scope carries the arguments.
+        decided = request.scope or request.subject
         try:
             await self._app.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=(
-                    f"*Permission {verdict}*\n\n"
-                    f"`{escape_markdown(request.subject, version=1)}`"
+                    f"*Permission {verdict}*\n\n`{escape_markdown(decided, version=1)}`"
                 ),
                 parse_mode="Markdown",
             )

@@ -427,6 +427,46 @@ def _fit_block(text: str) -> str:
     return f"{text[:_BLOCK_TEXT_LIMIT]}\n[{dropped} more characters, see the log]"
 
 
+def _approval_headline(request: ApprovalRequest) -> str:
+    """The card's first line.
+
+    Leads with `origin` when the requester set one, because those subjects are
+    digests: `pty:Bash:f5771755993b` as a headline tells the operator nothing, and
+    it pushed the command -- the thing being decided -- onto a second line on a
+    phone. A requester whose subject is already readable (a host, a command) sets
+    no origin and keeps the subject up here.
+    """
+    if request.origin:
+        return f"*Permission request*  ({_literal(request.origin)})"
+    return f"*Permission request*\n`{_literal(request.subject)}`"
+
+
+def _decided_text(request: ApprovalRequest) -> str:
+    """What a retired card should say was decided.
+
+    The scope when there is one, because that is the only text on the request that
+    carries arguments. The subject otherwise -- an egress subject (`pypi.org:443`) is
+    already the whole thing that was decided.
+    """
+    return request.scope or request.subject
+
+
+def _approval_footer(request: ApprovalRequest) -> str:
+    """Grant lifetime, and nothing else.
+
+    An earlier version put the subject here, then a `Covers:` line in front of it to
+    make a digest subject mean something. Both were duplication: the detail block
+    above already *is* the command, so a tool card said the same thing three times --
+    `(Bash)`, then `chmod 700 .`, then `Covers: bash:chmod 700 .  bash:chmod`.
+
+    Nothing is lost by dropping them. The grant key and the full command are both on
+    the GRANTED line in the log, and a retired card records the command
+    (`_decided_text`), so the decision is still traceable without spending three
+    lines of a phone screen on it.
+    """
+    return f"Grant lasts {request.ttl_seconds / 60:.0f} min and dies on restart."
+
+
 def _skill_option_groups(skills: list[tuple[str, str]]) -> list[dict]:
     """Group (name, description) skills by plugin namespace into Block Kit
     option_groups (label = plugin, or 'user' for un-namespaced names).
@@ -981,10 +1021,7 @@ class SlackFrontend(Frontend):
             blocks=[
                 {
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Permission request*\n`{_literal(request.subject)}`",
-                    },
+                    "text": {"type": "mrkdwn", "text": _approval_headline(request)},
                 },
                 {
                     # plain_text, so Slack parses no mrkdwn in it. Parts of a
@@ -997,15 +1034,7 @@ class SlackFrontend(Frontend):
                 },
                 {
                     "type": "context",
-                    "elements": [
-                        {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"Grant lasts {request.ttl_seconds / 60:.0f} min "
-                                "and dies on restart."
-                            ),
-                        }
-                    ],
+                    "elements": [{"type": "mrkdwn", "text": _approval_footer(request)}],
                 },
                 {
                     "type": "actions",
@@ -1041,11 +1070,16 @@ class SlackFrontend(Frontend):
         competing with it. The buttons go, so the prompt cannot be reused.
         """
         verdict = "approved" if granted else "denied"
+        # The scope, not the subject. A subject is the grant key, scoped to the
+        # program, so this line used to read "Permission approved: bash:chmod" -- a
+        # record of a decision that does not say what was decided. The scope carries
+        # the arguments.
+        decided = _decided_text(request)
         try:
             await self._app.client.chat_update(
                 channel=channel,
                 ts=ts,
-                text=f"Permission {verdict}: {request.subject}",
+                text=f"Permission {verdict}: {decided}",
                 blocks=[
                     {
                         "type": "context",
@@ -1053,8 +1087,7 @@ class SlackFrontend(Frontend):
                             {
                                 "type": "mrkdwn",
                                 "text": (
-                                    f"Permission *{verdict}*: "
-                                    f"`{_literal(request.subject)}`"
+                                    f"Permission *{verdict}*: `{_literal(decided)}`"
                                 ),
                             }
                         ],

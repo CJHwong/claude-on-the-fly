@@ -2700,6 +2700,72 @@ class TestApprovalCardCannotBeRestyledByTheAgent:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+    def test_the_card_says_the_command_once(self):
+        """The regression this guards: the footer carried the subject, then a
+        `Covers:` line in front of it, so a card read "(Bash)" / "chmod 700 ." /
+        "Covers: bash:chmod 700 .  bash:chmod" -- the same command three times on a
+        phone screen. The key and the full command are in the log instead."""
+        from claude_on_the_fly.slack import _approval_footer, _approval_headline
+
+        request = _request(
+            subject="bash:chmod",
+            detail="chmod 700 .",
+            origin="Bash",
+            scope="bash:chmod 700 .",
+        )
+        card = f"{_approval_headline(request)}\n{request.detail}\n{_approval_footer(request)}"
+        assert card.count("chmod") == 1
+        assert "Covers:" not in card
+        assert "bash:chmod" not in _approval_footer(request)
+
+    def test_an_egress_card_still_names_its_host_once(self):
+        """A no-origin request puts the subject in the headline, so dropping the
+        footer's copy must not leave the host off the card entirely."""
+        from claude_on_the_fly.slack import _approval_footer, _approval_headline
+
+        request = _request()
+        assert "pypi.org:443" in _approval_headline(request)
+        assert "pypi.org" not in _approval_footer(request)
+
+    def test_a_retired_card_records_the_command_not_the_program(self):
+        """The complaint this fixes: an approved card collapsed to "Permission
+        approved: bash:chmod", which does not say which file was chmodded. The
+        subject is program-scoped because it is the grant key; the scope has args."""
+        from claude_on_the_fly.slack import _decided_text
+
+        request = _request(
+            subject="bash:chmod", scope="bash:chmod 700 /Users/hoss/ws", origin="Bash"
+        )
+        assert _decided_text(request) == "bash:chmod 700 /Users/hoss/ws"
+
+    def test_a_retired_card_falls_back_to_the_subject(self):
+        """An egress subject is already the whole decision, so it needs no scope and
+        must still produce a record."""
+        from claude_on_the_fly.slack import _decided_text
+
+        assert _decided_text(_request()) == "pypi.org:443"
+
+    def test_a_readable_subject_keeps_the_headline(self):
+        """An egress or command request names a host or a binary, which is exactly
+        what the operator is deciding about, so those cards must not change."""
+        from claude_on_the_fly.slack import _approval_footer, _approval_headline
+
+        request = _request()
+        assert _approval_headline(request) == "*Permission request*\n`pypi.org:443`"
+        assert "pypi.org" not in _approval_footer(request)
+
+    def test_an_agent_reachable_origin_cannot_break_out_of_the_headline(self):
+        """origin is cotf-authored today, but it lands in mrkdwn beside a code span,
+        so it goes through the same literalising the subject does. A backtick or a
+        newline here would let the agent style the operator's own prompt."""
+        from claude_on_the_fly.slack import _approval_headline
+
+        headline = _approval_headline(
+            _request(origin="Bash`\n*APPROVED*, asked by claude")
+        )
+        assert "\n" not in headline
+        assert headline.count("`") == 0
+
     async def test_the_detail_is_posted_where_slack_parses_no_markup(self, frontend):
         frontend._is_bot_token = True
         frontend._sessions[1] = ("C1", "1785382860.1")
