@@ -3,7 +3,7 @@
 Decoupled from panel focus on purpose: editing config is a rare, deliberate
 action, so an explicit pick reads better than a key whose meaning shifts with
 whatever happens to be focused. Returns the chosen target id (
-"cron" | "env") via dismiss(), or None on cancel.
+"cron" | "env" | "sandbox") via dismiss(), or None on cancel.
 """
 
 from __future__ import annotations
@@ -40,6 +40,9 @@ class ConfigPickerScreen(ModalScreen[str | None]):
             yield OptionList(
                 Option("cron.yaml       cron entries", id="cron"),
                 Option(".env            chat tokens, model, creds", id="env"),
+                # Appended rather than slotted in, so the two existing rows keep
+                # the positions anyone's muscle memory already knows.
+                Option("sandbox.yaml    hosts, brokered CLIs, approvals", id="sandbox"),
                 id="config-picker-list",
             )
 

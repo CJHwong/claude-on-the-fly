@@ -540,6 +540,9 @@ class TestConfigEditing:
                 screen, "_edit_cron_config", lambda: edits.append("cron")
             )
             monkeypatch.setattr(screen, "_edit_env", lambda: edits.append("env"))
+            monkeypatch.setattr(
+                screen, "_edit_sandbox_config", lambda: edits.append("sandbox")
+            )
             screen._open_config_target(choice)
             await pilot.pause()
         assert edits == [expected]
@@ -1582,3 +1585,44 @@ class TestRefreshNowKey:
             screen.action_refresh_now()
             await pilot.pause()
         assert calls == ["tables", "log:True"]
+
+    async def test_editing_the_sandbox_config_seeds_the_commented_template(
+        self, isolated, monkeypatch, no_suspend
+    ):
+        """The first thing an operator opens should be the file explaining every
+        field, not an empty buffer whose schema they have to go and find."""
+        from claude_on_the_fly import settings
+
+        opened: list[tuple[object, object]] = []
+        monkeypatch.setattr(
+            dash.env_editor,
+            "open_in_editor",
+            lambda path, seed=None: opened.append((path, seed)),
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _capture(screen)
+            screen._edit_sandbox_config()
+            await pilot.pause()
+
+        target, seed = opened[0]
+        assert target == settings.operator_settings()
+        assert target.name == "sandbox.yaml"
+        # The bundled template, comments and all -- that is the point of seeding it.
+        assert "egress:" in str(seed) and "permissions:" in str(seed)
+        assert str(seed).count("#") > 40
+
+    async def test_a_sandbox_edit_names_the_file_it_touched(
+        self, isolated, monkeypatch, no_suspend
+    ):
+        """No diff afterwards, unlike .env: nothing in here is a secret to redact, and
+        the loaders re-read the file per call so an edit needs no restart."""
+        monkeypatch.setattr(dash.env_editor, "open_in_editor", lambda *a, **k: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            screen._edit_sandbox_config()
+            await pilot.pause()
+        assert any("sandbox.yaml" in str(note) for note in notices)
