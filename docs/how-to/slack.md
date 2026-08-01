@@ -93,7 +93,7 @@ next one without a restart.
 ## How it works
 
 - With a **user token**, anyone who DMs you triggers Claude (if they can DM you, they're trusted), and your own ID is always allowed
-- With a **bot token**, the auto-allowed ID is the bot's, not yours — add your own `U…` id to `slack.allowed_senders` (or use `*`) or your DMs will be dropped
+- With a **bot token**, the auto-allowed ID is the bot's, not yours — add your own `U…` id to `slack.allowed_senders` (or use `"*"`; the quotes are required by YAML) or your DMs will be dropped
 - In channels, only allowed senders (auto-allowed ID + `slack.allowed_senders`) can trigger Claude via @mention
 - Bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID (`B…`) is in `slack.allowed_senders`; trusted bot posts trigger Claude without an @mention. Don't list this app's own bot ID (it would loop)
 - Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly

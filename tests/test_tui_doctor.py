@@ -53,6 +53,16 @@ class TestGroupTable:
     def test_an_empty_group_makes_an_empty_table(self):
         assert _group_table("slack", []).row_count == 0
 
+    def test_migrated_setting_uses_its_config_yaml_name(self):
+        table = _group_table("backend", [_result("OLLAMA_MODEL", "ok", "= qwen3:8b")])
+        name_column = next(iter(table.columns))
+        assert list(name_column._cells) == ["agent.ollama.model"]
+
+    def test_environment_only_setting_keeps_its_env_name(self):
+        table = _group_table("slack", [_result("SLACK_TOKEN", "ok", "set")])
+        name_column = next(iter(table.columns))
+        assert list(name_column._cells) == ["SLACK_TOKEN"]
+
 
 class TestReRunsOnResume:
     async def test_opening_the_screen_runs_the_checks(self, monkeypatch, tmp_path):

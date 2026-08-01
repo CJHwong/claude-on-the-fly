@@ -82,6 +82,9 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
 | `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
 
+Use `allowed_senders: ["*"]` to allow every human sender. The quotes are required:
+a bare `*` starts a YAML alias and makes the configuration invalid.
+
 `*` allows any human but never implicitly allows bots. With a bot token, list your own
 human Slack ID or your DMs are ignored.
 

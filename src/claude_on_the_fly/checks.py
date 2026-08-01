@@ -40,6 +40,25 @@ def fix_hint(name: str) -> str:
     return DOTENV_HINT
 
 
+def display_name(name: str) -> str:
+    """User-facing spelling for a check's internal setting name.
+
+    Checkers deliberately still consume and identify settings through the legacy
+    environment-variable key space: it is the compatibility seam shared by the
+    runtime, preflight, and tests.  Doctor output is configuration documentation,
+    though, so showing ``OLLAMA_MODEL`` there after it moved to YAML sends the
+    operator to the wrong file.  Translate migrated settings at the presentation
+    boundary and leave real environment-only settings (tokens, LOG_LEVEL, etc.)
+    unchanged.
+    """
+    from claude_on_the_fly import settings
+
+    for path, field in settings.FIELDS.items():
+        if field.env == name:
+            return path
+    return name
+
+
 @dataclass(frozen=True)
 class CheckResult:
     name: str

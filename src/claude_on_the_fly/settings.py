@@ -188,7 +188,12 @@ def read_document(path: Path) -> dict[str, Any]:
         # Normalised to ValueError so callers have one exception type to catch. A
         # YAMLError is not a ValueError, so without this an unparseable file took
         # the daemon down at startup instead of falling back.
-        raise ValueError(f"not valid YAML ({exc.__class__.__name__})") from None
+        problem = str(getattr(exc, "problem", "") or exc.__class__.__name__)
+        context = str(getattr(exc, "context", "") or "")
+        detail = f"{context}: {problem}" if context else problem
+        mark = getattr(exc, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ValueError(f"not valid YAML{location}: {detail}") from None
     if raw is None:
         return {}
     if not isinstance(raw, dict):
