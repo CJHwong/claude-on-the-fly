@@ -75,6 +75,18 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
 - `docs/agent/broker.md` — when changing the credential broker or sandbox/jail wiring
 
+Operator docs follow Diátaxis and start at `docs/index.md`:
+
+- `docs/tutorials/` teaches through one complete first deployment.
+- `docs/how-to/` gives task-oriented procedures.
+- `docs/reference/` is the exact schema, defaults, and lifecycle contract.
+- `docs/explanation/` describes security and design concepts.
+- `docs/agent/` remains contributor-only implementation notes.
+
+Keep each page focused on one of those jobs. A setting change must update the packaged
+`config.yaml` template and the reference lifecycle table; add how-to or explanation only
+when the operator gains a new task or concept.
+
 When working across multiple areas, read all relevant files first — the subsystems share state through `orchestrator.py` and `agent.py`.
 
 ## Adding a setting
