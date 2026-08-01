@@ -53,10 +53,10 @@ class ConfigPickerScreen(ModalScreen[str | None]):
             # newest-last, would both read as arbitrary to someone opening this for
             # the first time.
             yield OptionList(
-                Option(".env            tokens, model, credentials", id="env"),
+                Option(".env            tokens and credentials", id="env"),
                 # Names the top-level keys rather than describing them, which is both
                 # shorter and more useful: it tells you what you will be looking at.
-                Option("config.yaml     egress, commands, permissions", id="sandbox"),
+                Option("config.yaml     agent, models, policy, app", id="sandbox"),
                 Option("cron.yaml       scheduled runs", id="cron"),
                 id="config-picker-list",
             )

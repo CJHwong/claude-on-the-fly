@@ -31,7 +31,7 @@ def _group_table(group_name: str, results: list[checks.CheckResult]) -> Table:
     for r in results:
         status = Text(r.status, style=_STATUS_STYLES.get(r.status, ""))
         fix = r.fix_hint or ""
-        table.add_row(r.name, status, r.detail, fix)
+        table.add_row(checks.display_name(r.name), status, r.detail, fix)
     return table
 
 

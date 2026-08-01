@@ -103,6 +103,16 @@ def test_an_unusable_file_says_nothing_you_added_is_active(operator_settings, ca
     assert "nothing you added there is active" in caplog.text
 
 
+def test_a_yaml_error_names_the_location_and_problem(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("slack:\n  allowed_senders: [*]\n")
+    with pytest.raises(ValueError) as caught:
+        settings.read_document(path)
+    message = str(caught.value)
+    assert "line 2, column" in message
+    assert "alias" in message
+
+
 def test_a_bad_section_says_the_others_still_load(operator_settings, caplog):
     operator_settings.write_text("egress: 3\ncommands:\n  tools: []\n")
     with caplog.at_level("ERROR", logger="claude_on_the_fly.settings"):

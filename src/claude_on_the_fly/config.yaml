@@ -260,6 +260,8 @@ slack:
   # the token's own id -- under a bot token that is the BOT's, not yours, so list
   # your own U... id or your DMs are dropped. The startup log shows what is live.
   # allowed_senders: [U012ABCDEF, B07JPABE2]
+  # To allow everyone, quote the wildcard: allowed_senders: ["*"]
+  # A bare `*` is YAML alias syntax and makes the whole file invalid.
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
   # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
 

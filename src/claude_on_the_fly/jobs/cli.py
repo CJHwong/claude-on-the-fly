@@ -248,7 +248,8 @@ def _cmd_doctor() -> int:
     failed = 0
     warned = 0
     for r in results:
-        sys.stdout.write(f"  {r.name:30s} {r.status:8s} {r.detail}\n")
+        name = checks.display_name(r.name)
+        sys.stdout.write(f"  {name:30s} {r.status:8s} {r.detail}\n")
         if r.status != "ok":
             if r.fix_hint:
                 sys.stdout.write(f"    hint: {r.fix_hint}\n")
