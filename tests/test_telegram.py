@@ -349,6 +349,14 @@ class TestAllowed:
         update.effective_user = None
         assert frontend._allowed(update) is False
 
+    def test_authorization_id_reloads_immediately(
+        self, frontend: TelegramFrontend, operator_settings
+    ) -> None:
+        operator_settings.write_text("telegram:\n  allowed_user_id: 456\n")
+        assert frontend._allowed(make_update(user_id=123)) is False
+        assert frontend._allowed(make_update(user_id=456)) is True
+        assert frontend._approval_chat() == 456
+
 
 # ============================================================
 # _extract_file

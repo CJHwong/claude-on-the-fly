@@ -74,6 +74,15 @@ def isolate_env_file(tmp_path, monkeypatch):
     return env_file
 
 
+@pytest.fixture(autouse=True)
+def isolate_startup_settings(monkeypatch):
+    """Do not let one daemon-startup simulation pin another test's modes."""
+    from claude_on_the_fly import settings
+
+    monkeypatch.setattr(settings, "_RESTART_STATE", {})
+    monkeypatch.setattr(settings, "_STARTUP_VALUES", {})
+
+
 @pytest.fixture
 def operator_settings(tmp_path, monkeypatch):
     """Path to a per-test operator `config.yaml`, with DATA_DIR redirected to it.
@@ -96,6 +105,7 @@ def operator_settings(tmp_path, monkeypatch):
     monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
     monkeypatch.setattr(settings, "_DOCUMENTS", {})
     monkeypatch.setattr(settings, "_RESTART_STATE", {})
+    monkeypatch.setattr(settings, "_STARTUP_VALUES", {})
     return data / settings.FILENAME
 
 

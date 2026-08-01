@@ -476,6 +476,27 @@ def test_check_reload_names_the_field_that_needs_a_restart(
     assert settings.check_reload() == expected
 
 
+def test_startup_value_keeps_security_mode_pinned_until_restart(operator_settings):
+    operator_settings.write_text(
+        'sandbox:\n  mode: "off"\npermissions:\n  mode: "off"\n'
+    )
+    settings.check_operator_settings()
+
+    operator_settings.write_text("sandbox:\n  mode: jail\npermissions:\n  mode: ask\n")
+
+    assert settings.startup_value("sandbox.mode") == "off"
+    assert settings.startup_value("permissions.mode") == "off"
+    assert settings.check_reload() == ("sandbox.mode", "permissions.mode")
+
+
+def test_worker_construction_settings_are_restart_required():
+    assert {
+        "jobs.concurrency",
+        "jobs.poll_interval_s",
+        "jobs.timeout",
+    } <= set(settings.RESTART_REQUIRED)
+
+
 def test_check_reload_ignores_a_field_that_is_re_read(operator_settings):
     """ttl_seconds and the allowlist land on their own. Reporting them would train
     the operator to ignore the notice."""

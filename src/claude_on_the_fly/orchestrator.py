@@ -156,6 +156,10 @@ class SessionPermissions:
             return {}
         existing = self._services.get(chat_id)
         if existing is not None and existing[0] == session:
+            existing[1].update_timing(
+                ttl_seconds=resolved.ttl_seconds,
+                timeout_seconds=resolved.timeout_seconds,
+            )
             return self._env(existing[1])
         if existing is not None:
             await existing[1].stop()
@@ -212,6 +216,7 @@ class SessionPermissions:
         return {
             cotf_approve.ENDPOINT_ENV: service.base_url + permissions.DECIDE_PATH,
             cotf_approve.NOTIFY_ENV: service.base_url + permissions.NOTIFY_PATH,
+            cotf_approve.REQUEST_TIMEOUT_ENV: str(service.broker.timeout_seconds + 5),
             permissions.TMUX_SESSION_ENV: service.tmux_session,
             **permissions.pty_env(),
         }
@@ -274,7 +279,9 @@ class Orchestrator:
         # Only pty mode populates it; elsewhere the gate never has a reading and
         # so never fires.
         self._context: dict[int, tuple[int, int]] = {}
-        self._auto_compact_pct = _auto_compact_pct()
+        # None means use the live setting. Tests and embedders may assign an
+        # explicit threshold through the compatibility property below.
+        self._auto_compact_pct_override: int | None = None
         self._event_log = event_log if event_log is not None else EventLog()
         # chat_id -> {identifier, started_at_monotonic, session_uuid}.
         # Populated at dispatch, cleared on completion. Drives the heartbeat
@@ -385,7 +392,8 @@ class Orchestrator:
         compaction rather than two — the second would find nothing to compact and
         bill a full-context pass to be told so.
         """
-        if not self._auto_compact_pct:
+        threshold = self._auto_compact_pct
+        if not threshold:
             return False
         reading = self._context.get(chat_id)
         if reading is None:
@@ -394,7 +402,7 @@ class Orchestrator:
         if window <= 0:
             return False
         pct = tokens * 100 / window
-        if pct < self._auto_compact_pct:
+        if pct < threshold:
             return False
         self._context.pop(chat_id, None)
         logger.info(
@@ -403,9 +411,19 @@ class Orchestrator:
             pct,
             tokens,
             window,
-            self._auto_compact_pct,
+            threshold,
         )
         return True
+
+    @property
+    def _auto_compact_pct(self) -> int:
+        if self._auto_compact_pct_override is not None:
+            return self._auto_compact_pct_override
+        return _auto_compact_pct()
+
+    @_auto_compact_pct.setter
+    def _auto_compact_pct(self, value: int) -> None:
+        self._auto_compact_pct_override = value
 
     async def _drain(self, chat_id: int) -> None:
         queue = self._queues[chat_id]
@@ -720,9 +738,16 @@ async def _start_sandbox(
     every route's key loaded in memory and ANTHROPIC_BASE_URL published, for a
     daemon that was on its way to exiting.
     """
+    # Approval artifacts are independent of the sandbox. Generate them before
+    # the sandbox-off return so a fresh ask-mode deployment has both backends'
+    # prompt/hook wiring available.
+    permissions.check()
+    if permissions.configured().enabled:
+        permissions.write_shim()
+        permissions.write_mcp_config()
+        permissions.write_pty_settings()
     if not sandbox.enabled():
         return None, None, None
-    permissions.check()
     broker_instance = None
     command_broker = None
     try:
@@ -763,12 +788,6 @@ async def _start_sandbox(
     # per run, that the boundary was actually in force rather than inferring it
     # from an absence of errors.
     await sandbox.verify_denials()
-    # The shim and its MCP config are rewritten every startup so the
-    # interpreter path cannot go stale across a venv move or an upgrade.
-    if permissions.configured().enabled:
-        permissions.write_shim()
-        permissions.write_mcp_config()
-        permissions.write_pty_settings()
     return broker_instance, SessionEgress(frontend), command_broker
 
 

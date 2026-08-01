@@ -199,7 +199,9 @@ def mode() -> str:
     `jial` used to read as "no sandbox at all" with nothing anywhere to say so,
     which is the most expensive possible way to be wrong about this setting.
     """
-    raw = settings.get("COTF_SANDBOX", "off").strip()
+    # The broker, proxy, and command service are built once. Keep the spawn
+    # boundary on that same startup mode until the reported restart happens.
+    raw = str(settings.startup_value("sandbox.mode", "off")).strip()
     value = raw.lower()
     if value in _MODES:
         return value

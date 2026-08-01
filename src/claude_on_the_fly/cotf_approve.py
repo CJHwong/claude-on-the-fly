@@ -44,6 +44,7 @@ NOTIFY_ENV = "COTF_APPROVE_NOTIFY_URL"
 # longer operator timeout and answers before this fires; this only catches a
 # daemon that has stopped answering at all.
 REQUEST_TIMEOUT_SECONDS = 600
+REQUEST_TIMEOUT_ENV = "COTF_APPROVE_TIMEOUT_SECONDS"
 
 DENY_MESSAGE = (
     "The operator did not approve this. Do not retry it. Say what you would need "
@@ -69,9 +70,13 @@ def _ask(payload: dict) -> tuple[bool, str]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(
-            request, timeout=REQUEST_TIMEOUT_SECONDS
-        ) as response:
+        timeout = float(os.environ.get(REQUEST_TIMEOUT_ENV, REQUEST_TIMEOUT_SECONDS))
+        if timeout <= 0:
+            timeout = REQUEST_TIMEOUT_SECONDS
+    except ValueError:
+        timeout = REQUEST_TIMEOUT_SECONDS
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             answer = json.loads(response.read().decode())
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
         return False, f"could not reach the operator ({exc.__class__.__name__})"

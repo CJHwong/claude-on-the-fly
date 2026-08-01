@@ -145,6 +145,9 @@ FIELDS: dict[str, Field] = {
 # names them rather than leaving an operator to wonder why their edit did nothing.
 # Dotted paths address one field; a bare name covers a whole section.
 RESTART_REQUIRED = (
+    # The spawn path must keep using the mode whose broker/proxy/jail services
+    # were constructed at startup.
+    "sandbox.mode",
     # PATH shims, written once into the agent's environment.
     "commands",
     # Decides whether the approval service is constructed at all, and whether the
@@ -156,6 +159,11 @@ RESTART_REQUIRED = (
     # The queue adapter is built once, and the worker on the other side of it was
     # started separately with the old value.
     "jobs.queue_kind",
+    # The worker and its runner are constructed once. Applying only some of
+    # these values to a live loop would create a misleading mixed posture.
+    "jobs.concurrency",
+    "jobs.poll_interval_s",
+    "jobs.timeout",
 )
 
 
@@ -545,12 +553,37 @@ def _restart_state() -> dict[str, str]:
 
 
 _RESTART_STATE: dict[str, str] = {}
+_STARTUP_VALUES: dict[str, object] = {}
 
 
 def _remember_restart_state() -> None:
     """Record what the restart-required fields were at startup."""
-    global _RESTART_STATE
+    global _RESTART_STATE, _STARTUP_VALUES
     _RESTART_STATE = _restart_state()
+    _STARTUP_VALUES = {path: _current_value(path) for path in RESTART_REQUIRED}
+
+
+def _current_value(path: str) -> object:
+    """One dotted value with its legacy environment override applied."""
+    field = FIELDS.get(path)
+    if field is not None:
+        override = _from_environment(field.env, None)
+        if override is not None:
+            return override
+    section, _, key = path.partition(".")
+    merged = {**bundled(section), **operator(section)}
+    return copy.deepcopy(merged.get(key) if key else merged)
+
+
+def startup_value(path: str, default: object = None) -> object:
+    """The value of a restart-required field when startup validation ran.
+
+    Before a daemon has established its baseline (notably in unit tests and
+    one-shot CLI commands), resolve the current document. Runtime readers use
+    this for settings whose supporting services cannot be rebuilt safely.
+    """
+    value = _STARTUP_VALUES[path] if path in _STARTUP_VALUES else _current_value(path)
+    return copy.deepcopy(default if value is None else value)
 
 
 def check_reload() -> tuple[str, ...]:

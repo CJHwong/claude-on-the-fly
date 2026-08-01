@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
-from claude_on_the_fly import logs
+from claude_on_the_fly import logs, settings
 from claude_on_the_fly.agent import DATA_DIR, Response, footer_parts
 from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.protocol import Frontend
@@ -92,7 +92,7 @@ class TelegramFrontend(Frontend):
 
         return {
             "bot_token": _redact_token(self._token),
-            "allowed_user_id": str(self._allowed_user_id),
+            "allowed_user_id": str(self._current_allowed_user_id()),
         }
 
     # --- Session persistence ---
@@ -180,7 +180,7 @@ class TelegramFrontend(Frontend):
         goes further and denies for sessionless work rather than falling back at
         all, because nobody is watching a cron job's thread.
         """
-        return chat_id if chat_id is not None else self._allowed_user_id
+        return chat_id if chat_id is not None else self._current_allowed_user_id()
 
     async def ask_approval(
         self, request: ApprovalRequest, chat_id: int | None = None
@@ -395,8 +395,21 @@ class TelegramFrontend(Frontend):
     def _allowed(self, update: Update) -> bool:
         return (
             update.effective_user is not None
-            and update.effective_user.id == self._allowed_user_id
+            and update.effective_user.id == self._current_allowed_user_id()
         )
+
+    def _current_allowed_user_id(self) -> int:
+        """Authorization principal, re-read so revocation applies immediately."""
+        raw = settings.get("TELEGRAM_ALLOWED_USER_ID", str(self._allowed_user_id))
+        try:
+            return int(raw)
+        except ValueError:
+            logger.error(
+                "telegram.allowed_user_id=%r is not an integer; retaining the "
+                "last valid startup value",
+                raw,
+            )
+            return self._allowed_user_id
 
     async def _on_update(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:

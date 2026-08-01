@@ -208,6 +208,30 @@ def test_a_denial_with_no_message_still_gets_one(monkeypatch):
     assert message == cotf_approve.DENY_MESSAGE
 
 
+def test_transport_timeout_follows_the_brokers_answer_window(monkeypatch):
+    class FakeResponse:
+        def read(self):
+            return b'{"behavior": "deny"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    seen: list[float] = []
+
+    def fake_urlopen(_request, timeout):
+        seen.append(timeout)
+        return FakeResponse()
+
+    monkeypatch.setenv(cotf_approve.ENDPOINT_ENV, "http://127.0.0.1:9/decide")
+    monkeypatch.setenv(cotf_approve.REQUEST_TIMEOUT_ENV, "1005")
+    monkeypatch.setattr(cotf_approve.urllib.request, "urlopen", fake_urlopen)
+    cotf_approve._ask({})
+    assert seen == [1005.0]
+
+
 # --- entry point ---
 
 

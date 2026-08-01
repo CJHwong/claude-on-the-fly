@@ -253,11 +253,12 @@ size, so an edit lands at the next read rather than the next restart — which f
 allowlist means the next CONNECT, and for `permissions.ttl_seconds` the next grant.
 The exceptions are the fields read once at startup, where acting on the new value
 means binding a socket, rewriting the agent's PATH, or constructing a service that
-was never built: `commands:` and `permissions.mode`. Those are listed in
+was never built: `sandbox.mode`, `commands:`, and `permissions.mode`. Those are listed in
 `settings.RESTART_REQUIRED`, and changing one gets you a message on the frontend
 naming it, on the next turn. Reporting instead of applying is deliberate — tearing
 down a credential-holding broker mid-turn trades a config annoyance for a class of
-mid-turn failure, and both fields are set once per deployment.
+mid-turn failure, and these fields are set once per deployment. Approval TTL and
+answer-window edits update existing sessions on their next turn.
 
 ```yaml
 egress:

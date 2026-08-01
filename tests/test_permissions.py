@@ -124,6 +124,13 @@ def test_the_operator_file_overrides_the_bundled_defaults(operator_settings):
     assert resolved.timeout_seconds == 45.0
 
 
+def test_permission_mode_stays_at_startup_value(operator_settings):
+    operator_settings.write_text('permissions:\n  mode: "off"\n')
+    settings.check_operator_settings()
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    assert permissions.configured().mode == "off"
+
+
 def test_a_broken_block_falls_back_to_off_and_says_so(operator_settings, caplog):
     """Failing closed here would gate every tool call in a deployment that never
     asked for it, so a typo has to mean "behave as before"."""

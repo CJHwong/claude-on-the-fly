@@ -818,6 +818,15 @@ class TestDueForCompaction:
         assert orch._due_for_compaction(1) is True
         assert orch._due_for_compaction(2) is False
 
+    def test_threshold_reloads_from_config(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        operator_settings.write_text("agent:\n  auto_compact_pct: 80\n")
+        orch._context[1] = (70, 100)
+        assert orch._due_for_compaction(1) is False
+        operator_settings.write_text("agent:\n  auto_compact_pct: 60\n")
+        assert orch._due_for_compaction(1) is True
+
 
 class TestOnMessageAutoCompacts:
     async def test_compaction_is_queued_ahead_of_the_message(
@@ -1120,7 +1129,7 @@ class TestStartSandbox:
         assert await orchestrator_mod._start_sandbox(frontend) == (None, None, None)
 
     async def test_a_command_broker_that_cannot_start_revokes_the_credentials(
-        self, frontend: StubFrontend, monkeypatch
+        self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
         """Without the teardown the credential broker stayed listening with every
         route's key loaded in memory and ANTHROPIC_BASE_URL still published, for a
@@ -1147,7 +1156,7 @@ class TestStartSandbox:
         command_broker.stop.assert_awaited_once()
 
     async def test_a_credential_broker_that_cannot_start_needs_no_teardown(
-        self, frontend: StubFrontend, monkeypatch, caplog
+        self, frontend: StubFrontend, monkeypatch, caplog, operator_settings
     ) -> None:
         monkeypatch.setenv("COTF_SANDBOX", "jail")
         monkeypatch.setattr(
@@ -1165,7 +1174,7 @@ class TestStartSandbox:
         )
 
     async def test_a_successful_start_publishes_the_shim_endpoint(
-        self, frontend: StubFrontend, monkeypatch
+        self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
         monkeypatch.setenv("COTF_SANDBOX", "jail")
         credential_broker = MagicMock()
@@ -1588,6 +1597,28 @@ async def test_session_permissions_hands_the_agent_its_endpoint(operator_setting
         await manager.close_all()
 
 
+async def test_existing_session_reloads_approval_timing(operator_settings):
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text(
+        "permissions:\n  mode: ask\n  ttl_seconds: 60\n  timeout_seconds: 30\n"
+    )
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        first = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
+        service = manager._services[7][1]
+        operator_settings.write_text(
+            "permissions:\n  mode: ask\n  ttl_seconds: 120\n  timeout_seconds: 45\n"
+        )
+        second = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
+        assert service.ttl_seconds == 120
+        assert service.broker.timeout_seconds == 45
+        assert float(second[cotf_approve.REQUEST_TIMEOUT_ENV]) > 45
+        assert first[cotf_approve.ENDPOINT_ENV] == second[cotf_approve.ENDPOINT_ENV]
+    finally:
+        await manager.close_all()
+
+
 async def test_the_service_can_reach_the_conversation_it_belongs_to(operator_settings):
     """A gate that cannot function has to say so where the operator is looking. The
     ERROR alone left a stuck turn looking like a slow one."""
@@ -1735,6 +1766,22 @@ async def test_start_sandbox_writes_the_approval_shim_when_approvals_are_on(
 
     await orchestrator_mod._start_sandbox(StubFrontend())
     assert written == ["shim", "config"]
+
+
+async def test_start_sandbox_writes_approval_artifacts_with_sandbox_off(
+    monkeypatch, operator_settings
+):
+    from claude_on_the_fly import permissions as perms
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.setenv("COTF_SANDBOX", "off")
+    written: list[str] = []
+    monkeypatch.setattr(perms, "write_shim", lambda: written.append("shim"))
+    monkeypatch.setattr(perms, "write_mcp_config", lambda: written.append("mcp"))
+    monkeypatch.setattr(perms, "write_pty_settings", lambda: written.append("pty"))
+
+    assert await orchestrator_mod._start_sandbox(StubFrontend()) == (None, None, None)
+    assert written == ["shim", "mcp", "pty"]
 
 
 async def test_start_sandbox_writes_no_shim_when_approvals_are_off(

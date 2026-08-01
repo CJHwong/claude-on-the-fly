@@ -262,6 +262,10 @@ class ApprovalBroker:
         return self._store
 
     @property
+    def timeout_seconds(self) -> float:
+        return self._timeout
+
+    @property
     def _tag(self) -> str:
         """Log prefix identifying which session's grant store this is."""
         return f"approval[{self._label}]" if self._label else "approval"
@@ -269,6 +273,10 @@ class ApprovalBroker:
     def allows(self, key: str) -> bool:
         """True if `key` is already granted. No question is asked."""
         return self._store.allows(key)
+
+    def update_timeout(self, timeout_seconds: float) -> None:
+        """Apply a reloaded answer window to subsequent approval requests."""
+        self._timeout = timeout_seconds
 
     async def check(self, req: ApprovalRequest) -> bool:
         """Grant `req` from the store, or ask the operator once and cache."""

@@ -6,6 +6,11 @@ The Slack half is on by default under `$job`. `slack.job_command` renames it; se
 
 Entry point: `src/claude_on_the_fly/jobs/cli.py`. Use case: `jobs/worker.py`. Ports and data types: `jobs/core.py`.
 
+The worker's `jobs.concurrency`, `jobs.poll_interval_s`, and `jobs.timeout`
+settings are construction-time settings and require a worker restart. They are
+listed in `settings.RESTART_REQUIRED`; changing the YAML does not partially
+reconfigure an already-running worker.
+
 ## Layers
 
 `jobs/core.py` is the clean core — stdlib only, no chat/DB/network/LLM/filesystem client. It holds `Job`, `Result`, and the three ports the worker depends on:

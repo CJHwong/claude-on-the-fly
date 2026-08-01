@@ -170,6 +170,9 @@ def configured() -> Permissions:
     so the fallback direction is deliberately "behave as before".
     """
     merged = {**settings.bundled("permissions"), **settings.operator("permissions")}
+    # Mode decides whether the per-session service and generated approval
+    # artifacts exist, so it is restart-required. Timing remains live-reloadable.
+    merged["mode"] = settings.startup_value("permissions.mode", "off")
     try:
         return parse(merged)
     except ConfigError as exc:
@@ -532,6 +535,11 @@ class PermissionService:
         if self._port is None:
             raise RuntimeError("permission service not started")
         return self._port
+
+    def update_timing(self, *, ttl_seconds: float, timeout_seconds: float) -> None:
+        """Apply live-reloaded timing to subsequent requests in this session."""
+        self.ttl_seconds = ttl_seconds
+        self.broker.update_timeout(timeout_seconds)
 
     @property
     def base_url(self) -> str:
