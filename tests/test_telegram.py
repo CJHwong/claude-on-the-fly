@@ -349,6 +349,14 @@ class TestAllowed:
         update.effective_user = None
         assert frontend._allowed(update) is False
 
+    def test_authorization_id_reloads_immediately(
+        self, frontend: TelegramFrontend, operator_settings
+    ) -> None:
+        operator_settings.write_text("telegram:\n  allowed_user_id: 456\n")
+        assert frontend._allowed(make_update(user_id=123)) is False
+        assert frontend._allowed(make_update(user_id=456)) is True
+        assert frontend._approval_chat() == 456
+
 
 # ============================================================
 # _extract_file
@@ -1262,10 +1270,10 @@ def _unescaped(text: str) -> str:
     return re.sub(r"\\.", "", text)
 
 
-def _request(subject="pypi.org:443", detail="agent asked for pypi.org:443"):
+def _request(subject="pypi.org:443", detail="agent asked for pypi.org:443", **kwargs):
     from claude_on_the_fly.approvals import ApprovalRequest
 
-    return ApprovalRequest(kind="host", subject=subject, detail=detail)
+    return ApprovalRequest(kind="host", subject=subject, detail=detail, **kwargs)
 
 
 class TestApprovalRouting:
@@ -1325,6 +1333,12 @@ class TestApprovalPromptCannotBeRestyledByTheAgent:
     async def test_an_ordinary_subject_still_reads_cleanly(self):
         _frontend, text = await self._post(_request())
         assert "`pypi.org:443`" in text
+
+    async def test_an_origin_cannot_forge_bold_text_either(self):
+        """origin is cotf-authored today, but it sits in the one line the operator
+        must be able to trust, so it is escaped like everything else."""
+        _frontend, text = await self._post(_request(origin="*APPROVED*, asked by x"))
+        assert "\\*APPROVED\\*" in text
 
     async def test_a_retired_prompt_escapes_the_subject_too(self):
         frontend = _approval_frontend()

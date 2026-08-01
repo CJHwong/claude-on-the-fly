@@ -20,6 +20,7 @@ from claude_on_the_fly.approvals import (
     GrantStore,
     RecordingGate,
     gate_from_frontend,
+    tool_policy,
 )
 
 
@@ -390,6 +391,47 @@ async def test_label_identifies_the_session_store(caplog):
     )
 
 
+async def test_the_grant_log_says_what_a_digest_key_covers(caplog):
+    """`tool:pty:Bash:f5771755993b` alone cannot be matched against anything without
+    scrolling back to the ask line. The scope goes last on the line, after the
+    duration, because it is free text: ahead of it a line ended "...requires approval
+    for 1800s", which reads as the approval lasting that long."""
+    broker = ApprovalBroker(RecordingGate(default=True), label="chat 7")
+    req = ApprovalRequest(
+        kind="tool",
+        subject="pty:Bash:f5771755993b",
+        detail="chmod 700 /tmp/x",
+        scope="chmod 700 /tmp/x && ls -ld /tmp/x",
+    )
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
+        assert await broker.check(req) is True
+    line = next(r.getMessage() for r in caplog.records if "GRANTED" in r.getMessage())
+    assert line.endswith(", covers chmod 700 /tmp/x && ls -ld /tmp/x")
+
+
+async def test_a_denial_log_names_the_scope_too(caplog):
+    """A denied pty call is the one an operator is most likely to come back to."""
+    broker = ApprovalBroker(RecordingGate(default=False), label="chat 7")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.approvals"):
+        await broker.check(
+            ApprovalRequest(
+                kind="tool", subject="pty:Bash:abc", detail="d", scope="rm -rf /tmp/x"
+            )
+        )
+    assert any("covers rm -rf /tmp/x" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_readable_key_gets_no_covers_clause(caplog):
+    """An egress subject already *is* the scope, so repeating it would be noise in
+    every line of the grant ledger."""
+    broker = ApprovalBroker(RecordingGate(default=True), label="chat 7")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
+        await broker.check(
+            ApprovalRequest(kind="host", subject="pypi.org:443", detail="d")
+        )
+    assert not any("covers" in r.getMessage() for r in caplog.records)
+
+
 async def test_rate_limit_line_shows_the_active_grants(caplog):
     """Diagnosing a rate-limit deny needs to distinguish a probing agent from a
     session that legitimately needed many hosts."""
@@ -498,3 +540,72 @@ async def test_a_cancelled_question_leaves_no_grant_behind():
     with contextlib.suppress(asyncio.CancelledError):
         await asker
     assert broker.allows("host:slow:443") is False
+
+
+# --- per-kind policy ---
+
+
+def _tool_request(subject: str) -> ApprovalRequest:
+    return ApprovalRequest(kind="tool", subject=subject, detail="cotf asked: Bash")
+
+
+async def test_tool_prompts_do_not_spend_the_egress_budget():
+    """The load-bearing case for splitting the budgets. The egress ceiling exists
+    because a burst of distinct hosts is itself the signal; a supervised turn asks
+    about tools far more often than that, and sharing one budget meant the turn
+    silently auto-denied every host it needed afterwards."""
+    gate = RecordingGate(default=True)
+    broker = ApprovalBroker(
+        gate,
+        policy=ApprovalPolicy(rate_limit=3),
+        policies={"tool": tool_policy()},
+    )
+    for index in range(20):
+        await broker.check(_tool_request(f"bash:prog{index}"))
+    # The host budget is untouched by all of that.
+    assert await broker.check(make_request("a.example:443")) is True
+    assert await broker.check(make_request("b.example:443")) is True
+    assert await broker.check(make_request("c.example:443")) is True
+    assert await broker.check(make_request("d.example:443")) is False
+
+
+async def test_the_egress_budget_still_bites_on_its_own_kind():
+    """Regression guard: splitting the budgets must not have loosened the one that
+    was there for a reason."""
+    gate = RecordingGate(default=True)
+    broker = ApprovalBroker(gate, policy=ApprovalPolicy(rate_limit=2))
+    for index in range(4):
+        await broker.check(make_request(f"host{index}.example:443"))
+    assert len(gate.seen) == 2
+
+
+async def test_a_kind_with_no_override_uses_the_shared_default():
+    broker = ApprovalBroker(RecordingGate(), policy=ApprovalPolicy(rate_limit=7))
+    assert broker.policy_for("host").rate_limit == 7
+    assert broker.policy_for("anything-else").rate_limit == 7
+
+
+def test_the_tool_policy_never_refuses_a_subject_outright():
+    """The egress never-ask tier covers subjects no legitimate task needs and an
+    operator could be talked into approving. Tool calls have no equivalent set, and
+    inventing one would be a denylist pretending to be a boundary."""
+    assert tool_policy().never_ask == frozenset()
+    assert not tool_policy().refuses("bash:curl")
+
+
+def test_the_tool_ceiling_is_looser_than_the_egress_one():
+    assert tool_policy().rate_limit > ApprovalPolicy().rate_limit
+
+
+async def test_the_rate_limit_log_names_the_kind_that_ran_out(caplog):
+    """Two budgets means a rate-limit line that does not say which one was spent is
+    unactionable."""
+    broker = ApprovalBroker(
+        RecordingGate(default=True),
+        policy=ApprovalPolicy(rate_limit=1),
+        policies={"tool": ApprovalPolicy(rate_limit=1)},
+    )
+    await broker.check(_tool_request("bash:ls"))
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
+        assert await broker.check(_tool_request("bash:cat")) is False
+    assert "tool requests" in caplog.text

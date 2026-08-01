@@ -808,3 +808,22 @@ def test_an_empty_readback_entry_is_rejected_rather_than_matching_everything():
         commands.parse_tools(
             {"tools": [{"name": "gh", "readback": ["  "]}]}, source="test"
         )
+
+
+def test_the_stale_sweep_spares_the_approval_shim(tmp_path):
+    """It shares this directory because fs-deny-most.sb re-grants reads here and
+    nowhere else under DATA_DIR. Without the reservation the sweep would delete it
+    on the next startup and every gated tool call would fail on a missing
+    interpreter."""
+    from claude_on_the_fly.commands import RESERVED_SHIM_NAMES, CommandBroker
+
+    reserved = tmp_path / next(iter(RESERVED_SHIM_NAMES))
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    reserved.write_text("#!/bin/sh\n")
+    stale = tmp_path / "some-old-tool"
+    stale.write_text("#!/bin/sh\n")
+
+    CommandBroker(tmp_path, tools=[]).write_shims()
+
+    assert reserved.is_file(), "the approval shim was swept away"
+    assert not stale.exists(), "a genuinely stale shim was left behind"

@@ -1,0 +1,305 @@
+# claude-on-the-fly settings: which hosts the agent may reach, which credentialed
+# CLIs it may run through the command broker, and whether tool calls are gated.
+# Credentials are the one thing that does NOT live here -- tokens stay in .env,
+# where a secret scanner expects them.
+#
+# Saving this file is enough. It is re-read when its timestamp changes, so an edit
+# takes effect at the next read rather than the next restart. The exceptions are
+# named for you: change something that was read once at startup (a bound socket, a
+# PATH shim, whether a service exists at all) and the next turn tells you a restart
+# is needed, instead of quietly running the old value.
+#
+# There are two copies of this file. The one inside the package holds the defaults
+# and is replaced on upgrade; the one at ~/.claude-on-the-fly/config.yaml is yours
+# to edit and is never overwritten, not even by an upgrade. If you are reading this
+# from your own copy, you are in the right place.
+#
+# Settings that used to be COTF_SANDBOX* / AGENT_BACKEND / CLAUDE_MODE and friends
+# live here now, under `sandbox:` and `agent:`. The environment variables still work
+# and still win, so nothing breaks by leaving them in .env -- but they are no longer
+# documented and will not gain new options. Credentials stay in .env.
+#
+# Yours is merged over the defaults one section at a time, so a typo in `egress:`
+# cannot cost you your `commands:` additions -- the broken section logs an ERROR
+# naming itself and falls back, and the others still load.
+#
+# Because your copy is never overwritten, a new section added by an upgrade will not
+# appear in it on its own. `[g]` in the TUI opens yours; the defaults above are the
+# reference for anything missing.
+#
+# That path is deliberately NOT in the seatbelt write allowlist. This file decides
+# what runs outside the sandbox holding real credentials, and which hosts skip the
+# operator prompt, so a sandboxed agent must not be able to grant itself either.
+
+egress:
+  # Hosts tunnelled without asking the operator.
+  #
+  # The bundled criterion is narrow on purpose: a host earns a place here only if
+  # a supported backend cannot complete a turn without it, so the model APIs and
+  # nothing else. Gating those would stop every fresh deployment on an approval
+  # for the agent's own first LLM call.
+  #
+  # Everything else is a decision worth making explicitly, which is why the
+  # obvious candidates are missing: a package install is arbitrary code execution,
+  # github.com grants writes, and telemetry and self-update endpoints are optional
+  # by definition. Add what your jobs actually need, and say why:
+  #
+  #   allow:
+  #     - pypi.org               # uv/pip installs
+  #     - files.pythonhosted.org # ...and the sdists/wheels they fetch
+  #     - github.com             # git clone/push. Grants writes.
+  #
+  # A host here is reached without a prompt for the whole session, and the proxy
+  # does not inspect what crosses it (no TLS interception -- see
+  # docs/agent/broker.md), so each entry is a covert channel you are accepting.
+  allow:
+    # claude backend, API-key auth. The credential broker covers this when a key
+    # is provisioned; listed for the OAuth case, where it cannot.
+    - api.anthropic.com
+    # codex backend, API-key auth
+    - api.openai.com
+    # codex backend, ChatGPT login. Verified against a live run: codex reaches
+    # both of these and cannot complete a turn without them.
+    - chatgpt.com
+    - ab.chatgpt.com
+
+  # Hosts refused outright, never offered to the operator. Cloud metadata
+  # endpoints hand instance credentials to anything that can reach them, and no
+  # legitimate agent task needs them, so they are not worth a prompt.
+  #
+  # Your entries are added to this list and cannot remove one. The merge is
+  # one-way on purpose: no config edit, and no agent that somehow gets a write
+  # here, can re-open a metadata endpoint.
+  never_ask:
+    - metadata.google.internal
+    - metadata.goog
+    - instance-data
+    - metadata
+
+commands:
+  # CLIs the sandboxed agent reaches through the command broker.
+  #
+  # A shimmed tool runs OUTSIDE the sandbox with your real credential and only its
+  # output crosses back, so adding an entry grants a capability. Read the trade in
+  # docs/agent/broker.md first.
+  #
+  # A tool NOT listed here is not shimmed, which means the agent runs the real
+  # binary inside the jail, where the seatbelt denies its credential store. It
+  # fails on its own config file. That is the intended outcome, not a bug -- but
+  # it is also why an unlisted-and-needed tool looks like a broken tool.
+  #
+  # Fields, all optional except `name`:
+  #   name             command name shimmed onto the agent's PATH. Must be on the
+  #                    daemon's PATH or it is skipped (a shim for a missing binary
+  #                    would turn "command not found" into a confusing broker
+  #                    error).
+  #   readback         subcommands that must never cross into the sandbox, written
+  #                    as the leading words of the command. Matched against the
+  #                    leading non-flag tokens, so "auth token" also refuses
+  #                    `gh --repo o/r auth token`.
+  #   readback_flags   flags that make any subcommand print the secret.
+  #   env_passthrough  extra env names the real binary needs. Kept narrow: the
+  #                    broker runs unjailed, so anything not listed stays out of
+  #                    the subprocess.
+  #
+  # There is deliberately no allow/deny policy beyond readback. `gh api --method
+  # DELETE` defeats any subcommand denylist, so a parser here would be a boundary
+  # that can be walked around. Scope the *token* instead: a fine-grained PAT
+  # limited to what the agent needs bounds it far more reliably than argv
+  # inspection.
+  tools:
+    - name: gh
+      # `gh auth token` and `--show-token` print the credential itself.
+      # Forwarding either would place the token in the sandbox and defeat the
+      # whole design.
+      readback:
+        - auth token
+      readback_flags:
+        - --show-token
+      env_passthrough: [GH_HOST, GH_REPO, GH_PAGER, NO_COLOR]
+
+    - name: acli
+      # Atlassian CLI. `acli auth` offers login / logout / status / switch and no
+      # token-printing subcommand at all, checked against `acli auth --help`, so
+      # there is no readback to refuse. What is refused is the auth *state*
+      # changing: `logout` would sign you out globally from inside an agent turn,
+      # and `login` / `switch` are interactive and would only hang the broker.
+      readback:
+        - auth logout
+        - auth login
+        - auth switch
+      env_passthrough: [ACLI_SITE, NO_COLOR]
+
+permissions:
+  # Whether a tool call the agent wants to make can reach you for approval.
+  #
+  #   off  (default)  Nothing is gated. Byte-identical to the behaviour before
+  #                   this feature existed, including --permission-mode
+  #                   bypassPermissions.
+  #   ask             Permission questions arrive on whichever frontend the
+  #                   session belongs to, with approve/deny buttons.
+  #
+  # What you are asked is NOT the same on every backend, and the difference is
+  # worth knowing before you turn this on:
+  #
+  #   claude (native)  claude's own question, forwarded. It decides what needs
+  #                    asking; cotf classifies nothing.
+  #   claude (pty)     claude's own question, forwarded out of its terminal
+  #                    dialog. Same as above. Note a denial costs one extra
+  #                    model turn, because the refusal has to be delivered as a
+  #                    message for the turn to end.
+  #   codex            cotf's question, not codex's. codex does have an approval
+  #                    system, but under `codex exec` there is no way for a human
+  #                    to answer it: the policy you pass is overridden to `never`,
+  #                    and the reviewer that does run is a model, whose verdict
+  #                    cotf cannot intercept. The one hook that can block a call
+  #                    also runs *before* codex decides it wants approval. So cotf
+  #                    decides what is worth interrupting you for, and that
+  #                    decision is a convenience filter, not a security boundary.
+  #
+  # Cron and the background job queue always stay on bypass. Nobody is watching
+  # a cron thread, so gating it would just fail every tool call.
+  #
+  # Quoted because YAML reads a bare `off` as the boolean false. Writing it bare
+  # still works (the loader treats false as off), but `on` is refused rather than
+  # guessed at, since it is not one of the two names.
+  mode: "off"
+
+  # --permission-mode handed to the claude backends when mode is `ask`. This is
+  # what decides how much you get asked about, so it is the volume knob.
+  #
+  #   default      claude asks about the interesting calls and stays quiet about
+  #                reads and inspection. Measured: it asked about chmod,
+  #                find -delete, sudo, curl and git init, and did not ask about
+  #                ls, cat, echo, git status or Read.
+  #   acceptEdits  as default, minus prompts for file edits.
+  #   manual       asks about more.
+  #   auto         hands the decision to a model instead of to you. Measured on
+  #                sonnet 5: it approved all six of a deliberately nasty set
+  #                (sudo, a write into /etc, chmod -R 777, find -delete,
+  #                ls ~/.ssh, curl) without asking once, at 2.6-3.1s and one
+  #                model call each. Pick it if you want fewer interruptions;
+  #                do not pick it expecting a safety net. Unavailable on some
+  #                models, which silently fall back.
+  #
+  # bypassPermissions and dontAsk are refused here: both were measured at zero
+  # prompts, so pairing either with `ask` produces a deployment that looks gated
+  # and is not.
+  claude_mode: default
+
+  # How long one approval lasts, and how long you have to answer before the gate
+  # gives up and denies. Grants are held in memory and die with the daemon.
+  # The 300s answer window is deliberate: claude tolerated a 205s wait and still
+  # ran the approved call, so the real limit is your patience, not the CLI's.
+  ttl_seconds: 1800
+  timeout_seconds: 300
+
+# The sections below moved out of .env. Every key is commented out on purpose: the
+# defaults live in the code that reads them, so an absent key means "whatever this
+# build does" rather than "whatever this template happened to say". Uncomment what
+# you want to pin.
+#
+# The reasoning behind each one -- what it trades, what it has been measured doing --
+# is in docs/reference/settings.md rather than repeated here.
+
+sandbox:
+  # Whether the agent process ever holds a real credential.
+  #   off (default) inherit the full environment
+  #   env           drop every *_API_KEY / *_TOKEN, route models via the broker
+  #   jail          as env, plus a seatbelt denying egress and keychain reads (macOS)
+  # mode: "off"
+
+  # jail mode only. deny-most makes $HOME opaque; grant the agent's own interpreter
+  # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3.
+  # fs: deny-most
+  # extra_paths:
+  #   - /opt/homebrew
+
+  # Narrow egress to the broker's loopback port and the egress proxy's, nothing else.
+  # broker_only_loopback: true
+
+agent:
+  # backend: claude (default) | codex
+  # Per-backend mode: native | ollama; claude also has pty, the only mode that
+  # reports a context reading and can forward claude's own permission dialog.
+  # Leave a model unset to let the CLI pick its own.
+  # backend: claude
+  # claude:
+  #   mode: native
+  #   model: sonnet
+  # codex:
+  #   mode: native
+  #   model: o3
+  # ollama:
+  #   model: deepseek-v4-flash:cloud
+
+  # Compact before answering once the previous turn left the context at or above
+  # this share of the window. Unset means compaction only on $compact.
+  # auto_compact_pct: 80
+
+  # Caches. skills_cache_ttl_seconds <= 0 probes the CLI every query;
+  # pricing_ttl_seconds of 0 always refreshes, negative never expires.
+  # skills_cache_ttl_seconds: 3600
+  # pricing_ttl_seconds: 21600
+
+  # claude-pty, used by claude's pty mode.
+  # pty:
+  #   auto_install: false
+  #   auto_refresh: true
+
+slack:
+  # Who may reach the agent. Read on every message, so adding a sender takes effect
+  # on their next one without a restart.
+  #
+  # One list, routed by Slack id prefix: B... is a bot and bypasses the @mention
+  # gate, anything else (U.../W.../"*") is a human. Empty is fail-closed except for
+  # the token's own id -- under a bot token that is the BOT's, not yours, so list
+  # your own U... id or your DMs are dropped. The startup log shows what is live.
+  # allowed_senders: [U012ABCDEF, B07JPABE2]
+  # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
+  # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
+
+  # Reply footer: off | summary | detailed
+  # stats: summary
+
+  # Slash command to register. Must match the app manifest; needs a restart.
+  # slash_command: /cotf
+
+  # Background-job trigger. Absent means $job; set it empty ("") to turn jobs off.
+  # job_command: "$job"
+
+  # Threads retained before LRU eviction, and replies per thread before inbound
+  # messages are gated ($continue resets the counter).
+  # session_cap: 1000
+  # reply_soft_limit: 10
+
+telegram:
+  # One bot, one operator. There is no list.
+  # allowed_user_id: 123456789
+  # stats: summary
+
+jobs:
+  # Queue adapter shared by the worker and the producers. Needs a restart: the
+  # worker is a separate process started with the old value.
+  # queue_kind: file
+
+  # concurrency is how many agent CLIs this machine hosts, separate from a cron
+  # entry's own max_concurrent. timeout of 0 or less means no limit.
+  # concurrency: 1
+  # poll_interval_s: 2.0
+  # timeout: 3600
+
+  # JOBS_SLACK_TOKEN stays in .env: it is a credential. Set it to a bot (xoxb-)
+  # token when SLACK_TOKEN is a user token, or the worker posts replies as you and
+  # the Slack daemon re-ingests its own output.
+
+logs:
+  # Retention in days for ~/.claude-on-the-fly/logs; 0 disables pruning. Assume
+  # anything written there leaves the machine and sits for this long.
+  # keep_days: 7
+
+  # Machine name in <role>-<host>-<date>.log. Defaults to the short hostname.
+  # host_tag: laptop
+
+  # LOG_LEVEL stays an environment variable: logging is configured before this file
+  # can be parsed, so a complaint about the file needs somewhere to go.

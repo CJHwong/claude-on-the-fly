@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
-from claude_on_the_fly import logs
+from claude_on_the_fly import logs, settings
 from claude_on_the_fly.agent import DATA_DIR, Response, footer_parts
 from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.protocol import Frontend
@@ -92,7 +92,7 @@ class TelegramFrontend(Frontend):
 
         return {
             "bot_token": _redact_token(self._token),
-            "allowed_user_id": str(self._allowed_user_id),
+            "allowed_user_id": str(self._current_allowed_user_id()),
         }
 
     # --- Session persistence ---
@@ -180,7 +180,7 @@ class TelegramFrontend(Frontend):
         goes further and denies for sessionless work rather than falling back at
         all, because nobody is watching a cron job's thread.
         """
-        return chat_id if chat_id is not None else self._allowed_user_id
+        return chat_id if chat_id is not None else self._current_allowed_user_id()
 
     async def ask_approval(
         self, request: ApprovalRequest, chat_id: int | None = None
@@ -215,14 +215,22 @@ class TelegramFrontend(Frontend):
         # literal.
         subject = escape_markdown(request.subject, version=1)
         detail = escape_markdown(request.detail, version=1)
+        # Same split as the Slack card: an `origin` requester has a digest for a
+        # subject, so the readable label leads and the digest drops to the footer
+        # where it is still available for matching against the grant log.
+        # The footer is the lifetime and nothing else. Repeating the subject, or the
+        # scope in front of it, said the same thing the detail block already says --
+        # see slack._approval_footer for the card that made that obvious.
+        foot = f"Grant lasts {minutes:.0f} min and dies on restart."
+        if request.origin:
+            head = (
+                f"*Permission request* ({escape_markdown(request.origin, version=1)})"
+            )
+        else:
+            head = f"*Permission request*\n\n`{subject}`"
         message = await self._app.bot.send_message(
             chat_id=chat_id,
-            text=(
-                f"*Permission request*\n\n"
-                f"`{subject}`\n\n"
-                f"{detail}\n\n"
-                f"Grant lasts {minutes:.0f} min and dies on restart."
-            ),
+            text=f"{head}\n\n{detail}\n\n{foot}",
             parse_mode="Markdown",
             reply_markup=keyboard,
             # The detail names the host the agent asked for, so a preview would
@@ -260,13 +268,16 @@ class TelegramFrontend(Frontend):
         """Strip the buttons and stamp the outcome so the prompt can't be reused."""
         if self._app is None:
             return
+        # The scope, not the subject: a subject is the grant key, scoped to the
+        # program, so this read "Permission approved / bash:chmod" -- a record that
+        # does not say which file. The scope carries the arguments.
+        decided = request.scope or request.subject
         try:
             await self._app.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=(
-                    f"*Permission {verdict}*\n\n"
-                    f"`{escape_markdown(request.subject, version=1)}`"
+                    f"*Permission {verdict}*\n\n`{escape_markdown(decided, version=1)}`"
                 ),
                 parse_mode="Markdown",
             )
@@ -384,8 +395,21 @@ class TelegramFrontend(Frontend):
     def _allowed(self, update: Update) -> bool:
         return (
             update.effective_user is not None
-            and update.effective_user.id == self._allowed_user_id
+            and update.effective_user.id == self._current_allowed_user_id()
         )
+
+    def _current_allowed_user_id(self) -> int:
+        """Authorization principal, re-read so revocation applies immediately."""
+        raw = settings.get("TELEGRAM_ALLOWED_USER_ID", str(self._allowed_user_id))
+        try:
+            return int(raw)
+        except ValueError:
+            logger.error(
+                "telegram.allowed_user_id=%r is not an integer; retaining the "
+                "last valid startup value",
+                raw,
+            )
+            return self._allowed_user_id
 
     async def _on_update(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:

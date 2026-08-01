@@ -50,39 +50,55 @@ reason (`/cof-yourname`); answer `none` if you'd rather have no slash command.
 
 ### Run
 
+Tokens go in `~/.claude-on-the-fly/.env`:
+
 ```bash
-export SLACK_APP_TOKEN="xapp-..."
-export SLACK_TOKEN="xoxb-..."   # xoxp- to reply as you, xoxb- to reply as the app
-# Optional, bot token only: the slash command you declared in the manifest. Must
-# match it exactly. Unset means no slash command — open the skill picker from a
-# message's "..." menu instead.
-# export SLACK_SLASH_COMMAND="/cof-yourname"
-# Background jobs are on by default under `$job`, run by the `claude-jobs`
-# worker in a fresh session, which replies in the same thread when it finishes.
-# Sent on its own it lists what this channel already has queued. Needs
-# claude-jobs running. Set this to rename the trigger, or set it empty to turn
-# background jobs off entirely. Single-quoted so the shell doesn't expand the $.
-# export SLACK_JOB_COMMAND='$job'   # rename
-# export SLACK_JOB_COMMAND=         # disable
-# Optional: sender IDs allowed to trigger Claude — users (U…/W…) and bots (B…) in
-# one list; "*" allows any human. Your own ID is always allowed.
-# export SLACK_ALLOWED_SENDER_IDS="U111,U222,B07JPABE2"
-# Optional: sender IDs to deny (wins over the allowlist):
-# export SLACK_BLOCKED_SENDER_IDS="U999"
-# Optional: sender IDs that trigger Claude but get no reply:
-# export SLACK_SILENT_SENDER_IDS="B07JPABE2,U111"
+SLACK_APP_TOKEN=xapp-...
+SLACK_TOKEN=xoxb-...   # xoxp- to reply as you, xoxb- to reply as the app
+```
+
+Everything else goes in `~/.claude-on-the-fly/config.yaml`, which is seeded with a
+commented template on first start. All of it is optional:
+
+```yaml
+slack:
+  # Senders allowed to trigger Claude. Users (U…/W…) and bots (B…) share one list;
+  # "*" allows any human. The token's own id is always allowed.
+  allowed_senders: [U111, U222, B07JPABE2]
+  # Denied senders, users or bots. Wins over the allowlist.
+  blocked_senders: [U999]
+  # Senders that trigger Claude but get no reply posted back.
+  silent_senders: [B07JPABE2]
+  # Bot token only: the slash command you declared in the manifest. Must match it
+  # exactly. Unset means no slash command -- open the skill picker from a message's
+  # "..." menu instead. Registered at startup, so a change needs a restart.
+  slash_command: /cof-yourname
+  # Background jobs are on by default under `$job`, run by the `claude-jobs` worker
+  # in a fresh session, which replies in the same thread when it finishes. Sent on
+  # its own it lists what this channel already has queued. Needs claude-jobs
+  # running. Set this to rename the trigger, or set it empty ("") to turn
+  # background jobs off entirely.
+  job_command: "$job"
+```
+
+Then:
+
+```bash
 uv run claude-slack
 ```
+
+The sender lists are read on every message, so adding someone takes effect on their
+next one without a restart.
 
 ## How it works
 
 - With a **user token**, anyone who DMs you triggers Claude (if they can DM you, they're trusted), and your own ID is always allowed
-- With a **bot token**, the auto-allowed ID is the bot's, not yours — add your own `U…` id to `SLACK_ALLOWED_SENDER_IDS` (or use `*`) or your DMs will be dropped
-- In channels, only allowed senders (auto-allowed ID + `SLACK_ALLOWED_SENDER_IDS`) can trigger Claude via @mention
-- Bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID (`B…`) is in `SLACK_ALLOWED_SENDER_IDS`; trusted bot posts trigger Claude without an @mention. Don't list this app's own bot ID (it would loop)
-- Senders listed in `SLACK_SILENT_SENDER_IDS` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
+- With a **bot token**, the auto-allowed ID is the bot's, not yours — add your own `U…` id to `slack.allowed_senders` (or use `*`) or your DMs will be dropped
+- In channels, only allowed senders (auto-allowed ID + `slack.allowed_senders`) can trigger Claude via @mention
+- Bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID (`B…`) is in `slack.allowed_senders`; trusted bot posts trigger Claude without an @mention. Don't list this app's own bot ID (it would loop)
+- Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
 
-See [Environment Variables](../reference/env-vars.md#slack) for the full Slack config.
+See [Settings](../reference/settings.md#slack) for the full Slack config.

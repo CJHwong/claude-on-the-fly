@@ -192,15 +192,7 @@ class TestTelegramMain:
 
 class TestSlackMain:
     def _preflight(self):
-        return (
-            "xapp-tok",
-            "xoxb-tok",
-            "U_SELF",
-            {"U_ALLOWED"},
-            set(),
-            set(),
-            set(),
-        )
+        return "xapp-tok", "xoxb-tok", "U_SELF"
 
     def test_the_preflight_result_is_what_the_frontend_is_built_from(
         self, monkeypatch, no_dotenv
@@ -215,8 +207,34 @@ class TestSlackMain:
         )
         monkeypatch.setattr(slack_mod.asyncio, "run", lambda coro: coro.close())
         slack_mod.main()
-        assert built[0]["app_token"] == "xapp-tok"
-        assert built[0]["allowed_user_ids"] == {"U_ALLOWED"}
+        assert built[0] == {
+            "app_token": "xapp-tok",
+            "token": "xoxb-tok",
+            "user_id": "U_SELF",
+        }
+
+    def test_the_sender_lists_are_left_unset_so_they_read_live(
+        self, monkeypatch, no_dotenv
+    ):
+        """Passing them would pin them, and adding an allowed sender would be back to
+        needing a restart."""
+        from claude_on_the_fly import preflight
+
+        monkeypatch.setattr("sys.argv", ["claude-slack"])
+        monkeypatch.setattr(preflight, "run_slack", self._preflight)
+        built: list[dict] = []
+        monkeypatch.setattr(
+            slack_mod, "SlackFrontend", lambda **kwargs: built.append(kwargs)
+        )
+        monkeypatch.setattr(slack_mod.asyncio, "run", lambda coro: coro.close())
+        slack_mod.main()
+        for key in (
+            "allowed_user_ids",
+            "blocked_senders",
+            "allowed_bot_ids",
+            "silent_sender_ids",
+        ):
+            assert key not in built[0], key
 
     def test_the_manifest_flag_generates_and_exits(self, monkeypatch, no_dotenv):
         """It must not fall through into starting a daemon: the operator asked for a

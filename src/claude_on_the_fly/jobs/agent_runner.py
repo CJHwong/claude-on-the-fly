@@ -70,7 +70,8 @@ class OrchestratorAgentRunner:
 
     `data_dir` roots the throwaway workspaces (`<data_dir>/workspaces/jobs/<run>`).
     `user_name` / `channel_context` / `timeout` are passed straight to
-    `agent.run`. The composition root (`cli.py`) fills `timeout` from env; the
+    `agent.run`. The composition root (`cli.py`) fills `timeout` from `jobs.timeout`;
+    the
     other two keep the defaults below.
     """
 

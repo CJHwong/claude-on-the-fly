@@ -16,10 +16,14 @@ Using a Claude subscription (Max/Pro) OAuth token with Claude Code in any extern
 
 ## Quick Start (no clone needed)
 
+Tokens live in `~/.claude-on-the-fly/.env`; everything else lives in
+`~/.claude-on-the-fly/config.yaml`, seeded with a commented template on first start
+and re-read whenever you save it.
+
 ```bash
 # Telegram
 export TELEGRAM_BOT_TOKEN=...
-export TELEGRAM_ALLOWED_USER_ID=...
+# then set telegram.allowed_user_id in ~/.claude-on-the-fly/config.yaml
 uvx --from git+https://github.com/CJHwong/claude-on-the-fly claude-telegram
 
 # Slack
@@ -49,5 +53,5 @@ uv run claude-slack  # or claude-telegram, claude-cron, claude-jobs
 ## Documentation
 
 - [How-to guides](docs/how-to/) — setup for each channel: [Slack](docs/how-to/slack.md), [Telegram](docs/how-to/telegram.md), [Cron](docs/how-to/cron.md)
-- [Reference](docs/reference/) — [Environment variables](docs/reference/env-vars.md), [Persona (CLAUDE.md)](docs/reference/persona.md), [Response footer](docs/reference/footer.md)
+- [Reference](docs/reference/) — [Settings](docs/reference/settings.md), [Persona (CLAUDE.md)](docs/reference/persona.md), [Response footer](docs/reference/footer.md)
 - `CLAUDE.md` — agent-only notes (backend quirks, architecture, subsystem internals)

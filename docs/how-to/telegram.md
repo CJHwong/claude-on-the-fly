@@ -8,9 +8,22 @@
 4. Search for `@userinfobot` on Telegram, send any message
 5. Copy your numeric user ID
 
+The token goes in `~/.claude-on-the-fly/.env`:
+
 ```bash
-export TELEGRAM_BOT_TOKEN="your-token-from-step-3"
-export TELEGRAM_ALLOWED_USER_ID="your-id-from-step-5"
+TELEGRAM_BOT_TOKEN=your-token-from-step-3
+```
+
+Your user ID goes in `~/.claude-on-the-fly/config.yaml`:
+
+```yaml
+telegram:
+  allowed_user_id: your-id-from-step-5
+```
+
+Then:
+
+```bash
 uv run claude-telegram
 ```
 
@@ -28,4 +41,4 @@ Send a message to your bot. That's it.
 - Photos/images - saved to workspace, Claude can view them
 - Multiple photos - batched into a single prompt
 
-See [Environment Variables](../reference/env-vars.md#telegram) for the full Telegram config.
+See [Settings](../reference/settings.md#telegram) for the full Telegram config.

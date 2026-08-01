@@ -1,6 +1,6 @@
 """Spawn-time sandboxing for agent subprocesses.
 
-Two independent protections, both gated by COTF_SANDBOX (default off):
+Two independent protections, both gated by `sandbox.mode` (default off):
 
   off  - inherit the full daemon environment, no wrapper. Current behavior,
          zero change for anyone who hasn't opted in.
@@ -24,6 +24,8 @@ import os
 import shutil
 from contextvars import ContextVar, Token
 from pathlib import Path
+
+from claude_on_the_fly import settings
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,17 @@ _PASSTHROUGH_PREFIXES = ("XDG_", "LC_")
 _PASSTHROUGH_SUFFIXES = ("_BASE_URL",)
 # Locates the command broker for the generated shims. Not a secret: it is a
 # loopback endpoint the agent is meant to reach (see commands.py).
-_PASSTHROUGH_ENDPOINTS = frozenset({"COTF_CMD_ENDPOINT"})
+# Loopback endpoints the agent is deliberately handed. COTF_APPROVE_URL is here
+# because the approval shim runs inside the sandbox and reads it to find the
+# daemon; without the passthrough every gated call would fail closed on a
+# missing endpoint, which looks exactly like a denial.
+_PASSTHROUGH_ENDPOINTS = frozenset(
+    {"COTF_CMD_ENDPOINT", "COTF_APPROVE_URL", "COTF_APPROVE_NOTIFY_URL"}
+)
+# claude-pty reads this for its tmux session name. The daemon sets it so it knows
+# which pane to type an approval into; claude-pty's own default is PID-based and
+# therefore unpredictable from outside.
+_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION", "CLAUDE_PTY_NO_TMUX"})
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -104,7 +116,12 @@ _MAX_EXTRA_PATHS = 3
 _DEFAULT_LOOPBACK = "localhost:*"
 # Fixed loopback allow slots in the jail profile, since SBPL has no arrays. One
 # each for the credential broker, the egress proxy, and the command broker.
-_LOOPBACK_SLOTS = 3
+# Four because SBPL has no arrays: each loopback grant is a separate parameter, so
+# the profile has to declare a fixed number of slots. The services are the
+# credential broker, the command broker, the CONNECT egress proxy, and -- when
+# permissions mode is `ask` -- the approval service the backends ask about tool
+# calls. A fifth service would need a fifth slot here and in both profiles.
+_LOOPBACK_SLOTS = 4
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # Backend-agnostic sandbox note appended to the system prompt (see
@@ -150,7 +167,7 @@ trying tells the user nothing about what is actually possible.
 Common blocked scenarios and the remedy to relay to the user:
 - Reading a file outside the allowed set (e.g. `cat ~/.aws/credentials`) fails \
 with "Operation not permitted". Remedy: the operator adds the path to \
-COTF_SANDBOX_EXTRA_PATHS.
+`sandbox.extra_paths`.
 - Writing a file outside the workspace fails with "Operation not permitted". \
 Remedy: the operator widens the sandbox write profile.
 - Reaching an external host that is not yet approved pauses while the operator \
@@ -175,9 +192,27 @@ launders the boundary rather than respecting it."""
 
 
 def mode() -> str:
-    """Resolved COTF_SANDBOX mode: 'off', 'env', or 'jail' (default 'off')."""
-    value = os.environ.get("COTF_SANDBOX", "off").lower()
-    return value if value in _MODES else "off"
+    """Resolved `sandbox.mode`: 'off', 'env', or 'jail' (default 'off').
+
+    An unrecognised value still resolves to 'off', because refusing to start would
+    turn a typo into an outage. But it no longer does so in silence: a misspelled
+    `jial` used to read as "no sandbox at all" with nothing anywhere to say so,
+    which is the most expensive possible way to be wrong about this setting.
+    """
+    # The broker, proxy, and command service are built once. Keep the spawn
+    # boundary on that same startup mode until the reported restart happens.
+    raw = str(settings.startup_value("sandbox.mode", "off")).strip()
+    value = raw.lower()
+    if value in _MODES:
+        return value
+    if raw:
+        logger.error(
+            "sandbox.mode=%r is not one of %s; running with NO sandbox. Fix the "
+            "value in config.yaml, or drop the key to choose that deliberately.",
+            raw,
+            list(_MODES),
+        )
+    return "off"
 
 
 def enabled() -> bool:
@@ -189,6 +224,7 @@ def _is_passthrough(key: str) -> bool:
         key in _PASSTHROUGH
         or key in _PROXY_VARS
         or key in _PASSTHROUGH_ENDPOINTS
+        or key in _PASSTHROUGH_PTY
         or key.startswith(_PASSTHROUGH_PREFIXES)
         or key.endswith(_PASSTHROUGH_SUFFIXES)
     )
@@ -197,16 +233,36 @@ def _is_passthrough(key: str) -> bool:
 def agent_env() -> dict[str, str] | None:
     """Environment for a spawned agent, or None to inherit the parent's unchanged.
 
-    None when sandboxing is off, which makes the spawn sites behave exactly as
-    before (create_subprocess_exec(env=None) inherits os.environ). When on, only
-    the passthrough allowlist is forwarded, so secrets in the daemon env do not
-    reach the agent, then any per-session overrides are layered on top.
+    None only when there is nothing to add: sandboxing off *and* no per-session
+    overrides. That keeps the spawn sites behaving exactly as before
+    (create_subprocess_exec(env=None) inherits os.environ). When sandboxing is on,
+    only the passthrough allowlist is forwarded, so secrets in the daemon env do
+    not reach the agent, then any per-session overrides are layered on top.
+
+    Sandboxing off *with* overrides still returns a dict, because the two settings
+    are independent: `permissions.mode` does not imply a sandbox mode, and the
+    approval service publishes its loopback endpoints through `_SESSION_ENV` like
+    the egress proxy does. Returning None there dropped COTF_APPROVE_URL and
+    CLAUDE_PTY_TMUX_SESSION on the floor, so the shim had nowhere to ask and
+    claude-pty named its own tmux session -- a turn that parked at a permission
+    dialog no one could answer.
     """
+    overrides = _SESSION_ENV.get() or {}
     if not enabled():
-        return None
+        if not overrides:
+            return None
+        # Inherit and layer, not curate: nothing is being withheld in this mode,
+        # so building the env from an allowlist would break every spawn that
+        # needs a var the allowlist happens not to name.
+        logger.debug(
+            "sandbox: off, inheriting the daemon env with %d session override(s) %s",
+            len(overrides),
+            sorted(overrides),
+        )
+        return {**os.environ, **overrides}
     env = {key: value for key, value in os.environ.items() if _is_passthrough(key)}
     dropped = len(os.environ) - len(env)
-    env.update(_SESSION_ENV.get() or {})
+    env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
     # reach the agent", so it must not itself become the leak. A dropped *count*
@@ -258,9 +314,9 @@ def _with_shims_on_path(env: dict[str, str]) -> dict[str, str]:
 
 
 def _fs_base_profile() -> Path:
-    """Filesystem base that jail.sb imports. COTF_SANDBOX_FS=deny-most selects
+    """Filesystem base that jail.sb imports. `sandbox.fs: deny-most` selects
     fs-deny-most.sb; anything else keeps fs-allow-reads.sb (the default)."""
-    if os.environ.get("COTF_SANDBOX_FS", "").lower() == "deny-most":
+    if settings.get("COTF_SANDBOX_FS").lower() == "deny-most":
         return _DENY_MOST_PROFILE
     return _BASE_PROFILE
 
@@ -289,7 +345,9 @@ def _loopback_ports() -> list[str]:
 
     Order is stable so the emitted profile is deterministic: credential broker
     (any published `*_BASE_URL`), then the egress proxy (`HTTPS_PROXY`), then the
-    command broker (`COTF_CMD_ENDPOINT`). Duplicates are collapsed.
+    command broker (`COTF_CMD_ENDPOINT`), then the approval service
+    (`COTF_APPROVE_URL`, present only when permissions mode is `ask`). Duplicates
+    are collapsed.
     """
     env = _spawn_env()
     found: list[str] = []
@@ -299,7 +357,7 @@ def _loopback_ports() -> list[str]:
             if port is not None:
                 found.append(port)
                 break
-    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT"):
+    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT", "COTF_APPROVE_URL"):
         port = _port_from_url(env.get(key, ""))
         if port is not None:
             found.append(port)
@@ -307,48 +365,49 @@ def _loopback_ports() -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def _loopback_specs() -> tuple[str, str, str]:
+def _loopback_specs() -> tuple[str, str, str, str]:
     """The remote-ip values for the jail's loopback allows, one per slot.
 
     Narrows to just the local services the agent was handed when
-    COTF_SANDBOX_BROKER_ONLY_LOOPBACK is set, closing the arbitrary-local-sink
+    `sandbox.broker_only_loopback` is set, closing the arbitrary-local-sink
     path. Every slot is always filled because SBPL has no arrays: spare slots
     repeat the first port, which is a harmless duplicate allow. If no port is
     known at all, loopback stays open rather than locking the agent out of a
     service it needs.
 
     A port past _LOOPBACK_SLOTS would be silently unreachable, so that case warns
-    loudly instead — the same fixed-slot trade as COTF_SANDBOX_EXTRA_PATHS.
+    loudly instead — the same fixed-slot trade as `sandbox.extra_paths`.
     """
-    if os.environ.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "").lower() not in _TRUTHY:
-        return _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK
+    if settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() not in _TRUTHY:
+        return (_DEFAULT_LOOPBACK,) * _LOOPBACK_SLOTS  # ty: ignore[invalid-return-type]
     ports = _loopback_ports()
     if not ports:
         logger.warning(
-            "COTF_SANDBOX_BROKER_ONLY_LOOPBACK set but no broker base-url, "
-            "HTTPS_PROXY, or COTF_CMD_ENDPOINT in env; leaving loopback open"
+            "sandbox.broker_only_loopback set but no broker base-url, "
+            "HTTPS_PROXY, COTF_CMD_ENDPOINT, or COTF_APPROVE_URL in env; "
+            "leaving loopback open"
         )
-        return _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK, _DEFAULT_LOOPBACK
+        return (_DEFAULT_LOOPBACK,) * _LOOPBACK_SLOTS  # ty: ignore[invalid-return-type]
     if len(ports) > _LOOPBACK_SLOTS:
         logger.warning(
             "%d loopback services but only %d profile slots; %s would be "
-            "unreachable. Unset COTF_SANDBOX_BROKER_ONLY_LOOPBACK or add a slot.",
+            "unreachable. Turn off sandbox.broker_only_loopback or add a slot.",
             len(ports),
             _LOOPBACK_SLOTS,
             ports[_LOOPBACK_SLOTS:],
         )
     specs = [f"localhost:{port}" for port in ports[:_LOOPBACK_SLOTS]]
     specs += [specs[0]] * (_LOOPBACK_SLOTS - len(specs))
-    return specs[0], specs[1], specs[2]
+    return specs[0], specs[1], specs[2], specs[3]
 
 
 def _extra_read_paths() -> list[str]:
-    """Operator read grants for deny-most, from COTF_SANDBOX_EXTRA_PATHS
-    (colon-separated), realpath'd and capped at _MAX_EXTRA_PATHS."""
-    paths = [p for p in os.environ.get("COTF_SANDBOX_EXTRA_PATHS", "").split(":") if p]
+    """Operator read grants for deny-most, from `sandbox.extra_paths`,
+    realpath'd and capped at _MAX_EXTRA_PATHS."""
+    paths = [p for p in settings.get("COTF_SANDBOX_EXTRA_PATHS").split(":") if p]
     if len(paths) > _MAX_EXTRA_PATHS:
         logger.warning(
-            "COTF_SANDBOX_EXTRA_PATHS has %d entries; granting only the first %d "
+            "sandbox.extra_paths has %d entries; granting only the first %d "
             "(seatbelt has no arrays)",
             len(paths),
             _MAX_EXTRA_PATHS,
@@ -363,8 +422,8 @@ def agent_guidance(workspace: Path | None = None) -> str:
     Empty when sandboxing is off. In jail mode it names what is blocked, how to
     tell a policy denial from a real error, and the operator remedy to relay, so
     the agent surfaces the fix instead of retrying or attempting chmod/sudo. The
-    allowed-reads and egress lines reflect the actual COTF_SANDBOX_FS and
-    COTF_SANDBOX_BROKER_ONLY_LOOPBACK settings.
+    allowed-reads and egress lines reflect the actual `sandbox.fs` and
+    `sandbox.broker_only_loopback` settings.
     """
     current = mode()
     if current == "off":
@@ -376,7 +435,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
     # Deferred like shim_dir(): agent imports this module, so a top-level import
     # of DATA_DIR would be a cycle. commands is deferred for the same reason, one
     # hop further out (commands -> settings -> agent -> sandbox).
-    from claude_on_the_fly import commands, settings
+    from claude_on_the_fly import commands
     from claude_on_the_fly.agent import MEMORY_DIR
 
     shimmed = commands.shimmed_names()
@@ -390,7 +449,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
     writes = (
         f"the workspace ({project}), your memory ({MEMORY_DIR}), and your temp dir."
     )
-    if os.environ.get("COTF_SANDBOX_FS", "").lower() == "deny-most":
+    if settings.get("COTF_SANDBOX_FS").lower() == "deny-most":
         # Must stay in step with the re-grants in fs-deny-most.sb. Under-listing
         # is not harmless: the note below tells the agent not to narrow its reads,
         # and a path missing here is one it will decline to try.
@@ -416,7 +475,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "the keychain, SSH private keys, cloud credentials (~/.aws/credentials), "
             "and token files (~/.npmrc, ~/.netrc, ~/.env)."
         )
-    if os.environ.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "").lower() in _TRUTHY:
+    if settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() in _TRUTHY:
         net = (
             "Outbound network reaches ONLY the local broker; other local ports and "
             "external hosts are blocked."
@@ -438,7 +497,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
 
 
 def wrap(argv: list[str], workspace: Path) -> list[str]:
-    """Wrap argv in the vendored seatbelt jail when COTF_SANDBOX=jail, else
+    """Wrap argv in the vendored seatbelt jail when `sandbox.mode: jail`, else
     return it unchanged.
 
     Invokes sandbox-exec against the vendored jail profile directly; the agent's
@@ -446,22 +505,22 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     (non-macOS), logs and returns the bare argv so jail degrades to env-only
     rather than failing the run.
 
-    COTF_SANDBOX_FS=deny-most swaps the read-permissive base for a least-privilege
-    one and forwards COTF_SANDBOX_EXTRA_PATHS grants. COTF_SANDBOX_BROKER_ONLY_LOOPBACK
+    `sandbox.fs: deny-most` swaps the read-permissive base for a least-privilege
+    one and forwards `sandbox.extra_paths` grants. `sandbox.broker_only_loopback`
     narrows egress from all loopback to just the broker port.
     """
     if mode() != "jail":
         return argv
     if not shutil.which("sandbox-exec"):
         logger.warning(
-            "COTF_SANDBOX=jail but sandbox-exec not found (macOS only); "
+            "sandbox.mode is jail but sandbox-exec was not found (macOS only); "
             "running with curated env but no seatbelt"
         )
         return argv
     tmpdir = os.path.realpath(os.environ.get("TMPDIR", "/tmp"))
     project = os.path.realpath(workspace)
     base = _fs_base_profile()
-    loopback, loopback_2, loopback_3 = _loopback_specs()
+    loopback, loopback_2, loopback_3, loopback_4 = _loopback_specs()
     params = [
         "-D",
         # realpath, like _TMPDIR and _PROJECT_DIR below. Seatbelt matches the
@@ -484,6 +543,8 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         f"_LOOPBACK_ALT={loopback_2}",
         "-D",
         f"_LOOPBACK_ALT2={loopback_3}",
+        "-D",
+        f"_LOOPBACK_ALT3={loopback_4}",
     ]
     # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
     # so only pass them there. Pad unused slots with the project dir (a no-op).
@@ -493,7 +554,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         for index, path in enumerate(extra, start=1):
             params += ["-D", f"_EXTRA_{index}={path}"]
     # The one positive record that the jail was applied. Without it a run with
-    # COTF_SANDBOX unset produces a log indistinguishable from a jailed one:
+    # An unset sandbox mode produces a log indistinguishable from a jailed one:
     # both are simply free of denials, and no denials also reads as success.
     logger.info(
         "sandbox: jailed %s (fs=%s, loopback=%s, project=%s)",
@@ -519,6 +580,12 @@ _DENY_PROBES = (
     "~/.docker/config.json",
     "~/.config/gcloud/credentials.db",
     "~/.sentryclirc",
+    # cotf's own frontend tokens. Probed because the rule covering them is a regex
+    # rather than a subpath -- the directory around it is deliberately readable -- and
+    # a regex is the kind of rule that can be narrowed by accident and stay silent
+    # about it. macOS cannot report a seatbelt denial, so this is the only place the
+    # boundary gets checked instead of assumed.
+    "~/.claude-on-the-fly/.env",
 )
 
 

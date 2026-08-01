@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
 import random
 import re
 import time
@@ -23,7 +22,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from claude_on_the_fly import logs
+from claude_on_the_fly import checks, logs, settings
 from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
 from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.heartbeat import live_pid
@@ -41,8 +40,8 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path.home() / ".claude-on-the-fly"
 # Soft cap on agent replies per thread. Once reached, inbound messages are
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
-# counter. Overridable via env for chattier or stricter threads.
-SLACK_REPLY_SOFT_LIMIT = int(os.environ.get("SLACK_REPLY_SOFT_LIMIT", "10"))
+# counter.
+DEFAULT_REPLY_SOFT_LIMIT = 10
 CONTINUE_COMMAND = "$continue"
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
@@ -67,6 +66,8 @@ COMPACT_COMMAND = "$compact"
 # the environment, and it made the constructor's job_queue seam unusable on its
 # own.
 DEFAULT_JOB_COMMAND = "$job"
+
+
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
 # it must match the command in the Slack app manifest — Slack does not namespace
@@ -74,7 +75,48 @@ DEFAULT_JOB_COMMAND = "$job"
 # wins and the older silently stops firing. `claude-slack --manifest` renders a
 # manifest that agrees with this value. Under a user token the command is never
 # received, so the $ prefixes above stay the only control surface.
-SLASH_COMMAND = os.environ.get("SLACK_SLASH_COMMAND") or None
+def _positive_int(name: str, fallback: int) -> int:
+    """A numeric setting, read per use so an edit lands without a restart.
+
+    A junk value falls back and says so once per read rather than raising: these are
+    a memory bound and a politeness limit, and neither is worth refusing to serve a
+    message over.
+    """
+    raw = settings.get(name).strip()
+    if not raw:
+        return fallback
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %d", name, raw, fallback)
+        return fallback
+    if value <= 0:
+        logger.warning("%s=%d must be positive; using %d", name, value, fallback)
+        return fallback
+    return value
+
+
+def reply_soft_limit() -> int:
+    """Agent replies allowed per thread before inbound messages are gated."""
+    return _positive_int("SLACK_REPLY_SOFT_LIMIT", DEFAULT_REPLY_SOFT_LIMIT)
+
+
+def session_cap() -> int:
+    """Live threads whose per-session state is retained before LRU eviction."""
+    return _positive_int("SLACK_SESSION_CAP", DEFAULT_SESSION_CAP)
+
+
+def slash_command() -> str | None:
+    """The registered slash command, or None when none is configured.
+
+    Read once, at `start`, because registering it is a handshake with Slack rather
+    than a local decision -- which is why `slack.slash_command` is in
+    `settings.RESTART_REQUIRED` and an edit to it earns a restart notice instead of
+    silently pointing at a command nothing is listening for.
+    """
+    return settings.get("SLACK_SLASH_COMMAND") or None
+
+
 # The 185 default spinner verbs Claude Code ships with. Rendered by
 # assistant.threads.setStatus as "<bot> is <verb>… (Ns)" while a turn runs, so
 # the status is alive rather than a frozen "thinking". Source:
@@ -269,7 +311,7 @@ SPINNER_VERBS = (
 # Max live threads whose per-session state we retain. Past this, the
 # least-recently-active thread is evicted; it re-hydrates from scratch if it
 # ever sees another message. Bounds memory in a long-running daemon.
-SLACK_SESSION_CAP = int(os.environ.get("SLACK_SESSION_CAP", "1000"))
+DEFAULT_SESSION_CAP = 1000
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
@@ -306,7 +348,8 @@ def _resolve_job_command() -> str | None:
     not want a background-job trigger says so, and `get(name, default) or None`
     is what keeps those two cases apart.
     """
-    return os.environ.get("SLACK_JOB_COMMAND", DEFAULT_JOB_COMMAND) or None
+    configured = settings.lookup("SLACK_JOB_COMMAND")
+    return (DEFAULT_JOB_COMMAND if configured is None else configured) or None
 
 
 def _build_job_queue() -> JobQueue | None:
@@ -425,6 +468,46 @@ def _fit_block(text: str) -> str:
         return text
     dropped = len(text) - _BLOCK_TEXT_LIMIT
     return f"{text[:_BLOCK_TEXT_LIMIT]}\n[{dropped} more characters, see the log]"
+
+
+def _approval_headline(request: ApprovalRequest) -> str:
+    """The card's first line.
+
+    Leads with `origin` when the requester set one, because those subjects are
+    digests: `pty:Bash:f5771755993b` as a headline tells the operator nothing, and
+    it pushed the command -- the thing being decided -- onto a second line on a
+    phone. A requester whose subject is already readable (a host, a command) sets
+    no origin and keeps the subject up here.
+    """
+    if request.origin:
+        return f"*Permission request*  ({_literal(request.origin)})"
+    return f"*Permission request*\n`{_literal(request.subject)}`"
+
+
+def _decided_text(request: ApprovalRequest) -> str:
+    """What a retired card should say was decided.
+
+    The scope when there is one, because that is the only text on the request that
+    carries arguments. The subject otherwise -- an egress subject (`pypi.org:443`) is
+    already the whole thing that was decided.
+    """
+    return request.scope or request.subject
+
+
+def _approval_footer(request: ApprovalRequest) -> str:
+    """Grant lifetime, and nothing else.
+
+    An earlier version put the subject here, then a `Covers:` line in front of it to
+    make a digest subject mean something. Both were duplication: the detail block
+    above already *is* the command, so a tool card said the same thing three times --
+    `(Bash)`, then `chmod 700 .`, then `Covers: bash:chmod 700 .  bash:chmod`.
+
+    Nothing is lost by dropping them. The grant key and the full command are both on
+    the GRANTED line in the log, and a retired card records the command
+    (`_decided_text`), so the decision is still traceable without spending three
+    lines of a phone screen on it.
+    """
+    return f"Grant lasts {request.ttl_seconds / 60:.0f} min and dies on restart."
 
 
 def _skill_option_groups(skills: list[tuple[str, str]]) -> list[dict]:
@@ -681,7 +764,7 @@ class SlackFrontend(Frontend):
         # `None` means "not specified, read the environment"; `""` means off.
         # Without that split a caller could rename the trigger but never
         # disable it, since every falsy override would fall through to the
-        # default — the same absent-vs-blank distinction the env var makes.
+        # default — the same absent-vs-blank distinction the setting itself makes.
         self._job_command = (
             job_command if job_command is not None else _resolve_job_command()
         ) or None
@@ -690,13 +773,15 @@ class SlackFrontend(Frontend):
         self._job_queue: JobQueue | None = job_queue or (
             _build_job_queue() if self._job_command else None
         )
-        self._allowed_user_ids = allowed_user_ids or set()
-        self._allowed_user_ids.add(user_id)
-        self._allow_all_senders = "*" in self._allowed_user_ids
-        # Blocks both humans (U…) and bots (B…) — a single sender denylist.
-        self._blocked_senders = blocked_senders or set()
-        self._allowed_bot_ids = allowed_bot_ids or set()
-        self._silent_sender_ids = silent_sender_ids or set()
+        # Access control is read per message, not pinned here, so adding a sender
+        # to config.yaml takes effect on their next message instead of on the next
+        # restart. A caller that passes a set is pinning it (every test does), and
+        # `None` means "read the config" -- the same absent-vs-empty split the job
+        # command makes, because an explicitly empty set is a real answer.
+        self._pinned_allowed_user_ids = allowed_user_ids
+        self._pinned_blocked_senders = blocked_senders
+        self._pinned_allowed_bot_ids = allowed_bot_ids
+        self._pinned_silent_sender_ids = silent_sender_ids
         logger.debug(
             "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_senders=%s, allowed_bot_ids=%s, silent_sender_ids=%s",
             user_id,
@@ -751,6 +836,62 @@ class SlackFrontend(Frontend):
         self._status_started: dict[int, float] = {}  # session -> turn start (mono)
         self._status_verbs: dict[int, list[str]] = {}  # session -> shuffled verbs
 
+    def _senders(self, key: str, pinned: set[str] | None) -> set[str]:
+        """One sender set: the pinned override, else the current config.
+
+        Goes through `checks.resolve_slack_ids` so the deprecated split allowlists
+        still merge exactly as they did at startup -- one resolver, not two that can
+        drift.
+        """
+        if pinned is not None:
+            return pinned
+        return checks.resolve_slack_ids(settings.environment(), key)
+
+    def _configured_senders(self) -> set[str]:
+        """The one configured allowlist, before the human/bot prefix split."""
+        return checks.resolve_slack_ids(
+            settings.environment(), "SLACK_ALLOWED_SENDER_IDS"
+        )
+
+    @property
+    def _allowed_user_ids(self) -> set[str]:
+        """Human senders allowed to trigger the agent, plus the token's own id.
+
+        One configured list routes by Slack id prefix: `B…` is a bot and takes the
+        trusted-bot path below, everything else (`U…`/`W…`/`*`) is a human. The
+        own-id union replaces an `.add(user_id)` mutation of the caller's set. With a
+        bot token that id is the BOT's, which is why an operator has to list their own
+        U… id (or `*`) for their DMs to get through.
+        """
+        pinned = self._pinned_allowed_user_ids
+        base = (
+            pinned
+            if pinned is not None
+            else {sid for sid in self._configured_senders() if not sid.startswith("B")}
+        )
+        return base | {self._user_id}
+
+    @property
+    def _allow_all_senders(self) -> bool:
+        return "*" in self._allowed_user_ids
+
+    @property
+    def _blocked_senders(self) -> set[str]:
+        """Blocks both humans (U…) and bots (B…) — a single sender denylist."""
+        return self._senders("SLACK_BLOCKED_SENDER_IDS", self._pinned_blocked_senders)
+
+    @property
+    def _allowed_bot_ids(self) -> set[str]:
+        """Bot senders that bypass the @mention gate, by `B…` prefix."""
+        pinned = self._pinned_allowed_bot_ids
+        if pinned is not None:
+            return pinned
+        return {sid for sid in self._configured_senders() if sid.startswith("B")}
+
+    @property
+    def _silent_sender_ids(self) -> set[str]:
+        return self._senders("SLACK_SILENT_SENDER_IDS", self._pinned_silent_sender_ids)
+
     def set_orchestrator(self, orchestrator: object) -> None:
         from claude_on_the_fly.orchestrator import Orchestrator
 
@@ -784,13 +925,13 @@ class SlackFrontend(Frontend):
         }
 
     def _evict_stale_sessions(self) -> None:
-        """Drop the least-recently-active threads once over SLACK_SESSION_CAP.
+        """Drop the least-recently-active threads once over the session cap.
 
         _sessions is an OrderedDict moved-to-end on every message, so the front
         is the oldest by last activity. Active threads (in-flight, or replied to
         recently) sit at the back and are never the eviction candidate.
         """
-        while len(self._sessions) > SLACK_SESSION_CAP:
+        while len(self._sessions) > session_cap():
             oldest_id = next(iter(self._sessions))
             self._forget_session(oldest_id)
             logger.debug("evicted stale session %s", oldest_id)
@@ -834,16 +975,17 @@ class SlackFrontend(Frontend):
 
     def _register_app_interactions(self) -> None:
         """Register the bot-token-only surface: picker, shortcut, and (when
-        SLACK_SLASH_COMMAND is set) the slash command.
+        slack.slash_command is set) the slash command.
 
         The view and shortcut callback ids are app-scoped, so they can't collide
         with another install and register unconditionally. The slash command is
         workspace-global and therefore opt-in."""
         app = self._app
 
-        if SLASH_COMMAND:
+        command = slash_command()
+        if command:
 
-            @app.command(SLASH_COMMAND)
+            @app.command(command)
             async def handle_command(ack, command, body, respond):
                 await self._handle_slash_command(ack, command, body, respond)
 
@@ -862,7 +1004,7 @@ class SlackFrontend(Frontend):
 
         logger.info(
             "slack: skill picker registered (slash command: %s)",
-            SLASH_COMMAND or "off, use the message shortcut",
+            command or "off, use the message shortcut",
         )
 
     async def _warm_skills(self) -> None:
@@ -981,10 +1123,7 @@ class SlackFrontend(Frontend):
             blocks=[
                 {
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Permission request*\n`{_literal(request.subject)}`",
-                    },
+                    "text": {"type": "mrkdwn", "text": _approval_headline(request)},
                 },
                 {
                     # plain_text, so Slack parses no mrkdwn in it. Parts of a
@@ -997,15 +1136,7 @@ class SlackFrontend(Frontend):
                 },
                 {
                     "type": "context",
-                    "elements": [
-                        {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"Grant lasts {request.ttl_seconds / 60:.0f} min "
-                                "and dies on restart."
-                            ),
-                        }
-                    ],
+                    "elements": [{"type": "mrkdwn", "text": _approval_footer(request)}],
                 },
                 {
                     "type": "actions",
@@ -1041,11 +1172,16 @@ class SlackFrontend(Frontend):
         competing with it. The buttons go, so the prompt cannot be reused.
         """
         verdict = "approved" if granted else "denied"
+        # The scope, not the subject. A subject is the grant key, scoped to the
+        # program, so this line used to read "Permission approved: bash:chmod" -- a
+        # record of a decision that does not say what was decided. The scope carries
+        # the arguments.
+        decided = _decided_text(request)
         try:
             await self._app.client.chat_update(
                 channel=channel,
                 ts=ts,
-                text=f"Permission {verdict}: {request.subject}",
+                text=f"Permission {verdict}: {decided}",
                 blocks=[
                     {
                         "type": "context",
@@ -1053,8 +1189,7 @@ class SlackFrontend(Frontend):
                             {
                                 "type": "mrkdwn",
                                 "text": (
-                                    f"Permission *{verdict}*: "
-                                    f"`{_literal(request.subject)}`"
+                                    f"Permission *{verdict}*: `{_literal(decided)}`"
                                 ),
                             }
                         ],
@@ -1530,12 +1665,12 @@ class SlackFrontend(Frontend):
             logger.info(
                 "slack %s/%s: reply count reset via continue", channel, thread_ts
             )
-        elif self._reply_counts.get(session_id, 0) >= SLACK_REPLY_SOFT_LIMIT:
+        elif self._reply_counts.get(session_id, 0) >= reply_soft_limit():
             logger.info(
                 "slack %s/%s: reply soft-limit %d reached, gating message",
                 channel,
                 thread_ts,
-                SLACK_REPLY_SOFT_LIMIT,
+                reply_soft_limit(),
             )
             await self._warn_reply_limit(channel, thread_ts)
             return
@@ -1728,7 +1863,7 @@ class SlackFrontend(Frontend):
     async def _warn_reply_limit(self, channel: str, thread_ts: str | None) -> None:
         """Tell the user the thread hit the reply soft-limit and how to resume."""
         note = (
-            f"Hit the {SLACK_REPLY_SOFT_LIMIT}-message limit for this thread. "
+            f"Hit the {reply_soft_limit()}-message limit for this thread. "
             f"Reply `{CONTINUE_COMMAND}` to keep going, or "
             f"`{CONTINUE_COMMAND} <your next message>` to continue and ask in one go."
         )
@@ -2233,24 +2368,12 @@ def main() -> None:
         )
 
     load_dotenv()
-    (
-        app_token,
-        token,
-        user_id,
-        allowed_user_ids,
-        blocked_senders,
-        allowed_bot_ids,
-        silent_sender_ids,
-    ) = run_slack()
-    frontend = SlackFrontend(
-        app_token=app_token,
-        token=token,
-        user_id=user_id,
-        allowed_user_ids=allowed_user_ids,
-        blocked_senders=blocked_senders,
-        allowed_bot_ids=allowed_bot_ids,
-        silent_sender_ids=silent_sender_ids,
-    )
+    app_token, token, user_id = run_slack()
+    # Sender lists are left unset on purpose: unset means "read the config on every
+    # message", which is what makes adding an allowed sender take effect without a
+    # restart. preflight has already validated them and refused to start on a broken
+    # one.
+    frontend = SlackFrontend(app_token=app_token, token=token, user_id=user_id)
     asyncio.run(run(frontend, platform="slack"))
 
 

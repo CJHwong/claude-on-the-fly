@@ -12,6 +12,8 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from claude_on_the_fly import orchestrator as orchestrator_mod
+from claude_on_the_fly import permissions as permissions_mod
+from claude_on_the_fly import settings
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import Orchestrator, Turn
@@ -816,6 +818,15 @@ class TestDueForCompaction:
         assert orch._due_for_compaction(1) is True
         assert orch._due_for_compaction(2) is False
 
+    def test_threshold_reloads_from_config(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        operator_settings.write_text("agent:\n  auto_compact_pct: 80\n")
+        orch._context[1] = (70, 100)
+        assert orch._due_for_compaction(1) is False
+        operator_settings.write_text("agent:\n  auto_compact_pct: 60\n")
+        assert orch._due_for_compaction(1) is True
+
 
 class TestOnMessageAutoCompacts:
     async def test_compaction_is_queued_ahead_of_the_message(
@@ -1118,7 +1129,7 @@ class TestStartSandbox:
         assert await orchestrator_mod._start_sandbox(frontend) == (None, None, None)
 
     async def test_a_command_broker_that_cannot_start_revokes_the_credentials(
-        self, frontend: StubFrontend, monkeypatch
+        self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
         """Without the teardown the credential broker stayed listening with every
         route's key loaded in memory and ANTHROPIC_BASE_URL still published, for a
@@ -1145,7 +1156,7 @@ class TestStartSandbox:
         command_broker.stop.assert_awaited_once()
 
     async def test_a_credential_broker_that_cannot_start_needs_no_teardown(
-        self, frontend: StubFrontend, monkeypatch, caplog
+        self, frontend: StubFrontend, monkeypatch, caplog, operator_settings
     ) -> None:
         monkeypatch.setenv("COTF_SANDBOX", "jail")
         monkeypatch.setattr(
@@ -1163,7 +1174,7 @@ class TestStartSandbox:
         )
 
     async def test_a_successful_start_publishes_the_shim_endpoint(
-        self, frontend: StubFrontend, monkeypatch
+        self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
         monkeypatch.setenv("COTF_SANDBOX", "jail")
         credential_broker = MagicMock()
@@ -1200,11 +1211,12 @@ class TestStartSandbox:
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
 
-    async def test_the_policy_file_is_seeded_and_checked_before_anything_reads_it(
+    async def test_start_sandbox_no_longer_seeds_the_policy_file(
         self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
-        """The loaders below fall back per section, so a typo left unreported here
-        surfaces later as a host prompt or a missing shim, nowhere near the edit."""
+        """Seeding moved up to `run`, which is the only place that reaches every
+        deployment shape. Asserted here so it cannot quietly move back and leave two
+        callers racing to create the same file."""
         monkeypatch.setenv("COTF_SANDBOX", "jail")
         monkeypatch.setattr(
             orchestrator_mod.broker, "start_default_broker", AsyncMock()
@@ -1219,16 +1231,6 @@ class TestStartSandbox:
         monkeypatch.setattr(
             orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
         )
-        assert not operator_settings.exists()
-        await orchestrator_mod._start_sandbox(frontend)
-        assert operator_settings.is_file()
-
-    async def test_sandboxing_off_does_not_seed_a_policy_file(
-        self, frontend: StubFrontend, monkeypatch, operator_settings
-    ) -> None:
-        """Nothing reads the policy when sandboxing is off, so writing a file about
-        it would be noise in the operator's directory."""
-        monkeypatch.delenv("COTF_SANDBOX", raising=False)
         await orchestrator_mod._start_sandbox(frontend)
         assert not operator_settings.exists()
 
@@ -1345,6 +1347,189 @@ class TestRunTeardown:
         command_broker.stop.assert_awaited_once()
         credential_broker.stop.assert_awaited_once()
 
+    async def test_shutdown_also_revokes_the_approval_services(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """Each approval service is a listening socket holding a session's grants.
+        Leaving one up past shutdown would keep answering for a daemon that is
+        gone."""
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(None, None, None)),
+        )
+        closed: list[str] = []
+
+        class SpyPermissions(orchestrator_mod.SessionPermissions):
+            async def close_all(self) -> None:
+                closed.append("closed")
+                await super().close_all()
+
+        monkeypatch.setattr(orchestrator_mod, "SessionPermissions", SpyPermissions)
+
+        stub = MagicMock()
+        stub.describe = lambda: {}
+        stub.set_orchestrator = MagicMock()
+        stub.stop = AsyncMock()
+
+        async def never_returns(_on_message):
+            await asyncio.sleep(3600)
+
+        stub.start = never_returns
+        original_wait = asyncio.Event.wait
+
+        async def stop_immediately(self):
+            self.set()
+            return await original_wait(self)
+
+        monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
+        await orchestrator_mod.run(stub, "test")
+        assert closed == ["closed"]
+
+
+class TestPolicyFileAtStartup:
+    """`run` seeds and validates the settings file, whatever the sandbox mode."""
+
+    @staticmethod
+    async def _run_once(monkeypatch) -> None:
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(None, None, None)),
+        )
+        stub = MagicMock()
+        stub.describe = lambda: {}
+        stub.set_orchestrator = MagicMock()
+        stub.stop = AsyncMock()
+
+        async def never_returns(_on_message):
+            await asyncio.sleep(3600)
+
+        stub.start = never_returns
+        original_wait = asyncio.Event.wait
+
+        async def stop_immediately(self):
+            self.set()
+            return await original_wait(self)
+
+        monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
+        await orchestrator_mod.run(stub, "test")
+
+    async def test_the_file_is_seeded_with_the_sandbox_off(
+        self, monkeypatch, operator_settings
+    ) -> None:
+        """This used to be gated on `sandbox.enabled()`, which meant the shape that
+        most needs the diagnostics -- sandbox off, approvals on -- was the one shape
+        that never got them, and never saw the commented template either."""
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        assert not operator_settings.exists()
+        await self._run_once(monkeypatch)
+        assert operator_settings.is_file()
+
+
+class TestConfigRestartNotice:
+    """Most of the file is re-read; the rest is reported rather than ignored."""
+
+    @staticmethod
+    def _orchestrator(frontend: StubFrontend) -> orchestrator_mod.Orchestrator:
+        return orchestrator_mod.Orchestrator(frontend, "test")
+
+    async def test_a_restart_required_edit_is_named_in_the_conversation(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """Reported where the operator already is, because that is where they will be
+        right after saving the file."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+
+        await self._orchestrator(frontend)._report_config_restarts(7)
+
+        assert len(frontend.sent) == 1
+        body = frontend.sent[0][1].body
+        assert "permissions.mode" in body
+        assert "needs a restart" in body
+        assert settings.FILENAME in body
+
+    async def test_a_live_edit_is_not_reported(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """An allowlist edit takes effect on the next read, so telling anyone to
+        restart for it would be a lie that trains them to ignore the notice."""
+        operator_settings.write_text("egress:\n  allow: [a.example]\n")
+        settings.check_operator_settings()
+        operator_settings.write_text("egress:\n  allow: [a.example, b.example]\n")
+
+        await self._orchestrator(frontend)._report_config_restarts(7)
+
+        assert frontend.sent == []
+
+    async def test_the_same_change_is_reported_once(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """check_reload compares against the startup baseline, so it keeps returning
+        the same answer until a restart. Sending it every turn is noise."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+
+        orch = self._orchestrator(frontend)
+        for _ in range(3):
+            await orch._report_config_restarts(7)
+
+        assert len(frontend.sent) == 1
+
+    async def test_a_second_change_is_reported_again(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        orch = self._orchestrator(frontend)
+
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        await orch._report_config_restarts(7)
+        operator_settings.write_text(
+            "permissions:\n  mode: ask\ncommands:\n  tools: []\n"
+        )
+        await orch._report_config_restarts(7)
+
+        assert len(frontend.sent) == 2
+        assert "commands" in frontend.sent[1][1].body
+
+    async def test_reverting_the_edit_clears_the_notice(
+        self, frontend: StubFrontend, operator_settings
+    ) -> None:
+        """So the next real change is reported, rather than swallowed by a flag that
+        was never lowered."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        orch = self._orchestrator(frontend)
+
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        await orch._report_config_restarts(7)
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        await orch._report_config_restarts(7)
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+        await orch._report_config_restarts(7)
+
+        assert len(frontend.sent) == 2
+
+    async def test_a_frontend_failure_does_not_kill_the_turn(
+        self, frontend: StubFrontend, operator_settings, caplog
+    ) -> None:
+        """A missed notice is a log line. An exception here would take down the drain
+        task with turns still queued."""
+        operator_settings.write_text('permissions:\n  mode: "off"\n')
+        settings.check_operator_settings()
+        operator_settings.write_text("permissions:\n  mode: ask\n")
+
+        orch = self._orchestrator(frontend)
+        frontend.send = AsyncMock(side_effect=RuntimeError("slack is down"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"):
+            await orch._report_config_restarts(7)
+        assert "could not report" in caplog.text
+
 
 def test_settings_summary_includes_the_frontends_own_fields(monkeypatch, caplog):
     """Secrets are redacted by the frontend before they get here, so this only has
@@ -1384,3 +1569,298 @@ class TestFrontendApprovalDefault:
         await Frontend.notify_queued(frontend, 1, 3)
         assert frontend.sent[0][0] == 1
         assert "Queued (3 pending)" in frontend.sent[0][1].body
+
+
+# --- per-session approval services ---
+
+
+async def test_session_permissions_is_inert_when_approvals_are_off(operator_settings):
+    """Off is the default, so this is the path almost every deployment takes: no
+    service, no env, nothing added to the spawn."""
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    assert await manager.env_for(1, "sess-a", Path("/tmp/ws")) == {}
+
+
+async def test_session_permissions_hands_the_agent_its_endpoint(operator_settings):
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        env = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
+        url = env[cotf_approve.ENDPOINT_ENV]
+        assert url.startswith("http://127.0.0.1:")
+        assert url.endswith(permissions_mod.DECIDE_PATH)
+        # Same session, same service: a new port per turn would drop grants mid-run.
+        assert await manager.env_for(7, "sess-a", Path("/tmp/ws")) == env
+    finally:
+        await manager.close_all()
+
+
+async def test_existing_session_reloads_approval_timing(operator_settings):
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text(
+        "permissions:\n  mode: ask\n  ttl_seconds: 60\n  timeout_seconds: 30\n"
+    )
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        first = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
+        service = manager._services[7][1]
+        operator_settings.write_text(
+            "permissions:\n  mode: ask\n  ttl_seconds: 120\n  timeout_seconds: 45\n"
+        )
+        second = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
+        assert service.ttl_seconds == 120
+        assert service.broker.timeout_seconds == 45
+        assert float(second[cotf_approve.REQUEST_TIMEOUT_ENV]) > 45
+        assert first[cotf_approve.ENDPOINT_ENV] == second[cotf_approve.ENDPOINT_ENV]
+    finally:
+        await manager.close_all()
+
+
+async def test_the_service_can_reach_the_conversation_it_belongs_to(operator_settings):
+    """A gate that cannot function has to say so where the operator is looking. The
+    ERROR alone left a stuck turn looking like a slow one."""
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    frontend = StubFrontend()
+    manager = orchestrator_mod.SessionPermissions(frontend)
+    try:
+        await manager.env_for(11, "sess-a", Path("/tmp/ws"))
+        service = manager._services[11][1]
+        assert service.notify is not None
+        await service.notify(permissions_mod.UNREADABLE_DIALOG_NOTICE)
+    finally:
+        await manager.close_all()
+    # The session's own chat, not a fallback: the notice belongs with the work.
+    assert [(chat_id, r.body) for chat_id, r in frontend.sent] == [
+        (11, permissions_mod.UNREADABLE_DIALOG_NOTICE)
+    ]
+
+
+async def test_a_new_session_drops_the_previous_grants(operator_settings, caplog):
+    """/new has to mean what it says. Reusing the service would carry every
+    approval from the conversation the operator just abandoned."""
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        first = await manager.env_for(9, "sess-a", Path("/tmp/ws"))
+        with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+            second = await manager.env_for(9, "sess-b", Path("/tmp/ws"))
+        assert first[cotf_approve.ENDPOINT_ENV] != second[cotf_approve.ENDPOINT_ENV]
+        assert "grants dropped" in caplog.text
+    finally:
+        await manager.close_all()
+
+
+async def test_each_chat_gets_its_own_grant_store(operator_settings):
+    """A grant approved in one conversation must not authorise another. The port is
+    the only label a request carries, so one service per chat is what confines it."""
+    from claude_on_the_fly import cotf_approve
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        one = await manager.env_for(1, "s", Path("/tmp/ws"))
+        two = await manager.env_for(2, "s", Path("/tmp/ws"))
+        assert one[cotf_approve.ENDPOINT_ENV] != two[cotf_approve.ENDPOINT_ENV]
+    finally:
+        await manager.close_all()
+
+
+async def test_check_turn_is_silent_for_a_chat_with_no_service(operator_settings):
+    """A chat that never started a service cannot have been gated, and there is
+    nothing to compare against."""
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager.check_turn(404, Response(body="x", tool_counts={"Bash": 2}), "codex")
+
+
+async def test_check_turn_reports_a_turn_that_never_reached_the_gate(
+    operator_settings, caplog
+):
+    """The whole point of the guard: codex treats an untrusted hook as no opinion
+    and runs the command, so an ungated turn is otherwise indistinguishable from a
+    supervised one."""
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        await manager.env_for(3, "s", Path("/tmp/ws"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(3, Response(body="x", tool_counts={"Bash": 2}), "codex")
+        assert "ran UNSUPERVISED" in caplog.text
+    finally:
+        await manager.close_all()
+
+
+async def test_the_spawn_env_carries_both_egress_and_approval_routing(
+    operator_settings, monkeypatch, tmp_path
+):
+    """Both managers publish into the same per-session ContextVar. An earlier
+    revision assigned rather than merged, so whichever ran second silently dropped
+    the other's routing."""
+    from claude_on_the_fly import cotf_approve, sandbox
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    frontend = StubFrontend()
+    egress_manager = MagicMock()
+    egress_manager.env_for = AsyncMock(
+        return_value={"HTTPS_PROXY": "http://127.0.0.1:1"}
+    )
+    permissions_manager = orchestrator_mod.SessionPermissions(frontend)
+    orch = Orchestrator(
+        frontend,
+        "test",
+        egress_manager=egress_manager,
+        permissions_manager=permissions_manager,
+    )
+    seen: dict[str, str] = {}
+
+    async def fake_run(*_args, **_kwargs):
+        current = sandbox._SESSION_ENV.get() or {}
+        seen.update(current)
+        return Response(body="done")
+
+    monkeypatch.setattr(orchestrator_mod.agent, "run", fake_run)
+    monkeypatch.setattr(orch, "_workspace_for", lambda _chat: tmp_path, raising=False)
+    try:
+        await orch._process(1, Turn(text="hi"))
+    finally:
+        await permissions_manager.close_all()
+    assert seen.get("HTTPS_PROXY") == "http://127.0.0.1:1"
+    assert cotf_approve.ENDPOINT_ENV in seen
+
+
+async def test_start_sandbox_writes_the_approval_shim_when_approvals_are_on(
+    monkeypatch, operator_settings
+):
+    """The shim and its MCP config are rewritten every startup so the interpreter
+    path cannot go stale across a venv move or an upgrade, and so a wheel build
+    never has to carry an exec bit."""
+    from claude_on_the_fly import permissions as perms
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    credential_broker = MagicMock()
+    credential_broker.stop = AsyncMock()
+    monkeypatch.setattr(
+        orchestrator_mod.broker,
+        "start_default_broker",
+        AsyncMock(return_value=credential_broker),
+    )
+    command_broker = MagicMock()
+    command_broker.start = AsyncMock()
+    command_broker.stop = AsyncMock()
+    command_broker.shimmed = []
+    command_broker.agent_env = lambda: {}
+    monkeypatch.setattr(
+        orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+    )
+    monkeypatch.setattr(
+        orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+    )
+    written: list[str] = []
+    monkeypatch.setattr(perms, "write_shim", lambda: written.append("shim"))
+    monkeypatch.setattr(perms, "write_mcp_config", lambda: written.append("config"))
+
+    await orchestrator_mod._start_sandbox(StubFrontend())
+    assert written == ["shim", "config"]
+
+
+async def test_start_sandbox_writes_approval_artifacts_with_sandbox_off(
+    monkeypatch, operator_settings
+):
+    from claude_on_the_fly import permissions as perms
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    monkeypatch.setenv("COTF_SANDBOX", "off")
+    written: list[str] = []
+    monkeypatch.setattr(perms, "write_shim", lambda: written.append("shim"))
+    monkeypatch.setattr(perms, "write_mcp_config", lambda: written.append("mcp"))
+    monkeypatch.setattr(perms, "write_pty_settings", lambda: written.append("pty"))
+
+    assert await orchestrator_mod._start_sandbox(StubFrontend()) == (None, None, None)
+    assert written == ["shim", "mcp", "pty"]
+
+
+async def test_start_sandbox_writes_no_shim_when_approvals_are_off(
+    monkeypatch, operator_settings
+):
+    from claude_on_the_fly import permissions as perms
+
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    credential_broker = MagicMock()
+    credential_broker.stop = AsyncMock()
+    monkeypatch.setattr(
+        orchestrator_mod.broker,
+        "start_default_broker",
+        AsyncMock(return_value=credential_broker),
+    )
+    command_broker = MagicMock()
+    command_broker.start = AsyncMock()
+    command_broker.stop = AsyncMock()
+    command_broker.shimmed = []
+    command_broker.agent_env = lambda: {}
+    monkeypatch.setattr(
+        orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+    )
+    monkeypatch.setattr(
+        orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        perms, "write_shim", lambda: pytest.fail("wrote a shim with approvals off")
+    )
+    await orchestrator_mod._start_sandbox(StubFrontend())
+
+
+async def test_the_guard_catches_a_gate_that_breaks_after_working_once(
+    operator_settings, caplog
+):
+    """The bug this replaced: comparing the service's lifetime total meant one early
+    request bought a permanent pass. A gate that worked on turn one and then
+    detached would never be reported again -- and that is the case most worth
+    catching, since a gate that never worked at all gets noticed on the first turn.
+    """
+
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        await manager.env_for(5, "s", Path("/tmp/ws"))
+        service = manager._services[5][1]
+
+        # Turn one: the gate is attached and answers a question.
+        service.requests_seen = 1
+        caplog.clear()
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(5, Response(body="a", tool_counts={"Bash": 1}), "codex")
+        assert "ran UNSUPERVISED" not in caplog.text, (
+            "a working turn must not be reported"
+        )
+
+        # Turn two: tools ran, the gate was never asked. Under the old lifetime
+        # comparison this passed, because the total was still 1.
+        caplog.clear()
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(5, Response(body="b", tool_counts={"Bash": 4}), "codex")
+        assert "ran UNSUPERVISED" in caplog.text
+    finally:
+        await manager.close_all()
+
+
+async def test_a_new_session_resets_the_guards_baseline(operator_settings, caplog):
+    """The replacement service counts from zero, so a stale baseline would make the
+    first turn's delta negative and silently pass."""
+    operator_settings.write_text("permissions:\n  mode: ask\n")
+    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    try:
+        await manager.env_for(6, "first", Path("/tmp/ws"))
+        manager._services[6][1].requests_seen = 7
+        manager.check_turn(6, Response(body="a", tool_counts={"Bash": 1}), "codex")
+
+        await manager.env_for(6, "second", Path("/tmp/ws"))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
+            manager.check_turn(6, Response(body="b", tool_counts={"Bash": 2}), "codex")
+        assert "ran UNSUPERVISED" in caplog.text
+    finally:
+        await manager.close_all()

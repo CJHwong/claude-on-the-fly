@@ -22,7 +22,9 @@ src/claude_on_the_fly/
   egress.py            # CONNECT proxy gating outbound HTTPS by destination host
   commands.py          # Runs credentialed CLIs outside the sandbox via PATH shims
   approvals.py         # Runtime permission grants (ask the operator, then widen)
-  settings.py          # ~/.claude-on-the-fly/sandbox.yaml (hosts + brokered CLIs)
+  permissions.py       # Tool-call approvals: config, subjects, per-backend wiring
+  cotf_approve.py      # Shim a sandboxed backend runs to ask (MCP or hook)
+  settings.py          # config.yaml (all settings, re-read on save); .env is secrets only
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
   protocol.py          # Frontend protocol (add new interfaces here)
   cron.py              # Cron producer daemon — runs shell, enqueues Jobs
@@ -74,3 +76,24 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/broker.md` — when changing the credential broker or sandbox/jail wiring
 
 When working across multiple areas, read all relevant files first — the subsystems share state through `orchestrator.py` and `agent.py`.
+
+## Adding a setting
+
+Settings live in `~/.claude-on-the-fly/config.yaml`; `.env` holds credentials and
+`LOG_LEVEL` only. To add one:
+
+1. Add a `FIELDS` entry in `settings.py` mapping the dotted YAML path to the
+   environment-variable name readers use. Set `sep` if it is a list.
+2. Document it in the bundled `config.yaml`, commented out. Defaults belong in the code
+   that reads the setting, not in the template — an absent key means "whatever this
+   build does". `permissions:` is the exception and ships real values.
+3. Read it with `settings.get(NAME, default)`, which is a drop-in for
+   `os.environ.get`. Never bind one to a module constant: that cannot see a value
+   `load_dotenv()` sets after import, nor a later edit to the file.
+4. If acting on a change means binding a socket, writing a PATH shim, or constructing a
+   service, add it to `RESTART_REQUIRED` — otherwise an operator's edit silently does
+   nothing.
+
+An environment variable listed in `FIELDS` keeps working and keeps winning, so nothing
+breaks for a deployment that never edits the file. `checks.fix_hint` derives "where do I
+set this" from `FIELDS`, so a moved setting cannot leave a `.env` hint behind.

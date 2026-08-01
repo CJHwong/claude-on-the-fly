@@ -8,11 +8,22 @@ import logging
 import os
 import signal
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from claude_on_the_fly import agent, broker, commands, egress, logs, sandbox, settings
+from claude_on_the_fly import (
+    agent,
+    broker,
+    commands,
+    cotf_approve,
+    egress,
+    logs,
+    permissions,
+    sandbox,
+    settings,
+)
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
@@ -36,8 +47,9 @@ logger = logging.getLogger(__name__)
 # is preceded by a compaction. Unset or 0 disables it, which is the default:
 # compaction is a full-context pass, so firing it unasked costs real money.
 #
-# Read per-instance rather than at import because load_dotenv() runs after this
-# module is imported. Only pty mode can supply the reading it compares against
+# Read per-instance rather than at import: `load_dotenv()` runs after this module is
+# imported, and the config file can change under a running daemon either way. Only pty
+# mode can supply the reading it compares against
 # (see `Response.context_tokens`), so in native mode this is inert however it is
 # set — the manual trigger is the whole feature there.
 AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
@@ -116,6 +128,131 @@ class SessionEgress:
         self._proxies.clear()
 
 
+class SessionPermissions:
+    """One approval service, with its own grant store, per session.
+
+    Mirrors SessionEgress, for the same two reasons: a grant must not leak into
+    another chat, and the prompt has to land in the conversation that caused it.
+    Separate from SessionEgress rather than folded into it because a deployment can
+    run either without the other -- egress gating is COTF_SANDBOX, tool approvals
+    are `permissions.mode`, and neither implies the other.
+    """
+
+    def __init__(self, frontend: Frontend) -> None:
+        self._frontend = frontend
+        self._services: dict[int, tuple[str, permissions.PermissionService]] = {}
+        # chat_id -> the service's request total as of the end of the last turn.
+        # The guard needs a per-turn delta, not a lifetime count: a session that
+        # asked once and then lost its gate would otherwise pass every later check
+        # on the strength of that one early request.
+        self._asked_before_turn: dict[int, int] = {}
+
+    async def env_for(
+        self, chat_id: int, session: str, workspace: Path
+    ) -> dict[str, str]:
+        """Approval env for this session, starting a service the first time."""
+        resolved = permissions.configured()
+        if not resolved.enabled:
+            return {}
+        existing = self._services.get(chat_id)
+        if existing is not None and existing[0] == session:
+            existing[1].update_timing(
+                ttl_seconds=resolved.ttl_seconds,
+                timeout_seconds=resolved.timeout_seconds,
+            )
+            return self._env(existing[1])
+        if existing is not None:
+            await existing[1].stop()
+            # The replacement service starts its count at zero, so a stale
+            # baseline here would make the first turn's delta negative.
+            self._asked_before_turn.pop(chat_id, None)
+            logger.info("permissions: chat %s session changed, grants dropped", chat_id)
+        label = f"chat {chat_id}"
+        service = permissions.PermissionService(
+            broker=ApprovalBroker(
+                approvals_mod.gate_from_frontend(self._frontend, chat_id),
+                policies={"tool": approvals_mod.tool_policy()},
+                timeout_seconds=resolved.timeout_seconds,
+                label=label,
+            ),
+            workspace=workspace,
+            ttl_seconds=resolved.ttl_seconds,
+            label=label,
+            tmux_session=permissions.tmux_session_name(chat_id, session),
+            notify=self._notifier(chat_id),
+        )
+        await service.start()
+        self._services[chat_id] = (session, service)
+        logger.info(
+            "permissions: chat %s -> 127.0.0.1:%d (own grant store, session %s, "
+            "pane %s)",
+            chat_id,
+            service.port,
+            session[:8],
+            service.tmux_session,
+        )
+        return self._env(service)
+
+    def _notifier(self, chat_id: int) -> Callable[[str], Awaitable[None]]:
+        """How a permission service reaches the conversation it belongs to.
+
+        A plain message rather than an approval card: these are reports of a gate
+        that could not function, not questions, and offering buttons for something
+        already decided would only invite a tap that does nothing.
+        """
+
+        async def send(text: str) -> None:
+            await self._frontend.send(chat_id, Response(body=text))
+
+        return send
+
+    @staticmethod
+    def _env(service: permissions.PermissionService) -> dict[str, str]:
+        """What a spawned agent needs to reach this service.
+
+        The pane name is published too, because claude-pty picks its own otherwise
+        and the daemon has to know where an approval keystroke goes.
+        """
+        return {
+            cotf_approve.ENDPOINT_ENV: service.base_url + permissions.DECIDE_PATH,
+            cotf_approve.NOTIFY_ENV: service.base_url + permissions.NOTIFY_PATH,
+            cotf_approve.REQUEST_TIMEOUT_ENV: str(service.broker.timeout_seconds + 5),
+            permissions.TMUX_SESSION_ENV: service.tmux_session,
+            **permissions.pty_env(),
+        }
+
+    def check_turn(self, chat_id: int, response: Response, backend: str) -> None:
+        """Report a turn that used tools without the gate ever being asked.
+
+        codex runs the command when its hook is untrusted or crashes, so that
+        failure is invisible from the outside: the operator sees an ordinary turn
+        and assumes it was supervised. Comparing the turn's own tool count against
+        what the service was asked is the only place the two facts meet.
+
+        Compares a per-turn delta rather than the service's lifetime total. With the
+        total, a session that asked about one thing early and then lost its gate
+        would pass every subsequent check forever on the strength of that one
+        request -- which is the failure mode most worth catching, since a gate that
+        never worked at all is far more likely to be noticed.
+        """
+        entry = self._services.get(chat_id)
+        if entry is None:
+            return
+        total = entry[1].requests_seen
+        asked_this_turn = total - self._asked_before_turn.get(chat_id, 0)
+        self._asked_before_turn[chat_id] = total
+        permissions.warn_if_ungated(
+            sum(response.tool_counts.values()),
+            asked_this_turn,
+            backend=backend,
+        )
+
+    async def close_all(self) -> None:
+        for _session, service in list(self._services.values()):
+            await service.stop()
+        self._services.clear()
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -123,10 +260,13 @@ class Orchestrator:
         platform: str,
         event_log: EventLog | None = None,
         egress_manager: SessionEgress | None = None,
+        permissions_manager: SessionPermissions | None = None,
     ) -> None:
         # None when sandboxing is off: no proxy, no per-session env, and the
         # spawn sites behave exactly as they did before any of this existed.
         self._egress = egress_manager
+        # None when approvals are off, which keeps the spawn env untouched.
+        self._permissions = permissions_manager
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
@@ -139,12 +279,17 @@ class Orchestrator:
         # Only pty mode populates it; elsewhere the gate never has a reading and
         # so never fires.
         self._context: dict[int, tuple[int, int]] = {}
-        self._auto_compact_pct = _auto_compact_pct()
+        # None means use the live setting. Tests and embedders may assign an
+        # explicit threshold through the compatibility property below.
+        self._auto_compact_pct_override: int | None = None
         self._event_log = event_log if event_log is not None else EventLog()
         # chat_id -> {identifier, started_at_monotonic, session_uuid}.
         # Populated at dispatch, cleared on completion. Drives the heartbeat
         # `running_jobs` slot consumed by the TUI's Active AI jobs pane.
         self._in_flight: dict[int, dict] = {}
+        # Restart-required config fields already reported. Compared as a set rather
+        # than a flag so a second edit is reported too, and reverting one clears it.
+        self._restarts_reported: tuple[str, ...] = ()
 
     def session_uuid(self, chat_id: int) -> str:
         counter = self._session_counters.get(chat_id, 0)
@@ -247,7 +392,8 @@ class Orchestrator:
         compaction rather than two — the second would find nothing to compact and
         bill a full-context pass to be told so.
         """
-        if not self._auto_compact_pct:
+        threshold = self._auto_compact_pct
+        if not threshold:
             return False
         reading = self._context.get(chat_id)
         if reading is None:
@@ -256,7 +402,7 @@ class Orchestrator:
         if window <= 0:
             return False
         pct = tokens * 100 / window
-        if pct < self._auto_compact_pct:
+        if pct < threshold:
             return False
         self._context.pop(chat_id, None)
         logger.info(
@@ -265,9 +411,19 @@ class Orchestrator:
             pct,
             tokens,
             window,
-            self._auto_compact_pct,
+            threshold,
         )
         return True
+
+    @property
+    def _auto_compact_pct(self) -> int:
+        if self._auto_compact_pct_override is not None:
+            return self._auto_compact_pct_override
+        return _auto_compact_pct()
+
+    @_auto_compact_pct.setter
+    def _auto_compact_pct(self, value: int) -> None:
+        self._auto_compact_pct_override = value
 
     async def _drain(self, chat_id: int) -> None:
         queue = self._queues[chat_id]
@@ -287,8 +443,46 @@ class Orchestrator:
             await self._frontend.send_typing(chat_id)
             await asyncio.sleep(4)
 
+    async def _report_config_restarts(self, chat_id: int) -> None:
+        """Name any config edit that this turn will not honour.
+
+        Checked per turn, and reported into the conversation the operator is
+        already in, because that is where they will be right after saving the file:
+        most of `config.yaml` takes effect on the next read, so the only edits
+        worth interrupting for are the ones where saving is *not* enough.
+
+        Reported once per distinct set. `settings.check_reload` compares against
+        the startup baseline and so keeps returning the same answer until a
+        restart, which sending every turn would turn into noise nobody reads.
+
+        Frontend failures are swallowed on purpose. A missed notice is a worse log
+        line; an exception here would kill the drain task with turns still queued.
+        """
+        changed = settings.check_reload()
+        if changed == self._restarts_reported:
+            return
+        self._restarts_reported = changed
+        if not changed:
+            return
+        logger.warning(
+            "settings: %s changed in %s and needs a daemon restart to take effect",
+            ", ".join(changed),
+            settings.operator_settings(),
+        )
+        body = (
+            f"Config change to {', '.join(changed)} needs a restart. The rest of "
+            f"{settings.FILENAME} is picked up on its own, but this part is read "
+            "once at startup, so this turn and the ones after it still run the old "
+            "value."
+        )
+        try:
+            await self._frontend.send(chat_id, Response(body=body))
+        except Exception:
+            logger.exception("settings: could not report the restart-required change")
+
     async def _process(self, chat_id: int, turn: Turn) -> None:
         text = turn.text
+        await self._report_config_restarts(chat_id)
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
         if self._platform in agent.ATTACHMENT_PLATFORMS:
@@ -330,10 +524,15 @@ class Orchestrator:
             # exhausted fd table). Outside it, that failure escaped _process
             # entirely: the in-flight slot set just above leaked, notify_complete
             # never ran, and the whole drain task died with turns still queued.
+            session_overrides: dict[str, str] = {}
             if self._egress is not None:
-                env_token = sandbox.session_env(
-                    await self._egress.env_for(chat_id, session)
+                session_overrides.update(await self._egress.env_for(chat_id, session))
+            if self._permissions is not None:
+                session_overrides.update(
+                    await self._permissions.env_for(chat_id, session, workspace)
                 )
+            if session_overrides:
+                env_token = sandbox.session_env(session_overrides)
             await self._frontend.notify_start(chat_id)
             typing_task = asyncio.create_task(self._typing_loop(chat_id))
             if turn.compact:
@@ -349,6 +548,14 @@ class Orchestrator:
                     user_name=self._frontend.sender_name(chat_id),
                     channel_context=self._frontend.channel_context(chat_id),
                     timeout=self._frontend.timeout_for(chat_id),
+                )
+            if self._permissions is not None:
+                # After the turn, because the tool count only exists once it is
+                # over. Reporting late beats not reporting: an ungated turn is
+                # exactly what an operator who enabled approvals must never
+                # discover by accident.
+                self._permissions.check_turn(
+                    chat_id, response, settings.get("AGENT_BACKEND", "claude")
                 )
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
@@ -464,7 +671,7 @@ def _auto_compact_pct() -> int:
     is a cost optimization, not something worth refusing to start over. The
     value is logged so a typo doesn't look like a silently working setting.
     """
-    raw = os.environ.get(AUTO_COMPACT_PCT_VAR, "").strip()
+    raw = settings.get(AUTO_COMPACT_PCT_VAR).strip()
     if not raw:
         return 0
     try:
@@ -494,15 +701,16 @@ def _redact_token(token: str) -> str:
 def _log_settings_summary(platform: str, frontend: Frontend) -> None:
     """Dump the resolved runtime settings at startup.
 
-    Pulls shared bits (log level, data dir, agent backend) from env, then
+    Pulls shared bits (log level, data dir, agent backend) from the resolved
+    settings, then
     appends frontend-specific fields via Frontend.describe(). Secrets are
     expected to be redacted by the frontend before being returned.
     """
     import os
 
-    backend = os.environ.get("AGENT_BACKEND", "claude").lower()
+    backend = settings.get("AGENT_BACKEND", "claude").lower()
     mode_var = f"{backend.upper()}_MODE"
-    mode = os.environ.get(mode_var, "native").lower()
+    mode = settings.get(mode_var, "native").lower()
 
     logger.info("%s settings:", platform)
     logger.info("  platform        = %s", platform)
@@ -511,7 +719,7 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
     logger.info("  agent_backend   = %s", backend)
     logger.info("  %-15s = %s", mode_var.lower(), mode)
     if mode == "ollama":
-        logger.info("  ollama_model    = %s", os.environ.get("OLLAMA_MODEL", "<unset>"))
+        logger.info("  ollama_model    = %s", settings.get("OLLAMA_MODEL", "<unset>"))
 
     for label, value in frontend.describe().items():
         logger.info("  %-15s = %s", label, value)
@@ -530,13 +738,16 @@ async def _start_sandbox(
     every route's key loaded in memory and ANTHROPIC_BASE_URL published, for a
     daemon that was on its way to exiting.
     """
+    # Approval artifacts are independent of the sandbox. Generate them before
+    # the sandbox-off return so a fresh ask-mode deployment has both backends'
+    # prompt/hook wiring available.
+    permissions.check()
+    if permissions.configured().enabled:
+        permissions.write_shim()
+        permissions.write_mcp_config()
+        permissions.write_pty_settings()
     if not sandbox.enabled():
         return None, None, None
-    # Before anything reads the policy: seed the operator's file if it is missing,
-    # and name any problem with it now. The loaders below fall back per section, so
-    # without this a typo surfaces as a host prompt or a missing shim much later,
-    # nowhere near the edit that caused it.
-    settings.check_operator_settings()
     broker_instance = None
     command_broker = None
     try:
@@ -590,6 +801,17 @@ async def run(frontend: Frontend, platform: str) -> None:
 
     _log_settings_summary(platform, frontend)
 
+    # Before anything reads the policy: seed the operator's file if it is missing,
+    # name any problem with it now, and record what the restart-required fields
+    # were, so a later edit to one can be reported rather than silently ignored.
+    #
+    # Unconditional, where this used to sit inside the sandbox branch. The file
+    # holds more than sandbox policy now, and `permissions:` in particular is read
+    # with the sandbox off -- so gating the seeding and the validation on
+    # `sandbox.enabled()` meant the one deployment shape that most needs the
+    # diagnostics was the shape that never got them.
+    settings.check_operator_settings()
+
     # When sandboxing is enabled, the broker holds the real API keys and the
     # agent reaches them only through loopback. start_default_broker publishes
     # base-urls into os.environ that sandbox.agent_env forwards to the agent.
@@ -599,7 +821,17 @@ async def run(frontend: Frontend, platform: str) -> None:
     # operator to grant an unknown one mid-run instead of failing the task.
     broker_instance, session_egress, command_broker = await _start_sandbox(frontend)
 
-    orch = Orchestrator(frontend, platform, egress_manager=session_egress)
+    # Approvals are independent of COTF_SANDBOX, so this is built whenever the
+    # config asks for it rather than only inside the sandbox branch.
+    session_permissions = (
+        SessionPermissions(frontend) if permissions.configured().enabled else None
+    )
+    orch = Orchestrator(
+        frontend,
+        platform,
+        egress_manager=session_egress,
+        permissions_manager=session_permissions,
+    )
     frontend.set_orchestrator(orch)
 
     stop = asyncio.Event()
@@ -624,6 +856,8 @@ async def run(frontend: Frontend, platform: str) -> None:
     # Stopping these revokes every route out of the sandbox at once.
     if session_egress is not None:
         await session_egress.close_all()
+    if session_permissions is not None:
+        await session_permissions.close_all()
     if command_broker is not None:
         await command_broker.stop()
     if broker_instance is not None:

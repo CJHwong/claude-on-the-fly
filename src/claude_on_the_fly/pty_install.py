@@ -15,6 +15,8 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from claude_on_the_fly import settings
+
 logger = logging.getLogger(__name__)
 
 INSTALL_URL = (
@@ -129,7 +131,7 @@ AUTO_REFRESH_VAR = "COTF_PTY_AUTO_REFRESH"
 
 def auto_refresh_enabled() -> bool:
     """Whether preflight may re-splice pty's hooks when they're incomplete."""
-    return os.environ.get(AUTO_REFRESH_VAR, "1").strip().lower() not in {
+    return settings.get(AUTO_REFRESH_VAR, "1").strip().lower() not in {
         "0",
         "false",
         "no",
@@ -170,7 +172,7 @@ def ensure_pty_installed(
     auto_yes_resolved = (
         auto_yes
         if auto_yes is not None
-        else os.environ.get("COTF_AUTO_INSTALL_PTY", "").lower() in {"1", "true", "yes"}
+        else settings.get("COTF_AUTO_INSTALL_PTY").lower() in {"1", "true", "yes"}
     )
 
     consented = prompt_consent(

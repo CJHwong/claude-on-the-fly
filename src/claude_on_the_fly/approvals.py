@@ -54,6 +54,16 @@ DEFAULT_TTL_SECONDS = 3600.0
 _RATE_LIMIT = 10
 _RATE_WINDOW_SECONDS = 600.0
 
+# The same ceiling is wrong for tool permissions. Ten questions per ten minutes
+# suits egress, where a burst of distinct hosts is the signal itself. A supervised
+# turn legitimately asks far more often than that -- a first pass over an
+# unfamiliar repo produced prompts for chmod, find, sudo, curl and git init inside
+# one turn -- and hitting the ceiling auto-denies the rest silently, which reads
+# to the operator as the agent giving up for no reason. Budgets are per kind so
+# neither shape can spend the other's.
+TOOL_RATE_LIMIT = 60
+TOOL_RATE_WINDOW_SECONDS = 600.0
+
 # How long a denial suppresses the same question. Agents retry hard: a live run
 # with codex produced 50 prompts for one denied host, because a "no" was not
 # remembered at all and each retry asked again. Short enough that the operator
@@ -73,16 +83,46 @@ class ApprovalRequest:
     :param detail: Mechanical context for the operator: what tried to do what.
         Never agent-authored prose.
     :param ttl_seconds: How long an approval lasts.
+    :param origin: Optional cotf-authored headline, e.g. "Bash, asked by claude".
+        Set it when the subject is a digest rather than something a human reads --
+        a pty grant key is `pty:Bash:f5771755993b`, which as a headline says
+        nothing. Frontends lead with this and move the subject to the footer. Left
+        empty by requesters whose subject *is* the readable thing (a host, a
+        command), so their cards are unchanged.
+    :param scope: Optional human-readable statement of what a grant here would
+        cover, for the same reason: a digest subject says nothing about scope. Shown
+        in full, not truncated -- the operator is deciding on the whole command, and
+        a tail cut off the end is exactly where an unexpected path would sit. The
+        requester bounds the length before setting it. Display and log text only:
+        `key` stays the identity, because the text a pty dialog yields is
+        wrap-damaged and cannot be trusted to reproduce a command exactly.
     """
 
     kind: str
     subject: str
     detail: str
     ttl_seconds: float = DEFAULT_TTL_SECONDS
+    origin: str = ""
+    scope: str = ""
 
     @property
     def key(self) -> str:
         return f"{self.kind}:{self.subject}"
+
+
+def _covers(req: ApprovalRequest) -> str:
+    """ " covers <scope>" for a log line, or "" when the key already says it.
+
+    The GRANTED and denied lines used to print the key alone, which for a pty grant
+    is `tool:pty:Bash:f5771755993b` -- unmatchable against anything without going
+    back to the ask line further up the log. Full text, not `scope_display`: a log
+    is read with a pager, not on a phone.
+
+    Last on the line, after the durations, because the scope is free text: with the
+    duration behind it a line ended "...This command requires approval for 1800s",
+    which reads as the approval lasting 1800s rather than the grant.
+    """
+    return f", covers {req.scope}" if req.scope else ""
 
 
 class ApprovalGate(Protocol):
@@ -158,6 +198,20 @@ class ApprovalPolicy:
         return False
 
 
+def tool_policy() -> ApprovalPolicy:
+    """The policy for `kind="tool"` requests: the same shape, a looser ceiling.
+
+    Nothing is never-asked here. The egress never-ask tier exists because a
+    metadata endpoint is a subject no legitimate task needs and an operator could
+    be talked into approving; a tool call has no equivalent set, and inventing one
+    would be a denylist pretending to be a boundary.
+    """
+    return ApprovalPolicy(
+        rate_limit=TOOL_RATE_LIMIT,
+        window_seconds=TOOL_RATE_WINDOW_SECONDS,
+    )
+
+
 class ApprovalBroker:
     """Wraps a gate with the grant store, the never-ask tier, and rate limiting.
 
@@ -176,13 +230,19 @@ class ApprovalBroker:
         gate: ApprovalGate,
         *,
         policy: ApprovalPolicy | None = None,
+        policies: dict[str, ApprovalPolicy] | None = None,
         store: GrantStore | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         label: str = "",
     ) -> None:
         self._gate = gate
+        # `policy` stays the default for every kind, so the egress caller that
+        # predates this is unchanged. `policies` overrides it per kind, which is
+        # what keeps a turn's worth of tool prompts from spending the budget that
+        # exists to blunt host probing.
         self._policy = policy or ApprovalPolicy()
+        self._policies = dict(policies or {})
         self._store = store or GrantStore(clock=clock)
         self._timeout = timeout_seconds
         self._clock = clock
@@ -190,7 +250,9 @@ class ApprovalBroker:
         # another. Without this the log cannot show which session's store a
         # decision landed in, and the confinement is unverifiable.
         self._label = label
-        self._recent: deque[float] = deque()
+        # kind -> when each recent question was asked. Separate deques rather than
+        # one shared, for the same reason the policies are separate.
+        self._recent: dict[str, deque[float]] = {}
         self._in_flight: dict[str, asyncio.Future[bool]] = {}
         # key -> when the operator's "no" stops suppressing the question.
         self._denied_until: dict[str, float] = {}
@@ -198,6 +260,10 @@ class ApprovalBroker:
     @property
     def store(self) -> GrantStore:
         return self._store
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout
 
     @property
     def _tag(self) -> str:
@@ -208,6 +274,10 @@ class ApprovalBroker:
         """True if `key` is already granted. No question is asked."""
         return self._store.allows(key)
 
+    def update_timeout(self, timeout_seconds: float) -> None:
+        """Apply a reloaded answer window to subsequent approval requests."""
+        self._timeout = timeout_seconds
+
     async def check(self, req: ApprovalRequest) -> bool:
         """Grant `req` from the store, or ask the operator once and cache."""
         if self._store.allows(req.key):
@@ -216,24 +286,30 @@ class ApprovalBroker:
             # later request produced nothing here.
             logger.debug("%s: %s allowed by standing grant", self._tag, req.key)
             return True
-        if self._policy.refuses(req.subject):
+        policy = self.policy_for(req.kind)
+        if policy.refuses(req.subject):
             logger.warning(
                 "%s: refuse %s without asking (never-ask policy)", self._tag, req.key
             )
             return False
         if self._in_deny_cooldown(req.key):
             return False
-        if self._rate_limited():
+        if self._rate_limited(req.kind):
             logger.warning(
-                "%s: deny %s (rate limit: >%d requests in %.0fs, active grants %s)",
+                "%s: deny %s (rate limit: >%d %s requests in %.0fs, active grants %s)",
                 self._tag,
                 req.key,
-                self._policy.rate_limit,
-                self._policy.window_seconds,
+                policy.rate_limit,
+                req.kind,
+                policy.window_seconds,
                 self._store.active(),
             )
             return False
         return await self._ask_once(req)
+
+    def policy_for(self, kind: str) -> ApprovalPolicy:
+        """The policy governing `kind`, falling back to the shared default."""
+        return self._policies.get(kind, self._policy)
 
     async def _ask_once(self, req: ApprovalRequest) -> bool:
         """Ask, collapsing concurrent duplicates onto a single question."""
@@ -262,7 +338,7 @@ class ApprovalBroker:
 
     async def _invoke_gate(self, req: ApprovalRequest) -> bool:
         """Run the gate under a timeout. Every failure mode denies."""
-        self._recent.append(self._clock())
+        self._recent.setdefault(req.kind, deque()).append(self._clock())
         logger.info(
             "%s: asking operator about %s via %s (%s)",
             self._tag,
@@ -288,15 +364,20 @@ class ApprovalBroker:
                 self._clock() + self._policy.deny_cooldown_seconds
             )
             logger.info(
-                "%s: operator denied %s (not asking again for %.0fs)",
+                "%s: operator denied %s (not asking again for %.0fs)%s",
                 self._tag,
                 req.key,
                 self._policy.deny_cooldown_seconds,
+                _covers(req),
             )
             return False
         self._store.grant(req.key, req.ttl_seconds)
         logger.warning(
-            "%s: operator GRANTED %s for %.0fs", self._tag, req.key, req.ttl_seconds
+            "%s: operator GRANTED %s for %.0fs%s",
+            self._tag,
+            req.key,
+            req.ttl_seconds,
+            _covers(req),
         )
         return True
 
@@ -321,11 +402,13 @@ class ApprovalBroker:
         )
         return True
 
-    def _rate_limited(self) -> bool:
-        cutoff = self._clock() - self._policy.window_seconds
-        while self._recent and self._recent[0] < cutoff:
-            self._recent.popleft()
-        return len(self._recent) >= self._policy.rate_limit
+    def _rate_limited(self, kind: str) -> bool:
+        policy = self.policy_for(kind)
+        recent = self._recent.setdefault(kind, deque())
+        cutoff = self._clock() - policy.window_seconds
+        while recent and recent[0] < cutoff:
+            recent.popleft()
+        return len(recent) >= policy.rate_limit
 
 
 @dataclass

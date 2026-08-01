@@ -588,6 +588,8 @@ class DashboardScreen(Screen):
             self._edit_cron_config()
         elif choice == "env":
             self._edit_env()
+        elif choice == "sandbox":
+            self._edit_sandbox_config()
 
     def _edit_cron_config(self) -> None:
         from claude_on_the_fly.cron import EXAMPLE_YAML
@@ -596,6 +598,27 @@ class DashboardScreen(Screen):
             env_editor.open_in_editor(CRON_CONFIG, seed=EXAMPLE_YAML)
         self._refresh()
         self._notify(f"edited {CRON_CONFIG.name}", "information")
+
+    def _edit_sandbox_config(self) -> None:
+        """Edit the operator's sandbox policy: egress hosts, brokered CLIs, approvals.
+
+        Seeded from the bundled template when absent, the same way the daemon seeds
+        it at startup, so the first thing opened is a commented file explaining every
+        field rather than an empty buffer whose schema has to be guessed.
+
+        No diff afterwards, unlike .env: nothing here is a secret to redact, and the
+        loaders re-read the file per call, so an edit takes effect on the next session
+        without a restart.
+        """
+        from claude_on_the_fly import settings
+
+        target = settings.operator_settings()
+        with self.app.suspend():
+            env_editor.open_in_editor(
+                target, seed=settings.BUNDLED_SETTINGS.read_text(encoding="utf-8")
+            )
+        self._refresh()
+        self._notify(f"edited {target.name}", "information")
 
     def _edit_env(self) -> None:
         env_file = supervisor.DEFAULT_ENV_FILE

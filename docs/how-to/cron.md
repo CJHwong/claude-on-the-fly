@@ -124,7 +124,7 @@ Two independent numbers:
 
 - `max_concurrent` on an entry — how much of *that entry's* work may be
   outstanding at once. Default 1.
-- `JOBS_CONCURRENCY` on the worker — how many agents *this machine* runs at once.
+- `jobs.concurrency` on the worker — how many agents *this machine* runs at once.
   Default 1.
 
 ## Coming from `schedule.yaml`

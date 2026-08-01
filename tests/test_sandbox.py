@@ -38,6 +38,48 @@ def test_agent_env_none_when_off(monkeypatch):
     assert sandbox.agent_env() is None
 
 
+def test_session_overrides_reach_the_agent_with_the_sandbox_off(monkeypatch):
+    """Sandboxing and approvals are independent settings, so `off` must not eat the
+    session env. It used to: agent_env() returned None before the overrides were
+    read, which dropped the approval service's own endpoint and left claude-pty
+    naming its tmux session after its pid -- a turn stuck at a dialog whose pane
+    the daemon could not find. The values are ephemeral-port loopback URLs, so
+    there is no static default that could stand in for them.
+    """
+    monkeypatch.delenv("COTF_SANDBOX", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-curated-in-this-mode")
+    token = sandbox.session_env(
+        {
+            "COTF_APPROVE_URL": "http://127.0.0.1:56188/decide",
+            "COTF_APPROVE_NOTIFY_URL": "http://127.0.0.1:56188/notify",
+            "CLAUDE_PTY_TMUX_SESSION": "cotf-pty-42-abcd1234",
+            "CLAUDE_PTY_NO_TMUX": "0",
+        }
+    )
+    try:
+        env = sandbox.agent_env()
+    finally:
+        sandbox.reset_session_env(token)
+
+    assert env is not None
+    assert env["COTF_APPROVE_URL"] == "http://127.0.0.1:56188/decide"
+    assert env["COTF_APPROVE_NOTIFY_URL"] == "http://127.0.0.1:56188/notify"
+    assert env["CLAUDE_PTY_TMUX_SESSION"] == "cotf-pty-42-abcd1234"
+    assert env["CLAUDE_PTY_NO_TMUX"] == "0"
+    # Off means off: this mode withholds nothing, so the daemon env is inherited
+    # whole rather than rebuilt from the passthrough allowlist.
+    assert env["ANTHROPIC_API_KEY"] == "sk-not-curated-in-this-mode"
+
+
+def test_a_session_override_does_not_outlive_its_token(monkeypatch):
+    """The ContextVar is per turn. If a reset left the value behind, the next
+    session would inherit the previous one's approval endpoint."""
+    monkeypatch.delenv("COTF_SANDBOX", raising=False)
+    token = sandbox.session_env({"COTF_APPROVE_URL": "http://127.0.0.1:1/decide"})
+    sandbox.reset_session_env(token)
+    assert sandbox.agent_env() is None
+
+
 def test_agent_env_drops_secrets_keeps_essentials(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX", "env")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
@@ -129,7 +171,9 @@ def test_guidance_jail_covers_all_denial_scenarios(monkeypatch, tmp_path):
     assert "Operation not permitted" in text and "Permission denied" in text
     assert "451" in text
     # every denial category has a scenario + remedy
-    assert "COTF_SANDBOX_EXTRA_PATHS" in text  # file-read remedy
+    assert (
+        "sandbox.extra_paths" in text
+    )  # file-read remedy, named as the operator sets it
     assert "write profile" in text  # file-write remedy
     # Network remedy is now an approval, not a config change: the agent is told
     # the request pauses for the operator and that a 403 means they declined.
@@ -225,7 +269,7 @@ def _clear_loopback_env(monkeypatch):
 
 def test_loopback_open_by_default(monkeypatch):
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
-    assert sandbox._loopback_specs() == ("localhost:*",) * 3
+    assert sandbox._loopback_specs() == ("localhost:*",) * sandbox._LOOPBACK_SLOTS
 
 
 def test_loopback_narrows_to_broker_port(monkeypatch):
@@ -234,19 +278,21 @@ def test_loopback_narrows_to_broker_port(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321/anthropic")
     # Only the broker port is known, so spare slots repeat it rather than
     # widening back to every loopback port.
-    assert sandbox._loopback_specs() == ("localhost:54321",) * 3
+    assert sandbox._loopback_specs() == ("localhost:54321",) * sandbox._LOOPBACK_SLOTS
 
 
-def test_loopback_narrows_to_all_three_services(monkeypatch):
+def test_loopback_narrows_to_every_known_service(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
     _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321/anthropic")
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:54322")
     monkeypatch.setenv("COTF_CMD_ENDPOINT", "http://127.0.0.1:54323")
+    monkeypatch.setenv("COTF_APPROVE_URL", "http://127.0.0.1:54324/decide")
     assert sandbox._loopback_specs() == (
         "localhost:54321",
         "localhost:54322",
         "localhost:54323",
+        "localhost:54324",
     )
 
 
@@ -264,10 +310,13 @@ def test_loopback_reads_the_per_session_env_not_just_os_environ(monkeypatch):
         }
     )
     try:
+        # Three services and four slots, so the spare repeats the first
+        # port -- a duplicate allow, which is harmless.
         assert sandbox._loopback_specs() == (
             "localhost:5001",
             "localhost:6002",
             "localhost:7003",
+            "localhost:5001",
         )
     finally:
         sandbox.reset_session_env(token)
@@ -278,19 +327,24 @@ def test_loopback_narrows_to_egress_port_alone(monkeypatch):
     _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:54322")
     # A deployment with no credentialed provider still gets a narrowed jail.
-    assert sandbox._loopback_specs() == ("localhost:54322",) * 3
+    assert sandbox._loopback_specs() == ("localhost:54322",) * sandbox._LOOPBACK_SLOTS
 
 
 def test_loopback_warns_rather_than_silently_dropping_a_service(monkeypatch, caplog):
-    """Guard for a future fourth loopback service. Unreachable through env today
-    (the broker serves every route on one port, so the three sources fill the
-    three slots exactly), so drive _loopback_ports directly."""
+    """Guard for a future fifth loopback service. Unreachable through env today
+    (the broker serves every route on one port, so the four sources fill the four
+    slots exactly), so drive _loopback_ports directly."""
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
-    monkeypatch.setattr(sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4"])
+    monkeypatch.setattr(sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4", "5"])
     with caplog.at_level("WARNING"):
         specs = sandbox._loopback_specs()
-    # Four services, three slots: the drop must be loud, never silent.
-    assert specs == ("localhost:1", "localhost:2", "localhost:3")
+    # Five services, four slots: the drop must be loud, never silent.
+    assert specs == (
+        "localhost:1",
+        "localhost:2",
+        "localhost:3",
+        "localhost:4",
+    )
     assert "unreachable" in caplog.text
 
 
@@ -306,7 +360,7 @@ def test_loopback_stays_open_when_no_service_is_known(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
     _clear_loopback_env(monkeypatch)
     # Fail-safe: never lock the agent out of a broker it might need.
-    assert sandbox._loopback_specs() == ("localhost:*",) * 3
+    assert sandbox._loopback_specs() == ("localhost:*",) * sandbox._LOOPBACK_SLOTS
 
 
 def test_wrap_jail_passes_three_loopback_slots(monkeypatch, tmp_path):
@@ -567,7 +621,7 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     assert set(results.values()) == {sandbox.ABSENT}, results
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "deny untested" in logged
-    assert "0/6 probed" in logged
+    assert f"0/{len(sandbox._DENY_PROBES)} probed" in logged
 
 
 async def test_broken_profile_is_not_reported_as_absent(monkeypatch, tmp_path, caplog):
@@ -923,6 +977,147 @@ def test_the_daemons_own_env_file_is_unreadable_in_the_jail(
     assert "not permitted" in done.stderr.lower(), done.stderr
 
 
+# Measured: what a real `codex exec` turn wrote under ~/.codex. A grant missing from
+# here is a codex that cannot run; a grant here that codex does not need is attack
+# surface, so the list is the measurement and not a guess.
+_CODEX_MUST_WRITE = (
+    "/.codex/sessions",
+    "/.codex/tmp",
+    "/.codex/cache",
+    "/.codex/log",
+    "/.codex/shell_snapshots",
+    "/.codex/plugins/cache",
+    "/.codex/models_cache.json",
+    "/.codex/auth.json",
+)
+
+# Files that decide what codex executes, or what it is told to do. None was written by
+# a real turn.
+_CODEX_MUST_NOT_WRITE = (
+    "hooks.json",
+    "config.toml",
+    "rules/x.rules",
+    "AGENTS.md",
+    "history.jsonl",
+    "plugins/manifest.toml",
+    "a-config-codex-has-not-invented-yet.toml",
+)
+
+
+def test_the_cotf_env_deny_covers_any_depth():
+    """The tokens must not be readable from a copy one directory down.
+
+    `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and memory
+    live under it -- so the tokens are covered by a regex rather than a subpath deny.
+    The regex used to be anchored at the directory root, which left
+    `pre-migration-backup-*/.env` and a syncer's `sub/.env` readable while the file an
+    operator actually thinks about was protected. Asserted on the profile text because
+    the suite's HOME is a tmpdir the profile grants wholesale, so a live read there
+    would succeed for the wrong reason.
+    """
+    text = sandbox._BASE_PROFILE.read_text()
+    rule = next(
+        line
+        for line in text.splitlines()
+        if "deny file-read*" in line and "claude-on-the-fly" in line and ".env" in line
+    )
+    assert "(.*/)?" in rule, rule
+
+
+def test_the_cotf_env_is_a_verified_denial():
+    """A regex deny is the kind that can be narrowed by accident and stay quiet about
+    it, and macOS cannot report a seatbelt denial. Probing it per run is the substitute
+    for trusting it."""
+    assert "~/.claude-on-the-fly/.env" in sandbox._DENY_PROBES
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_codex_directory_is_deny_default_not_a_denylist(profile):
+    """~/.codex must stay partly writable or codex will not start, but it also holds
+    everything deciding what codex executes and what it is told.
+
+    An earlier revision granted the whole directory and denied three files. That list
+    was already incomplete: plugins/, history.jsonl and AGENTS.md stayed writable, and
+    AGENTS.md is standing instructions codex reads on every later run, so an injected
+    agent could leave itself orders that outlive the session. Enumerating the
+    dangerous files loses that race every time codex adds one, which is why this is a
+    deny with an explicit re-grant instead.
+
+    Structural because the suite's HOME is a tmpdir inside _TMPDIR, which the profile
+    grants wholesale, so a live write there would succeed for the wrong reason. The
+    live counterpart is below.
+    """
+    text = profile.read_text()
+    assert (
+        '(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))' in text
+    ), "the ~/.codex write policy is no longer deny-default"
+    granted = set(
+        re.findall(
+            r"\(allow file-write\*\s*\n?\s*\((?:subpath|literal) "
+            r'\(string-append \(param "_HOME"\) "([^"]+)"',
+            text,
+        )
+    )
+    for path in _CODEX_MUST_WRITE:
+        assert path in granted, f"{path} is not granted; codex cannot run without it"
+    # The re-grants must not reach back up to the whole directory.
+    assert "/.codex" not in granted, "the blanket ~/.codex grant is back"
+
+
+@pytest.mark.parametrize("target", _CODEX_MUST_NOT_WRITE)
+def test_codex_execution_control_paths_are_unwritable_in_the_jail(
+    monkeypatch, tmp_path, original_home, target
+):
+    """Live counterpart, against the real home so the deny is why the write fails
+    rather than the path being absent.
+
+    This has to run against the real home: a tmpdir HOME sits under _TMPDIR or
+    /private/var/folders, both granted wholesale, so the grant would win and the probe
+    would pass for the wrong reason.
+
+    Appends zero bytes so an existing file cannot be altered even if a deny had stopped
+    working, and for the paths that do not exist the only possible damage is a stray
+    empty file that codex's own parsers would reject rather than act on.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    if not (original_home / ".codex").is_dir():
+        pytest.skip("no real ~/.codex on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    path = original_home / ".codex" / target
+    existed = path.exists()
+
+    done = _run_jailed(["/bin/sh", "-c", f"printf '' >> {path}"], tmp_path)
+
+    assert done.returncode != 0, f"{target} was writable inside the jail"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+    assert path.exists() == existed, f"the probe changed {target} on disk"
+
+
+def test_codex_can_still_write_what_a_real_turn_needs(
+    monkeypatch, tmp_path, original_home
+):
+    """The other half: deny-default is only correct if the re-grants are complete.
+    Every path here was observed being written by a real `codex exec` turn, so a deny
+    creeping over one of them is a codex that cannot run."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    sessions = original_home / ".codex" / "sessions"
+    if not sessions.is_dir():
+        pytest.skip("no real ~/.codex/sessions on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    probe = sessions / ".cotf-suite-probe"
+    try:
+        done = _run_jailed(["/bin/sh", "-c", f"printf '' > {probe}"], tmp_path)
+        assert done.returncode == 0, f"sessions/ is not writable: {done.stderr}"
+        assert probe.exists()
+    finally:
+        if probe.exists() and probe.stat().st_size == 0:
+            probe.unlink()
+
+
 def test_deny_most_guidance_lists_every_path_the_profile_grants(monkeypatch):
     """The guidance also tells the agent not to narrow its reads, because
     "refusing a read you are actually permitted to make costs the user real work".
@@ -947,3 +1142,24 @@ def test_guidance_names_memory_as_writable(monkeypatch):
     guidance = sandbox.agent_guidance(Path("/tmp/workspace"))
     assert str(agent.MEMORY_DIR) in guidance
     assert "Writing:" in guidance
+
+
+def test_an_unrecognised_sandbox_mode_says_so_instead_of_silently_disabling(
+    monkeypatch, caplog
+):
+    """It still resolves to off, because refusing to start would turn a typo into an
+    outage. But a misspelled `jial` used to read as "no sandbox at all" with nothing
+    anywhere to say so, which is the most expensive way to be wrong about this."""
+    monkeypatch.setenv("COTF_SANDBOX", "jial")
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
+        assert sandbox.mode() == "off"
+    assert "not one of" in caplog.text
+    assert "NO sandbox" in caplog.text
+
+
+def test_an_unset_sandbox_mode_is_silent(monkeypatch, caplog):
+    """Choosing off deliberately must not produce an error every startup."""
+    monkeypatch.delenv("COTF_SANDBOX", raising=False)
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
+        assert sandbox.mode() == "off"
+    assert caplog.text == ""

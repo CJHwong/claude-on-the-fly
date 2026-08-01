@@ -4,7 +4,8 @@ Keeps API keys out of the agent. A bypassPermissions agent that gets prompt-inje
 will exfiltrate any secret it can reach, so the defense is architectural: the key
 value never enters the agent process, and a local broker injects it at the point of use.
 
-Two layers, both opt-in via `COTF_SANDBOX` (default `off`):
+Two layers, both opt-in via `sandbox.mode` in `~/.claude-on-the-fly/config.yaml`
+(default `off`; the `COTF_SANDBOX` environment variable still works and still wins):
 
 | mode   | env curation | seatbelt jail | platform |
 |--------|--------------|---------------|----------|
@@ -56,20 +57,20 @@ Route(
 
 ## Narrowing the filesystem and loopback (jail mode)
 
-These knobs only take effect under `COTF_SANDBOX=jail` and each defaults to the current
+These knobs only take effect under `sandbox.mode: jail` and each defaults to the current
 behavior when unset:
 
-- `COTF_SANDBOX_FS=deny-most` swaps the read-permissive base (`fs-allow-reads.sb`) for `fs-deny-most.sb`,
+- `sandbox.fs: deny-most` swaps the read-permissive base (`fs-allow-reads.sb`) for `fs-deny-most.sb`,
   which makes `$HOME` opaque and re-grants only the project dir, `~/.claude`, `~/.cache/uv`,
   and up to three operator paths. Reads outside `$HOME` (system libraries, the toolchain)
   stay allowed so binaries run. This is coarser than `fs-allow-reads.sb` by design: an agent that reads
   a home dotfile outside the granted set (e.g. `~/.gitconfig`) is denied. Note the agent's own
   binary and interpreters often live under `$HOME` (`~/.local/bin`, mise/nvm/npm paths); grant
-  those via `COTF_SANDBOX_EXTRA_PATHS` or the agent cannot exec and the run fails to start.
-- `COTF_SANDBOX_EXTRA_PATHS` (colon-separated, capped at 3) are extra read grants for
+  those via `sandbox.extra_paths` or the agent cannot exec and the run fails to start.
+- `sandbox.extra_paths` (a YAML list, capped at 3) are extra read grants for
   deny-most. Seatbelt has no arrays, so a fourth path is dropped with a warning; nest under
   a shared parent or edit the profile if you need more.
-- `COTF_SANDBOX_BROKER_ONLY_LOOPBACK=1` narrows egress from all loopback ports to just the
+- `sandbox.broker_only_loopback: true` narrows egress from all loopback ports to just the
   broker's port (read from the published `*_BASE_URL`), closing the arbitrary-local-sink
   path. If no broker base-url is present it leaves loopback open, so the agent is never
   locked out of a broker it needs.
@@ -238,14 +239,26 @@ set to put in `egress.allow` instead of guessing it up front.
 Both host lists and the brokered-command list live in one file:
 
 ```
-~/.claude-on-the-fly/sandbox.yaml
+~/.claude-on-the-fly/config.yaml
 ```
 
-It is seeded from a commented template (`settings.py`, `sandbox.yaml` inside the
-package) the first time a sandboxed daemon starts, so the first thing you open
-explains its own schema. `settings.check_operator_settings` runs at startup and
-names anything wrong with it — including a misspelled section, which YAML accepts
-happily and which would otherwise do nothing with no diagnostic anywhere.
+It is seeded from a commented template (`settings.py`, `config.yaml` inside the
+package) the first time any daemon starts, so the first thing you open explains its
+own schema. `settings.check_operator_settings` runs at startup and names anything
+wrong with it — including a misspelled section, which YAML accepts happily and
+which would otherwise do nothing with no diagnostic anywhere.
+
+**Saving it is enough.** `settings.py` re-parses on a change to the file's mtime or
+size, so an edit lands at the next read rather than the next restart — which for the
+allowlist means the next CONNECT, and for `permissions.ttl_seconds` the next grant.
+The exceptions are the fields read once at startup, where acting on the new value
+means binding a socket, rewriting the agent's PATH, or constructing a service that
+was never built: `sandbox.mode`, `commands:`, and `permissions.mode`. Those are listed in
+`settings.RESTART_REQUIRED`, and changing one gets you a message on the frontend
+naming it, on the next turn. Reporting instead of applying is deliberate — tearing
+down a credential-holding broker mid-turn trades a config annoyance for a class of
+mid-turn failure, and these fields are set once per deployment. Approval TTL and
+answer-window edits update existing sessions on their next turn.
 
 ```yaml
 egress:
@@ -384,7 +397,7 @@ That order is deliberate: deny first, shim only what is needed. For `aws`,
 `kubectl`, `terraform`, and `vault` it is deliberate and permanent — the shim runs
 the binary outside the jail with the operator's full credential and no action
 policy, and `terraform apply` or `kubectl delete` against production is not a
-trade worth making for convenience. Use `COTF_SANDBOX=env` for a run that needs
+trade worth making for convenience. Use `sandbox.mode: env` for a run that needs
 one of those.
 
 ### Why loopback and not a unix socket
@@ -395,7 +408,7 @@ A unix socket was the first choice and it does not work. Verified against real
 `(remote unix)` permits the connect, and it is not path-scoped — it opens *every*
 unix socket on the machine, including the Docker socket and the ssh-agent this
 profile otherwise protects. A loopback port can be scoped to one endpoint
-(`COTF_SANDBOX_BROKER_ONLY_LOOPBACK`); a unix socket allow cannot.
+(`sandbox.broker_only_loopback`); a unix socket allow cannot.
 
 Loopback carries no authentication, which is not a new exposure: the credential
 files the broker reads are already readable by any same-UID process on the host.
@@ -460,7 +473,7 @@ has everything in it and is not shareable**; an INFO log is.
 
 That matters because this directory is shaped for a file syncer, so anything
 written here should be assumed to leave the machine and to sit there for
-`COTF_LOG_KEEP_DAYS`. A prompt is the user's data rather than a diagnostic.
+`logs.keep_days`. A prompt is the user's data rather than a diagnostic.
 
 Argv clipping is by token *length*, not by flag name, so a new content-carrying
 flag is covered without being enumerated.
@@ -469,7 +482,7 @@ flag is covered without being enumerated.
 
 - **Wired into the chat orchestrator** (`orchestrator.run`: telegram/slack/gmail). Symphony
   and scheduler share the spawn-site env curation but do **not** auto-start the broker. Do
-  not set `COTF_SANDBOX` for them until the broker is started in their run loops too,
+  not set `sandbox.mode` for them until the broker is started in their run loops too,
   or curation removes the key with no base-url to replace it and breaks LLM auth.
 - **Auth model:** the broker only covers a backend that authenticates with an
   injectable key *header* it can be pointed at via a base-url. That is narrower
@@ -519,7 +532,7 @@ tunnel this project cannot read and must not block.
 
 This is not one gap to be patched. It is the shape of the thing, and it has at
 least two distinct channels. Both were observed live on 2026-07-30 under
-`COTF_SANDBOX=jail`:
+`sandbox.mode: jail`:
 
 **1. Server-side tool connectors (MCP).** Asked for recent open PRs, codex called
 `mcp__codex_apps__github` → `_search_prs` and got real private PRs from private org
@@ -584,3 +597,209 @@ MCP tool to reach for and falls back to `gh`. Removing the cache is not required
 Provider-side browsing has no equivalent lever in this project's control. Treat any
 task whose confidentiality depends on the agent *not* being able to fetch a URL as
 out of scope for this sandbox.
+
+## Tool permissions
+
+Off by default (`permissions.mode: off` in `~/.claude-on-the-fly/config.yaml`).
+With it off, argv is byte-identical to a build without this feature, `--permission-mode
+bypassPermissions` included. Switching it to `ask` routes permission questions to
+whichever frontend owns the session, with approve/deny buttons.
+
+**What you are asked is not the same on every backend.** This is the central thing to
+know, and it is not a design preference: it is what each CLI actually exposes.
+
+| Backend | Mechanism | Whose question | cotf classifies? |
+|---|---|---|---|
+| claude native | `--permission-prompt-tool` via a stdio MCP shim | claude's own | no |
+| claude pty | `Notification` hook, answered as a keystroke | claude's own | no |
+| codex | `PreToolUse` hook injected with `-c` | **cotf's** | yes |
+
+For claude, the CLI decides what deserves a human and cotf forwards it. Measured on
+2.1.220: it asked about `chmod`, `find -delete`, `sudo`, `curl` and `git init`, and did
+not ask about `ls`, `cat`, `echo`, `git status` or `Read`.
+
+For codex there is nothing forwardable, which is not the same as codex having no
+approval system. It has one; under `codex exec` none of it reaches a human.
+
+- `codex exec` overrides `approval_policy` to `never` whatever you pass. Measured:
+  request `untrusted`, codex reports `never`.
+- Set `approvals_reviewer` and approvals do fire, and the `PermissionRequest` hook
+  arrives carrying codex's own wording, e.g. *"Allow curl network access to check the
+  HTTP status code from example.com?"*.
+- But the reviewer is a model. `approvals_reviewer` accepts `user`, `auto_review` and
+  `guardian_subagent`; `user` is inert under exec (no event at all, the sandbox simply
+  denies), and the other two each spawn a guardian subagent that answers
+  `{"outcome":"allow"}`.
+- And that hook cannot be answered. `block`, `denied` and `approved` were all ignored
+  and the command ran. It also fires 25ms *after* `PreToolUse`, the only hook that can
+  block:
+
+  ```
+  13:29:00.026  PreToolUse         can block, does not yet know approval is wanted
+  13:29:00.051  PermissionRequest  knows, cannot block
+  ```
+
+So the gate has to sit where codex has not yet formed an opinion, and cotf decides what
+is worth interrupting you for, in `permissions.worth_asking`. That ordering is the whole
+reason the two backends differ; it is not a preference. The approval card says which:
+`claude asked:` versus `cotf asked:`.
+
+**That classifier is a convenience filter, not a boundary.** It exists so a turn of
+`ls` and `git status` does not cost twenty taps. It is defeated by anything that makes
+the first word stop predicting what runs, which is why compound commands are refused
+outright rather than parsed. The boundary is unchanged and elsewhere: the seatbelt
+profile, the CONNECT proxy, and the credential broker.
+
+### pty is gated through its own dialog
+
+Interactive claude accepts `--permission-prompt-tool`, resolves it, starts the server
+and answers `tools/list` on it, and then never calls it: it draws its own terminal
+dialog instead. So pty gets the permission mode but not the prompt tool, and the dialog
+is relayed instead.
+
+1. cotf sets `CLAUDE_PTY_TMUX_SESSION` to a name it chooses, because claude-pty's own
+   default is PID-based and unpredictable from outside. That is how the daemon knows
+   which pane it may type into.
+2. A `Notification` hook with matcher `permission_prompt`, installed via `--settings`,
+   posts to the daemon and returns. It cannot decide anything: claude is blocked on the
+   dialog, not on the hook.
+3. The daemon captures the pane, parses the dialog, asks the operator, and types the
+   answer back.
+
+**The dialog is the only source of what is being asked.** The obvious alternative does
+not exist: at the moment the dialog is up, claude's transcript contains no `tool_use`
+record at all (measured at 12 lines, none of them a tool call, while finished
+transcripts in the same directory hold two). The assistant message is written after the
+permission resolves.
+
+That has two consequences.
+
+**Grant scope is the exact dialog**, keyed as `pty:<tool>:<sha256(body)[:12]>`. A
+terminal hard-wraps, and one real capture broke a file path across two lines, so the
+body cannot be trusted as an identity and program-level scoping like `bash:git` is not
+available here. Hashing the whole prompt means a grant matches only an identical one:
+less reuse than the other backends, and no way to over-widen. The operator reads the
+full text; only the digest reaches the grant log.
+
+**The option digits are read, never assumed.** Two real dialogs put No at 3 only because
+both offered a widen-scope option in the middle; one without it puts No at 2. A "Yes"
+whose label carries an "and also" clause is rejected outright, so
+`2. Yes, and don't ask again for: chmod a+w *` can never be typed. If the option list
+cannot be resolved unambiguously, cotf types nothing at all and says so, because a
+guessed digit could approve something the operator never saw.
+
+**A refusal costs an extra model turn.** Pressing the refuse option ends the turn with no
+final assistant message, so claude's Stop hook never fires, no envelope is written, and
+claude-pty waits until it gives up (measured: `PTY_EXIT=1` after the full timeout).
+cotf therefore sends the keystroke *and* injects a short fixed message, which lets the
+turn end normally and is also the only way the reason reaches the model. The wording is
+fixed rather than operator-supplied, since that text is injected into a live session.
+
+### claude_mode is the volume knob
+
+`claude_mode` is the `--permission-mode` handed to claude under `ask`. `default` ships.
+
+`auto` is accepted and **is not a safety net.** It hands the decision to a model rather
+than to you. Measured on sonnet 5 against a deliberately nasty set, it approved all six
+without asking once, at 2.6 to 3.1 seconds and one model call each: `sudo -n whoami`, a
+write into `/etc`, `chmod -R 777`, `find -delete`, `ls ~/.ssh`, and `curl`. Pick it for
+fewer interruptions, not for protection. It is also unavailable on some models
+(haiku 4.5 prints `auto mode unavailable for this model`) and silently falls back.
+
+`bypassPermissions` and `dontAsk` are **refused** with an error naming both settings.
+Both were measured at zero prompts, so pairing either with `ask` would give a daemon
+that reports approvals as on and gates nothing.
+
+### Why codex needs a trust bypass, and what makes it safe
+
+`permissions.codex_argv` passes `--dangerously-bypass-hook-trust`. It has to: codex
+persists no trust entry for a hook supplied via `-c`, and without the bypass the hook is
+**silently skipped and the command runs anyway**. Nine candidate trust-key spellings
+were tried, `trusted_hash` is not derivable from the command string, and a run with the
+bypass writes no trust entry to fall back on.
+
+That flag is only safe because `~/.codex` is deny-default for writes. The directory
+has to stay partly writable or codex will not start, so both profiles deny it wholesale
+and re-grant only what a real `codex exec` turn was measured writing: `sessions/`,
+`tmp/`, `cache/`, `log/`, `shell_snapshots/`, `plugins/cache/`, `models_cache.json`,
+`version.json`, `installation_id`, the sqlite family with their `-wal`/`-shm` siblings,
+and `auth.json`.
+
+`auth.json` is granted deliberately. Denying the write protects nothing, since reading
+it is already permitted by design, and it would break ChatGPT token refresh the first
+time one expired.
+
+This started as the opposite shape, a blanket grant with three files denied, and that
+list was already incomplete: `plugins/`, `history.jsonl` and `AGENTS.md` stayed
+writable. `AGENTS.md` is the sharp one, being standing instructions codex reads on
+every later run, so an injected agent could leave itself orders that outlive the
+session. Enumerating the dangerous files loses that race every time codex adds one.
+
+Two granted paths remain execution-adjacent and cannot be closed, which is a known
+limit rather than an oversight:
+
+- `shell_snapshots/` holds a shell script codex writes and then sources.
+- `plugins/cache/` holds plugin payloads. Scoped to `cache/` and the staging directory,
+  so a manifest at the `plugins/` root stays denied.
+
+### The ungated-turn guard
+
+A startup self-test would cost a model call every boot and only prove the hook worked
+then. Instead every turn compares its own tool count against how many decisions the
+service was asked for. Tools used and nothing asked means the turn ran unsupervised, and
+that is logged at ERROR. This is the only place those two facts meet, and codex's
+failure mode is silent by construction: an untrusted or crashed hook is treated as no
+opinion, so the operator sees an ordinary turn.
+
+### Scope of a grant
+
+Subjects are derived by the daemon from the payload the backend handed it, never from
+anything the agent wrote about its own call.
+
+- `bash:<program>` for a simple command, so approving `git` covers a turn of git work.
+- `bash-exact:<command>` for anything containing shell control characters or that fails
+  to lex. `ls && curl evil.example` must never be covered by a grant given to `ls`.
+- `write:<relative path>` inside the workspace, `write-outside:<absolute path>` for an
+  escape. Per path, not one shared bucket: approving a write to `~/.zshrc` must not
+  authorise the next one to `~/.ssh/config`.
+- `fetch:<host>`, and `tool:<Name>` for everything else.
+
+Operator-facing text is flattened to one line and length-capped with the cap announced.
+Tool input is entirely agent-authored, so without flattening an agent could draw a fake
+verdict line under the real one, and a silent truncation is how you approve the half of
+a command you were not shown.
+
+### What is deliberately not done
+
+- **Cron and the background job queue are never gated.** Nobody is watching a cron
+  thread, so gating it would fail every tool call.
+- **`approvals_reviewer` is not enabled in production.** It spawns a guardian subagent
+  per escalation, fed the agent history, returning `{"outcome":"allow"}`. Real spend for
+  a decision you never see and cannot override.
+- **No codex `app-server` port.** `PermissionRequest` lives there and is the better
+  mechanism, but moving off `codex exec` is a separate project.
+
+### Also worth knowing
+
+Seeding never overwrites, so an existing `~/.claude-on-the-fly/config.yaml` will not
+grow a `permissions:` block on upgrade. Defaults apply and approvals stay off until you
+add one.
+
+`codex` does not start at all under `sandbox.fs: deny-most`; it fails with
+`Operation not permitted` before any network call. That is pre-existing and unrelated to
+approvals, verified against a baseline with the permission changes stashed.
+
+pty approvals need claude-pty's **tmux** backend, not its `script` one, because the
+script backend has no addressable pane. claude-pty picks tmux only when tmux is on PATH
+and `CLAUDE_PTY_NO_TMUX` is not `1`.
+
+cotf handles both halves. It sets `CLAUDE_PTY_NO_TMUX=0` in the spawn environment, so an
+operator who exports that variable for their own use does not silently lose approvals,
+and `check_pty_tmux_for_approvals` refuses at startup when tmux is missing, which cotf
+cannot fix for you. If a pane is missing anyway, the relay says so explicitly rather
+than stalling in silence, and distinguishes "the session does not exist, so claude-pty
+took the script backend" from "the session is live but the prompt did not render as
+expected", since those need different fixes.
+
+The check reports ok when approvals are off. The script backend is perfectly fine when
+nothing is being gated.

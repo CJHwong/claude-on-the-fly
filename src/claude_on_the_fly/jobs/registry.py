@@ -8,11 +8,10 @@ so they always agree on which queue they are talking to. Mirrors the
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, settings
 from claude_on_the_fly.jobs.core import JobQueue
 from claude_on_the_fly.jobs.file_queue import FileInboxQueue
 
@@ -35,7 +34,7 @@ def make_queue(root: Path | None = None) -> JobQueue:
     Raises `ValueError` on an unknown kind. `root` overrides the default
     `<DATA_DIR>/jobs` location (used by tests and the enqueue CLI).
     """
-    kind = os.environ.get("JOBS_QUEUE_KIND", "file").lower()
+    kind = settings.get("JOBS_QUEUE_KIND", "file").lower()
     factory = SUPPORTED_QUEUES.get(kind)
     if factory is None:
         raise ValueError(
