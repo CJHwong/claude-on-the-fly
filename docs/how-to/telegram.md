@@ -41,4 +41,4 @@ Send a message to your bot. That's it.
 - Photos/images - saved to workspace, Claude can view them
 - Multiple photos - batched into a single prompt
 
-See [Settings](../reference/settings.md#telegram) for the full Telegram config.
+See the [`telegram` reference](../reference/config-yaml.md#telegram) for every field.

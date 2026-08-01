@@ -1,6 +1,8 @@
 # claude-on-the-fly
 
-> **Experimental.** This is a personal project, not production software. It spawns Claude Code with `--permission-mode bypassPermissions`, meaning Claude has full read/write access to files on the host machine within its workspace. Use at your own risk. Do not run this on a machine with sensitive data you wouldn't want an LLM to access.
+> **Experimental.** The default configuration is intentionally backward-compatible:
+> the agent inherits the daemon environment and tool calls are not gated. Enable the
+> sandbox and operator approvals before using it on a machine with sensitive data.
 
 Remote access to Claude Code via Slack and Telegram. Send a message, get Claude working on it, see the response with cost/latency/token stats.
 
@@ -52,6 +54,9 @@ uv run claude-slack  # or claude-telegram, claude-cron, claude-jobs
 
 ## Documentation
 
-- [How-to guides](docs/how-to/) — setup for each channel: [Slack](docs/how-to/slack.md), [Telegram](docs/how-to/telegram.md), [Cron](docs/how-to/cron.md)
-- [Reference](docs/reference/) — [Settings](docs/reference/settings.md), [Persona (CLAUDE.md)](docs/reference/persona.md), [Response footer](docs/reference/footer.md)
-- `CLAUDE.md` — agent-only notes (backend quirks, architecture, subsystem internals)
+- [Documentation map](docs/index.md)
+- New deployment: [build a safe Slack installation](docs/tutorials/first-safe-deployment.md)
+- Common tasks: [how-to guides](docs/how-to/)
+- Exact schemas and defaults: [reference](docs/reference/)
+- Security and design concepts: [explanation](docs/explanation/)
+- `CLAUDE.md` and `docs/agent/` are maintainer notes.

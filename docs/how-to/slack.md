@@ -101,4 +101,4 @@ next one without a restart.
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
 
-See [Settings](../reference/settings.md#slack) for the full Slack config.
+See the [`slack` reference](../reference/config-yaml.md#slack) for every field.

@@ -51,7 +51,8 @@ egress:
   #
   # A host here is reached without a prompt for the whole session, and the proxy
   # does not inspect what crosses it (no TLS interception -- see
-  # docs/agent/broker.md), so each entry is a covert channel you are accepting.
+  # docs/explanation/security-model.md), so each entry is a covert channel you
+  # are accepting.
   allow:
     # claude backend, API-key auth. The credential broker covers this when a key
     # is provisioned; listed for the OAuth case, where it cannot.
@@ -81,7 +82,7 @@ commands:
   #
   # A shimmed tool runs OUTSIDE the sandbox with your real credential and only its
   # output crosses back, so adding an entry grants a capability. Read the trade in
-  # docs/agent/broker.md first.
+  # docs/how-to/broker-a-command.md first.
   #
   # A tool NOT listed here is not shimmed, which means the agent runs the real
   # binary inside the jail, where the seatbelt denies its credential store. It
@@ -131,7 +132,7 @@ commands:
       env_passthrough: [ACLI_SITE, NO_COLOR]
 
 permissions:
-  # Whether a tool call the agent wants to make can reach you for approval.
+  # Whether a tool call can reach you for approval. Changing mode needs a restart.
   #
   #   off  (default)  Nothing is gated. Byte-identical to the behaviour before
   #                   this feature existed, including --permission-mode
@@ -200,10 +201,12 @@ permissions:
 # you want to pin.
 #
 # The reasoning behind each one -- what it trades, what it has been measured doing --
-# is in docs/reference/settings.md rather than repeated here.
+# is in docs/reference/config-yaml.md rather than repeated here.
 
 sandbox:
   # Whether the agent process ever holds a real credential.
+  # Changing mode needs a chat-daemon restart; the other sandbox keys apply on
+  # the next turn.
   #   off (default) inherit the full environment
   #   env           drop every *_API_KEY / *_TOKEN, route models via the broker
   #   jail          as env, plus a seatbelt denying egress and keychain reads (macOS)
@@ -243,6 +246,7 @@ agent:
   # pricing_ttl_seconds: 21600
 
   # claude-pty, used by claude's pty mode.
+  # These controls act during startup preflight.
   # pty:
   #   auto_install: false
   #   auto_refresh: true
@@ -266,6 +270,7 @@ slack:
   # slash_command: /cotf
 
   # Background-job trigger. Absent means $job; set it empty ("") to turn jobs off.
+  # Trigger and queue are constructed at Slack startup, so changing it needs a restart.
   # job_command: "$job"
 
   # Threads retained before LRU eviction, and replies per thread before inbound
@@ -283,6 +288,7 @@ jobs:
   # worker is a separate process started with the old value.
   # queue_kind: file
 
+  # Worker construction settings. All three need a claude-jobs restart.
   # concurrency is how many agent CLIs this machine hosts, separate from a cron
   # entry's own max_concurrent. timeout of 0 or less means no limit.
   # concurrency: 1
@@ -296,9 +302,11 @@ jobs:
 logs:
   # Retention in days for ~/.claude-on-the-fly/logs; 0 disables pruning. Assume
   # anything written there leaves the machine and sits for this long.
+  # Applied the next time pruning runs, normally daemon startup.
   # keep_days: 7
 
   # Machine name in <role>-<host>-<date>.log. Defaults to the short hostname.
+  # Applied at logger startup and again at daily rollover.
   # host_tag: laptop
 
   # LOG_LEVEL stays an environment variable: logging is configured before this file
