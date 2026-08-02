@@ -23,6 +23,7 @@ _STATE_STYLES = {
     "disabled": "dim",
 }
 _STATE_GLYPH = {"running": "●", "stopped": "○", "broken": "⚠", "disabled": "⊘"}
+MAX_TAIL_BYTES = 2 * 1024 * 1024
 
 
 def fmt_age(seconds: float | None) -> str:
@@ -77,15 +78,11 @@ def tail_lines(path: Path, n: int) -> list[str]:
             size = f.tell()
             if size == 0:
                 return []
-            data = b""
-            cursor = size
-            chunk = 8192
-            while cursor > 0 and data.count(b"\n") <= n:
-                read = min(chunk, cursor)
-                cursor -= read
-                f.seek(cursor)
-                data = f.read(read) + data
-                chunk *= 2  # Exponential growth caps long-line worst cases.
+            # A single unbroken line must not make a TUI refresh allocate the
+            # entire session log. The visible tail is bounded by bytes as well
+            # as by line count.
+            f.seek(max(0, size - MAX_TAIL_BYTES))
+            data = f.read(MAX_TAIL_BYTES)
         text = data.decode("utf-8", errors="replace")
         lines = text.split("\n")
         # Drop trailing empty entry from the final newline if present.
@@ -122,8 +119,10 @@ def read_new_lines(path: Path, offset: int | None) -> tuple[list[str], int]:
                 offset = start
             if offset == size:
                 return [], size
+            if size - offset > MAX_TAIL_BYTES:
+                offset = size - MAX_TAIL_BYTES
             f.seek(offset)
-            data = f.read(size - offset)
+            data = f.read(min(size - offset, MAX_TAIL_BYTES))
     except OSError:
         return [], offset or 0
     last_newline = data.rfind(b"\n")

@@ -663,9 +663,8 @@ class TestSpawnWaitsForAHeartbeat:
         monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
         monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
         killed: list[tuple[int, int]] = []
-        monkeypatch.setattr(supervisor.os, "getpgid", lambda pid: pid)
         monkeypatch.setattr(
-            supervisor.os, "killpg", lambda pgid, sig: killed.append((pgid, sig))
+            supervisor.os, "kill", lambda pid, sig: killed.append((pid, sig))
         )
 
         with pytest.raises(supervisor.SpawnTimeout) as caught:
