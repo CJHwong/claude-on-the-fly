@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shlex
 from pathlib import Path
 from typing import Literal
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
@@ -263,7 +265,12 @@ class HistoryScreen(OverlayScreen):
             )
             return
         try:
-            self.app.copy_to_clipboard(f"cd {workspace} && {cmd}")
+            # Backend values ultimately include data read from a session store.
+            # Re-tokenize and re-quote both pieces before placing them in a
+            # shell command copied to the clipboard.
+            safe_cmd = shlex.join(shlex.split(cmd))
+            takeover = f"cd -- {shlex.quote(str(workspace))} && {safe_cmd}"
+            self.app.copy_to_clipboard(takeover)
         except Exception as exc:
             self._notify(f"clipboard write failed: {exc}", "error")
             return
@@ -402,7 +409,7 @@ class HistoryScreen(OverlayScreen):
             table.add_row(
                 _format_local_time(e.get("ts")),
                 badge,
-                ident,
+                Text(ident),
                 str(e.get("type", "?")),
                 _format_runtime(runtime),
                 _format_detail(e),
@@ -428,7 +435,7 @@ class HistoryScreen(OverlayScreen):
             table.add_row(
                 _format_local_time(e.get("ts")),
                 badge,
-                ident,
+                Text(ident),
                 str(e.get("type", "?")),
                 str(row["runs"]),
                 _format_runtime(row["runtime"]),
@@ -479,7 +486,13 @@ class HistoryScreen(OverlayScreen):
         self._watch_path = path
         self._watch_mtime = mtime
         _, _, ident = self._watch_target.rpartition(":")
-        header.update(f"[bold]watch: {ident}[/bold] [dim]{path.name}[/dim]")
+        header.update(
+            Text.assemble(
+                ("watch: ", "bold"),
+                (ident, "bold"),
+                (f" {path.name}", "dim"),
+            )
+        )
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
         render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
@@ -508,7 +521,6 @@ class HistoryScreen(OverlayScreen):
     def _notify(
         self, msg: str, severity: Literal["information", "warning", "error"]
     ) -> None:
-        # Same signature as the dashboard's `_notify`: Textual's own severity
-        # literal, so the call typechecks instead of needing a suppression.
+        # Disable markup so remote/user-controlled notification text stays literal.
         with contextlib.suppress(Exception):
-            self.app.notify(msg, severity=severity)
+            self.app.notify(msg, severity=severity, markup=False)
