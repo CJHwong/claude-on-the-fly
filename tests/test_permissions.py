@@ -187,20 +187,26 @@ WS = Path("/tmp/ws")
 
 
 @pytest.mark.parametrize(
-    ("command", "expected"),
+    "command",
     [
-        ("ls -la", "bash:ls"),
-        ("/usr/bin/env python -V", "bash:env"),
-        ("git status --short", "bash:git status"),
-        ("git push --force", "bash:git push"),
-        ("git", "bash:git"),
+        "ls -la",
+        "/usr/bin/env python -V",
+        "git status --short",
+        "git push --force",
+        "git",
     ],
 )
-def test_a_simple_command_is_scoped_to_its_program(command, expected):
-    """Approving `git` once should cover a turn of git work; that is the whole tap
-    saving. The program name is taken basename-first so an absolute path cannot
-    open a second subject for the same binary."""
-    assert permissions.subject_for(_call("Bash", command=command), WS) == expected
+def test_a_simple_command_is_scoped_to_its_exact_argv(command):
+    """The grant key is a digest of the complete canonical argv."""
+    subject = permissions.subject_for(_call("Bash", command=command), WS)
+    assert subject.startswith("bash-exact:")
+    assert len(subject) == len("bash-exact:") + 64
+
+
+def test_different_simple_commands_have_different_grant_keys():
+    first = permissions.subject_for(_call("Bash", command="git status"), WS)
+    second = permissions.subject_for(_call("Bash", command="git push"), WS)
+    assert first != second
 
 
 @pytest.mark.parametrize(
@@ -313,17 +319,22 @@ def test_who_raised_the_question_is_on_the_card():
     ],
 )
 def test_the_scope_carries_arguments_the_grant_key_does_not(call, expected):
-    """A subject is scoped to the program so one approval covers a turn of work,
-    which is why it reads `bash:chmod`. That makes it a useless record of what was
-    approved, so the scope spells the call out."""
+    """The human-readable scope spells out the complete call separately from the
+    machine-oriented grant key."""
     assert permissions.scope_for(call) == expected
 
 
 def test_the_grant_key_stays_program_scoped():
-    """The point of the split: widening the record must not widen the grant."""
+    """The grant key is exact, while the display scope remains readable."""
     call = permissions.ToolCall("Bash", {"command": "chmod 700 /ws"})
-    assert permissions.subject_for(call, WS) == "bash:chmod"
+    assert permissions.subject_for(call, WS).startswith("bash-exact:")
     assert permissions.scope_for(call) == "bash:chmod 700 /ws"
+
+
+def test_git_branch_is_not_treated_as_read_only():
+    assert permissions.worth_asking(
+        permissions.ToolCall("Bash", {"command": "git branch"})
+    )
 
 
 def test_an_unheaded_dialog_still_gets_a_headline():
@@ -367,12 +378,10 @@ def test_request_carries_the_tool_kind_and_the_configured_ttl():
     request = permissions.request_for(
         _call("Bash", command="ls"), WS, asked_by="cotf", ttl_seconds=99
     )
-    assert (request.kind, request.subject, request.ttl_seconds) == (
-        "tool",
-        "bash:ls",
-        99,
-    )
-    assert request.key == "tool:bash:ls"
+    assert request.kind == "tool"
+    assert request.subject.startswith("bash-exact:")
+    assert request.ttl_seconds == 99
+    assert request.key == f"tool:{request.subject}"
 
 
 # --- worth_asking, which is codex-only ---
@@ -487,7 +496,8 @@ async def test_the_same_read_from_claude_is_forwarded_not_filtered():
         _call("Bash", command="git status"), permissions.SOURCE_CLAUDE
     )
     assert allowed
-    assert [request.subject for request in gate.seen] == ["bash:git status"]
+    assert len(gate.seen) == 1
+    assert gate.seen[0].subject.startswith("bash-exact:")
 
 
 async def test_a_denial_tells_the_agent_what_to_do_next():
