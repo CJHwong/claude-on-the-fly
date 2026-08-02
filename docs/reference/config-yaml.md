@@ -12,6 +12,12 @@ Lifecycle terms are defined in [Configuration files and lifecycle](settings.md).
 | `extra_paths` | list / empty | Up to three read grants for `deny-most` | Next turn |
 | `broker_only_loopback` | boolean / false | Limit jail loopback to published broker/proxy ports | Next turn |
 
+In `jail` mode, the agent may read the global Claude configuration needed to start but
+cannot persist turn-created global `~/.claude` settings, hooks, or plugins. The
+workspace-created `CLAUDE.md`/`AGENTS.md` persona symlinks remain intentional and are
+still loaded by the backend CLIs; this read-side policy is about untrusted handoff and
+configuration writes, not those persona links.
+
 ## `agent`
 
 | Key | Type / default | Values and effect | Lifecycle |
@@ -36,11 +42,14 @@ Claude routed through Ollama; manual `$compact` remains available.
 | Key | Type / default | Effect | Lifecycle |
 |---|---|---|---|
 | `allow` | list of hostnames / packaged list | Tunnel without asking | Immediate, next CONNECT |
+| `private_allow` | list of hostnames / empty | Permit explicitly listed names to resolve to private or loopback addresses | Immediate, next CONNECT |
 | `never_ask` | list of hostnames / packaged list | Refuse without offering approval | Immediate, next CONNECT |
 
 Operator lists are unioned with packaged lists. They cannot subtract packaged model
 hosts or metadata denials. A malformed operator list falls back to packaged entries.
-An allowed host is a covert channel: TLS payloads are not inspected.
+`allow` alone never bypasses public-address validation; use `private_allow` only for a
+known local service. Every hostname is resolved and pinned before tunnelling. An allowed
+host is a covert channel: TLS payloads are not inspected.
 
 ## `commands`
 
@@ -51,11 +60,14 @@ An allowed host is a covert channel: TLS payloads are not inspected.
 | `name` | non-empty string / required | Executable shimmed onto the agent PATH |
 | `readback` | list of command prefixes / empty | Commands refused because they reveal or change credentials |
 | `readback_flags` | list of strings / empty | Flags that make any command reveal a credential |
+| `allow` | list of leading subcommand prefixes / empty | Positive command allowlist; empty or absent denies every invocation |
 | `env_passthrough` | list of names / empty | Additional daemon variables forwarded to the real CLI |
 
 The whole section requires a chat-daemon restart. Removing a packaged refusal is
-allowed but logged as a warning. The broker does not try to authorize arbitrary CLI
-semantics; scope the credential itself.
+allowed but logged as a warning. Arguments and flags after an allowed prefix are passed
+through, so the broker is not a full CLI-semantics parser; scope the credential itself.
+Operator overrides replace packaged entries by name. They do not inherit the packaged
+`allow` list, so an override that omits it disables that tool.
 
 ## `permissions`
 
