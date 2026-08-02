@@ -276,15 +276,24 @@ def check_claude_cli() -> None:
 
 async def check_telegram(token: str) -> None:
     """Verify Telegram bot token is valid."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"https://api.telegram.org/bot{token}/getMe")
-        data = resp.json()
-        if not data.get("ok"):
-            raise _exit(
-                f"Invalid Telegram bot token: {data.get('description', 'unknown error')}"
-            )
-        bot_name = data["result"]["username"]
-        logger.info("Telegram bot: @%s", bot_name)
+    # HTTPX logs completed request URLs at INFO, and Telegram puts the bot
+    # credential in that URL. Suppress that logger only for this startup probe;
+    # restore the caller's level immediately afterward.
+    httpx_logger = logging.getLogger("httpx")
+    previous_level = httpx_logger.level
+    httpx_logger.setLevel(max(previous_level, logging.WARNING))
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"https://api.telegram.org/bot{token}/getMe")
+            data = resp.json()
+            if not data.get("ok"):
+                raise _exit(
+                    f"Invalid Telegram bot token: {data.get('description', 'unknown error')}"
+                )
+            bot_name = data["result"]["username"]
+            logger.info("Telegram bot: @%s", bot_name)
+    finally:
+        httpx_logger.setLevel(previous_level)
 
 
 async def check_slack(app_token: str, token: str) -> str:

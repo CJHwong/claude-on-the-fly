@@ -86,12 +86,21 @@ def edit_and_diff(
 ) -> EnvDiff:
     """Open $EDITOR on env_file. Returns the diff after the editor exits.
 
-    If env_file does not exist and create_if_missing is True, touch it first
+    If env_file does not exist and create_if_missing is True, create it first
     so the editor opens a writable empty buffer.
     """
     if create_if_missing and not env_file.exists():
         env_file.parent.mkdir(parents=True, exist_ok=True)
-        env_file.touch()
+        try:
+            fd = os.open(
+                env_file,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
 
     before = dict(dotenv_values(env_file))
     cmd = [*_resolve_editor(), str(env_file)]

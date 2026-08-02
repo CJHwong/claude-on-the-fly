@@ -437,7 +437,7 @@ class TestIngestEvent:
         session_id, text = frontend._on_message.call_args[0]
         assert isinstance(session_id, int)
         assert "ping" in text
-        assert "[from: testuser]" in text
+        assert '[from-id: U_ALLOWED] [display: "testuser"]' in text
 
     async def test_group_channel_type_requires_mention(self, frontend):
         event = {
@@ -1075,7 +1075,7 @@ class TestDownloadFile:
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.content_type = content_type
-        mock_resp.read = AsyncMock(return_value=content)
+        mock_resp.content.read = AsyncMock(return_value=content)
 
         mock_get_ctx = MagicMock()
         mock_get_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
@@ -1134,6 +1134,24 @@ class TestDownloadFile:
             await SlackFrontend._download_file(
                 "https://example.com/f", dest, "xoxp-tok"
             )
+
+    async def test_replaces_symlink_without_writing_through_it(self, tmp_path):
+        target = tmp_path / "outside.txt"
+        target.write_text("original")
+        dest = tmp_path / "uploaded.txt"
+        dest.symlink_to(target)
+        mock_ctx, _ = self._mock_aiohttp(b"new bytes")
+
+        with patch(
+            "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+        ):
+            await SlackFrontend._download_file(
+                "https://example.com/f", dest, "xoxp-tok"
+            )
+
+        assert target.read_text() == "original"
+        assert dest.read_bytes() == b"new bytes"
+        assert not dest.is_symlink()
 
 
 class TestIngestEventWithFiles:
@@ -1924,11 +1942,12 @@ class TestBotConversationGate:
         )
         assert await bot_frontend._is_bot_conversation("DX") is False
 
-    async def test_ambiguous_error_fails_open(self, bot_frontend):
+    async def test_ambiguous_error_fails_closed(self, bot_frontend):
         bot_frontend._app.client.conversations_info = AsyncMock(
             side_effect=SlackApiError("x", {"ok": False, "error": "ratelimited"})
         )
-        assert await bot_frontend._is_bot_conversation("DY") is True
+        assert await bot_frontend._is_bot_conversation("DY") is False
+        assert "DY" not in bot_frontend._own_dm
 
     async def test_ingest_skips_foreign_dm(self, bot_frontend):
         bot_frontend._app.client.conversations_info = AsyncMock(
@@ -3268,18 +3287,18 @@ class TestChannelType:
 
 class TestIsBotConversation:
     async def test_a_cached_answer_is_not_refetched(self, frontend):
-        frontend._own_dm["D1"] = False
+        frontend._own_dm["D1"] = (False, time.monotonic() + 60)
         assert await frontend._is_bot_conversation("D1") is False
         frontend._app.client.conversations_info.assert_not_awaited()
 
-    async def test_an_unexpected_error_fails_open(self, frontend, caplog):
-        """Only a definitive not-a-member error is False, so a transport hiccup can
-        never drop the bot's own DMs."""
+    async def test_an_unexpected_error_fails_closed(self, frontend, caplog):
+        """A membership lookup failure must not authorize an unknown DM."""
         frontend._app.client.conversations_info = AsyncMock(
             side_effect=RuntimeError("socket reset")
         )
         with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
-            assert await frontend._is_bot_conversation("D1") is True
+            assert await frontend._is_bot_conversation("D1") is False
+        assert "D1" not in frontend._own_dm
         assert "is_bot_conversation" in "\n".join(
             r.getMessage() for r in caplog.records
         )

@@ -36,8 +36,10 @@ from claude_on_the_fly.agent import (
     ensure_persona,
     get_backend,
     parse_stream,
+    read_attachment,
     run,
     stats_mode,
+    write_attachment,
 )
 from claude_on_the_fly.backends.claude import ClaudeBackend
 from claude_on_the_fly.transcript import Turn
@@ -375,6 +377,30 @@ class TestCollectOutbox:
             (outbox / f"f{i:02d}.txt").write_text("x")
         result = collect_outbox(tmp_path)
         assert len(result) == MAX_ATTACHMENTS
+
+    def test_rejects_symlinks_at_collection_and_read(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_text("not an attachment")
+        link = outbox / "report.txt"
+        link.symlink_to(target)
+
+        assert collect_outbox(tmp_path) == []
+        with pytest.raises(OSError):
+            read_attachment(link)
+
+    def test_download_replaces_a_symlink_not_its_target(self, tmp_path: Path):
+        target = tmp_path / "outside.txt"
+        target.write_text("original")
+        destination = tmp_path / "workspace.txt"
+        destination.symlink_to(target)
+
+        write_attachment(destination, b"new attachment")
+
+        assert target.read_text() == "original"
+        assert destination.read_bytes() == b"new attachment"
+        assert not destination.is_symlink()
 
 
 class TestArchiveOutbox:
@@ -2659,14 +2685,14 @@ class TestProcessListeners:
         assert result["result"] == "hi"
 
     async def test_already_exited_process_is_still_announced_finished(self):
-        """_kill_process_tree returns early for a process that ended on its own;
-        a listener that never heard would keep treating it as live."""
+        """A naturally exited process is still announced as finished."""
         from claude_on_the_fly.agent import _kill_process_tree, add_process_listener
 
         seen: list[tuple[int, str, bool]] = []
         proc = MagicMock()
         proc.pid = 777
         proc.returncode = 0  # already exited
+        proc.wait = AsyncMock(return_value=0)
 
         add_process_listener(lambda *args: seen.append(args))
         try:
@@ -2908,17 +2934,16 @@ async def test_a_process_group_that_is_already_gone_is_not_an_error(monkeypatch)
 
 
 async def test_a_pgid_lookup_that_fails_falls_back_to_a_plain_kill(monkeypatch):
-    """getpgid can fail if the child is mid-exit; killing the pid alone is worse
-    than the group but better than leaving it running."""
+    """A failed process-group kill falls back to the direct child."""
     proc = MagicMock()
     proc.pid = 4242
     proc.returncode = None
     proc.wait = AsyncMock(return_value=0)
 
-    def no_such_group(_pid):
+    def no_such_group(_pid, _signal):
         raise OSError("no such process")
 
-    monkeypatch.setattr(agent_mod.os, "getpgid", no_such_group)
+    monkeypatch.setattr(agent_mod.os, "killpg", no_such_group)
     await agent_mod._kill_process_tree(proc)
     proc.kill.assert_called_once()
 
