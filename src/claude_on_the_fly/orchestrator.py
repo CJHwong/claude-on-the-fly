@@ -39,6 +39,7 @@ from claude_on_the_fly.events import (
     EventLog,
 )
 from claude_on_the_fly.heartbeat import HeartbeatWriter
+from claude_on_the_fly.jobs.orphans import ProcessLedger
 from claude_on_the_fly.protocol import Frontend
 
 logger = logging.getLogger(__name__)
@@ -261,12 +262,16 @@ class Orchestrator:
         event_log: EventLog | None = None,
         egress_manager: SessionEgress | None = None,
         permissions_manager: SessionPermissions | None = None,
+        command_broker: commands.CommandBroker | None = None,
     ) -> None:
         # None when sandboxing is off: no proxy, no per-session env, and the
         # spawn sites behave exactly as they did before any of this existed.
         self._egress = egress_manager
         # None when approvals are off, which keeps the spawn env untouched.
         self._permissions = permissions_manager
+        # Daemon-wide service, but each turn receives a token bound to its own
+        # workspace before the backend process is spawned.
+        self._commands = command_broker
         self._frontend = frontend
         self._platform = platform
         self._running: dict[int, asyncio.Task] = {}
@@ -514,6 +519,7 @@ class Orchestrator:
         # any partially-applied frontend status/reaction.
         typing_task: asyncio.Task | None = None
         env_token = None
+        command_token: str | None = None
         try:
             # Point this turn's agent at its own egress proxy. Set here rather
             # than passed down because the spawn is several frames below, inside
@@ -531,6 +537,10 @@ class Orchestrator:
                 session_overrides.update(
                     await self._permissions.env_for(chat_id, session, workspace)
                 )
+            if self._commands is not None:
+                command_env = self._commands.agent_env(workspace)
+                command_token = command_env[commands.TOKEN_ENV]
+                session_overrides.update(command_env)
             if session_overrides:
                 env_token = sandbox.session_env(session_overrides)
             await self._frontend.notify_start(chat_id)
@@ -540,12 +550,17 @@ class Orchestrator:
                     chat_id, workspace, session, self._frontend.timeout_for(chat_id)
                 )
             else:
+                identity = getattr(self._frontend, "sender_identity", None)
                 response = await agent.run(
                     workspace,
                     session,
                     text,
                     self._platform,
-                    user_name=self._frontend.sender_name(chat_id),
+                    user_name=(
+                        identity(chat_id)
+                        if callable(identity)
+                        else self._frontend.sender_name(chat_id)
+                    ),
                     channel_context=self._frontend.channel_context(chat_id),
                     timeout=self._frontend.timeout_for(chat_id),
                 )
@@ -624,6 +639,8 @@ class Orchestrator:
                 typing_task.cancel()
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
+            if command_token is not None and self._commands is not None:
+                self._commands.revoke_token(command_token)
             await self._frontend.notify_complete(chat_id)
 
     async def _run_compaction(
@@ -762,13 +779,24 @@ async def _start_sandbox(
                 ),
             )
         )
-        # Daemon-wide, unlike egress: a brokered command carries no per-session
-        # state to confine, and the credential it uses is the operator's either
-        # way. Publishing into os.environ (not the session ContextVar) for the
-        # same reason.
+        # The broker is daemon-wide, but its bearer token is per turn so the
+        # request can be bound to the originating workspace. Publish only the
+        # harmless endpoint here; the session token is layered by _process().
         command_broker = commands.CommandBroker(sandbox.shim_dir())
         await command_broker.start()
-        os.environ.update(command_broker.agent_env())
+        # The endpoint is harmless to publish daemon-wide, but the bearer token
+        # must be issued per turn and bound to that turn's workspace. Do not leave
+        # the private base token in the daemon environment for sandbox.agent_env
+        # to forward accidentally.
+        command_env = command_broker.agent_env()
+        os.environ.update(
+            {
+                key: value
+                for key, value in command_env.items()
+                if key != commands.TOKEN_ENV
+            }
+        )
+        os.environ.pop(commands.TOKEN_ENV, None)
     except Exception:
         logger.exception("sandbox: startup failed, revoking what already started")
         if command_broker is not None:
@@ -812,55 +840,68 @@ async def run(frontend: Frontend, platform: str) -> None:
     # diagnostics was the shape that never got them.
     settings.check_operator_settings()
 
-    # When sandboxing is enabled, the broker holds the real API keys and the
-    # agent reaches them only through loopback. start_default_broker publishes
-    # base-urls into os.environ that sandbox.agent_env forwards to the agent.
-    #
-    # The egress proxy covers everything the broker cannot: it gates ordinary
-    # HTTPS by destination host and, via the approval broker, can ask the
-    # operator to grant an unknown one mid-run instead of failing the task.
-    broker_instance, session_egress, command_broker = await _start_sandbox(frontend)
+    # Agent CLIs are separate process groups. Recover groups left by a forced
+    # daemon stop before accepting new work, and record every live group so the
+    # supervisor can reap it even if this process is SIGKILLed.
+    process_ledger = ProcessLedger(DATA_DIR / "state" / f"{platform}.pids")
+    process_ledger.sweep()
+    agent.add_process_listener(process_ledger.on_process)
 
-    # Approvals are independent of COTF_SANDBOX, so this is built whenever the
-    # config asks for it rather than only inside the sandbox branch.
-    session_permissions = (
-        SessionPermissions(frontend) if permissions.configured().enabled else None
-    )
-    orch = Orchestrator(
-        frontend,
-        platform,
-        egress_manager=session_egress,
-        permissions_manager=session_permissions,
-    )
-    frontend.set_orchestrator(orch)
+    try:
+        # When sandboxing is enabled, the broker holds the real API keys and the
+        # agent reaches them only through loopback. start_default_broker publishes
+        # base-urls into os.environ that sandbox.agent_env forwards to the agent.
+        #
+        # The egress proxy covers everything the broker cannot: it gates ordinary
+        # HTTPS by destination host and, via the approval broker, can ask the
+        # operator to grant an unknown one mid-run instead of failing the task.
+        broker_instance, session_egress, command_broker = await _start_sandbox(frontend)
 
-    stop = asyncio.Event()
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+        # Approvals are independent of COTF_SANDBOX, so this is built whenever the
+        # config asks for it rather than only inside the sandbox branch.
+        session_permissions = (
+            SessionPermissions(frontend) if permissions.configured().enabled else None
+        )
+        orch = Orchestrator(
+            frontend,
+            platform,
+            egress_manager=session_egress,
+            permissions_manager=session_permissions,
+            command_broker=command_broker,
+        )
+        frontend.set_orchestrator(orch)
 
-    heartbeat = HeartbeatWriter(platform, extra_provider=orch.heartbeat_extra)
-    heartbeat_task = asyncio.create_task(heartbeat.run())
+        stop = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
 
-    frontend_task = asyncio.create_task(frontend.start(orch.on_message))
-    logger.info("Running (%s). Ctrl+C to stop.", platform)
+        heartbeat = HeartbeatWriter(platform, extra_provider=orch.heartbeat_extra)
+        heartbeat_task = asyncio.create_task(heartbeat.run())
 
-    await stop.wait()
+        frontend_task = asyncio.create_task(frontend.start(orch.on_message))
+        logger.info("Running (%s). Ctrl+C to stop.", platform)
 
-    logger.info("Shutting down...")
-    heartbeat_task.cancel()
-    frontend_task.cancel()
-    await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
-    await orch.shutdown()
-    await frontend.stop()
-    # Stopping these revokes every route out of the sandbox at once.
-    if session_egress is not None:
-        await session_egress.close_all()
-    if session_permissions is not None:
-        await session_permissions.close_all()
-    if command_broker is not None:
-        await command_broker.stop()
-    if broker_instance is not None:
-        await broker_instance.stop()
-    with contextlib.suppress(FileNotFoundError):
-        heartbeat.path.unlink()
+        await stop.wait()
+
+        logger.info("Shutting down...")
+        heartbeat_task.cancel()
+        frontend_task.cancel()
+        await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
+        await orch.shutdown()
+        await frontend.stop()
+        # Stopping these revokes every route out of the sandbox at once.
+        if session_egress is not None:
+            await session_egress.close_all()
+        if session_permissions is not None:
+            await session_permissions.close_all()
+        if command_broker is not None:
+            await command_broker.stop()
+        if broker_instance is not None:
+            await broker_instance.stop()
+        with contextlib.suppress(FileNotFoundError):
+            heartbeat.path.unlink()
+    finally:
+        # Startup or frontend failures can happen before the normal shutdown
+        # sequence. Never leave a durable process listener attached to the module.
+        agent.remove_process_listener(process_ledger.on_process)

@@ -18,6 +18,12 @@ from claude_on_the_fly.transcript import (
     remove_workspace_sessions,
 )
 
+
+def _write_mapping(workspace: Path, session_uuid: str, thread_id: str) -> Path:
+    """Create a daemon-owned Codex mapping for transcript tests."""
+    return transcript.codex_state.write_thread_id(workspace, session_uuid, thread_id)
+
+
 # ---------------------------------------------------------------------------
 # _workspace_to_claude_hash — must match claude's own scheme byte-for-byte
 # ---------------------------------------------------------------------------
@@ -239,22 +245,24 @@ class TestExtractCodex:
 
     def test_empty_thread_id_returns_none(self, tmp_path: Path):
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("   ")
+        workspace.mkdir()
+        mapping = transcript.codex_state.mapping_path(workspace, "u1")
+        mapping.parent.mkdir(parents=True, exist_ok=True)
+        mapping.write_text("   ")
         assert extract_codex(workspace, "u1") is None
 
     def test_no_matching_rollout_returns_none(self, tmp_path: Path, codex_sessions_dir):
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("thread-xyz")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-xyz")
         assert extract_codex(workspace, "u1") is None
 
     def test_extracts_user_and_agent_messages(
         self, tmp_path: Path, codex_sessions_dir, ndjson
     ):
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("thread-abc")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-abc")
 
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
@@ -280,8 +288,8 @@ class TestExtractCodex:
     ):
         """User text with `---` in it survives the split."""
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("thread-xx")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-xx")
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-xx.jsonl"
@@ -295,8 +303,8 @@ class TestExtractCodex:
         self, tmp_path: Path, codex_sessions_dir, ndjson
     ):
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("thread-yy")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-yy")
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-yy.jsonl"
@@ -318,8 +326,8 @@ class TestExtractCodex:
     ):
         """Defensive: if two rollouts somehow exist for the same thread, take latest."""
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("thread-zz")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-zz")
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         older = rollout_dir / "rollout-2026-05-18T10-00-00-thread-zz.jsonl"
@@ -579,8 +587,7 @@ class TestFindLatestPriorTranscript:
         text: str = "from codex",
         mtime: float | None = None,
     ) -> Path:
-        (workspace / ".codex_sessions").mkdir(parents=True, exist_ok=True)
-        (workspace / ".codex_sessions" / uuid).write_text(thread_id)
+        _write_mapping(workspace, uuid, thread_id)
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True, exist_ok=True)
         rollout = rollout_dir / f"rollout-2026-05-18T12-00-00-{thread_id}.jsonl"
@@ -800,6 +807,17 @@ class TestRemoveWorkspaceSessions:
 
         assert not claude_dir.exists()
 
+    def test_removes_the_codex_mapping_too(self, tmp_path: Path, monkeypatch) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        mapping_root = tmp_path / "codex-mappings"
+        monkeypatch.setattr(transcript.codex_state, "MAPPINGS_DIR", mapping_root)
+        mapping = _write_mapping(workspace, "u1", "thread-1")
+
+        remove_workspace_sessions(workspace)
+
+        assert not mapping.exists()
+
     def test_leaves_other_workspaces_alone(
         self, tmp_path: Path, claude_projects_dir: Path
     ) -> None:
@@ -919,9 +937,8 @@ class TestUnreadableFilesAreSkippedNotFatal:
         self, tmp_path: Path, monkeypatch
     ):
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        mapping = workspace / ".codex_sessions" / "u1"
-        mapping.write_text("thread-abc")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-abc")
 
         def read_fails(self, *_args, **_kwargs):
             raise OSError("permission denied")
@@ -1013,8 +1030,8 @@ class TestCodexRolloutScannersSkipIrrelevantRecords:
         self, tmp_path: Path, codex_sessions_dir
     ):
         workspace = tmp_path / "ws"
-        (workspace / ".codex_sessions").mkdir(parents=True)
-        (workspace / ".codex_sessions" / "u1").write_text("thread-abc")
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-abc")
         self._rollout(
             codex_sessions_dir,
             {"type": "session_meta", "payload": {"cwd": "/ws"}},
@@ -1082,8 +1099,12 @@ class TestListCodexSessionFiles:
     def test_no_sessions_dir_is_an_empty_list(self, tmp_path: Path):
         assert transcript._list_codex_session_files(tmp_path) == []
 
-    def test_a_subdirectory_is_not_a_mapping(self, tmp_path: Path, codex_sessions_dir):
-        sessions = tmp_path / ".codex_sessions"
+    def test_a_subdirectory_is_not_a_mapping(
+        self, tmp_path: Path, codex_sessions_dir, monkeypatch
+    ):
+        mapping_root = tmp_path / "codex-mappings"
+        monkeypatch.setattr(transcript.codex_state, "MAPPINGS_DIR", mapping_root)
+        sessions = mapping_root
         sessions.mkdir()
         (sessions / "somedir").mkdir()
         assert transcript._list_codex_session_files(tmp_path) == []
@@ -1091,32 +1112,49 @@ class TestListCodexSessionFiles:
     def test_a_mapping_that_cannot_be_read_is_skipped(
         self, tmp_path: Path, codex_sessions_dir, monkeypatch
     ):
-        sessions = tmp_path / ".codex_sessions"
-        sessions.mkdir()
-        (sessions / "u1").write_text("thread-abc")
+        mapping_root = tmp_path / "codex-mappings"
+        monkeypatch.setattr(transcript.codex_state, "MAPPINGS_DIR", mapping_root)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-abc")
 
-        def read_fails(self, *_args, **_kwargs):
+        def open_fails(path, *_args, **_kwargs):
             raise OSError("permission denied")
 
-        monkeypatch.setattr(Path, "read_text", read_fails)
-        assert transcript._list_codex_session_files(tmp_path) == []
+        monkeypatch.setattr(transcript.codex_state.os, "open", open_fails)
+        assert transcript._list_codex_session_files(workspace) == []
+
+    def test_a_mapping_symlink_is_skipped(
+        self, tmp_path: Path, codex_sessions_dir, monkeypatch
+    ):
+        mapping_root = tmp_path / "codex-mappings"
+        monkeypatch.setattr(transcript.codex_state, "MAPPINGS_DIR", mapping_root)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        mapping = _write_mapping(workspace, "u1", "thread-abc")
+        target = tmp_path / "target.json"
+        target.write_bytes(mapping.read_bytes())
+        mapping.unlink()
+        mapping.symlink_to(target)
+
+        assert transcript._list_codex_session_files(workspace) == []
 
     def test_a_mapping_whose_rollout_is_gone_is_skipped(
         self, tmp_path: Path, codex_sessions_dir
     ):
         """A pruned rollout leaves the mapping behind; offering it as a handoff
         candidate would make the caller extract nothing and stop looking."""
-        sessions = tmp_path / ".codex_sessions"
-        sessions.mkdir()
-        (sessions / "u1").write_text("thread-vanished")
-        assert transcript._list_codex_session_files(tmp_path) == []
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-vanished")
+        assert transcript._list_codex_session_files(workspace) == []
 
     def test_a_rollout_that_cannot_be_stated_is_skipped(
         self, tmp_path: Path, codex_sessions_dir, monkeypatch
     ):
-        sessions = tmp_path / ".codex_sessions"
-        sessions.mkdir()
-        (sessions / "u1").write_text("thread-abc")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "u1", "thread-abc")
         rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
         rollout_dir.mkdir(parents=True)
         (rollout_dir / "rollout-2026-07-30T12-00-00-thread-abc.jsonl").write_bytes(b"")
@@ -1132,7 +1170,7 @@ class TestListCodexSessionFiles:
             return real_stat(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "stat", stat_fails)
-        assert transcript._list_codex_session_files(tmp_path) == []
+        assert transcript._list_codex_session_files(workspace) == []
 
     def test_a_claude_log_that_cannot_be_stated_is_skipped(
         self, tmp_path: Path, claude_projects_dir, monkeypatch

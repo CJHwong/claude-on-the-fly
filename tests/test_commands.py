@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from pathlib import Path
 
 import pytest
 from aiohttp import ClientSession
@@ -20,6 +21,7 @@ from claude_on_the_fly.commands import (
     MAX_STREAM_BYTES,
     CommandBroker,
     ShimmedTool,
+    allowed_command,
     leading_tokens,
     refuses_readback,
 )
@@ -87,13 +89,20 @@ def test_gh_readback_covers_both_shapes():
     assert "--show-token" in GH.readback_flags
 
 
+def test_bundled_gh_allowlist_blocks_alias_api_and_unknown_commands():
+    assert allowed_command(GH, ["pr", "view", "--repo", "owner/repo"])
+    assert not allowed_command(GH, ["alias", "set", "x", "!cat /etc/passwd"])
+    assert not allowed_command(GH, ["api", "--method", "DELETE", "/repos/x"])
+    assert not allowed_command(GH, ["arbitrary-alias"])
+
+
 # --- broker lifecycle and dispatch ---
 
 
 @pytest.fixture
 def echo_tool():
     """A shimmed tool backed by /bin/echo so tests need no real CLI."""
-    return ShimmedTool(name="echo", readback=frozenset({("secret",)}))
+    return ShimmedTool(name="echo", readback=frozenset({("secret",)}), allow=((),))
 
 
 async def start(tmp_path, tools, **kwargs) -> tuple[CommandBroker, int]:
@@ -102,16 +111,23 @@ async def start(tmp_path, tools, **kwargs) -> tuple[CommandBroker, int]:
     return broker, port
 
 
-async def post(port: int, payload: dict) -> dict:
+async def post(
+    broker: CommandBroker, payload: dict, *, workspace: Path | None = None
+) -> dict:
+    env = broker.agent_env(workspace)
     async with ClientSession() as client:
-        resp = await client.post(f"http://127.0.0.1:{port}/run", json=payload)
+        resp = await client.post(
+            f"http://127.0.0.1:{broker.port}/run",
+            json=payload,
+            headers={commands.TOKEN_HEADER: env[commands.TOKEN_ENV]},
+        )
         return await resp.json()
 
 
 async def test_runs_the_real_binary(tmp_path, echo_tool):
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
-        out = await post(port, {"tool": "echo", "argv": ["hello", "world"]})
+        out = await post(broker, {"tool": "echo", "argv": ["hello", "world"]})
         assert out["stdout"].strip() == "hello world"
         assert out["rc"] == 0
         assert out["refused"] is False
@@ -120,9 +136,9 @@ async def test_runs_the_real_binary(tmp_path, echo_tool):
 
 
 async def test_readback_refused_over_the_wire(tmp_path, echo_tool):
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
-        out = await post(port, {"tool": "echo", "argv": ["secret", "value"]})
+        out = await post(broker, {"tool": "echo", "argv": ["secret", "value"]})
         assert out["refused"] is True
         assert out["rc"] == 1
         # The refused command must not have run, so its output cannot appear.
@@ -133,18 +149,18 @@ async def test_readback_refused_over_the_wire(tmp_path, echo_tool):
 
 
 async def test_exit_code_propagates(tmp_path):
-    broker, port = await start(tmp_path, (ShimmedTool(name="false"),))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="false", allow=((),)),))
     try:
-        out = await post(port, {"tool": "false", "argv": []})
+        out = await post(broker, {"tool": "false", "argv": []})
         assert out["rc"] == 1
     finally:
         await broker.stop()
 
 
 async def test_unbrokered_tool_is_refused(tmp_path, echo_tool):
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
-        out = await post(port, {"tool": "curl", "argv": ["https://example.com"]})
+        out = await post(broker, {"tool": "curl", "argv": ["https://example.com"]})
         assert out["rc"] == 127
         assert "not brokered" in out["stderr"]
     finally:
@@ -164,18 +180,20 @@ async def test_absent_binary_is_not_shimmed(tmp_path):
 
 
 async def test_stdin_is_forwarded(tmp_path):
-    broker, port = await start(tmp_path, (ShimmedTool(name="cat"),))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="cat", allow=((),)),))
     try:
-        out = await post(port, {"tool": "cat", "argv": [], "stdin": "piped input"})
+        out = await post(broker, {"tool": "cat", "argv": [], "stdin": "piped input"})
         assert out["stdout"] == "piped input"
     finally:
         await broker.stop()
 
 
 async def test_output_is_capped(tmp_path):
-    broker, port = await start(tmp_path, (ShimmedTool(name="yes"),), run_timeout=1.0)
+    broker, _port = await start(
+        tmp_path, (ShimmedTool(name="yes", allow=((),)),), run_timeout=1.0
+    )
     try:
-        out = await post(port, {"tool": "yes", "argv": ["x"]})
+        out = await post(broker, {"tool": "yes", "argv": ["x"]})
         # `yes` never exits, so this also covers the timeout path.
         assert len(out["stdout"]) <= MAX_STREAM_BYTES
     finally:
@@ -183,10 +201,12 @@ async def test_output_is_capped(tmp_path):
 
 
 async def test_timeout_reports_and_does_not_hang(tmp_path):
-    broker, port = await start(tmp_path, (ShimmedTool(name="sleep"),), run_timeout=0.3)
+    broker, _port = await start(
+        tmp_path, (ShimmedTool(name="sleep", allow=((),)),), run_timeout=0.3
+    )
     try:
         out = await asyncio.wait_for(
-            post(port, {"tool": "sleep", "argv": ["30"]}), timeout=10
+            post(broker, {"tool": "sleep", "argv": ["30"]}), timeout=10
         )
         assert out["rc"] == 124
         assert "timed out" in out["stderr"]
@@ -204,6 +224,94 @@ async def test_malformed_body_is_rejected(tmp_path, echo_tool):
                 headers={"Content-Type": "application/json"},
             )
             assert resp.status == 400
+    finally:
+        await broker.stop()
+
+
+async def test_missing_or_wrong_broker_token_is_rejected(tmp_path, echo_tool):
+    broker, port = await start(tmp_path, (echo_tool,))
+    try:
+        async with ClientSession() as client:
+            for token in (None, "wrong"):
+                headers = {} if token is None else {commands.TOKEN_HEADER: token}
+                resp = await client.post(
+                    f"http://127.0.0.1:{port}/run",
+                    json={"tool": "echo", "argv": ["hello"]},
+                    headers=headers,
+                )
+                assert resp.status == 403
+    finally:
+        await broker.stop()
+
+
+async def test_command_allowlist_denies_unlisted_subcommands(tmp_path):
+    tool = ShimmedTool(name="echo", allow=(("hello",),))
+    broker, _port = await start(tmp_path, (tool,))
+    try:
+        allowed = await post(broker, {"tool": "echo", "argv": ["hello", "world"]})
+        denied = await post(broker, {"tool": "echo", "argv": ["nope"]})
+        assert allowed["rc"] == 0
+        assert denied["rc"] == 126
+        assert denied["refused"] is True
+    finally:
+        await broker.stop()
+
+
+async def test_scoped_token_rejects_a_cwd_outside_the_session_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    broker, _port = await start(tmp_path, (ShimmedTool(name="echo", allow=((),)),))
+    try:
+        denied = await post(
+            broker,
+            {"tool": "echo", "argv": ["hello"], "cwd": str(tmp_path)},
+            workspace=workspace,
+        )
+        allowed = await post(
+            broker,
+            {"tool": "echo", "argv": ["hello"], "cwd": str(workspace)},
+            workspace=workspace,
+        )
+        assert denied["rc"] == 126
+        assert denied["refused"] is True
+        assert allowed["stdout"].strip() == "hello"
+    finally:
+        await broker.stop()
+
+
+async def test_scoped_token_is_revoked_after_a_turn(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    broker, _port = await start(tmp_path, (ShimmedTool(name="echo", allow=((),)),))
+    try:
+        env = broker.agent_env(workspace)
+        broker.revoke_token(env[commands.TOKEN_ENV])
+        async with ClientSession() as client:
+            response = await client.post(
+                f"http://127.0.0.1:{broker.port}/run",
+                json={"tool": "echo", "argv": [], "cwd": str(workspace)},
+                headers={commands.TOKEN_HEADER: env[commands.TOKEN_ENV]},
+            )
+        assert response.status == 403
+    finally:
+        await broker.stop()
+
+
+@pytest.mark.parametrize(
+    "argv", [["/etc/passwd"], ["--file=/etc/passwd"], ["../outside"]]
+)
+async def test_path_arguments_cannot_escape_the_workspace(tmp_path, argv):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    broker, _port = await start(tmp_path, (ShimmedTool(name="echo", allow=((),)),))
+    try:
+        result = await post(
+            broker,
+            {"tool": "echo", "argv": argv, "cwd": str(workspace)},
+            workspace=workspace,
+        )
+        assert result["rc"] == 126
+        assert result["refused"] is True
     finally:
         await broker.stop()
 
@@ -241,7 +349,9 @@ async def test_shims_are_written_executable(tmp_path, echo_tool):
 async def test_agent_env_points_at_the_endpoint(tmp_path, echo_tool):
     broker, port = await start(tmp_path, (echo_tool,))
     try:
-        assert broker.agent_env() == {ENDPOINT_ENV: f"http://127.0.0.1:{port}"}
+        env = broker.agent_env()
+        assert env[ENDPOINT_ENV] == f"http://127.0.0.1:{port}"
+        assert env[commands.TOKEN_ENV] == broker._token
     finally:
         await broker.stop()
 
@@ -334,11 +444,11 @@ def test_endpoint_is_in_the_restart_mapping():
 async def test_shim_invocation_is_logged_with_argv0(tmp_path, echo_tool, caplog):
     """Only a shim reaches /run, so an arrival here is the one parent-side proof
     the shim was used. argv0 says whether PATH resolution or a direct path did it."""
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
         with caplog.at_level("DEBUG", logger="claude_on_the_fly.commands"):
             await post(
-                port,
+                broker,
                 {"tool": "echo", "argv": ["hi"], "argv0": "/shims/echo", "cwd": "/w"},
             )
         assert any(
@@ -350,10 +460,10 @@ async def test_shim_invocation_is_logged_with_argv0(tmp_path, echo_tool, caplog)
 
 
 async def test_refusal_logs_the_cwd(tmp_path, echo_tool, caplog):
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
         with caplog.at_level("WARNING", logger="claude_on_the_fly.commands"):
-            await post(port, {"tool": "echo", "argv": ["secret"], "cwd": "/w"})
+            await post(broker, {"tool": "echo", "argv": ["secret"], "cwd": "/w"})
         assert any("REFUSE echo" in (r.getMessage()) for r in caplog.records)
     finally:
         await broker.stop()
@@ -366,10 +476,10 @@ async def test_long_argv_token_is_clipped_by_default(
     ride into the log with the argv."""
     monkeypatch.setattr(logs, "log_content", lambda: False)
     prose = "x" * 400
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
         with caplog.at_level("WARNING", logger="claude_on_the_fly.commands"):
-            await post(port, {"tool": "echo", "argv": ["--body", prose]})
+            await post(broker, {"tool": "echo", "argv": ["--body", prose]})
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "RUN echo" in logged
         assert prose not in logged
@@ -383,10 +493,10 @@ async def test_content_logging_opt_in_restores_full_argv(
 ):
     monkeypatch.setattr(logs, "log_content", lambda: True)
     prose = "y" * 200
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
         with caplog.at_level("WARNING", logger="claude_on_the_fly.commands"):
-            await post(port, {"tool": "echo", "argv": ["--body", prose]})
+            await post(broker, {"tool": "echo", "argv": ["--body", prose]})
         assert prose in "\n".join(r.getMessage() for r in caplog.records)
     finally:
         await broker.stop()
@@ -396,10 +506,10 @@ async def test_subprocess_env_keys_logged_never_values(
     tmp_path, echo_tool, caplog, monkeypatch
 ):
     monkeypatch.setenv("GH_HOST", "secret-host.example")
-    broker, port = await start(tmp_path, (echo_tool,))
+    broker, _port = await start(tmp_path, (echo_tool,))
     try:
         with caplog.at_level("DEBUG", logger="claude_on_the_fly.commands"):
-            await post(port, {"tool": "echo", "argv": ["hi"]})
+            await post(broker, {"tool": "echo", "argv": ["hi"]})
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "with env" in logged
         # The subprocess env is logged by key so a value can never leak through it.
@@ -419,7 +529,7 @@ async def test_shim_does_not_hang_on_an_idle_stdin(tmp_path, monkeypatch):
     by review.
     """
     monkeypatch.setenv("COTF_SANDBOX", "off")
-    broker, _port = await start(tmp_path, (ShimmedTool(name="echo"),))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="echo", allow=((),)),))
     try:
         shim = str(tmp_path / "shims" / "echo")
         read_fd, write_fd = os.pipe()  # never written to, never closed
@@ -444,7 +554,7 @@ async def test_shim_does_not_hang_on_an_idle_stdin(tmp_path, monkeypatch):
 async def test_shim_still_forwards_real_piped_stdin(tmp_path, monkeypatch):
     """The idle-stdin fix must not cost the feature it guards."""
     monkeypatch.setenv("COTF_SANDBOX", "off")
-    broker, _port = await start(tmp_path, (ShimmedTool(name="cat"),))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="cat", allow=((),)),))
     try:
         shim = str(tmp_path / "shims" / "cat")
         proc = await asyncio.create_subprocess_exec(
@@ -723,9 +833,11 @@ async def test_a_binary_that_cannot_be_executed_reports_127_not_a_traceback(
     broken.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
 
-    broker, port = await start(tmp_path, (ShimmedTool(name="broken-shebang"),))
+    broker, _port = await start(
+        tmp_path, (ShimmedTool(name="broken-shebang", allow=((),)),)
+    )
     try:
-        out = await post(port, {"tool": "broken-shebang", "argv": []})
+        out = await post(broker, {"tool": "broken-shebang", "argv": []})
         assert out["rc"] == 127
         assert "cannot run broken-shebang" in out["stderr"]
     finally:
@@ -736,11 +848,16 @@ async def test_output_past_the_cap_is_truncated_with_an_actionable_note(tmp_path
     """Capped while reading rather than truncated afterwards: an unbounded
     producer would otherwise be buffered whole and turn any chatty command into a
     daemon memory bomb."""
-    broker, port = await start(tmp_path, (ShimmedTool(name="head"),))
+    (tmp_path / "source").write_bytes(b"x" * (MAX_STREAM_BYTES * 2))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="head", allow=((),)),))
     try:
         out = await post(
-            port,
-            {"tool": "head", "argv": ["-c", str(MAX_STREAM_BYTES * 2), "/dev/zero"]},
+            broker,
+            {
+                "tool": "head",
+                "argv": ["-c", str(MAX_STREAM_BYTES * 2), "source"],
+                "cwd": str(tmp_path),
+            },
         )
         assert len(out["stdout"].encode("utf-8", "replace")) <= MAX_STREAM_BYTES
         assert "output truncated" in out["stderr"]
@@ -750,14 +867,16 @@ async def test_output_past_the_cap_is_truncated_with_an_actionable_note(tmp_path
 
 
 async def test_truncation_is_logged(tmp_path, caplog):
-    broker, port = await start(tmp_path, (ShimmedTool(name="head"),))
+    (tmp_path / "source").write_bytes(b"x" * (MAX_STREAM_BYTES * 2))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="head", allow=((),)),))
     try:
         with caplog.at_level("WARNING", logger="claude_on_the_fly.commands"):
             await post(
-                port,
+                broker,
                 {
                     "tool": "head",
-                    "argv": ["-c", str(MAX_STREAM_BYTES * 2), "/dev/zero"],
+                    "argv": ["-c", str(MAX_STREAM_BYTES * 2), "source"],
+                    "cwd": str(tmp_path),
                 },
             )
     finally:
@@ -772,11 +891,11 @@ async def test_stdin_for_a_command_that_never_reads_it_does_not_fail_the_run(
 ):
     """`true` exits without draining stdin, so the write races the exit and can
     hit a broken pipe. That is the command working, not an error to surface."""
-    broker, port = await start(tmp_path, (ShimmedTool(name="true"),))
+    broker, _port = await start(tmp_path, (ShimmedTool(name="true", allow=((),)),))
     try:
         # Comfortably past a 64 KiB pipe buffer so the write has to block,
         # and comfortably under the broker's own 1 MiB request cap.
-        out = await post(port, {"tool": "true", "argv": [], "stdin": "x" * (1 << 19)})
+        out = await post(broker, {"tool": "true", "argv": [], "stdin": "x" * (1 << 19)})
         assert out["rc"] == 0
         assert out["stderr"] == ""
     finally:

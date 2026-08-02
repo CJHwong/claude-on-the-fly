@@ -11,7 +11,15 @@ import shlex
 import time
 from pathlib import Path
 
-from claude_on_the_fly import agent, permissions, pricing, sandbox, settings, transcript
+from claude_on_the_fly import (
+    agent,
+    codex_state,
+    permissions,
+    pricing,
+    sandbox,
+    settings,
+    transcript,
+)
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
@@ -127,10 +135,10 @@ async def _run_codex_exec(
     try:
         if timeout is not None:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+                agent.communicate_capped(proc), timeout=timeout
             )
         else:
-            stdout_bytes, stderr_bytes = await proc.communicate()
+            stdout_bytes, stderr_bytes = await agent.communicate_capped(proc)
     except TimeoutError:
         logger.warning("codex exec: timed out after %ss", timeout)
         raise RuntimeError(f"Codex CLI timed out after {timeout}s") from None
@@ -231,7 +239,19 @@ def _expand_codex_prompt(prompt: str) -> str:
         name = name[len("prompts:") :]
     if not name:
         return prompt
-    path = _codex_prompts_dir() / f"{name}.md"
+    # Slack controls this name. Keep the documented top-level prompt surface,
+    # but never let an absolute, traversing, or symlinked name escape it.
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        return prompt
+    prompts_dir = _codex_prompts_dir()
+    try:
+        prompts_root = prompts_dir.resolve()
+        path = prompts_dir / f"{name}.md"
+        if path.resolve().parent != prompts_root:
+            return prompt
+    except OSError as exc:
+        logger.warning("expand: cannot resolve prompt %s: %s", name, exc)
+        return prompt
     if not path.is_file():
         return prompt
     try:
@@ -246,8 +266,9 @@ class CodexBackend:
     """Drives the `codex exec` CLI in non-interactive (`--json`) mode.
 
     Codex assigns its own `thread_id` and offers no flag to pre-seed it, so
-    we persist a `<workspace>/.codex_sessions/<our-session-uuid>` mapping file
-    after the first turn and pass `resume <thread_id>` on follow-ups.
+    COTF persists a daemon-owned, workspace-bound mapping after the first turn
+    and passes `resume <thread_id>` on follow-ups. The mapping is never read from
+    the agent-writable workspace.
     """
 
     def __init__(self, launcher: OllamaLauncher | None = None) -> None:
@@ -273,11 +294,7 @@ class CodexBackend:
         )
         # codex exec won't expand a /custom-prompt itself, so do it here.
         prompt = _expand_codex_prompt(prompt)
-        sessions_dir = workspace / ".codex_sessions"
-        session_file = sessions_dir / session_uuid
-        existing_thread = (
-            session_file.read_text().strip() if session_file.exists() else None
-        )
+        existing_thread = codex_state.read_thread_id(workspace, session_uuid)
 
         # First codex turn for this session: forward any prior claude history,
         # and prepend the system prompt (codex has no --system-prompt flag, so
@@ -325,8 +342,7 @@ class CodexBackend:
 
         new_thread = result.get("thread_id")
         if not existing_thread and new_thread:
-            sessions_dir.mkdir(parents=True, exist_ok=True)
-            session_file.write_text(new_thread)
+            codex_state.write_thread_id(workspace, session_uuid, new_thread)
             logger.info(
                 "codex: persisted new thread=%s for session=%s",
                 new_thread,
@@ -456,10 +472,7 @@ class CodexBackend:
 
     def _thread_id(self, workspace: Path, session_uuid: str) -> str | None:
         """Codex's own thread id for one of our sessions, or None if unmapped."""
-        session_file = workspace / ".codex_sessions" / session_uuid
-        if not session_file.is_file():
-            return None
-        return session_file.read_text().strip() or None
+        return codex_state.read_thread_id(workspace, session_uuid)
 
     async def compact(
         self,
@@ -528,28 +541,23 @@ class CodexBackend:
 
     def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
         """`codex resume <thread_id>` when a thread mapping exists for this uuid."""
-        session_file = workspace / ".codex_sessions" / session_uuid
-        if not session_file.is_file():
-            return None
-        thread_id = session_file.read_text().strip()
+        thread_id = codex_state.read_thread_id(workspace, session_uuid)
         if not thread_id:
             return None
-        return f"codex resume {thread_id}"
+        return f"codex resume {shlex.quote(thread_id)}"
 
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
         """The rollout JSONL codex appends to, resolved via our session mapping.
 
         Codex names rollouts by its own thread id, not our session_uuid, so we
-        read the thread id from `workspace/.codex_sessions/<uuid>` and let the
+        read the thread id from the daemon-owned mapping and let the
         transcript helper locate the dated rollout file. The watch formatter
         understands codex's message events (role + input_text/output_text)."""
-        session_file = workspace / ".codex_sessions" / session_uuid
-        if session_file.is_file():
-            thread_id = session_file.read_text().strip()
-            if thread_id:
-                rollout = transcript._find_codex_rollout(thread_id)
-                if rollout is not None:
-                    return rollout
+        thread_id = codex_state.read_thread_id(workspace, session_uuid)
+        if thread_id:
+            rollout = transcript._find_codex_rollout(thread_id)
+            if rollout is not None:
+                return rollout
         # No mapping yet (first turn, still running): codex only reveals its
         # thread id at the end, so match the rollout it's actively writing by
         # the workspace cwd. Lets the watch pane tail live instead of staying

@@ -9,7 +9,8 @@ Public surface:
 - `Turn` dataclass
 - `extract_claude(workspace, session_uuid)` reads ~/.claude/projects/<hash>/<uuid>.jsonl
 - `extract_codex(workspace, session_uuid)` reads the codex rollout matching the
-  thread_id persisted under <workspace>/.codex_sessions/<session_uuid>
+  thread_id persisted in the daemon-owned ~/.claude-on-the-fly/codex-sessions/
+  store, outside the agent-writable workspace
 - `format_handoff(turns, from_backend)` renders a labeled preamble, capped by
   turn count and char budget from the most recent backward
 - `find_latest_prior_transcript(workspace, exclude_uuid)` scans both backends'
@@ -33,6 +34,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+from claude_on_the_fly import codex_state
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +81,8 @@ def remove_workspace_sessions(workspace: Path) -> None:
     claude names a directory in its own config tree after the workspace path, so
     a caller that deletes a throwaway workspace still leaves that directory
     behind — and because the name encodes a path that will never exist again,
-    nothing can ever reclaim it. codex keeps its per-workspace mapping *inside*
-    the workspace, so removing the workspace is already enough for it and there
-    is nothing to do here.
+    nothing can ever reclaim it. codex keeps its per-workspace mapping in the
+    daemon-owned store, so remove those records by exact workspace identity too.
 
     Call this before deleting the workspace: the name is derived from
     `workspace.resolve()`, and resolution is only reliable while the path is
@@ -92,6 +94,7 @@ def remove_workspace_sessions(workspace: Path) -> None:
     shutil.rmtree(
         CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace), ignore_errors=True
     )
+    codex_state.remove_workspace(workspace)
 
 
 def _iter_jsonl(path: Path):
@@ -202,12 +205,8 @@ def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
 
     Strips the system-prompt prefix we prepend to every codex user message.
     """
-    session_file = workspace / ".codex_sessions" / session_uuid
-    if not session_file.is_file():
-        return None
-    try:
-        thread_id = session_file.read_text().strip()
-    except OSError:
+    thread_id = codex_state.read_thread_id(workspace, session_uuid)
+    if thread_id is None:
         return None
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
@@ -369,17 +368,15 @@ def _list_claude_session_files(workspace: Path) -> list[tuple[Path, str, float]]
 
 def _list_codex_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
     """Return (rollout_path, our_uuid, rollout_mtime) for every codex mapping
-    under <workspace>/.codex_sessions whose rollout still exists."""
-    sessions_dir = workspace / ".codex_sessions"
-    if not sessions_dir.is_dir():
-        return []
+    in the daemon-owned store whose rollout still exists."""
     out: list[tuple[Path, str, float]] = []
-    for mapping in sessions_dir.iterdir():
-        if not mapping.is_file():
-            continue
-        try:
-            thread_id = mapping.read_text().strip()
-        except OSError:
+    for (
+        _mapping_path,
+        session_uuid,
+        _mapping_mtime,
+    ) in codex_state.mappings_for_workspace(workspace):
+        thread_id = codex_state.read_thread_id(workspace, session_uuid)
+        if thread_id is None:
             continue
         rollout = _find_codex_rollout(thread_id)
         if rollout is None:
@@ -388,7 +385,7 @@ def _list_codex_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
             mtime = rollout.stat().st_mtime
         except OSError:
             continue
-        out.append((rollout, mapping.name, mtime))
+        out.append((rollout, session_uuid, mtime))
     return out
 
 
