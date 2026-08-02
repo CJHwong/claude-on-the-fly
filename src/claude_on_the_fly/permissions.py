@@ -35,6 +35,7 @@ config that quietly means the opposite of what it says is worse than a refusal.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import shlex
@@ -238,7 +239,7 @@ _READ_ONLY_PROGRAMS = frozenset(
 
 # git is two tools wearing one name. These subcommands report; the rest can
 # rewrite history, move refs, or run a pager of the repo's choosing.
-_READ_ONLY_GIT = frozenset({"status", "log", "diff", "show", "branch", "describe"})
+_READ_ONLY_GIT = frozenset({"status", "log", "diff", "show", "describe"})
 
 # Tools whose input names a path to be written.
 _WRITE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit", "apply_patch"})
@@ -305,19 +306,15 @@ def _segments(command: str) -> list[str] | None:
 def _bash_subject(command: str) -> str:
     """Grant scope for a shell command.
 
-    A simple command is scoped to its program, so approving `git` once covers a
-    turn of git work. Anything else is scoped to the exact string, because
-    `ls && curl evil.example` must not be covered by a grant an operator gave to
-    `ls`. That is the whole reason `_segments` returns None rather than the first
-    word it can find.
+    Every command is scoped to its complete, canonical argv (or complete shell
+    text for a compound command). A program-only grant would let approval for
+    one invocation of `chmod`, `git`, or another command silently cover a
+    materially different invocation later in the turn.
     """
     argv = _segments(command)
-    if argv is None:
-        return f"bash-exact:{_flatten(command)}"
-    program = Path(argv[0]).name
-    if program == "git" and len(argv) > 1:
-        return f"bash:git {argv[1]}"
-    return f"bash:{program}"
+    canonical = shlex.join(argv) if argv is not None else _flatten(command)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"bash-exact:{digest}"
 
 
 def _write_subject(path_text: str, workspace: Path) -> str:
@@ -350,7 +347,9 @@ def subject_for(call: ToolCall, workspace: Path) -> str:
         # apply_patch carries the patch in `command`; the claude tools use
         # `file_path`. Same question either way: what is being written, and where.
         if call.name == "apply_patch":
-            return f"patch-exact:{_flatten(call.text('command'))[:120]}"
+            patch = _flatten(call.text("command"))
+            digest = hashlib.sha256(patch.encode("utf-8")).hexdigest()
+            return f"patch-exact:{digest}"
         return _write_subject(call.text("file_path"), workspace)
     if call.name in _FETCH_TOOLS:
         host = urlsplit(call.text("url")).hostname or "<no host>"
@@ -377,11 +376,9 @@ def _call_text(call: ToolCall) -> str:
 def scope_for(call: ToolCall) -> str:
     """What a grant covers, spelled out, in the same shape a pty dialog's scope has.
 
-    Deliberately not `subject_for`. A subject is the grant *key*, scoped to the
-    program so approving `git` once covers a turn of git work -- which is why it
-    reads `bash:chmod` with no arguments. That makes it useless as a record of what
-    was approved: "Permission approved: bash:chmod" does not say which file. This
-    carries the arguments; the key stays program-scoped.
+    Deliberately not `subject_for`. A subject is a stable digest so the grant key
+    cannot be confused with display text. This carries the complete arguments for
+    the operator and logs; the key remains exact and machine-oriented.
     """
     body = _capped(_call_text(call))
     return f"{call.name.lower()}:{body}" if body else ""
@@ -451,8 +448,9 @@ def worth_asking(call: ToolCall) -> bool:
     attention", so that a turn of `ls` and `git status` does not cost twenty taps.
     It is defeated by anything that makes the first word stop predicting what
     runs, which is why `_segments` refuses compound commands outright rather than
-    trying to parse them -- the same reason `config.yaml` declines to police
-    `gh api --method DELETE` by argv and says to scope the token instead.
+    trying to parse them. The command broker's separate positive allowlist blocks
+    the bundled `gh api` route by default; provider-side token scope remains the
+    defense for semantics this approval convenience filter does not model.
 
     The boundary is elsewhere and unchanged: the seatbelt profile, the CONNECT
     proxy, and the credential broker. Every one of them holds whether this

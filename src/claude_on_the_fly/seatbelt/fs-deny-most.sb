@@ -65,7 +65,10 @@
 (allow file-read* (subpath (param "_EXTRA_3")))
 
 ;; -- Writes: identical allowlist to fs-allow-reads.sb --
-(allow file-write* (subpath (string-append (param "_HOME") "/.claude")))
+;; Global Claude settings/hooks/plugins are read by future invocations, so a
+;; sandboxed turn must not persist instructions there. The deny is explicit even
+;; though deny-most already denies HOME, keeping the policy invariant visible.
+(deny file-write* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
 ;; codex needs this to start at all; see the note in fs-allow-reads.sb.
 ;; codex needs to write under ~/.codex or it will not start, but the directory also
@@ -73,11 +76,11 @@
 ;; is deny-default with an explicit re-grant, rather than a grant with a denylist of
 ;; the dangerous files.
 ;;
-;; The denylist came first and was already incomplete: hooks.json, config.toml and
-;; rules/ were denied while plugins/, history.jsonl and AGENTS.md stayed writable --
-;; and AGENTS.md is standing instructions codex reads on every later run, so an
-;; injected agent could leave itself orders that outlive the session. Enumerating the
-;; dangerous files means losing that race every time codex adds one.
+;; The old denylist was already incomplete: hooks.json, config.toml and rules/ were
+;; denied while plugins/, history.jsonl and AGENTS.md stayed writable -- and AGENTS.md
+;; is standing instructions codex reads on every later run, so an injected agent could
+;; leave itself orders that outlive the session. Enumerating dangerous files means
+;; losing that race every time codex adds one; the explicit grants above avoid it.
 ;;
 ;; The grants below are measured, not guessed: they are what a real `codex exec` turn
 ;; touched under this directory. Two of them are execution-adjacent and cannot be

@@ -19,8 +19,13 @@ from claude_on_the_fly import settings
 
 logger = logging.getLogger(__name__)
 
+# Immutable ref, reviewed when this dependency was updated. Never execute a
+# mutable branch URL from daemon preflight: a repository force-push must not turn
+# a routine hook refresh into arbitrary code execution.
+PTY_INSTALL_COMMIT = "323796ca5052127352d00a3e5c68eb403001a8b8"
 INSTALL_URL = (
-    "https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh"
+    "https://raw.githubusercontent.com/CJHwong/claude-interactive-p/"
+    f"{PTY_INSTALL_COMMIT}/install.sh"
 )
 MANUAL_HINT = f"curl -fsSL {INSTALL_URL} | bash"
 
