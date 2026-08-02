@@ -314,6 +314,26 @@ class TestProcess:
         assert len(frontend.sent) == 1
         assert frontend.sent[0][1].body == "answer"
 
+    async def test_command_token_is_bound_to_the_turn_workspace_and_revoked(
+        self, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        command_broker = MagicMock()
+        command_broker.agent_env.side_effect = lambda workspace: {
+            orchestrator_mod.commands.ENDPOINT_ENV: "http://127.0.0.1:1234",
+            orchestrator_mod.commands.TOKEN_ENV: f"token:{workspace}",
+        }
+        orch = Orchestrator(frontend, "test", command_broker=command_broker)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        workspace = tmp_path / "workspaces" / "test/1"
+        command_broker.agent_env.assert_called_once_with(workspace)
+        command_broker.revoke_token.assert_called_once_with(f"token:{workspace}")
+
     async def test_sends_error_on_agent_failure(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:

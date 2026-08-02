@@ -14,9 +14,11 @@ strands-agents per-URL injection) are summarized there.
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import logging
 import os
+import secrets
 import subprocess
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -86,6 +88,7 @@ _CHUNK = 64 * 1024
 # request limit with headroom, and kept explicit rather than unlimited because
 # `_handle` buffers the body in memory before forwarding.
 _MAX_BODY_BYTES = 64 * 1024 * 1024
+_SESSION_PREFIX = "/_session/"
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,10 @@ class Broker:
         # When present, a method/path scope miss becomes an operator question
         # instead of a flat 403. None keeps the original deny-only behavior.
         self._approvals = approvals
+        # The route is on loopback, but loopback is not authentication. A
+        # random path capability keeps an unrelated local process that merely
+        # discovers the port from invoking a credentialed upstream request.
+        self._token = secrets.token_urlsafe(32)
 
     @property
     def port(self) -> int:
@@ -221,12 +228,16 @@ class Broker:
     def base_url_env(self) -> dict[str, str]:
         """Env overrides pointing each provider SDK at this broker.
 
-        For every route that declares a base_url_env_var, maps it to
-        http://127.0.0.1:<port><prefix>. The agent sends plain HTTP there and
-        the broker injects the real key on the broker->upstream leg.
+        For every route that declares a base_url_env_var, maps it to a
+        token-scoped URL. The agent sends plain HTTP there and the broker injects
+        the real key on the broker->upstream leg. The unscoped loopback root is
+        never a usable route.
         """
         return {
-            route.base_url_env_var: f"http://127.0.0.1:{self.port}{route.prefix}"
+            route.base_url_env_var: (
+                f"http://127.0.0.1:{self.port}{_SESSION_PREFIX}"
+                f"{self._token}{route.prefix}"
+            )
             for route in self._routes
             if route.base_url_env_var
         }
@@ -348,11 +359,27 @@ class Broker:
             "whatever you can still do; if they approve, a later retry succeeds."
         )
 
+    def _authorized_path(self, path: str) -> str | None:
+        """Strip the bearer path capability, or return None when absent/bad."""
+        if not path.startswith(_SESSION_PREFIX):
+            return None
+        rest = path[len(_SESSION_PREFIX) :]
+        token, separator, route_tail = rest.partition("/")
+        if not separator or not token or not hmac.compare_digest(token, self._token):
+            return None
+        return "/" + route_tail
+
     async def _handle(self, request: web.Request) -> web.StreamResponse:
-        route = self._match(request.path)
+        route_path = self._authorized_path(request.path)
+        if route_path is None:
+            logger.warning("broker: deny unauthenticated loopback request")
+            return web.Response(
+                status=403, text="[sandbox] broker authentication required"
+            )
+        route = self._match(route_path)
         if route is None:
             logger.warning(
-                "broker: deny %s %s (no matching route)", request.method, request.path
+                "broker: deny %s %s (no matching route)", request.method, route_path
             )
             return web.Response(
                 status=403,
@@ -368,7 +395,7 @@ class Broker:
                 ),
             )
 
-        tail = request.path[len(route.prefix) :].lstrip("/")
+        tail = route_path[len(route.prefix) :].lstrip("/")
         denial = await self._scope_denial(route, request.method, tail)
         if denial is not None:
             return denial
@@ -380,7 +407,7 @@ class Broker:
         # question can be answered without the value ever being written down.
         logger.debug(
             "broker: %s -> %s, injecting %r from %s, forwarding headers %s, %d B body",
-            request.path,
+            route_path,
             url,
             route.header,
             route.keychain_service,
@@ -464,7 +491,8 @@ async def start_default_broker(
     approvals: ApprovalBroker | None = None,
 ) -> Broker | None:
     """Start a broker for whichever DEFAULT_ROUTES have keychain items, publish
-    their base-urls into os.environ for agent_env to forward, and return it.
+    their token-scoped base-urls into os.environ for sandbox.agent_env to forward,
+    and return it.
 
     Returns None when no route is provisioned (nothing to serve).
     """

@@ -18,13 +18,14 @@ real binary with the real credential, and only the output crosses back. The
 credential stays outside, every invocation is logged, and stopping the broker
 revokes the capability.
 
-**No action policy, deliberately.** This does not parse subcommands to
-allow/deny/ask. `gh api --method DELETE /repos/o/r` defeats any subcommand
-denylist, so a parser here would be a security boundary that can be walked
-around, plus a second enumerate-the-bad list. The scope lever is the *token*: a
-fine-grained PAT limited to what the agent needs bounds it far more reliably than
-argv inspection. What a hijacked agent can do for the life of a session is the
-accepted trade; what it cannot do is keep the credential afterwards.
+**Action access is an explicit positive allowlist.** Each configured tool may
+declare leading subcommand prefixes such as `pr list` or `repo view`; a missing
+or empty list denies every invocation. This is intentionally a conservative
+prefix gate, not a parser for a CLI's full API semantics: arguments and flags
+after an allowed prefix are passed through, while generic operations such as
+`gh api` remain unavailable unless an operator explicitly opts them in. The
+provider credential should still have the smallest possible scope because no
+argv policy can understand every future CLI flag safely.
 
 The one thing that *is* refused is **credential readback** — a command whose
 output is the secret itself. That is not policy, it is closing the door this
@@ -38,14 +39,17 @@ file; see `settings.py` for where that lives and why.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
+import secrets
 import shutil
+import signal
 import stat
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, cast
 
 from claude_on_the_fly import logs, settings
@@ -70,6 +74,8 @@ _STDIN_WAIT_SECONDS = 0.25
 # Env var carrying the broker's endpoint to the sandbox. Ends up in the agent's
 # environment via sandbox._PASSTHROUGH, and the generated shims read it.
 ENDPOINT_ENV = "COTF_CMD_ENDPOINT"
+TOKEN_ENV = "COTF_CMD_TOKEN"
+TOKEN_HEADER = "X-COTF-Command-Token"
 
 # Files in the shim directory that are not command shims and must survive the
 # stale sweep. The permission-approval shim shares the directory because
@@ -95,6 +101,9 @@ class ShimmedTool:
         against the leading non-flag tokens. `("auth", "token")` refuses
         `gh auth token` and `gh auth token --hostname x`.
     :param readback_flags: flags that make any command print the secret.
+    :param allow: leading subcommand paths that may run. An empty list denies
+        every invocation; the command broker is deliberately not a general
+        shell for a credentialed binary.
     :param env_passthrough: extra parent env names the real binary needs beyond
         the shared essentials. Kept narrow so the subprocess does not inherit
         every secret the daemon happens to hold.
@@ -104,6 +113,7 @@ class ShimmedTool:
     readback: frozenset[tuple[str, ...]] = frozenset()
     readback_flags: frozenset[str] = frozenset()
     env_passthrough: frozenset[str] = frozenset()
+    allow: tuple[tuple[str, ...], ...] = ()
 
 
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
@@ -148,6 +158,7 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
         readback=frozenset(words(entry.get("readback"), "readback")),
         readback_flags=names(entry.get("readback_flags"), "readback_flags"),
         env_passthrough=names(entry.get("env_passthrough"), "env_passthrough"),
+        allow=words(entry.get("allow"), "allow"),
     )
 
 
@@ -270,11 +281,17 @@ import urllib.request
 
 TOOL = {tool!r}
 endpoint = os.environ.get({endpoint_env!r}, "")
+token = os.environ.get({token_env!r}, "")
 if not endpoint:
     sys.stderr.write(
         "[sandbox] {tool} runs through the command broker, which is not "
         "reachable from here ({endpoint_env} is unset). Tell the user; this is "
         "configuration, not something you can work around.\\n"
+    )
+    raise SystemExit(127)
+if not token:
+    sys.stderr.write(
+        "[sandbox] command broker token is missing; this invocation is refused.\\n"
     )
     raise SystemExit(127)
 
@@ -313,6 +330,7 @@ request = urllib.request.Request(
     headers={{"Content-Type": "application/json"}},
     method="POST",
 )
+request.add_header({token_header!r}, token)
 try:
     with urllib.request.urlopen(request, timeout={timeout}) as response:
         payload = json.loads(response.read())
@@ -381,6 +399,62 @@ def refuses_readback(tool: ShimmedTool, argv: list[str]) -> bool:
     )
 
 
+def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
+    """Return whether ``argv`` starts with one configured safe subcommand.
+
+    Flags are removed while identifying the leading subcommand path, so ordinary
+    options may appear before or after a vetted prefix. This is deliberately not
+    a full CLI parser; a tool with no entries is deny-by-default and provider-side
+    credential scope remains necessary.
+    """
+    if not tool.allow:
+        return False
+    tokens = leading_tokens(argv)
+    return any(tokens[: len(prefix)] == prefix for prefix in tool.allow)
+
+
+def _unsafe_path_argument(argv: list[str]) -> str | None:
+    """Return the first absolute/traversing argument, or ``None``.
+
+    The broker is not a file-transfer channel. Relative paths are still allowed
+    for a vetted command and are resolved by the CLI from the session workspace;
+    host-absolute and escaping paths are refused before process creation. The
+    Windows check matters when a cross-platform config is exercised on macOS.
+    """
+    for item in argv:
+        for candidate in (item, item.split("=", 1)[1] if "=" in item else ""):
+            if not candidate or candidate == ".":
+                continue
+            if candidate == ".." or candidate.startswith(("/", "~/", "~\\")):
+                return item
+            if (
+                PureWindowsPath(candidate).is_absolute()
+                or ".." in Path(candidate).parts
+            ):
+                return item
+    return None
+
+
+def _workspace_cwd(body: dict, workspace: Path | None) -> str | None:
+    """Validate a shim-reported cwd against its session workspace."""
+    raw = body.get("cwd")
+    if workspace is None:
+        cwd = str(raw or Path.cwd())
+        return cwd if Path(cwd).is_dir() else str(Path.cwd())
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        root = workspace.resolve(strict=False)
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            return None
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return str(resolved) if resolved.is_dir() else None
+
+
 def _subprocess_env(tool: ShimmedTool) -> dict[str, str]:
     keys = (*_BASE_ENV_KEYS, *tool.env_passthrough)
     return {key: os.environ[key] for key in keys if key in os.environ}
@@ -413,8 +487,14 @@ async def _terminate(proc) -> None:
     during loop teardown, which surfaces as a stray "Event loop is closed"
     unraisable rather than anything actionable.
     """
-    if proc.returncode is None:
-        proc.kill()
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        if proc.returncode is None:
+            proc.kill()
+    except OSError:
+        if proc.returncode is None:
+            proc.kill()
     transport = getattr(proc, "_transport", None)
     if transport is not None:
         transport.close()
@@ -454,10 +534,11 @@ class CommandBroker:
     socket and the ssh-agent. A loopback port can be scoped to exactly one
     endpoint (see COTF_SANDBOX_BROKER_ONLY_LOOPBACK); a unix socket allow cannot.
 
-    Loopback carries no authentication, and that is not a new exposure: the
-    credential files this broker reads are already readable by any same-UID
-    process on the host. The sandbox is the only thing being constrained, so a
-    token here would be theatre rather than a boundary.
+    The endpoint requires a high-entropy bearer token. Production tokens are
+    issued per turn and bound to that turn's canonical workspace; a process that
+    merely discovers the loopback port cannot invoke a credentialed CLI or move
+    its working directory outside the workspace. It is not a substitute for OS
+    isolation, but it closes accidental and cross-process loopback access.
     """
 
     def __init__(
@@ -478,6 +559,8 @@ class CommandBroker:
         # from the shim-generation path without pulling the web stack in.
         self._runner: Any = None
         self._port: int | None = None
+        self._token = secrets.token_urlsafe(32)
+        self._session_workspaces: dict[str, Path] = {}
 
     @property
     def port(self) -> int:
@@ -492,9 +575,23 @@ class CommandBroker:
     def endpoint(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def agent_env(self) -> dict[str, str]:
-        """Env pointing the sandbox at this broker and at the generated shims."""
-        return {ENDPOINT_ENV: self.endpoint()}
+    def agent_env(self, workspace: Path | None = None) -> dict[str, str]:
+        """Env for a broker client, optionally scoped to one workspace.
+
+        The no-argument form is retained for the broker's local test harness and
+        startup plumbing. A real agent turn must pass its workspace so the token
+        cannot be replayed against another directory.
+        """
+        if workspace is None:
+            token = self._token
+        else:
+            token = secrets.token_urlsafe(32)
+            self._session_workspaces[token] = workspace.resolve(strict=False)
+        return {ENDPOINT_ENV: self.endpoint(), TOKEN_ENV: token}
+
+    def revoke_token(self, token: str) -> None:
+        """Revoke one per-turn workspace token after its agent is reaped."""
+        self._session_workspaces.pop(token, None)
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         from aiohttp import web
@@ -522,10 +619,12 @@ class CommandBroker:
 
     async def stop(self) -> None:
         if self._runner is None:
+            self._session_workspaces.clear()
             return
         runner, self._runner = self._runner, None
         await runner.cleanup()
         self._port = None
+        self._session_workspaces.clear()
 
     def write_shims(self) -> None:
         """(Re)generate one executable shim per installed tool.
@@ -559,6 +658,8 @@ class CommandBroker:
                     interpreter=sys.executable,
                     tool=name,
                     endpoint_env=ENDPOINT_ENV,
+                    token_env=TOKEN_ENV,
+                    token_header=TOKEN_HEADER,
                     timeout=int(self._run_timeout),
                     stdin_wait=_STDIN_WAIT_SECONDS,
                 )
@@ -572,6 +673,19 @@ class CommandBroker:
             body = await request.json()
         except (json.JSONDecodeError, ValueError):
             return web.json_response({"error": "malformed request"}, status=400)
+        supplied = request.headers.get(TOKEN_HEADER, "")
+        workspace = None
+        if supplied and hmac.compare_digest(supplied, self._token):
+            # The daemon's private base token is useful only to local callers
+            # such as tests/startup diagnostics; production turns receive a
+            # workspace-scoped token below and never inherit this one.
+            workspace = None
+        elif supplied:
+            workspace = self._session_workspaces.get(supplied)
+        base_token = bool(supplied and hmac.compare_digest(supplied, self._token))
+        if not supplied or (workspace is None and not base_token):
+            logger.warning("commands: deny unauthenticated loopback request")
+            return web.json_response({"error": "unauthorized"}, status=403)
         name = str(body.get("tool", ""))
         tool = self._tools.get(name)
         if tool is None:
@@ -593,12 +707,32 @@ class CommandBroker:
             str(body.get("argv0", "")),
             str(body.get("cwd", "")),
         )
-        result = await self._run(tool, argv, body)
+        result = await self._run(tool, argv, body, workspace=workspace)
         return web.json_response(result.as_payload())
 
     async def _run(
-        self, tool: ShimmedTool, argv: list[str], body: dict
+        self,
+        tool: ShimmedTool,
+        argv: list[str],
+        body: dict,
+        *,
+        workspace: Path | None = None,
     ) -> CommandResult:
+        if not allowed_command(tool, argv):
+            logger.warning(
+                "commands: REFUSE %s %s (not in the configured command allowlist)",
+                tool.name,
+                logs.redact_argv(argv),
+            )
+            return CommandResult(
+                stderr=(
+                    f"[sandbox] {tool.name} subcommand is not allowlisted. "
+                    "Ask the operator to add this exact safe subcommand to "
+                    "commands.tools.allow.\n"
+                ),
+                rc=126,
+                refused=True,
+            )
         if refuses_readback(tool, argv):
             logger.warning(
                 "commands: REFUSE %s %s (credential readback, cwd=%s)",
@@ -608,13 +742,40 @@ class CommandBroker:
             )
             return CommandResult(stderr=_REFUSAL_TEXT + "\n", rc=1, refused=True)
 
+        unsafe_path = _unsafe_path_argument(argv)
+        if unsafe_path is not None:
+            logger.warning(
+                "commands: REFUSE %s %s (absolute or escaping path argument)",
+                tool.name,
+                logs.redact_argv(argv),
+            )
+            return CommandResult(
+                stderr=(
+                    "[sandbox] absolute and workspace-escaping path arguments are "
+                    "not allowed through the command broker.\n"
+                ),
+                rc=126,
+                refused=True,
+            )
+
         binary = shutil.which(tool.name)
         if binary is None:  # pragma: no cover - filtered at construction
             return CommandResult(stderr=f"[sandbox] {tool.name} not found\n", rc=127)
 
-        cwd = str(body.get("cwd") or Path.cwd())
-        if not Path(cwd).is_dir():
-            cwd = str(Path.cwd())
+        cwd = _workspace_cwd(body, workspace)
+        if cwd is None:
+            logger.warning(
+                "commands: REFUSE %s (cwd is outside its session workspace)",
+                tool.name,
+            )
+            return CommandResult(
+                stderr=(
+                    "[sandbox] the command broker only runs inside this session's "
+                    "workspace.\n"
+                ),
+                rc=126,
+                refused=True,
+            )
         # The full argv is the audit record, and it is deliberately at WARNING:
         # every brokered command runs with a real credential, so it should be
         # visible without turning debug logging on.
@@ -640,6 +801,7 @@ class CommandBroker:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except OSError as exc:
             return CommandResult(
