@@ -30,7 +30,10 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
 ### Session resume
 
 - **claude**: `--resume <uuid>` works for both create and resume.
-- **codex**: assigns its own `thread_id`. Persist `<workspace>/.codex_sessions/<our-uuid>` mapping after first turn, then `resume <thread_id>` on follow-ups.
+- **codex**: assigns its own `thread_id`. Persist the authenticated mapping in the
+  daemon-owned `~/.claude-on-the-fly/codex-sessions/` store after the first turn, then
+  `resume <thread_id>` on follow-ups. The store is outside the agent-writable workspace,
+  reads reject symlinks, and new records are atomic owner-only (`0600`) files.
 
 ### Tool / skill counts (footer display)
 
@@ -104,4 +107,4 @@ Both modes report prompt size and window size, which is what the auto-compact ga
 
 - `ensure_persona()` at `src/claude_on_the_fly/agent.py:140` symlinks the global `~/.claude-on-the-fly/CLAUDE.md` into every workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex) — see `PERSONA_FILENAMES` at `agent.py:137`.
 - `transcript.py` handles cross-backend handoff: when the daemon switches backends, it parses the prior backend's session JSONL into a single prompt so context carries over. If you're changing session-log paths or output schemas in a backend, this is the file that will break.
-- `remove_workspace_sessions()` deletes the session directory claude keys to a workspace path but keeps *outside* it (`~/.claude/projects/<hash>/`). codex keeps its mapping inside the workspace, so deleting the workspace is enough for it.
+- `remove_workspace_sessions()` deletes the session directory claude keys to a workspace path but keeps *outside* it (`~/.claude/projects/<hash>/`) and removes matching Codex mappings from the daemon-owned store.

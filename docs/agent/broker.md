@@ -24,8 +24,10 @@ reliable chat identity.
 
 `broker.py` strips caller authentication, injects the keychain credential on the
 upstream leg, and never forwards it across redirects. Routes can constrain methods and
-path tails. `sandbox.agent_env` forwards provider base URLs but omits token-like daemon
-variables.
+path tails. Its loopback URLs are paired with a per-turn token bound to the originating
+workspace, so discovering a port does not by itself authorize a request or let a turn
+choose another cwd. `sandbox.agent_env` forwards provider base URLs but omits token-like
+daemon variables.
 
 ## Egress proxy
 
@@ -37,12 +39,16 @@ common clients discard CONNECT bodies.
 ## Command broker
 
 `commands.py` writes reserved PATH shims and relays argv, bounded stdin, and a narrow
-environment to the real executable outside the jail. Readback prefixes and flags prevent
-credential material crossing back. Tool entries merge by name; removed packaged
-refusals are warned.
+environment to the real executable outside the jail. A tool's explicit `allow` prefixes
+are a deny-by-default positive gate; absolute/escaping path arguments and cwd values
+outside the turn's workspace are rejected before process creation; readback prefixes and
+flags prevent credential material crossing back. Tool entries merge by name; removed
+packaged refusals are warned. An operator override without `allow` therefore disables
+that tool until its safe subcommands are listed.
 
-The broker intentionally does not parse general command authorization. Generic API
-subcommands make such a policy bypassable; use provider-side credential scope.
+The broker does not parse arbitrary CLI semantics after an allowed prefix. Generic API
+subcommands remain unavailable unless explicitly listed, and provider-side credential
+scope is still required because argv inspection cannot safely model every future flag.
 
 ## Tool approvals
 
