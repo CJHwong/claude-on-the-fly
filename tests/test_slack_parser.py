@@ -497,7 +497,7 @@ class TestIngestEventForwards:
         assert "C08M9HWQWV8" in text
         assert "1776404384.245429" in text
         assert "AGFUS" in text
-        assert "[from: chopin] Help…" in text
+        assert '[from-id: U03DXM5L8KX] [display: "chopin"] Help…' in text
         # forwarded block comes before the cover note
         assert text.index("<forwarded_message>") < text.index("Help…")
 
@@ -525,7 +525,7 @@ class TestIngestEventForwards:
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
         _, text = fe._on_message.call_args[0]  # type: ignore[union-attr]
         assert "question body" in text
-        assert "[from: chopin]" in text
+        assert '[from-id: U03DXM5L8KX] [display: "chopin"]' in text
 
     async def test_forward_plus_files(self):
         fe = _make_frontend()
@@ -584,7 +584,7 @@ class TestIngestEventForwards:
 
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
         _, text = fe._on_message.call_args[0]  # type: ignore[union-attr]
-        assert text == "[from: chopin] just a normal DM"
+        assert text == '[from-id: U03DXM5L8KX] [display: "chopin"] just a normal DM'
 
     async def test_app_post_blocks_reach_prompt(self):
         fe = _make_frontend()
@@ -740,8 +740,8 @@ class TestThreadContextFetch:
         # current message must NOT appear inside the context block.
         ctx_block = payload.split("</thread_context>")[0]
         assert "1776800010.000000" not in ctx_block
-        # context block precedes the [from:] cover.
-        assert payload.index("<thread_context>") < payload.index("[from:")
+        # context block precedes the immutable sender marker.
+        assert payload.index("<thread_context>") < payload.index("[from-id:")
 
     async def test_top_level_message_does_not_fetch(self):
         fe = _make_frontend()
@@ -800,7 +800,7 @@ class TestThreadContextFetch:
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
         _, payload = fe._on_message.call_args[0]  # type: ignore[union-attr]
         assert "<thread_context>" not in payload
-        assert "[from: chopin]" in payload
+        assert '[from-id: U03DXM5L8KX] [display: "chopin"]' in payload
 
     async def test_empty_thread_response_no_context_block(self):
         fe = _make_frontend()

@@ -714,7 +714,7 @@ async def _exec_pty(
     agent.track_agent_process(proc, cmd)
 
     async def _wait() -> tuple[bytes, bytes, int]:
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await agent.communicate_capped(proc)
         return stdout, stderr, proc.returncode if proc.returncode is not None else -1
 
     try:

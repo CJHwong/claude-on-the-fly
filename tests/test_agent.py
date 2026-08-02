@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -36,8 +38,10 @@ from claude_on_the_fly.agent import (
     ensure_persona,
     get_backend,
     parse_stream,
+    read_attachment,
     run,
     stats_mode,
+    write_attachment,
 )
 from claude_on_the_fly.backends.claude import ClaudeBackend
 from claude_on_the_fly.transcript import Turn
@@ -376,6 +380,30 @@ class TestCollectOutbox:
         result = collect_outbox(tmp_path)
         assert len(result) == MAX_ATTACHMENTS
 
+    def test_rejects_symlinks_at_collection_and_read(self, tmp_path: Path):
+        outbox = tmp_path / OUTBOX_DIRNAME
+        outbox.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_text("not an attachment")
+        link = outbox / "report.txt"
+        link.symlink_to(target)
+
+        assert collect_outbox(tmp_path) == []
+        with pytest.raises(OSError):
+            read_attachment(link)
+
+    def test_download_replaces_a_symlink_not_its_target(self, tmp_path: Path):
+        target = tmp_path / "outside.txt"
+        target.write_text("original")
+        destination = tmp_path / "workspace.txt"
+        destination.symlink_to(target)
+
+        write_attachment(destination, b"new attachment")
+
+        assert target.read_text() == "original"
+        assert destination.read_bytes() == b"new attachment"
+        assert not destination.is_symlink()
+
 
 class TestArchiveOutbox:
     def test_empty_list_is_noop(self, tmp_path: Path):
@@ -420,12 +448,28 @@ class _AsyncLineIter:
         return self._lines.popleft()
 
 
+class _AsyncChunkReader:
+    """Stand-in for `StreamReader.read`: the payload once, then EOF forever.
+
+    A double that answers every `read()` with the same bytes describes a stream
+    that never ends, which is not a thing a pipe does. It only looked correct
+    while the collector called `read` exactly once.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    async def __call__(self, _limit: int = -1) -> bytes:
+        payload, self._payload = self._payload, b""
+        return payload
+
+
 def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     proc = MagicMock()
     proc.returncode = returncode
     proc.stdout = _AsyncLineIter(stdout)
     proc.stderr = MagicMock()
-    proc.stderr.read = AsyncMock(return_value=stderr)
+    proc.stderr.read = _AsyncChunkReader(stderr)
     proc.wait = AsyncMock(return_value=returncode)
     return proc
 
@@ -567,7 +611,7 @@ class TestExec:
         proc.returncode = None
         proc.stdout = _NeverEnds()
         proc.stderr = MagicMock()
-        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.stderr.read = _AsyncChunkReader(b"")
         proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
         proc.wait = AsyncMock(return_value=-9)
 
@@ -661,7 +705,7 @@ def _never_ending_proc() -> MagicMock:
     proc.returncode = None
     proc.stdout = _NeverEnds()
     proc.stderr = MagicMock()
-    proc.stderr.read = AsyncMock(return_value=b"")
+    proc.stderr.read = _AsyncChunkReader(b"")
     proc.wait = AsyncMock(return_value=-9)
     return proc
 
@@ -2659,14 +2703,14 @@ class TestProcessListeners:
         assert result["result"] == "hi"
 
     async def test_already_exited_process_is_still_announced_finished(self):
-        """_kill_process_tree returns early for a process that ended on its own;
-        a listener that never heard would keep treating it as live."""
+        """A naturally exited process is still announced as finished."""
         from claude_on_the_fly.agent import _kill_process_tree, add_process_listener
 
         seen: list[tuple[int, str, bool]] = []
         proc = MagicMock()
         proc.pid = 777
         proc.returncode = 0  # already exited
+        proc.wait = AsyncMock(return_value=0)
 
         add_process_listener(lambda *args: seen.append(args))
         try:
@@ -2908,17 +2952,16 @@ async def test_a_process_group_that_is_already_gone_is_not_an_error(monkeypatch)
 
 
 async def test_a_pgid_lookup_that_fails_falls_back_to_a_plain_kill(monkeypatch):
-    """getpgid can fail if the child is mid-exit; killing the pid alone is worse
-    than the group but better than leaving it running."""
+    """A failed process-group kill falls back to the direct child."""
     proc = MagicMock()
     proc.pid = 4242
     proc.returncode = None
     proc.wait = AsyncMock(return_value=0)
 
-    def no_such_group(_pid):
+    def no_such_group(_pid, _signal):
         raise OSError("no such process")
 
-    monkeypatch.setattr(agent_mod.os, "getpgid", no_such_group)
+    monkeypatch.setattr(agent_mod.os, "killpg", no_such_group)
     await agent_mod._kill_process_tree(proc)
     proc.kill.assert_called_once()
 
@@ -3039,3 +3082,278 @@ def test_a_backend_that_raises_while_looking_is_skipped_not_fatal(
     # codex is tried after claude and finds nothing here, so the answer is None
     # rather than a propagated RuntimeError.
     assert agent_mod.resolve_session_log(tmp_path, "some-uuid") is None
+
+
+# ---------------------------------------------------------------------------
+# Draining a subprocess's streams
+# ---------------------------------------------------------------------------
+
+
+class TestStreamsAreDrainedToEof:
+    """These use a real subprocess on purpose.
+
+    The bug they exist for is a property of `asyncio.StreamReader.read(n)`:
+    it returns as soon as any byte is buffered, so a collector built on one
+    `read(cap + 1)` keeps only whatever the child flushed first. A test double
+    that hands back its whole output in one call cannot reproduce that, which
+    is how a single-`read` collector passed a suite at 100% coverage while
+    truncating every codex turn to its opening JSONL event.
+    """
+
+    @staticmethod
+    async def _spawn(script: str) -> asyncio.subprocess.Process:
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    # Three writes separated by real gaps: the first read can only see chunk0.
+    _CHUNKED = (
+        "import sys, time\n"
+        "for i in range(3):\n"
+        "    sys.{stream}.write('chunk%d\\n' % i)\n"
+        "    sys.{stream}.flush()\n"
+        "    time.sleep(0.05)\n"
+    )
+
+    async def test_stdout_written_in_several_chunks_arrives_whole(self):
+        proc = await self._spawn(self._CHUNKED.format(stream="stdout"))
+        stdout, _stderr = await agent_mod.communicate_capped(proc)
+        assert stdout == b"chunk0\nchunk1\nchunk2\n"
+
+    async def test_stderr_written_in_several_chunks_arrives_whole(self):
+        proc = await self._spawn(self._CHUNKED.format(stream="stderr"))
+        _stdout, stderr = await agent_mod.communicate_capped(proc)
+        assert stderr == b"chunk0\nchunk1\nchunk2\n"
+
+    async def test_the_helper_itself_reads_past_the_first_chunk(self):
+        """`_consume` drains stderr through this directly, so pin it here too."""
+        proc = await self._spawn(self._CHUNKED.format(stream="stderr"))
+        assert proc.stderr is not None
+        assert await agent_mod._read_to_eof_capped(proc.stderr) == (
+            b"chunk0\nchunk1\nchunk2\n"
+        )
+        await proc.wait()
+
+    async def test_a_child_that_outruns_the_cap_is_killed(self, monkeypatch):
+        monkeypatch.setattr(agent_mod, "MAX_AGENT_OUTPUT_BYTES", 256)
+        killed: list[object] = []
+
+        async def spy(proc):
+            killed.append(proc)
+
+        monkeypatch.setattr(agent_mod, "_kill_process_tree", spy)
+        proc = await self._spawn("import sys; sys.stdout.write('x' * 5000)")
+        with pytest.raises(agent_mod.AgentOutputLimitError):
+            await agent_mod.communicate_capped(proc)
+        assert killed == [proc]
+        # The spy stood in for the real kill, so reap the child here. It may
+        # have finished writing on its own already.
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+
+    async def test_a_child_that_stays_under_the_cap_is_left_alone(self, monkeypatch):
+        monkeypatch.setattr(agent_mod, "MAX_AGENT_OUTPUT_BYTES", 4096)
+        killed: list[object] = []
+
+        async def spy(proc):
+            killed.append(proc)
+
+        monkeypatch.setattr(agent_mod, "_kill_process_tree", spy)
+        proc = await self._spawn("import sys; sys.stdout.write('x' * 100)")
+        stdout, _stderr = await agent_mod.communicate_capped(proc)
+        assert len(stdout) == 100
+        assert killed == []
+
+    async def test_a_stream_that_only_blows_the_cap_after_the_other_closes(
+        self, monkeypatch
+    ):
+        """stdout finishes small and clean; stderr goes over afterwards.
+
+        The early guard only inspects whichever stream completed first, so this
+        is the ordering that reaches the check after both have been gathered.
+        """
+        monkeypatch.setattr(agent_mod, "MAX_AGENT_OUTPUT_BYTES", 256)
+        killed: list[object] = []
+
+        async def spy(proc):
+            killed.append(proc)
+
+        monkeypatch.setattr(agent_mod, "_kill_process_tree", spy)
+
+        proc = MagicMock()
+        proc.stdout = asyncio.StreamReader()
+        proc.stderr = asyncio.StreamReader()
+        proc.stdout.feed_data(b"done")
+        proc.stdout.feed_eof()
+
+        async def blow_the_cap_late():
+            # Long enough that the first wait returns with only stdout done;
+            # a bare sleep(0) lets both land in the same batch.
+            await asyncio.sleep(0.05)
+            proc.stderr.feed_data(b"x" * 5000)
+            proc.stderr.feed_eof()
+
+        asyncio.get_running_loop().create_task(blow_the_cap_late())
+        with pytest.raises(agent_mod.AgentOutputLimitError):
+            await agent_mod.communicate_capped(proc)
+        assert killed == [proc]
+
+    async def test_a_proc_without_real_streams_is_still_capped(self, monkeypatch):
+        """Doubles and embedders that expose only `communicate()`."""
+        monkeypatch.setattr(agent_mod, "MAX_AGENT_OUTPUT_BYTES", 256)
+        killed: list[object] = []
+
+        async def spy(proc):
+            killed.append(proc)
+
+        monkeypatch.setattr(agent_mod, "_kill_process_tree", spy)
+
+        proc = MagicMock()
+        proc.stdout = None
+        proc.stderr = None
+        proc.communicate = AsyncMock(return_value=(b"x" * 5000, b""))
+        with pytest.raises(agent_mod.AgentOutputLimitError):
+            await agent_mod.communicate_capped(proc)
+        assert killed == [proc]
+
+
+class TestConsumeRefusesAnOversizedTurn:
+    """`_consume` caps each stream separately, and says which one it was."""
+
+    async def test_stdout_past_the_cap_is_refused(self, monkeypatch):
+        monkeypatch.setattr(agent_mod, "MAX_AGENT_OUTPUT_BYTES", 64)
+        proc = _make_proc(0, b"x" * 5000 + b"\n")
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(agent_mod.AgentOutputLimitError, match="stdout"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+    async def test_stderr_past_the_cap_is_refused(self, monkeypatch):
+        # Roomy enough that the (small) stdout stream is not what trips it.
+        monkeypatch.setattr(agent_mod, "MAX_AGENT_OUTPUT_BYTES", 1024)
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")), stderr=b"x" * 5000)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(agent_mod.AgentOutputLimitError, match="stderr"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+
+
+class TestAttachmentHandoffRefusesWhatItCannotVouchFor:
+    """The jail boundary. Every check re-runs on the descriptor that supplies
+    the bytes, because the path the caller validated and the file it ends up
+    reading are not guaranteed to be the same thing."""
+
+    def test_an_outbox_entry_that_cannot_be_inspected_is_skipped_loudly(
+        self, tmp_path, caplog
+    ):
+        workspace = tmp_path / "ws"
+        outbox = workspace / OUTBOX_DIRNAME
+        outbox.mkdir(parents=True)
+        (outbox / "good.txt").write_text("fine")
+        (outbox / "gone.txt").write_text("vanishing")
+        real_lstat = Path.lstat
+
+        def flaky(self):
+            if self.name == "gone.txt":
+                raise OSError("vanished")
+            return real_lstat(self)
+
+        with (
+            patch.object(Path, "lstat", flaky),
+            caplog.at_level("WARNING"),
+        ):
+            collected = collect_outbox(workspace)
+
+        assert [p.name for p in collected] == ["good.txt"]
+        assert "cannot inspect gone.txt" in caplog.text
+
+    def test_a_missing_outbox_is_not_an_error(self, tmp_path):
+        assert collect_outbox(tmp_path / "no-such-ws") == []
+
+    def test_an_outbox_that_is_not_a_directory_is_ignored(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / OUTBOX_DIRNAME).write_text("a file, not a directory")
+        assert collect_outbox(workspace) == []
+
+    def test_reading_a_non_regular_file_is_refused(self, tmp_path):
+        """`os.open` on a fifo would block on a reader; the fstat check is what
+        stops a non-file ever getting that far."""
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        fd = os.open(fifo, flags)
+        try:
+            with (
+                patch.object(agent_mod.os, "open", return_value=os.dup(fd)),
+                pytest.raises(OSError, match="not a regular file"),
+            ):
+                read_attachment(fifo)
+        finally:
+            os.close(fd)
+
+    def test_reading_a_file_over_the_cap_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_mod, "MAX_ATTACHMENT_BYTES", 16)
+        big = tmp_path / "big.bin"
+        big.write_bytes(b"x" * 64)
+        with pytest.raises(ValueError, match="exceeds 16 bytes"):
+            read_attachment(big)
+
+    def test_a_file_that_grows_past_the_cap_while_being_read_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """The size check is a fast reject, not the guarantee. The running
+        total is what actually bounds the read."""
+        monkeypatch.setattr(agent_mod, "MAX_ATTACHMENT_BYTES", 32)
+        path = tmp_path / "grows.bin"
+        path.write_bytes(b"x" * 8)
+        real_fstat = agent_mod.os.fstat
+
+        class _SmallStat:
+            def __init__(self, real):
+                self.st_mode = real.st_mode
+                self.st_size = 1
+
+        monkeypatch.setattr(
+            agent_mod.os, "fstat", lambda fd: _SmallStat(real_fstat(fd))
+        )
+        monkeypatch.setattr(agent_mod.os, "read", lambda fd, n: b"y" * 64)
+        with pytest.raises(ValueError, match="exceeds 32 bytes"):
+            read_attachment(path)
+
+    def test_writing_more_than_the_cap_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_mod, "MAX_ATTACHMENT_BYTES", 8)
+        with pytest.raises(ValueError, match="exceeds 8 bytes"):
+            agent_mod.write_attachment(tmp_path / "out.bin", b"x" * 9)
+
+    def test_a_failed_write_leaves_no_temp_file_behind(self, tmp_path, monkeypatch):
+        dest = tmp_path / "out.bin"
+
+        def boom(_src, _dst):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(agent_mod.os, "replace", boom)
+        with pytest.raises(OSError, match="read-only"):
+            agent_mod.write_attachment(dest, b"data")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_installing_a_non_regular_download_is_refused(self, tmp_path):
+        source = tmp_path / "a-directory"
+        source.mkdir()
+        with pytest.raises(OSError, match="not a regular file"):
+            agent_mod.install_download(source, tmp_path / "dest")
+
+    def test_installing_an_oversized_download_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_mod, "MAX_ATTACHMENT_BYTES", 4)
+        source = tmp_path / "big.bin"
+        source.write_bytes(b"x" * 16)
+        with pytest.raises(ValueError, match="exceeds 4 bytes"):
+            agent_mod.install_download(source, tmp_path / "dest")
+        assert source.exists()

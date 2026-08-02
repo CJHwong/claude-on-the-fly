@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import stat
+
 import pytest
 
 from claude_on_the_fly.tui.env_editor import (
@@ -96,6 +98,13 @@ class TestEditAndDiff:
         diff = edit_and_diff(env_file, runner=runner)
         assert env_file.exists()
         assert diff.added == {"TELEGRAM_BOT_TOKEN": "tok"}
+
+    def test_creates_new_env_file_owner_only(self, tmp_path):
+        env_file = tmp_path / ".env"
+
+        edit_and_diff(env_file, runner=lambda cmd, check=False: None)
+
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
 
     def test_no_change_yields_empty_diff(self, tmp_path):
         env_file = tmp_path / ".env"

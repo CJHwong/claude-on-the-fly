@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -367,6 +368,32 @@ class TestCheckTelegram:
             SystemExit, match=r"Invalid Telegram bot token.*Unauthorized"
         ):
             await check_telegram("bad-token")
+
+    @pytest.mark.asyncio
+    @patch("claude_on_the_fly.preflight.httpx.AsyncClient")
+    async def test_token_is_not_emitted_by_httpx_request_logging(
+        self, mock_client_cls, caplog
+    ):
+        client = _make_async_client({"ok": True, "result": {"username": "testbot"}})
+
+        async def logged_get(*args, **kwargs):
+            logging.getLogger("httpx").info(
+                "HTTP Request: GET https://api.telegram.org/botsecret-token/getMe"
+            )
+            return client.get.return_value
+
+        client.get.side_effect = logged_get
+        mock_client_cls.return_value = client
+        httpx_logger = logging.getLogger("httpx")
+        previous_level = httpx_logger.level
+        httpx_logger.setLevel(logging.NOTSET)
+        try:
+            with caplog.at_level(logging.INFO, logger="httpx"):
+                await check_telegram("secret-token")
+        finally:
+            httpx_logger.setLevel(previous_level)
+
+        assert "secret-token" not in "\n".join(r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
