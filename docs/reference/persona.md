@@ -18,3 +18,7 @@ The symlink is re-created on every message, so even if removed mid-session it se
 If no `CLAUDE.md` exists, Claude runs with the default system prompt only.
 
 For codex backend compatibility, the file is also symlinked as `AGENTS.md` in each workspace.
+
+These persona links are intentional. The sandbox's symlink rejection applies to
+untrusted attachment/outbox handoffs and daemon state; it does not reject the
+workspace links that COTF creates for Claude Code and Codex to load their instructions.

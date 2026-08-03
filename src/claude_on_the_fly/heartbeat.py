@@ -139,6 +139,7 @@ class HeartbeatWriter:
             payload = {
                 "frontend": self._frontend,
                 "pid": self._pid,
+                "process_group": os.getpgrp() if self._pid == os.getpid() else None,
                 "started_at": self._started_at,
                 "last_heartbeat": _utcnow_iso(),
                 "version": self._version,

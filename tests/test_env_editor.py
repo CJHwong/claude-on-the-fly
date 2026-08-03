@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import stat
+
 import pytest
 
 from claude_on_the_fly.tui.env_editor import (
@@ -97,6 +100,13 @@ class TestEditAndDiff:
         assert env_file.exists()
         assert diff.added == {"TELEGRAM_BOT_TOKEN": "tok"}
 
+    def test_creates_new_env_file_owner_only(self, tmp_path):
+        env_file = tmp_path / ".env"
+
+        edit_and_diff(env_file, runner=lambda cmd, check=False: None)
+
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
     def test_no_change_yields_empty_diff(self, tmp_path):
         env_file = tmp_path / ".env"
         env_file.write_text("A=1\n")
@@ -186,3 +196,26 @@ def test_example_yaml_is_a_valid_template(tmp_path):
     cfg_path.write_text(EXAMPLE_YAML, encoding="utf-8")
     with pytest.raises(ValueError, match="at least one entry"):
         load_config(cfg_path)
+
+
+def test_a_file_created_between_the_check_and_the_open_is_not_clobbered(
+    tmp_path, monkeypatch
+):
+    """O_EXCL is the point: two TUIs opening the editor at once must not have
+    one truncate the other's new file. Losing the race means using what is
+    already there."""
+    env_file = tmp_path / ".env"
+    real_open = os.open
+
+    def racing_open(path, flags, mode=0o777):
+        # Another process got there first, between exists() and here.
+        if flags & os.O_EXCL:
+            env_file.write_text("SOME_KEY=written-by-the-other-process\n")
+            raise FileExistsError(17, "File exists")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    diff = edit_and_diff(env_file, runner=lambda cmd, check=False: None)
+
+    assert env_file.read_text() == "SOME_KEY=written-by-the-other-process\n"
+    assert not diff.changed

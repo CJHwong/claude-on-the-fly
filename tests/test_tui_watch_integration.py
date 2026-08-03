@@ -72,13 +72,12 @@ async def test_watch_pane_renders_jsonl_for_a_cron_row(
     monkeypatch.delenv("CODEX_MODE", raising=False)
     monkeypatch.delenv("OLLAMA_MODEL", raising=False)
 
-    projects_dir = tmp_path / "claude-projects"
-    projects_dir.mkdir()
+    claude_config = tmp_path / "claude-config"
+    projects_dir = claude_config / "projects"
+    projects_dir.mkdir(parents=True)
     event_log_path = tmp_path / "events.jsonl"
 
-    monkeypatch.setattr(
-        "claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir
-    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_config))
     # EventLog.__init__'s default arg is captured at function definition, so
     # patching `events.DEFAULT_PATH` is silently ignored. Wrap the class so a
     # no-arg `EventLog()` reads from our tmp file.

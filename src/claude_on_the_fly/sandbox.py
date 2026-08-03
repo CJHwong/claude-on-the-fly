@@ -58,7 +58,12 @@ _PASSTHROUGH_SUFFIXES = ("_BASE_URL",)
 # daemon; without the passthrough every gated call would fail closed on a
 # missing endpoint, which looks exactly like a denial.
 _PASSTHROUGH_ENDPOINTS = frozenset(
-    {"COTF_CMD_ENDPOINT", "COTF_APPROVE_URL", "COTF_APPROVE_NOTIFY_URL"}
+    {
+        "COTF_CMD_ENDPOINT",
+        "COTF_CMD_TOKEN",
+        "COTF_APPROVE_URL",
+        "COTF_APPROVE_NOTIFY_URL",
+    }
 )
 # claude-pty reads this for its tmux session name. The daemon sets it so it knows
 # which pane to type an approval into; claude-pty's own default is PID-based and
@@ -595,6 +600,10 @@ READABLE = "READABLE"
 BROKEN = "BROKEN"
 
 
+class SandboxBoundaryError(RuntimeError):
+    """The live jail did not enforce one of its credential-read denies."""
+
+
 async def _probe_deny(spec: str, workspace: Path) -> str | None:
     """Attempt one expected-denied read under the live profile. Outcome, or None
     if the probe itself never ran and so says nothing either way."""
@@ -650,6 +659,8 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     unified log, `(with report)` is rejected for deny actions, and three separate
     log predicates over a real violation return nothing. Verified, not assumed.
     So the agent's own blocked reads are unobservable from this side, permanently.
+    A broken profile or readable credential path is therefore a startup failure,
+    not a warning after which autonomous work continues.
 
     What *is* observable is whether the boundary was in force, which this answers
     by attempting the reads itself under the same profile the agent gets. It does
@@ -697,5 +708,11 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
             len(results),
             _fs_base_profile().name,
             len(results) - len(denied),
+        )
+    if broken or leaked:
+        details = ", ".join([*broken, *leaked])
+        raise SandboxBoundaryError(
+            "sandbox boundary self-test failed; refusing to start autonomous "
+            f"work ({details})"
         )
     return results

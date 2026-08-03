@@ -31,9 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from dotenv import dotenv_values
-
-from claude_on_the_fly import checks, logs
+from claude_on_the_fly import checks, envfile, logs
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import CheckResult
 from claude_on_the_fly.heartbeat import STATE_DIR
@@ -200,13 +198,13 @@ def _remove_heartbeat(frontend: str) -> None:
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
-    """Merge os.environ with the env file (if it exists). File wins on conflicts."""
-    merged: dict[str, str] = dict(os.environ)
-    if env_file is not None and env_file.is_file():
-        for k, v in dotenv_values(env_file).items():
-            if v is not None:
-                merged[k] = v
-    return merged
+    """Merge os.environ with the env file (if it exists). File wins on conflicts.
+
+    Kept as the spawn path's name for the operation; the operation itself lives
+    in `envfile` so `transcript` and `checks` can ask the same question without
+    importing the TUI.
+    """
+    return envfile.merged(env_file)
 
 
 def _heartbeat_fresh(frontend: str) -> bool:
@@ -224,6 +222,43 @@ def _heartbeat_fresh(frontend: str) -> bool:
         return age < HEARTBEAT_FRESH_WINDOW_S
     except (OSError, json.JSONDecodeError, ValueError):
         return False
+
+
+def _agent_group_owned(frontend: str, pid: int) -> bool:
+    """Whether the daemon advertises a private process group we may signal."""
+    try:
+        data = json.loads(_heartbeat_file(frontend).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return data.get("pid") == pid and data.get("process_group") == pid
+
+
+def _signal_daemon(frontend: str, pid: int, sig: signal.Signals) -> None:
+    """Signal the daemon and its children when the daemon owns a process group."""
+    try:
+        if _agent_group_owned(frontend, pid):
+            os.killpg(pid, sig)
+        else:
+            # Older/external daemons do not prove that their group is private;
+            # signaling a shared shell group could kill unrelated processes.
+            os.kill(pid, sig)
+    except OSError as exc:
+        logger.warning("signal %s pid=%d failed: %s", sig.name, pid, exc)
+
+
+def _sweep_agent_groups(frontend: str) -> None:
+    """Reap detached agent groups recorded by a chat daemon."""
+    path = DATA_DIR / "state" / f"{frontend}.pids"
+    if not path.is_file():
+        return
+    try:
+        from claude_on_the_fly.jobs.orphans import ProcessLedger
+
+        ProcessLedger(path).sweep()
+    except Exception:
+        # Stopping the daemon must still complete if the optional recovery pass
+        # cannot inspect a stale ledger.
+        logger.exception("could not sweep detached agent groups for %s", frontend)
 
 
 def _tail_file(path: Path, n_lines: int = 25) -> str:
@@ -320,8 +355,7 @@ def spawn(
             time.sleep(HEARTBEAT_POLL_INTERVAL_S)
 
         # Timed out without a heartbeat — child still running but unresponsive.
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        _signal_daemon(frontend, proc.pid, signal.SIGTERM)
         _remove_pid(frontend)
         raise SpawnTimeout(
             frontend=frontend,
@@ -347,10 +381,7 @@ def stop(frontend: str, *, grace_s: float = DEFAULT_GRACE_S) -> int:
         _remove_heartbeat(frontend)
         raise NotRunning(f"{frontend} is not running")
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as exc:
-        logger.warning("SIGTERM to %s pid=%d failed: %s", frontend, pid, exc)
+    _signal_daemon(frontend, pid, signal.SIGTERM)
 
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
@@ -362,10 +393,8 @@ def stop(frontend: str, *, grace_s: float = DEFAULT_GRACE_S) -> int:
         time.sleep(KILL_POLL_INTERVAL_S)
 
     # Grace expired — escalate to SIGKILL.
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError as exc:
-        logger.warning("SIGKILL to %s pid=%d failed: %s", frontend, pid, exc)
+    _signal_daemon(frontend, pid, signal.SIGKILL)
+    _sweep_agent_groups(frontend)
 
     # Best-effort second wait so callers don't race on file cleanup.
     for _ in range(20):

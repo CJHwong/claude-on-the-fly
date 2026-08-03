@@ -43,6 +43,11 @@ def _echo_app(record: list[dict]) -> web.Application:
     return app
 
 
+def _url(bro: Broker, path: str) -> str:
+    """Build an authenticated URL, including the broker's path capability."""
+    return f"http://127.0.0.1:{bro.port}/_session/{bro._token}{path}"
+
+
 @pytest.fixture
 def fake_keychain(monkeypatch):
     secrets: dict[str, str] = {}
@@ -64,12 +69,12 @@ async def test_injects_credential_and_strips_caller_auth(fake_keychain):
             )
         ]
     )
-    port = await bro.start()
+    await bro.start()
     try:
         async with ClientSession() as client:
             # Agent sends a forged key, as a poisoned file might coach it to.
             resp = await client.post(
-                f"http://127.0.0.1:{port}/anthropic/v1/messages",
+                _url(bro, "/anthropic/v1/messages"),
                 headers={
                     "x-api-key": "ATTACKER-EMBEDDED",
                     "authorization": "Bearer EVIL",
@@ -108,10 +113,10 @@ async def test_bearer_value_prefix(fake_keychain):
             )
         ]
     )
-    port = await bro.start()
+    await bro.start()
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/openai/v1/models")
+            resp = await client.get(_url(bro, "/openai/v1/models"))
             assert resp.status == 200
     finally:
         await bro.stop()
@@ -134,10 +139,10 @@ async def test_unknown_route_is_refused(fake_keychain):
             )
         ]
     )
-    port = await bro.start()
+    await bro.start()
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/evil/exfil")
+            resp = await client.get(_url(bro, "/evil/exfil"))
             assert resp.status == 403
     finally:
         await bro.stop()
@@ -172,11 +177,11 @@ async def test_does_not_follow_redirects(fake_keychain):
             )
         ]
     )
-    port = await bro.start()
+    await bro.start()
     try:
         async with ClientSession() as client:
             resp = await client.get(
-                f"http://127.0.0.1:{port}/anthropic/start", allow_redirects=False
+                _url(bro, "/anthropic/start"), allow_redirects=False
             )
             assert resp.status == 302
     finally:
@@ -239,11 +244,9 @@ async def test_base_url_env_after_start(fake_keychain):
             )
         ]
     )
-    port = await bro.start()
+    await bro.start()
     try:
-        assert bro.base_url_env() == {
-            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}/anthropic"
-        }
+        assert bro.base_url_env() == {"ANTHROPIC_BASE_URL": _url(bro, "/anthropic")}
     finally:
         await bro.stop()
 
@@ -266,7 +269,7 @@ async def test_start_default_broker_publishes_base_url(monkeypatch):
     assert bro is not None
     try:
         assert (
-            os.environ["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{bro.port}/anthropic"
+            os.environ["ANTHROPIC_BASE_URL"] == bro.base_url_env()["ANTHROPIC_BASE_URL"]
         )
     finally:
         await bro.stop()
@@ -303,7 +306,7 @@ async def _scoped_broker(fake_keychain, received, approvals=None, **route_kwargs
 
 async def test_scoped_route_allows_listed_method_and_tail(fake_keychain):
     received: list[dict] = []
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain,
         received,
         methods=frozenset({"POST"}),
@@ -311,9 +314,7 @@ async def test_scoped_route_allows_listed_method_and_tail(fake_keychain):
     )
     try:
         async with ClientSession() as client:
-            resp = await client.post(
-                f"http://127.0.0.1:{port}/scoped/v1/messages", json={"hi": 1}
-            )
+            resp = await client.post(_url(bro, "/scoped/v1/messages"), json={"hi": 1})
             assert resp.status == 200
     finally:
         await bro.stop()
@@ -325,12 +326,12 @@ async def test_scoped_route_allows_listed_method_and_tail(fake_keychain):
 
 async def test_scoped_route_blocks_disallowed_method(fake_keychain):
     received: list[dict] = []
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain, received, methods=frozenset({"POST"})
     )
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            resp = await client.get(_url(bro, "/scoped/v1/messages"))
             assert resp.status == 403
     finally:
         await bro.stop()
@@ -341,12 +342,12 @@ async def test_scoped_route_blocks_disallowed_method(fake_keychain):
 
 async def test_scoped_route_blocks_disallowed_tail(fake_keychain):
     received: list[dict] = []
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain, received, allowed_tails=frozenset({"v1/messages"})
     )
     try:
         async with ClientSession() as client:
-            resp = await client.post(f"http://127.0.0.1:{port}/scoped/v1/admin")
+            resp = await client.post(_url(bro, "/scoped/v1/admin"))
             assert resp.status == 403
     finally:
         await bro.stop()
@@ -357,13 +358,11 @@ async def test_scoped_route_blocks_disallowed_tail(fake_keychain):
 async def test_unscoped_route_allows_any_method_and_tail(fake_keychain):
     # Empty methods/allowed_tails (the default) preserve today's behavior.
     received: list[dict] = []
-    bro, up_runner, port = await _scoped_broker(fake_keychain, received)
+    bro, up_runner, _port = await _scoped_broker(fake_keychain, received)
     try:
         async with ClientSession() as client:
             for method, tail in (("GET", "anything"), ("DELETE", "v9/wild")):
-                resp = await client.request(
-                    method, f"http://127.0.0.1:{port}/scoped/{tail}"
-                )
+                resp = await client.request(method, _url(bro, f"/scoped/{tail}"))
                 assert resp.status == 200
     finally:
         await bro.stop()
@@ -379,7 +378,7 @@ async def test_scope_miss_reaches_upstream_when_operator_approves(fake_keychain)
     in-scope call: approval widens policy, it does not bypass the broker."""
     received: list[dict] = []
     gate = RecordingGate(default=True)
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain,
         received,
         approvals=ApprovalBroker(gate),
@@ -387,7 +386,7 @@ async def test_scope_miss_reaches_upstream_when_operator_approves(fake_keychain)
     )
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            resp = await client.get(_url(bro, "/scoped/v1/messages"))
             assert resp.status == 200
     finally:
         await bro.stop()
@@ -401,7 +400,7 @@ async def test_scope_miss_reaches_upstream_when_operator_approves(fake_keychain)
 async def test_scope_miss_still_403s_when_operator_declines(fake_keychain):
     received: list[dict] = []
     gate = RecordingGate(default=False)
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain,
         received,
         approvals=ApprovalBroker(gate),
@@ -409,7 +408,7 @@ async def test_scope_miss_still_403s_when_operator_declines(fake_keychain):
     )
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            resp = await client.get(_url(bro, "/scoped/v1/messages"))
             assert resp.status == 403
             body = await resp.text()
     finally:
@@ -426,7 +425,7 @@ async def test_scope_miss_still_403s_when_operator_declines(fake_keychain):
 async def test_approved_scope_is_cached_for_later_calls(fake_keychain):
     received: list[dict] = []
     gate = RecordingGate(default=True)
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain,
         received,
         approvals=ApprovalBroker(gate),
@@ -435,7 +434,7 @@ async def test_approved_scope_is_cached_for_later_calls(fake_keychain):
     try:
         async with ClientSession() as client:
             for _ in range(3):
-                resp = await client.post(f"http://127.0.0.1:{port}/scoped/v1/admin")
+                resp = await client.post(_url(bro, "/scoped/v1/admin"))
                 assert resp.status == 200
     finally:
         await bro.stop()
@@ -448,12 +447,12 @@ async def test_approved_scope_is_cached_for_later_calls(fake_keychain):
 async def test_scope_miss_denies_without_an_approval_channel(fake_keychain):
     """No gate wired in keeps the original deny-only behavior."""
     received: list[dict] = []
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain, received, methods=frozenset({"POST"})
     )
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            resp = await client.get(_url(bro, "/scoped/v1/messages"))
             assert resp.status == 403
     finally:
         await bro.stop()
@@ -464,7 +463,7 @@ async def test_scope_miss_denies_without_an_approval_channel(fake_keychain):
 async def test_in_scope_call_never_asks(fake_keychain):
     received: list[dict] = []
     gate = RecordingGate(default=True)
-    bro, up_runner, port = await _scoped_broker(
+    bro, up_runner, _port = await _scoped_broker(
         fake_keychain,
         received,
         approvals=ApprovalBroker(gate),
@@ -473,7 +472,7 @@ async def test_in_scope_call_never_asks(fake_keychain):
     )
     try:
         async with ClientSession() as client:
-            resp = await client.post(f"http://127.0.0.1:{port}/scoped/v1/messages")
+            resp = await client.post(_url(bro, "/scoped/v1/messages"))
             assert resp.status == 200
     finally:
         await bro.stop()
@@ -484,11 +483,11 @@ async def test_in_scope_call_never_asks(fake_keychain):
 async def test_add_route_widens_a_live_broker(fake_keychain):
     received: list[dict] = []
     fake_keychain["cotf-late"] = "LATE-KEY"
-    bro, up_runner, port = await _scoped_broker(fake_keychain, received)
+    bro, up_runner, _port = await _scoped_broker(fake_keychain, received)
     up2_runner, up2_port = await _start(_echo_app(received))
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/late/v1/thing")
+            resp = await client.get(_url(bro, "/late/v1/thing"))
             assert resp.status == 403
             bro.add_route(
                 Route(
@@ -498,7 +497,7 @@ async def test_add_route_widens_a_live_broker(fake_keychain):
                     keychain_service="cotf-late",
                 )
             )
-            resp = await client.get(f"http://127.0.0.1:{port}/late/v1/thing")
+            resp = await client.get(_url(bro, "/late/v1/thing"))
             assert resp.status == 200
     finally:
         await bro.stop()
@@ -601,10 +600,10 @@ async def test_gzipped_upstream_response_survives_the_broker(monkeypatch):
             )
         ]
     )
-    port = await broker.start()
+    await broker.start()
     try:
         async with ClientSession() as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/up/v1/thing")
+            resp = await client.get(_url(broker, "/up/v1/thing"))
             assert resp.status == 200
             body = await resp.read()
         assert body == payload, "body did not survive the broker intact"
@@ -643,12 +642,12 @@ async def test_body_larger_than_aiohttps_default_cap_still_reaches_upstream(
             )
         ]
     )
-    port = await bro.start()
+    await bro.start()
     try:
         async with ClientSession() as client:
             for size in (2 * 1024 * 1024, 8 * 1024 * 1024):
                 resp = await client.post(
-                    f"http://127.0.0.1:{port}/anthropic/v1/messages",
+                    _url(bro, "/anthropic/v1/messages"),
                     data=b"x" * size,
                 )
                 assert resp.status == 200, await resp.text()
@@ -729,3 +728,51 @@ def test_port_before_start_raises_rather_than_returning_a_placeholder():
     )
     with pytest.raises(RuntimeError, match="not started"):
         _ = bro.port
+
+
+class TestLoopbackAuthentication:
+    """The bearer path capability is the only thing separating the agent's own
+    requests from anything else that can reach loopback. Every rejection below
+    must be a 403 with no upstream call and no credential in play."""
+
+    @pytest.mark.parametrize(
+        ("path", "why"),
+        [
+            pytest.param("/anthropic/v1/messages", "no session prefix", id="no-prefix"),
+            pytest.param("/_session/", "no token at all", id="empty"),
+            pytest.param(
+                "/_session/sometoken", "token but no route tail", id="no-tail"
+            ),
+            pytest.param("/_session//v1/messages", "empty token", id="blank-token"),
+            pytest.param(
+                "/_session/wrong-token/v1/messages", "wrong token", id="wrong"
+            ),
+        ],
+    )
+    async def test_an_unauthenticated_request_is_refused(
+        self, path, why, fake_keychain
+    ):
+        fake_keychain["cotf-anthropic"] = "REAL-INJECTED-KEY"
+        received: list[dict] = []
+        up_runner, up_port = await _start(_echo_app(received))
+        bro = Broker(
+            [
+                Route(
+                    prefix="/anthropic",
+                    upstream=f"http://localhost:{up_port}",
+                    header="x-api-key",
+                    keychain_service="cotf-anthropic",
+                )
+            ]
+        )
+        await bro.start()
+        try:
+            async with ClientSession() as client:
+                resp = await client.post(f"http://127.0.0.1:{bro.port}{path}")
+                body = await resp.text()
+            assert resp.status == 403, why
+            assert "authentication required" in body
+            assert received == [], "upstream was reached despite a failed auth"
+        finally:
+            await bro.stop()
+            await up_runner.cleanup()

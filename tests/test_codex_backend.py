@@ -23,6 +23,11 @@ def _ndjson(*messages: dict) -> bytes:
     return b"\n".join(json.dumps(m).encode() for m in messages)
 
 
+def _write_mapping(workspace: Path, session_uuid: str, thread_id: str) -> Path:
+    """Create a daemon-owned mapping for backend tests."""
+    return codex_mod.codex_state.write_thread_id(workspace, session_uuid, thread_id)
+
+
 # ---------------------------------------------------------------------------
 # parse_codex_stream
 # ---------------------------------------------------------------------------
@@ -345,10 +350,11 @@ class TestCodexBackendRun:
         cmd = mock.call_args[0][1]
         # No `resume` subcommand on first call.
         assert "resume" not in cmd
-        # Session file written with the codex thread_id.
-        session_file = workspace / ".codex_sessions" / "our-session-1"
-        assert session_file.exists()
-        assert session_file.read_text() == "codex-thread-xyz"
+        # The mapping is daemon-owned and workspace-bound, not agent-writable.
+        mapping = codex_mod.codex_state.mapping_path(workspace, "our-session-1")
+        record = json.loads(mapping.read_text())
+        assert record["thread_id"] == "codex-thread-xyz"
+        assert not (workspace / ".codex_sessions").exists()
         assert resp.body == "hello"
 
     async def test_killed_first_turn_still_delivers_reply_and_persists_thread(
@@ -383,15 +389,13 @@ class TestCodexBackendRun:
         # fallback token count honest instead of billing the turn as free.
         assert resp.tokens_in == 100
         assert resp.tokens_out == 5
-        session_file = workspace / ".codex_sessions" / "killed-session"
-        assert session_file.read_text() == "codex-thread-killed"
+        mapping = codex_mod.codex_state.mapping_path(workspace, "killed-session")
+        assert json.loads(mapping.read_text())["thread_id"] == "codex-thread-killed"
 
     async def test_second_call_resumes_persisted_thread(self, tmp_path: Path):
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        sessions_dir = workspace / ".codex_sessions"
-        sessions_dir.mkdir()
-        (sessions_dir / "our-session-1").write_text("existing-thread")
+        mapping = _write_mapping(workspace, "our-session-1", "existing-thread")
 
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -407,8 +411,8 @@ class TestCodexBackendRun:
         assert "resume" in cmd
         idx = cmd.index("resume")
         assert cmd[idx + 1] == "existing-thread"
-        # Session file unchanged (we do not overwrite on resume).
-        assert (sessions_dir / "our-session-1").read_text() == "existing-thread"
+        # Mapping unchanged (we do not overwrite on resume).
+        assert json.loads(mapping.read_text())["thread_id"] == "existing-thread"
 
     async def test_no_launcher_omits_ollama_prefix(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -567,9 +571,7 @@ class TestCodexBackendRun:
         not codex stdout's cumulative running total."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        sessions_dir = workspace / ".codex_sessions"
-        sessions_dir.mkdir()
-        (sessions_dir / "sess-resume").write_text("existing-thread")
+        _write_mapping(workspace, "sess-resume", "existing-thread")
 
         # Simulate: pre-exec total was 12000 in, 100 out.
         # Post-exec total is 26000 in, 250 out. This exec contributed 14000 / 150.
@@ -898,9 +900,7 @@ class TestCodexBackendHandoff:
         it bloats input tokens by ~4.7KB per turn for nothing."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        sessions_dir = workspace / ".codex_sessions"
-        sessions_dir.mkdir()
-        (sessions_dir / "sess-resume").write_text("existing-thread")
+        _write_mapping(workspace, "sess-resume", "existing-thread")
 
         with (
             patch(
@@ -1007,11 +1007,9 @@ class TestCodexBackendTakeoverCommand:
         self, tmp_path: Path
     ) -> None:
         workspace = tmp_path / "ws"
-        sessions_dir = workspace / ".codex_sessions"
-        sessions_dir.mkdir(parents=True)
         session_uuid = "deadbeef-1234"
         thread_id = "thread-abc-xyz"
-        (sessions_dir / session_uuid).write_text(f"{thread_id}\n")
+        _write_mapping(workspace, session_uuid, thread_id)
 
         cmd = CodexBackend().takeover_command(workspace, session_uuid)
         assert cmd == f"codex resume {thread_id}"
@@ -1023,9 +1021,6 @@ class TestCodexBackendTakeoverCommand:
 
     def test_returns_none_when_mapping_file_empty(self, tmp_path: Path) -> None:
         workspace = tmp_path / "ws"
-        sessions_dir = workspace / ".codex_sessions"
-        sessions_dir.mkdir(parents=True)
-        (sessions_dir / "empty-uuid").write_text("")
         assert CodexBackend().takeover_command(workspace, "empty-uuid") is None
 
 
@@ -1042,8 +1037,8 @@ class TestCodexSessionLogPath:
 
     def test_resolves_via_thread_mapping(self, codex_sessions_dir, tmp_path) -> None:
         ws = tmp_path / "ws"
-        (ws / ".codex_sessions").mkdir(parents=True)
-        (ws / ".codex_sessions" / "our-uuid").write_text("threadabc\n")
+        ws.mkdir()
+        _write_mapping(ws, "our-uuid", "threadabc")
         rollout = codex_sessions_dir / "rollout-2026-06-06T10-00-00-threadabc.jsonl"
         rollout.write_text('{"id":"threadabc"}\n')
 
@@ -1054,8 +1049,6 @@ class TestCodexSessionLogPath:
 
     def test_none_when_mapping_empty(self, codex_sessions_dir, tmp_path) -> None:
         ws = tmp_path / "ws"
-        (ws / ".codex_sessions").mkdir(parents=True)
-        (ws / ".codex_sessions" / "our-uuid").write_text("")
         assert CodexBackend().session_log_path(ws, "our-uuid") is None
 
     def test_resolves_live_by_cwd_before_mapping_written(
@@ -1113,6 +1106,25 @@ class TestExpandCodexPrompt:
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))
         assert _expand_codex_prompt("/nope") == "/nope"
 
+    @pytest.mark.parametrize("invocation", ["absolute", "traversal"])
+    def test_prompt_name_cannot_escape_prompt_directory(
+        self, tmp_path, monkeypatch, invocation
+    ):
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("HOST_SECRET")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+        if invocation == "absolute":
+            prompt = "/" + str(outside.with_suffix(""))
+        else:
+            prompt = "/prompts/../outside"
+
+        assert _expand_codex_prompt(prompt) == prompt
+
     def test_expands_body_strips_frontmatter_and_named_args(
         self, tmp_path, monkeypatch
     ):
@@ -1165,9 +1177,7 @@ class TestCodexCompact:
     """
 
     def _wire_thread(self, workspace: Path, session_uuid: str, thread_id: str) -> None:
-        mapping = workspace / ".codex_sessions"
-        mapping.mkdir(parents=True, exist_ok=True)
-        (mapping / session_uuid).write_text(thread_id)
+        _write_mapping(workspace, session_uuid, thread_id)
 
     async def test_no_thread_yet_is_not_reported_as_unsupported(self, tmp_path):
         outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
@@ -1369,6 +1379,41 @@ class TestCodexExec:
 
 
 class TestExpandCodexPromptFailures:
+    def test_a_symlinked_prompt_pointing_outside_is_not_expanded(
+        self, tmp_path, monkeypatch
+    ):
+        """The name has no slash and the file exists, so only comparing the
+        *resolved* parent catches it. A link is how you escape a directory
+        without a traversal sequence in the name."""
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("HOST_SECRET")
+        (prompts / "sneaky.md").symlink_to(outside)
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+        assert _expand_codex_prompt("/sneaky") == "/sneaky"
+
+    def test_an_unresolvable_prompt_path_is_left_alone(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The traversal guard resolves both sides to compare them. If that
+        resolution itself fails, the name cannot be proven to stay inside the
+        prompts directory, so the text passes through unexpanded."""
+        from claude_on_the_fly.backends import codex as codex_module
+
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+        def boom(self, *args, **kwargs):
+            raise OSError("too many levels of symbolic links")
+
+        monkeypatch.setattr(codex_module.Path, "resolve", boom)
+        with caplog.at_level("WARNING"):
+            assert codex_module._expand_codex_prompt("/review") == "/review"
+        assert "cannot resolve prompt review" in caplog.text
+
     def test_a_template_that_cannot_be_read_leaves_the_prompt_alone(
         self, tmp_path, monkeypatch, caplog
     ):

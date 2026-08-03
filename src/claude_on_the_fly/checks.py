@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from claude_on_the_fly import envfile
+
 Status = Literal["ok", "missing", "invalid", "warn"]
 
 DOTENV_HINT = "set in ~/.claude-on-the-fly/.env"
@@ -770,12 +772,12 @@ def check_binaries(env: Mapping[str, str]) -> list[CheckResult]:
     if mode == "ollama":
         results.append(_which("ollama", "Install: https://ollama.com"))
     if mode == "pty" and backend == "claude":
-        results.extend(check_pty_setup())
+        results.extend(check_pty_setup(env))
 
     return results
 
 
-def check_pty_setup() -> list[CheckResult]:
+def check_pty_setup(env: Mapping[str, str] | None = None) -> list[CheckResult]:
     """Validate claude-pty install + hook wiring for CLAUDE_MODE=pty.
 
     Three sub-checks: the pty binary resolves, jq is on PATH (pty shells out
@@ -805,8 +807,8 @@ def check_pty_setup() -> list[CheckResult]:
 
     results.append(_which("jq", "Install: brew install jq (pty shells out to jq)"))
 
-    results.append(check_pty_hooks())
-    results.append(check_pty_hook_paths())
+    results.append(check_pty_hooks(env))
+    results.append(check_pty_hook_paths(env))
     results.append(check_pty_tmux_for_approvals())
     return results
 
@@ -899,7 +901,7 @@ def _is_pty_shim(command: str, marker: str) -> bool:
         return PTY_PROJECT_SLUG in command
 
 
-def check_pty_hooks() -> CheckResult:
+def check_pty_hooks(env: Mapping[str, str] | None = None) -> CheckResult:
     """Verify ~/.claude/settings.json wires pty's Stop hook + statusline shim.
 
     The two hooks are what make pty work — without them claude-pty hangs
@@ -914,8 +916,7 @@ def check_pty_hooks() -> CheckResult:
         PTY_INSTALL_HINT,
     )
 
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-    settings_path = Path(config_dir) / "settings.json"
+    settings_path = envfile.claude_config_dir(env) / "settings.json"
     if not settings_path.is_file():
         return CheckResult(
             name="claude-pty hooks",
@@ -991,7 +992,7 @@ def check_pty_hooks() -> CheckResult:
     )
 
 
-def check_pty_hook_paths() -> CheckResult:
+def check_pty_hook_paths(env: Mapping[str, str] | None = None) -> CheckResult:
     """Report wired pty hooks whose script is gone.
 
     install.sh only ever dedups its *own* path — deliberately, since several
@@ -1001,8 +1002,7 @@ def check_pty_hook_paths() -> CheckResult:
     Reported rather than repaired, for the same reason install.sh leaves it: the
     entry belongs to whoever wrote it.
     """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-    settings_path = Path(config_dir) / "settings.json"
+    settings_path = envfile.claude_config_dir(env) / "settings.json"
     import json as _json
 
     try:
@@ -1046,7 +1046,7 @@ def check_pty_hook_paths() -> CheckResult:
     )
 
 
-def pty_postcompact_hook_wired() -> bool:
+def pty_postcompact_hook_wired(env: Mapping[str, str] | None = None) -> bool:
     """Whether this machine's settings.json can finish a pty compaction.
 
     Called on the compaction path itself, not only by the doctor: without the
@@ -1057,11 +1057,11 @@ def pty_postcompact_hook_wired() -> bool:
     Fails closed on an unreadable config — refusing with a message beats an
     unbounded wait.
     """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    settings_path = envfile.claude_config_dir(env) / "settings.json"
     import json as _json
 
     try:
-        config = _json.loads((Path(config_dir) / "settings.json").read_text())
+        config = _json.loads(settings_path.read_text())
     except (_json.JSONDecodeError, OSError):
         return False
     return _has_pty_postcompact_hook(config)

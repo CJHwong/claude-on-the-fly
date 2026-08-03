@@ -169,6 +169,10 @@ class GrantStore:
             return False
         return True
 
+    def revoke(self, key: str) -> None:
+        """Remove one live grant immediately, if it exists."""
+        self._expiry.pop(key, None)
+
     def active(self) -> list[str]:
         """Unexpired grant keys, for the startup summary and heartbeat."""
         return [key for key in list(self._expiry) if self.allows(key)]

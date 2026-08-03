@@ -609,3 +609,18 @@ async def test_the_rate_limit_log_names_the_kind_that_ran_out(caplog):
     with caplog.at_level("WARNING", logger="claude_on_the_fly.approvals"):
         assert await broker.check(_tool_request("bash:cat")) is False
     assert "tool requests" in caplog.text
+
+
+class TestRevoke:
+    """A grant outliving the policy that justified it is the failure mode: the
+    egress reload calls this when a host leaves the allowlist."""
+
+    def test_a_live_grant_stops_allowing_once_revoked(self):
+        store = GrantStore()
+        store.grant("host:example.com:443", ttl_seconds=3600)
+        assert store.allows("host:example.com:443")
+        store.revoke("host:example.com:443")
+        assert not store.allows("host:example.com:443")
+
+    def test_revoking_something_that_was_never_granted_is_silent(self):
+        GrantStore().revoke("host:never-asked:443")

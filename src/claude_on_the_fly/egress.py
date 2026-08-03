@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import re
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
 from claude_on_the_fly import settings
 from claude_on_the_fly.approvals import ApprovalBroker, ApprovalRequest
@@ -53,8 +56,9 @@ def parse_hosts(section: object, key: str, *, source: str) -> frozenset[str]:
     error naming the file, not a silently dead entry that turns into an approval
     prompt months later for a host the operator believes they already allowed.
     """
-    if not isinstance(section, dict):
+    if not isinstance(section, Mapping):
         raise ValueError(f"{source}: the egress section must be a mapping")
+    section = cast(Mapping[str, object], section)
     value = section.get(key)
     if value is None:
         return frozenset()
@@ -110,6 +114,16 @@ def default_allowed_hosts() -> frozenset[str]:
     are deliberately absent because each is a real decision an operator makes.
     """
     return _egress_hosts("allow")
+
+
+def default_private_hosts() -> frozenset[str]:
+    """Hosts explicitly allowed to resolve to private/loopback addresses.
+
+    This is separate from ``egress.allow`` so adding a hostname to the normal
+    allowlist cannot accidentally turn DNS into an SSRF route. Local development
+    services need an explicit second opt-in.
+    """
+    return _egress_hosts("private_allow")
 
 
 def default_never_ask() -> frozenset[str]:
@@ -253,6 +267,15 @@ def is_dns_safe_host(host: str) -> bool:
     return bool(host) and _DNS_SAFE_HOST.match(host) is not None
 
 
+def _explicit_private_address(address: str) -> bool:
+    """Whether an address is private/loopback but not link-local metadata space."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return (parsed.is_private or parsed.is_loopback) and not parsed.is_link_local
+
+
 def parse_connect_target(target: str) -> tuple[str, int] | None:
     """Split a CONNECT target into (host, port), or None if malformed.
 
@@ -283,6 +306,7 @@ class EgressProxy:
         *,
         allowed_hosts: frozenset[str] = frozenset(),
         never_ask: frozenset[str] | None = None,
+        private_allowed_hosts: frozenset[str] = frozenset(),
         grant_ttl_seconds: float = 3600.0,
         label: str = "",
     ) -> None:
@@ -295,15 +319,22 @@ class EgressProxy:
         # Pre-approved hosts skip the operator entirely: `egress.allow` from the
         # settings file (the model APIs, plus whatever the operator added) unioned
         # with anything the caller front-loaded.
-        self._allowed = default_allowed_hosts() | frozenset(
-            host.lower() for host in allowed_hosts
+        self._front_loaded_allowed = frozenset(host.lower() for host in allowed_hosts)
+        self._front_loaded_private = frozenset(
+            host.lower() for host in (*private_allowed_hosts, *allowed_hosts)
         )
+        self._allowed = self._front_loaded_allowed | default_allowed_hosts()
         # None rather than a frozenset default so the settings file is read per
         # instance instead of once at import, which is what lets an operator edit
         # take effect on the next session rather than on the next daemon restart.
-        if never_ask is None:
-            never_ask = default_never_ask()
-        self._never_ask = frozenset(host.lower() for host in never_ask)
+        self._uses_default_never_ask = never_ask is None
+        self._front_loaded_never_ask = frozenset(
+            host.lower() for host in (never_ask or ())
+        )
+        self._never_ask = (
+            default_never_ask() if never_ask is None else self._front_loaded_never_ask
+        )
+        self._private_allowed = self._front_loaded_private | default_private_hosts()
         self._ttl = grant_ttl_seconds
         self._server: asyncio.Server | None = None
         self._port: int | None = None
@@ -495,26 +526,26 @@ class EgressProxy:
     async def _permitted(self, host: str, port: int) -> _Decision:
         """Where to connect and why, or a refusal carrying its reason.
 
-        Order matters. The operator allowlist wins first and is returned by name
-        without a private-address check: an operator writing `localhost` into
-        `egress.allow` so the agent can hit its own dev server means it, and that
-        is a deliberate config act rather than something the agent induced.
-
-        Everything else must clear the never-ask tier *and* resolve entirely to
-        public addresses, and is then pinned to the address we validated.
+        Every hostname is resolved and pinned before it is connected, including a
+        pre-approved one. Private/loopback answers require the separate
+        ``egress.private_allow`` opt-in; ``egress.allow`` alone is never an SSRF
+        exception. The policy is refreshed here so edits revoke stale live
+        allowlist decisions on the next CONNECT.
         """
+        self._refresh_policy()
         lowered = host.lower()
         if not is_dns_safe_host(host):
             logger.warning("%s: refuse %r (host is not DNS-safe)", self._tag, host)
             return _Decision(None, "host is not DNS-safe", _MALFORMED_HOST)
-        if lowered in self._allowed:
-            return _Decision(host, "pre-approved host")
         if lowered in self._never_ask:
             logger.warning("%s: refuse %s:%d (never-ask policy)", self._tag, host, port)
             return _Decision(None, "never-ask policy", _NEVER_ASK)
-        pinned = await self._resolve_public(lowered, port)
+        private_ok = lowered in self._private_allowed
+        pinned = await self._resolve_public(lowered, port, allow_private=private_ok)
         if pinned is None:
             return _Decision(None, "no usable public address", _NO_PUBLIC_ADDRESS)
+        if lowered in self._allowed:
+            return _Decision(pinned, "pre-approved host")
         subject = f"{lowered}:{port}"
         # Asked before deciding so the log distinguishes a standing grant from a
         # fresh operator decision; check() itself cannot report which it was.
@@ -536,8 +567,27 @@ class EgressProxy:
             return _Decision(None, "operator declined or gate denied", _DENIED)
         return _Decision(pinned, "standing grant" if already else "operator approved")
 
-    async def _resolve_public(self, host: str, port: int) -> str | None:
-        """Resolve `host` and return one validated public address, else None.
+    def _refresh_policy(self) -> None:
+        """Reload host policy and revoke grants invalidated by the edit."""
+        allowed = self._front_loaded_allowed | default_allowed_hosts()
+        never_ask = (
+            self._front_loaded_never_ask | default_never_ask()
+            if self._uses_default_never_ask
+            else self._front_loaded_never_ask
+        )
+        private_allowed = self._front_loaded_private | default_private_hosts()
+        removed = (self._allowed - allowed) | (never_ask - self._never_ask)
+        for key in self._approvals.store.active():
+            if any(key.startswith(f"host:{host}:") for host in removed):
+                self._approvals.store.revoke(key)
+        self._allowed = allowed
+        self._never_ask = never_ask
+        self._private_allowed = private_allowed
+
+    async def _resolve_public(
+        self, host: str, port: int, *, allow_private: bool = False
+    ) -> str | None:
+        """Resolve `host` and return one validated, pinned address, else None.
 
         Two jobs beyond rejecting private space. First, `blocked_host` only
         inspects IP *literals*, so a hostname pointing into private space (a
@@ -574,7 +624,9 @@ class EgressProxy:
         logger.debug("%s: %s resolved to %s", self._tag, host, addresses)
         pinned: str | None = None
         for address in addresses:
-            if blocked_host(address):
+            if blocked_host(address) and not (
+                allow_private and _explicit_private_address(address)
+            ):
                 logger.warning(
                     "%s: refuse %s:%d (resolves to non-public %s)",
                     self._tag,

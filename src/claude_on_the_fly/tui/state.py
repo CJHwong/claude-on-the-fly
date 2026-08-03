@@ -25,6 +25,7 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Literal
 
+from claude_on_the_fly import envfile
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.cron import load_config as load_cron_config
@@ -260,14 +261,11 @@ def _queue_kind() -> str:
     `load_dotenv()` — the daemons see it because `supervisor.spawn` merges that
     file into the child's environment. So reading `os.environ` alone would
     report `file` for every deployment that configures anything else, which is
-    the very lie the caller's guard exists to prevent. `supervisor._load_env`
-    is that merge (file wins on conflicts), reused rather than reimplemented.
+    the very lie the caller's guard exists to prevent. `envfile` is that merge
+    (file wins on conflicts), reused rather than reimplemented.
     """
     global _queue_kind_cache
-    # Deferred: supervisor imports this module, so a top-level import cycles.
-    from claude_on_the_fly.tui import supervisor
-
-    env_file = supervisor.DEFAULT_ENV_FILE
+    env_file = envfile.default_env_file()
     try:
         mtime_ns = env_file.stat().st_mtime_ns
     except OSError:
@@ -276,7 +274,7 @@ def _queue_kind() -> str:
     cached = _queue_kind_cache
     if cached is not None and cached[:3] == (env_file, mtime_ns, override):
         return cached[3]
-    kind = supervisor._load_env(env_file).get("JOBS_QUEUE_KIND", "file").lower()
+    kind = envfile.merged(env_file).get("JOBS_QUEUE_KIND", "file").lower()
     _queue_kind_cache = (env_file, mtime_ns, override, kind)
     return kind
 

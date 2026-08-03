@@ -279,14 +279,20 @@ def tail(path: Path, *, poll_s: float = 0.5) -> Iterator[dict]:
     blocks polling for new lines. Caller is expected to wrap in try/except
     KeyboardInterrupt for clean exit. Skips malformed lines silently.
     """
+    max_buffer = 2 * 1024 * 1024
     with path.open("r") as f:
         buf = ""
         while True:
-            chunk = f.read()
+            chunk = f.read(64 * 1024)
             if not chunk:
                 time.sleep(poll_s)
                 continue
             buf += chunk
+            if len(buf) > max_buffer and "\n" not in buf:
+                # Keep the tail of an unterminated hostile/degenerate line; the
+                # formatter cannot render a complete event until a newline
+                # arrives, and retaining the whole prefix is unbounded.
+                buf = buf[-max_buffer:]
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
                 line = line.strip()

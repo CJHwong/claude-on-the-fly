@@ -15,6 +15,8 @@ import os
 import re
 import shutil
 import signal
+import stat
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -65,6 +67,18 @@ OUTBOX_INSTRUCTION = (
 )
 
 
+def sender_marker(sender_id: object, display_name: object = "") -> str:
+    """Render a platform-authenticated sender marker for the model prompt.
+
+    The immutable platform id is the only identity-bearing field. Display names
+    are JSON-quoted informational text, so brackets, newlines, and lookalike
+    markers cannot change the prompt grammar.
+    """
+    identity = re.sub(r"[^A-Za-z0-9_.:@-]", "_", str(sender_id))
+    display = json.dumps(str(display_name), ensure_ascii=True)
+    return f"[from-id: {identity}] [display: {display}]"
+
+
 def collect_outbox(workspace: Path) -> list[Path]:
     """Files the agent left in workspace/outbox to attach to the reply.
 
@@ -73,11 +87,25 @@ def collect_outbox(workspace: Path) -> list[Path]:
     caps and logs every skip; nothing is dropped silently.
     """
     outbox = workspace / OUTBOX_DIRNAME
-    if not outbox.is_dir():
+    try:
+        outbox_stat = outbox.lstat()
+    except OSError:
         return []
-    files = sorted(
-        p for p in outbox.iterdir() if p.is_file() and not p.name.startswith(".")
-    )
+    if not stat.S_ISDIR(outbox_stat.st_mode):
+        return []
+    files: list[Path] = []
+    for path in sorted(outbox.iterdir()):
+        if path.name.startswith("."):
+            continue
+        try:
+            path_stat = path.lstat()
+        except OSError as exc:
+            logger.warning("outbox: cannot inspect %s, skipping: %s", path.name, exc)
+            continue
+        if not stat.S_ISREG(path_stat.st_mode):
+            logger.warning("outbox: refusing non-regular file %s", path.name)
+            continue
+        files.append(path)
     collected: list[Path] = []
     for index, path in enumerate(files):
         if len(collected) >= MAX_ATTACHMENTS:
@@ -90,7 +118,7 @@ def collect_outbox(workspace: Path) -> list[Path]:
             )
             break
         try:
-            size = path.stat().st_size
+            size = path.lstat().st_size
         except OSError as exc:
             logger.warning("outbox: cannot stat %s, skipping: %s", path.name, exc)
             continue
@@ -104,6 +132,71 @@ def collect_outbox(workspace: Path) -> list[Path]:
             continue
         collected.append(path)
     return collected
+
+
+def read_attachment(path: Path) -> bytes:
+    """Read one attachment without following the final path component.
+
+    Attachments cross from the jailed agent into an unsandboxed frontend. The
+    caller may have validated the path earlier, so the validation must happen
+    again on the descriptor that supplies the bytes. This also keeps frontend
+    tests and non-outbox callers on the same safe read path.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        path_stat = os.fstat(fd)
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise OSError(f"attachment is not a regular file: {path}")
+        if path_stat.st_size > MAX_ATTACHMENT_BYTES:
+            raise ValueError(f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, MAX_ATTACHMENT_BYTES + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > MAX_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes: {path}"
+                )
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def write_attachment(path: Path, data: bytes) -> None:
+    """Atomically install downloaded bytes without following the destination.
+
+    Replacing a destination path is intentional: repeated uploads with the same
+    filename keep their existing behavior. `os.replace` replaces a symlink itself,
+    rather than opening its target, so an agent-created link cannot redirect the
+    write outside the workspace.
+    """
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise ValueError(f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def install_download(source: Path, destination: Path) -> None:
+    """Move one downloader-created file into place without following links."""
+    source_stat = source.lstat()
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise OSError(f"download is not a regular file: {source}")
+    if source_stat.st_size > MAX_ATTACHMENT_BYTES:
+        raise ValueError(f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes: {source}")
+    os.replace(source, destination)
 
 
 def archive_outbox(workspace: Path, files: list[Path]) -> None:
@@ -415,6 +508,42 @@ def parse_stream(stdout: bytes) -> dict:
 
 
 DEFAULT_TIMEOUT = 3600.0
+MAX_AGENT_OUTPUT_BYTES = 8 * 1024 * 1024
+
+
+class AgentOutputLimitError(RuntimeError):
+    """The CLI produced more output than a supervised turn may buffer."""
+
+
+# Chunk size for the drain loop below. Any value works; this one keeps the
+# syscall count sane on an 8 MB cap without holding a large slice per read.
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+async def _read_to_eof_capped(stream: asyncio.StreamReader) -> bytes:
+    """Read a stream to EOF, stopping early once the cap is passed.
+
+    `StreamReader.read(n)` with a positive `n` returns as soon as *any* byte is
+    buffered — it does not wait for `n` bytes and it does not wait for EOF. So a
+    single `read(cap + 1)` collects only whatever the CLI happened to flush
+    first, which for a backend that streams (codex emits JSONL events over the
+    life of the turn) is the opening event and nothing else. Loop until EOF
+    instead.
+
+    Returns the bytes read rather than raising, because the two callers want
+    different things from an over-cap stream: one reports it, one kills the
+    process group. Reading one byte past the cap before stopping is what keeps
+    their `len(...) > cap` test honest.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total <= MAX_AGENT_OUTPUT_BYTES:
+        chunk = await stream.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 class ClaudeUnavailableError(RuntimeError):
@@ -440,15 +569,23 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     assert proc.stdout is not None and proc.stderr is not None
 
     # Drain stderr concurrently so the subprocess can't block on a full pipe.
-    stderr_task = asyncio.create_task(proc.stderr.read())
+    # It has to run to EOF for that to hold: a drain that stops after the first
+    # chunk leaves the pipe to fill exactly as if nothing were reading it.
+    stderr_task = asyncio.create_task(_read_to_eof_capped(proc.stderr))
 
     tool_counts: dict[str, int] = {}
     skill_counts: dict[str, int] = {}
     compact: dict = {}
     result: dict = {}
     line_count = 0
+    stdout_bytes = 0
     try:
         async for raw in proc.stdout:
+            stdout_bytes += len(raw)
+            if stdout_bytes > MAX_AGENT_OUTPUT_BYTES:
+                raise AgentOutputLimitError(
+                    f"agent stdout exceeded {MAX_AGENT_OUTPUT_BYTES} bytes"
+                )
             line = raw.strip()
             if not line:
                 continue
@@ -469,6 +606,11 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
             stderr_bytes = await stderr_task
         except (asyncio.CancelledError, Exception):
             stderr_bytes = b""
+
+    if len(stderr_bytes) > MAX_AGENT_OUTPUT_BYTES:
+        raise AgentOutputLimitError(
+            f"agent stderr exceeded {MAX_AGENT_OUTPUT_BYTES} bytes"
+        )
 
     await proc.wait()
     logger.debug(
@@ -496,6 +638,41 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     if result.get("is_error") or result.get("subtype", "").startswith("error"):
         raise _classify(result.get("result", "Unknown error"))
     return result
+
+
+async def communicate_capped(proc) -> tuple[bytes, bytes]:
+    """Collect both subprocess streams without allowing unbounded buffering."""
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    if not isinstance(stdout_stream, asyncio.StreamReader) or not isinstance(
+        stderr_stream, asyncio.StreamReader
+    ):
+        # Small test doubles and embedders sometimes expose only communicate().
+        stdout, stderr = await proc.communicate()
+        if len(stdout) > MAX_AGENT_OUTPUT_BYTES or len(stderr) > MAX_AGENT_OUTPUT_BYTES:
+            await _kill_process_tree(proc)
+            raise AgentOutputLimitError(
+                f"agent output exceeded {MAX_AGENT_OUTPUT_BYTES} bytes"
+            )
+        return stdout, stderr
+
+    stdout_task = asyncio.create_task(_read_to_eof_capped(stdout_stream))
+    stderr_task = asyncio.create_task(_read_to_eof_capped(stderr_stream))
+    tasks = {stdout_task, stderr_task}
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    if any(len(task.result()) > MAX_AGENT_OUTPUT_BYTES for task in done):
+        await _kill_process_tree(proc)
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise AgentOutputLimitError(
+            f"agent output exceeded {MAX_AGENT_OUTPUT_BYTES} bytes"
+        )
+    stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+    if len(stdout) > MAX_AGENT_OUTPUT_BYTES or len(stderr) > MAX_AGENT_OUTPUT_BYTES:
+        await _kill_process_tree(proc)
+        raise AgentOutputLimitError(
+            f"agent output exceeded {MAX_AGENT_OUTPUT_BYTES} bytes"
+        )
+    return stdout, stderr
 
 
 # Notified when an agent CLI's process group starts and when it has been
@@ -561,14 +738,17 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     treating it as live.
     """
     try:
-        if proc.returncode is not None:
-            return
+        # Do not return merely because the leader already exited. A CLI can
+        # naturally exit while a tool child it spawned is still alive in the
+        # dedicated group; returning here is the orphaning bug this helper is
+        # responsible for preventing.
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except OSError:
-            # getpgid/killpg can race with a natural exit; fall back to a plain kill.
+            # The leader may have been reaped and the group may already be gone;
+            # a plain kill is still useful while it remains addressable.
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
         with contextlib.suppress(ProcessLookupError):

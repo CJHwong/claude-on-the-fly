@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import socket
 
 import pytest
@@ -283,12 +284,22 @@ async def test_dns_failure_is_refused_without_asking(monkeypatch):
         await proxy.stop()
 
 
-async def test_preapproved_host_skips_the_private_address_check():
-    """An operator naming localhost in `egress.allow` means it: that is a
-    config act, not something the agent can induce."""
+async def test_explicit_private_allow_skips_the_private_address_check(monkeypatch):
+    """A local development host needs the separate private-address opt-in."""
     echo_port, echo = await start_echo_server()
+
+    async def resolve_local(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "getaddrinfo", resolve_local, raising=False
+    )
     gate = RecordingGate(default=False)
-    proxy = EgressProxy(ApprovalBroker(gate), allowed_hosts=frozenset({"localhost"}))
+    proxy = EgressProxy(
+        ApprovalBroker(gate),
+        allowed_hosts=frozenset({"localhost"}),
+        private_allowed_hosts=frozenset({"localhost"}),
+    )
     port = await proxy.start()
     try:
         status, body = await connect_through(
@@ -300,6 +311,19 @@ async def test_preapproved_host_skips_the_private_address_check():
     finally:
         await proxy.stop()
         echo.close()
+
+
+async def test_preapproved_host_alone_does_not_allow_private_resolution(monkeypatch):
+    async def resolve_local(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "getaddrinfo", resolve_local, raising=False
+    )
+    gate = RecordingGate(default=True)
+    proxy = EgressProxy(ApprovalBroker(gate), allowed_hosts=frozenset({"localhost"}))
+    assert await proxy._resolve_public("localhost", 443) is None
+    assert gate.seen == []
 
 
 # --- denials ---
@@ -588,17 +612,10 @@ def test_defaults_exclude_hosts_that_are_real_decisions():
 async def test_model_api_tunnels_without_asking(monkeypatch):
     echo_port, echo = await start_echo_server()
     gate = RecordingGate(default=False)
-    real_open = asyncio.open_connection
-
-    async def open_local(host, port, **kwargs):
-        # Remap on the hostname, not on a pinned IP: an allowlisted host is
-        # connected to by name and never goes through resolve-and-pin, which is
-        # exactly the behavior under test.
-        if host == "api.anthropic.com":
-            return await real_open("127.0.0.1", echo_port, **kwargs)
-        return await real_open(host, port, **kwargs)
-
-    monkeypatch.setattr(asyncio, "open_connection", open_local)
+    # Even pre-approved model APIs are resolved and pinned before connecting.
+    # Stand in for a public address while directing the pinned connection to the
+    # local echo server.
+    pin_public_resolution(monkeypatch, echo_port)
     # No allowed_hosts passed at all: the default set must still let it through.
     proxy = EgressProxy(ApprovalBroker(gate))
     port = await proxy.start()
@@ -723,7 +740,8 @@ async def test_allow_line_names_why_preapproved(caplog):
     broker = ApprovalBroker(gate)
     proxy = EgressProxy(broker, allowed_hosts=frozenset({"example.com"}))
     decision = await proxy._permitted("example.com", 443)
-    assert decision.address == "example.com"
+    assert decision.address is not None
+    ipaddress.ip_address(decision.address)
     assert decision.because == "pre-approved host"
     # Never reached the operator, so no prompt was raised for it.
     assert gate.seen == []
@@ -1038,3 +1056,55 @@ async def test_pipe_survives_a_peer_that_vanishes_mid_stream():
             raise ConnectionResetError("peer gone")
 
     await EgressProxy._pipe(reader, ResettingWriter())  # type: ignore[arg-type]
+
+
+class TestPolicyReloadRevokesWhatItInvalidates:
+    """An operator narrowing the allowlist expects it to take effect now. A
+    grant issued under the old policy outliving the edit would keep the host
+    reachable for the rest of its TTL."""
+
+    def test_a_grant_for_a_host_removed_from_the_allowlist_is_revoked(
+        self, monkeypatch
+    ):
+        proxy = EgressProxy(
+            ApprovalBroker(RecordingGate(default=True)),
+            allowed_hosts=frozenset({"kept.example"}),
+        )
+        proxy._approvals.store.grant("host:dropped.example:443", ttl_seconds=3600)
+        proxy._approvals.store.grant("host:other.example:443", ttl_seconds=3600)
+        # The edit: dropped.example is no longer front-loaded.
+        proxy._allowed = proxy._allowed | {"dropped.example"}
+
+        proxy._refresh_policy()
+
+        assert not proxy._approvals.store.allows("host:dropped.example:443")
+        assert proxy._approvals.store.allows("host:other.example:443")
+
+    def test_a_reload_that_changes_nothing_keeps_every_grant(self):
+        proxy = EgressProxy(
+            ApprovalBroker(RecordingGate(default=True)),
+            allowed_hosts=frozenset({"kept.example"}),
+        )
+        proxy._approvals.store.grant("host:asked.example:443", ttl_seconds=3600)
+        proxy._refresh_policy()
+        assert proxy._approvals.store.allows("host:asked.example:443")
+
+
+class TestExplicitPrivateAddress:
+    def test_a_hostname_is_not_an_address(self):
+        """Called with whatever the CONNECT line carried, which is not always
+        an IP at all."""
+        assert egress._explicit_private_address("example.com") is False
+
+    @pytest.mark.parametrize(
+        ("address", "expected"),
+        [
+            pytest.param("127.0.0.1", True, id="loopback"),
+            pytest.param("10.0.0.1", True, id="private"),
+            pytest.param("169.254.169.254", False, id="link-local-metadata"),
+            pytest.param("8.8.8.8", False, id="public"),
+            pytest.param("not-an-ip", False, id="garbage"),
+        ],
+    )
+    def test_classification(self, address, expected):
+        assert egress._explicit_private_address(address) is expected

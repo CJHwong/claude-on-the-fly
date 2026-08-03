@@ -29,8 +29,48 @@ os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_TEST_HOME) / ".claude")
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
 import json  # noqa: E402
+import operator  # noqa: E402
 
 import pytest  # noqa: E402
+
+# Contain os.killpg for the whole suite.
+#
+# Production code reaps an agent CLI with `os.killpg(proc.pid, SIGKILL)`, which
+# is correct there: those children are spawned with start_new_session=True, so
+# the pid *is* a process-group id. Under test the same call receives pids that
+# are not. A `MagicMock` proc is the common case, and `os.killpg` resolves it
+# through `__index__`, which MagicMock answers with **1** -- so the call becomes
+# `killpg(1, SIGKILL)`, a real signal aimed at a real process group.
+#
+# Where that lands decides whether the suite survives. On a developer macOS box
+# and on a GitHub runner it is EPERM, so nothing happens and nobody notices. In
+# a container whose pytest sits in the targeted group it kills the test run
+# outright. A test that spawns a child without a new session can likewise hand
+# over a pid whose group is pytest's own.
+#
+# Refusing those two shapes costs no coverage: every caller already treats an
+# OSError from killpg as "the group is gone, fall back to proc.kill()", which is
+# the branch these tests want to exercise anyway. A genuinely detached group --
+# what tests/jobs/test_orphans.py creates on purpose -- is still signalled for
+# real, because that is the behaviour under test.
+_real_killpg = os.killpg
+
+
+def _contained_killpg(pgid: object, sig: int) -> None:
+    try:
+        resolved = operator.index(pgid)
+    except TypeError as exc:
+        raise ProcessLookupError(
+            f"test double pid {pgid!r} is not a process group"
+        ) from exc
+    if resolved <= 1:
+        raise ProcessLookupError(f"refusing to signal process group {resolved}")
+    if resolved == os.getpgrp():
+        raise ProcessLookupError("refusing to signal the test runner's own group")
+    return _real_killpg(resolved, sig)
+
+
+os.killpg = _contained_killpg
 
 
 @pytest.fixture(scope="session")
@@ -64,13 +104,24 @@ def isolate_jobs_dir(tmp_path, monkeypatch):
 def isolate_env_file(tmp_path, monkeypatch):
     """Keep the whole suite off the developer's real `.env`.
 
-    `state._queue_kind()` reads it through `supervisor.DEFAULT_ENV_FILE` on
-    every `snapshot()`, so without this a `JOBS_QUEUE_KIND` on the dev machine
-    would decide what the TUI tests see. Returns the (initially absent) path, so
-    a test wanting a specific setting just writes it.
+    `state._queue_kind()` reads it on every `snapshot()`, so without this a
+    `JOBS_QUEUE_KIND` on the dev machine would decide what the TUI tests see.
+    Returns the (initially absent) path, so a test wanting a specific setting
+    just writes it.
+
+    Both seams are redirected to the same file: `envfile.default_env_file` is
+    what the readers call, `supervisor.DEFAULT_ENV_FILE` is the TUI's CLI
+    default. Pointing them at different files is how a test would end up
+    proving the very disagreement this suite exists to catch.
     """
+    from claude_on_the_fly import envfile
+
     env_file = tmp_path / ".env"
     monkeypatch.setattr("claude_on_the_fly.tui.supervisor.DEFAULT_ENV_FILE", env_file)
+    monkeypatch.setattr(envfile, "default_env_file", lambda: env_file)
+    # Parsed-file cache is module state, keyed by (path, mtime). Clear it so a
+    # path a later test happens to reuse cannot serve another test's values.
+    monkeypatch.setattr(envfile, "_parsed", None)
     return env_file
 
 
@@ -123,10 +174,17 @@ def clear_backend_env(monkeypatch):
 
 @pytest.fixture
 def claude_projects_dir(tmp_path, monkeypatch):
-    """Redirect transcript module's CLAUDE_PROJECTS_DIR to a tmp_path subdir."""
-    root = tmp_path / "claude-projects"
-    root.mkdir()
-    monkeypatch.setattr("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", root)
+    """Redirect claude's projects dir to a tmp_path subdir.
+
+    Redirects `CLAUDE_CONFIG_DIR` rather than patching the resolver, so tests
+    exercise the resolution itself. A fixture that stubbed the answer would go
+    on passing if the resolver started reading the wrong environment again,
+    which is exactly the bug it is here to keep out.
+    """
+    config = tmp_path / "claude-config"
+    root = config / "projects"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     return root
 
 

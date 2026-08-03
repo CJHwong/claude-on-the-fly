@@ -196,7 +196,11 @@
 ;; ---------------------------------------------------------------------------
 ;; Write access — deny-default, explicit allowlist only
 ;; ---------------------------------------------------------------------------
-(allow file-write* (subpath (string-append (param "_HOME") "/.claude")))
+;; Claude's global config contains settings, hooks, commands, and plugins that
+;; the agent reads on later invocations. Do not let an untrusted turn persist
+;; instructions there. Claude can still read its config and write its session
+;; state in the workspace; global config changes are an operator action.
+(deny file-write* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
 ;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
 ;; dies at startup with "failed to initialize in-process app-server client:
@@ -208,11 +212,11 @@
 ;; is deny-default with an explicit re-grant, rather than a grant with a denylist of
 ;; the dangerous files.
 ;;
-;; The denylist came first and was already incomplete: hooks.json, config.toml and
-;; rules/ were denied while plugins/, history.jsonl and AGENTS.md stayed writable --
-;; and AGENTS.md is standing instructions codex reads on every later run, so an
-;; injected agent could leave itself orders that outlive the session. Enumerating the
-;; dangerous files means losing that race every time codex adds one.
+;; The old denylist was already incomplete: hooks.json, config.toml and rules/ were
+;; denied while plugins/, history.jsonl and AGENTS.md stayed writable -- and AGENTS.md
+;; is standing instructions codex reads on every later run, so an injected agent could
+;; leave itself orders that outlive the session. Enumerating dangerous files means
+;; losing that race every time codex adds one; the explicit grants above avoid it.
 ;;
 ;; The grants below are measured, not guessed: they are what a real `codex exec` turn
 ;; touched under this directory. Two of them are execution-adjacent and cannot be

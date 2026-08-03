@@ -57,5 +57,16 @@ jobs:
       - name: Sync dev env
         run: uv sync --locked
 
+      # A hung test must name itself. Left to the job's own `timeout-minutes`,
+      # the step is *cancelled* rather than failed, and GitHub archives no log
+      # for a cancelled step -- so a suite that stops making progress produces
+      # zero evidence about where. Two additions fix that:
+      #
+      #   timeout 600           SIGTERM at 10 minutes, inside the 15-minute job
+      #                         cap, so the step FAILS (124) and its log is kept.
+      #   faulthandler_timeout  dumps every thread's stack once a single test
+      #                         passes 60s, which names the offender directly.
+      #
+      # The suite runs in ~3 minutes, so neither bound is near normal operation.
       - name: pytest
-        run: uv run --no-sync pytest -q
+        run: timeout 600 uv run --no-sync pytest -q -o faulthandler_timeout=60

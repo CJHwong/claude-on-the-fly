@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -84,19 +85,19 @@ def make_message(
 class TestWorkspaceName:
     def test_known_chat(self, frontend: TelegramFrontend) -> None:
         frontend._chat_names[1] = "hoss"
-        assert frontend.workspace_name(1) == "telegram/hoss"
+        assert frontend.workspace_name(1) == "telegram/1"
 
     def test_unknown_chat_uses_id(self, frontend: TelegramFrontend) -> None:
         assert frontend.workspace_name(999) == "telegram/999"
 
     def test_no_session_token_no_suffix(self, frontend: TelegramFrontend) -> None:
         frontend._chat_names[1] = "hoss"
-        assert frontend.workspace_name(1) == "telegram/hoss"
+        assert frontend.workspace_name(1) == "telegram/1"
 
     def test_session_token_adds_suffix(self, frontend: TelegramFrontend) -> None:
         frontend._chat_names[1] = "hoss"
         frontend._session_tokens[1] = "20260606-123412"
-        assert frontend.workspace_name(1) == "telegram/hoss-20260606-123412"
+        assert frontend.workspace_name(1) == "telegram/1-20260606-123412"
 
     def test_unknown_chat_with_token(self, frontend: TelegramFrontend) -> None:
         frontend._session_tokens[5] = "20260606-090000"
@@ -491,7 +492,7 @@ class TestCmdNew:
         assert re.fullmatch(r"\d{8}-\d{6}", token)
         # The workspace suffix is the token, so it never recycles an old dir.
         frontend._chat_names[1] = "hoss"
-        assert frontend.workspace_name(1) == f"telegram/hoss-{token}"
+        assert frontend.workspace_name(1) == f"telegram/1-{token}"
 
     async def test_pushes_token_to_orchestrator_in_step(
         self, frontend: TelegramFrontend
@@ -517,7 +518,7 @@ class TestCmdNew:
         await frontend._cmd_new(make_update(chat_id=9), MagicMock())
 
         assert frontend._session_tokens[9] == "20260606-120000"
-        assert frontend.workspace_name(9) == "telegram/hoss-20260606-120000"
+        assert frontend.workspace_name(9) == "telegram/9-20260606-120000"
 
     async def test_replies_with_session_token(self, frontend: TelegramFrontend) -> None:
         update = make_update(chat_id=1)
@@ -561,7 +562,7 @@ class TestSessionPersistence:
         assert frontend._session_tokens[7] == "20260606-120000"
         orch.set_session_token.assert_called_once_with(7, "20260606-120000")
         frontend._chat_names[7] = "hoss"
-        assert frontend.workspace_name(7) == "telegram/hoss-20260606-120000"
+        assert frontend.workspace_name(7) == "telegram/7-20260606-120000"
 
     def test_load_missing_file_is_noop(self, frontend: TelegramFrontend) -> None:
         # Fresh install: no file yet, no crash, no tokens (base session).
@@ -881,10 +882,10 @@ class TestOnUpdate:
         frontend._on_message.assert_awaited_once()
         call_text = frontend._on_message.call_args[0][1]
         assert "hello world" in call_text
-        assert "[from: hoss]" in call_text
+        assert '[from-id: 1] [display: "hoss"]' in call_text
 
     async def test_file_message_saves_and_calls_on_message(
-        self, frontend: TelegramFrontend
+        self, frontend: TelegramFrontend, tmp_path: Path
     ) -> None:
         frontend._on_message = AsyncMock()
         frontend._app = MagicMock()
@@ -911,15 +912,7 @@ class TestOnUpdate:
         msg.message_id = 10
         update.message = msg
 
-        with patch("claude_on_the_fly.telegram.Path") as MockPath:
-            mock_workspace = MagicMock()
-            MockPath.home.return_value.__truediv__ = MagicMock(
-                return_value=mock_workspace
-            )
-            mock_workspace.__truediv__ = MagicMock(return_value=mock_workspace)
-            mock_workspace.mkdir = MagicMock()
-            mock_workspace.name = "report.pdf"
-
+        with patch("claude_on_the_fly.telegram.Path.home", return_value=tmp_path):
             await frontend._on_update(update, MagicMock())
 
         frontend._on_message.assert_awaited_once()
@@ -1023,19 +1016,15 @@ class TestSaveFile:
         frontend._app = mock_app
         frontend._chat_names[1] = "hoss"
 
-        with patch("claude_on_the_fly.telegram.Path") as MockPath:
-            # Path.home() / x / y / z chains via __truediv__; just let MagicMock
-            # auto-chain and verify the important calls at the end.
-            MockPath.home.return_value = tmp_path
-            # Path(file_name).name must return a string for the / operator
-            safe_path = MagicMock()
-            safe_path.name = "report.pdf"
-            MockPath.return_value = safe_path
-
+        with (
+            patch("claude_on_the_fly.telegram.Path.home", return_value=tmp_path),
+            patch("claude_on_the_fly.telegram.install_download") as mock_install,
+        ):
             result = await frontend._save_file(1, "file_abc", "report.pdf")
 
         mock_app.bot.get_file.assert_awaited_once_with("file_abc")
         mock_tg_file.download_to_drive.assert_awaited_once()
+        mock_install.assert_called_once()
         assert result is not None
 
     async def test_raises_when_no_app(self, frontend: TelegramFrontend) -> None:
@@ -1075,7 +1064,7 @@ class TestFlushMediaGroup:
         assert "[File saved: a.jpg]" in call_text
         assert "[File saved: b.png]" in call_text
         assert "look at these" in call_text
-        assert "[from: hoss]" in call_text
+        assert '[from-id: 1] [display: "hoss"]' in call_text
 
     async def test_default_text_when_no_caption(
         self, frontend: TelegramFrontend
@@ -1561,3 +1550,57 @@ class TestPhotoSendWithoutAnApp:
         attachment, which is what the user would actually notice."""
         frontend._app = None
         assert await frontend._try_send_photo(99, Path("shot.png"), b"bytes") is False
+
+
+class TestSenderIdentity:
+    def test_it_is_the_chat_id(self, frontend):
+        """Telegram is always a DM, so the chat is the person."""
+        assert frontend.sender_identity(99) == "99"
+
+
+class TestAllowedUserIdIsRereadNotCached:
+    """Re-read per update so revoking access takes effect without a restart.
+    A junk edit must not widen access or lock the operator out."""
+
+    def test_a_valid_edit_takes_effect_immediately(self, frontend, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "456")
+        assert frontend._current_allowed_user_id() == 456
+
+    def test_an_unparseable_value_keeps_the_last_valid_one(
+        self, frontend, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "not-an-id")
+        with caplog.at_level("ERROR"):
+            assert frontend._current_allowed_user_id() == 123
+        assert "not an integer" in caplog.text
+
+
+class TestDownloadCleanup:
+    async def test_a_failed_download_leaves_no_temp_file(
+        self, frontend, tmp_path, monkeypatch
+    ):
+        """The temp file sits in the agent's own workspace, so an abandoned one
+        is visible to the agent and to the next listing."""
+        workspace = tmp_path / "ws"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        monkeypatch.setattr(
+            frontend, "workspace_name", lambda _chat_id: "telegram/probe"
+        )
+
+        class _File:
+            async def download_to_drive(self, _path):
+                raise OSError("connection reset")
+
+        class _Bot:
+            async def get_file(self, _file_id):
+                return _File()
+
+        frontend._app = SimpleNamespace(bot=_Bot())
+        with pytest.raises(OSError, match="connection reset"):
+            await frontend._save_file(1, "file-id", "report.pdf")
+
+        target = (
+            tmp_path / "home" / ".claude-on-the-fly" / "workspaces" / "telegram/probe"
+        )
+        assert [p.name for p in target.iterdir()] == []
+        assert workspace.exists() is False

@@ -14,6 +14,7 @@ from claude_on_the_fly import (
     checks,
     permissions,
     pricing,
+    pty_install,
     sandbox,
     settings,
     transcript,
@@ -343,11 +344,8 @@ class ClaudeBackend:
         # Codex backend already takes the existence-check approach; mirror it
         # here so first-turn dispatches don't crash before the new-session
         # branch can run.
-        # Read via the transcript module rather than the imported symbol so
-        # tests that monkeypatch CLAUDE_PROJECTS_DIR via the fixture see the
-        # redirected value.
         session_path = (
-            transcript.CLAUDE_PROJECTS_DIR
+            transcript.claude_projects_dir()
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )
@@ -616,16 +614,9 @@ class ClaudeBackend:
         return f"claude --resume {session_uuid}"
 
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
-        """Live JSONL claude appends to as the session runs.
-
-        Reads CLAUDE_PROJECTS_DIR through the transcript module so tests
-        that monkeypatch it via the `claude_projects_dir` fixture (or a
-        direct `setattr`) see the redirected location. The bare import
-        captures the value at module-load time and is invisible to
-        monkeypatch.
-        """
+        """Live JSONL claude appends to as the session runs."""
         path = (
-            transcript.CLAUDE_PROJECTS_DIR
+            transcript.claude_projects_dir()
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )
@@ -695,6 +686,11 @@ async def _exec_pty(
     skill_counts are always empty in pty mode (pty doesn't surface per-turn
     tool_use events).
     """
+    # Before the spawn, not after: claude skips its workspace trust dialog only
+    # in non-interactive mode, and pty's whole job is to give it a real TTY. An
+    # untrusted directory therefore does not fail here, it stops on the dialog
+    # and spends the entire turn timeout waiting for a keystroke nobody sends.
+    pty_install.ensure_workspace_trusted(workspace)
     cmd = sandbox.wrap(cmd, workspace)
     logger.debug(
         "exec_pty: cwd=%s cmd=%s timeout=%s",
@@ -714,7 +710,7 @@ async def _exec_pty(
     agent.track_agent_process(proc, cmd)
 
     async def _wait() -> tuple[bytes, bytes, int]:
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await agent.communicate_capped(proc)
         return stdout, stderr, proc.returncode if proc.returncode is not None else -1
 
     try:

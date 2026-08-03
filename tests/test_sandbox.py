@@ -636,9 +636,11 @@ async def test_broken_profile_is_not_reported_as_absent(monkeypatch, tmp_path, c
     broken.write_text("(version 1)\n(this-is-not-a-real-operation\n")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setattr(sandbox, "_JAIL_PROFILE", broken)
-    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
-        results = await sandbox.verify_denials(tmp_path)
-    assert set(results.values()) == {sandbox.BROKEN}, results
+    with (
+        caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
+        pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
+    ):
+        await sandbox.verify_denials(tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "the profile is broken" in logged
     assert "did not load" in logged
@@ -849,9 +851,11 @@ async def test_a_readable_credential_path_is_an_error_not_a_pass(
         return ReadableProbe()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_readable)
-    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
-        results = await sandbox.verify_denials(tmp_path)
-    assert set(results.values()) == {sandbox.READABLE}, results
+    with (
+        caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
+        pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
+    ):
+        await sandbox.verify_denials(tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "PROBE FAIL" in logged
     assert "credential path(s) READABLE inside the jail" in logged

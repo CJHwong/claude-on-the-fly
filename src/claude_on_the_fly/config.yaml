@@ -64,6 +64,12 @@ egress:
     - chatgpt.com
     - ab.chatgpt.com
 
+  # Hostnames allowed to resolve to a private or loopback address. This is a
+  # separate opt-in from `allow`: adding a name to the normal allowlist never
+  # disables DNS-rebinding/SSRF protection. Use this only for a known local
+  # development service, and keep the service bound to the intended interface.
+  private_allow: []
+
   # Hosts refused outright, never offered to the operator. Cloud metadata
   # endpoints hand instance credentials to anything that can reach them, and no
   # legitimate agent task needs them, so they are not worth a prompt.
@@ -103,11 +109,13 @@ commands:
   #                    broker runs unjailed, so anything not listed stays out of
   #                    the subprocess.
   #
-  # There is deliberately no allow/deny policy beyond readback. `gh api --method
-  # DELETE` defeats any subcommand denylist, so a parser here would be a boundary
-  # that can be walked around. Scope the *token* instead: a fine-grained PAT
-  # limited to what the agent needs bounds it far more reliably than argv
-  # inspection.
+  #   allow             safe leading subcommands. The list is deny-by-default;
+  #                    flags and arguments may follow the listed words. A
+  #                    credentialed CLI is not a general shell, so `gh api`,
+  #                    `gh alias`, auth changes, and mutations stay unavailable
+  #                    unless an operator explicitly adds a narrowly chosen
+  #                    prefix. The loopback endpoint also requires a per-daemon
+  #                    bearer token.
   tools:
     - name: gh
       # `gh auth token` and `--show-token` print the credential itself.
@@ -117,6 +125,14 @@ commands:
         - auth token
       readback_flags:
         - --show-token
+      allow:
+        - pr list
+        - pr view
+        - repo view
+        - issue list
+        - issue view
+        - run list
+        - run view
       env_passthrough: [GH_HOST, GH_REPO, GH_PAGER, NO_COLOR]
 
     - name: acli
@@ -129,6 +145,10 @@ commands:
         - auth logout
         - auth login
         - auth switch
+      allow:
+        - jira workitem search
+        - jira workitem view
+        - jira workitem get
       env_passthrough: [ACLI_SITE, NO_COLOR]
 
 permissions:

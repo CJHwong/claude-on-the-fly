@@ -23,7 +23,16 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from claude_on_the_fly import checks, logs, settings
-from claude_on_the_fly.agent import Response, cached_skills, footer_parts, get_backend
+from claude_on_the_fly.agent import (
+    MAX_ATTACHMENT_BYTES,
+    Response,
+    cached_skills,
+    footer_parts,
+    get_backend,
+    read_attachment,
+    sender_marker,
+    write_attachment,
+)
 from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
@@ -814,7 +823,11 @@ class SlackFrontend(Frontend):
         self._processed_ts: deque[str] = deque(maxlen=1000)
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
         self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
-        self._own_dm: dict[str, bool] = {}  # channel_id -> is a DM the bot is in
+        self._own_dm: dict[str, tuple[bool, float]] = {}
+        # Membership is authorization state, not immutable channel metadata.
+        # Cache definitive answers briefly, and never cache an answer produced by
+        # an API failure.
+        self._own_dm_ttl = 60.0
         self._connected_once = False
         self._workspace_names: dict[int, str] = {}
         self._sender_names: dict[int, str] = {}
@@ -904,6 +917,10 @@ class SlackFrontend(Frontend):
 
     def sender_name(self, chat_id: int) -> str:
         return self._sender_names.get(chat_id, "unknown")
+
+    def sender_identity(self, chat_id: int) -> str:
+        """Stable Slack user id used for prompt/memory routing."""
+        return self._session_sender_ids.get(chat_id, str(chat_id))
 
     def channel_context(self, chat_id: int) -> str:
         return self._channel_contexts.get(chat_id, "dm")
@@ -1404,13 +1421,14 @@ class SlackFrontend(Frontend):
         authorizing user's *other* DMs (with third parties) too, which are not
         addressed to the bot. conversations.info on the bot token resolves the
         bot's own DMs and returns channel_not_found / not_in_channel for ones it
-        isn't in. Cached per channel; fail-open (only a definitive not-a-member
-        error is False) so it can never drop the bot's own DMs.
+        isn't in. Cache definitive answers briefly; unexpected API failures fail
+        closed and are not cached.
         """
         cached = self._own_dm.get(channel)
-        if cached is not None:
-            return cached
-        result = True
+        now = time.monotonic()
+        if cached is not None and cached[1] > now:
+            return cached[0]
+        result = False
         try:
             info = await self._app.client.conversations_info(channel=channel)
             ch = info["channel"]
@@ -1418,9 +1436,13 @@ class SlackFrontend(Frontend):
         except SlackApiError as exc:
             if exc.response.get("error") in ("channel_not_found", "not_in_channel"):
                 result = False
+            else:
+                logger.warning("is_bot_conversation: %s: %s", channel, exc)
+                return False
         except Exception as exc:
             logger.warning("is_bot_conversation: %s: %s", channel, exc)
-        self._own_dm[channel] = result
+            return False
+        self._own_dm[channel] = (result, now + self._own_dm_ttl)
         return result
 
     async def _on_hello(self, event, say):
@@ -1712,9 +1734,9 @@ class SlackFrontend(Frontend):
             segments.append(thread_context)
         segments.extend(_render_forward(f) for f in forwards)
         if cover:
-            segments.append(f"[from: {sender}] {cover}")
+            segments.append(f"{sender_marker(sender_id, sender)} {cover}")
         elif forwards:
-            segments.append(f"[from: {sender}]")
+            segments.append(sender_marker(sender_id, sender))
         final_text = "\n\n".join(segments)
 
         self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
@@ -1725,10 +1747,10 @@ class SlackFrontend(Frontend):
         preview = text[:80] if text else "(forward only)"
         fwd_marker = f" (+{len(forwards)} fwd)" if forwards else ""
         logger.info(
-            "slack %s/%s: [from: %s] %s%s",
+            "slack %s/%s: %s %s%s",
             channel,
             thread_ts,
-            sender,
+            sender_marker(sender_id, sender),
             preview,
             fwd_marker,
         )
@@ -1823,7 +1845,7 @@ class SlackFrontend(Frontend):
         failures: list[str] = []
         for path in attachments:
             try:
-                data = await asyncio.to_thread(path.read_bytes)
+                data = await asyncio.to_thread(read_attachment, path)
                 resp = await self._app.client.files_upload_v2(
                     channel=channel,
                     thread_ts=thread_ts,
@@ -2157,10 +2179,14 @@ class SlackFrontend(Frontend):
                 raise RuntimeError(
                     f"got HTML instead of file data (likely auth issue): {url}"
                 )
-            data = await resp.read()
+            data = await resp.content.read(MAX_ATTACHMENT_BYTES + 1)
             if not data:
                 raise RuntimeError(f"empty response body: {url}")
-            dest.write_bytes(data)
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"download exceeds {MAX_ATTACHMENT_BYTES} bytes: {dest.name}"
+                )
+            write_attachment(dest, data)
             logger.debug(
                 "downloaded %s: %d bytes, content-type=%s",
                 dest.name,

@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import secrets
+import tempfile
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +27,14 @@ from telegram.ext import (
 from telegram.helpers import escape_markdown
 
 from claude_on_the_fly import logs, settings
-from claude_on_the_fly.agent import DATA_DIR, Response, footer_parts
+from claude_on_the_fly.agent import (
+    DATA_DIR,
+    Response,
+    footer_parts,
+    install_download,
+    read_attachment,
+    sender_marker,
+)
 from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.protocol import Frontend
 
@@ -76,13 +85,20 @@ class TelegramFrontend(Frontend):
         self._orchestrator = orchestrator
 
     def workspace_name(self, chat_id: int) -> str:
-        name = self._chat_names.get(chat_id, str(chat_id))
         token = self._session_tokens.get(chat_id)
-        folder = f"{name}-{token}" if token else name
+        # User-controlled usernames and first names are display data, never
+        # filesystem identifiers. The Telegram chat id is platform-assigned and
+        # therefore cannot traverse the workspace or change the seatbelt project
+        # grant. Existing name-based workspaces are intentionally not reused.
+        folder = f"{chat_id}-{token}" if token else str(chat_id)
         return f"telegram/{folder}"
 
     def sender_name(self, chat_id: int) -> str:
         return self._chat_names.get(chat_id, "unknown")
+
+    def sender_identity(self, chat_id: int) -> str:
+        """Stable platform identity used for prompt/memory routing."""
+        return str(chat_id)
 
     def channel_context(self, chat_id: int) -> str:
         return "dm"  # Telegram bot is always a DM
@@ -333,7 +349,7 @@ class TelegramFrontend(Frontend):
         for path in attachments:
             kind, _ = mimetypes.guess_type(path.name)
             try:
-                data = await asyncio.to_thread(path.read_bytes)
+                data = await asyncio.to_thread(read_attachment, path)
                 if kind in PHOTO_MIME_TYPES and await self._try_send_photo(
                     chat_id, path, data
                 ):
@@ -435,7 +451,7 @@ class TelegramFrontend(Frontend):
 
         if text:
             sender = self._chat_names.get(chat_id, "unknown")
-            text = f"[from: {sender}] {text}"
+            text = f"{sender_marker(chat_id, sender)} {text}"
             logger.info("chat %s: %s", chat_id, logs.redact(text))
             if self._on_message:
                 await self._on_message(chat_id, text)
@@ -529,7 +545,15 @@ class TelegramFrontend(Frontend):
         safe_name = Path(file_name).name
         dest = workspace / safe_name
         tg_file = await self._app.bot.get_file(file_id)
-        await tg_file.download_to_drive(dest)
+        fd, temp_name = tempfile.mkstemp(prefix=".cotf-download-", dir=workspace)
+        os.close(fd)
+        temp_path = Path(temp_name)
+        try:
+            await tg_file.download_to_drive(temp_path)
+            install_download(temp_path, dest)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
         logger.info("Saved file %s for chat %s", file_name, chat_id)
         return dest
 
@@ -572,7 +596,7 @@ class TelegramFrontend(Frontend):
                 else "\nPlease review the uploaded files."
             )
             sender = self._chat_names.get(chat_id, "unknown")
-            text = f"[from: {sender}] {text}"
+            text = f"{sender_marker(chat_id, sender)} {text}"
             logger.info("chat %s: %s", chat_id, logs.redact(text))
             if self._on_message:
                 await self._on_message(chat_id, text)

@@ -9,7 +9,8 @@ Public surface:
 - `Turn` dataclass
 - `extract_claude(workspace, session_uuid)` reads ~/.claude/projects/<hash>/<uuid>.jsonl
 - `extract_codex(workspace, session_uuid)` reads the codex rollout matching the
-  thread_id persisted under <workspace>/.codex_sessions/<session_uuid>
+  thread_id persisted in the daemon-owned ~/.claude-on-the-fly/codex-sessions/
+  store, outside the agent-writable workspace
 - `format_handoff(turns, from_backend)` renders a labeled preamble, capped by
   turn count and char budget from the most recent backward
 - `find_latest_prior_transcript(workspace, exclude_uuid)` scans both backends'
@@ -26,13 +27,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+from claude_on_the_fly import codex_state, envfile
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +44,21 @@ BackendName = Literal["claude", "codex"]
 # prompt. We rsplit on it to recover the raw user text from a codex transcript.
 _CODEX_PROMPT_SEPARATOR = "\n\n---\n\n"
 
-CLAUDE_PROJECTS_DIR = (
-    Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-)
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+
+
+def claude_projects_dir() -> Path:
+    """Where claude keeps session JSONL, resolved per call.
+
+    A module constant read this from `os.environ` at import, which made the
+    answer depend on who imported the module. The daemon writing the logs is
+    spawned with `DATA_DIR/.env` merged in; the TUI reading them is not, so a
+    deployment that sets `CLAUDE_CONFIG_DIR` in that file had the two processes
+    looking at different directories, and the watch pane reported "agent hasn't
+    run a turn" over a session that was streaming. Resolving through
+    `envfile` per call is what makes the reader agree with the writer.
+    """
+    return envfile.claude_config_dir() / "projects"
 
 
 @dataclass(frozen=True)
@@ -78,9 +91,8 @@ def remove_workspace_sessions(workspace: Path) -> None:
     claude names a directory in its own config tree after the workspace path, so
     a caller that deletes a throwaway workspace still leaves that directory
     behind — and because the name encodes a path that will never exist again,
-    nothing can ever reclaim it. codex keeps its per-workspace mapping *inside*
-    the workspace, so removing the workspace is already enough for it and there
-    is nothing to do here.
+    nothing can ever reclaim it. codex keeps its per-workspace mapping in the
+    daemon-owned store, so remove those records by exact workspace identity too.
 
     Call this before deleting the workspace: the name is derived from
     `workspace.resolve()`, and resolution is only reliable while the path is
@@ -90,8 +102,10 @@ def remove_workspace_sessions(workspace: Path) -> None:
     caller's real outcome.
     """
     shutil.rmtree(
-        CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace), ignore_errors=True
+        claude_projects_dir() / _workspace_to_claude_hash(workspace),
+        ignore_errors=True,
     )
+    codex_state.remove_workspace(workspace)
 
 
 def _iter_jsonl(path: Path):
@@ -113,7 +127,7 @@ def _iter_jsonl(path: Path):
 def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     """Return the user/assistant turns from claude's session JSONL, or None."""
     session_path = (
-        CLAUDE_PROJECTS_DIR
+        claude_projects_dir()
         / _workspace_to_claude_hash(workspace)
         / f"{session_uuid}.jsonl"
     )
@@ -202,12 +216,8 @@ def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
 
     Strips the system-prompt prefix we prepend to every codex user message.
     """
-    session_file = workspace / ".codex_sessions" / session_uuid
-    if not session_file.is_file():
-        return None
-    try:
-        thread_id = session_file.read_text().strip()
-    except OSError:
+    thread_id = codex_state.read_thread_id(workspace, session_uuid)
+    if thread_id is None:
         return None
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
@@ -354,7 +364,7 @@ def format_handoff(
 def _list_claude_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
     """Return (path, uuid, mtime) for every claude JSONL under the workspace's
     project dir. Missing dir → []."""
-    project_dir = CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace)
+    project_dir = claude_projects_dir() / _workspace_to_claude_hash(workspace)
     if not project_dir.is_dir():
         return []
     out: list[tuple[Path, str, float]] = []
@@ -369,17 +379,15 @@ def _list_claude_session_files(workspace: Path) -> list[tuple[Path, str, float]]
 
 def _list_codex_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
     """Return (rollout_path, our_uuid, rollout_mtime) for every codex mapping
-    under <workspace>/.codex_sessions whose rollout still exists."""
-    sessions_dir = workspace / ".codex_sessions"
-    if not sessions_dir.is_dir():
-        return []
+    in the daemon-owned store whose rollout still exists."""
     out: list[tuple[Path, str, float]] = []
-    for mapping in sessions_dir.iterdir():
-        if not mapping.is_file():
-            continue
-        try:
-            thread_id = mapping.read_text().strip()
-        except OSError:
+    for (
+        _mapping_path,
+        session_uuid,
+        _mapping_mtime,
+    ) in codex_state.mappings_for_workspace(workspace):
+        thread_id = codex_state.read_thread_id(workspace, session_uuid)
+        if thread_id is None:
             continue
         rollout = _find_codex_rollout(thread_id)
         if rollout is None:
@@ -388,7 +396,7 @@ def _list_codex_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
             mtime = rollout.stat().st_mtime
         except OSError:
             continue
-        out.append((rollout, mapping.name, mtime))
+        out.append((rollout, session_uuid, mtime))
     return out
 
 

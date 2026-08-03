@@ -230,9 +230,7 @@ class TestRunDoesNotNudgeACompaction:
     async def test_compaction_prompt_skips_the_nudge_retry(self, tmp_path, monkeypatch):
         """A successful compaction returns `result: ""`. The nudge would spend a
         second billed turn asking for a reply that was never owed."""
-        monkeypatch.setattr(
-            claude_mod.transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects"
-        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
             / "projects"
@@ -464,9 +462,7 @@ class TestOllamaWithholdsTheContextWindow:
         }
 
     async def _run(self, backend, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            claude_mod.transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects"
-        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
             / "projects"
@@ -557,9 +553,7 @@ class TestOllamaCostUsesCacheRates:
         }
 
     async def _run(self, backend, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            claude_mod.transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects"
-        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
             / "projects"
@@ -880,3 +874,42 @@ class TestStatuslineResponseFields:
             "exceeds_200k": True,
             "fast_mode": False,
         }
+
+
+class TestPtySpawnTrustsItsWorkspace:
+    async def test_the_workspace_is_trusted_before_the_spawn(
+        self, tmp_path, monkeypatch
+    ):
+        """Order matters: claude stops on the trust dialog rather than failing,
+        so trusting after the spawn would still burn the whole turn."""
+        events: list[str] = []
+
+        monkeypatch.setattr(
+            claude_mod.pty_install,
+            "ensure_workspace_trusted",
+            lambda ws: events.append(f"trusted:{ws.name}") or True,
+        )
+
+        class _Proc:
+            returncode = 0
+            pid = 1234
+
+            def __init__(self):
+                events.append("spawned")
+                self.stdout = None
+                self.stderr = None
+
+            async def communicate(self):
+                return b'{"result": "hi"}', b""
+
+        async def fake_spawn(*_args, **_kwargs):
+            return _Proc()
+
+        with (
+            patch("asyncio.create_subprocess_exec", fake_spawn),
+            patch.object(claude_mod.agent, "track_agent_process"),
+            patch.object(claude_mod.agent, "_kill_process_tree", AsyncMock()),
+        ):
+            await claude_mod._exec_pty(tmp_path / "ws", ["claude-pty"], timeout=None)
+
+        assert events == ["trusted:ws", "spawned"]

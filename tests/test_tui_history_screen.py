@@ -403,7 +403,7 @@ class TestCopyTakeover:
             notices = _capture_notices(app, screen)
             await pilot.press("t")
             await pilot.pause()
-        assert copied == ["cd /tmp/ws && claude --resume x"]
+        assert copied == ["cd -- /tmp/ws && claude --resume x"]
         assert any("copied takeover cmd for ACE-1" in msg for msg, _sev in notices)
 
     async def test_a_backend_with_no_session_yet_says_so(self, event_log, monkeypatch):

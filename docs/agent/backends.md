@@ -30,7 +30,10 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
 ### Session resume
 
 - **claude**: `--resume <uuid>` works for both create and resume.
-- **codex**: assigns its own `thread_id`. Persist `<workspace>/.codex_sessions/<our-uuid>` mapping after first turn, then `resume <thread_id>` on follow-ups.
+- **codex**: assigns its own `thread_id`. Persist the authenticated mapping in the
+  daemon-owned `~/.claude-on-the-fly/codex-sessions/` store after the first turn, then
+  `resume <thread_id>` on follow-ups. The store is outside the agent-writable workspace,
+  reads reject symlinks, and new records are atomic owner-only (`0600`) files.
 
 ### Tool / skill counts (footer display)
 
@@ -78,6 +81,14 @@ Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementat
 
 Drives `claude-pty` from [claude-interactive-p](https://github.com/CJHwong/claude-interactive-p) under a PTY, surfacing `ctx N%` and `5h N% → HH:MM` in the footer (fields `claude -p` doesn't expose). Wall-clock ~1–2s slower per turn. Doctor surfaces three stale-install failure modes: missing `claude-pty` binary, missing `jq`, or missing Stop-hook / statusline-shim wiring in `~/.claude/settings.json`. Tool/skill counts are not surfaced in pty mode.
 
+**pty spawns trust their workspace first.** claude records a per-directory trust decision and skips the dialog only in non-interactive mode — `-p`, or a non-TTY stdout ([`claude --help`](https://docs.claude.com/en/docs/claude-code/cli-reference), verified on 2.1.220). Native mode therefore never sees it and pty always does, because handing claude a TTY is what pty is for. An untrusted directory does not fail the turn, it stops on `❯ 1. Yes, I trust this folder` and waits for a keystroke nobody sends, so the turn ends at the caller's timeout with no output. No flag suppresses it interactively and no subcommand grants it (`claude project` only purges), which leaves claude's own project-state file as the only lever. `pty_install.ensure_workspace_trusted` sets `projects.<workspace>.hasTrustDialogAccepted` there as the first statement of `_exec_pty`, before the spawn — after would be useless, since claude waits rather than failing.
+
+Bounded three ways. Only paths under `DATA_DIR/workspaces` qualify (`cotf_owns_workspace` resolves before comparing, so `..` cannot smuggle one in), so a session pointed at an operator's own checkout is left alone. Only that one key is written, through a temp file and `os.replace` at `0600`, and a state file that fails to parse is reported rather than replaced — the file is claude's, reaches megabytes, and rewriting it from a failed parse would discard the lot. `st_mtime_ns` is compared before the replace and the read retried (three attempts) when it moved, because claude rewrites this file on its own schedule; that is a re-read, not a lock, since claude takes no lock either. A successful grant is memoized per process, so a daemon does not re-parse a megabyte per turn.
+
+It grants no privilege: cotf created the directory and already runs claude with `--permission-mode bypassPermissions`. The seatbelt jail and the approval gate are the controls, and neither is touched. Two limits worth knowing: on the first-run path where the file does not exist yet there is no mtime to compare, so a file claude creates inside that window would be overwritten; and the process memo does not notice a trust key stripped by hand, which stays memoized until restart. A failed grant is logged and the spawn proceeds anyway, degrading to the old hang rather than refusing the turn.
+
+**The state file is not inside `CLAUDE_CONFIG_DIR` by default.** It is `$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set, and `~/.claude.json` at *home root* when it is not — not `~/.claude/.claude.json`, which on a machine that once set the variable may exist as an unrelated stale file with no `projects` key at all. `pty_install.claude_state_file` encodes that split and resolves the variable through `envfile`, so it reads what the daemon receives rather than what the viewing shell exports.
+
 **Compaction under pty needs claude-interactive-p's `PostCompact` hook.** claude-pty's envelope is written by its **Stop** hook, and a compaction fires no Stop hook: it produces no assistant message. Without a second writer the envelope never appears, the TUI drops back to waiting for input, and claude-pty's poll loop has no wall-clock cap of its own — so the run only ends when the caller's timeout does, an hour by default. `hooks/postcompact_envelope.sh` writes it instead, gated on `trigger == "manual"`: Claude Code's *own* mid-turn compaction lands as `trigger: "auto"` while the real turn is still running, and an envelope there would end the turn early and return the summary in place of the answer. `checks.check_pty_hooks` warns (does not block) when the hook is absent, so an older install keeps running ordinary turns and only loses compaction.
 
 `ClaudeBackend.compact` runs in whichever mode the backend is in — no cross-mode shortcut. Reaching for `claude -p` from a pty backend would forfeit what pty is for (an operator can `tmux attach` to a live turn, and a compaction is the longest, priciest thing a thread does, so the worst one to make invisible), and the two resolve their own effort / fast-mode / output-style settings, so a `-p` compaction could summarize a conversation under settings it never ran under.
@@ -104,4 +115,4 @@ Both modes report prompt size and window size, which is what the auto-compact ga
 
 - `ensure_persona()` at `src/claude_on_the_fly/agent.py:140` symlinks the global `~/.claude-on-the-fly/CLAUDE.md` into every workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex) — see `PERSONA_FILENAMES` at `agent.py:137`.
 - `transcript.py` handles cross-backend handoff: when the daemon switches backends, it parses the prior backend's session JSONL into a single prompt so context carries over. If you're changing session-log paths or output schemas in a backend, this is the file that will break.
-- `remove_workspace_sessions()` deletes the session directory claude keys to a workspace path but keeps *outside* it (`~/.claude/projects/<hash>/`). codex keeps its mapping inside the workspace, so deleting the workspace is enough for it.
+- `remove_workspace_sessions()` deletes the session directory claude keys to a workspace path but keeps *outside* it (`~/.claude/projects/<hash>/`) and removes matching Codex mappings from the daemon-owned store.

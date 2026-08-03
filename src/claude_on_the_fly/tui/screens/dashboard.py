@@ -462,7 +462,7 @@ class DashboardScreen(Screen):
         except Exception:
             return  # focus event fired before the cue mounted
         if target:
-            cue.update(f"[dim]acting on:[/dim] [bold]{target}[/bold]")
+            cue.update(Text.assemble(("acting on: ", "dim"), (target, "bold")))
         else:
             cue.update("[dim]acting on: (Tab to a panel)[/dim]")
 
@@ -677,14 +677,15 @@ class DashboardScreen(Screen):
         if path is None:
             self._notify("no log selected to copy", "warning")
             return
+        tail_n = 500
         try:
-            content = path.read_text(errors="replace")
+            if not path.is_file():
+                raise OSError(f"log does not exist: {path}")
+            tail_lines = render.tail_lines(path, tail_n)
         except Exception as exc:
             self._notify(f"copy failed: {exc}", "error")
             return
-        lines = content.splitlines()
-        tail_n = 500
-        tail = "\n".join(lines[-tail_n:])
+        tail = "".join(tail_lines).rstrip("\n")
         try:
             # Textual's clipboard uses OSC 52 — works in iTerm2, kitty,
             # WezTerm, Alacritty out of the box.
@@ -692,7 +693,7 @@ class DashboardScreen(Screen):
         except Exception as exc:
             self._notify(f"clipboard write failed: {exc}", "error")
             return
-        shown = min(len(lines), tail_n)
+        shown = len(tail_lines)
         self._notify(
             f"copied last {shown} line(s) of {path.name} to clipboard",
             "information",
@@ -971,11 +972,11 @@ class DashboardScreen(Screen):
     def _notify(
         self, msg: str, severity: Literal["information", "warning", "error"]
     ) -> None:
-        # Textual notify; also surface on the dashboard's bottom line.
+        # Disable markup so remote/user-controlled notification text stays literal.
         with contextlib.suppress(Exception):
-            self.app.notify(msg, severity=severity)
+            self.app.notify(msg, severity=severity, markup=False)
         line = self.query_one("#status-line", Static)
-        line.update(f"[dim]{msg}[/dim]")
+        line.update(Text(msg, style="dim"))
 
     # ------------------------------------------------------------------
     # Refresh
@@ -1178,7 +1179,9 @@ class DashboardScreen(Screen):
             self._chat_workspaces[key] = identifier
             if session:
                 self._job_sessions[key] = str(session)
-            table.add_row(identifier, render.fmt_age(job.get("uptime_s")), key=key)
+            table.add_row(
+                Text(identifier), render.fmt_age(job.get("uptime_s")), key=key
+            )
             keys.append(key)
 
         if not keys:
