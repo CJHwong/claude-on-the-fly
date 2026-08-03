@@ -579,9 +579,10 @@ class Orchestrator:
                 response.tokens_in,
                 response.tokens_out,
             )
-            # Only pty mode reports this. A turn that doesn't sets nothing rather
-            # than zeroing the reading, so a mode switch mid-thread can't make a
-            # large context look small.
+            # pty reports it off the statusline; native (non-ollama) adds it up
+            # in `_native_context_fields`; ollama withholds it. A turn that
+            # doesn't report sets nothing rather than zeroing the reading, so a
+            # mode switch mid-thread can't make a large context look small.
             if response.context_tokens and response.context_window_size:
                 self._context[chat_id] = (
                     response.context_tokens,

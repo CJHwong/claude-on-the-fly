@@ -863,6 +863,41 @@ class TestParseStream:
         out = parse_stream(stream)
         assert out["tool_counts"] == {"unknown": 1}
 
+    def test_last_assistant_usage_is_captured(self):
+        """The reading a compaction faces is the final prompt size, so only the
+        last assistant message's usage survives to the envelope."""
+        stream = _ndjson(
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_1",
+                    "content": [],
+                    "usage": {"input_tokens": 20_000},
+                },
+            },
+            {"type": "user", "message": {"content": []}},
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_2",
+                    "content": [],
+                    "usage": {"input_tokens": 22_100, "output_tokens": 45},
+                },
+            },
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_usage"] == {
+            "input_tokens": 22_100,
+            "output_tokens": 45,
+        }
+
+    def test_no_assistant_message_leaves_no_usage_reading(self):
+        """A compaction turn emits no assistant message; the envelope must not
+        fall back to its top-level `usage` (the whole turn's aggregate)."""
+        stream = _ndjson(_result_line())
+        assert "last_assistant_usage" not in parse_stream(stream)
+
 
 # ---------------------------------------------------------------------------
 # _merge_cli_output

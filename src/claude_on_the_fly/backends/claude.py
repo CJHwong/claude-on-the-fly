@@ -88,14 +88,20 @@ def _native_context_fields(cli_output: dict) -> dict:
     built on `tokens_in` would under-read the prompt by about half in the case it
     exists to catch.
 
-    `modelUsage` lists every model a turn touched, sub-agents included. The
-    top-level `usage` is the main session's, so pair it with the widest window
-    listed: a sub-agent's smaller one would overstate how full the context is,
-    and for a feature that spends money to act, over-reading is the costly
-    direction. Empty dict when either number is missing, which reads downstream
-    as "no reading" rather than as zero.
+    The reading comes from the *last assistant message*'s usage, not the
+    envelope's top-level `usage`: the top-level figure sums every API call in
+    the turn (a 2-call turn reported ~2x the final prompt, matching the call
+    count), so it overstates how full the context is exactly when a turn has
+    worked hard enough to be near the edge. The per-message usage is what a
+    compaction would actually be up against.
+
+    `modelUsage` lists every model a turn touched, sub-agents included. Pair
+    the prompt with the widest window listed: a sub-agent's smaller one would
+    overstate how full the context is, and for a feature that spends money to
+    act, over-reading is the costly direction. Empty dict when either number is
+    missing, which reads downstream as "no reading" rather than as zero.
     """
-    usage = cli_output.get("usage") or {}
+    usage = cli_output.get("last_assistant_usage") or {}
     tokens = (
         int(usage.get("input_tokens", 0))
         + int(usage.get("cache_read_input_tokens", 0))
@@ -588,8 +594,11 @@ class ClaudeBackend:
         across every assistant record by pty's transcript pass, so it's the
         truthful cross-turn total.
 
-        Native/ollama stay on `usage` because that's how stream-json folds
-        already work, and we want zero behavior change there.
+        Native/ollama stay on `usage`: the result envelope's top-level figure
+        is already the whole turn's aggregate — every API call's input summed,
+        which is exactly what the footer wants. It is *not* the final prompt
+        size, so the auto-compact reading must come from
+        `last_assistant_usage` instead (see `_native_context_fields`).
         """
         if self.pty:
             mu = cli_output.get("modelUsage") or {}

@@ -255,12 +255,13 @@ class TestRunDoesNotNudgeACompaction:
 
 class TestNativeContextFields:
     """The auto-compact gate's reading in native mode. pty gets it from the
-    statusline; native has to add it up."""
+    statusline; native has to add it up — from the last assistant message, not
+    the envelope's top-level `usage`, which is the whole turn's aggregate."""
 
     def test_sums_all_three_usage_terms(self):
         out = claude_mod._native_context_fields(
             {
-                "usage": {
+                "last_assistant_usage": {
                     "input_tokens": 2,
                     "cache_read_input_tokens": 22034,
                     "cache_creation_input_tokens": 18554,
@@ -270,12 +271,31 @@ class TestNativeContextFields:
         )
         assert out == {"context_tokens": 40590, "context_window_size": 200000}
 
+    def test_top_level_usage_is_the_turn_aggregate_and_is_ignored(self):
+        """The envelope's top-level `usage` sums every API call in the turn, so
+        it over-reads the prompt by about the call count. A 2-call turn here
+        reports ~2x the final prompt — the reading must come from the last
+        assistant message only."""
+        out = claude_mod._native_context_fields(
+            {
+                "usage": {
+                    "input_tokens": 91_449,  # aggregate, what a buggy read would use
+                },
+                "last_assistant_usage": {"input_tokens": 46_447},
+                "modelUsage": {"claude-sonnet-5": {"contextWindow": 200000}},
+            }
+        )
+        assert out["context_tokens"] == 46_447
+
     def test_cache_creation_is_not_dropped(self):
         """`tokens_in` omits it on purpose, but a cold cache — the case this
         feature exists for — puts most of the prompt there."""
         out = claude_mod._native_context_fields(
             {
-                "usage": {"input_tokens": 0, "cache_creation_input_tokens": 400_000},
+                "last_assistant_usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 400_000,
+                },
                 "modelUsage": {"m": {"contextWindow": 1_000_000}},
             }
         )
@@ -286,7 +306,7 @@ class TestNativeContextFields:
         and over-reading is the direction that spends money."""
         out = claude_mod._native_context_fields(
             {
-                "usage": {"input_tokens": 100},
+                "last_assistant_usage": {"input_tokens": 100},
                 "modelUsage": {
                     "claude-haiku-4-5": {"contextWindow": 200000},
                     "claude-sonnet-5": {"contextWindow": 1000000},
@@ -296,15 +316,25 @@ class TestNativeContextFields:
         assert out["context_window_size"] == 1000000
 
     def test_no_window_means_no_reading_rather_than_zero(self):
-        assert claude_mod._native_context_fields({"usage": {"input_tokens": 100}}) == {}
+        assert (
+            claude_mod._native_context_fields(
+                {"last_assistant_usage": {"input_tokens": 100}}
+            )
+            == {}
+        )
 
     def test_no_usage_means_no_reading(self):
-        assert claude_mod._native_context_fields({"modelUsage": {"m": {}}}) == {}
+        assert (
+            claude_mod._native_context_fields(
+                {"last_assistant_usage": {}, "modelUsage": {"m": {}}}
+            )
+            == {}
+        )
 
     def test_malformed_model_usage_entry_is_ignored(self):
         out = claude_mod._native_context_fields(
             {
-                "usage": {"input_tokens": 100},
+                "last_assistant_usage": {"input_tokens": 100},
                 "modelUsage": {"a": "not-a-dict", "b": {"contextWindow": 200000}},
             }
         )
@@ -454,7 +484,13 @@ class TestOllamaWithholdsTheContextWindow:
             "subtype": "success",
             "is_error": False,
             "result": "hi",
-            "usage": {"input_tokens": 10, "cache_read_input_tokens": 38_492},
+            # Top-level `usage` is the whole turn's aggregate — twice the last
+            # message here. The reading must come from the per-message figure.
+            "usage": {"input_tokens": 20, "cache_read_input_tokens": 76_984},
+            "last_assistant_usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 38_492,
+            },
             "modelUsage": {"glm-5.2:cloud": {"contextWindow": 200000}},
             "tool_counts": {},
             "skill_counts": {},
