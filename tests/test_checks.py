@@ -27,6 +27,7 @@ from claude_on_the_fly.checks import (
     resolve_slack_ids,
     slack_deprecations,
 )
+from claude_on_the_fly.interim import interim_progress_enabled
 
 
 class TestSlackResolvers:
@@ -1079,6 +1080,87 @@ class TestAutoCompactCapability:
             }
         )
         assert first_failure(results) is None
+
+
+class TestInterimProgressCheck:
+    """Interim progress needs a line-by-line stream; a mode that hands back one
+    envelope at the end of the turn can never produce one."""
+
+    def test_unset_adds_no_row(self):
+        results = check_backend({"AGENT_BACKEND": "claude"})
+        assert not any(r.name == "COTF_INTERIM_PROGRESS" for r in results)
+
+    def test_off_adds_no_row(self):
+        results = check_backend(
+            {"AGENT_BACKEND": "claude", "COTF_INTERIM_PROGRESS": "false"}
+        )
+        assert not any(r.name == "COTF_INTERIM_PROGRESS" for r in results)
+
+    def test_claude_native_is_ok(self):
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "native",
+                "COTF_INTERIM_PROGRESS": "1",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_INTERIM_PROGRESS")
+        assert row.status == "ok"
+
+    def test_claude_ollama_is_ok(self):
+        """The correction over _AUTO_COMPACT_CAPABLE: ollama streams exactly as
+        native does, because the launcher only prepends an argv prefix."""
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "ollama",
+                "OLLAMA_MODEL": "glm-5.2:cloud",
+                "COTF_INTERIM_PROGRESS": "1",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_INTERIM_PROGRESS")
+        assert row.status == "ok"
+
+    def test_claude_pty_warns(self):
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "pty",
+                "COTF_INTERIM_PROGRESS": "1",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_INTERIM_PROGRESS")
+        assert row.status == "warn"
+        assert "claude/pty" in row.detail
+
+    def test_codex_warns(self):
+        results = check_backend(
+            {"AGENT_BACKEND": "codex", "COTF_INTERIM_PROGRESS": "1"}
+        )
+        row = next(r for r in results if r.name == "COTF_INTERIM_PROGRESS")
+        assert row.status == "warn"
+
+    @pytest.mark.parametrize(
+        ("raw", "on"),
+        [("1", True), ("true", True), (" ON ", True), ("maybe", False), ("", False)],
+    )
+    def test_the_doctor_agrees_with_the_runtime_on_what_counts_as_on(
+        self, raw, on, monkeypatch
+    ):
+        """One setting, so one predicate — `interim.interim_progress_reads_as_on`,
+        which both sides call. Two copies of the truthy set would let a widening
+        on one side produce a doctor that reports nothing for a value the daemon
+        is acting on, which is worse than no doctor at all."""
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", raw)
+        assert interim_progress_enabled() is on
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_MODE": "native",
+                "COTF_INTERIM_PROGRESS": raw,
+            }
+        )
+        assert any(r.name == "COTF_INTERIM_PROGRESS" for r in results) is on
 
 
 class TestJobTriggerCollidesWithCompact:

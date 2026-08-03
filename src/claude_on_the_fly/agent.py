@@ -19,6 +19,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -603,6 +604,86 @@ def _classify(message: str) -> RuntimeError:
     return RuntimeError(message)
 
 
+# Where this turn's mid-turn narration goes, or None to forward nothing (the
+# default, and what every caller outside a chat frontend gets). A ContextVar for
+# the same reason as sandbox._SESSION_ENV: the stream loop is several frames
+# below the orchestrator that knows which chat this is, and threading a callback
+# through would change `agent.run`, the AgentBackend Protocol, both backends'
+# `run`, `_exec`, `_exec_pty`, `_consume` and `_fold`. asyncio copies the context
+# when a task is created, so a value set in Orchestrator._process reaches that
+# turn's stream and no other. Sync by contract: it is called from inside the
+# stdout read loop, so it must not await.
+_PROGRESS_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "cotf_progress_sink", default=None
+)
+
+
+def set_progress_sink(
+    sink: Callable[[str], None],
+) -> Token[Callable[[str], None] | None]:
+    """Forward this turn's mid-turn text blocks to `sink`. Reset with the token."""
+    return _PROGRESS_SINK.set(sink)
+
+
+def reset_progress_sink(token: Token[Callable[[str], None] | None]) -> None:
+    _PROGRESS_SINK.reset(token)
+
+
+class InterimRelay:
+    """The main agent's mid-turn text blocks, forwarded as the turn produces them.
+
+    A turn's final answer is a text block too, and the frontend posts that itself
+    from `Response.body` — so a block is only forwarded once something proves the
+    turn continued past it, which is a `tool_use`. Whatever is still pending when
+    the stream ends is the answer, and is dropped rather than posted twice under a
+    progress marker.
+
+    Measured (claude 2.1.220): every assistant message carries exactly ONE
+    content block, so the normal shape is `text` in one message and the `tool_use`
+    in the next, and "pending across messages" is the main path rather than the
+    fallback. A message holding both is rare but must still come out in order,
+    which is why the flush happens at the `tool_use` block itself and not after
+    the loop: only text that PRECEDED the tool call is proven to be narration, and
+    text positioned after it is still a candidate for the final answer.
+
+    Sub-agent output is not in the stream to begin with -- `--forward-subagent-text`
+    is off unless asked for, and `_native_base_argv` never asks. The
+    `parent_tool_use_id` check is the belt to that braces: the field is present on
+    every default-stream assistant line with the value None (measured), and it is
+    the field the flag's own help text says subagent forwarding sets.
+
+    Thinking is excluded by selecting `type == "text"`. That filter is
+    load-bearing, not defensive: the main agent's own thinking blocks ARE in the
+    default stream (measured), each as its own message, and they carry their
+    payload under `thinking` -- as `transcript.py` and `tui/session_format.py`
+    both already rely on.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+        self._pending: list[str] = []
+
+    def feed(self, msg: dict) -> None:
+        if msg.get("type") != "assistant" or msg.get("parent_tool_use_id"):
+            return
+        for block in msg.get("message", {}).get("content", []):
+            kind = block.get("type")
+            if kind == "text":
+                text = (block.get("text") or "").strip()
+                if text:
+                    self._pending.append(text)
+            elif kind == "tool_use":
+                # Inside the loop, deliberately: this flushes what came BEFORE
+                # this tool call. Flushing after the loop would also release text
+                # that followed it, which is not yet proven to be narration.
+                self._flush()
+
+    def _flush(self) -> None:
+        for text in self._pending:
+            self._emit(text)
+        self._pending.clear()
+
+
 async def _consume(proc: asyncio.subprocess.Process) -> dict:
     """Stream stdout, fold into result, validate returncode. Caller owns proc lifecycle."""
     assert proc.stdout is not None and proc.stderr is not None
@@ -619,6 +700,9 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     result: dict = {}
     line_count = 0
     stdout_bytes = 0
+    # Read once, at the top: the sink belongs to the turn, not to a line.
+    sink = _PROGRESS_SINK.get()
+    relay = InterimRelay(sink) if sink is not None else None
     try:
         async for raw in proc.stdout:
             stdout_bytes += len(raw)
@@ -636,6 +720,14 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
                 logger.warning("exec: skipping malformed line: %s", line[:120])
                 continue
             r = _fold(msg, tool_counts, skill_counts, compact, last_usage)
+            if relay is not None:
+                try:
+                    relay.feed(msg)
+                except Exception:
+                    # Same rule as _announce_process: a sink that raises must not
+                    # take the agent run down with it. The turn is worth more than
+                    # the progress line.
+                    logger.exception("agent: progress relay failed")
             if r is not None:
                 result = r
     except BaseException:

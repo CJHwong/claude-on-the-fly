@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 from claude_on_the_fly import envfile
+from claude_on_the_fly.interim import interim_progress_reads_as_on
 
 Status = Literal["ok", "missing", "invalid", "warn"]
 
@@ -693,6 +694,10 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
     if auto_compact is not None:
         results.append(auto_compact)
 
+    interim = _check_interim_progress(env, backend, mode)
+    if interim is not None:
+        results.append(interim)
+
     return results
 
 
@@ -740,6 +745,46 @@ def _check_auto_compact(
             "Use CLAUDE_MODE=native or pty for automatic compaction; manual "
             "compaction still works in every mode"
         ),
+    )
+
+
+# Backend/mode pairs whose output we read line by line as it is produced. Not the
+# same set as _AUTO_COMPACT_CAPABLE and not derivable from it: claude's ollama
+# mode streams exactly as native does (the launcher only prepends an argv
+# prefix), while pty returns a single envelope from claude-pty and codex buffers
+# all of stdout before parsing it. Auto-compact's gap is ollama, for an unrelated
+# reason — the window figure describes the wrong model there.
+_INTERIM_CAPABLE: frozenset[tuple[str, str]] = frozenset(
+    {("claude", "native"), ("claude", "ollama")}
+)
+
+
+def _check_interim_progress(
+    env: Mapping[str, str], backend: str, mode: str
+) -> CheckResult | None:
+    """Report interim progress switched on where it can never fire. None when off.
+
+    Advisory, like the auto-compact threshold: a setting that does nothing is not
+    a reason to refuse to start, but silence reads as a working setting.
+
+    On/off is decided by `interim.interim_progress_reads_as_on` rather than by a
+    second copy of the truthy set here: the runtime reads the same setting, and a
+    doctor that disagreed with it would report "off" for a value the daemon acts
+    on. The predicate takes the raw string, so this stays a pure function over
+    the mapping it was handed.
+    """
+    if not interim_progress_reads_as_on(env.get("COTF_INTERIM_PROGRESS", "")):
+        return None
+    if (backend, mode) in _INTERIM_CAPABLE:
+        return CheckResult(name="COTF_INTERIM_PROGRESS", status="ok", detail="= on")
+    return CheckResult(
+        name="COTF_INTERIM_PROGRESS",
+        status="warn",
+        detail=(
+            f"on but inert under {backend}/{mode} — that mode hands back one "
+            "envelope at the end of the turn, so there is no stream to follow"
+        ),
+        fix_hint="Use agent.claude.mode native or ollama to see progress while a turn runs",
     )
 
 

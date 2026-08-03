@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from claude_on_the_fly import interim as interim_mod
 from claude_on_the_fly import orchestrator as orchestrator_mod
 from claude_on_the_fly import permissions as permissions_mod
 from claude_on_the_fly import settings
@@ -38,6 +39,7 @@ class StubFrontend(Frontend):
         self.queued_notifications: list[tuple[int, int]] = []
         self.start_notifications: list[int] = []
         self.complete_notifications: list[int] = []
+        self.progress: list[tuple[int, str]] = []
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         pass
@@ -57,6 +59,9 @@ class StubFrontend(Frontend):
 
     async def notify_complete(self, chat_id: int) -> None:
         self.complete_notifications.append(chat_id)
+
+    async def send_progress(self, chat_id: int, text: str) -> None:
+        self.progress.append((chat_id, text))
 
     async def stop(self) -> None:
         pass
@@ -780,6 +785,261 @@ class TestEventEmission:
             await task
 
         assert orch.heartbeat_extra() == {"running_jobs": []}
+
+
+# ---------------------------------------------------------------------------
+# _process: mid-turn progress wiring
+# ---------------------------------------------------------------------------
+
+
+def _watch_send_ordering(frontend: StubFrontend) -> list[int]:
+    """How many progress messages had landed each time `send` was called.
+
+    The relay is closed before the reply is posted, so a progress line can never
+    arrive after the message that ends the turn. Two independent lists cannot show
+    that on their own.
+    """
+    seen: list[int] = []
+    original = frontend.send
+
+    async def recording_send(chat_id: int, response: Response) -> list[Path] | None:
+        seen.append(len(frontend.progress))
+        return await original(chat_id, response)
+
+    frontend.send = recording_send  # type: ignore[method-assign]
+    return seen
+
+
+class SilentFrontend(StubFrontend):
+    """A frontend that never overrode `send_progress` — the Telegram shape.
+
+    Re-inheriting the ABC's concrete no-op is the whole point: `StubFrontend`
+    overrides it, and the gate under test is exactly "did anyone override this?".
+    """
+
+    send_progress = Frontend.send_progress
+
+
+class TestProcessInterim:
+    async def test_a_frontend_that_cannot_deliver_starts_no_relay(
+        self,
+        event_log: EventLog,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """`send_progress` is a concrete no-op on the ABC, so the setting alone is
+        not enough: with the toggle on under Telegram, every turn would otherwise
+        spawn a drain task that ticks for the life of the turn and delivers into
+        nothing."""
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", "1")
+        frontend = SilentFrontend()
+        orch = Orchestrator(frontend, "test", event_log=event_log)
+        seen: list[object] = []
+
+        async def fake_run(*_args, **_kwargs) -> Response:
+            seen.append(orchestrator_mod.agent._PROGRESS_SINK.get())
+            return Response(body="done")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(orchestrator_mod.agent, "run", new=fake_run),
+        ):
+            await orch._process(1, Turn("hi"))
+
+        assert orch._start_interim(1) is None
+        assert seen == [None]
+        assert frontend.progress == []
+
+    async def test_narration_reaches_the_frontend_mid_turn(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", "1")
+        monkeypatch.setattr(interim_mod, "DEFAULT_INTERIM_WARMUP_S", 0.0)
+        monkeypatch.setattr(interim_mod, "DEFAULT_INTERIM_MIN_GAP_S", 0.0)
+        order = _watch_send_ordering(frontend)
+
+        async def fake_run(*_args, **_kwargs) -> Response:
+            # Exactly once: with the gap at 0.0 every post is immediately due, so
+            # a second emit here would pass without exercising coalescing at all.
+            # The limiter's own behaviour is proved in tests/test_interim.py.
+            sink = orchestrator_mod.agent._PROGRESS_SINK.get()
+            assert sink is not None
+            sink("盤點完成")
+            return Response(body="done")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(orchestrator_mod.agent, "run", new=fake_run),
+        ):
+            await orch._process(1, Turn("hi"))
+
+        assert frontend.progress == [(1, "盤點完成")]
+        assert order == [1]
+
+    async def test_toggle_off_is_identical_to_today(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.delenv("COTF_INTERIM_PROGRESS", raising=False)
+        seen: list[object] = []
+        response = Response(body="ok", cost=0.02, tokens_in=10, tokens_out=20)
+
+        async def fake_run(*_args, **_kwargs) -> Response:
+            seen.append(orchestrator_mod.agent._PROGRESS_SINK.get())
+            return response
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(orchestrator_mod.agent, "run", new=fake_run),
+        ):
+            await orch._process(1, Turn("hi"))
+
+        assert seen == [None]
+        assert frontend.progress == []
+        assert frontend.sent == [(1, response)]
+        done = event_log.tail(10)[-1]
+        assert done["type"] == "worker_done"
+        assert done["cost"] == 0.02
+        assert done["tokens_in"] == 10
+        assert done["tokens_out"] == 20
+
+    async def test_a_compaction_turn_starts_no_relay(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """A compaction produces no assistant message to narrate."""
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", "1")
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = AsyncMock(return_value=Compaction(ok=True))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True))
+
+        assert frontend.progress == []
+
+    async def test_a_failing_turn_flushes_the_last_narration_before_the_error_reply(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """The GAP is deliberately NOT patched away, and TWO lines are narrated,
+        which is what makes the flush the only thing that can release the second.
+
+        The warm-up is patched to 0 because the flush respects it — a turn that
+        fails before the warm-up posts nothing, which `tests/test_interim.py`
+        pins separately. But warm-up 0 with a single line proves nothing: with no
+        previous post the limiter has nothing to hold against, so that line goes
+        out through the ordinary path and the assertion passes with
+        `flush=False`. The first line here is what starts the gap; the second is
+        held inside it, on the real 300s default, until `aclose(flush=True)`.
+        """
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", "1")
+        monkeypatch.setattr(interim_mod, "DEFAULT_INTERIM_WARMUP_S", 0.0)
+        order = _watch_send_ordering(frontend)
+
+        async def fake_run(*_args, **_kwargs) -> Response:
+            emit = orchestrator_mod.agent._PROGRESS_SINK.get()
+            emit("halfway")
+            emit("and then it broke")
+            raise RuntimeError("boom")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(orchestrator_mod.agent, "run", new=fake_run),
+        ):
+            await orch._process(1, Turn("hi"))
+
+        assert frontend.progress == [(1, "halfway"), (1, "and then it broke")]
+        assert order == [2]
+        assert "Error: boom" in frontend.sent[0][1].body
+        assert event_log.tail(10)[-1]["type"] == "worker_failed"
+
+    async def test_an_unavailable_backend_takes_the_same_flush_path(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """One inner arm covers both outer handlers; there is no second site.
+
+        Two lines, and the gap left real, for the reason spelled out on the test
+        above: the second is held by the limiter and only the flush releases it.
+        """
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", "1")
+        monkeypatch.setattr(interim_mod, "DEFAULT_INTERIM_WARMUP_S", 0.0)
+        order = _watch_send_ordering(frontend)
+
+        async def fake_run(*_args, **_kwargs) -> Response:
+            emit = orchestrator_mod.agent._PROGRESS_SINK.get()
+            emit("halfway")
+            emit("and then it broke")
+            raise ClaudeUnavailableError("monthly usage limit")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(orchestrator_mod.agent, "run", new=fake_run),
+        ):
+            await orch._process(1, Turn("hi"))
+
+        assert frontend.progress == [(1, "halfway"), (1, "and then it broke")]
+        assert order == [2]
+        assert "Claude unavailable" in frontend.sent[0][1].body
+        assert event_log.tail(10)[-1]["reason"] == "unavailable"
+
+    async def test_an_aborted_turn_cancels_the_relay_without_awaiting(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Every assertion reads through the sink the turn itself captured. The
+        ContextVar is None in the test's own context whatever the code does, which
+        is what made an earlier version of this test unable to fail."""
+        monkeypatch.setenv("COTF_INTERIM_PROGRESS", "1")
+        holder: dict[str, object] = {}
+        release = asyncio.Event()
+
+        async def fake_run(*_args, **_kwargs) -> Response:
+            holder["sink"] = orchestrator_mod.agent._PROGRESS_SINK.get()
+            await release.wait()
+            return Response(body="never")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(orchestrator_mod.agent, "run", new=fake_run),
+        ):
+            await orch.on_message(1, "go")
+            for _ in range(200):
+                if "sink" in holder:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert await orch.abort(1) is True
+
+        relay = holder["sink"].__self__  # type: ignore[attr-defined]
+        assert isinstance(relay, interim_mod.InterimProgress)
+        assert relay._closed is True
+        await asyncio.sleep(0)
+        assert relay._task.done()
 
 
 # ---------------------------------------------------------------------------

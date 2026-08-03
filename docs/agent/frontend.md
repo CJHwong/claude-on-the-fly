@@ -19,6 +19,7 @@ Messaging-platform adapters (Slack, Telegram) implement the `Frontend` ABC at `s
 ### Optional overrides worth knowing
 
 - `notify_queued` / `notify_start` / `notify_complete` (default no-op) — for frontends that want cheaper signals than text replies (e.g. emoji reactions).
+- `send_progress(chat_id, text)` (default no-op) — one mid-turn narration message while a turn runs, gated on `interim.progress`; only Slack implements it, and the implementation contract is on `Frontend.send_progress` in `protocol.py`. The coalescing and rate limiting live in `src/claude_on_the_fly/interim.py`, not in the adapter and not in `orchestrator.py` — how often a person wants to be interrupted is the same question on every platform.
 - `timeout_for(chat_id)` — per-message subprocess timeout override; `None` uses the agent default.
 - `describe()` — frontend-specific settings to print in the startup preview. Redact secrets before returning.
 

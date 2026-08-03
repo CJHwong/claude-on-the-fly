@@ -12,6 +12,7 @@ import pytest
 from telegram.error import BadRequest
 
 from claude_on_the_fly.agent import Response
+from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.telegram import (
     MAX_MESSAGE_LENGTH,
     SUGGESTION_LABEL_CAP,
@@ -1920,3 +1921,8 @@ class TestDownloadCleanup:
         )
         assert [p.name for p in target.iterdir()] == []
         assert workspace.exists() is False
+
+
+def test_telegram_does_not_implement_send_progress():
+    """Interim progress is Slack-only; Telegram behaves exactly as before."""
+    assert TelegramFrontend.send_progress is Frontend.send_progress

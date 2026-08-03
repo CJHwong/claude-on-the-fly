@@ -52,6 +52,26 @@ class Frontend(ABC):
         once the reply has been posted. No-op by default.
         """
 
+    async def send_progress(self, chat_id: int, text: str) -> None:
+        """Deliver one mid-turn narration message from the agent, while it runs.
+
+        Called only while a turn is running, only when `interim.progress` is on,
+        and only with the main agent's own text — not thinking, not sub-agent
+        output. The caller has already coalesced and rate-limited it, so one call
+        is one message the user should see. Implementations must mark it as machine
+        progress, distinct from the reply `send()` will post, and must not count it
+        against any reply budget.
+
+        No-op by default, so a frontend with no thread to put it in — or no wish
+        to — behaves exactly as it did before this existed.
+
+        Best-effort, and deliberately one-way: an implementation that cannot
+        deliver returns without saying so, and the caller has already started its
+        next rate-limiting gap by the time this runs. A dropped message therefore
+        costs a whole gap of silence rather than being retried — the accepted
+        price of not putting a delivery-outcome contract on every frontend.
+        """
+
     async def ask_approval(
         self, request: ApprovalRequest, chat_id: int | None = None
     ) -> bool:

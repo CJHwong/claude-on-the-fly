@@ -37,6 +37,20 @@ configuration writes, not those persona links.
 Automatic compaction requires a reliable context-window reading. It is inert for
 Claude routed through Ollama; manual `$compact` remains available.
 
+## `interim`
+
+| Key | Type / default | Values and effect | Lifecycle |
+|---|---|---|---|
+| `progress` | boolean / false | Forward the agent's mid-turn narration into the thread as it is produced | Immediate |
+| `warmup_seconds` | number / `300` | Silence before a turn's first progress message; `0` posts from the first line; negative or invalid uses default | Immediate |
+| `min_gap_seconds` | number / `300` | Shortest gap between two progress messages; `0` posts every line as it arrives; negative or invalid uses default | Immediate |
+
+Interim progress needs a line-by-line stream, so it is inert under `agent.claude.mode:
+pty` and under the codex backend, and it is inert on a frontend that does not implement
+progress delivery (today, Telegram). It posts only in DMs and group DMs, is paced by
+`warmup_seconds` and `min_gap_seconds` so a short turn produces nothing and a long one
+a periodic digest, and it does not count against `slack.reply_soft_limit`.
+
 ## `egress`
 
 | Key | Type / default | Effect | Lifecycle |
