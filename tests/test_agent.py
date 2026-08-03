@@ -1682,6 +1682,69 @@ class TestClaudeBackendLauncher:
         model_indices = [i for i, v in enumerate(cmd) if v == "--model"]
         assert model_indices == [3]
 
+    async def test_effort_flag_only_under_launcher(self, monkeypatch):
+        """OLLAMA_EFFORT must not reach native argv: native inherits the CLI's
+        own settings.json effortLevel, and a flag here would override it."""
+        output = _cli_output()
+        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert "--effort" not in mock.call_args[0][1]
+
+    async def test_effort_flag_under_launcher(self, monkeypatch):
+        """Ollama mode: the served model differs from the CLI's native provider,
+        so the operator's effort setting is passed explicitly."""
+        output = _cli_output()
+        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        cmd = mock.call_args[0][1]
+        assert "--effort" in cmd
+        assert cmd[cmd.index("--effort") + 1] == "max"
+
+    async def test_effort_omitted_without_setting(self, monkeypatch):
+        """Unset OLLAMA_EFFORT → no --effort even under the launcher."""
+        output = _cli_output()
+        monkeypatch.delenv("OLLAMA_EFFORT", raising=False)
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        assert "--effort" not in mock.call_args[0][1]
+
+    async def test_effort_level_not_in_claude_set_skipped(self, monkeypatch, caplog):
+        """`minimal` is codex-only; claude must skip it rather than pass it to
+        the CLI, which would reject the turn."""
+        output = _cli_output()
+        monkeypatch.setenv("OLLAMA_EFFORT", "minimal")
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        assert "--effort" not in mock.call_args[0][1]
+        assert "ignoring unknown effort 'minimal'" in caplog.text
+
     async def test_native_mode_uses_cli_total_cost_usd(self):
         """Without a launcher, cost comes straight from claude's billing field."""
         output = _cli_output(cost=0.05)

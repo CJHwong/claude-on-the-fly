@@ -478,6 +478,73 @@ class TestCodexBackendRun:
         assert "-m" not in cmd
         assert "o3" not in cmd
 
+    async def test_effort_config_only_under_launcher(self, tmp_path, monkeypatch):
+        """OLLAMA_EFFORT must not reach native argv: native inherits the
+        operator's own model_reasoning_effort in ~/.codex/config.toml."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("OLLAMA_EFFORT", "high")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+        assert "-c" not in mock.call_args[0][1]
+
+    async def test_effort_config_under_launcher(self, tmp_path, monkeypatch):
+        """Ollama mode: effort is passed as a TOML-quoted -c override."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("OLLAMA_EFFORT", "high")
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(launcher=launcher).run(
+                workspace, "sess", "hi", "telegram"
+            )
+        cmd = mock.call_args[0][1]
+        assert 'model_reasoning_effort="high"' in cmd
+
+    async def test_effort_omitted_without_setting(self, tmp_path, monkeypatch):
+        """Unset OLLAMA_EFFORT → no -c override even under the launcher."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.delenv("OLLAMA_EFFORT", raising=False)
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(launcher=launcher).run(
+                workspace, "sess", "hi", "telegram"
+            )
+        assert "-c" not in mock.call_args[0][1]
+
+    async def test_effort_level_not_in_codex_set_skipped(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """`max` is claude-only; codex must skip it rather than hand it to its
+        config parse, which would fail the spawn."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(launcher=launcher).run(
+                workspace, "sess", "hi", "telegram"
+            )
+        assert "-c" not in mock.call_args[0][1]
+        assert "ignoring unknown effort 'max'" in caplog.text
+
     async def test_native_with_codex_model_injects_m_flag(
         self, tmp_path: Path, monkeypatch
     ):
