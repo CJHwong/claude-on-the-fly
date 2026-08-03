@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1549,3 +1550,57 @@ class TestPhotoSendWithoutAnApp:
         attachment, which is what the user would actually notice."""
         frontend._app = None
         assert await frontend._try_send_photo(99, Path("shot.png"), b"bytes") is False
+
+
+class TestSenderIdentity:
+    def test_it_is_the_chat_id(self, frontend):
+        """Telegram is always a DM, so the chat is the person."""
+        assert frontend.sender_identity(99) == "99"
+
+
+class TestAllowedUserIdIsRereadNotCached:
+    """Re-read per update so revoking access takes effect without a restart.
+    A junk edit must not widen access or lock the operator out."""
+
+    def test_a_valid_edit_takes_effect_immediately(self, frontend, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "456")
+        assert frontend._current_allowed_user_id() == 456
+
+    def test_an_unparseable_value_keeps_the_last_valid_one(
+        self, frontend, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "not-an-id")
+        with caplog.at_level("ERROR"):
+            assert frontend._current_allowed_user_id() == 123
+        assert "not an integer" in caplog.text
+
+
+class TestDownloadCleanup:
+    async def test_a_failed_download_leaves_no_temp_file(
+        self, frontend, tmp_path, monkeypatch
+    ):
+        """The temp file sits in the agent's own workspace, so an abandoned one
+        is visible to the agent and to the next listing."""
+        workspace = tmp_path / "ws"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        monkeypatch.setattr(
+            frontend, "workspace_name", lambda _chat_id: "telegram/probe"
+        )
+
+        class _File:
+            async def download_to_drive(self, _path):
+                raise OSError("connection reset")
+
+        class _Bot:
+            async def get_file(self, _file_id):
+                return _File()
+
+        frontend._app = SimpleNamespace(bot=_Bot())
+        with pytest.raises(OSError, match="connection reset"):
+            await frontend._save_file(1, "file-id", "report.pdf")
+
+        target = (
+            tmp_path / "home" / ".claude-on-the-fly" / "workspaces" / "telegram/probe"
+        )
+        assert [p.name for p in target.iterdir()] == []
+        assert workspace.exists() is False

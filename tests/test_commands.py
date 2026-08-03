@@ -946,3 +946,82 @@ def test_the_stale_sweep_spares_the_approval_shim(tmp_path):
 
     assert reserved.is_file(), "the approval shim was swept away"
     assert not stale.exists(), "a genuinely stale shim was left behind"
+
+
+class TestAllowlistIsDenyByDefault:
+    def test_a_tool_with_no_entries_permits_nothing(self):
+        """An unconfigured tool must not inherit "anything goes" — the shim
+        holds a live credential and the allowlist is the only gate."""
+        assert allowed_command(ShimmedTool(name="gh"), ["gh", "auth", "token"]) is False
+
+
+class TestWorkspaceCwd:
+    """The shim reports its own cwd, so the value is agent-influenced. It has to
+    land inside the session's workspace or be refused outright."""
+
+    @pytest.mark.parametrize(
+        ("raw", "why"),
+        [
+            pytest.param(None, "absent", id="absent"),
+            pytest.param("", "empty", id="empty"),
+            pytest.param(123, "not a string", id="not-a-string"),
+            pytest.param("relative/path", "not absolute", id="relative"),
+        ],
+    )
+    def test_an_unusable_cwd_is_refused(self, tmp_path, raw, why):
+        assert commands._workspace_cwd({"cwd": raw}, tmp_path) is None, why
+
+    def test_a_cwd_outside_the_workspace_is_refused(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        assert commands._workspace_cwd({"cwd": str(tmp_path)}, workspace) is None
+
+    def test_a_cwd_inside_the_workspace_is_accepted(self, tmp_path):
+        workspace = tmp_path / "ws"
+        inner = workspace / "sub"
+        inner.mkdir(parents=True)
+        assert commands._workspace_cwd({"cwd": str(inner)}, workspace) == str(
+            inner.resolve()
+        )
+
+
+class TestTerminateAlwaysReaps:
+    """`killpg` can fail for reasons that all mean the same thing here: this
+    child still has to be killed and reaped, or it becomes a zombie."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(ProcessLookupError(), id="already-gone"),
+            pytest.param(PermissionError(), id="not-ours"),
+            pytest.param(OSError("group signalling unsupported"), id="oserror"),
+        ],
+    )
+    async def test_a_failed_group_kill_falls_back_to_killing_the_child(
+        self, monkeypatch, error
+    ):
+        proc = await asyncio.create_subprocess_exec(
+            "sleep", "30", stdout=asyncio.subprocess.PIPE
+        )
+
+        def boom(_pgid, _sig):
+            raise error
+
+        monkeypatch.setattr(commands.os, "killpg", boom)
+        await commands._terminate(proc)
+        assert proc.returncode is not None
+
+    async def test_a_child_already_reaped_is_not_killed_twice(self, monkeypatch):
+        proc = await asyncio.create_subprocess_exec(
+            "true", stdout=asyncio.subprocess.PIPE
+        )
+        await proc.wait()
+
+        def boom(_pgid, _sig):
+            raise ProcessLookupError()
+
+        monkeypatch.setattr(commands.os, "killpg", boom)
+        killed = {"n": 0}
+        monkeypatch.setattr(type(proc), "kill", lambda self: killed.__setitem__("n", 1))
+        await commands._terminate(proc)
+        assert killed["n"] == 0

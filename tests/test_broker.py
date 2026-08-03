@@ -728,3 +728,51 @@ def test_port_before_start_raises_rather_than_returning_a_placeholder():
     )
     with pytest.raises(RuntimeError, match="not started"):
         _ = bro.port
+
+
+class TestLoopbackAuthentication:
+    """The bearer path capability is the only thing separating the agent's own
+    requests from anything else that can reach loopback. Every rejection below
+    must be a 403 with no upstream call and no credential in play."""
+
+    @pytest.mark.parametrize(
+        ("path", "why"),
+        [
+            pytest.param("/anthropic/v1/messages", "no session prefix", id="no-prefix"),
+            pytest.param("/_session/", "no token at all", id="empty"),
+            pytest.param(
+                "/_session/sometoken", "token but no route tail", id="no-tail"
+            ),
+            pytest.param("/_session//v1/messages", "empty token", id="blank-token"),
+            pytest.param(
+                "/_session/wrong-token/v1/messages", "wrong token", id="wrong"
+            ),
+        ],
+    )
+    async def test_an_unauthenticated_request_is_refused(
+        self, path, why, fake_keychain
+    ):
+        fake_keychain["cotf-anthropic"] = "REAL-INJECTED-KEY"
+        received: list[dict] = []
+        up_runner, up_port = await _start(_echo_app(received))
+        bro = Broker(
+            [
+                Route(
+                    prefix="/anthropic",
+                    upstream=f"http://localhost:{up_port}",
+                    header="x-api-key",
+                    keychain_service="cotf-anthropic",
+                )
+            ]
+        )
+        await bro.start()
+        try:
+            async with ClientSession() as client:
+                resp = await client.post(f"http://127.0.0.1:{bro.port}{path}")
+                body = await resp.text()
+            assert resp.status == 403, why
+            assert "authentication required" in body
+            assert received == [], "upstream was reached despite a failed auth"
+        finally:
+            await bro.stop()
+            await up_runner.cleanup()

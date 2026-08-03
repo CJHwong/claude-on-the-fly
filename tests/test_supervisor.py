@@ -774,3 +774,88 @@ class TestStopAllSkipsWhatVanishes:
             ),
         )
         assert supervisor.stop_all() == []
+
+
+class TestSignallingRespectsGroupOwnership:
+    """Signalling a process *group* reaches the agent CLIs a daemon spawned.
+    It is only safe when the daemon proved the group is its own; otherwise the
+    group could be the operator's shell."""
+
+    def test_a_daemon_that_owns_its_group_gets_the_group_signalled(
+        self, isolated_state, monkeypatch
+    ):
+        state = isolated_state / "state"
+        (state / "slack.json").write_text(
+            json.dumps({"frontend": "slack", "pid": 4321, "process_group": 4321})
+        )
+        killed: list[tuple] = []
+        monkeypatch.setattr(
+            supervisor.os, "killpg", lambda pid, sig: killed.append(("group", pid, sig))
+        )
+        monkeypatch.setattr(
+            supervisor.os, "kill", lambda pid, sig: killed.append(("single", pid, sig))
+        )
+
+        supervisor._signal_daemon("slack", 4321, signal.SIGTERM)
+
+        assert killed == [("group", 4321, signal.SIGTERM)]
+
+    def test_a_daemon_that_does_not_advertise_a_group_gets_only_its_own_pid(
+        self, isolated_state, monkeypatch
+    ):
+        state = isolated_state / "state"
+        _write_heartbeat(state, "slack", 4321)  # no process_group key
+        killed: list[tuple] = []
+        monkeypatch.setattr(
+            supervisor.os, "killpg", lambda pid, sig: killed.append(("group", pid, sig))
+        )
+        monkeypatch.setattr(
+            supervisor.os, "kill", lambda pid, sig: killed.append(("single", pid, sig))
+        )
+
+        supervisor._signal_daemon("slack", 4321, signal.SIGTERM)
+
+        assert killed == [("single", 4321, signal.SIGTERM)]
+
+
+class TestSweepingDetachedAgentGroups:
+    def test_no_ledger_means_nothing_to_do(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(supervisor, "DATA_DIR", tmp_path)
+        supervisor._sweep_agent_groups("slack")
+
+    def test_a_ledger_is_swept(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(supervisor, "DATA_DIR", tmp_path)
+        ledger = tmp_path / "state" / "slack.pids"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("")
+        swept: list[Path] = []
+
+        class _Ledger:
+            def __init__(self, path):
+                self.path = path
+
+            def sweep(self):
+                swept.append(self.path)
+
+        monkeypatch.setattr("claude_on_the_fly.jobs.orphans.ProcessLedger", _Ledger)
+        supervisor._sweep_agent_groups("slack")
+        assert swept == [ledger]
+
+    def test_an_unreadable_ledger_does_not_stop_the_daemon_stopping(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """This runs on the stop path. A recovery pass that cannot read a stale
+        ledger must not leave the operator unable to stop a daemon."""
+        monkeypatch.setattr(supervisor, "DATA_DIR", tmp_path)
+        ledger = tmp_path / "state" / "slack.pids"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("garbage")
+
+        class _Ledger:
+            def __init__(self, path):
+                raise OSError("stale ledger")
+
+        monkeypatch.setattr("claude_on_the_fly.jobs.orphans.ProcessLedger", _Ledger)
+        with caplog.at_level("ERROR"):
+            supervisor._sweep_agent_groups("slack")
+        assert "could not sweep detached agent groups for slack" in caplog.text

@@ -408,3 +408,67 @@ def test_notify_mode_is_reachable_from_the_entry_point(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO('{"notification_type":"idle_prompt"}'))
     assert cotf_approve.main(["notify"]) == 0
     assert capsys.readouterr().out == ""
+
+
+class TestRequestTimeoutIsAlwaysUsable:
+    """The daemon publishes this, but the shim runs inside the sandbox where the
+    value is just an environment string. A junk one must not make the request
+    non-blocking, which would deny every call instantly."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("not-a-number", id="unparseable"),
+            pytest.param("", id="empty"),
+            pytest.param("0", id="zero"),
+            pytest.param("-5", id="negative"),
+        ],
+    )
+    def test_an_unusable_value_falls_back_to_the_default(self, monkeypatch, raw):
+        seen: dict = {}
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self):
+                return b'{"behavior": "allow"}'
+
+        def fake_urlopen(_request, timeout):
+            seen["timeout"] = timeout
+            return _Response()
+
+        monkeypatch.setenv(cotf_approve.ENDPOINT_ENV, "http://127.0.0.1:1/decide")
+        monkeypatch.setenv(cotf_approve.REQUEST_TIMEOUT_ENV, raw)
+        monkeypatch.setattr(cotf_approve.urllib.request, "urlopen", fake_urlopen)
+
+        allowed, _message = cotf_approve._ask({"tool_name": "Bash"})
+
+        assert allowed is True
+        assert seen["timeout"] == cotf_approve.REQUEST_TIMEOUT_SECONDS
+
+    def test_a_sane_value_is_honoured(self, monkeypatch):
+        seen: dict = {}
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self):
+                return b'{"behavior": "allow"}'
+
+        monkeypatch.setenv(cotf_approve.ENDPOINT_ENV, "http://127.0.0.1:1/decide")
+        monkeypatch.setenv(cotf_approve.REQUEST_TIMEOUT_ENV, "42")
+        monkeypatch.setattr(
+            cotf_approve.urllib.request,
+            "urlopen",
+            lambda _r, timeout: seen.__setitem__("timeout", timeout) or _Response(),
+        )
+        cotf_approve._ask({"tool_name": "Bash"})
+        assert seen["timeout"] == 42

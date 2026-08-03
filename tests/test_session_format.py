@@ -699,3 +699,21 @@ def test_the_tail_skips_blank_lines_between_events(tmp_path):
         if len(events) == 2:
             break
     assert [e["type"] for e in events] == ["a", "b"]
+
+
+def test_an_unterminated_line_cannot_grow_without_bound(tmp_path):
+    """A writer emitting megabytes with no newline would otherwise be buffered
+    whole: no event can be rendered until a newline arrives, so the prefix has
+    nowhere to go. The tail keeps a bounded suffix and recovers on the next
+    complete line."""
+    path = tmp_path / "session.jsonl"
+    # Past the 2 MB cap the tail enforces, with enough slack that the read
+    # which trips the cap is still entirely newline-free.
+    path.write_text("x" * (2 * 1024 * 1024 + 3 * 65536) + '\n{"type":"after"}\n')
+
+    events = []
+    for event in watch.tail(path, poll_s=0.01):
+        events.append(event)
+        break
+
+    assert [e["type"] for e in events] == ["after"]

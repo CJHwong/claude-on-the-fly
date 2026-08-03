@@ -1320,3 +1320,29 @@ class TestPrependHandoffFormatsToNothing:
             )
             == "hi"
         )
+
+
+def test_a_mapping_whose_thread_id_no_longer_validates_is_skipped(
+    tmp_path, monkeypatch
+):
+    """The scan lists mappings, then re-reads each one. A record that passed the
+    listing but fails the stricter per-record read must drop out rather than
+    contribute a session with no usable thread."""
+    mapping_root = tmp_path / "codex-sessions"
+    mapping_root.mkdir()
+    monkeypatch.setattr(transcript.codex_state, "MAPPINGS_DIR", mapping_root)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    transcript.codex_state.write_thread_id(workspace, "s1", "thread-1")
+
+    # The listing is deliberately kept happy: it is the per-record re-read that
+    # has to reject, or the loop body never runs at all.
+    monkeypatch.setattr(
+        transcript.codex_state,
+        "mappings_for_workspace",
+        lambda _ws: [(mapping_root / "x.json", "s1", 1.0)],
+    )
+    monkeypatch.setattr(
+        transcript.codex_state, "read_thread_id", lambda _ws, _uuid: None
+    )
+    assert transcript._list_codex_session_files(workspace) == []

@@ -190,3 +190,29 @@ class TestSnapshotJson:
         )
         payload = _json.loads(render.render_snapshot_json(snap))
         assert payload["timestamp"] == "2026-07-30T12:00:00Z"
+
+
+class TestReadNewLinesIsBounded:
+    """Tailed every tick from the dashboard. A daemon that dumps a huge burst
+    between two ticks must not pull the whole thing into the pane."""
+
+    def test_a_burst_larger_than_the_cap_is_read_from_its_tail(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(render, "MAX_TAIL_BYTES", 64)
+        path = tmp_path / "daemon.log"
+        path.write_bytes(b"old line\n" + b"".join(b"x" * 31 + b"\n" for _ in range(10)))
+
+        lines, offset = render.read_new_lines(path, 0)
+
+        assert offset == path.stat().st_size
+        assert lines, "the tail should still yield complete lines"
+        assert "old line" not in lines, "reading started at the cap, not at zero"
+        assert sum(len(line) + 1 for line in lines) <= 64
+
+    def test_a_small_file_is_read_whole(self, tmp_path):
+        path = tmp_path / "daemon.log"
+        path.write_text("one\ntwo\n")
+        lines, offset = render.read_new_lines(path, 0)
+        assert lines == ["one", "two"]
+        assert offset == 8

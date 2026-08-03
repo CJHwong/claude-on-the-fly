@@ -1056,3 +1056,55 @@ async def test_pipe_survives_a_peer_that_vanishes_mid_stream():
             raise ConnectionResetError("peer gone")
 
     await EgressProxy._pipe(reader, ResettingWriter())  # type: ignore[arg-type]
+
+
+class TestPolicyReloadRevokesWhatItInvalidates:
+    """An operator narrowing the allowlist expects it to take effect now. A
+    grant issued under the old policy outliving the edit would keep the host
+    reachable for the rest of its TTL."""
+
+    def test_a_grant_for_a_host_removed_from_the_allowlist_is_revoked(
+        self, monkeypatch
+    ):
+        proxy = EgressProxy(
+            ApprovalBroker(RecordingGate(default=True)),
+            allowed_hosts=frozenset({"kept.example"}),
+        )
+        proxy._approvals.store.grant("host:dropped.example:443", ttl_seconds=3600)
+        proxy._approvals.store.grant("host:other.example:443", ttl_seconds=3600)
+        # The edit: dropped.example is no longer front-loaded.
+        proxy._allowed = proxy._allowed | {"dropped.example"}
+
+        proxy._refresh_policy()
+
+        assert not proxy._approvals.store.allows("host:dropped.example:443")
+        assert proxy._approvals.store.allows("host:other.example:443")
+
+    def test_a_reload_that_changes_nothing_keeps_every_grant(self):
+        proxy = EgressProxy(
+            ApprovalBroker(RecordingGate(default=True)),
+            allowed_hosts=frozenset({"kept.example"}),
+        )
+        proxy._approvals.store.grant("host:asked.example:443", ttl_seconds=3600)
+        proxy._refresh_policy()
+        assert proxy._approvals.store.allows("host:asked.example:443")
+
+
+class TestExplicitPrivateAddress:
+    def test_a_hostname_is_not_an_address(self):
+        """Called with whatever the CONNECT line carried, which is not always
+        an IP at all."""
+        assert egress._explicit_private_address("example.com") is False
+
+    @pytest.mark.parametrize(
+        ("address", "expected"),
+        [
+            pytest.param("127.0.0.1", True, id="loopback"),
+            pytest.param("10.0.0.1", True, id="private"),
+            pytest.param("169.254.169.254", False, id="link-local-metadata"),
+            pytest.param("8.8.8.8", False, id="public"),
+            pytest.param("not-an-ip", False, id="garbage"),
+        ],
+    )
+    def test_classification(self, address, expected):
+        assert egress._explicit_private_address(address) is expected

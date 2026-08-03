@@ -1379,6 +1379,41 @@ class TestCodexExec:
 
 
 class TestExpandCodexPromptFailures:
+    def test_a_symlinked_prompt_pointing_outside_is_not_expanded(
+        self, tmp_path, monkeypatch
+    ):
+        """The name has no slash and the file exists, so only comparing the
+        *resolved* parent catches it. A link is how you escape a directory
+        without a traversal sequence in the name."""
+        from claude_on_the_fly.backends.codex import _expand_codex_prompt
+
+        prompts = tmp_path / "prompts"
+        prompts.mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("HOST_SECRET")
+        (prompts / "sneaky.md").symlink_to(outside)
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+        assert _expand_codex_prompt("/sneaky") == "/sneaky"
+
+    def test_an_unresolvable_prompt_path_is_left_alone(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The traversal guard resolves both sides to compare them. If that
+        resolution itself fails, the name cannot be proven to stay inside the
+        prompts directory, so the text passes through unexpanded."""
+        from claude_on_the_fly.backends import codex as codex_module
+
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+        def boom(self, *args, **kwargs):
+            raise OSError("too many levels of symbolic links")
+
+        monkeypatch.setattr(codex_module.Path, "resolve", boom)
+        with caplog.at_level("WARNING"):
+            assert codex_module._expand_codex_prompt("/review") == "/review"
+        assert "cannot resolve prompt review" in caplog.text
+
     def test_a_template_that_cannot_be_read_leaves_the_prompt_alone(
         self, tmp_path, monkeypatch, caplog
     ):
