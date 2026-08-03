@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import stat
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -335,3 +338,281 @@ def test_a_missing_bash_stops_the_installer(monkeypatch):
     ok, message = pty_install.run_installer(runner=must_not_run)
     assert ok is False
     assert "bash not on PATH" in message
+
+
+# ---------------------------------------------------------------------------
+# Workspace trust
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeStateFileLocation:
+    """Verified against claude 2.1.220: the variable moves the file, but with it
+    unset the file sits beside ~/.claude rather than inside it."""
+
+    def test_it_follows_claude_config_dir_when_set(self, tmp_path, monkeypatch):
+        env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")}
+        assert pty_install.claude_state_file(env) == tmp_path / "cfg" / ".claude.json"
+
+    def test_it_defaults_to_home_root_not_the_claude_directory(self, monkeypatch):
+        assert pty_install.claude_state_file({}) == Path.home() / ".claude.json"
+
+    def test_it_reads_the_env_file_not_the_viewing_shell(self, tmp_path, monkeypatch):
+        """Same split-brain as the session-log lookup: the daemon that spawns
+        claude gets DATA_DIR/.env, so this must resolve the same way."""
+        from claude_on_the_fly import envfile
+
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"CLAUDE_CONFIG_DIR={tmp_path / 'from-file'}\n")
+        monkeypatch.setattr(envfile, "default_env_file", lambda: env_file)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "from-shell"))
+
+        assert pty_install.claude_state_file() == (
+            tmp_path / "from-file" / ".claude.json"
+        )
+
+
+@pytest.fixture
+def state_file(tmp_path, monkeypatch):
+    """A claude project-state file this test owns."""
+    path = tmp_path / ".claude.json"
+    monkeypatch.setattr(pty_install, "claude_state_file", lambda env=None: path)
+    monkeypatch.setattr(pty_install, "_trusted_workspaces", set())
+    return path
+
+
+class TestTrustWorkspace:
+    def test_it_records_trust_for_a_workspace_claude_has_not_seen(
+        self, state_file, tmp_path
+    ):
+        state_file.write_text(json.dumps({"projects": {}}))
+        workspace = tmp_path / "ws"
+
+        assert pty_install.trust_workspace(workspace) is True
+
+        data = json.loads(state_file.read_text())
+        assert data["projects"][str(workspace)]["hasTrustDialogAccepted"] is True
+
+    def test_it_preserves_everything_claude_already_wrote(self, state_file, tmp_path):
+        """The file is claude's. Trust is one key inside it, not a file we own."""
+        workspace = tmp_path / "ws"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "userID": "abc123",
+                    "projects": {
+                        "/some/other/project": {"lastCost": 42},
+                        str(workspace): {"lastSessionId": "keep-me"},
+                    },
+                }
+            )
+        )
+
+        pty_install.trust_workspace(workspace)
+
+        data = json.loads(state_file.read_text())
+        assert data["userID"] == "abc123"
+        assert data["projects"]["/some/other/project"] == {"lastCost": 42}
+        assert data["projects"][str(workspace)]["lastSessionId"] == "keep-me"
+        assert data["projects"][str(workspace)]["hasTrustDialogAccepted"] is True
+
+    def test_an_already_trusted_workspace_is_not_rewritten(self, state_file, tmp_path):
+        workspace = tmp_path / "ws"
+        state_file.write_text(
+            json.dumps({"projects": {str(workspace): {"hasTrustDialogAccepted": True}}})
+        )
+        before = state_file.stat().st_mtime_ns
+
+        assert pty_install.trust_workspace(workspace) is True
+        assert state_file.stat().st_mtime_ns == before
+
+    def test_a_missing_state_file_is_created(self, state_file, tmp_path):
+        workspace = tmp_path / "ws"
+        assert pty_install.trust_workspace(workspace) is True
+        data = json.loads(state_file.read_text())
+        assert data["projects"][str(workspace)]["hasTrustDialogAccepted"] is True
+
+    def test_the_written_file_is_owner_only(self, state_file, tmp_path):
+        pty_install.trust_workspace(tmp_path / "ws")
+        assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+
+    @pytest.mark.parametrize(
+        ("content", "why"),
+        [
+            pytest.param("{not json", "unparseable", id="unparseable"),
+            pytest.param('"a string"', "not an object", id="scalar"),
+            pytest.param(
+                '{"projects": []}', "projects is not a map", id="bad-projects"
+            ),
+            pytest.param(
+                '{"projects": {"WS": "not a dict"}}',
+                "entry is not a map",
+                id="bad-entry",
+            ),
+        ],
+    )
+    def test_a_state_file_it_cannot_understand_is_left_untouched(
+        self, state_file, tmp_path, content, why
+    ):
+        """Rewriting a file claude owns, from a parse we know failed, would
+        replace all of it with our own small idea of its contents."""
+        workspace = tmp_path / "ws"
+        state_file.write_text(content.replace("WS", str(workspace)))
+        before = state_file.read_text()
+
+        assert pty_install.trust_workspace(workspace) is False, why
+        assert state_file.read_text() == before
+
+    def test_a_write_that_fails_reports_it_and_leaves_no_temp_file(
+        self, state_file, tmp_path, monkeypatch, caplog
+    ):
+        state_file.write_text(json.dumps({"projects": {}}))
+
+        def boom(_src, _dst):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(pty_install.os, "replace", boom)
+        with caplog.at_level("WARNING"):
+            assert pty_install.trust_workspace(tmp_path / "ws") is False
+        assert "could not trust" in caplog.text
+        assert [p.name for p in tmp_path.iterdir()] == [".claude.json"]
+
+    def test_a_concurrent_claude_write_is_re_read_not_clobbered(
+        self, state_file, tmp_path
+    ):
+        """claude rewrites this file on its own schedule. A read-modify-write
+        that ignored that would discard whatever it recorded in between."""
+        workspace = tmp_path / "ws"
+        state_file.write_text(json.dumps({"projects": {}}))
+        writes = {"n": 0}
+        real_stat = Path.stat
+
+        def claude_writes_once(self, **kwargs):
+            result = real_stat(self, **kwargs)
+            if self == state_file and writes["n"] == 0:
+                writes["n"] = 1
+                # Land a change between our read and our replace.
+                state_file.write_text(
+                    json.dumps({"projects": {"/elsewhere": {"lastCost": 7}}})
+                )
+            return result
+
+        Path.stat = claude_writes_once
+        try:
+            assert pty_install.trust_workspace(workspace) is True
+        finally:
+            Path.stat = real_stat
+
+        data = json.loads(state_file.read_text())
+        assert data["projects"]["/elsewhere"] == {"lastCost": 7}, "claude's write lost"
+        assert data["projects"][str(workspace)]["hasTrustDialogAccepted"] is True
+
+    def test_it_gives_up_rather_than_spinning_on_a_file_that_never_settles(
+        self, state_file, tmp_path, monkeypatch, caplog
+    ):
+        workspace = tmp_path / "ws"
+        state_file.write_text(json.dumps({"projects": {}}))
+        real_stat = Path.stat
+        bumps = {"n": 0}
+
+        def always_changing(self, **kwargs):
+            result = real_stat(self, **kwargs)
+            if self == state_file:
+                bumps["n"] += 1
+                state_file.write_text(json.dumps({"projects": {}, "n": bumps["n"]}))
+            return result
+
+        monkeypatch.setattr(Path, "stat", always_changing)
+        with caplog.at_level("WARNING"):
+            assert pty_install.trust_workspace(workspace) is False
+        assert "gave up trusting" in caplog.text
+
+
+class TestOnlyCotfsOwnWorkspacesAreTrusted:
+    def test_a_workspace_under_the_data_dir_is_ours(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path)
+        workspace = tmp_path / "workspaces" / "slack" / "dm-someone"
+        workspace.mkdir(parents=True)
+        assert pty_install.cotf_owns_workspace(workspace) is True
+
+    def test_an_operators_own_checkout_is_not_ours(self, tmp_path, monkeypatch):
+        """A session pointed at a real repo must not have cotf silently mark it
+        trusted on the operator's behalf."""
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path / "cotf")
+        assert pty_install.cotf_owns_workspace(tmp_path / "my-repo") is False
+
+    def test_a_traversal_out_of_the_workspace_root_is_not_ours(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path / "cotf")
+        (tmp_path / "cotf" / "workspaces").mkdir(parents=True)
+        escaped = tmp_path / "cotf" / "workspaces" / ".." / ".." / "elsewhere"
+        assert pty_install.cotf_owns_workspace(escaped) is False
+
+    def test_ensure_refuses_a_workspace_that_is_not_ours(
+        self, state_file, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path / "cotf")
+        assert pty_install.ensure_workspace_trusted(tmp_path / "my-repo") is False
+        assert not state_file.exists()
+
+    def test_ensure_trusts_ours_once_and_then_stops_reading(
+        self, state_file, tmp_path, monkeypatch
+    ):
+        """The state file reaches megabytes; a daemon runs many turns against
+        one workspace."""
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path)
+        workspace = tmp_path / "workspaces" / "slack" / "dm-someone"
+        workspace.mkdir(parents=True)
+        calls = {"n": 0}
+        real = pty_install.trust_workspace
+
+        def counting(ws, env=None):
+            calls["n"] += 1
+            return real(ws, env)
+
+        monkeypatch.setattr(pty_install, "trust_workspace", counting)
+
+        assert pty_install.ensure_workspace_trusted(workspace) is True
+        assert pty_install.ensure_workspace_trusted(workspace) is True
+        assert calls["n"] == 1
+
+    def test_a_failed_trust_is_not_memoized(self, state_file, tmp_path, monkeypatch):
+        """Otherwise a transient write failure would disable the check for the
+        rest of the daemon's life."""
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path)
+        workspace = tmp_path / "workspaces" / "slack" / "dm-someone"
+        workspace.mkdir(parents=True)
+        monkeypatch.setattr(pty_install, "trust_workspace", lambda ws, env=None: False)
+        assert pty_install.ensure_workspace_trusted(workspace) is False
+        assert str(workspace) not in pty_install._trusted_workspaces
+
+
+class TestWorkspaceIsTrusted:
+    def test_it_reports_a_recorded_grant(self, state_file, tmp_path):
+        workspace = tmp_path / "ws"
+        state_file.write_text(
+            json.dumps({"projects": {str(workspace): {"hasTrustDialogAccepted": True}}})
+        )
+        assert pty_install.workspace_is_trusted(workspace) is True
+
+    @pytest.mark.parametrize(
+        "projects",
+        [
+            pytest.param({}, id="no-entry"),
+            pytest.param({"WS": {}}, id="entry-without-the-key"),
+            pytest.param(
+                {"WS": {"hasTrustDialogAccepted": False}}, id="explicit-false"
+            ),
+            pytest.param({"WS": "not a dict"}, id="unusable-entry"),
+        ],
+    )
+    def test_anything_short_of_a_recorded_grant_reads_as_untrusted(
+        self, state_file, tmp_path, projects
+    ):
+        workspace = tmp_path / "ws"
+        resolved = {k.replace("WS", str(workspace)): v for k, v in projects.items()}
+        state_file.write_text(json.dumps({"projects": resolved}))
+        assert pty_install.workspace_is_trusted(workspace) is False
+
+    def test_an_unreadable_state_file_reads_as_untrusted(self, state_file, tmp_path):
+        assert pty_install.workspace_is_trusted(tmp_path / "ws") is False

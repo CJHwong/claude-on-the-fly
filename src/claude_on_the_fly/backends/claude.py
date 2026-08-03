@@ -14,6 +14,7 @@ from claude_on_the_fly import (
     checks,
     permissions,
     pricing,
+    pty_install,
     sandbox,
     settings,
     transcript,
@@ -685,6 +686,11 @@ async def _exec_pty(
     skill_counts are always empty in pty mode (pty doesn't surface per-turn
     tool_use events).
     """
+    # Before the spawn, not after: claude skips its workspace trust dialog only
+    # in non-interactive mode, and pty's whole job is to give it a real TTY. An
+    # untrusted directory therefore does not fail here, it stops on the dialog
+    # and spends the entire turn timeout waiting for a keystroke nobody sends.
+    pty_install.ensure_workspace_trusted(workspace)
     cmd = sandbox.wrap(cmd, workspace)
     logger.debug(
         "exec_pty: cwd=%s cmd=%s timeout=%s",
