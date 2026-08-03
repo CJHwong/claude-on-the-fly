@@ -255,6 +255,13 @@ agent:
   #   model: o3
   # ollama:
   #   model: deepseek-v4-flash:cloud
+  #   effort: high
+  # Effort applies to the ollama-served model, whichever backend runs under it;
+  # in native (or pty) mode the CLIs inherit their own config and this setting
+  # never overrides it. Both backends accept low | medium | high | xhigh;
+  # claude additionally accepts max, codex additionally minimal. A level the
+  # active backend doesn't accept is ignored with a warning. Unset means
+  # whatever the CLI's own default is.
 
   # Compact before answering once the previous turn left the context at or above
   # this share of the window. Unset means compaction only on $compact.

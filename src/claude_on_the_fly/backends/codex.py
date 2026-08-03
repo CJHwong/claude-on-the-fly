@@ -40,6 +40,10 @@ COMPACT_TOKEN_LIMIT = 2000
 # cannot be a standalone operation the way claude's `/compact` is. Keep the reply
 # tiny: it lands in the conversation the compaction just summarized.
 COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
+# `model_reasoning_effort` choices, from codex's config reference. The shared
+# OLLAMA_EFFORT setting is validated against this before it reaches codex
+# (claude's accepted set differs: no `minimal`, plus `max`).
+_CODEX_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 
 
 # item.completed types that are not tool calls. "reasoning" never was; "error"
@@ -453,6 +457,22 @@ class CodexBackend:
         binary = [] if self.launcher else ["codex"]
         model_env = settings.get("CODEX_MODEL").strip()
         model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
+        # Reasoning effort is passed only for the ollama-served model. Native
+        # mode inherits the operator's own model_reasoning_effort in
+        # ~/.codex/config.toml; an override here would silently trump it. Quoted
+        # as TOML per the `-c` contract. Responses-API-only in codex, so it
+        # reaches the model only when the ollama endpoint honors it — harmless
+        # either way. OLLAMA_EFFORT is shared with the claude backend, whose
+        # accepted levels differ (no `minimal`), so a value codex doesn't accept
+        # is skipped, not passed through to die in codex's own config parse.
+        effort = settings.get("OLLAMA_EFFORT").strip() if self.launcher else ""
+        if effort and effort not in _CODEX_EFFORT_LEVELS:
+            logger.warning(
+                "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
+                effort,
+            )
+            effort = ""
+        effort_args = ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
         # --yolo stays whether approvals are on or not. codex exec overrides
         # approval_policy to `never` regardless (measured: request untrusted, get
         # never), so there is no CLI-side gate to leave enabled -- the PreToolUse
@@ -468,6 +488,7 @@ class CodexBackend:
             "-C",
             str(workspace),
             *model_args,
+            *effort_args,
         ]
 
     def _thread_id(self, workspace: Path, session_uuid: str) -> str | None:

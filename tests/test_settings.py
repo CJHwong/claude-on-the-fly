@@ -292,10 +292,12 @@ def test_an_absent_key_leaves_the_readers_own_default(operator_settings):
 def test_a_nested_backend_block_flattens(operator_settings):
     operator_settings.write_text(
         "agent:\n  backend: codex\n  codex:\n    mode: ollama\n    model: o3\n"
+        "  ollama:\n    effort: xhigh\n"
     )
     assert settings.get("AGENT_BACKEND", "claude") == "codex"
     assert settings.get("CODEX_MODE", "native") == "ollama"
     assert settings.get("CODEX_MODEL") == "o3"
+    assert settings.get("OLLAMA_EFFORT") == "xhigh"
 
 
 def test_a_yaml_list_joins_the_way_its_env_var_did(operator_settings):
