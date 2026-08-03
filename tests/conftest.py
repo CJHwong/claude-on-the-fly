@@ -64,13 +64,24 @@ def isolate_jobs_dir(tmp_path, monkeypatch):
 def isolate_env_file(tmp_path, monkeypatch):
     """Keep the whole suite off the developer's real `.env`.
 
-    `state._queue_kind()` reads it through `supervisor.DEFAULT_ENV_FILE` on
-    every `snapshot()`, so without this a `JOBS_QUEUE_KIND` on the dev machine
-    would decide what the TUI tests see. Returns the (initially absent) path, so
-    a test wanting a specific setting just writes it.
+    `state._queue_kind()` reads it on every `snapshot()`, so without this a
+    `JOBS_QUEUE_KIND` on the dev machine would decide what the TUI tests see.
+    Returns the (initially absent) path, so a test wanting a specific setting
+    just writes it.
+
+    Both seams are redirected to the same file: `envfile.default_env_file` is
+    what the readers call, `supervisor.DEFAULT_ENV_FILE` is the TUI's CLI
+    default. Pointing them at different files is how a test would end up
+    proving the very disagreement this suite exists to catch.
     """
+    from claude_on_the_fly import envfile
+
     env_file = tmp_path / ".env"
     monkeypatch.setattr("claude_on_the_fly.tui.supervisor.DEFAULT_ENV_FILE", env_file)
+    monkeypatch.setattr(envfile, "default_env_file", lambda: env_file)
+    # Parsed-file cache is module state, keyed by (path, mtime). Clear it so a
+    # path a later test happens to reuse cannot serve another test's values.
+    monkeypatch.setattr(envfile, "_parsed", None)
     return env_file
 
 
@@ -123,10 +134,17 @@ def clear_backend_env(monkeypatch):
 
 @pytest.fixture
 def claude_projects_dir(tmp_path, monkeypatch):
-    """Redirect transcript module's CLAUDE_PROJECTS_DIR to a tmp_path subdir."""
-    root = tmp_path / "claude-projects"
-    root.mkdir()
-    monkeypatch.setattr("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", root)
+    """Redirect claude's projects dir to a tmp_path subdir.
+
+    Redirects `CLAUDE_CONFIG_DIR` rather than patching the resolver, so tests
+    exercise the resolution itself. A fixture that stubbed the answer would go
+    on passing if the resolver started reading the wrong environment again,
+    which is exactly the bug it is here to keep out.
+    """
+    config = tmp_path / "claude-config"
+    root = config / "projects"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     return root
 
 

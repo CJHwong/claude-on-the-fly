@@ -31,9 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from dotenv import dotenv_values
-
-from claude_on_the_fly import checks, logs
+from claude_on_the_fly import checks, envfile, logs
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import CheckResult
 from claude_on_the_fly.heartbeat import STATE_DIR
@@ -200,13 +198,13 @@ def _remove_heartbeat(frontend: str) -> None:
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
-    """Merge os.environ with the env file (if it exists). File wins on conflicts."""
-    merged: dict[str, str] = dict(os.environ)
-    if env_file is not None and env_file.is_file():
-        for k, v in dotenv_values(env_file).items():
-            if v is not None:
-                merged[k] = v
-    return merged
+    """Merge os.environ with the env file (if it exists). File wins on conflicts.
+
+    Kept as the spawn path's name for the operation; the operation itself lives
+    in `envfile` so `transcript` and `checks` can ask the same question without
+    importing the TUI.
+    """
+    return envfile.merged(env_file)
 
 
 def _heartbeat_fresh(frontend: str) -> bool:

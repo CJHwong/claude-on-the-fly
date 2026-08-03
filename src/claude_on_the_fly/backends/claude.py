@@ -343,11 +343,8 @@ class ClaudeBackend:
         # Codex backend already takes the existence-check approach; mirror it
         # here so first-turn dispatches don't crash before the new-session
         # branch can run.
-        # Read via the transcript module rather than the imported symbol so
-        # tests that monkeypatch CLAUDE_PROJECTS_DIR via the fixture see the
-        # redirected value.
         session_path = (
-            transcript.CLAUDE_PROJECTS_DIR
+            transcript.claude_projects_dir()
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )
@@ -616,16 +613,9 @@ class ClaudeBackend:
         return f"claude --resume {session_uuid}"
 
     def session_log_path(self, workspace: Path, session_uuid: str) -> Path | None:
-        """Live JSONL claude appends to as the session runs.
-
-        Reads CLAUDE_PROJECTS_DIR through the transcript module so tests
-        that monkeypatch it via the `claude_projects_dir` fixture (or a
-        direct `setattr`) see the redirected location. The bare import
-        captures the value at module-load time and is invisible to
-        monkeypatch.
-        """
+        """Live JSONL claude appends to as the session runs."""
         path = (
-            transcript.CLAUDE_PROJECTS_DIR
+            transcript.claude_projects_dir()
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )

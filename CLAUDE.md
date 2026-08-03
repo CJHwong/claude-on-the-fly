@@ -25,6 +25,7 @@ src/claude_on_the_fly/
   permissions.py       # Tool-call approvals: config, subjects, per-backend wiring
   cotf_approve.py      # Shim a sandboxed backend runs to ask (MCP or hook)
   settings.py          # config.yaml (all settings, re-read on save); .env is secrets only
+  envfile.py           # Reads DATA_DIR/.env the way a spawned daemon receives it (file wins)
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
   protocol.py          # Frontend protocol (add new interfaces here)
   cron.py              # Cron producer daemon — runs shell, enqueues Jobs

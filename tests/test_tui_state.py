@@ -572,22 +572,22 @@ class TestScheduleCache:
 def test_the_queue_kind_is_cached_until_the_env_file_changes(tmp_path, monkeypatch):
     """Read on every dashboard tick, and each miss re-reads and re-parses the env
     file for a value that almost never changes."""
+    from claude_on_the_fly import envfile
     from claude_on_the_fly.tui import state as state_mod
-    from claude_on_the_fly.tui import supervisor as supervisor_mod
 
     env_file = tmp_path / ".env"
     env_file.write_text("JOBS_QUEUE_KIND=file\n")
-    monkeypatch.setattr(supervisor_mod, "DEFAULT_ENV_FILE", env_file)
+    monkeypatch.setattr(envfile, "default_env_file", lambda: env_file)
     monkeypatch.setattr(state_mod, "_queue_kind_cache", None)
     monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
     reads = {"n": 0}
-    real_load = supervisor_mod._load_env
+    real_load = envfile.merged
 
     def counting_load(path):
         reads["n"] += 1
         return real_load(path)
 
-    monkeypatch.setattr(supervisor_mod, "_load_env", counting_load)
+    monkeypatch.setattr(envfile, "merged", counting_load)
     assert state_mod._queue_kind() == "file"
     assert state_mod._queue_kind() == "file"
     assert reads["n"] == 1

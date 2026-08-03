@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import time
 from collections.abc import Callable
@@ -35,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from claude_on_the_fly import codex_state
+from claude_on_the_fly import codex_state, envfile
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +44,21 @@ BackendName = Literal["claude", "codex"]
 # prompt. We rsplit on it to recover the raw user text from a codex transcript.
 _CODEX_PROMPT_SEPARATOR = "\n\n---\n\n"
 
-CLAUDE_PROJECTS_DIR = (
-    Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-)
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+
+
+def claude_projects_dir() -> Path:
+    """Where claude keeps session JSONL, resolved per call.
+
+    A module constant read this from `os.environ` at import, which made the
+    answer depend on who imported the module. The daemon writing the logs is
+    spawned with `DATA_DIR/.env` merged in; the TUI reading them is not, so a
+    deployment that sets `CLAUDE_CONFIG_DIR` in that file had the two processes
+    looking at different directories, and the watch pane reported "agent hasn't
+    run a turn" over a session that was streaming. Resolving through
+    `envfile` per call is what makes the reader agree with the writer.
+    """
+    return envfile.claude_config_dir() / "projects"
 
 
 @dataclass(frozen=True)
@@ -92,7 +102,8 @@ def remove_workspace_sessions(workspace: Path) -> None:
     caller's real outcome.
     """
     shutil.rmtree(
-        CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace), ignore_errors=True
+        claude_projects_dir() / _workspace_to_claude_hash(workspace),
+        ignore_errors=True,
     )
     codex_state.remove_workspace(workspace)
 
@@ -116,7 +127,7 @@ def _iter_jsonl(path: Path):
 def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     """Return the user/assistant turns from claude's session JSONL, or None."""
     session_path = (
-        CLAUDE_PROJECTS_DIR
+        claude_projects_dir()
         / _workspace_to_claude_hash(workspace)
         / f"{session_uuid}.jsonl"
     )
@@ -353,7 +364,7 @@ def format_handoff(
 def _list_claude_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
     """Return (path, uuid, mtime) for every claude JSONL under the workspace's
     project dir. Missing dir → []."""
-    project_dir = CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(workspace)
+    project_dir = claude_projects_dir() / _workspace_to_claude_hash(workspace)
     if not project_dir.is_dir():
         return []
     out: list[tuple[Path, str, float]] = []

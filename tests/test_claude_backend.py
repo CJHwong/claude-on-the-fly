@@ -230,9 +230,7 @@ class TestRunDoesNotNudgeACompaction:
     async def test_compaction_prompt_skips_the_nudge_retry(self, tmp_path, monkeypatch):
         """A successful compaction returns `result: ""`. The nudge would spend a
         second billed turn asking for a reply that was never owed."""
-        monkeypatch.setattr(
-            claude_mod.transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects"
-        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
             / "projects"
@@ -464,9 +462,7 @@ class TestOllamaWithholdsTheContextWindow:
         }
 
     async def _run(self, backend, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            claude_mod.transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects"
-        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
             / "projects"
@@ -557,9 +553,7 @@ class TestOllamaCostUsesCacheRates:
         }
 
     async def _run(self, backend, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            claude_mod.transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects"
-        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
             / "projects"

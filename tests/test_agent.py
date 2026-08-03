@@ -1843,10 +1843,10 @@ class TestClaudeBackendHandoff:
             / "claude-projects"
             / _workspace_to_claude_hash(self._workspace)
         )
-        # claude_projects_dir fixture set CLAUDE_PROJECTS_DIR to tmp_path/claude-projects.
+        # Wherever the claude_projects_dir fixture pointed the resolver.
         from claude_on_the_fly import transcript
 
-        session_dir = transcript.CLAUDE_PROJECTS_DIR / _workspace_to_claude_hash(
+        session_dir = transcript.claude_projects_dir() / _workspace_to_claude_hash(
             self._workspace
         )
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -1883,7 +1883,7 @@ class TestClaudeBackendTakeoverCommand:
         session_dir.mkdir(parents=True)
         (session_dir / f"{session_uuid}.jsonl").write_text("{}\n")
 
-        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(projects_dir.parent)}):
             cmd = ClaudeBackend().takeover_command(workspace, session_uuid)
 
         assert cmd == f"claude --resume {session_uuid}"
@@ -1894,7 +1894,7 @@ class TestClaudeBackendTakeoverCommand:
         projects_dir = tmp_path / ".claude" / "projects"
         projects_dir.mkdir(parents=True)
 
-        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(projects_dir.parent)}):
             cmd = ClaudeBackend().takeover_command(workspace, "missing-uuid")
 
         assert cmd is None
@@ -1913,7 +1913,7 @@ class TestClaudeBackendSessionLogPath:
         expected = session_dir / f"{session_uuid}.jsonl"
         expected.write_text("")
 
-        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(projects_dir.parent)}):
             path = ClaudeBackend().session_log_path(workspace, session_uuid)
 
         assert path == expected
@@ -1924,7 +1924,7 @@ class TestClaudeBackendSessionLogPath:
         projects_dir = tmp_path / ".claude" / "projects"
         projects_dir.mkdir(parents=True)
 
-        with patch("claude_on_the_fly.transcript.CLAUDE_PROJECTS_DIR", projects_dir):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(projects_dir.parent)}):
             path = ClaudeBackend().session_log_path(workspace, "absent")
 
         assert path is None
