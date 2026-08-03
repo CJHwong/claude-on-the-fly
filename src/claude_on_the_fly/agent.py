@@ -441,14 +441,27 @@ def _fold(
     tool_counts: dict[str, int],
     skill_counts: dict[str, int],
     compact: dict | None = None,
+    last_usage: dict | None = None,
 ) -> dict | None:
     """Apply one parsed stream-json message to running tallies.
 
     Returns the message dict if it is a `type: "result"` line, else None.
-    Mutates tool_counts, skill_counts, and (when given) compact in place.
+    Mutates tool_counts, skill_counts, and (when given) compact and
+    last_usage in place.
+
+    When last_usage is given, it is replaced with each assistant message's
+    `usage`, so the result line ends up carrying the *final* prompt size.
+    The result envelope's own top-level `usage` is the sum across every API
+    call in the turn, which overstates how full the context is the moment the
+    turn ends (see `_native_context_fields`); the last assistant message is
+    the reading that reflects the context a compaction would actually see.
     """
     msg_type = msg.get("type")
     if msg_type == "assistant":
+        if last_usage is not None:
+            usage = msg.get("message", {}).get("usage") or {}
+            last_usage.clear()
+            last_usage.update(usage)
         for block in msg.get("message", {}).get("content", []):
             if block.get("type") != "tool_use":
                 continue
@@ -474,7 +487,10 @@ def _fold(
             if msg.get("compact_error"):
                 compact["error"] = msg["compact_error"]
     elif msg_type == "result":
-        return dict(msg)
+        result = dict(msg)
+        if last_usage:
+            result["last_assistant_usage"] = dict(last_usage)
+        return result
     return None
 
 
@@ -487,6 +503,7 @@ def parse_stream(stdout: bytes) -> dict:
     tool_counts: dict[str, int] = {}
     skill_counts: dict[str, int] = {}
     compact: dict = {}
+    last_usage: dict = {}
     result: dict = {}
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -497,7 +514,7 @@ def parse_stream(stdout: bytes) -> dict:
         except json.JSONDecodeError:
             logger.warning("parse_stream: skipping malformed line: %s", line[:120])
             continue
-        r = _fold(msg, tool_counts, skill_counts, compact)
+        r = _fold(msg, tool_counts, skill_counts, compact, last_usage)
         if r is not None:
             result = r
     if result:
@@ -576,6 +593,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     tool_counts: dict[str, int] = {}
     skill_counts: dict[str, int] = {}
     compact: dict = {}
+    last_usage: dict = {}
     result: dict = {}
     line_count = 0
     stdout_bytes = 0
@@ -595,7 +613,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
             except json.JSONDecodeError:
                 logger.warning("exec: skipping malformed line: %s", line[:120])
                 continue
-            r = _fold(msg, tool_counts, skill_counts, compact)
+            r = _fold(msg, tool_counts, skill_counts, compact, last_usage)
             if r is not None:
                 result = r
     except BaseException:
@@ -823,6 +841,10 @@ def _merge_cli_output(first: dict, second: dict) -> dict:
     merged["skill_counts"] = _sum_counts(
         first.get("skill_counts"), second.get("skill_counts")
     )
+    # `last_assistant_usage` is deliberately NOT summed: `merged = dict(second)`
+    # already keeps the retry's reading, which resumes the session and so is
+    # more current than anything the first run produced. Summing the two would
+    # over-read the context exactly like the top-level `usage` does.
     return merged
 
 
