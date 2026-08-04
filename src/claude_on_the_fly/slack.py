@@ -332,6 +332,9 @@ _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_foun
 # rest. A listing is a glance, not a report, and it competes with the rest of
 # the thread for screen.
 JOB_LIST_LIMIT = 10
+# Cap on remembered tapped suggestion menus. A tap usually retires the menu, so
+# the spent set only grows on marks that failed; the cap bounds it regardless.
+SUGGESTION_SPENT_CAP = 500
 # Prompt characters per listed row. Long enough to recognise the job you asked
 # for, short enough that ten of them stay one screen.
 JOB_LIST_PROMPT_CHARS = 80
@@ -430,6 +433,29 @@ def _build_response_blocks(body: str, response: Response) -> list[dict]:
             {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
         )
     return blocks
+
+
+def _retire_suggestion_block(blocks: list[dict], label: str) -> list[dict]:
+    """Rebuild message blocks with the suggestion menu collapsed to a status line.
+
+    The whole menu goes on any tap, not just the tapped button: a second click
+    must not send a second message. The context block keeps the ✓ pick visible
+    in the chat as history. The label is the clicked button's own text rather
+    than something parsed out of the message body, so agent-rendered content
+    is never re-read out of the payload.
+    """
+    retired: list[dict] = []
+    for block in blocks:
+        if block.get("type") != "actions":
+            retired.append(block)
+            continue
+        retired.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"✓ {label}"}],
+            }
+        )
+    return retired
 
 
 # Slack only shows a short single line for an option description; keep it well
@@ -839,6 +865,10 @@ class SlackFrontend(Frontend):
             int, deque[tuple[str, str]]
         ] = {}  # session -> FIFO of (channel, ts)
         self._pending_reply_suppressed: dict[int, deque[bool]] = {}
+        # (channel, ts) -> None for suggestion menus already tapped. The menu
+        # retire is a cosmetic chat_update that can fail; this is the
+        # synchronous guard that actually stops a re-tap from sending twice.
+        self._spent_menus: dict[tuple[str, str], None] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
         self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
@@ -1018,6 +1048,12 @@ class SlackFrontend(Frontend):
         async def handle_approval_action(ack, body):
             await ack()
             await self._on_approval_action(body)
+
+        @app.action(re.compile(r"^cotf-sugg:"))
+        @app.action(re.compile(r"^cotf-shortcut:"))  # legacy: buttons from older builds
+        async def handle_suggestion_action(ack, body):
+            await ack()
+            await self._on_suggestion_action(body)
 
         logger.info(
             "slack: skill picker registered (slash command: %s)",
@@ -1234,6 +1270,90 @@ class SlackFrontend(Frontend):
             logger.info("slack: approval click for unknown or settled nonce %s", nonce)
             return
         future.set_result(action.get("action_id") == "cotf-grant")
+
+    async def _on_suggestion_action(self, body: dict) -> None:
+        """Send a suggestion label from a button tap as the next message.
+
+        Same dispatch gate as a typed message: the clicker must be an allowed
+        sender, because the button lands in a thread anyone in the channel can
+        see.
+        """
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        sender_id = (body.get("user") or {}).get("id", "")
+        if not self._is_allowed(sender_id):
+            logger.warning("slack: ignoring suggestion click from %s", sender_id)
+            return
+        # The label comes straight from the clicked button's payload: it is
+        # the label we rendered, so no per-message state and no index
+        # round-trip is needed.
+        label = (actions[0].get("text") or {}).get("text", "")
+        if not label:
+            logger.info("slack: suggestion click without a label, dropping")
+            return
+        chat_id = self._session_id_for(body)
+        if chat_id is None or self._on_message is None:
+            return
+        # Slack gives a clicked button no selected state, so the menu is
+        # retired on any tap: the whole actions block collapses to a status
+        # line, so nothing on it can be clicked twice, and the ✓ names the
+        # pick for anyone scrolling back. The retire is cosmetic and can fail
+        # (a transient API error, a dropped scope), so the spent set below is
+        # what actually enforces one tap, one message.
+        channel = (body.get("channel") or {}).get("id", "")
+        ts = (body.get("message") or {}).get("ts", "")
+        if channel and ts:
+            key = (channel, ts)
+            if key in self._spent_menus:
+                logger.info("slack: suggestion on %s already spent, dropping", key)
+                return
+            self._spent_menus[key] = None
+            if len(self._spent_menus) > SUGGESTION_SPENT_CAP:
+                self._spent_menus.pop(next(iter(self._spent_menus)))
+        await self._retire_suggestion_menu(body, label)
+        # Mirror the typed-message bookkeeping: one (channel, ts) and one
+        # suppressed flag per dispatched turn, so notify_start pairs this
+        # turn's reactions with its own message instead of the next one's.
+        self._pending_msg.setdefault(chat_id, deque()).append((channel, ts))
+        self._pending_reply_suppressed.setdefault(chat_id, deque()).append(False)
+        display = (body.get("user") or {}).get("name", "")
+        # Same sender marker a typed message carries, so the agent sees who
+        # pressed the button.
+        await self._on_message(chat_id, f"{sender_marker(sender_id, display)} {label}")
+
+    async def _retire_suggestion_menu(self, body: dict, label: str) -> None:
+        """Rewrite the clicked message, collapsing the menu to a status line."""
+        message = body.get("message") or {}
+        channel = (body.get("channel") or {}).get("id", "")
+        ts = message.get("ts", "")
+        blocks = message.get("blocks")
+        if not (channel and ts and blocks):
+            return
+        try:
+            await self._app.client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=message.get("text", ""),
+                blocks=_retire_suggestion_block(blocks, label),
+            )
+        except Exception as exc:
+            # The label is routed regardless; only the cosmetic mark failed,
+            # and the spent set keeps a re-tap from dispatching twice.
+            logger.warning("slack: could not retire suggestion menu: %s", exc)
+
+    def _session_id_for(self, body: dict) -> int | None:
+        """The chat whose thread a button lives in, or None when it is stale.
+
+        The button was rendered on a reply that `send` posted at the session's
+        (channel, thread_ts), so matching both pins it to exactly one session.
+        """
+        channel = (body.get("channel") or {}).get("id", "")
+        thread = (body.get("message") or {}).get("thread_ts")
+        for chat_id, (chan, thr) in self._sessions.items():
+            if chan == channel and thr == thread:
+                return chat_id
+        return None
 
     def _is_allowed(self, sender_id: str) -> bool:
         """Single dispatch gate: only allowed senders reach the agent.
@@ -1805,6 +1925,22 @@ class SlackFrontend(Frontend):
         logger.info("slack %s/%s => %s", channel, thread_ts, logs.redact(response.body))
 
         blocks = _build_response_blocks(response.body, response)
+        # Suggestions parsed out of the reply; empty means no buttons.
+        labels = response.suggestions
+        if labels:
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": label},
+                            "action_id": f"cotf-sugg:{i}",
+                        }
+                        for i, label in enumerate(labels)
+                    ],
+                }
+            )
 
         try:
             resp = await self._app.client.chat_postMessage(

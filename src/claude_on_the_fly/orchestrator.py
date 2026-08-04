@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import re
 import signal
 import time
 from collections.abc import Awaitable, Callable
@@ -54,6 +57,95 @@ logger = logging.getLogger(__name__)
 # (see `Response.context_tokens`), so in native mode this is inert however it is
 # set — the manual trigger is the whole feature there.
 AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
+
+# Appended to every chat turn's prompt when suggestions are enabled: the agent
+# ends its reply with the follow-ups it was asked for, wrapped so the daemon
+# can strip them and render them as buttons without the user ever seeing the
+# machine half of the reply. Appended per turn rather than baked into the
+# system prompt so cron and the job queue (which share the agent) never carry
+# it, and so an edit takes effect on the next read like any live setting.
+SUGGESTIONS_TEMPLATE = (
+    "End your reply with a JSON array of 3 short follow-up questions the user "
+    "might ask next, wrapped in <suggestions> tags like this: "
+    '<suggestions>["question one", "question two"]</suggestions>. '
+    "Nothing else inside the tags, and nothing after them."
+)
+
+# Slack allows at most five buttons per actions block, and button text maxes
+# out at 75 characters (the block-kit hard cap; more and chat_postMessage
+# rejects the whole block); both caps live here so the frontends and the
+# parser agree without importing each other.
+MAX_SUGGESTIONS = 5
+MAX_SUGGESTION_LENGTH = 75
+
+_SUGGESTIONS_RE = re.compile(r"<suggestions>(.*?)</suggestions>", re.DOTALL)
+# The agent sometimes wraps the block in a code fence; the fence markers sit
+# outside the tags, so after the block is removed the open and close lines
+# become adjacent and this drops the dangling pair from the visible body.
+_FENCE_PAIR_RE = re.compile(r"```[a-zA-Z]*\s*\n\s*```\s*")
+_SUGGESTIONS_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _suggestions_enabled() -> bool:
+    """Live gate for the suggestions template. Read per turn, not at import."""
+    return settings.get("COTF_SUGGESTIONS_ENABLED").lower() in _SUGGESTIONS_TRUTHY
+
+
+def _extract_suggestions(body: str) -> tuple[str, list[str]]:
+    """Split a reply into (visible text, suggestion labels).
+
+    Every <suggestions> block is stripped from the visible body; the labels
+    come from the last one, since the template tells the agent to end the
+    reply with it. A reply that was only blocks gets a placeholder so
+    frontends never send an empty message.
+    """
+    matches = list(_SUGGESTIONS_RE.finditer(body))
+    if not matches:
+        return body, []
+    parts: list[str] = []
+    cursor = 0
+    for match in matches:
+        parts.append(body[cursor : match.start()])
+        cursor = match.end()
+    parts.append(body[cursor:])
+    cleaned = _FENCE_PAIR_RE.sub("", "".join(parts)).strip()
+    return (cleaned or "Suggestions:"), _parse_suggestion_block(matches[-1].group(1))
+
+
+def _labels_from(data: object) -> list[str]:
+    """Suggestion labels out of a parsed block payload (a list of strings)."""
+    if not isinstance(data, list):
+        return []
+    return [
+        str(item).strip()[:MAX_SUGGESTION_LENGTH]
+        for item in data
+        if isinstance(item, str) and item.strip()
+    ]
+
+
+def _parse_suggestion_block(raw: str) -> list[str]:
+    """Turn the block's contents into labels: a JSON list first, a
+    Python-style literal (single-quoted lists, trailing commas) as a lenient
+    second, a markdown list as a third. Anything else yields nothing, and the
+    caller shows no buttons for a malformed block rather than stale ones."""
+    content = raw.strip()
+    if content.startswith("```"):
+        # The agent sometimes wraps the block in a code fence despite the
+        # template; strip the fence and any "json" language tag.
+        content = re.sub(r"^```[a-zA-Z]*\s*", "", content)
+        content = re.sub(r"\s*```$", "", content).strip()
+    items: list[str] = []
+    try:
+        items = _labels_from(json.loads(content))
+    except json.JSONDecodeError:
+        try:
+            items = _labels_from(ast.literal_eval(content))
+        except (ValueError, SyntaxError):
+            for line in content.splitlines():
+                match = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
+                if match:
+                    items.append(match.group(1)[:MAX_SUGGESTION_LENGTH])
+    return items[:MAX_SUGGESTIONS]
 
 
 @dataclass(frozen=True)
@@ -551,10 +643,12 @@ class Orchestrator:
                 )
             else:
                 identity = getattr(self._frontend, "sender_identity", None)
+                suggestions = _suggestions_enabled()
+                prompt = f"{text}\n\n{SUGGESTIONS_TEMPLATE}" if suggestions else text
                 response = await agent.run(
                     workspace,
                     session,
-                    text,
+                    prompt,
                     self._platform,
                     user_name=(
                         identity(chat_id)
@@ -564,6 +658,13 @@ class Orchestrator:
                     channel_context=self._frontend.channel_context(chat_id),
                     timeout=self._frontend.timeout_for(chat_id),
                 )
+                # A stray <suggestions> block is stripped whether or not the
+                # feature is on: an agent mid-session keeps emitting them
+                # after a toggle-off, and raw machine text must never reach
+                # the user. The labels only become buttons while enabled.
+                response.body, parsed = _extract_suggestions(response.body)
+                if suggestions:
+                    response.suggestions = parsed
             if self._permissions is not None:
                 # After the turn, because the tool count only exists once it is
                 # over. Reporting late beats not reporting: an ungated turn is
@@ -610,7 +711,8 @@ class Orchestrator:
         except ClaudeUnavailableError as exc:
             logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
             await self._frontend.send(
-                chat_id, Response(body=f"Claude unavailable: {exc}")
+                chat_id,
+                Response(body=f"Claude unavailable: {exc}"),
             )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
@@ -624,7 +726,10 @@ class Orchestrator:
             )
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)
-            await self._frontend.send(chat_id, Response(body=f"Error: {exc}"))
+            await self._frontend.send(
+                chat_id,
+                Response(body=f"Error: {exc}"),
+            )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,

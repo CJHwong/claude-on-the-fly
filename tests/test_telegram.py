@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest
 
-from claude_on_the_fly.telegram import MAX_MESSAGE_LENGTH, TelegramFrontend
+from claude_on_the_fly.agent import Response
+from claude_on_the_fly.telegram import (
+    MAX_MESSAGE_LENGTH,
+    SUGGESTION_LABEL_CAP,
+    SUGGESTION_SPENT_CAP,
+    TelegramFrontend,
+)
 
 
 @pytest.fixture
@@ -196,6 +202,39 @@ class TestSendChunked:
         sent_text = calls[0].kwargs.get("text", "")
         assert len(sent_text) == MAX_MESSAGE_LENGTH
 
+    async def test_last_chunk_carries_reply_markup(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        markup = MagicMock()
+
+        await frontend._send_chunked(1, "short message", markup)
+
+        frontend._app.bot.send_message.assert_called_once_with(
+            chat_id=1,
+            text="short message",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
+    async def test_multiple_chunks_markup_only_on_last(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        markup = MagicMock()
+
+        line = "x" * 2000
+        text = f"{line}\n{line}\n{line}"
+        await frontend._send_chunked(1, text, markup)
+
+        calls = frontend._app.bot.send_message.call_args_list
+        assert len(calls) >= 2
+        for call in calls[:-1]:
+            assert "reply_markup" not in call.kwargs
+        assert calls[-1].kwargs.get("reply_markup") is markup
+
 
 # ============================================================
 # _send_msg
@@ -211,6 +250,22 @@ class TestSendMsg:
 
         frontend._app.bot.send_message.assert_called_once_with(
             chat_id=1, text="hello", parse_mode="Markdown"
+        )
+
+    async def test_includes_reply_markup_when_given(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        markup = MagicMock()
+
+        await frontend._send_msg(1, "hello", markup)
+
+        frontend._app.bot.send_message.assert_called_once_with(
+            chat_id=1,
+            text="hello",
+            parse_mode="Markdown",
+            reply_markup=markup,
         )
 
     async def test_fallback_plain_text_on_bad_request(
@@ -661,8 +716,9 @@ class TestStart:
 
         assert frontend._on_message is on_message
         assert frontend._app is mock_app
-        # 3 commands, 2 message handlers, 1 approval callback query
-        assert mock_app.add_handler.call_count == 6
+        # 3 commands, 2 message handlers, 3 callback queries
+        # (approval + suggestion + spent-suggestion)
+        assert mock_app.add_handler.call_count == 8
         mock_app.initialize.assert_awaited_once()
         mock_app.start.assert_awaited_once()
         mock_updater.start_polling.assert_awaited_once()
@@ -825,6 +881,51 @@ class TestSend:
         sent_text = frontend._app.bot.send_message.call_args.kwargs["text"]
         assert "_stats_" in sent_text
         assert "tools" not in sent_text
+
+    async def test_send_renders_suggestions(self, frontend: TelegramFrontend) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=7)
+        )
+
+        await frontend.send(1, Response(body="here", suggestions=["alpha?", "beta?"]))
+
+        call = frontend._app.bot.send_message.call_args
+        rows = call.kwargs["reply_markup"].inline_keyboard
+        assert [row[0].text for row in rows] == ["alpha?", "beta?"]
+        assert [row[0].callback_data for row in rows] == [
+            "cotf-sugg:0",
+            "cotf-sugg:1",
+        ]
+        # The message that carried them is remembered for the tap to resolve,
+        # keyed with the chat id (message ids are only unique per chat).
+        assert frontend._suggestion_labels[(1, 7)] == ["alpha?", "beta?"]
+
+    async def test_suggestion_labels_cap_evicts_the_oldest(self, frontend):
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=7)
+        )
+        for i in range(SUGGESTION_LABEL_CAP):
+            frontend._suggestion_labels[(99, i)] = ["old"]
+
+        await frontend.send(1, Response(body="here", suggestions=["new?"]))
+
+        assert len(frontend._suggestion_labels) == SUGGESTION_LABEL_CAP
+        assert (99, 0) not in frontend._suggestion_labels
+        assert (1, 7) in frontend._suggestion_labels
+
+    async def test_send_no_buttons_when_suggestions_empty(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+
+        await frontend.send(1, Response(body="plain", suggestions=[]))
+
+        call = frontend._app.bot.send_message.call_args
+        assert call.kwargs["text"] == "plain"
+        assert "reply_markup" not in call.kwargs
 
     async def test_send_noop_when_no_app(self, frontend: TelegramFrontend) -> None:
         response = MagicMock()
@@ -1478,6 +1579,218 @@ class TestApprovalTapAuthorisation:
         frontend._pending_approvals["abc"] = future
         await frontend._on_approval_tap(self._update(123, "cotf-deny:abc"), None)
         assert future.result() is True
+
+
+class TestSuggestionTap:
+    """All shortcut buttons carry generated labels resolved from the per-message
+    store; there is no static list anymore."""
+
+    STORE_LABELS = ["what can you do?", "summarize the conversation"]
+
+    def _update(self, user_id: int, data: str, chat_id: int = 1) -> MagicMock:
+        update = MagicMock()
+        query = MagicMock()
+        query.data = data
+        query.answer = AsyncMock()
+        query.message = MagicMock()
+        query.message.message_id = 7
+        query.message.chat = MagicMock()
+        query.message.chat.id = chat_id
+        update.callback_query = query
+        update.effective_user = MagicMock()
+        update.effective_user.id = user_id
+        update.effective_chat = MagicMock()
+        update.effective_chat.id = chat_id
+        return update
+
+    async def test_tap_sends_label_as_next_message(self, frontend, caplog):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+
+        frontend._on_message.assert_awaited_once()
+        text = frontend._on_message.await_args.args[1]
+        assert "what can you do?" in text
+        assert text.startswith("[from-id: 1]")
+
+    async def test_second_shortcut_sends_its_label(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:1"), None)
+
+        assert "summarize the conversation" in frontend._on_message.await_args.args[1]
+
+    async def test_unauthorized_tap_is_ignored(self, frontend, caplog):
+        frontend._on_message = AsyncMock()
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.telegram"):
+            await frontend._on_suggestion_tap(self._update(999, "cotf-sugg:0"), None)
+        frontend._on_message.assert_not_awaited()
+        assert "unauthorized user 999" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_stale_index_is_dropped(self, frontend, caplog):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+        update = self._update(123, "cotf-sugg:9")
+        with caplog.at_level("INFO", logger="claude_on_the_fly.telegram"):
+            await frontend._on_suggestion_tap(update, None)
+        frontend._on_message.assert_not_awaited()
+        update.callback_query.answer.assert_awaited_once_with(
+            text="This option is no longer available."
+        )
+        assert "unknown index" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_unparseable_index_is_dropped(self, frontend):
+        frontend._on_message = AsyncMock()
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:abc"), None)
+        frontend._on_message.assert_not_awaited()
+
+    async def test_tap_without_on_message_is_a_noop(self, frontend):
+        frontend._on_message = None
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+
+    async def test_non_callback_update_is_ignored(self, frontend):
+        update = MagicMock()
+        update.callback_query = None
+        await frontend._on_suggestion_tap(update, None)
+
+    async def test_tap_confirms_via_toast(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+        update = self._update(123, "cotf-sugg:1")
+
+        await frontend._on_suggestion_tap(update, None)
+
+        update.callback_query.answer.assert_awaited_once_with(
+            text="Sent: summarize the conversation"
+        )
+
+    async def test_tap_marks_and_retires_the_button(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._app = MagicMock()
+        frontend._app.bot.edit_message_reply_markup = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+
+        edit = frontend._app.bot.edit_message_reply_markup.await_args.kwargs
+        assert edit["chat_id"] == 1
+        assert edit["message_id"] == 7
+        buttons = [row[0] for row in edit["reply_markup"].inline_keyboard]
+        assert len(buttons) == 1  # the rest of the menu retires, not left live
+        assert buttons[0].text == "✓ what can you do?"
+        assert buttons[0].callback_data == "cotf-done:0"
+
+    async def test_tap_without_a_message_is_dropped(self, frontend, caplog):
+        # No message, no store key, no label to send: the tap dies instead of
+        # guessing.
+        frontend._on_message = AsyncMock()
+        update = self._update(123, "cotf-sugg:0")
+        update.callback_query.message = None
+
+        await frontend._on_suggestion_tap(update, None)
+
+        frontend._on_message.assert_not_awaited()
+
+    async def test_tap_resolves_from_message_store(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = ["alpha?", "beta?"]
+
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:1"), None)
+
+        text = frontend._on_message.await_args.args[1]
+        assert "beta?" in text
+
+    async def test_tap_ignores_another_chats_store_entry(self, frontend, caplog):
+        # A message id from another chat must not resolve here: ids are only
+        # unique per chat, so the key carries the chat id.
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(2, 7)] = ["other chat?"]
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.telegram"):
+            await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+        frontend._on_message.assert_not_awaited()
+
+    async def test_repeat_tap_on_the_same_message_is_dropped(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+        update = self._update(123, "cotf-sugg:0")
+
+        await frontend._on_suggestion_tap(update, None)
+        await frontend._on_suggestion_tap(update, None)
+
+        frontend._on_message.assert_awaited_once()
+
+    async def test_spent_menus_cap_evicts_the_oldest(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+        for i in range(SUGGESTION_SPENT_CAP):
+            frontend._spent_menus[(99, i)] = None
+
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+
+        assert len(frontend._spent_menus) == SUGGESTION_SPENT_CAP
+        assert (99, 0) not in frontend._spent_menus
+        assert (1, 7) in frontend._spent_menus
+        frontend._on_message.assert_awaited_once()
+
+    async def test_tap_without_store_entry_is_dropped(self, frontend, caplog):
+        # A restart empties the store; there is no static list to fall back
+        # to, so the tap is dropped rather than sending a guessed label.
+        frontend._on_message = AsyncMock()
+        with caplog.at_level("INFO", logger="claude_on_the_fly.telegram"):
+            await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+        frontend._on_message.assert_not_awaited()
+        assert "unknown index" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_tap_retire_uses_store_label(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._app = MagicMock()
+        frontend._app.bot.edit_message_reply_markup = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = ["alpha?"]
+
+        await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+
+        edit = frontend._app.bot.edit_message_reply_markup.await_args.kwargs
+        button = edit["reply_markup"].inline_keyboard[0][0]
+        assert button.text == "✓ alpha?"
+        assert (1, 7) not in frontend._suggestion_labels  # entry retired with the menu
+
+    async def test_mark_failure_is_logged_and_tap_still_sends(
+        self, frontend, caplog
+    ) -> None:
+        frontend._on_message = AsyncMock()
+        frontend._app = MagicMock()
+        frontend._app.bot.edit_message_reply_markup = AsyncMock(
+            side_effect=BadRequest("cannot edit")
+        )
+        frontend._suggestion_labels[(1, 7)] = self.STORE_LABELS
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.telegram"):
+            await frontend._on_suggestion_tap(self._update(123, "cotf-sugg:0"), None)
+        frontend._on_message.assert_awaited_once()
+        assert "could not retire suggestion menu" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+
+class TestDoneTap:
+    async def test_done_tap_confirms_without_sending(self, frontend):
+        frontend._on_message = AsyncMock()
+        update = TestSuggestionTap()._update(123, "cotf-done:0")
+
+        await frontend._on_done_tap(update, None)
+
+        frontend._on_message.assert_not_awaited()
+        update.callback_query.answer.assert_awaited_once_with(text="Already sent.")
+
+    async def test_done_tap_without_query_is_a_noop(self, frontend):
+        update = MagicMock()
+        update.callback_query = None
+        await frontend._on_done_tap(update, None)
 
 
 # ---------------------------------------------------------------------------

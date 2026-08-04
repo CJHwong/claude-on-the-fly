@@ -9,13 +9,14 @@ import mimetypes
 import os
 import secrets
 import tempfile
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -52,6 +53,11 @@ PHOTO_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gi
 # session the user was last on, instead of snapping back to the base session.
 # Base sessions (no token) need no entry — their UUID is deterministic.
 SESSIONS_FILE = DATA_DIR / "state" / "telegram-sessions.json"
+# Cap on remembered generated-label entries and spent shortcut menus. Both are
+# keyed per message and normally retired by a tap; the caps bound the store
+# for a long-running daemon whose messages are never tapped.
+SUGGESTION_LABEL_CAP = 500
+SUGGESTION_SPENT_CAP = 500
 
 
 class TelegramFrontend(Frontend):
@@ -76,6 +82,18 @@ class TelegramFrontend(Frontend):
         # port plus scope, and short enough that a subject would get truncated
         # into ambiguity.
         self._pending_approvals: dict[str, asyncio.Future[bool]] = {}
+        # (chat_id, message_id) -> suggestion labels. Labels cannot ride the
+        # 64-byte callback_data, so the tap resolves them from the message
+        # that carried them. Message ids are only unique per chat, so the key
+        # carries the chat id too. Entries are dropped when the message's menu
+        # retires and pruned past SUGGESTION_LABEL_CAP for replies nobody ever
+        # taps.
+        self._suggestion_labels: OrderedDict[tuple[int, int], list[str]] = OrderedDict()
+        # (chat_id, message_id) -> None for menus already tapped. The keyboard
+        # retire is a cosmetic edit that can fail (an API error, a message too
+        # old to edit); this is the synchronous guard that actually stops a
+        # re-tap from sending twice.
+        self._spent_menus: dict[tuple[int, int], None] = {}
 
     def set_orchestrator(self, orchestrator: object) -> None:
         from claude_on_the_fly.orchestrator import Orchestrator
@@ -166,6 +184,12 @@ class TelegramFrontend(Frontend):
         )
         self._app.add_handler(
             CallbackQueryHandler(self._on_approval_tap, pattern=r"^cotf-(grant|deny):")
+        )
+        self._app.add_handler(
+            CallbackQueryHandler(self._on_suggestion_tap, pattern=r"^cotf-sugg:")
+        )
+        self._app.add_handler(
+            CallbackQueryHandler(self._on_done_tap, pattern=r"^cotf-done:")
         )
         await self._app.initialize()
         await self._app.start()
@@ -323,6 +347,100 @@ class TelegramFrontend(Frontend):
             return
         future.set_result(action == "cotf-grant")
 
+    async def _on_suggestion_tap(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Send a preset follow-up from a shortcut button as the next message."""
+        query = update.callback_query
+        if query is None or not query.data:
+            return
+        if not self._allowed(update):
+            await query.answer()
+            logger.warning(
+                "ignoring suggestion tap from unauthorized user %s",
+                update.effective_user.id if update.effective_user else "unknown",
+            )
+            return
+        index = self._suggestion_index(query.data)
+        message = query.message
+        key = (message.chat.id, message.message_id) if message is not None else None
+        # Labels are keyed to the message that carried them; a miss means the
+        # store died with a restart, and there is no static list to fall back
+        # to, so the tap is dropped rather than guessing.
+        labels = self._suggestion_labels.get(key) if key else None
+        label = (
+            labels[index] if labels is not None and 0 <= index < len(labels) else None
+        )
+        if label is None:
+            await query.answer(text="This option is no longer available.")
+            logger.info("suggestion tap for unknown index, dropping")
+            return
+        # Telegram gives a tapped button no selected state, so the menu is
+        # retired on any tap: the toast says what was sent, and the ✓ remnant
+        # says it again for anyone scrolling back. The retire is cosmetic and
+        # can fail, so the spent set below is what actually enforces one tap,
+        # one message.
+        if key is not None:
+            if key in self._spent_menus:
+                await query.answer(text="This option is no longer available.")
+                logger.info("suggestion tap on spent menu, dropping")
+                return
+            self._spent_menus[key] = None
+            if len(self._spent_menus) > SUGGESTION_SPENT_CAP:
+                self._spent_menus.pop(next(iter(self._spent_menus)))
+        await query.answer(text=f"Sent: {label}")
+        if message is not None and self._app is not None:
+            try:
+                await self._app.bot.edit_message_reply_markup(
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    reply_markup=self._marked_keyboard(label),
+                )
+            except TelegramError as exc:
+                # The label was already sent; only the cosmetic mark failed.
+                logger.warning("could not retire suggestion menu: %s", exc)
+            finally:
+                # Retiring the menu also drops this message's generated
+                # labels: the menu is spent regardless of whether the edit
+                # went through, so the store entry is done either way.
+                if key is not None:
+                    self._suggestion_labels.pop(key, None)
+        if self._on_message is None or update.effective_chat is None:
+            return
+        chat_id = update.effective_chat.id
+        sender = self._chat_names.get(chat_id, "unknown")
+        # Same sender marker a typed message carries, so the agent sees who
+        # pressed the button.
+        await self._on_message(chat_id, f"{sender_marker(chat_id, sender)} {label}")
+
+    async def _on_done_tap(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """A spent shortcut button: the label was already sent, just confirm."""
+        query = update.callback_query
+        if query is not None:
+            await query.answer(text="Already sent.")
+
+    @staticmethod
+    def _marked_keyboard(label: str) -> InlineKeyboardMarkup:
+        """The keyboard after a tap: only the picked button, marked and retired.
+
+        The rest of the menu is dropped rather than left live, so a second
+        press cannot send a second message. The ✓ remnant names the pick and
+        stays in the chat as history; its `cotf-done` callback is a no-op.
+        """
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"✓ {label}", callback_data="cotf-done:0")]]
+        )
+
+    @staticmethod
+    def _suggestion_index(data: str) -> int:
+        """Index out of a `cotf-sugg:<i>` callback; -1 when unparseable."""
+        try:
+            return int(data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+
     # --- Sending ---
 
     async def send(self, chat_id: int, response: Response) -> list[Path] | None:
@@ -335,7 +453,28 @@ class TelegramFrontend(Frontend):
         if tools:
             text = f"{text}\n_{tools}_"
         logger.info("chat %s => %s", chat_id, logs.redact(text))
-        await self._send_chunked(chat_id, text)
+        # One button per row: short labels read better stacked on a phone.
+        # Empty suggestions mean no buttons; the store below is how a tap
+        # resolves the label back out of this message.
+        labels = response.suggestions
+        keyboard = None
+        if labels:
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(label, callback_data=f"cotf-sugg:{i}")]
+                    for i, label in enumerate(labels)
+                ]
+            )
+        message_id = await self._send_chunked(chat_id, text, keyboard)
+        if labels and message_id is not None:
+            # Keyed with the chat id: Telegram message ids are only unique
+            # within a chat, and a bare id would let one chat's tap resolve
+            # another chat's labels.
+            key = (chat_id, message_id)
+            self._suggestion_labels[key] = list(labels)
+            self._suggestion_labels.move_to_end(key)
+            while len(self._suggestion_labels) > SUGGESTION_LABEL_CAP:
+                self._suggestion_labels.popitem(last=False)
         await self._send_attachments(chat_id, response.attachments)
         return response.attachments
 
@@ -382,29 +521,44 @@ class TelegramFrontend(Frontend):
         if self._app:
             await self._app.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    async def _send_chunked(self, chat_id: int, text: str) -> None:
+    async def _send_chunked(
+        self, chat_id: int, text: str, reply_markup: object | None = None
+    ) -> int | None:
+        """Send a reply split into chunks; return the last chunk's message id
+        (None when nothing was sent), so the caller can key per-message state
+        to the message that actually carries the keyboard."""
         lines = text.split("\n")
         chunk = ""
+        last_id: int | None = None
         for line in lines:
             candidate = f"{chunk}\n{line}" if chunk else line
             if len(candidate) > MAX_MESSAGE_LENGTH:
                 if chunk:
-                    await self._send_msg(chat_id, chunk)
+                    last_id = await self._send_msg(chat_id, chunk)
                 chunk = line[:MAX_MESSAGE_LENGTH]
             else:
                 chunk = candidate
         if chunk:
-            await self._send_msg(chat_id, chunk)
+            # The keyboard rides only the last chunk: intermediate chunks are
+            # splits of one reply, and the buttons belong on the tail end.
+            last_id = await self._send_msg(chat_id, chunk, reply_markup=reply_markup)
+        return last_id
 
-    async def _send_msg(self, chat_id: int, text: str) -> None:
+    async def _send_msg(
+        self, chat_id: int, text: str, reply_markup: object | None = None
+    ) -> int | None:
+        """Send one message; return its id, or None when the app is absent."""
         if not self._app:
             raise RuntimeError("App not started")
+        kwargs = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
         try:
-            await self._app.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode="Markdown"
-            )
+            result = await self._app.bot.send_message(**kwargs)
         except BadRequest:
-            await self._app.bot.send_message(chat_id=chat_id, text=text)
+            kwargs.pop("parse_mode", None)
+            result = await self._app.bot.send_message(**kwargs)
+        return getattr(result, "message_id", None)
 
     # --- Receiving ---
 

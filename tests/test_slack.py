@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -215,7 +216,7 @@ class TestMetadataAccessors:
 
 
 @pytest.fixture
-def frontend():
+def frontend(monkeypatch):
     with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
         mock_app = MagicMock()
         mock_app.client = MagicMock()
@@ -2920,6 +2921,209 @@ class TestApprovalClickAuthorisation:
         assert future.result() is True, "the answer changed after settling"
 
 
+class TestSuggestionActions:
+    """Preset one-tap follow-up buttons rendered under every reply."""
+
+    @staticmethod
+    def _tap(
+        action_id: str = "cotf-sugg:0",
+        label: str = "what can you do?",
+        user_id: str = "U_ALLOWED",
+        channel: str = "C1",
+        thread_ts: str | None = "t1",
+    ) -> dict:
+        return {
+            "user": {"id": user_id, "name": "hoss"},
+            "channel": {"id": channel},
+            "message": {
+                "ts": "99.1",
+                "text": "hello",
+                **({"thread_ts": thread_ts} if thread_ts is not None else {}),
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "hello"}},
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": lbl},
+                                "action_id": f"cotf-sugg:{i}",
+                            }
+                            for i, lbl in enumerate(
+                                ["what can you do?", "summarize the conversation"]
+                            )
+                        ],
+                    },
+                ],
+            },
+            "actions": [
+                {
+                    "action_id": action_id,
+                    "text": {"type": "plain_text", "text": label},
+                }
+            ],
+        }
+
+    async def test_send_renders_suggestions(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+
+        await frontend.send(
+            session_id, Response(body="hello", suggestions=["alpha?", "beta?"])
+        )
+
+        blocks = frontend._app.client.chat_postMessage.call_args[1]["blocks"]
+        actions = next(b for b in blocks if b["type"] == "actions")
+        labels = [e["text"]["text"] for e in actions["elements"]]
+        assert labels == ["alpha?", "beta?"]
+
+    async def test_send_no_buttons_when_suggestions_empty(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+
+        await frontend.send(session_id, Response(body="hello", suggestions=[]))
+
+        blocks = frontend._app.client.chat_postMessage.call_args[1]["blocks"]
+        assert all(b["type"] != "actions" for b in blocks)
+
+    async def test_tap_sends_label_as_next_message(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(self._tap())
+
+        frontend._on_message.assert_awaited_once()
+        text = frontend._on_message.await_args.args[1]
+        assert "what can you do?" in text
+        assert text.startswith("[from-id: U_ALLOWED]")
+
+    async def test_tap_uses_thread_ts_for_session_match(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(
+            self._tap(action_id="cotf-sugg:1", label="summarize the conversation")
+        )
+
+        assert "summarize the conversation" in frontend._on_message.await_args.args[1]
+
+    async def test_unauthorized_tap_is_ignored(self, frontend, caplog):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(self._tap(user_id="U_STRANGER"))
+        frontend._on_message.assert_not_awaited()
+        assert "ignoring suggestion click from U_STRANGER" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_tap_without_a_label_is_dropped(self, frontend, caplog):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        body = self._tap()
+        del body["actions"][0]["text"]
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(body)
+        frontend._on_message.assert_not_awaited()
+        assert "without a label" in "\n".join(r.getMessage() for r in caplog.records)
+
+    async def test_generated_label_is_sent_verbatim(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(self._tap(label="alpha?"))
+
+        text = frontend._on_message.await_args.args[1]
+        assert "alpha?" in text
+        update = frontend._app.client.chat_update.await_args.kwargs
+        status = next(b for b in update["blocks"] if b["type"] == "context")
+        assert status["elements"][0]["text"] == "✓ alpha?"
+
+    async def test_tap_without_a_matching_session_is_dropped(self, frontend):
+        await frontend._on_suggestion_action(self._tap(channel="C_OTHER"))
+        frontend._on_message.assert_not_awaited()
+
+    async def test_tap_with_no_actions_is_ignored(self, frontend):
+        await frontend._on_suggestion_action({"user": {"id": "U_ALLOWED"}})
+
+    async def test_tap_marks_and_retires_the_button(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(self._tap())
+
+        update = frontend._app.client.chat_update.await_args.kwargs
+        assert update["channel"] == "C1"
+        assert update["ts"] == "99.1"
+        assert all(b["type"] != "actions" for b in update["blocks"])
+        status = next(b for b in update["blocks"] if b["type"] == "context")
+        assert status["elements"][0]["text"] == "✓ what can you do?"
+        frontend._on_message.assert_awaited_once()
+
+    async def test_tap_without_message_blocks_skips_the_mark(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        body = self._tap()
+        del body["message"]["blocks"]
+
+        await frontend._on_suggestion_action(body)
+
+        frontend._app.client.chat_update.assert_not_awaited()
+        frontend._on_message.assert_awaited_once()
+
+    async def test_mark_failure_is_logged_and_tap_still_sends(
+        self, frontend, caplog
+    ) -> None:
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(self._tap())
+        frontend._on_message.assert_awaited_once()
+        assert "could not retire suggestion menu" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_second_tap_on_the_same_message_is_dropped(self, frontend):
+        # The retire is a cosmetic chat_update that can fail; the spent guard
+        # is what stops a re-tap from dispatching a second turn.
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+
+        await frontend._on_suggestion_action(self._tap())
+        await frontend._on_suggestion_action(self._tap())
+
+        frontend._on_message.assert_awaited_once()
+
+    async def test_tap_fills_the_pending_message_queue(self, frontend):
+        # The tap turn mirrors typed-message bookkeeping so notify_start pairs
+        # reactions with this turn's own message, not the next typed one's.
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(self._tap())
+
+        chat_id = frontend._session_id_for(self._tap())
+        assert frontend._pending_msg[chat_id] == deque([("C1", "99.1")])
+        assert frontend._pending_reply_suppressed[chat_id] == deque([False])
+
+    async def test_spent_menus_cap_evicts_the_oldest(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        for i in range(slack_mod.SUGGESTION_SPENT_CAP):
+            frontend._spent_menus[(f"C{i}", "1.0")] = None
+
+        await frontend._on_suggestion_action(self._tap())
+
+        assert len(frontend._spent_menus) == slack_mod.SUGGESTION_SPENT_CAP
+        assert ("C0", "1.0") not in frontend._spent_menus
+        assert ("C1", "99.1") in frontend._spent_menus
+        frontend._on_message.assert_awaited_once()
+
+
 class TestApprovalCardDoesNotUnfurl:
     async def test_the_destination_being_gated_is_not_fetched(self, frontend):
         """An unfurl would have Slack fetch the very host being gated, before any
@@ -3492,6 +3696,7 @@ class TestRegisteredHandlers:
         frontend._handle_picker_submit = AsyncMock()
         frontend._handle_run_skill_shortcut = AsyncMock()
         frontend._on_approval_action = AsyncMock()
+        frontend._on_suggestion_action = AsyncMock()
         with patch.object(slack_mod, "slash_command", lambda: "/cotf"):
             frontend._register_app_interactions()
 
@@ -3507,11 +3712,27 @@ class TestRegisteredHandlers:
         await shortcut_cb("ack", "shortcut")
         frontend._handle_run_skill_shortcut.assert_awaited_once()
 
-        action_cb = frontend._app.action.return_value.call_args[0][0]
+        # The suggestion handler is registered under both its own pattern and
+        # the legacy cotf-shortcut: pattern (buttons from older builds). The
+        # stacked decorator makes the mock's second call receive the inner
+        # decorator's return, so only real handlers are invoked here.
+        action_cbs = [
+            call.args[0]
+            for call in frontend._app.action.return_value.call_args_list
+            if not isinstance(call.args[0], MagicMock)
+        ]
+        assert len(action_cbs) == 2  # approval + suggestion (both patterns)
+        patterns = [
+            call.args[0].pattern for call in frontend._app.action.call_args_list
+        ]
+        assert r"^cotf-shortcut:" in patterns  # legacy pattern stays registered
+        assert r"^cotf-sugg:" in patterns
         ack = AsyncMock()
-        await action_cb(ack, {"user": {"id": "U_ALLOWED"}})
-        ack.assert_awaited_once()
+        for action_cb in action_cbs:
+            await action_cb(ack, {"user": {"id": "U_ALLOWED"}})
+        assert ack.await_count == 2
         frontend._on_approval_action.assert_awaited_once()
+        frontend._on_suggestion_action.assert_awaited_once()
 
     def test_the_slash_command_is_opt_in(self, frontend):
         """It is workspace-global, so registering it unasked would collide with

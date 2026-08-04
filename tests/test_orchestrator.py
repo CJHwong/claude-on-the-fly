@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -16,7 +17,13 @@ from claude_on_the_fly import permissions as permissions_mod
 from claude_on_the_fly import settings
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
-from claude_on_the_fly.orchestrator import Orchestrator, Turn
+from claude_on_the_fly.orchestrator import (
+    SUGGESTIONS_TEMPLATE,
+    Orchestrator,
+    Turn,
+    _extract_suggestions,
+    _parse_suggestion_block,
+)
 from claude_on_the_fly.protocol import Frontend
 
 # ---------------------------------------------------------------------------
@@ -313,6 +320,76 @@ class TestProcess:
         # Response was sent
         assert len(frontend.sent) == 1
         assert frontend.sent[0][1].body == "answer"
+        # Suggestions disabled: empty means no buttons.
+        assert frontend.sent[0][1].suggestions == []
+
+    async def test_appends_template_and_parses_suggestions_when_enabled(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COTF_SUGGESTIONS_ENABLED", "true")
+        fake_response = Response(
+            body='Here is the answer <suggestions>["ask a?", "ask b?"]</suggestions>'
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=fake_response)
+            await orch._process(1, Turn("question"))
+
+        prompt = mock_agent.run.call_args.args[2]
+        assert prompt == f"question\n\n{SUGGESTIONS_TEMPLATE}"
+        sent = frontend.sent[0][1]
+        # The machine half of the reply never reaches the user.
+        assert sent.body == "Here is the answer"
+        assert sent.suggestions == ["ask a?", "ask b?"]
+
+    async def test_malformed_block_yields_no_suggestions(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COTF_SUGGESTIONS_ENABLED", "true")
+        fake_response = Response(
+            body="answer <suggestions>not json at all</suggestions>"
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=fake_response)
+            await orch._process(1, Turn("question"))
+
+        sent = frontend.sent[0][1]
+        assert sent.body == "answer"
+        # Empty suggestions render no buttons rather than stale static ones.
+        assert sent.suggestions == []
+
+    async def test_block_only_reply_gets_a_placeholder(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COTF_SUGGESTIONS_ENABLED", "true")
+        fake_response = Response(body='<suggestions>["only?"]</suggestions>')
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=fake_response)
+            await orch._process(1, Turn("question"))
+
+        sent = frontend.sent[0][1]
+        assert sent.body == "Suggestions:"
+        assert sent.suggestions == ["only?"]
 
     async def test_command_token_is_bound_to_the_turn_workspace_and_revoked(
         self, frontend: StubFrontend, tmp_path: Path
@@ -1884,3 +1961,70 @@ async def test_a_new_session_resets_the_guards_baseline(operator_settings, caplo
         assert "ran UNSUPERVISED" in caplog.text
     finally:
         await manager.close_all()
+
+
+class TestSuggestionsParsing:
+    def test_no_block_leaves_body_untouched(self):
+        body, labels = _extract_suggestions("plain reply")
+        assert body == "plain reply"
+        assert labels == []
+
+    def test_block_is_stripped_and_parsed(self):
+        body, labels = _extract_suggestions(
+            'a\n\n<suggestions>["x?", "y?"]</suggestions>'
+        )
+        assert body == "a"
+        assert labels == ["x?", "y?"]
+
+    def test_block_only_reply_gets_placeholder(self):
+        body, labels = _extract_suggestions('<suggestions>["x?"]</suggestions>')
+        assert body == "Suggestions:"
+        assert labels == ["x?"]
+
+    def test_code_fenced_block_is_parsed(self):
+        assert _parse_suggestion_block('```json\n["a?", "b?"]\n```') == ["a?", "b?"]
+
+    def test_markdown_list_fallback(self):
+        assert _parse_suggestion_block("- first?\n* second?") == ["first?", "second?"]
+
+    def test_non_string_items_are_filtered(self):
+        assert _parse_suggestion_block('[1, "ok?", {"x": 1}]') == ["ok?"]
+
+    def test_non_list_payloads_yield_nothing(self):
+        assert _parse_suggestion_block('{"x": 1}') == []
+        assert _parse_suggestion_block('"just a string"') == []
+
+    def test_garbage_yields_nothing(self):
+        assert _parse_suggestion_block("whatever") == []
+
+    def test_caps_at_five(self):
+        labels = [f"q{i}?" for i in range(8)]
+        assert _parse_suggestion_block(json.dumps(labels)) == labels[:5]
+
+    def test_overlong_labels_are_truncated(self):
+        # 75, not 80: Slack's block-kit button text hard cap is 75 characters,
+        # and a longer label would reject the whole message.
+        long = "x" * 200
+        assert _parse_suggestion_block(f'["{long}?"]') == ["x" * 75]
+
+    def test_single_quoted_json_is_parsed(self):
+        # LLMs emit single-quoted lists despite the template; the parser
+        # accepts them as Python literals rather than dropping the questions.
+        assert _parse_suggestion_block("['ask a?', 'ask b?']") == [
+            "ask a?",
+            "ask b?",
+        ]
+
+    def test_all_blocks_are_stripped_and_the_last_wins(self):
+        body, labels = _extract_suggestions(
+            'a <suggestions>["x?"]</suggestions> b <suggestions>["y?"]</suggestions>'
+        )
+        assert body == "a  b"  # the two gaps join; only the ends are trimmed
+        assert labels == ["y?"]
+
+    def test_fenced_block_leaves_no_dangling_fence(self):
+        body, labels = _extract_suggestions(
+            'answer\n```json\n<suggestions>["x?"]</suggestions>\n```'
+        )
+        assert body == "answer"
+        assert labels == ["x?"]
