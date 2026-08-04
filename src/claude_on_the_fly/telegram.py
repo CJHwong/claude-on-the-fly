@@ -535,12 +535,7 @@ class TelegramFrontend(Frontend):
     async def _save_file(self, chat_id: int, file_id: str, file_name: str) -> Path:
         if not self._app:
             raise RuntimeError("App not started")
-        workspace = (
-            Path.home()
-            / ".claude-on-the-fly"
-            / "workspaces"
-            / self.workspace_name(chat_id)
-        )
+        workspace = DATA_DIR / "workspaces" / self.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
         safe_name = Path(file_name).name
         dest = workspace / safe_name

@@ -231,7 +231,7 @@ def _cmd_run() -> int:
     if not token:
         sys.stderr.write(
             "no Slack token for the job notifier; "
-            "set JOBS_SLACK_TOKEN or SLACK_TOKEN in ~/.claude-on-the-fly/.env\n"
+            f"set JOBS_SLACK_TOKEN or SLACK_TOKEN in {agent.DATA_DIR / '.env'}\n"
         )
         return 2
     loop_warning = _notifier_loop_warning(token_var, token)

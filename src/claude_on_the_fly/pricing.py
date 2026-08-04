@@ -28,14 +28,14 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 
 from claude_on_the_fly import settings
+from claude_on_the_fly.agent import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 PRICING_URL = "https://openrouter.ai/api/v1/models"
-CACHE_DIR = Path.home() / ".claude-on-the-fly" / "pricing"
+CACHE_DIR = DATA_DIR / "pricing"
 CACHE_PATH = CACHE_DIR / "openrouter.json"
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 FETCH_TIMEOUT_SECONDS = 5.0

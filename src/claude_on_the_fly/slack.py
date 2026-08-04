@@ -24,6 +24,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from claude_on_the_fly import checks, logs, settings
 from claude_on_the_fly.agent import (
+    DATA_DIR,
     MAX_ATTACHMENT_BYTES,
     Response,
     cached_skills,
@@ -46,7 +47,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path.home() / ".claude-on-the-fly"
 # Soft cap on agent replies per thread. Once reached, inbound messages are
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
 # counter.

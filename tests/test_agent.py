@@ -83,6 +83,26 @@ def _tool_use(name: str, **input_fields) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class TestDataDirFrom:
+    def test_default_is_home_dot_claude_on_the_fly(self):
+        assert agent_mod.data_dir_from({}) == Path.home() / ".claude-on-the-fly"
+
+    def test_env_var_points_the_data_dir(self):
+        assert agent_mod.data_dir_from({"COTF_DATA_DIR": "/srv/cotf-a"}) == Path(
+            "/srv/cotf-a"
+        )
+
+    def test_empty_env_var_falls_back_like_an_absent_one(self):
+        assert agent_mod.data_dir_from({"COTF_DATA_DIR": ""}) == (
+            Path.home() / ".claude-on-the-fly"
+        )
+
+    def test_module_constant_was_resolved_from_the_environment(self):
+        """The daemon-wide constant is the function applied to os.environ, so a
+        launch with COTF_DATA_DIR set moves every DATA_DIR-derived path."""
+        assert agent_mod.data_dir_from(os.environ) == agent_mod.DATA_DIR
+
+
 class TestCompaction:
     def test_saved_tokens_is_the_difference(self):
         c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162)

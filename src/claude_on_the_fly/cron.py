@@ -46,6 +46,7 @@ from liquid import Environment, StrictUndefined
 from liquid.exceptions import LiquidError, LiquidSyntaxError
 
 from claude_on_the_fly import logs
+from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.jobs.core import Job, JobQueue
 from claude_on_the_fly.jobs.key_state import (
     DEFAULT_MAX_FIRES,
@@ -55,7 +56,6 @@ from claude_on_the_fly.jobs.key_state import (
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path.home() / ".claude-on-the-fly"
 LOG_DIR = DATA_DIR / "logs"
 DEFAULT_CONFIG = DATA_DIR / "cron.yaml"
 # What this file was called, and the key it used, before the rename. Read so an

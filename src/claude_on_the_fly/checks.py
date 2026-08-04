@@ -22,8 +22,6 @@ from claude_on_the_fly import envfile
 
 Status = Literal["ok", "missing", "invalid", "warn"]
 
-DOTENV_HINT = "set in ~/.claude-on-the-fly/.env"
-
 
 def fix_hint(name: str) -> str:
     """Where to set `name`, by its environment-variable spelling.
@@ -33,13 +31,17 @@ def fix_hint(name: str) -> str:
     behind. That was not hypothetical: three checkers sent an operator to `.env` for
     a value the file had taken over, which is the worst kind of stale doc -- a
     diagnostic that is confidently wrong at the moment someone needs it.
+
+    Resolved against `agent.DATA_DIR` per call, so a daemon on a redirected data
+    dir (COTF_DATA_DIR) is told about its own files, not the default location's.
     """
     from claude_on_the_fly import settings
+    from claude_on_the_fly.agent import DATA_DIR
 
     for path, field in settings.FIELDS.items():
         if field.env == name:
-            return f"set `{path}` in ~/.claude-on-the-fly/{settings.FILENAME}"
-    return DOTENV_HINT
+            return f"set `{path}` in {DATA_DIR / settings.FILENAME}"
+    return f"set in {DATA_DIR / '.env'}"
 
 
 def display_name(name: str) -> str:

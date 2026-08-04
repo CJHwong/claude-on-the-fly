@@ -14,6 +14,12 @@
 # to edit and is never overwritten, not even by an upgrade. If you are reading this
 # from your own copy, you are in the right place.
 #
+# The whole directory moves together: set COTF_DATA_DIR in the environment before
+# launching to give that daemon its own data dir (its own config.yaml, .env,
+# cron.yaml, logs, and state) instead of ~/.claude-on-the-fly. It must be a real
+# environment variable -- this file and .env live inside the directory, so neither
+# can point at it. Two daemons on one machine are one directory apart.
+#
 # Settings that used to be COTF_SANDBOX* / AGENT_BACKEND / CLAUDE_MODE and friends
 # live here now, under `sandbox:` and `agent:`. The environment variables still work
 # and still win, so nothing breaks by leaving them in .env -- but they are no longer

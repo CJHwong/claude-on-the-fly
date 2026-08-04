@@ -18,7 +18,7 @@ import signal
 import stat
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +30,25 @@ from claude_on_the_fly import sandbox, settings
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path.home() / ".claude-on-the-fly"
+
+def data_dir_from(env: Mapping[str, str]) -> Path:
+    """The per-daemon data directory, from `COTF_DATA_DIR` when set.
+
+    One daemon per directory: config.yaml, .env, cron.yaml, logs, state, and
+    workspaces all hang off this path, so a second daemon on the same machine
+    gets its own everything -- including its own heartbeat and pid files, which
+    is what stops it fighting the first daemon for the same sockets. An empty
+    value falls back to the default, like an absent one.
+
+    It has to be a real environment variable rather than a `config.yaml` or
+    `.env` setting: both files live inside this directory, so a file in the
+    directory cannot point at the directory. `load_dotenv()` cannot help either
+    -- DATA_DIR is resolved at import, before any `.env` is read.
+    """
+    return Path(env.get("COTF_DATA_DIR") or Path.home() / ".claude-on-the-fly")
+
+
+DATA_DIR = data_dir_from(os.environ)
 MEMORY_DIR = DATA_DIR / "memory"
 MEMORY_ROOT = str(MEMORY_DIR)
 KNOWLEDGE_DIR = str(MEMORY_DIR / "knowledge")

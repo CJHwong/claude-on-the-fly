@@ -285,7 +285,7 @@ class TestCacheLifecycle:
     def test_write_failure_uses_in_memory_index(self, isolated_pricing_cache):
         """Read-only disk: still return correct prices for this run."""
         with (
-            patch.object(pricing.Path, "mkdir", side_effect=OSError("disk full")),
+            patch.object(Path, "mkdir", side_effect=OSError("disk full")),
             patch.object(pricing, "_fetch", return_value=SAMPLE),
         ):
             cost = pricing.cost_for("gpt-5", 1000, 100)

@@ -1582,7 +1582,10 @@ class TestDownloadCleanup:
         """The temp file sits in the agent's own workspace, so an abandoned one
         is visible to the agent and to the next listing."""
         workspace = tmp_path / "ws"
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        monkeypatch.setattr(
+            "claude_on_the_fly.telegram.DATA_DIR",
+            tmp_path / "home" / ".claude-on-the-fly",
+        )
         monkeypatch.setattr(
             frontend, "workspace_name", lambda _chat_id: "telegram/probe"
         )

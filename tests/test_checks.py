@@ -1240,8 +1240,11 @@ class TestFixHint:
     """
 
     def test_a_credential_points_at_dotenv(self):
-        assert checks_mod.fix_hint("SLACK_TOKEN") == checks_mod.DOTENV_HINT
-        assert checks_mod.fix_hint("TELEGRAM_BOT_TOKEN") == checks_mod.DOTENV_HINT
+        from claude_on_the_fly.agent import DATA_DIR
+
+        expected = f"set in {DATA_DIR / '.env'}"
+        assert checks_mod.fix_hint("SLACK_TOKEN") == expected
+        assert checks_mod.fix_hint("TELEGRAM_BOT_TOKEN") == expected
 
     def test_a_migrated_setting_points_at_its_config_key(self):
         hint = checks_mod.fix_hint("TELEGRAM_ALLOWED_USER_ID")
@@ -1251,10 +1254,12 @@ class TestFixHint:
     def test_every_migrated_setting_gets_a_config_hint(self):
         """The drift guard: a new FIELDS entry cannot quietly keep the .env hint."""
         from claude_on_the_fly import settings
+        from claude_on_the_fly.agent import DATA_DIR
 
+        dotenv_hint = f"set in {DATA_DIR / '.env'}"
         for path, field in settings.FIELDS.items():
             hint = checks_mod.fix_hint(field.env)
-            assert hint != checks_mod.DOTENV_HINT, field.env
+            assert hint != dotenv_hint, field.env
             assert path in hint, path
 
     def test_a_missing_migrated_value_reports_the_config_key(self):

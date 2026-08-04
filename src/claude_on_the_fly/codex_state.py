@@ -15,7 +15,9 @@ import stat
 from contextlib import suppress
 from pathlib import Path
 
-MAPPINGS_DIR = Path.home() / ".claude-on-the-fly" / "codex-sessions"
+from claude_on_the_fly.agent import DATA_DIR
+
+MAPPINGS_DIR = DATA_DIR / "codex-sessions"
 _MAX_THREAD_ID = 512
 
 
