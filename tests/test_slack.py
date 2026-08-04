@@ -3809,6 +3809,12 @@ class TestSendFallsBackToDm:
         assert [p["channel"] for p in posts] == ["C1", "D1"]
         assert "couldn't post my reply" in posts[1]["text"]
         assert "the answer" in posts[1]["text"]
+        # Link previews stay off on replies and on the fallback DM: the links
+        # are for the user to click, not for Slack to fetch.
+        assert posts[0]["unfurl_links"] is False
+        assert posts[0]["unfurl_media"] is False
+        assert posts[1]["unfurl_links"] is False
+        assert posts[1]["unfurl_media"] is False
 
     async def test_a_non_fallback_error_is_just_logged(self, frontend, caplog):
         """A rate limit or a bad payload is not a routing problem, and DMing on

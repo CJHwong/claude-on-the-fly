@@ -1948,6 +1948,10 @@ class SlackFrontend(Frontend):
                 text=response.body,
                 blocks=blocks,
                 thread_ts=thread_ts,
+                # A reply's links are for the user to click, not for Slack to
+                # fetch; an unfurl adds noise and pushes buttons off-screen.
+                unfurl_links=False,
+                unfurl_media=False,
             )
         except SlackApiError as exc:
             error = exc.response.get("error", "unknown_error")
@@ -2261,6 +2265,8 @@ class SlackFrontend(Frontend):
                 channel=dm_channel,
                 text=body,
                 blocks=blocks,
+                unfurl_links=False,
+                unfurl_media=False,
             )
         except Exception as exc:
             logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
