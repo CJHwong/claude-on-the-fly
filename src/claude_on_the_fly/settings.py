@@ -75,6 +75,7 @@ SECTIONS = (
     "telegram",
     "jobs",
     "logs",
+    "suggestions",
 )
 
 # Sections that ship real values in the bundled template, as opposed to a block of
@@ -138,6 +139,7 @@ FIELDS: dict[str, Field] = {
     "jobs.timeout": Field("JOBS_TIMEOUT"),
     "logs.keep_days": Field("COTF_LOG_KEEP_DAYS"),
     "logs.host_tag": Field("COTF_HOST_TAG"),
+    "suggestions.enabled": Field("COTF_SUGGESTIONS_ENABLED"),
 }
 
 # Sections and fields that are read once, at startup, because acting on them means

@@ -318,6 +318,13 @@ telegram:
   # allowed_user_id: 123456789
   # stats: summary
 
+suggestions:
+  # Ask the agent to end every chat reply with follow-up suggestions, rendered
+  # as tappable buttons under the reply (Slack actions block, Telegram inline
+  # keyboard). Costs a few dozen extra tokens per turn; when the agent does not
+  # emit the block, no buttons are shown. Off by default.
+  # enabled: true
+
 jobs:
   # Queue adapter shared by the worker and the producers. Needs a restart: the
   # worker is a separate process started with the old value.

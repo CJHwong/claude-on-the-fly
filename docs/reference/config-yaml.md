@@ -110,6 +110,15 @@ human Slack ID or your DMs are ignored.
 Changing `allowed_user_id` immediately revokes the previous ID for messages and approval
 taps. An invalid edit retains the last valid startup ID and logs an error.
 
+## `suggestions`
+
+| Key | Type / default | Effect | Lifecycle |
+|---|---|---|---|
+| `enabled` | boolean / `false` | Ask the agent to end each chat reply with follow-up buttons instead of the static shortcut list | Next turn |
+
+While enabled, the agent's own follow-up questions render as buttons and the static
+shortcut list is suppressed; a reply without a suggestions block shows no buttons at all.
+
 ## `jobs`
 
 | Key | Type / default | Effect | Lifecycle |

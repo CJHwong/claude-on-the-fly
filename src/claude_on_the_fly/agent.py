@@ -395,6 +395,10 @@ class Response:
     model: str = ""
     tool_counts: dict[str, int] = field(default_factory=dict)
     skill_counts: dict[str, int] = field(default_factory=dict)
+    # Follow-up suggestions rendered as tappable buttons under the reply.
+    # Empty means no buttons (agent emitted no <suggestions> block, or the
+    # reply is a notice, not an agent turn).
+    suggestions: list[str] = field(default_factory=list)
     # Set only on a compaction turn, so callers can tell one from a reply.
     compaction: Compaction | None = None
     # Optional statusline-derived fields, only populated in CLAUDE_MODE=pty.
