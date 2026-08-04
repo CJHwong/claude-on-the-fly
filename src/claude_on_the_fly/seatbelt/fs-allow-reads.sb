@@ -7,6 +7,7 @@
 ;;
 ;; Parameters (injected by wrapper):
 ;;   _HOME        — user home directory
+;;   _DATA_DIR    — daemon data directory (COTF_DATA_DIR when redirected)
 ;;   _PROJECT_DIR — resolved project working directory
 ;;   _TMPDIR      — macOS per-user temp directory
 
@@ -179,8 +180,15 @@
 ;; anything a syncer drops beside it (`.env.sync-conflict-...`). A deny list that
 ;; covers the canonical path and not its neighbours protects the file an operator
 ;; thinks about and misses the ones they do not.
+;;
+;; Each rule is dual-scoped: the default `~/.claude-on-the-fly` location stays
+;; denied even when this daemon runs on a redirected data dir (COTF_DATA_DIR),
+;; because the default directory then holds *another daemon's* tokens and
+;; conversation logs. The _DATA_DIR rules cover the redirected directory itself.
 (deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.claude-on-the-fly/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/logs")))
+(deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
 (deny file-read* (literal (string-append (param "_HOME") "/.zhistory")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.zsh")))
 
@@ -255,7 +263,8 @@
 ;; is outside the workspace, so without this every memory write fails with
 ;; "Operation not permitted" and the feature is silently off under `jail`.
 ;; Scoped to memory/ on purpose: the sibling .env and logs/ stay unreadable.
-(allow file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
+;; Resolved from _DATA_DIR so a redirected data dir keeps its own memory writable.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))

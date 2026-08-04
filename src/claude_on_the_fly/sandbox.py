@@ -525,6 +525,10 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     tmpdir = os.path.realpath(os.environ.get("TMPDIR", "/tmp"))
     project = os.path.realpath(workspace)
     base = _fs_base_profile()
+    # Deferred like shim_dir(): agent imports this module, so a top-level import
+    # of DATA_DIR would be a cycle.
+    from claude_on_the_fly.agent import DATA_DIR
+
     loopback, loopback_2, loopback_3, loopback_4 = _loopback_specs()
     params = [
         "-D",
@@ -536,6 +540,13 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         # still said "jailed". The write grants under $HOME would fail the same
         # way, which is what makes this a correctness bug and not only a leak.
         f"_HOME={os.path.realpath(Path.home())}",
+        "-D",
+        # Same realpath contract as _HOME: the profile's data-dir rules are
+        # parameterized on _DATA_DIR, so a redirected DATA_DIR (COTF_DATA_DIR)
+        # behind a symlink would silently match nothing -- the re-grants that
+        # keep memory reachable and the denies that keep the other daemon's .env
+        # out would both no-op.
+        f"_DATA_DIR={os.path.realpath(DATA_DIR)}",
         "-D",
         f"_PROJECT_DIR={project}",
         "-D",
@@ -578,6 +589,14 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
 # with "is a directory" on an unjailed host, which this would classify as ABSENT
 # and quietly under-report. A file gives a clean three-way split between denied,
 # missing, and readable.
+#
+# The cotf .env probe is the default location's. When COTF_DATA_DIR redirects
+# the daemon's data dir, the default directory is *another daemon's* and the
+# boundary to that one still has to hold, so the probe stays. The daemon's own
+# .env sits wherever DATA_DIR points and is appended by `_deny_probe_specs`,
+# because a literal probe cannot know that path at import.
+_DEFAULT_COTF_ENV = "~/.claude-on-the-fly/.env"
+
 _DENY_PROBES = (
     "~/.config/gh/hosts.yml",
     "~/.aws/credentials",
@@ -590,8 +609,24 @@ _DENY_PROBES = (
     # a regex is the kind of rule that can be narrowed by accident and stay silent
     # about it. macOS cannot report a seatbelt denial, so this is the only place the
     # boundary gets checked instead of assumed.
-    "~/.claude-on-the-fly/.env",
+    _DEFAULT_COTF_ENV,
 )
+
+
+def _deny_probe_specs() -> tuple[str, ...]:
+    """The static probe list plus this daemon's own `.env`.
+
+    The own `.env` hangs off DATA_DIR, which COTF_DATA_DIR can point anywhere;
+    a literal probe would target the default directory and prove nothing about
+    the file holding this daemon's tokens. Deduped against the default location
+    so the common case probes the file once.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    own = str(DATA_DIR / ".env")
+    if os.path.realpath(Path(_DEFAULT_COTF_ENV).expanduser()) == os.path.realpath(own):
+        return _DENY_PROBES
+    return (*_DENY_PROBES, own)
 
 
 DENIED = "denied"
@@ -674,15 +709,16 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     """
     if mode() != "jail":
         return {}
-    # Concurrently: these are six independent subprocesses, each with its own
-    # 15s ceiling, and they sit on the daemon's startup path. Run in sequence the
+    # Concurrently: these are independent subprocesses, each with its own 15s
+    # ceiling, and they sit on the daemon's startup path. Run in sequence the
     # worst case was a minute and a half of a daemon that had not begun serving.
+    specs = _deny_probe_specs()
     outcomes = await asyncio.gather(
-        *(_probe_deny(spec, workspace or Path.cwd()) for spec in _DENY_PROBES)
+        *(_probe_deny(spec, workspace or Path.cwd()) for spec in specs)
     )
     results: dict[str, str] = {
         spec: outcome
-        for spec, outcome in zip(_DENY_PROBES, outcomes, strict=True)
+        for spec, outcome in zip(specs, outcomes, strict=True)
         if outcome is not None
     }
     broken = [spec for spec, outcome in results.items() if outcome == BROKEN]

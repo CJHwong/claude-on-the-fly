@@ -669,6 +669,25 @@ def test_home_param_is_realpathed(monkeypatch, tmp_path):
     assert str(linked_home) not in home_param
 
 
+def test_data_dir_param_is_realpathed(monkeypatch, tmp_path):
+    """The profile's data-dir rules are parameterized on _DATA_DIR, so a
+    redirected DATA_DIR (COTF_DATA_DIR) reached through a symlink gets the same
+    realpath treatment as _HOME. An unresolved param would silently match
+    nothing: the memory grants and the .env/logs denies scoped to it would
+    no-op while the profile still loaded and the log still said "jailed"."""
+    real = tmp_path / "real-data"
+    real.mkdir()
+    linked = tmp_path / "linked-data"
+    linked.symlink_to(real)
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", linked)
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    argv = sandbox.wrap(["/bin/echo", "hi"], tmp_path)
+    data_param = next(arg for arg in argv if arg.startswith("_DATA_DIR="))
+    assert data_param == f"_DATA_DIR={real}"
+    assert str(linked) not in data_param
+
+
 async def test_credential_denies_fire_under_a_symlinked_home(monkeypatch, tmp_path):
     """End-to-end version of the above: a real sandbox-exec run proves the deny
     matches when home is reached through a symlink."""
@@ -954,7 +973,7 @@ def test_memory_grant_is_scoped_to_memory_not_the_whole_data_dir(profile):
     """
     text = profile.read_text()
     grants = re.findall(
-        r'\(allow file-(?:read|write)\*.*?\.claude-on-the-fly([^"]*)"', text
+        r'\(allow file-(?:read|write)\*.*?\(param "_DATA_DIR"\) "([^"]*)"', text
     )
     assert grants, "expected at least one data-dir grant"
     for suffix in grants:
@@ -1008,7 +1027,8 @@ _CODEX_MUST_NOT_WRITE = (
 )
 
 
-def test_the_cotf_env_deny_covers_any_depth():
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_cotf_env_deny_covers_any_depth(profile):
     """The tokens must not be readable from a copy one directory down.
 
     `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and memory
@@ -1019,13 +1039,28 @@ def test_the_cotf_env_deny_covers_any_depth():
     the suite's HOME is a tmpdir the profile grants wholesale, so a live read there
     would succeed for the wrong reason.
     """
-    text = sandbox._BASE_PROFILE.read_text()
-    rule = next(
+    text = profile.read_text()
+    if profile == sandbox._BASE_PROFILE:
+        # The default location's own deny lives only in allow-reads; deny-most
+        # covers the default location through its blanket _HOME opacity.
+        default_rule = next(
+            line
+            for line in text.splitlines()
+            if "deny file-read*" in line
+            and "claude-on-the-fly" in line
+            and ".env" in line
+        )
+        assert "(.*/)?" in default_rule, default_rule
+    # A redirected data dir (COTF_DATA_DIR) is covered by the same-shaped rule
+    # scoped to _DATA_DIR in both profiles, so a second daemon's .env is denied
+    # wherever the dir sits -- under _HOME, where deny-most is opaque anyway,
+    # or outside it, where only this deny reaches.
+    data_rule = next(
         line
         for line in text.splitlines()
-        if "deny file-read*" in line and "claude-on-the-fly" in line and ".env" in line
+        if "deny file-read*" in line and "_DATA_DIR" in line and ".env" in line
     )
-    assert "(.*/)?" in rule, rule
+    assert "(.*/)?" in data_rule, data_rule
 
 
 def test_the_cotf_env_is_a_verified_denial():
@@ -1033,6 +1068,24 @@ def test_the_cotf_env_is_a_verified_denial():
     it, and macOS cannot report a seatbelt denial. Probing it per run is the substitute
     for trusting it."""
     assert "~/.claude-on-the-fly/.env" in sandbox._DENY_PROBES
+
+
+def test_deny_probe_specs_dedupe_the_default_location(monkeypatch):
+    """The default location is probed once: the daemon's own .env is the same
+    file, and a second probe adds a startup subprocess for nothing."""
+    monkeypatch.setattr(
+        "claude_on_the_fly.agent.DATA_DIR", Path.home() / ".claude-on-the-fly"
+    )
+    assert sandbox._deny_probe_specs() == sandbox._DENY_PROBES
+
+
+def test_deny_probe_specs_append_a_redirected_env(monkeypatch, tmp_path):
+    """A redirected data dir probes its own .env in addition to the default
+    location's, which then belongs to another daemon on the same machine."""
+    redirected = tmp_path / "other-data"
+    monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", redirected)
+    specs = sandbox._deny_probe_specs()
+    assert specs == (*sandbox._DENY_PROBES, str(redirected / ".env"))
 
 
 @pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])

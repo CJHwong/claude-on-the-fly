@@ -14,8 +14,13 @@
 ;; the re-granted set (e.g. ~/.gitconfig, ~/.npmrc) will be denied. Grant those
 ;; explicitly via COTF_SANDBOX_EXTRA_PATHS if a run needs them.
 ;;
-;; Parameters (injected by the wrapper): _HOME, _PROJECT_DIR, _TMPDIR, and
-;; _EXTRA_1.._EXTRA_3 (unused slots resolve to _PROJECT_DIR, a harmless no-op).
+;; cotf's own data-dir re-grants (shims/ and memory/) are scoped to _DATA_DIR,
+;; which the wrapper resolves from the daemon's data directory (COTF_DATA_DIR
+;; when redirected). Only the daemon's own shims and memory are re-granted: a
+;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
+;;
+;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
+;; and _EXTRA_1.._EXTRA_3 (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
 (version 1)
 (deny default)
@@ -50,12 +55,12 @@
 ;; Command-broker shims. Generated under DATA_DIR, which deny-most makes
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".
-(allow file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/shims")))
+(allow file-read* (subpath (string-append (param "_DATA_DIR") "/shims")))
 ;; The agent's persistent memory, which the system prompt has it read every turn.
 ;; It lives outside the workspace, so deny-most makes it opaque along with the
 ;; rest of $HOME unless it is granted back. Scoped to memory/ so the sibling .env
 ;; and logs/ stay unreadable.
-(allow file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
+(allow file-read* (subpath (string-append (param "_DATA_DIR") "/memory")))
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-read* (subpath (param "_TMPDIR")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
@@ -63,6 +68,14 @@
 (allow file-read* (subpath (param "_EXTRA_1")))
 (allow file-read* (subpath (param "_EXTRA_2")))
 (allow file-read* (subpath (param "_EXTRA_3")))
+;; The daemon's own .env and logs stay denied even outside _HOME: deny-most only
+;; makes $HOME opaque, and COTF_DATA_DIR can point the data dir anywhere -- at a
+;; redirected directory outside $HOME every rule above would leave the tokens
+;; readable. Same shape as fs-allow-reads.sb's rules, so a redirected daemon gets
+;; the same boundary in both profiles. Last in this section so they win over the
+;; _TMPDIR / _EXTRA_* allows above if the data dir ever sits under those.
+(deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
+(deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
 
 ;; -- Writes: identical allowlist to fs-allow-reads.sb --
 ;; Global Claude settings/hooks/plugins are read by future invocations, so a
@@ -112,7 +125,7 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/memory")))
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))
