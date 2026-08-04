@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from claude_on_the_fly import checks, envfile, logs
+from claude_on_the_fly import checks, envfile, logs, settings
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import CheckResult
 from claude_on_the_fly.heartbeat import STATE_DIR
@@ -312,7 +312,13 @@ def spawn(
         raise AlreadyRunning(frontend, existing)
 
     resolved_env: dict[str, str] = dict(env) if env is not None else _load_env(env_file)
-    results = checks.check_frontend(frontend, resolved_env)
+    # config.yaml is layered over the merged env for the checks only: migrated
+    # settings live in the file, and a preflight that read the bare env would
+    # refuse a daemon its own startup would accept (run_telegram checks
+    # settings.environment()). The child itself gets the raw merged env and does
+    # its own layering, so baking config values in here would make the daemon
+    # log "legacy env var wins" warnings about values it never asked for.
+    results = checks.check_frontend(frontend, settings.environment(resolved_env))
     if not checks.all_ok(results):
         raise PreflightFailed(frontend=frontend, results=results)
 

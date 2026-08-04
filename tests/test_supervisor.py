@@ -71,6 +71,23 @@ class TestSpawn:
         assert "TELEGRAM_BOT_TOKEN" in bad_names
         popen.assert_not_called()
 
+    def test_preflight_reads_migrated_settings_from_config_yaml(
+        self, isolated_state, operator_settings
+    ):
+        """A setting that moved to config.yaml must satisfy the spawn preflight
+        even when absent from the environment. The daemon's own startup checks
+        settings.environment(), which layers the file; a preflight that read the
+        bare env would refuse a daemon that would have started fine."""
+        operator_settings.write_text("telegram:\n  allowed_user_id: 8760905177\n")
+        popen = MagicMock(return_value=MagicMock(pid=4242))
+        pid = supervisor.spawn(
+            "telegram",
+            env={"TELEGRAM_BOT_TOKEN": "tok"},
+            popen_factory=popen,
+            wait_for_heartbeat=False,
+        )
+        assert pid == 4242
+
     def test_success_writes_pid_file(self, isolated_state):
         popen = MagicMock(return_value=MagicMock(pid=4242))
         pid = supervisor.spawn(
