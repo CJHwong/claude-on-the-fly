@@ -1009,9 +1009,16 @@ class SlackFrontend(Frontend):
 
         self._app.event("hello")(self._on_hello)
 
-        # Slash commands + the skill picker are an app interaction: they only
-        # reach a bot-token install (commands/interactivity scopes). A user
-        # token never receives them, so registering would be dead weight.
+        # Suggestion buttons render on every reply regardless of token kind,
+        # and block_actions payloads reach both installs, so their handler is
+        # registered unconditionally. The slash command + skill picker are an
+        # app interaction only a bot-token install receives; a user token
+        # never sees them, so registering would be dead weight.
+        @self._app.action(re.compile(r"^cotf-sugg:"))
+        async def handle_suggestion_action(ack, body):
+            await ack()
+            await self._on_suggestion_action(body)
+
         if self._is_bot_token:
             self._register_app_interactions()
             self._warm_task = asyncio.create_task(self._warm_skills())
@@ -1048,12 +1055,6 @@ class SlackFrontend(Frontend):
         async def handle_approval_action(ack, body):
             await ack()
             await self._on_approval_action(body)
-
-        @app.action(re.compile(r"^cotf-sugg:"))
-        @app.action(re.compile(r"^cotf-shortcut:"))  # legacy: buttons from older builds
-        async def handle_suggestion_action(ack, body):
-            await ack()
-            await self._on_suggestion_action(body)
 
         logger.info(
             "slack: skill picker registered (slash command: %s)",

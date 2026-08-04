@@ -1599,6 +1599,29 @@ class TestStartGatesOnToken:
         frontend._register_app_interactions.assert_not_called()
         assert frontend._warm_task is None
 
+    async def test_user_token_still_registers_suggestion_handler(self, frontend):
+        """Buttons render on every reply and block_actions payloads reach a
+        user-token install too, so the suggestion handler must be registered
+        regardless of token kind (a tap was previously a 404)."""
+        frontend._on_suggestion_action = AsyncMock()
+        with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
+            handler_cls.return_value.start_async = AsyncMock()
+            await frontend.start(AsyncMock())
+        patterns = [
+            call.args[0].pattern for call in frontend._app.action.call_args_list
+        ]
+        assert r"^cotf-sugg:" in patterns
+        action_cbs = [
+            call.args[0]
+            for call in frontend._app.action.return_value.call_args_list
+            if not isinstance(call.args[0], MagicMock)
+        ]
+        assert len(action_cbs) == 1
+        ack = AsyncMock()
+        await action_cbs[0](ack, {"user": {"id": "U_ALLOWED"}})
+        assert ack.await_count == 1
+        frontend._on_suggestion_action.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # $stop text prefix (works in threads; both token kinds)
@@ -3690,7 +3713,9 @@ class TestRegisteredHandlers:
 
     async def test_the_bot_token_surface_is_registered_and_wired(self, frontend):
         """Slash commands, the picker, the shortcut, and the approval buttons only
-        reach a bot-token install, so a user token must not register them."""
+        reach a bot-token install, so a user token must not register them. The
+        suggestion buttons are the exception: they render on every reply, so their
+        handler lives in start() and is not token-gated."""
         frontend._is_bot_token = True
         frontend._handle_slash_command = AsyncMock()
         frontend._handle_picker_submit = AsyncMock()
@@ -3712,27 +3737,22 @@ class TestRegisteredHandlers:
         await shortcut_cb("ack", "shortcut")
         frontend._handle_run_skill_shortcut.assert_awaited_once()
 
-        # The suggestion handler is registered under both its own pattern and
-        # the legacy cotf-shortcut: pattern (buttons from older builds). The
-        # stacked decorator makes the mock's second call receive the inner
-        # decorator's return, so only real handlers are invoked here.
+        # Only the approval action registers here; the suggestion handler
+        # moved to start() so user-token installs get it too.
         action_cbs = [
             call.args[0]
             for call in frontend._app.action.return_value.call_args_list
             if not isinstance(call.args[0], MagicMock)
         ]
-        assert len(action_cbs) == 2  # approval + suggestion (both patterns)
+        assert len(action_cbs) == 1  # approval only
         patterns = [
             call.args[0].pattern for call in frontend._app.action.call_args_list
         ]
-        assert r"^cotf-shortcut:" in patterns  # legacy pattern stays registered
-        assert r"^cotf-sugg:" in patterns
+        assert r"^cotf-sugg:" not in patterns
         ack = AsyncMock()
-        for action_cb in action_cbs:
-            await action_cb(ack, {"user": {"id": "U_ALLOWED"}})
-        assert ack.await_count == 2
+        await action_cbs[0](ack, {"user": {"id": "U_ALLOWED"}})
+        assert ack.await_count == 1
         frontend._on_approval_action.assert_awaited_once()
-        frontend._on_suggestion_action.assert_awaited_once()
 
     def test_the_slash_command_is_opt_in(self, frontend):
         """It is workspace-global, so registering it unasked would collide with
