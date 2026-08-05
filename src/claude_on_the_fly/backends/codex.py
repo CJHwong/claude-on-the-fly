@@ -40,6 +40,76 @@ COMPACT_TOKEN_LIMIT = 2000
 # cannot be a standalone operation the way claude's `/compact` is. Keep the reply
 # tiny: it lands in the conversation the compaction just summarized.
 COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
+
+# How long to let codex exit on its own after it has gone quiet on a finished
+# turn, before killing it.
+#
+# codex can deadlock in its own teardown: it drops its tokio runtime with no
+# `shutdown_timeout`, so one stuck `spawn_blocking` task — which `abort()`
+# cannot cancel — parks the process forever with its reply already written to
+# stdout. Waiting for EOF is no escape, because a surviving
+# `codex-code-mode-host` child inherits stdout and holds the pipe open for as
+# long as it lives; observed hangs lasted days.
+#
+# `turn.completed` is codex saying the turn produced everything it is going to.
+# After that, continued silence is teardown rather than work, so kill it and let
+# the caller deliver the reply already in hand.
+POST_TURN_EXIT_GRACE = 30.0
+_TURN_COMPLETED_MARKER = b'"turn.completed"'
+
+
+class _StreamWatch:
+    """Tracks whether the turn finished and when output was last seen."""
+
+    def __init__(self) -> None:
+        self.turn_completed = asyncio.Event()
+        self.last_output_at = time.monotonic()
+        # Enough of the previous chunk to still match a marker split across a
+        # chunk boundary, without retaining the whole stream a second time.
+        self._carry = b""
+
+    def feed(self, chunk: bytes) -> None:
+        """Note output, and whether it completed the turn. Never raises."""
+        self.last_output_at = time.monotonic()
+        if self.turn_completed.is_set():
+            return
+        if _TURN_COMPLETED_MARKER in self._carry + chunk:
+            self.turn_completed.set()
+            self._carry = b""
+            return
+        self._carry = (self._carry + chunk)[-(len(_TURN_COMPLETED_MARKER) - 1) :]
+
+
+async def _kill_once_quiet_after_turn(
+    proc: asyncio.subprocess.Process, watch: _StreamWatch
+) -> None:
+    """Kill `proc` once it has been silent for the grace period post-turn."""
+    await watch.turn_completed.wait()
+    while True:
+        idle = time.monotonic() - watch.last_output_at
+        if idle >= POST_TURN_EXIT_GRACE:
+            break
+        # Re-armed by any further output, so a second turn in one exec
+        # (auto-compaction) is never cut short.
+        await asyncio.sleep(POST_TURN_EXIT_GRACE - idle)
+    logger.warning(
+        "codex exec: silent for %ss after turn.completed and still running; "
+        "killing it so the finished reply can be delivered",
+        POST_TURN_EXIT_GRACE,
+    )
+    await agent._kill_process_tree(proc)
+
+
+async def _collect_codex_output(proc) -> tuple[bytes, bytes]:
+    """`communicate_capped`, but not hostage to a codex that won't exit."""
+    watch = _StreamWatch()
+    watchdog = asyncio.create_task(_kill_once_quiet_after_turn(proc, watch))
+    try:
+        return await agent.communicate_capped(proc, on_stdout_chunk=watch.feed)
+    finally:
+        watchdog.cancel()
+
+
 # `model_reasoning_effort` choices, from codex's config reference. The shared
 # OLLAMA_EFFORT setting is validated against this before it reaches codex
 # (claude's accepted set differs: no `minimal`, plus `max`).
@@ -139,10 +209,10 @@ async def _run_codex_exec(
     try:
         if timeout is not None:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                agent.communicate_capped(proc), timeout=timeout
+                _collect_codex_output(proc), timeout=timeout
             )
         else:
-            stdout_bytes, stderr_bytes = await agent.communicate_capped(proc)
+            stdout_bytes, stderr_bytes = await _collect_codex_output(proc)
     except TimeoutError:
         logger.warning("codex exec: timed out after %ss", timeout)
         raise RuntimeError(f"Codex CLI timed out after {timeout}s") from None
