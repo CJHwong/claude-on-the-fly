@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -207,15 +208,137 @@ def _exec_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     return proc
 
 
-async def _run_exec(proc, tmp_path: Path):
+async def _run_exec(proc, tmp_path: Path, kill: AsyncMock | None = None):
     with (
         patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
         patch.object(codex_mod.agent, "track_agent_process"),
-        patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()),
+        patch.object(codex_mod.agent, "_kill_process_tree", kill or AsyncMock()),
     ):
         return await codex_mod._run_codex_exec(
             tmp_path, ["codex", "exec"], timeout=None
         )
+
+
+def _stream(data: bytes = b"", *, eof: bool = True) -> asyncio.StreamReader:
+    """A real StreamReader — `communicate_capped` isinstance-checks for one.
+
+    `eof=False` models a codex that has written everything but never exits, so
+    its stdout pipe stays open (in the wild, held by a surviving
+    `codex-code-mode-host` child). Reads block there until something feeds EOF.
+    """
+    stream = asyncio.StreamReader()
+    if data:
+        stream.feed_data(data)
+    if eof:
+        stream.feed_eof()
+    return stream
+
+
+def _streamed_proc(returncode: int, stdout: asyncio.StreamReader, stderr=None):
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.stdout = stdout
+    proc.stderr = stderr if stderr is not None else _stream()
+    proc.wait = AsyncMock(return_value=returncode)
+    return proc
+
+
+class TestStreamWatch:
+    def test_marker_split_across_chunks_is_still_found(self):
+        watch = codex_mod._StreamWatch()
+        marker = codex_mod._TURN_COMPLETED_MARKER
+        watch.feed(b'{"type": ' + marker[:5])
+        assert not watch.turn_completed.is_set()
+        watch.feed(marker[5:] + b"}\n")
+        assert watch.turn_completed.is_set()
+
+    def test_carry_does_not_grow_with_the_stream(self):
+        watch = codex_mod._StreamWatch()
+        for _ in range(50):
+            watch.feed(b"x" * 4096)
+        assert len(watch._carry) == len(codex_mod._TURN_COMPLETED_MARKER) - 1
+
+    def test_further_output_after_completion_only_bumps_activity(self):
+        watch = codex_mod._StreamWatch()
+        watch.feed(codex_mod._TURN_COMPLETED_MARKER)
+        before = watch.last_output_at
+        watch.feed(b"trailing noise")
+        assert watch.turn_completed.is_set()
+        assert watch.last_output_at >= before
+
+
+class TestHungCodexIsKilled:
+    """codex can finish a turn and then never exit. Don't wait for it."""
+
+    async def test_hang_after_turn_completed_is_killed_and_reply_delivered(
+        self, tmp_path: Path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(codex_mod, "POST_TURN_EXIT_GRACE", 0.05)
+        stdout = _stream(
+            _ndjson(
+                {"type": "thread.started", "thread_id": "t1"},
+                _agent_message("PR #804 is merged."),
+                _turn_completed(input_tokens=10),
+            ),
+            eof=False,
+        )
+        stderr = _stream(eof=False)
+        proc = _streamed_proc(-9, stdout, stderr)
+
+        # The real _kill_process_tree closes the pipes, which is what lets the
+        # readers finally see EOF; the fake has to do the same.
+        def release(*_args):
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+        kill = AsyncMock(side_effect=release)
+
+        with caplog.at_level(logging.WARNING):
+            out = await asyncio.wait_for(
+                _run_exec(proc, tmp_path, kill=kill), timeout=5
+            )
+
+        assert out["body"] == "PR #804 is merged."
+        assert out["completed"] is True
+        assert kill.await_count >= 1
+        assert "silent for" in caplog.text
+
+    async def test_no_kill_when_codex_exits_on_its_own(self, tmp_path: Path):
+        proc = _streamed_proc(
+            0, _stream(_ndjson(_agent_message("done"), _turn_completed()))
+        )
+        kill = AsyncMock()
+        out = await asyncio.wait_for(_run_exec(proc, tmp_path, kill=kill), timeout=5)
+        assert out["body"] == "done"
+        # Only the unconditional `finally` teardown, never the watchdog.
+        assert kill.await_count == 1
+
+    async def test_grace_rearms_while_output_keeps_coming(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A second turn in one exec (auto-compaction) must not be cut short."""
+        monkeypatch.setattr(codex_mod, "POST_TURN_EXIT_GRACE", 0.4)
+        stdout = _stream(
+            _ndjson(_agent_message("first"), _turn_completed(input_tokens=1)),
+            eof=False,
+        )
+        proc = _streamed_proc(0, stdout)
+
+        async def second_turn():
+            # Well inside the grace, so the timer keeps re-arming.
+            await asyncio.sleep(0.1)
+            stdout.feed_data(b"\n" + _ndjson(_agent_message("second")))
+            await asyncio.sleep(0.1)
+            stdout.feed_data(b"\n" + _ndjson(_turn_completed(input_tokens=2)))
+            await asyncio.sleep(0.1)
+            stdout.feed_eof()
+
+        kill = AsyncMock()
+        feeder = asyncio.create_task(second_turn())
+        out = await asyncio.wait_for(_run_exec(proc, tmp_path, kill=kill), timeout=5)
+        await feeder
+        assert out["body"] == "second"
+        assert kill.await_count == 1  # teardown only — the watchdog never fired
 
 
 class TestRunCodexExec:
