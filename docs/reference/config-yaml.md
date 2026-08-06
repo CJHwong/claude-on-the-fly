@@ -93,6 +93,13 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `job_command` | string / `$job` | Prefix for background work; empty disables | Restart Slack |
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
 | `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
+| `personas` | mapping / empty | Per-chat instructions file, replacing the data-root `CLAUDE.md`; keys are channel id, channel name, sender id, `dm`, or `default` | Immediate |
+
+Persona values are paths relative to the data root and must resolve inside it. A value
+that escapes it, does not exist, or is not a string is refused with an ERROR naming the
+key, and that chat falls through to its next key, then `default`, then the data-root
+`CLAUDE.md`. `telegram` and `jobs` take a `personas` mapping too, keyed by chat id and
+job key. See [Persona](persona.md) for the full key order.
 
 Use `allowed_senders: ["*"]` to allow every human sender. The quotes are required:
 a bare `*` starts a YAML alias and makes the configuration invalid.
@@ -106,6 +113,7 @@ human Slack ID or your DMs are ignored.
 |---|---|---|---|
 | `allowed_user_id` | integer / required | Sole authorized user and fallback approval DM | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, or `detailed` | Immediate |
+| `personas` | mapping / empty | Per-chat instructions file, keyed by chat id or `default` | Immediate |
 
 Changing `allowed_user_id` immediately revokes the previous ID for messages and approval
 taps. An invalid edit retains the last valid startup ID and logs an error.
@@ -127,6 +135,7 @@ shortcut list is suppressed; a reply without a suggestions block shows no button
 | `concurrency` | integer / `1` | Concurrent agent processes; below 1 uses 1 | Restart jobs |
 | `poll_interval_s` | number / `2.0` | Idle queue polling interval | Restart jobs |
 | `timeout` | number / agent default | Per-job wall clock; `<=0` means unlimited | Restart jobs |
+| `personas` | mapping / empty | Per-job instructions file, keyed by the job key or `default` | Immediate |
 
 A timeout carried by a cron job overrides the worker default for that job.
 

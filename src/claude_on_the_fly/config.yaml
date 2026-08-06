@@ -313,10 +313,25 @@ slack:
   # session_cap: 1000
   # reply_soft_limit: 10
 
+  # Per-chat persona: a file, relative to the data root, that REPLACES the
+  # data-root CLAUDE.md for one chat. Key it by channel id (survives renames; the
+  # C... in any Slack link), channel name, a U... sender id, or `dm`. `default`
+  # catches every chat the others do not name. Read per message.
+  # Key order and failure handling: docs/reference/persona.md
+  # personas:
+  #   C07ABCDEF: personas/oncall.md    # #ops-alerts
+  #   dm: personas/guest.md
+  #   default: personas/team.md
+
 telegram:
   # One bot, one operator. There is no list.
   # allowed_user_id: 123456789
   # stats: summary
+
+  # Per-chat persona, keyed by chat id, plus `default`. docs/reference/persona.md
+  # personas:
+  #   "123456789": personas/private.md
+  #   default: personas/team.md
 
 suggestions:
   # Ask the agent to end every chat reply with follow-up suggestions, rendered
@@ -336,6 +351,14 @@ jobs:
   # concurrency: 1
   # poll_interval_s: 2.0
   # timeout: 3600
+
+  # Per-job persona, keyed by the job key exactly as the producer set it. Only cron
+  # sets one: the entry name, or <entry>/<item key> for a producer entry. A job with
+  # no key ($job, claude-jobs enqueue) or an unlisted one gets `default`.
+  # personas:
+  #   daily-digest: personas/digest.md   # a cron entry name
+  #   stale-prs/42: personas/nudge.md    # producer entry: <entry>/<item key>
+  #   default: personas/jobs.md
 
   # JOBS_SLACK_TOKEN stays in .env: it is a credential. Set it to a bot (xoxb-)
   # token when SLACK_TOKEN is a user token, or the worker posts replies as you and
