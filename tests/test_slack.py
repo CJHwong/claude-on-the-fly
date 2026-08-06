@@ -739,6 +739,153 @@ class TestSend:
 
 
 # ---------------------------------------------------------------------------
+# send_progress
+# ---------------------------------------------------------------------------
+
+
+def _seed_progress_route(frontend, channel_type: str | None = "im") -> int:
+    """Route + channel type + an ok response.
+
+    The shared fixture's `chat_postMessage` has no `return_value`, so `resp["ts"]`
+    would otherwise be a MagicMock; and its `conversations_info` stub answers with
+    a channel that is neither an im nor an mpim, so an unseeded type cache
+    resolves to "channel" and nothing posts.
+    """
+    session_id = _session_key("C1", "t1")
+    frontend._sessions[session_id] = ("C1", "t1")
+    if channel_type is not None:
+        frontend._channel_types["C1"] = channel_type
+    frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+    return session_id
+
+
+class TestSendProgress:
+    async def test_posts_a_context_block_into_the_thread(self, frontend):
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "still working")
+
+        kwargs = frontend._app.client.chat_postMessage.call_args.kwargs
+        assert kwargs["channel"] == "C1"
+        assert kwargs["thread_ts"] == "t1"
+        assert kwargs["blocks"][0]["type"] == "context"
+        assert kwargs["text"].startswith(slack_mod.INTERIM_PREFIX)
+        assert "still working" in kwargs["blocks"][0]["elements"][0]["text"]
+
+    async def test_records_the_ts_so_it_is_not_re_ingested(self, frontend):
+        """Under a user token our own post comes back as an event, and `_catchup`
+        re-reads it after a reconnect without passing Bolt's self-event filter."""
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "working")
+        assert "99.0" in frontend._our_sent_timestamps
+
+        await frontend._ingest_event(
+            {"ts": "99.0", "channel": "C1", "user": "U_ALLOWED", "text": "working"}
+        )
+        frontend._on_message.assert_not_awaited()
+
+    async def test_does_not_count_against_the_reply_budget(self, frontend):
+        session_id = _seed_progress_route(frontend)
+
+        for _ in range(3):
+            await frontend.send_progress(session_id, "working")
+        assert frontend._reply_counts.get(session_id, 0) == 0
+
+        await frontend.send(session_id, Response(body="x"))
+        assert frontend._reply_counts[session_id] == 1
+
+    async def test_a_group_dm_is_allowed(self, frontend):
+        session_id = _seed_progress_route(frontend, "mpim")
+
+        await frontend.send_progress(session_id, "working")
+
+        frontend._app.client.chat_postMessage.assert_awaited_once()
+
+    async def test_a_shared_channel_gets_no_progress(self, frontend, caplog):
+        """Interim posts bypass the reply budget, so nothing would cap how much
+        narration a heavy turn pushes at bystanders."""
+        session_id = _seed_progress_route(frontend, "channel")
+
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            await frontend.send_progress(session_id, "working")
+
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+        assert "outside a DM/group DM" in caplog.text
+
+    async def test_an_unknown_channel_type_gets_no_progress(self, frontend):
+        """Fail-closed: a missed progress line costs one silent turn, a wrong one
+        puts narration in a team channel."""
+        session_id = _seed_progress_route(frontend, channel_type=None)
+        frontend._app.client.conversations_info.side_effect = Exception("no such")
+
+        await frontend.send_progress(session_id, "working")
+
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_no_session_posts_nothing(self, frontend):
+        await frontend.send_progress(4242, "working")
+
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_silenced_sender_gets_no_progress(self, frontend):
+        """A silent sender is contracted to get no reply; forwarding its narration
+        would break that. The type cache is left empty on purpose, so the absent
+        `conversations_info` call proves the cheap guard runs first."""
+        session_id = _seed_progress_route(frontend, channel_type=None)
+        frontend._in_flight_reply_suppressed[session_id] = True
+
+        await frontend.send_progress(session_id, "working")
+
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+        frontend._app.client.conversations_info.assert_not_awaited()
+
+    async def test_markdown_is_converted(self, frontend):
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "**bold**")
+
+        assert (
+            "*bold*" in frontend._app.client.chat_postMessage.call_args.kwargs["text"]
+        )
+
+    async def test_a_very_long_line_is_truncated_not_dropped(self, frontend):
+        """One honest truncated line beats fourteen blocks of progress noise."""
+        session_id = _seed_progress_route(frontend, "im")
+
+        await frontend.send_progress(session_id, "x" * 5000)
+
+        rendered = frontend._app.client.chat_postMessage.call_args.kwargs["blocks"][0][
+            "elements"
+        ][0]["text"]
+        assert len(rendered) < SLACK_BLOCK_LIMIT
+        assert "more characters" in rendered
+        assert "xxxxxxxxxx" in rendered
+
+    async def test_a_slack_error_is_swallowed(self, frontend, caplog):
+        session_id = _seed_progress_route(frontend)
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=SlackApiError("nope", {"ok": False, "error": "rate_limited"})
+        )
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            await frontend.send_progress(session_id, "working")
+
+        assert "failed to post" in caplog.text
+
+    async def test_a_not_ok_response_records_nothing(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        frontend._app.client.chat_postMessage.return_value = {
+            "ok": False,
+            "error": "channel_not_found",
+        }
+
+        await frontend.send_progress(session_id, "working")
+
+        assert list(frontend._our_sent_timestamps) == []
+
+
+# ---------------------------------------------------------------------------
 # _resolve_sender
 # ---------------------------------------------------------------------------
 

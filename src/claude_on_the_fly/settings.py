@@ -71,6 +71,7 @@ SECTIONS = (
     "permissions",
     "sandbox",
     "agent",
+    "interim",
     "slack",
     "telegram",
     "jobs",
@@ -123,6 +124,13 @@ FIELDS: dict[str, Field] = {
     "agent.auto_compact_pct": Field("COTF_AUTO_COMPACT_PCT"),
     "agent.pty.auto_install": Field("COTF_AUTO_INSTALL_PTY"),
     "agent.pty.auto_refresh": Field("COTF_PTY_AUTO_REFRESH"),
+    # Its own section because every section here names a module, and mid-turn
+    # progress has one: `interim.py`. It is not a backend knob (it survives a
+    # backend swap) and not platform rendering (the pacing question is the same on
+    # every frontend), so it belongs beside neither `agent:` nor `slack:`.
+    "interim.progress": Field("COTF_INTERIM_PROGRESS"),
+    "interim.warmup_seconds": Field("COTF_INTERIM_WARMUP_SECONDS"),
+    "interim.min_gap_seconds": Field("COTF_INTERIM_MIN_GAP_SECONDS"),
     "slack.allowed_senders": Field("SLACK_ALLOWED_SENDER_IDS", sep=","),
     "slack.blocked_senders": Field("SLACK_BLOCKED_SENDER_IDS", sep=","),
     "slack.silent_senders": Field("SLACK_SILENT_SENDER_IDS", sep=","),

@@ -76,6 +76,14 @@ COMPACT_COMMAND = "$compact"
 # the environment, and it made the constructor's job_queue seam unusable on its
 # own.
 DEFAULT_JOB_COMMAND = "$job"
+# Marker on every forwarded mid-turn message. It goes in the message's `text=` as
+# well as the block: that is what a mobile push shows, and a context block is
+# styling, not a prefix.
+INTERIM_PREFIX = "⏳"
+# Progress goes only where the audience asked for this turn. In a shared channel
+# there is no reply budget protecting bystanders from it (interim posts do not
+# increment one), so narration would land on people who never asked a question.
+_INTERIM_CHANNEL_TYPES = frozenset({"im", "mpim"})
 
 
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
@@ -2142,6 +2150,59 @@ class SlackFrontend(Frontend):
             )
         except Exception as exc:
             logger.error("post_notice: failed to post %r: %s", text, exc)
+            return
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+
+    async def send_progress(self, chat_id: int, text: str) -> None:
+        """Post one mid-turn progress message into the thread the turn runs in.
+
+        Its own `chat_postMessage` rather than `send()`, for two reasons that are
+        both about not spending the user's allowance: `send` counts a reply against
+        `slack.reply_soft_limit` (in both its arms, `send` and `_fallback_dm`), and
+        progress must not burn a ten-message budget; and a progress line is a
+        context block, not a reply with a stats footer.
+
+        DMs and group DMs only. That exemption from the reply budget is exactly why
+        — in a channel, nothing at all would cap how much narration a heavy turn
+        pushes at people who are not in the conversation.
+
+        Records the ts for the same reason every other post here does — under a
+        user token our own message comes back as an event, and `_catchup` re-reads
+        it after a reconnect without passing Bolt's self-event filter at all.
+        """
+        route = self._sessions.get(chat_id)
+        if not route:
+            logger.debug("progress: no channel for session %s", chat_id)
+            return
+        channel, thread_ts = route
+        if self._in_flight_reply_suppressed.get(chat_id, False):
+            logger.debug("progress: omitted for silenced sender in %s", channel)
+            return
+        # Async and last of the three guards, so a cheap sync check never pays for
+        # a lookup. `_channel_type` is cache-first and returns "" when
+        # conversations_info fails — "" is not in the set, so a failed lookup
+        # means no post. Fail-closed on purpose: a missed progress line costs one
+        # silent turn, a wrong one puts narration in a team channel.
+        if await self._channel_type(channel) not in _INTERIM_CHANNEL_TYPES:
+            logger.debug("progress: omitted outside a DM/group DM in %s", channel)
+            return
+        logger.info("slack %s/%s ~> %s", channel, thread_ts, logs.redact(text))
+        rendered = f"{INTERIM_PREFIX} {_fit_block(to_mrkdwn(text))}"
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel,
+                text=rendered,
+                blocks=[
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": rendered}],
+                    }
+                ],
+                thread_ts=thread_ts,
+            )
+        except Exception as exc:
+            logger.error("progress: failed to post: %s", exc)
             return
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])

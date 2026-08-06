@@ -42,6 +42,7 @@ from claude_on_the_fly.events import (
     EventLog,
 )
 from claude_on_the_fly.heartbeat import HeartbeatWriter
+from claude_on_the_fly.interim import InterimProgress, interim_progress_enabled
 from claude_on_the_fly.jobs.orphans import ProcessLedger
 from claude_on_the_fly.protocol import Frontend
 
@@ -612,6 +613,8 @@ class Orchestrator:
         typing_task: asyncio.Task | None = None
         env_token = None
         command_token: str | None = None
+        interim: InterimProgress | None = None
+        sink_token = None
         try:
             # Point this turn's agent at its own egress proxy. Set here rather
             # than passed down because the spawn is several frames below, inside
@@ -645,19 +648,45 @@ class Orchestrator:
                 identity = getattr(self._frontend, "sender_identity", None)
                 suggestions = _suggestions_enabled()
                 prompt = f"{text}\n\n{SUGGESTIONS_TEMPLATE}" if suggestions else text
-                response = await agent.run(
-                    workspace,
-                    session,
-                    prompt,
-                    self._platform,
-                    user_name=(
-                        identity(chat_id)
-                        if callable(identity)
-                        else self._frontend.sender_name(chat_id)
-                    ),
-                    channel_context=self._frontend.channel_context(chat_id),
-                    timeout=self._frontend.timeout_for(chat_id),
-                )
+                interim = self._start_interim(chat_id)
+                if interim is not None:
+                    sink_token = agent.set_progress_sink(interim.emit)
+                try:
+                    response = await agent.run(
+                        workspace,
+                        session,
+                        prompt,
+                        self._platform,
+                        user_name=(
+                            identity(chat_id)
+                            if callable(identity)
+                            else self._frontend.sender_name(chat_id)
+                        ),
+                        channel_context=self._frontend.channel_context(chat_id),
+                        timeout=self._frontend.timeout_for(chat_id),
+                    )
+                except asyncio.CancelledError:
+                    # FIRST, and the order is load-bearing rather than stylistic:
+                    # CancelledError IS a BaseException, so the arm below would
+                    # otherwise catch an abort and take the graceful path.
+                    # Synchronous on purpose — $stop is somebody waiting for an
+                    # ack, and aclose() can spend INTERIM_CLOSE_GRACE draining
+                    # posts that are now moot. One in-flight post may be
+                    # cancelled with its ts unrecorded; that is the trade.
+                    if interim is not None:
+                        interim.cancel()
+                    raise
+                except BaseException:
+                    # Both `except ClaudeUnavailableError` and `except Exception`
+                    # below post a message of their own; the relay has to be shut
+                    # down before either of them does, or a progress line lands
+                    # after the error text and a cancelled post leaves an
+                    # unrecorded ts. flush=True because on this path there is no
+                    # reply body to duplicate against, and the last thing the
+                    # agent said before it failed is the most useful line there is.
+                    if interim is not None:
+                        await interim.aclose(flush=True)
+                    raise
                 # A stray <suggestions> block is stripped whether or not the
                 # feature is on: an agent mid-session keeps emitting them
                 # after a toggle-off, and raw machine text must never reach
@@ -665,6 +694,11 @@ class Orchestrator:
                 response.body, parsed = _extract_suggestions(response.body)
                 if suggestions:
                     response.suggestions = parsed
+                if interim is not None:
+                    # Before the reply is posted, so a late progress message cannot
+                    # land after the answer it was leading up to. Discards whatever
+                    # is still held rather than dumping a digest above the reply.
+                    await interim.aclose()
             if self._permissions is not None:
                 # After the turn, because the tool count only exists once it is
                 # over. Reporting late beats not reporting: an ungated turn is
@@ -743,11 +777,42 @@ class Orchestrator:
             self._in_flight.pop(chat_id, None)
             if typing_task is not None:
                 typing_task.cancel()
+            if sink_token is not None:
+                agent.reset_progress_sink(sink_token)
+            if interim is not None:
+                # Synchronous, like typing_task: a finally on the abort path must
+                # not spend INTERIM_CLOSE_GRACE before the "Stopped" ack goes out.
+                # Idempotent with the aclose/cancel above.
+                interim.cancel()
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
             if command_token is not None and self._commands is not None:
                 self._commands.revoke_token(command_token)
             await self._frontend.notify_complete(chat_id)
+
+    def _start_interim(self, chat_id: int) -> InterimProgress | None:
+        """This turn's progress relay, or None when nothing could come of one.
+
+        The second gate is not redundant with the first. `send_progress` is a
+        concrete no-op on the ABC, so a frontend that never overrode it — today,
+        Telegram — would otherwise get a relay per turn whose drain task ticks for
+        the life of the turn and delivers into nothing. Comparing the attribute on
+        the class rather than the instance's bound method, the same way
+        `tests/test_telegram.py` asserts the no-op is still inherited.
+        """
+        if not interim_progress_enabled():
+            return None
+        if type(self._frontend).send_progress is Frontend.send_progress:
+            logger.debug(
+                "interim: %s does not deliver progress, not starting a relay",
+                type(self._frontend).__name__,
+            )
+            return None
+
+        async def post(text: str) -> None:
+            await self._frontend.send_progress(chat_id, text)
+
+        return InterimProgress(post)
 
     async def _run_compaction(
         self, chat_id: int, workspace: Path, session: str, timeout: float | None

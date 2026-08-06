@@ -27,6 +27,7 @@ from claude_on_the_fly.agent import (
     OUTBOX_DIRNAME,
     ClaudeUnavailableError,
     Compaction,
+    InterimRelay,
     OllamaLauncher,
     Response,
     _classify,
@@ -41,7 +42,9 @@ from claude_on_the_fly.agent import (
     parse_stream,
     persona_for,
     read_attachment,
+    reset_progress_sink,
     run,
+    set_progress_sink,
     stats_mode,
     write_attachment,
 )
@@ -713,6 +716,52 @@ class TestExec:
             await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=0.1)
         mock_kill.assert_awaited_once_with(proc)
 
+    async def test_progress_sink_receives_mid_turn_text(self):
+        """Passing `timeout=` is deliberate: it proves the ContextVar survives
+        `asyncio.wait_for(_consume(proc), ...)`, which the `sandbox.session_env`
+        precedent does not establish (agent_env() is read before the wrapper)."""
+        emitted: list[str] = []
+        stream = _ndjson(
+            _assistant_line({"type": "text", "text": "working"}),
+            _assistant_line(_tool_use("Bash")),
+            _result_line(result="done"),
+        )
+        proc = _make_proc(0, stream)
+
+        token = set_progress_sink(emitted.append)
+        try:
+            with patch("asyncio.create_subprocess_exec", return_value=proc):
+                result = await _exec(Path("/tmp"), ["claude", "-p", "hi"], timeout=5)
+        finally:
+            reset_progress_sink(token)
+
+        assert emitted == ["working"]
+        assert result["result"] == "done"
+
+    async def test_a_raising_sink_does_not_kill_the_turn(self, caplog):
+        def boom(text: str) -> None:
+            raise RuntimeError("the sink is broken")
+
+        stream = _ndjson(
+            _assistant_line({"type": "text", "text": "working"}),
+            _assistant_line(_tool_use("Bash")),
+            _result_line(result="done"),
+        )
+        proc = _make_proc(0, stream)
+
+        token = set_progress_sink(boom)
+        try:
+            with (
+                patch("asyncio.create_subprocess_exec", return_value=proc),
+                caplog.at_level("ERROR", logger="claude_on_the_fly.agent"),
+            ):
+                result = await _exec(Path("/tmp"), ["claude", "-p", "hi"])
+        finally:
+            reset_progress_sink(token)
+
+        assert result["result"] == "done"
+        assert "progress relay failed" in caplog.text
+
 
 def _never_ending_proc() -> MagicMock:
     class _NeverEnds:
@@ -754,6 +803,138 @@ class TestClassify:
         err = _classify("")
         assert isinstance(err, RuntimeError)
         assert not isinstance(err, ClaudeUnavailableError)
+
+
+# ---------------------------------------------------------------------------
+# Mid-turn progress relay
+# ---------------------------------------------------------------------------
+
+
+class TestInterimRelay:
+    """Written against the MEASURED stream shape: one content block per assistant
+    message, so "pending across messages" is the normal path, not the fallback."""
+
+    def _relay(self) -> tuple[InterimRelay, list[str]]:
+        emitted: list[str] = []
+        return InterimRelay(emitted.append), emitted
+
+    def test_the_measured_two_tool_sequence_forwards_both_narrations(self):
+        relay, emitted = self._relay()
+        for msg in (
+            _assistant_line({"type": "thinking", "thinking": "let me see"}),
+            _assistant_line({"type": "text", "text": "Step one now."}),
+            _assistant_line(_tool_use("Bash")),
+            _assistant_line({"type": "thinking", "thinking": "and now the second"}),
+            _assistant_line({"type": "text", "text": "Step two now."}),
+            _assistant_line(_tool_use("Bash")),
+            _assistant_line({"type": "text", "text": "final answer"}),
+        ):
+            relay.feed(msg)
+
+        assert emitted == ["Step one now.", "Step two now."]
+
+    def test_text_alone_waits_for_the_next_tool_call(self):
+        relay, emitted = self._relay()
+        relay.feed(_assistant_line({"type": "text", "text": "looking"}))
+        assert emitted == []
+
+        relay.feed(_assistant_line(_tool_use("Read")))
+        assert emitted == ["looking"]
+
+    def test_the_last_block_is_the_answer_and_is_not_forwarded(self):
+        relay, emitted = self._relay()
+        relay.feed(_assistant_line({"type": "text", "text": "narration"}))
+        relay.feed(_assistant_line(_tool_use("Bash")))
+        relay.feed(_assistant_line({"type": "text", "text": "the answer"}))
+
+        assert emitted == ["narration"]
+
+    def test_text_after_a_tool_use_in_the_same_message_is_held(self):
+        """The one multi-block case, and the one that pins the in-loop flush:
+        a post-loop flush would release "after" before it was proven narration."""
+        relay, emitted = self._relay()
+        relay.feed(
+            _assistant_line(
+                {"type": "text", "text": "before"},
+                _tool_use("Bash"),
+                {"type": "text", "text": "after"},
+            )
+        )
+        assert emitted == ["before"]
+
+        relay.feed(_assistant_line(_tool_use("Read")))
+        assert emitted == ["before", "after"]
+
+    def test_thinking_blocks_are_not_forwarded(self):
+        relay, emitted = self._relay()
+        relay.feed(_assistant_line({"type": "thinking", "thinking": "private"}))
+        relay.feed(_assistant_line(_tool_use("Bash")))
+
+        assert emitted == []
+
+    def test_subagent_lines_are_ignored(self):
+        relay, emitted = self._relay()
+        relay.feed(
+            {
+                **_assistant_line({"type": "text", "text": "sub"}),
+                "parent_tool_use_id": "toolu_1",
+            }
+        )
+        relay.feed(_assistant_line(_tool_use("Bash")))
+
+        assert emitted == []
+
+    def test_a_null_parent_tool_use_id_is_still_forwarded(self):
+        """The measured default-stream shape: the key is present, valued None."""
+        relay, emitted = self._relay()
+        relay.feed(
+            {
+                **_assistant_line({"type": "text", "text": "main"}),
+                "parent_tool_use_id": None,
+            }
+        )
+        relay.feed(_assistant_line(_tool_use("Bash")))
+
+        assert emitted == ["main"]
+
+    def test_blank_text_is_skipped(self):
+        relay, emitted = self._relay()
+        relay.feed(_assistant_line({"type": "text", "text": "   "}))
+        relay.feed(_assistant_line(_tool_use("Bash")))
+
+        assert emitted == []
+
+    def test_non_assistant_lines_are_ignored(self):
+        relay, emitted = self._relay()
+        relay.feed(_result_line())
+        relay.feed({"type": "user", "message": {"content": [{"type": "tool_result"}]}})
+        relay.feed({"type": "system", "subtype": "hook_started"})
+        relay.feed({"type": "system", "subtype": "init"})
+
+        assert emitted == []
+
+    def test_several_text_messages_keep_their_order(self):
+        relay, emitted = self._relay()
+        for word in ("first", "second", "third"):
+            relay.feed(_assistant_line({"type": "text", "text": word}))
+        relay.feed(_assistant_line(_tool_use("Bash")))
+
+        assert emitted == ["first", "second", "third"]
+
+
+class TestProgressSink:
+    def test_sink_is_off_by_default(self):
+        assert agent_mod._PROGRESS_SINK.get() is None
+
+    def test_set_and_reset_round_trip(self):
+        emitted: list[str] = []
+        sink = emitted.append
+        token = set_progress_sink(sink)
+        try:
+            assert agent_mod._PROGRESS_SINK.get() is sink
+        finally:
+            reset_progress_sink(token)
+        assert agent_mod._PROGRESS_SINK.get() is None
 
 
 # ---------------------------------------------------------------------------

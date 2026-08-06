@@ -300,6 +300,25 @@ def test_a_nested_backend_block_flattens(operator_settings):
     assert settings.get("OLLAMA_EFFORT") == "xhigh"
 
 
+def test_interim_progress_reads_from_its_own_section(operator_settings):
+    """Every section here names a module, and mid-turn progress has one of its own
+    (`interim.py`); it is neither a backend knob nor platform rendering, so it is
+    not under `agent:` and not under `slack:`. The section carries the prefix, so
+    the leaf is just `progress`."""
+    operator_settings.write_text("interim:\n  progress: true\n")
+    assert settings.get("COTF_INTERIM_PROGRESS") == "1"
+
+
+def test_interim_pacing_reads_from_its_own_section(operator_settings):
+    """The warm-up and the gap sit beside the toggle they pace: one module reads all
+    three, so one section holds all three."""
+    operator_settings.write_text(
+        "interim:\n  warmup_seconds: 60\n  min_gap_seconds: 90.5\n"
+    )
+    assert settings.get("COTF_INTERIM_WARMUP_SECONDS") == "60"
+    assert settings.get("COTF_INTERIM_MIN_GAP_SECONDS") == "90.5"
+
+
 def test_a_yaml_list_joins_the_way_its_env_var_did(operator_settings):
     """Paths were colon-joined like PATH; sender ids comma-joined. A single separator
     for all of them would corrupt one of the two."""

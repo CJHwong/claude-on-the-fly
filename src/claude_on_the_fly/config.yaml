@@ -284,6 +284,14 @@ agent:
   #   auto_install: false
   #   auto_refresh: true
 
+interim:
+  # Forward the agent's mid-turn narration into the thread while a turn runs, so a
+  # long turn is not silent. Off by default; claude native/ollama only; DMs and
+  # group DMs only. Pacing, in seconds: silence, then one digest per gap.
+  # progress: true
+  # warmup_seconds: 300
+  # min_gap_seconds: 300
+
 slack:
   # Who may reach the agent. Read on every message, so adding a sender takes effect
   # on their next one without a restart.
