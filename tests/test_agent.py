@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -38,6 +39,7 @@ from claude_on_the_fly.agent import (
     ensure_persona,
     get_backend,
     parse_stream,
+    persona_for,
     read_attachment,
     run,
     stats_mode,
@@ -1479,6 +1481,223 @@ class TestEnsurePersona:
             link = workspace / filename
             assert link.is_symlink()
             assert link.resolve() == source.resolve()
+
+    def test_a_per_chat_source_wins_over_the_global(self, tmp_path: Path) -> None:
+        (tmp_path / "CLAUDE.md").write_text("global")
+        channel = tmp_path / "personas" / "oncall.md"
+        channel.parent.mkdir()
+        channel.write_text("oncall")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace, channel)
+
+        for filename in ("CLAUDE.md", "AGENTS.md"):
+            assert (workspace / filename).resolve() == channel.resolve()
+
+    def test_a_stale_link_is_removed_when_nothing_resolves(
+        self, tmp_path: Path
+    ) -> None:
+        """The persona entry was deleted and there is no global file to fall back
+        to. Leaving the link would keep the chat on a persona nothing configures."""
+        gone = tmp_path / "personas" / "old.md"
+        gone.parent.mkdir()
+        gone.write_text("retired")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace, gone)
+            gone.unlink()
+            ensure_persona(workspace)
+
+        assert not (workspace / "CLAUDE.md").exists()
+        assert not (workspace / "AGENTS.md").is_symlink()
+
+    def test_a_real_file_is_left_alone_when_nothing_resolves(
+        self, tmp_path: Path
+    ) -> None:
+        """Only links into DATA_DIR are ours. A CLAUDE.md the agent wrote in its own
+        workspace is content, and deleting it would be data loss."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / "CLAUDE.md").write_text("written by the agent")
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", tmp_path):
+            ensure_persona(workspace)
+
+        assert (workspace / "CLAUDE.md").read_text() == "written by the agent"
+
+    def test_a_link_outside_data_dir_is_left_alone(self, tmp_path: Path) -> None:
+        elsewhere = tmp_path / "elsewhere.md"
+        elsewhere.write_text("not ours")
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / "CLAUDE.md").symlink_to(elsewhere)
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", data_dir):
+            ensure_persona(workspace)
+
+        assert (workspace / "CLAUDE.md").is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# persona_for
+# ---------------------------------------------------------------------------
+
+
+class TestPersonaFor:
+    def _persona(self, root: Path, name: str = "oncall.md") -> Path:
+        path = root / "personas" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"# {name}")
+        return path
+
+    def test_no_personas_section_means_the_global_persona(
+        self, operator_settings: Path
+    ) -> None:
+        operator_settings.write_text("slack:\n  stats: off\n")
+        assert persona_for("slack", ("C07ABCDEF",)) is None
+
+    def test_a_channel_id_key_matches(self, operator_settings: Path) -> None:
+        root = operator_settings.parent
+        wanted = self._persona(root)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        assert persona_for("slack", ("C07ABCDEF", "ops-alerts")) == wanted.resolve()
+
+    def test_a_channel_name_key_matches(self, operator_settings: Path) -> None:
+        root = operator_settings.parent
+        wanted = self._persona(root)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    ops-alerts: personas/oncall.md\n"
+        )
+        assert persona_for("slack", ("C07ABCDEF", "ops-alerts")) == wanted.resolve()
+
+    def test_the_first_key_wins_over_a_later_one(self, operator_settings: Path) -> None:
+        root = operator_settings.parent
+        by_id = self._persona(root, "by-id.md")
+        self._persona(root, "by-name.md")
+        operator_settings.write_text(
+            "slack:\n"
+            "  personas:\n"
+            "    C07ABCDEF: personas/by-id.md\n"
+            "    ops-alerts: personas/by-name.md\n"
+        )
+        assert persona_for("slack", ("C07ABCDEF", "ops-alerts")) == by_id.resolve()
+
+    def test_default_is_consulted_after_every_key(
+        self, operator_settings: Path
+    ) -> None:
+        fallback = self._persona(operator_settings.parent, "team.md")
+        operator_settings.write_text(
+            "slack:\n"
+            "  personas:\n"
+            "    C0OTHER: personas/oncall.md\n"
+            "    default: personas/team.md\n"
+        )
+        assert persona_for("slack", ("C07ABCDEF",)) == fallback.resolve()
+
+    def test_a_listed_chat_wins_over_default(self, operator_settings: Path) -> None:
+        root = operator_settings.parent
+        wanted = self._persona(root)
+        self._persona(root, "team.md")
+        operator_settings.write_text(
+            "slack:\n"
+            "  personas:\n"
+            "    C07ABCDEF: personas/oncall.md\n"
+            "    default: personas/team.md\n"
+        )
+        assert persona_for("slack", ("C07ABCDEF",)) == wanted.resolve()
+
+    def test_no_match_and_no_default_means_the_root_persona(
+        self, operator_settings: Path
+    ) -> None:
+        self._persona(operator_settings.parent)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C0OTHER: personas/oncall.md\n"
+        )
+        assert persona_for("slack", ("C07ABCDEF",)) is None
+
+    def test_a_missing_file_falls_back_and_says_so(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/typo.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "does not exist" in caplog.text
+        assert "C07ABCDEF" in caplog.text
+
+    def test_a_path_escaping_the_data_root_is_refused(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        outside = operator_settings.parent.parent / "elsewhere.md"
+        outside.write_text("someone else's file")
+        operator_settings.write_text(
+            f"slack:\n  personas:\n    C07ABCDEF: ../{outside.name}\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "escapes" in caplog.text
+
+    def test_an_absolute_path_is_refused(self, operator_settings: Path, caplog) -> None:
+        outside = operator_settings.parent.parent / "elsewhere.md"
+        outside.write_text("someone else's file")
+        operator_settings.write_text(f"slack:\n  personas:\n    C07ABCDEF: {outside}\n")
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "escapes" in caplog.text
+
+    def test_a_non_string_value_is_refused(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        operator_settings.write_text("slack:\n  personas:\n    C07ABCDEF: [a, b]\n")
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "must be a path relative to" in caplog.text
+
+    def test_a_rejected_key_still_falls_through_to_the_next_one(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        root = operator_settings.parent
+        wanted = self._persona(root, "by-name.md")
+        operator_settings.write_text(
+            "slack:\n"
+            "  personas:\n"
+            "    C07ABCDEF: personas/typo.md\n"
+            "    ops-alerts: personas/by-name.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF", "ops-alerts")) == wanted.resolve()
+        assert "does not exist" in caplog.text
+
+    def test_a_rejected_key_still_falls_through_to_default(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        fallback = self._persona(operator_settings.parent, "team.md")
+        operator_settings.write_text(
+            "slack:\n"
+            "  personas:\n"
+            "    C07ABCDEF: personas/typo.md\n"
+            "    default: personas/team.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) == fallback.resolve()
+        assert "does not exist" in caplog.text
+
+    def test_personas_that_is_not_a_mapping_is_named(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        operator_settings.write_text("slack:\n  personas: personas/oncall.md\n")
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "must be a mapping" in caplog.text
 
 
 # ---------------------------------------------------------------------------

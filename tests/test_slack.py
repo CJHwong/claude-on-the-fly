@@ -814,6 +814,75 @@ class TestResolveSessionMetadata:
 
 
 # ---------------------------------------------------------------------------
+# persona_source
+# ---------------------------------------------------------------------------
+
+
+class TestPersonaSource:
+    """The keys `persona_source` hands to `agent.persona_for`. What those keys then
+    resolve to is `TestPersonaFor` in test_agent.py."""
+
+    def _keys(self, frontend, chat_id: int) -> tuple[str, ...]:
+        with patch("claude_on_the_fly.slack.persona_for", return_value=None) as spy:
+            assert frontend.persona_source(chat_id) is None
+        return spy.call_args[0][1]
+
+    async def test_a_channel_is_keyed_by_id_then_name(self, frontend):
+        frontend._remember_session(200, "C1", "1.0")
+        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        assert self._keys(frontend, 200) == ("C1", "general")
+
+    async def test_an_unresolvable_channel_is_still_keyed_by_id(self, frontend):
+        """Not by the sender: it is a channel whose name we could not read, and
+        keying a channel on whoever spoke last would flip its persona mid-thread."""
+        frontend._app.client.conversations_info.side_effect = Exception("boom")
+        frontend._remember_session(400, "C99", "5.0")
+        frontend._session_sender_ids[400] = "U_ALLOWED"
+        await frontend._resolve_session_metadata(400, "hoss", "C99", "channel", "5.0")
+        assert self._keys(frontend, 400) == ("C99", "C99")
+
+    async def test_a_dm_is_keyed_by_channel_then_sender_then_dm(self, frontend):
+        frontend._remember_session(100, "D1", None)
+        frontend._session_sender_ids[100] = "U_ALLOWED"
+        await frontend._resolve_session_metadata(100, "hoss", "D1", "im", "")
+        assert self._keys(frontend, 100) == ("D1", "U_ALLOWED", "dm")
+
+    async def test_a_group_dm_is_keyed_like_a_dm(self, frontend):
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "mpdm-a-b", "is_mpim": True}
+        }
+        frontend._app.client.conversations_members.return_value = {"members": ["U_A"]}
+        frontend._remember_session(300, "G1", "1.0")
+        frontend._session_sender_ids[300] = "U_A"
+        await frontend._resolve_session_metadata(300, "hoss", "G1", "mpim", "1.0")
+        assert self._keys(frontend, 300) == ("G1", "U_A", "dm")
+
+    async def test_a_dm_with_no_known_sender_drops_that_key(self, frontend):
+        """A message with no `user` field (a bot post) resolves the session without
+        a sender id. The empty key must not reach the config lookup."""
+        frontend._remember_session(101, "D2", None)
+        await frontend._resolve_session_metadata(101, "hoss", "D2", "im", "")
+        assert self._keys(frontend, 101) == ("D2", "dm")
+
+    def test_an_unknown_session_asks_for_the_dm_default(self, frontend):
+        assert self._keys(frontend, 999) == ("dm",)
+
+    async def test_the_resolved_file_is_returned(self, frontend, tmp_path):
+        persona = tmp_path / "oncall.md"
+        persona.write_text("# oncall")
+        frontend._remember_session(200, "C1", "1.0")
+        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        with patch("claude_on_the_fly.slack.persona_for", return_value=persona):
+            assert frontend.persona_source(200) == persona
+
+    async def test_a_forgotten_session_drops_its_channel_name(self, frontend):
+        frontend._remember_session(200, "C1", "1.0")
+        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        frontend._forget_session(200)
+        assert 200 not in frontend._channel_names
+
+
+# ---------------------------------------------------------------------------
 # set_orchestrator
 # ---------------------------------------------------------------------------
 

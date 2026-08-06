@@ -71,6 +71,35 @@ async def test_fresh_workspace_and_persona_per_call(tmp_path: Path) -> None:
     assert persona.call_count == 2
 
 
+async def test_a_keyed_job_can_have_its_own_persona(tmp_path: Path) -> None:
+    """The job key is the persona key, so one poller's instructions do not leak
+    into every other job the worker runs."""
+    runner = OrchestratorAgentRunner(data_dir=tmp_path)
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            return_value=Response(body="ok"),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona") as persona,
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.persona_for",
+            return_value=tmp_path / "ticket-bot.md",
+        ) as resolve,
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        await runner.run(_job("a", key="ACE-1234"))
+        await runner.run(_job("b"))
+
+    assert [call.args for call in resolve.call_args_list] == [
+        ("jobs", ("ACE-1234",)),
+        ("jobs", ()),  # unkeyed: nothing to match on, so only the default file
+    ]
+    assert persona.call_args.args[1] == tmp_path / "ticket-bot.md"
+
+
 async def test_agent_exception_becomes_failure_result(tmp_path: Path) -> None:
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     with (

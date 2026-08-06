@@ -30,6 +30,7 @@ from claude_on_the_fly.agent import (
     cached_skills,
     footer_parts,
     get_backend,
+    persona_for,
     read_attachment,
     sender_marker,
     write_attachment,
@@ -858,6 +859,10 @@ class SlackFrontend(Frontend):
         self._workspace_names: dict[int, str] = {}
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
+        # session -> channel name, or "" for a DM/group DM. Set alongside the
+        # workspace name and read by `persona_source` to tell a channel (keyed by
+        # id or name) from a DM (keyed by whoever is talking).
+        self._channel_names: dict[int, str] = {}
         self._user_name_cache: dict[str, str] = {}  # slack user_id -> display name
         self._session_sender_ids: dict[int, str] = {}  # session -> slack user_id
         self._dm_channels: dict[str, str] = {}  # slack user_id -> im channel id
@@ -955,6 +960,28 @@ class SlackFrontend(Frontend):
     def channel_context(self, chat_id: int) -> str:
         return self._channel_contexts.get(chat_id, "dm")
 
+    def persona_source(self, chat_id: int) -> Path | None:
+        """The `slack.personas` file for this thread's channel, or None.
+
+        Candidates are built per call, not cached with the rest of the session
+        metadata: a DM's persona may be keyed on the sender, and that id is not
+        always known at the moment the workspace name is (a message with no `user`
+        field resolves the session without one). Reading it live means the persona
+        lands as soon as the id does, and an edited config takes effect on the next
+        message.
+        """
+        entry = self._sessions.get(chat_id)
+        channel = entry[0] if entry else ""
+        name = self._channel_names.get(chat_id, "")
+        if name:
+            keys = (channel, name)
+        else:
+            # DM or group DM. Its channel id is stable per conversation, so it can
+            # be keyed directly; the sender id is what makes one person's DMs
+            # separable from everyone else's.
+            keys = (channel, self._session_sender_ids.get(chat_id, ""), "dm")
+        return persona_for("slack", tuple(key for key in keys if key))
+
     def describe(self) -> dict[str, str]:
         from claude_on_the_fly.orchestrator import _redact_token
 
@@ -1003,6 +1030,7 @@ class SlackFrontend(Frontend):
         self._workspace_names.pop(session_id, None)
         self._sender_names.pop(session_id, None)
         self._channel_contexts.pop(session_id, None)
+        self._channel_names.pop(session_id, None)
         self._session_sender_ids.pop(session_id, None)
         self._reply_counts.pop(session_id, None)
         self._pending_msg.pop(session_id, None)
@@ -2476,6 +2504,7 @@ class SlackFrontend(Frontend):
         if channel_type == "im":
             self._workspace_names[session_id] = f"dm-{sender}-{short_ts}"
             self._channel_contexts[session_id] = "dm (private)"
+            self._channel_names[session_id] = ""
             return
 
         try:
@@ -2486,6 +2515,10 @@ class SlackFrontend(Frontend):
             logger.warning("Failed to resolve channel %s: %s", channel, exc)
             self._workspace_names[session_id] = f"{channel}-{short_ts}"
             self._channel_contexts[session_id] = f"channel:{channel}"
+            # Still a channel, just an unnamed one: the id is the only key a
+            # persona can match, and falling through to the DM branch would key it
+            # on the sender instead.
+            self._channel_names[session_id] = channel
             return
 
         if ch.get("is_mpim"):
@@ -2493,7 +2526,9 @@ class SlackFrontend(Frontend):
             self._workspace_names[session_id] = f"{name}-{short_ts}"
             context = f"group-dm (private)\nParticipants: {', '.join(members)}"
             self._channel_contexts[session_id] = context
+            self._channel_names[session_id] = ""
         else:
+            self._channel_names[session_id] = name
             visibility = "private" if ch.get("is_private") else "public"
             self._workspace_names[session_id] = f"{name}-{short_ts}"
             self._channel_contexts[session_id] = (

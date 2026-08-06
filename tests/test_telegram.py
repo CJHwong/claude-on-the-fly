@@ -136,6 +136,27 @@ class TestChannelContext:
 
 
 # ============================================================
+# persona_source
+# ============================================================
+
+
+class TestPersonaSource:
+    def test_keyed_by_chat_id(self, frontend: TelegramFrontend, tmp_path: Path) -> None:
+        persona = tmp_path / "private.md"
+        with patch(
+            "claude_on_the_fly.telegram.persona_for", return_value=persona
+        ) as resolve:
+            assert frontend.persona_source(123456789) == persona
+        assert resolve.call_args.args == ("telegram", ("123456789",))
+
+    def test_none_falls_back_to_the_root_persona(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        with patch("claude_on_the_fly.telegram.persona_for", return_value=None):
+            assert frontend.persona_source(1) is None
+
+
+# ============================================================
 # set_orchestrator
 # ============================================================
 
