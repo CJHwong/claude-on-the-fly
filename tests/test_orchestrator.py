@@ -413,7 +413,9 @@ class TestProcess:
 
         sent = frontend.sent[0][1]
         assert sent.body == "Suggestions:"
-        assert sent.suggestions == ["only?"]
+        # A reply that is only buttons is a skipped reply: no body to pair
+        # the buttons with, so they are dropped rather than shown blind.
+        assert sent.suggestions == []
 
     async def test_command_token_is_bound_to_the_turn_workspace_and_revoked(
         self, frontend: StubFrontend, tmp_path: Path
@@ -2255,10 +2257,12 @@ class TestSuggestionsParsing:
         assert body == "a"
         assert labels == ["x?", "y?"]
 
-    def test_block_only_reply_gets_placeholder(self):
-        body, labels = _extract_suggestions('<suggestions>["x?"]</suggestions>')
+    def test_block_only_reply_gets_placeholder_and_drops_labels(self, caplog):
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.orchestrator"):
+            body, labels = _extract_suggestions('<suggestions>["x?"]</suggestions>')
         assert body == "Suggestions:"
-        assert labels == ["x?"]
+        assert labels == []
+        assert "reply body empty" in "\n".join(r.getMessage() for r in caplog.records)
 
     def test_code_fenced_block_is_parsed(self):
         assert _parse_suggestion_block('```json\n["a?", "b?"]\n```') == ["a?", "b?"]

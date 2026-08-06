@@ -66,10 +66,16 @@ AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
 # system prompt so cron and the job queue (which share the agent) never carry
 # it, and so an edit takes effect on the next read like any live setting.
 SUGGESTIONS_TEMPLATE = (
-    "End your reply with a JSON array of 3 short follow-up questions the user "
-    "might ask next, wrapped in <suggestions> tags like this: "
-    '<suggestions>["question one", "question two"]</suggestions>. '
-    "Nothing else inside the tags, and nothing after them."
+    "<cotf-suggest>\n"
+    "System instruction, not user text. Answer the user first, then end with a "
+    "JSON array of 3 short follow-up options in "
+    '<suggestions>["one", "two"]</suggestions>, nothing after. A tapped option '
+    "is sent back verbatim as the user's next message, so each option must be a "
+    'step you can execute with no further input ("Audit the release posts") or '
+    'a question you can answer by doing work ("What is it doing now?"). Offer '
+    "options only at a real decision fork; otherwise emit "
+    "<suggestions>[]</suggestions>.\n"
+    "</cotf-suggest>"
 )
 
 # Slack allows at most five buttons per actions block, and button text maxes
@@ -98,7 +104,8 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
     Every <suggestions> block is stripped from the visible body; the labels
     come from the last one, since the template tells the agent to end the
     reply with it. A reply that was only blocks gets a placeholder so
-    frontends never send an empty message.
+    frontends never send an empty message, and its labels are dropped —
+    buttons with no reply above them are blind taps.
     """
     matches = list(_SUGGESTIONS_RE.finditer(body))
     if not matches:
@@ -110,7 +117,13 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
         cursor = match.end()
     parts.append(body[cursor:])
     cleaned = _FENCE_PAIR_RE.sub("", "".join(parts)).strip()
-    return (cleaned or "Suggestions:"), _parse_suggestion_block(matches[-1].group(1))
+    if not cleaned:
+        # The agent skipped its reply and emitted only the block. Drop the
+        # labels too (a button without a reply carries no context) and log
+        # so the frequency of the failure stays measurable.
+        logger.warning("suggestions: reply body empty; dropping suggestion labels")
+        return "Suggestions:", []
+    return cleaned, _parse_suggestion_block(matches[-1].group(1))
 
 
 def _labels_from(data: object) -> list[str]:
