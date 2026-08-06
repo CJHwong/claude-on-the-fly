@@ -89,7 +89,13 @@ class OrchestratorAgentRunner:
         workspace = self.data_dir / "workspaces" / job.platform / run_id
         workspace.mkdir(parents=True, exist_ok=True)
         try:
-            agent.ensure_persona(workspace)
+            # Keyed on `job.key`, the same field that names the unit of work in the
+            # log line below: a poller aimed at one tracker can run its own
+            # instructions without every other job inheriting them.
+            agent.ensure_persona(
+                workspace,
+                agent.persona_for("jobs", (job.key,) if job.key else ()),
+            )
             session_uuid = str(
                 uuid5(
                     NAMESPACE_URL,

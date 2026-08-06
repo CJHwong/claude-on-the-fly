@@ -33,6 +33,7 @@ from claude_on_the_fly.agent import (
     Response,
     footer_parts,
     install_download,
+    persona_for,
     read_attachment,
     sender_marker,
 )
@@ -120,6 +121,16 @@ class TelegramFrontend(Frontend):
 
     def channel_context(self, chat_id: int) -> str:
         return "dm"  # Telegram bot is always a DM
+
+    def persona_source(self, chat_id: int) -> Path | None:
+        """The `telegram.personas` file for this chat, or None.
+
+        One key, the chat id: Telegram has a single authorized operator, so there
+        is no channel or sender to distinguish. It is still worth having -- a second
+        daemon aimed at the same person is a different bot with a different job --
+        and `default` covers every chat without naming an id.
+        """
+        return persona_for("telegram", (str(chat_id),))
 
     def describe(self) -> dict[str, str]:
         from claude_on_the_fly.orchestrator import _redact_token

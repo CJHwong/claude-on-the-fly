@@ -323,6 +323,25 @@ class TestProcess:
         # Suggestions disabled: empty means no buttons.
         assert frontend.sent[0][1].suggestions == []
 
+    async def test_links_the_frontends_own_persona(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        """A frontend that keys personas per chat decides which file gets linked;
+        the default None keeps the single global persona."""
+        persona = tmp_path / "oncall.md"
+        persona.write_text("# oncall")
+        assert frontend.persona_source(1) is None  # the protocol default
+        frontend.persona_source = lambda chat_id: persona  # type: ignore[method-assign]
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        workspace = tmp_path / "workspaces" / "test/1"
+        mock_agent.ensure_persona.assert_called_once_with(workspace, persona)
+
     async def test_appends_template_and_parses_suggestions_when_enabled(
         self,
         orch: Orchestrator,

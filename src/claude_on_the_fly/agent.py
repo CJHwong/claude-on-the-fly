@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import yaml
 
@@ -251,18 +251,126 @@ def _link_persona(source: Path, target: Path) -> None:
 PERSONA_FILENAMES = ("CLAUDE.md", "AGENTS.md")
 
 
-def ensure_persona(workspace: Path) -> None:
-    """Symlink the global CLAUDE.md persona into the workspace under every
-    name an agent CLI might read (CLAUDE.md for claude, AGENTS.md for codex).
+def _persona_path(platform: str, key: str, value: object) -> Path | None:
+    """One `personas:` entry as a usable file, or None with an ERROR saying why.
 
-    Idempotent: no-op when source is missing, no-op when the link is already
-    correct, replaces wrong symlinks or pre-existing files.
+    Every rejection falls through to the next candidate and ultimately to the
+    global persona, because a channel left with no instructions at all is a worse
+    failure than one running the default -- and both need a log line, since
+    neither is visible from Slack.
     """
-    source = DATA_DIR / "CLAUDE.md"
+    if not isinstance(value, str) or not value:
+        logger.error(
+            "%s.personas: `%s` must be a path relative to %s, got %r; ignoring it, "
+            "so this chat falls through to its next key",
+            platform,
+            key,
+            DATA_DIR,
+            value,
+        )
+        return None
+    # Containment is checked against the resolved root because DATA_DIR itself may
+    # be reached through a symlink. An absolute value lands outside DATA_DIR and is
+    # rejected here too: this file decides what instructions the agent runs under,
+    # so it points at the operator's own data directory or nowhere.
+    root = DATA_DIR.resolve()
+    path = (DATA_DIR / value).resolve()
+    if not path.is_relative_to(root):
+        logger.error(
+            "%s.personas: `%s` -> %s escapes %s; ignoring it, so this chat falls "
+            "through to its next key",
+            platform,
+            key,
+            value,
+            root,
+        )
+        return None
+    if not path.is_file():
+        logger.error(
+            "%s.personas: `%s` -> %s does not exist; ignoring it, so this chat falls "
+            "through to its next key",
+            platform,
+            key,
+            path,
+        )
+        return None
+    return path
+
+
+# Table key every chat falls back to. Listed explicitly rather than inferred from a
+# conventional filename: reading the table is then the whole story, so nobody has to
+# know that a file somewhere else in DATA_DIR is silently in charge.
+PERSONA_DEFAULT_KEY = "default"
+
+
+def _persona_table(platform: str) -> dict[str, object]:
+    """The `personas:` mapping from one frontend's section, or {} if unusable."""
+    table = settings.operator(platform).get("personas")
+    if table is None:
+        return {}
+    if not isinstance(table, dict):
+        logger.error(
+            "%s.personas: must be a mapping of chat id -> file, got %s; no chat gets "
+            "a per-chat persona",
+            platform,
+            type(table).__name__,
+        )
+        return {}
+    return cast("dict[str, object]", table)
+
+
+def persona_for(platform: str, keys: tuple[str, ...]) -> Path | None:
+    """The persona file for one chat, or None for the data-root CLAUDE.md.
+
+    The `personas:` table is consulted under `keys`, then under `default`.
+
+    `keys` are the chat's identifiers in priority order (for Slack: channel id,
+    then channel name). The frontend supplies them rather than the section because
+    only it knows which of its identifiers may decide a persona -- a channel's
+    sender changes per message while its workspace is per thread, so keying a
+    channel on the sender would flip the persona mid-conversation.
+
+    Whatever is returned REPLACES the data-root CLAUDE.md for that chat; the two
+    do not stack.
+    """
+    table = _persona_table(platform)
+    for key in (*keys, PERSONA_DEFAULT_KEY):
+        if key not in table:
+            continue
+        path = _persona_path(platform, key, table[key])
+        if path is not None:
+            return path
+    return None
+
+
+def ensure_persona(workspace: Path, source: Path | None = None) -> None:
+    """Symlink a persona into the workspace under every name an agent CLI might
+    read (CLAUDE.md for claude, AGENTS.md for codex).
+
+    `source` defaults to the global CLAUDE.md; a frontend passes a per-chat file
+    from `persona_for`. Idempotent: no-op when the link is already correct,
+    replaces wrong symlinks or pre-existing files.
+
+    With nothing to link, links this function created before are removed. A stale
+    one would otherwise outlive the config entry that asked for it, leaving a chat
+    on a persona no file in DATA_DIR still names.
+    """
+    source = source or DATA_DIR / "CLAUDE.md"
     if not source.is_file():
+        _unlink_personas(workspace)
         return
     for filename in PERSONA_FILENAMES:
         _link_persona(source, workspace / filename)
+
+
+def _unlink_personas(workspace: Path) -> None:
+    """Remove persona symlinks pointing into DATA_DIR. A real file at either name
+    is the agent's or the operator's own and is left alone."""
+    root = DATA_DIR.resolve()
+    for filename in PERSONA_FILENAMES:
+        target = workspace / filename
+        if target.is_symlink() and target.resolve().is_relative_to(root):
+            target.unlink()
 
 
 STATS_MODES = ("off", "summary", "detailed")

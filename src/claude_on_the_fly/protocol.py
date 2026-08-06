@@ -100,6 +100,15 @@ class Frontend(ABC):
     def channel_context(self, chat_id: int) -> str:
         """Where this conversation is happening, e.g. 'dm', 'channel:#general'."""
 
+    def persona_source(self, chat_id: int) -> Path | None:
+        """Per-chat persona file, or None for the global CLAUDE.md.
+
+        Override to let one channel or DM run different instructions than the
+        rest; see `agent.persona_for`. Default is None, so a frontend that has no
+        opinion keeps the single global persona.
+        """
+        return None
+
     def describe(self) -> dict[str, str]:
         """Frontend-specific settings to print in the startup preview.
 
