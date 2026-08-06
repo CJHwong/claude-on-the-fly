@@ -3062,9 +3062,39 @@ class TestSuggestionActions:
         status = next(b for b in update["blocks"] if b["type"] == "context")
         assert status["elements"][0]["text"] == "✓ alpha?"
 
-    async def test_tap_without_a_matching_session_is_dropped(self, frontend):
+    async def test_tap_survives_a_restart_that_emptied_the_session_map(
+        self, frontend
+    ) -> None:
+        # A daemon restart drops _sessions, so a button drawn by the previous
+        # process taps into an empty map. The session id is derived from the
+        # tap's own (channel, thread_ts), so the turn still dispatches.
+        frontend._sessions.clear()
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(self._tap())
+
+        frontend._on_message.assert_awaited_once()
+        chat_id = frontend._on_message.await_args.args[0]
+        assert chat_id == _session_key("C1", "t1")
+        # Re-registered, so send() can route the reply back into the thread.
+        assert frontend._sessions[chat_id] == ("C1", "t1")
+
+    async def test_tap_in_an_unknown_channel_routes_to_its_own_thread(self, frontend):
+        # No session for C_OTHER, and no scan to fail: the tap is authorized and
+        # names its own thread, so it gets one.
+        frontend._app.client.chat_update = AsyncMock()
+
         await frontend._on_suggestion_action(self._tap(channel="C_OTHER"))
-        frontend._on_message.assert_not_awaited()
+
+        assert frontend._on_message.await_args.args[0] == _session_key("C_OTHER", "t1")
+
+    async def test_tap_with_no_handler_wired_is_logged(self, frontend, caplog):
+        frontend._on_message = None
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(self._tap())
+        assert "no message handler wired" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
 
     async def test_tap_with_no_actions_is_ignored(self, frontend):
         await frontend._on_suggestion_action({"user": {"id": "U_ALLOWED"}})

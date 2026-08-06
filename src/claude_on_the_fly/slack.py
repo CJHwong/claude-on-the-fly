@@ -983,6 +983,19 @@ class SlackFrontend(Frontend):
             self._forget_session(oldest_id)
             logger.debug("evicted stale session %s", oldest_id)
 
+    def _remember_session(
+        self, session_id: int, channel: str, thread_ts: str | None
+    ) -> None:
+        """Mark a thread as the most recently active, evicting past the cap.
+
+        Every entry point that routes a turn goes through here, so a thread the
+        cap evicted (or a process restart dropped) re-hydrates on next contact
+        instead of being unreachable.
+        """
+        self._sessions[session_id] = (channel, thread_ts)
+        self._sessions.move_to_end(session_id)
+        self._evict_stale_sessions()
+
     def _forget_session(self, session_id: int) -> None:
         """Drop every per-session dict entry for one thread. All of this state
         is reconstructable, so a re-hydrating thread just re-resolves it."""
@@ -1293,16 +1306,17 @@ class SlackFrontend(Frontend):
         if not label:
             logger.info("slack: suggestion click without a label, dropping")
             return
-        chat_id = self._session_id_for(body)
-        if chat_id is None or self._on_message is None:
+        if self._on_message is None:
+            logger.warning("slack: suggestion click with no message handler wired")
             return
+        chat_id = self._session_id_for(body)
+        channel = (body.get("channel") or {}).get("id", "")
         # Slack gives a clicked button no selected state, so the menu is
         # retired on any tap: the whole actions block collapses to a status
         # line, so nothing on it can be clicked twice, and the ✓ names the
         # pick for anyone scrolling back. The retire is cosmetic and can fail
         # (a transient API error, a dropped scope), so the spent set below is
         # what actually enforces one tap, one message.
-        channel = (body.get("channel") or {}).get("id", "")
         ts = (body.get("message") or {}).get("ts", "")
         if channel and ts:
             key = (channel, ts)
@@ -1313,6 +1327,12 @@ class SlackFrontend(Frontend):
             if len(self._spent_menus) > SUGGESTION_SPENT_CAP:
                 self._spent_menus.pop(next(iter(self._spent_menus)))
         await self._retire_suggestion_menu(body, label)
+        # A tap can arrive after a restart or a cap eviction emptied _sessions,
+        # so the thread is registered here exactly as a typed message registers
+        # it. Without this, send() has no route for the reply.
+        self._remember_session(
+            chat_id, channel, (body.get("message") or {}).get("thread_ts")
+        )
         # Mirror the typed-message bookkeeping: one (channel, ts) and one
         # suppressed flag per dispatched turn, so notify_start pairs this
         # turn's reactions with its own message instead of the next one's.
@@ -1343,18 +1363,19 @@ class SlackFrontend(Frontend):
             # and the spent set keeps a re-tap from dispatching twice.
             logger.warning("slack: could not retire suggestion menu: %s", exc)
 
-    def _session_id_for(self, body: dict) -> int | None:
-        """The chat whose thread a button lives in, or None when it is stale.
+    def _session_id_for(self, body: dict) -> int:
+        """The chat whose thread a button lives in.
 
         The button was rendered on a reply that `send` posted at the session's
-        (channel, thread_ts), so matching both pins it to exactly one session.
+        (channel, thread_ts), and _session_key is a pure function of that pair,
+        so the id is derived from the tap itself. Deriving rather than looking up
+        a live session is what makes a button outlive the process that drew it: a
+        restart (or a session-cap eviction) empties _sessions, and a scan there
+        would find nothing and silently drop the tap.
         """
         channel = (body.get("channel") or {}).get("id", "")
         thread = (body.get("message") or {}).get("thread_ts")
-        for chat_id, (chan, thr) in self._sessions.items():
-            if chan == channel and thr == thread:
-                return chat_id
-        return None
+        return _session_key(channel, thread)
 
     def _is_allowed(self, sender_id: str) -> bool:
         """Single dispatch gate: only allowed senders reach the agent.
@@ -1501,9 +1522,7 @@ class SlackFrontend(Frontend):
         workspace + context.
         """
         session_id = _session_key(channel, thread_ts)
-        self._sessions[session_id] = (channel, thread_ts)
-        self._sessions.move_to_end(session_id)
-        self._evict_stale_sessions()
+        self._remember_session(session_id, channel, thread_ts)
         sender = await self._resolve_sender(user_id) if user_id else "unknown"
         self._sender_names[session_id] = sender
         if user_id:
@@ -1660,9 +1679,7 @@ class SlackFrontend(Frontend):
         session_id = _session_key(channel, thread_ts)
         is_new_session = session_id not in self._sessions
         is_mid_thread = bool(event.get("thread_ts")) and event["thread_ts"] != ts
-        self._sessions[session_id] = (channel, thread_ts)
-        self._sessions.move_to_end(session_id)
-        self._evict_stale_sessions()
+        self._remember_session(session_id, channel, thread_ts)
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
