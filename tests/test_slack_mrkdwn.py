@@ -1,5 +1,9 @@
 """Tests for the Markdown -> Slack mrkdwn converter."""
 
+import string
+
+import pytest
+
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
 
@@ -86,6 +90,115 @@ def test_blank_input_returned_as_is():
 
 def test_bold_inside_paragraph():
     assert to_mrkdwn("a **b** c") == "a *b* c"
+
+
+def test_emphasis_gets_a_boundary_space_around_cjk():
+    assert to_mrkdwn("這是**粗體**字") == "這是 *粗體* 字"
+    assert to_mrkdwn("這是*斜體*嗎") == "這是 _斜體_ 嗎"
+    assert to_mrkdwn("這是~~刪除~~字") == "這是 ~刪除~ 字"
+
+
+def test_emphasis_gets_a_boundary_space_before_full_width_punctuation():
+    assert to_mrkdwn("**結論**：可以做") == "*結論* ：可以做"
+
+
+def test_emphasis_gets_a_boundary_space_inside_a_list_item():
+    assert to_mrkdwn("- **項目**內容") == "- *項目* 內容"
+
+
+def test_intraword_emphasis_gets_boundary_spaces():
+    assert to_mrkdwn("un**bold**ed") == "un *bold* ed"
+
+
+def test_emphasis_keeps_an_existing_boundary():
+    assert to_mrkdwn("**Done**. next") == "*Done*. next"
+    assert to_mrkdwn("這是 **粗體** 字") == "這是 *粗體* 字"
+    assert to_mrkdwn("**開頭粗體** 在句首") == "*開頭粗體* 在句首"
+
+
+def test_heading_with_bold_flattens_the_strong():
+    assert to_mrkdwn("## Title: **key**") == "*Title: key*"
+    assert to_mrkdwn("## **key** trailing") == "*key trailing*"
+    assert to_mrkdwn("# **A** and **B**") == "*A and B*"
+    assert to_mrkdwn("## 標題：**重點**") == "*標題：重點*"
+    assert to_mrkdwn("## **key**") == "*key*"
+
+
+def test_heading_with_italic_or_strike_keeps_them():
+    assert to_mrkdwn("## *ital*") == "*_ital_*"
+    assert to_mrkdwn("## ~~struck~~") == "*~struck~*"
+
+
+def test_heading_with_bold_link_flattens_the_label():
+    assert to_mrkdwn("## [**bold**](https://x.dev)") == "*<https://x.dev|bold>*"
+
+
+def test_an_image_with_no_source_and_no_alt_renders_as_nothing():
+    """No src, no alt, nothing to show — the paragraph drops rather than
+    leaking a literal `![]()` into the message, same as a literal `---`."""
+    assert to_mrkdwn("![]()") == ""
+    assert to_mrkdwn("看圖 ![]() 說明") == "看圖  說明"
+
+
+def test_an_entity_renders_as_its_decoded_character():
+    """Entity nodes are leaf unknowns, so they fall back to their content."""
+    assert to_mrkdwn("a &amp; b") == "a & b"
+    assert to_mrkdwn("a &lt; b") == "a < b"
+
+
+# Slack's boundary rule is half-width punctuation, whitespace, or a line
+# boundary. Full-width forms (U+FF01-FF5E punctuation) and CJK punctuation look
+# like boundaries but are not, so the guard must insert a space before them.
+# U+3000 is the one full-width character that IS a boundary — it is whitespace.
+_FULL_WIDTH_PUNCT = (
+    "！＂＃＄％＆＇（）＊＋，－．／：；＜＝＞？＠［＼］＾＿｀｛｜｝～"
+    "、。〃〈〉《》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟・…—"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "mrkdwn"),
+    [("**粗體**", "*粗體*"), ("*斜體*", "_斜體_"), ("~~刪除~~", "~刪除~")],
+)
+@pytest.mark.parametrize("punct", _FULL_WIDTH_PUNCT)
+def test_full_width_punctuation_is_not_a_boundary(source, mrkdwn, punct):
+    assert to_mrkdwn(f"{source}{punct}後") == f"{mrkdwn} {punct}後"
+    assert to_mrkdwn(f"前{punct}{source}") == f"前{punct} {mrkdwn}"
+
+
+# Backslash is a markdown escape character: `\**粗體**` parses as an escaped
+# literal asterisk plus emphasis, so it changes the tree instead of sitting
+# next to a marker as a plain neighbour. The guard itself treats it as a
+# boundary, same as any other ASCII punctuation.
+@pytest.mark.parametrize("punct", string.punctuation.replace("\\", ""))
+def test_ascii_punctuation_is_a_boundary(punct):
+    assert to_mrkdwn(f"**粗體**{punct}後") == f"*粗體*{punct}後"
+    assert to_mrkdwn(f"前{punct}**粗體**") == f"前{punct}*粗體*"
+
+
+def test_full_width_space_is_a_boundary():
+    assert to_mrkdwn("**粗體**　後") == "*粗體*　後"
+    assert to_mrkdwn("前　**粗體**") == "前　*粗體*"
+
+
+def test_nested_emphasis_needs_no_boundary():
+    assert to_mrkdwn("**bold _ital_**") == "*bold _ital_*"
+
+
+def test_adjacent_emphasis_markers_need_no_boundary():
+    assert to_mrkdwn("**a***b*") == "*a*_b_"
+
+
+def test_emphasis_adjacent_to_a_code_span_keeps_the_backtick_boundary():
+    assert to_mrkdwn("**a**`b`") == "*a*`b`"
+
+
+def test_heading_with_code_span_keeps_the_span():
+    assert to_mrkdwn("## `a*b`") == "*`a*b`*"
+
+
+def test_bold_link_label_gets_no_boundary_spaces():
+    assert to_mrkdwn("[**粗體**](https://x.dev)") == "<https://x.dev|*粗體*>"
 
 
 def test_paragraphs_separated_by_blank_line():

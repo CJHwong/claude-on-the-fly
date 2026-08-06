@@ -15,12 +15,25 @@ them survive. Raw inline HTML (e.g. Slack ``<@U123>`` mentions) is preserved.
 
 from __future__ import annotations
 
+import string
+
 from markdown_it import MarkdownIt
 from markdown_it.tree import SyntaxTreeNode
 
 # CommonMark + tables + strikethrough. Linkify stays OFF so bare URLs pass
 # through as text instead of being rewritten into <url|url> links.
 _MD = MarkdownIt("commonmark").enable("table").enable("strikethrough")
+
+# Slack parses *bold* / _italic_ / ~strike~ only when the character outside
+# each marker is whitespace, a line boundary, or half-width punctuation. CJK
+# text has none of those between words, so a converted marker would arrive as
+# a literal character; the guard inserts a space to give the marker a
+# boundary. Backtick is half-width but not in string.punctuation.
+_BOUNDARY = frozenset(string.punctuation + "`")
+
+
+def _is_boundary(char: str) -> bool:
+    return char.isspace() or char in _BOUNDARY
 
 
 def to_mrkdwn(text: str) -> str:
@@ -37,7 +50,10 @@ def _render_block(node: SyntaxTreeNode, depth: int) -> str:
     if kind == "paragraph":
         return _inline(node)
     if kind == "heading":
-        return f"*{_inline(node)}*"
+        # The wrapper's *…* would pair with a strong's asterisks instead of its
+        # own, so strong renders as plain text inside a heading. Bold-in-bold
+        # is invisible anyway, and the whole line stays bold.
+        return f"*{_inline(node, flatten_strong=True)}*"
     if kind in ("fence", "code_block"):
         return _fence(node.content)
     if kind in ("bullet_list", "ordered_list"):
@@ -110,12 +126,36 @@ def _fence(content: str) -> str:
     return f"```\n{content.rstrip(chr(10))}\n```"
 
 
-def _inline(node: SyntaxTreeNode) -> str:
-    """Render the inline children of a block node (paragraph, heading, cell)."""
-    return "".join(_render_inline(child) for child in node.children or [])
+def _inline(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
+    """Render the inline children of a block node (paragraph, heading, cell).
+
+    Emphasis markers need a boundary on each side or Slack renders them
+    literally, so the guard lives at this join point, where the neighbouring
+    characters are known.
+    """
+    pairs = []
+    for child in node.children or []:
+        part = _render_inline(child, flatten_strong)
+        if part:
+            pairs.append((child, part))
+    out = []
+    for index, (child, part) in enumerate(pairs):
+        if _emits_markers(child, flatten_strong):
+            if index and not _is_boundary(pairs[index - 1][1][-1]):
+                part = f" {part}"
+            if index + 1 < len(pairs) and not _is_boundary(pairs[index + 1][1][0]):
+                part = f"{part} "
+        out.append(part)
+    return "".join(out)
 
 
-def _render_inline(node: SyntaxTreeNode) -> str:
+def _emits_markers(node: SyntaxTreeNode, flatten_strong: bool) -> bool:
+    """True when this child rendered as *…* / _…_ / ~…~ — the marker forms
+    that need a boundary. A flattened strong renders as plain text instead."""
+    return node.type in ("em", "s") or (node.type == "strong" and not flatten_strong)
+
+
+def _render_inline(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
     kind = node.type
     if kind == "text":
         return node.content
@@ -129,21 +169,25 @@ def _render_inline(node: SyntaxTreeNode) -> str:
         # node, so `_render_block` handles it, and its fallthrough drops it.
         return node.content
     if kind == "strong":
-        return f"*{_inline(node)}*"
+        return _inline(node) if flatten_strong else f"*{_inline(node)}*"
     if kind == "em":
-        return f"_{_inline(node)}_"
+        return f"_{_inline(node, flatten_strong)}_"
     if kind == "s":
-        return f"~{_inline(node)}~"
+        return f"~{_inline(node, flatten_strong)}~"
     if kind == "link":
-        return _render_link(node)
+        return _render_link(node, flatten_strong)
     if kind == "image":
         return str(node.attrs.get("src", "")) or _inline(node)
-    return _inline(node) or node.content
+    # `node.content` is the raw source, meant for leaf unknowns like entity.
+    # For a container whose children all render empty (an image with no src and
+    # no alt), resurrecting the source would leak literal `![]()` into the
+    # message — same class of noise as a literal `---` or `<div>`.
+    return _inline(node, flatten_strong) if node.children else node.content
 
 
-def _render_link(node: SyntaxTreeNode) -> str:
+def _render_link(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
     href = node.attrs.get("href", "")
-    label = _inline(node)
+    label = _inline(node, flatten_strong)
     if not href:
         return label
     return f"<{href}|{label}>" if label and label != href else f"<{href}>"
