@@ -48,6 +48,7 @@ from claude_on_the_fly.agent import (
     stats_mode,
     write_attachment,
 )
+from claude_on_the_fly.backends import codex as codex_mod
 from claude_on_the_fly.backends.claude import ClaudeBackend
 from claude_on_the_fly.transcript import Turn
 
@@ -489,6 +490,19 @@ class _AsyncChunkReader:
         return payload
 
 
+class _ChunkedStreamReader(asyncio.StreamReader):
+    """A stream reader that exposes predetermined, awkward byte boundaries."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        super().__init__()
+        self._chunks = deque(chunks)
+
+    async def read(self, _limit: int = -1) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.popleft()
+
+
 def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     proc = MagicMock()
     proc.returncode = returncode
@@ -496,6 +510,27 @@ def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     proc.stderr = MagicMock()
     proc.stderr.read = _AsyncChunkReader(stderr)
     proc.wait = AsyncMock(return_value=returncode)
+    return proc
+
+
+def _codex_item_event(event_type: str, item_type: str, text: str | None = None) -> dict:
+    item = {"type": item_type}
+    if text is not None:
+        item["text"] = text
+    return {"type": event_type, "item": item}
+
+
+def _make_codex_chunked_proc(stdout: bytes):
+    split_points = (7, 31, 67, 103, len(stdout))
+    chunks = [
+        stdout[start:end]
+        for start, end in zip((0, *split_points[:-1]), split_points, strict=True)
+    ]
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.stdout = _ChunkedStreamReader(chunks)
+    proc.stderr = _ChunkedStreamReader([b""])
+    proc.wait = AsyncMock(return_value=0)
     return proc
 
 
@@ -760,6 +795,69 @@ class TestExec:
             reset_progress_sink(token)
 
         assert result["result"] == "done"
+        assert "progress relay failed" in caplog.text
+
+
+class TestCodexInterimProgress:
+    def test_observer_ignores_blank_and_malformed_lines(self, caplog):
+        observer = codex_mod._CodexStreamObserver(
+            codex_mod._StreamWatch(), lambda _text: None
+        )
+
+        with caplog.at_level("ERROR", logger=codex_mod.__name__):
+            observer.feed(b"\nnot-json\n[]\n")
+            observer.finish()
+
+        assert "progress relay failed" in caplog.text
+
+    async def test_forwards_narration_across_chunk_boundaries_without_final_duplication(
+        self,
+    ):
+        stream = b"\n".join(
+            json.dumps(event).encode()
+            for event in (
+                {"type": "thread.started", "thread_id": "thread-1"},
+                _codex_item_event("item.completed", "agent_message", "first step"),
+                _codex_item_event("item.started", "command_execution"),
+                _codex_item_event("item.completed", "command_execution"),
+                _codex_item_event("item.completed", "agent_message", "final answer"),
+                {"type": "turn.completed", "usage": {}},
+            )
+        )
+        proc = _make_codex_chunked_proc(stream)
+        emitted: list[str] = []
+        token = set_progress_sink(emitted.append)
+        try:
+            captured, _stderr = await codex_mod._collect_codex_output(proc)
+        finally:
+            reset_progress_sink(token)
+
+        assert emitted == ["first step"]
+        assert codex_mod.parse_codex_stream(captured)["body"] == "final answer"
+
+    async def test_a_broken_progress_sink_does_not_break_codex_output(self, caplog):
+        stream = b"\n".join(
+            json.dumps(event).encode()
+            for event in (
+                _codex_item_event("item.completed", "agent_message", "working"),
+                _codex_item_event("item.started", "command_execution"),
+                _codex_item_event("item.completed", "agent_message", "done"),
+                {"type": "turn.completed", "usage": {}},
+            )
+        )
+        proc = _make_codex_chunked_proc(stream)
+
+        def fail(_text: str) -> None:
+            raise RuntimeError("progress sink failed")
+
+        token = set_progress_sink(fail)
+        try:
+            with caplog.at_level("ERROR", logger=codex_mod.__name__):
+                captured, _stderr = await codex_mod._collect_codex_output(proc)
+        finally:
+            reset_progress_sink(token)
+
+        assert codex_mod.parse_codex_stream(captured)["body"] == "done"
         assert "progress relay failed" in caplog.text
 
 

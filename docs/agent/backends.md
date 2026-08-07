@@ -40,6 +40,20 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
 - **claude**: skills populated by CLI; tools from `tool_use` blocks.
 - **codex**: no skill concept in the footer (`skill_counts` always empty). Tools from `item.completed` events. `list_skills()` scans `$CODEX_HOME/prompts/*.md` for the picker.
 
+### Interim progress
+
+When enabled, native and Ollama turns from both backends can forward mid-turn
+narration through the shared progress sink. Claude consumes its stream line by line
+in `agent._consume`; Codex observes its `--json` JSONL chunks incrementally and keeps
+partial lines until the next chunk arrives. An `agent_message` is held until a tool
+event proves it is narration, then the existing `InterimProgress` relay applies its
+warm-up and pacing policy. The final Codex message is discarded from the relay when
+`turn.completed` arrives because `Response.body` posts it once as the answer.
+
+Progress delivery is best effort: a parser or frontend failure is logged and never
+turns a successful agent run into an error. Claude pty has no line-oriented stream,
+and Telegram still inherits the frontend no-op, so both remain unsupported.
+
 ### System prompt
 
 - **claude**: `--system-prompt` flag.

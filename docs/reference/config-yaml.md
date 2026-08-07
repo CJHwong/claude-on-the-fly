@@ -46,10 +46,11 @@ Claude routed through Ollama; manual `$compact` remains available.
 | `min_gap_seconds` | number / `300` | Shortest gap between two progress messages; `0` posts every line as it arrives; negative or invalid uses default | Immediate |
 
 Interim progress needs a line-by-line stream, so it is inert under `agent.claude.mode:
-pty` and under the codex backend, and it is inert on a frontend that does not implement
-progress delivery (today, Telegram). It posts only in DMs and group DMs, is paced by
-`warmup_seconds` and `min_gap_seconds` so a short turn produces nothing and a long one
-a periodic digest, and it does not count against `slack.reply_soft_limit`.
+pty` and on a frontend that does not implement progress delivery (today, Telegram).
+Claude native/ollama and Codex native/ollama provide the required stream. It posts only
+in DMs and group DMs, is paced by `warmup_seconds` and `min_gap_seconds` so a short turn
+produces nothing and a long one a periodic digest, and it does not count against
+`slack.reply_soft_limit`.
 
 ## `egress`
 

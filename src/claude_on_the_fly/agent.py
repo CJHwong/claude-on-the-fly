@@ -745,6 +745,11 @@ def reset_progress_sink(token: Token[Callable[[str], None] | None]) -> None:
     _PROGRESS_SINK.reset(token)
 
 
+def progress_sink() -> Callable[[str], None] | None:
+    """Return the current turn's progress sink, if one was installed."""
+    return _PROGRESS_SINK.get()
+
+
 class InterimRelay:
     """The main agent's mid-turn text blocks, forwarded as the turn produces them.
 

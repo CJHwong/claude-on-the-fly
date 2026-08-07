@@ -286,8 +286,9 @@ agent:
 
 interim:
   # Forward the agent's mid-turn narration into the thread while a turn runs, so a
-  # long turn is not silent. Off by default; claude native/ollama only; DMs and
-  # group DMs only. Pacing, in seconds: silence, then one digest per gap.
+  # long turn is not silent. Off by default; native/ollama backends only (not
+  # claude pty); DMs and group DMs only. Pacing, in seconds: silence, then one
+  # digest per gap.
   # progress: true
   # warmup_seconds: 300
   # min_gap_seconds: 300

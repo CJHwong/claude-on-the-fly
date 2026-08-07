@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from claude_on_the_fly import (
@@ -80,6 +81,98 @@ class _StreamWatch:
         self._carry = (self._carry + chunk)[-(len(_TURN_COMPLETED_MARKER) - 1) :]
 
 
+class _CodexProgressRelay:
+    """Hold Codex messages until a tool event proves they were narration."""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+        self._pending: list[str] = []
+
+    def feed(self, msg: dict) -> None:
+        kind = msg.get("type")
+        if kind == "item.completed":
+            item = msg.get("item") or {}
+            item_type = item.get("type")
+            if item_type == "agent_message":
+                text = (item.get("text") or "").strip()
+                if text:
+                    self._pending.append(text)
+            elif self._is_tool_item(item_type):
+                self._flush()
+        elif kind == "item.started":
+            item_type = (msg.get("item") or {}).get("type")
+            if self._is_tool_item(item_type):
+                self._flush()
+        elif kind == "turn.completed":
+            # The pending message is the final answer. Response.body will carry
+            # it after the stream is parsed, so forwarding it would duplicate it.
+            self._pending.clear()
+
+    def finish(self) -> None:
+        """Drop any unproven text when the stream ends without another tool."""
+        self._pending.clear()
+
+    @staticmethod
+    def _is_tool_item(item_type: object) -> bool:
+        return (
+            isinstance(item_type, str)
+            and item_type != "agent_message"
+            and item_type not in _NON_TOOL_ITEMS
+        )
+
+    def _flush(self) -> None:
+        pending, self._pending = self._pending, []
+        for text in pending:
+            try:
+                self._emit(text)
+            except Exception:
+                # Progress is best effort. A broken frontend must not abort the
+                # Codex turn or stop the JSONL reader.
+                logger.exception("codex: progress relay failed")
+
+
+class _CodexStreamObserver:
+    """Observe Codex chunks for progress without changing final parsing."""
+
+    def __init__(self, watch: _StreamWatch, emit: Callable[[str], None] | None) -> None:
+        self._watch = watch
+        self._line_buffer = b""
+        self._relay = _CodexProgressRelay(emit) if emit is not None else None
+
+    def feed(self, chunk: bytes) -> None:
+        self._watch.feed(chunk)
+        relay = self._relay
+        if relay is None:
+            return
+        self._line_buffer += chunk
+        while b"\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split(b"\n", 1)
+            self._feed_line(line, relay)
+
+    def finish(self) -> None:
+        relay = self._relay
+        if relay is None:
+            return
+        if self._line_buffer.strip():
+            self._feed_line(self._line_buffer, relay)
+        relay.finish()
+
+    def _feed_line(self, raw: bytes, relay: _CodexProgressRelay) -> None:
+        line = raw.strip()
+        if not line:
+            return
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        try:
+            relay.feed(msg)
+        except Exception:
+            # Keep the callback non-raising: it runs inside the bounded stdout
+            # reader, where an exception would discard the whole turn.
+            logger.exception("codex: progress relay failed")
+
+
 async def _kill_once_quiet_after_turn(
     proc: asyncio.subprocess.Process, watch: _StreamWatch
 ) -> None:
@@ -103,10 +196,12 @@ async def _kill_once_quiet_after_turn(
 async def _collect_codex_output(proc) -> tuple[bytes, bytes]:
     """`communicate_capped`, but not hostage to a codex that won't exit."""
     watch = _StreamWatch()
+    observer = _CodexStreamObserver(watch, agent.progress_sink())
     watchdog = asyncio.create_task(_kill_once_quiet_after_turn(proc, watch))
     try:
-        return await agent.communicate_capped(proc, on_stdout_chunk=watch.feed)
+        return await agent.communicate_capped(proc, on_stdout_chunk=observer.feed)
     finally:
+        observer.finish()
         watchdog.cancel()
 
 
