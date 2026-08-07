@@ -60,6 +60,7 @@ class TestParseCodexStream:
                 "usage": {
                     "input_tokens": 100,
                     "cached_input_tokens": 20,
+                    "cache_write_input_tokens": 10,
                     "output_tokens": 5,
                     "reasoning_output_tokens": 3,
                 },
@@ -69,6 +70,7 @@ class TestParseCodexStream:
         assert out["thread_id"] == "thread-abc"
         assert out["body"] == "pong"
         assert out["usage"]["input_tokens"] == 100
+        assert out["usage"]["cache_write_input_tokens"] == 10
         assert out["usage"]["reasoning_output_tokens"] == 3
         assert out["error"] is None
         # reasoning is not a tool
@@ -438,6 +440,7 @@ def _success_result(
     body: str = "hello",
     input_tokens: int = 100,
     cached: int = 20,
+    cache_write: int = 0,
     output_tokens: int = 10,
     reasoning_tokens: int = 5,
     tool_counts: dict | None = None,
@@ -448,6 +451,7 @@ def _success_result(
         "usage": {
             "input_tokens": input_tokens,
             "cached_input_tokens": cached,
+            "cache_write_input_tokens": cache_write,
             "output_tokens": output_tokens,
             "reasoning_output_tokens": reasoning_tokens,
         },
@@ -822,6 +826,86 @@ class TestCodexBackendRun:
         assert resp.tokens_in == 5000
         assert resp.tokens_out == 50 + 5  # output + reasoning default of 5
 
+    async def test_cost_uses_cache_buckets_from_stdout_usage(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        result = _success_result(
+            input_tokens=200,
+            cached=80,
+            cache_write=20,
+            output_tokens=40,
+            reasoning_tokens=60,
+        )
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_model",
+                return_value="gpt-test",
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
+                return_value=None,
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=result,
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex.pricing.cost_for",
+                return_value=0.42,
+            ) as cost_for,
+        ):
+            resp = await CodexBackend().run(workspace, "sess", "hi", "telegram")
+
+        assert resp.cost == 0.42
+        assert cost_for.call_args.args == ("gpt-test", 100, 100, 80, 20)
+
+    async def test_cost_uses_cache_deltas_from_session_totals(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "sess-resume", "existing-thread")
+        pre = {
+            "input_tokens": 1000,
+            "cached_input_tokens": 600,
+            "cache_write_input_tokens": 100,
+            "output_tokens": 100,
+            "reasoning_output_tokens": 20,
+        }
+        post = {
+            "input_tokens": 1200,
+            "cached_input_tokens": 700,
+            "cache_write_input_tokens": 150,
+            "output_tokens": 140,
+            "reasoning_output_tokens": 35,
+        }
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_model",
+                return_value="gpt-test",
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
+                side_effect=[pre, post],
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(thread_id="existing-thread"),
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex.pricing.cost_for",
+                return_value=0.24,
+            ) as cost_for,
+        ):
+            resp = await CodexBackend().run(
+                workspace, "sess-resume", "next turn", "telegram"
+            )
+
+        assert resp.cost == 0.24
+        assert cost_for.call_args.args == ("gpt-test", 50, 55, 100, 50)
+
     async def test_response_sums_output_and_reasoning_tokens(self, tmp_path: Path):
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -881,6 +965,17 @@ class TestCodexBackendRun:
         assert resp.skill_counts == {}
 
 
+class TestCodexUsageAccounting:
+    def test_new_thread_usage_has_no_previous_snapshot(self):
+        current = {
+            "input_tokens": 100,
+            "cached_input_tokens": 40,
+            "cache_write_input_tokens": 20,
+        }
+
+        assert codex_mod._usage_delta(current, None) == current
+
+
 # ---------------------------------------------------------------------------
 # _merge_codex_results + nudge retry
 # ---------------------------------------------------------------------------
@@ -895,14 +990,23 @@ class TestMergeCodexResults:
 
     def test_usage_summed(self):
         first = _success_result(
-            input_tokens=100, cached=50, output_tokens=10, reasoning_tokens=5
+            input_tokens=100,
+            cached=50,
+            cache_write=12,
+            output_tokens=10,
+            reasoning_tokens=5,
         )
         second = _success_result(
-            input_tokens=200, cached=30, output_tokens=80, reasoning_tokens=20
+            input_tokens=200,
+            cached=30,
+            cache_write=7,
+            output_tokens=80,
+            reasoning_tokens=20,
         )
         merged = _merge_codex_results(first, second)
         assert merged["usage"]["input_tokens"] == 300
         assert merged["usage"]["cached_input_tokens"] == 80
+        assert merged["usage"]["cache_write_input_tokens"] == 19
         assert merged["usage"]["output_tokens"] == 90
         assert merged["usage"]["reasoning_output_tokens"] == 25
 

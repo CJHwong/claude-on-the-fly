@@ -306,8 +306,8 @@ def cost_for(
     cache reads in (`Response.tokens_in` is exactly such a figure) or those
     tokens get billed twice, at the dearer rate.
 
-    The cache arguments default to 0 so a caller whose backend has no prompt
-    caching — codex — bills identically to before.
+    The cache arguments default to 0 so a backend without prompt-caching
+    metadata can retain its existing billing behavior.
 
     Never raises — pricing is decorative. Caller should coalesce to 0.
     """

@@ -234,6 +234,40 @@ def _merge_codex_results(first: dict, second: dict) -> dict:
     }
 
 
+_CODEX_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _usage_delta(current: dict, previous: dict | None) -> dict:
+    """Return one turn's counts from Codex's cumulative usage snapshots."""
+    if previous is None:
+        return dict(current)
+    return {
+        field: current.get(field, 0) - previous.get(field, 0)
+        for field in _CODEX_USAGE_FIELDS
+    }
+
+
+def _billable_usage(usage: dict) -> tuple[int, int, int, int]:
+    """Return non-overlapping ``(input, output, cache_read, cache_write)``."""
+    input_tokens = usage.get("input_tokens", 0)
+    cache_read = usage.get("cached_input_tokens", 0)
+    cache_write = usage.get("cache_write_input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    reasoning_tokens = usage.get("reasoning_output_tokens", 0)
+    return (
+        max(input_tokens - cache_read - cache_write, 0),
+        output_tokens + reasoning_tokens,
+        cache_read,
+        cache_write,
+    )
+
+
 def parse_codex_stream(stdout: bytes) -> dict:
     """Parse the JSONL emitted by `codex exec --json`.
 
@@ -563,27 +597,24 @@ class CodexBackend:
             else None
         )
         if post_totals is not None:
-            pre_in = (pre_totals or {}).get("input_tokens", 0)
-            pre_out = (pre_totals or {}).get("output_tokens", 0)
-            pre_reasoning = (pre_totals or {}).get("reasoning_output_tokens", 0)
-            tokens_in = post_totals.get("input_tokens", 0) - pre_in
-            tokens_out = (
-                post_totals.get("output_tokens", 0)
-                + post_totals.get("reasoning_output_tokens", 0)
-                - pre_out
-                - pre_reasoning
-            )
+            usage = _usage_delta(post_totals, pre_totals)
         else:
             usage = result.get("usage") or {}
-            tokens_in = usage.get("input_tokens", 0)
-            tokens_out = usage.get("output_tokens", 0) + usage.get(
-                "reasoning_output_tokens", 0
-            )
+        tokens_in = usage.get("input_tokens", 0)
+        tokens_out = usage.get("output_tokens", 0) + usage.get(
+            "reasoning_output_tokens", 0
+        )
+        billable_in, billable_out, cache_read, cache_write = _billable_usage(usage)
         # Codex CLI doesn't emit cost; look it up from a price table off-thread
         # so the rare fetch never blocks the event loop. None coalesces to 0.
         computed_cost = (
             await asyncio.to_thread(
-                pricing.cost_for, model_label, tokens_in, tokens_out
+                pricing.cost_for,
+                model_label,
+                billable_in,
+                billable_out,
+                cache_read,
+                cache_write,
             )
             or 0
         )
