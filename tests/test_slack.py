@@ -923,8 +923,34 @@ class TestResolveSessionMetadata:
 
     async def test_dm_sets_workspace_and_context(self, frontend):
         await frontend._resolve_session_metadata(100, "hoss", "D1", "im", "123.456")
-        assert frontend._workspace_names[100] == "dm-hoss-123"
+        assert frontend._workspace_names[100] == "dm-hoss-123-456"
         assert frontend._channel_contexts[100] == "dm (private)"
+
+    async def test_two_messages_in_one_second_get_separate_workspaces(self, frontend):
+        """`_session_key` hashes the full thread_ts, so sub-second-apart
+        messages are separate sessions. Their workspaces must be separate too:
+        the directory is the agent's cwd and where `_save_files` writes Slack
+        attachments, so sharing one lets concurrent sessions overwrite or
+        cross-read each other's downloads. Slack emits duplicate notifications
+        inside one second routinely."""
+        await frontend._resolve_session_metadata(
+            101, "bot", "D1", "im", "1786342813.662689"
+        )
+        await frontend._resolve_session_metadata(
+            102, "bot", "D1", "im", "1786342813.872239"
+        )
+        assert frontend._workspace_names[101] != frontend._workspace_names[102]
+
+    async def test_thread_ts_fraction_survives_in_a_channel_workspace(self, frontend):
+        """Every workspace name runs through the same `short_ts`, so the
+        channel and mpim branches must not collide either."""
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "general", "is_mpim": False, "is_private": False}
+        }
+        await frontend._resolve_session_metadata(
+            203, "hoss", "C1", "channel", "1786342813.662689"
+        )
+        assert frontend._workspace_names[203] == "general-1786342813-662689"
 
     async def test_channel_resolves_name_and_visibility_public(self, frontend):
         frontend._app.client.conversations_info.return_value = {
@@ -2725,7 +2751,8 @@ class TestCompactResolvesTheWorkspace:
 
         name = frontend.workspace_name(session)
         assert name != f"slack/{session}", "fell back to the session key"
-        assert name == "slack/dm-testuser-1784899718"  # sender + thread ts
+        # sender + the whole thread ts, fraction included
+        assert name == "slack/dm-testuser-1784899718-993159"
 
     async def test_it_matches_what_an_ordinary_message_would_produce(self, frontend):
         """Same thread, same workspace, whichever path got there first — else the

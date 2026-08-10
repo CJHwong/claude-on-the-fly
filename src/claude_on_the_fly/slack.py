@@ -2560,7 +2560,15 @@ class SlackFrontend(Frontend):
         if session_id in self._workspace_names:
             return
 
-        short_ts = thread_ts.split(".")[0] if thread_ts else "root"
+        # The whole thread_ts, fraction included, with the dot swapped for a
+        # dash so it reads as one path segment. Truncating to the integer
+        # second used to look tidier and silently collided: `_session_key`
+        # hashes the full ts, so two messages in the same second are two
+        # separate sessions, and both landed on one workspace directory —
+        # concurrent agents sharing a cwd, and `_save_files` overwriting or
+        # cross-reading the other conversation's attachments. Slack emits
+        # sub-second duplicates often enough for this to be routine.
+        short_ts = thread_ts.replace(".", "-") if thread_ts else "root"
 
         if channel_type == "im":
             self._workspace_names[session_id] = f"dm-{sender}-{short_ts}"
