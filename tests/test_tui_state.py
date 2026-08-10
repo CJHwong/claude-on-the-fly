@@ -208,6 +208,76 @@ class TestJobs:
         assert snap.jobs == []
         assert snap.schedule_error is not None
 
+    def test_job_detail_prefers_the_command(self, tmp_path, empty_state, alive_check):
+        """A producer's prompt is the template applied to each item the command
+        lists; the command is what distinguishes the job, so it wins."""
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [
+                {
+                    "name": "prune",
+                    "cron": "0 4 * * *",
+                    "command": "~/scripts/prune.sh --verbose",
+                    "prompt": "summarise the output",
+                },
+            ],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.jobs[0].detail == "~/scripts/prune.sh --verbose"
+
+    def test_job_detail_keeps_the_prompt_text(self, tmp_path, empty_state, alive_check):
+        """The detail block shows the prompt as written (newlines intact); the
+        table cell collapses whitespace at display time."""
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [
+                {
+                    "name": "digest",
+                    "cron": "0 9 * * *",
+                    "prompt": "summarise\nmy inbox\n\nplease",
+                },
+            ],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.jobs[0].detail == "summarise\nmy inbox\n\nplease"
+
+    def test_job_detail_shows_the_prompt_file_path(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """The file is not read per tick (a fire happens at most once a minute;
+        the table refreshes every second) — the path is what the operator needs
+        to see."""
+        prompt_file = tmp_path / "prompts" / "digest.md"
+        prompt_file.parent.mkdir()
+        prompt_file.write_text("summarise my inbox")
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [
+                {
+                    "name": "digest",
+                    "cron": "0 9 * * *",
+                    "prompt_file": str(prompt_file),
+                },
+            ],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.jobs[0].detail == str(prompt_file)
+
+    def test_job_detail_keeps_a_long_prompt_in_full(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """The detail block shows the whole prompt; only the table cell clips."""
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt": "x" * 500}],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.jobs[0].detail == "x" * 500
+
 
 # ---------------------------------------------------------------------------
 # Snapshot — stale detection (post-upgrade)

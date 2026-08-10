@@ -28,6 +28,7 @@ from typing import Literal
 from claude_on_the_fly import envfile
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
+from claude_on_the_fly.cron import CronEntry
 from claude_on_the_fly.cron import load_config as load_cron_config
 from claude_on_the_fly.cron import next_fire as cron_next_fire
 from claude_on_the_fly.heartbeat import STATE_DIR
@@ -77,8 +78,13 @@ class FrontendStatus:
 class JobInfo:
     name: str
     cron: str
-    kind: str  # "prompt" or "script"
+    kind: str  # "prompt" | "producer" | "command"
     next_fire: datetime
+    # The full text of what this job runs, for the cron table's detail block:
+    # the command when there is one, else the prompt text, else the
+    # prompt_file path. Kept raw (newlines intact); the table cell collapses
+    # whitespace at display time.
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -302,6 +308,22 @@ def _jobs_queue_view() -> JobsQueueView | None:
     return JobsQueueView(depth=depth, rows=rows, hidden=hidden)
 
 
+def _job_detail(entry: CronEntry) -> str:
+    """The full text of what this job runs, for the cron table's detail block.
+
+    The command when there is one (a producer's prompt is the template applied
+    to each item the command lists; the command is what distinguishes it),
+    else the prompt text, else the prompt_file path. Kept raw — the table
+    cell collapses whitespace at display time, and the detail block shows the
+    text as written.
+    """
+    return (
+        entry.command
+        or entry.prompt
+        or (str(entry.prompt_file) if entry.prompt_file else "")
+    )
+
+
 def _jobs_from_schedule(
     schedule_yaml: Path, now: datetime
 ) -> tuple[list[JobInfo], str | None]:
@@ -320,6 +342,7 @@ def _jobs_from_schedule(
             cron=s.cron,
             kind=s.kind,
             next_fire=cron_next_fire(s.cron, local_now),
+            detail=_job_detail(s),
         )
         for s in specs
     ]

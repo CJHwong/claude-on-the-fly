@@ -72,6 +72,10 @@ from claude_on_the_fly.tui.screens.help import HelpScreen
 
 LOG_DIR = DATA_DIR / "logs"
 CRON_CONFIG = DATA_DIR / "cron.yaml"
+# The cron table's flexible column: sized to the leftover width on every
+# refresh (see _resize_prompt_column) so the name column can auto-size to its
+# content and the prompt/command text still gets the rest of the row.
+PROMPT_COLUMN = "prompt / command"
 TAIL_LINES = 200
 # When showing an agent job watch, tail this many raw JSONL events; each
 # formats to 1–4 visible lines so the rendered pane stays manageable.
@@ -129,6 +133,18 @@ class DashboardScreen(Screen):
     }
     #cron-entries, #chat-strip, #jobs-queue {
         height: auto;
+    }
+    #cron-detail-header, #cron-detail {
+        display: none;
+    }
+    #cron-detail-header {
+        height: auto;
+        padding: 0 0 0 1;
+    }
+    #cron-detail {
+        height: auto;
+        max-height: 8;
+        border: solid grey;
     }
     #action-cue {
         height: auto;
@@ -227,6 +243,13 @@ class DashboardScreen(Screen):
         # resolved separately: "<frontend>:<chat_id>" → workspace_name.
         self._job_sessions: dict[str, str] = {}
         self._chat_workspaces: dict[str, str] = {}
+        # job name → raw detail text, rebuilt every tick from the snapshot.
+        # The detail block reads from here, not from the table cell, which
+        # holds the whitespace-collapsed one-liner.
+        self._cron_details: dict[str, str] = {}
+        # (job name, detail) last shown in the cron detail block, so the 1Hz
+        # refresh skips the rewrite when the selection hasn't changed.
+        self._cron_detail_shown: tuple[str, str] | None = None
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
         # Which daemon the lifecycle keys + log row follow for the cron /
@@ -260,6 +283,15 @@ class DashboardScreen(Screen):
                     yield Static(id="cron-header", markup=True)
                     yield DataTable(
                         id="cron-entries", cursor_type="row", zebra_stripes=True
+                    )
+                    # The highlighted row's full prompt/command, wrapped —
+                    # the table cell only shows a clipped one-liner.
+                    yield Static(id="cron-detail-header", markup=True)
+                    yield RichLog(
+                        id="cron-detail",
+                        wrap=True,
+                        highlight=False,
+                        markup=False,
                     )
                 # `jobs-queue`, NOT `cron-entries` — the latter is already the
                 # cron tab's cron table above.
@@ -299,10 +331,16 @@ class DashboardScreen(Screen):
 
     def on_mount(self) -> None:
         jobs = self.query_one("#cron-entries", DataTable)
-        jobs.add_column("name", width=14)
+        # Auto-width: the name column sizes to its widest name, so names show
+        # in full instead of clipping at a fixed width.
+        jobs.add_column("name")
         jobs.add_column("cron", width=16)
         jobs.add_column("kind", width=8)
         jobs.add_column("next fire", width=24)
+        # Flexible: resized to the leftover width on every refresh and on
+        # resize (see _resize_prompt_column); the mount-time width only
+        # matters for the pre-layout paint.
+        jobs.add_column(PROMPT_COLUMN, width=20)
         # The background-job queue: what the worker is running now and what is
         # waiting. The id cell shows only the random tail (the time half of the
         # id is already the `enqueued` column); the row key keeps the full id.
@@ -322,9 +360,11 @@ class DashboardScreen(Screen):
         chat.add_column("running request", width=34)
         chat.add_column("uptime", width=8)
         # The log panes shouldn't grab Tab focus — within a tab, Tab cycles only
-        # that tab's table.
+        # that tab's table. Same for the cron detail block (mouse wheel still
+        # scrolls it).
         self.query_one("#log-pane", RichLog).can_focus = False
         self.query_one("#watch-pane", RichLog).can_focus = False
+        self.query_one("#cron-detail", RichLog).can_focus = False
         self._refresh()
         self.set_interval(1.0, self._refresh)
         self.set_interval(1.0, self._refresh_log)
@@ -333,6 +373,17 @@ class DashboardScreen(Screen):
         # highlighted chat daemon is the default supervisor target.
         self.query_one("#chat-strip", DataTable).focus()
         self._update_action_cue()
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Re-fit the cron table's prompt column to the new width.
+
+        The first _refresh runs before layout (table size 0), so without this
+        the first paint would show the mount-time placeholder width; a
+        terminal resize would otherwise leave the column stale until the next
+        1Hz tick.
+        """
+        with contextlib.suppress(Exception):
+            self._resize_prompt_column(self.query_one("#cron-entries", DataTable))
 
     # ------------------------------------------------------------------
     # Selection / focus
@@ -450,6 +501,8 @@ class DashboardScreen(Screen):
         # hits the mtime guard and no-ops instead of rewriting 200+ lines.
         self._refresh_log()
         self._update_action_cue()
+        if event.data_table.id == "cron-entries":
+            self._refresh_cron_detail()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         # Tabbing between zones changes which daemon the lifecycle keys target.
@@ -1041,6 +1094,7 @@ class DashboardScreen(Screen):
 
         table = self.query_one("#cron-entries", DataTable)
         previously = self._selected_job()
+        self._cron_details = {job.name: job.detail for job in snap.jobs}
         table.clear()
         keys: list[str] = []
         for job in snap.jobs:
@@ -1049,13 +1103,101 @@ class DashboardScreen(Screen):
                 if sched_running
                 else "-"
             )
-            table.add_row(job.name, job.cron, job.kind, next_str, key=job.name)
+            # Text(), not str: the detail is operator-written and can carry
+            # markup-looking brackets ("[pytest]"), which a bare str cell would
+            # feed to Rich's markup parser — same reason the jobs queue wraps
+            # its prompt cell. Whitespace is collapsed because a DataTable cell
+            # cannot render a newline; the full text lives in the detail block
+            # below the table.
+            table.add_row(
+                job.name,
+                job.cron,
+                job.kind,
+                next_str,
+                Text(" ".join(job.detail.split())),
+                key=job.name,
+            )
             keys.append(job.name)
         if not keys:
-            # Short enough to fit the 14-wide name column; `g` opens the config.
-            table.add_row(Text("no jobs (g)", style="dim"), "", "", "", key="__empty__")
+            # Short enough to fit the auto-sized name column; `g` opens the
+            # config.
+            table.add_row(
+                Text("no jobs (g)", style="dim"), "", "", "", "", key="__empty__"
+            )
         else:
             self._restore_cursor(table, keys, previously)
+        self._resize_prompt_column(table)
+        self._refresh_cron_detail()
+
+    def _refresh_cron_detail(self) -> None:
+        """Show the highlighted cron row's full prompt/command in the detail
+        block below the table; hide the block when nothing is highlighted.
+
+        The block shows the raw text (newlines intact), unlike the table cell
+        which collapses whitespace to one line. Rewrites are skipped when the
+        selection and text are unchanged, so the 1Hz refresh doesn't repaint
+        the block every tick.
+        """
+        header = self.query_one("#cron-detail-header", Static)
+        pane = self.query_one("#cron-detail", RichLog)
+        job = self._selected_job()
+        if job is None or job == "__empty__":
+            self._cron_detail_shown = None
+            if header.display:
+                header.display = False
+                pane.display = False
+            return
+        detail = self._cron_details.get(job, "")
+        if not detail:
+            self._cron_detail_shown = None
+            if header.display:
+                header.display = False
+                pane.display = False
+            return
+        if (job, detail) == self._cron_detail_shown:
+            return
+        self._cron_detail_shown = (job, detail)
+        header.update(f"[bold]prompt / command: {job}[/bold]")
+        pane.clear()
+        pane.write(Text(detail))
+        if not header.display:
+            header.display = True
+            pane.display = True
+
+    def _resize_prompt_column(self, table: DataTable) -> None:
+        """Size the prompt/command column to the table's leftover width.
+
+        The name column auto-sizes to its content (so names show in full) and
+        the other three are fixed, so the prompt column takes whatever is
+        left and DataTable clips the overflow. The name column's width is
+        measured from the rows rather than read off the column: DataTable
+        measures cells on idle, after this synchronous pass, so the column's
+        own width is one tick stale. No-op before the first layout, when the
+        table's size is still 0.
+        """
+        if table.size.width <= 0:
+            return
+        prompt = next(
+            (c for c in table.columns.values() if c.label.plain == PROMPT_COLUMN),
+            None,
+        )
+        if prompt is None:
+            return
+        name_col = next(c for c in table.columns.values() if c.label.plain == "name")
+        widest_name = max(
+            (len(str(table.get_row(key)[0])) for key in table.rows),
+            default=0,
+        )
+        name_render = (
+            max(len(name_col.label.plain), widest_name) + 2 * table.cell_padding
+        )
+        others = name_render + sum(
+            c.get_render_width(table)
+            for c in table.columns.values()
+            if c is not prompt and c is not name_col
+        )
+        prompt.width = max(10, table.size.width - others - 2 * table.cell_padding)
+        prompt.auto_width = False
 
     def _refresh_jobs(
         self, snap: state.Snapshot, jobs: state.FrontendStatus | None

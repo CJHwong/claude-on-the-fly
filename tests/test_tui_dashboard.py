@@ -1199,7 +1199,7 @@ class TestCronTable:
             jobs_queue=None,
         )
 
-    def _job(self, name="nightly"):
+    def _job(self, name="nightly", detail=""):
         from datetime import datetime, timedelta
 
         from claude_on_the_fly.tui.state import JobInfo
@@ -1209,6 +1209,13 @@ class TestCronTable:
             cron="0 4 * * *",
             kind="prompt",
             next_fire=datetime.now() + timedelta(hours=1),
+            detail=detail,
+        )
+
+    @staticmethod
+    def _prompt_col(table):
+        return next(
+            c for c in table.columns.values() if c.label.plain == dash.PROMPT_COLUMN
         )
 
     def _status(self, state_str):
@@ -1264,6 +1271,211 @@ class TestCronTable:
             # snapshot and drop the cursor for reasons unrelated to this.
             screen._refresh_cron(self._snap(jobs), self._status("running"))
             assert screen._selected_job() == "b"
+
+    async def test_the_detail_cell_reaches_the_table(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job(detail="summarise my inbox")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert "summarise my inbox" in row
+
+    async def test_the_prompt_column_takes_the_leftover_width(self, isolated):
+        """The name column auto-sizes to its content; the prompt column gets the
+        rest, so the table fits the terminal instead of overflowing."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            # The cron table only gets a size once its tab is laid out; the
+            # 1Hz refresh refits the column from that size.
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            screen._refresh_cron(
+                self._snap([self._job("a-long-name", detail="x" * 200)]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            total = sum(c.get_render_width(table) for c in table.columns.values())
+            # Inside the run_test block: the widget's size resets to 0 when
+            # the app shuts down, so the assertion must not outlive it.
+            assert total == table.size.width
+
+    async def test_resize_is_a_no_op_before_layout(self, isolated, monkeypatch):
+        """The first _refresh runs before layout, when the table's size is still
+        0 — the column keeps its mount-time width rather than going negative."""
+        from textual.geometry import Size
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            table = app.screen.query_one("#cron-entries", DataTable)
+            monkeypatch.setattr(DataTable, "size", property(lambda self: Size(0, 0)))
+            screen._resize_prompt_column(table)
+            prompt = self._prompt_col(table)
+        assert prompt.width == 20
+
+    async def test_resize_without_the_prompt_column_is_a_no_op(self, isolated):
+        """Defensive: a table that never had the column (e.g. the jobs queue)
+        is left untouched."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            before = {c.label.plain: c.width for c in table.columns.values()}
+            screen._resize_prompt_column(table)
+            after = {c.label.plain: c.width for c in table.columns.values()}
+        assert before == after
+
+    async def test_on_resize_refits_the_prompt_column(self, isolated):
+        """A terminal resize re-fits the column (the second resize event carries
+        the table's fresh size)."""
+        from textual import events
+        from textual.geometry import Size
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            screen._refresh_cron(
+                self._snap([self._job("a-long-name")]), self._status("running")
+            )
+            await pilot.pause()
+            screen.on_resize(
+                events.Resize(size=Size(80, 24), virtual_size=Size(80, 24))
+            )
+            table = app.screen.query_one("#cron-entries", DataTable)
+            total = sum(c.get_render_width(table) for c in table.columns.values())
+            # Inside the run_test block: the widget's size resets to 0 when
+            # the app shuts down, so the assertion must not outlive it.
+            assert total == table.size.width
+
+    async def test_the_table_cell_collapses_the_detail(self, isolated):
+        """A DataTable cell cannot render a newline; the full text lives in
+        the detail block."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("digest", detail="summarise\nmy inbox")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert "summarise my inbox" in row
+        assert "\n" not in row[4]
+
+    async def test_the_detail_block_shows_the_highlighted_row(self, isolated):
+        """The block below the table shows the full prompt as written, not the
+        collapsed one-liner the cell clips."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            screen._refresh_cron(
+                self._snap([self._job("digest", detail="summarise\nmy inbox")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            header = app.screen.query_one("#cron-detail-header", Static)
+            rendered = _pane_text(app, "#cron-detail")
+            # Inside the run_test block: display reverts to the CSS default
+            # (none) when the app shuts down.
+            assert header.display
+            assert "digest" in str(header.content)
+            assert "summarise\nmy inbox" in rendered
+
+    async def test_the_detail_block_follows_the_cursor(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            jobs = [
+                self._job("a", detail="prompt a"),
+                self._job("b", detail="prompt b"),
+            ]
+            screen._refresh_cron(self._snap(jobs), self._status("running"))
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            table.move_cursor(row=1)
+            await pilot.pause()
+            rendered = _pane_text(app, "#cron-detail")
+        assert "prompt b" in rendered
+        assert "prompt a" not in rendered
+
+    async def test_the_detail_block_hides_when_nothing_is_highlighted(self, isolated):
+        """An empty schedule leaves the block hidden so the log row keeps the
+        space."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            screen._refresh_cron(
+                self._snap([self._job("digest", detail="summarise")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            screen._refresh_cron(self._snap([]), self._status("running"))
+            await pilot.pause()
+            header = app.screen.query_one("#cron-detail-header", Static)
+            pane = app.screen.query_one("#cron-detail", RichLog)
+        assert not header.display
+        assert not pane.display
+
+    async def test_the_detail_block_is_not_rewritten_when_unchanged(self, isolated):
+        """The 1Hz refresh must not repaint the block every tick; a rewrite
+        would clear the pane, so a clear that raises proves the skip."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            screen._refresh_cron(
+                self._snap([self._job("digest", detail="summarise")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            pane = app.screen.query_one("#cron-detail", RichLog)
+            pane.clear = lambda: (_ for _ in ()).throw(AssertionError("rewritten"))  # type: ignore[method-assign]
+            screen._refresh_cron_detail()
+
+    async def test_the_detail_block_hides_for_a_row_without_detail(self, isolated):
+        """Defensive: a highlighted row the snapshot knows nothing about (it
+        can only appear by hand-editing the table) hides the block, even when
+        it was showing another job's prompt."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            screen._refresh_cron(
+                self._snap([self._job("digest", detail="summarise")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            table.clear()
+            table.add_row("orphan-a", "", "", "", key="orphan-a")
+            table.add_row("orphan-b", "", "", "", key="orphan-b")
+            await pilot.pause()
+            table.move_cursor(row=1)
+            await pilot.pause()
+            header = app.screen.query_one("#cron-detail-header", Static)
+            pane = app.screen.query_one("#cron-detail", RichLog)
+        assert not header.display
+        assert not pane.display
 
 
 class TestTabBadges:
