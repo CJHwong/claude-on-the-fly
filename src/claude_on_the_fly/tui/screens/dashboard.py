@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shlex
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -45,6 +46,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
+    Button,
     DataTable,
     Footer,
     Header,
@@ -57,8 +59,10 @@ from textual.widgets import (
 from claude_on_the_fly import checks, logs
 from claude_on_the_fly.agent import (
     DATA_DIR,
+    get_backend,
     resolve_session_log,
 )
+from claude_on_the_fly.cron import request_run_now
 from claude_on_the_fly.tui import (
     env_editor,
     render,
@@ -123,9 +127,11 @@ class DashboardScreen(Screen):
     DEFAULT_CSS = """
     #daemon-tabs {
         height: auto;
+        max-height: 50%;
     }
     #chat-panel, #cron-panel, #jobs-panel {
         height: auto;
+        max-height: 100%;
     }
     #cron-header, #chat-strip-header, #jobs-queue-header {
         height: auto;
@@ -133,6 +139,7 @@ class DashboardScreen(Screen):
     }
     #cron-entries, #chat-strip, #jobs-queue {
         height: auto;
+        max-height: 100%;
     }
     #cron-detail-header, #cron-detail {
         display: none;
@@ -145,6 +152,11 @@ class DashboardScreen(Screen):
         height: auto;
         max-height: 8;
         border: solid grey;
+    }
+    #cron-run-now {
+        height: auto;
+        width: auto;
+        margin: 0 0 0 1;
     }
     #action-cue {
         height: auto;
@@ -175,6 +187,9 @@ class DashboardScreen(Screen):
         Binding("c", "copy_log", "Copy tail", show=False),
         Binding("R", "refresh_now", "Refresh", show=False),
         Binding("K", "stop_all", "Stop all", show=False),
+        Binding("n", "run_now", "Run now", show=False),
+        Binding("t", "copy_takeover", "Copy takeover", show=False),
+        Binding("s", "cycle_cron_sort", "Sort cron", show=False),
         Binding("1", "show_tab('tab-chat')", "chat tab", show=False),
         Binding("2", "show_tab('tab-cron')", "cron tab", show=False),
         Binding("3", "show_tab('tab-jobs')", "jobs tab", show=False),
@@ -200,6 +215,9 @@ class DashboardScreen(Screen):
         "Copy tail": "copy the highlighted log's tail to the clipboard",
         "Refresh": "refresh now",
         "Stop all": "stop every running daemon",
+        "Run now": "fire the highlighted cron entry now (cron tab)",
+        "Copy takeover": "copy the highlighted chat job's resume command (chat tab)",
+        "Sort cron": "toggle the cron table between next-fire and name order",
         "chat tab": "switch to the chat tab",
         "cron tab": "switch to the cron tab",
         "jobs tab": "switch to the background-jobs tab",
@@ -247,6 +265,9 @@ class DashboardScreen(Screen):
         # The detail block reads from here, not from the table cell, which
         # holds the whitespace-collapsed one-liner.
         self._cron_details: dict[str, str] = {}
+        # Cron table order: "next" (the snapshot's natural order) or "name".
+        # `s` toggles; the header names the current mode.
+        self._cron_sort: Literal["next", "name"] = "next"
         # (job name, detail) last shown in the cron detail block, so the 1Hz
         # refresh skips the rewrite when the selection hasn't changed.
         self._cron_detail_shown: tuple[str, str] | None = None
@@ -293,6 +314,9 @@ class DashboardScreen(Screen):
                         highlight=False,
                         markup=False,
                     )
+                    # Mouse path for run-now; `n` is the keyboard path. Both
+                    # gate on the cron daemon being alive (see action_run_now).
+                    yield Button("Run now", id="cron-run-now")
                 # `jobs-queue`, NOT `cron-entries` — the latter is already the
                 # cron tab's cron table above.
                 with (
@@ -361,10 +385,11 @@ class DashboardScreen(Screen):
         chat.add_column("uptime", width=8)
         # The log panes shouldn't grab Tab focus — within a tab, Tab cycles only
         # that tab's table. Same for the cron detail block (mouse wheel still
-        # scrolls it).
+        # scrolls it) and the Run-now button (its keyboard path is `n`).
         self.query_one("#log-pane", RichLog).can_focus = False
         self.query_one("#watch-pane", RichLog).can_focus = False
         self.query_one("#cron-detail", RichLog).can_focus = False
+        self.query_one("#cron-run-now", Button).can_focus = False
         self._refresh()
         self.set_interval(1.0, self._refresh)
         self.set_interval(1.0, self._refresh_log)
@@ -629,6 +654,83 @@ class DashboardScreen(Screen):
         finally:
             self._clear_busy()
             self._refresh()
+
+    async def action_run_now(self) -> None:
+        """Fire the highlighted cron entry now, via the daemon's trigger file.
+
+        The daemon polls the trigger file at 1s granularity, so the entry
+        fires within a second — through the same `_fire` path as a scheduled
+        fire, gates included. Refuses when the daemon is down: a trigger
+        written to nobody would sit there and fire on the next start, which
+        is a surprise, not a run-now.
+        """
+        if self._busy_msg:
+            return
+        job = self._selected_job()
+        if job is None or job == "__empty__":
+            self._notify("no cron entry selected", "warning")
+            return
+        if not supervisor.is_running("cron"):
+            self._notify("cron daemon not running — press r to start", "warning")
+            return
+        try:
+            request_run_now(job)
+        except Exception as exc:
+            self._notify(f"run-now failed: {exc}", "error")
+            return
+        self._notify(f"run-now requested for {job}", "information")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cron-run-now":
+            await self.action_run_now()
+
+    def action_cycle_cron_sort(self) -> None:
+        """Toggle the cron table between next-fire and name order."""
+        self._cron_sort = "name" if self._cron_sort == "next" else "next"
+        self._refresh()
+
+    def action_copy_takeover(self) -> None:
+        """Copy `cd <workspace> && <resume cmd>` for the highlighted chat job.
+
+        Same contract as the History screen's `t`: the row's own
+        (workspace, session_uuid) pair, so the command resumes that exact
+        session rather than whatever the current env points at.
+        """
+        key = self._datatable_cursor_key("#chat-strip")
+        if not key or key == "__empty__":
+            self._notify("no row selected", "warning")
+            return
+        workspace_name = self._chat_workspaces.get(key)
+        session_uuid = self._job_sessions.get(key)
+        if not workspace_name or not session_uuid:
+            self._notify("no takeover for this row", "warning")
+            return
+        workspace = DATA_DIR / "workspaces" / workspace_name
+        try:
+            cmd = get_backend().takeover_command(workspace, session_uuid)
+        except Exception as exc:
+            self._notify(f"takeover failed: {exc}", "error")
+            return
+        if cmd is None:
+            self._notify(
+                "no session yet — agent hasn't run a turn",
+                "warning",
+            )
+            return
+        try:
+            # Backend values ultimately include data read from a session store.
+            # Re-tokenize and re-quote both pieces before placing them in a
+            # shell command copied to the clipboard.
+            safe_cmd = shlex.join(shlex.split(cmd))
+            takeover = f"cd -- {shlex.quote(str(workspace))} && {safe_cmd}"
+            self.app.copy_to_clipboard(takeover)
+        except Exception as exc:
+            self._notify(f"clipboard write failed: {exc}", "error")
+            return
+        self._notify(
+            f"copied takeover cmd for {workspace_name}",
+            "information",
+        )
 
     def action_open_config(self) -> None:
         """Pick a config to edit via a modal. Decoupled from focus on purpose —
@@ -1087,17 +1189,25 @@ class DashboardScreen(Screen):
         self.query_one("#cron-header", Static).update(
             render.cron_header(
                 state=sched.state if sched else "stopped",
+                count=len(snap.jobs),
                 next_fire_str=next_fire_str,
+                sort="next fire" if self._cron_sort == "next" else "name",
                 schedule_error=snap.schedule_error,
             )
         )
 
+        # The snapshot arrives sorted by next fire; the name order is a
+        # display-only re-sort on top of it.
+        jobs = snap.jobs
+        if self._cron_sort == "name":
+            jobs = sorted(jobs, key=lambda j: j.name)
+
         table = self.query_one("#cron-entries", DataTable)
         previously = self._selected_job()
-        self._cron_details = {job.name: job.detail for job in snap.jobs}
+        self._cron_details = {job.name: job.detail for job in jobs}
         table.clear()
         keys: list[str] = []
-        for job in snap.jobs:
+        for job in jobs:
             next_str = (
                 render._fmt_next_fire(job.next_fire, snap.timestamp)
                 if sched_running

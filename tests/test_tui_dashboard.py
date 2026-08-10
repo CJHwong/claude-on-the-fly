@@ -10,11 +10,12 @@ again.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
 from textual.app import App
-from textual.widgets import DataTable, RichLog, Static, TabbedContent
+from textual.widgets import Button, DataTable, RichLog, Static, TabbedContent
 
 import claude_on_the_fly.tui.screens.dashboard as dash
 from claude_on_the_fly.checks import CheckResult
@@ -1477,6 +1478,91 @@ class TestCronTable:
         assert not header.display
         assert not pane.display
 
+    async def test_the_header_shows_the_job_count(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("a"), self._job("b")]),
+                self._status("running"),
+            )
+            await pilot.pause()
+            header = str(app.screen.query_one("#cron-header", Static).content)
+        assert "2 jobs" in header
+
+    async def test_the_header_names_the_sort_mode(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._cron_sort = "name"
+            screen._refresh_cron(self._snap([self._job()]), self._status("running"))
+            await pilot.pause()
+            header = str(app.screen.query_one("#cron-header", Static).content)
+        assert "sort: name" in header
+
+    async def test_s_toggles_the_sort_mode(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            assert screen._cron_sort == "next"
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._cron_sort == "name"
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._cron_sort == "next"
+
+    async def test_name_sort_orders_the_table(self, isolated):
+        """The snapshot arrives sorted by next fire; the name order is a
+        display-only re-sort on top of it."""
+        from datetime import datetime, timedelta
+
+        from claude_on_the_fly.tui.state import JobInfo
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._cron_sort = "name"
+            jobs = [
+                JobInfo(
+                    name="zeta",
+                    cron="0 4 * * *",
+                    kind="prompt",
+                    next_fire=datetime.now() + timedelta(minutes=1),
+                ),
+                JobInfo(
+                    name="alpha",
+                    cron="0 4 * * *",
+                    kind="prompt",
+                    next_fire=datetime.now() + timedelta(hours=2),
+                ),
+            ]
+            screen._refresh_cron(self._snap(jobs), self._status("running"))
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+        assert str(table.get_row_at(0)[0]) == "alpha"
+        assert str(table.get_row_at(1)[0]) == "zeta"
+
+    async def test_a_large_schedule_is_capped_and_scrolls(self, isolated):
+        """The table must not grow unboundedly and squeeze the log row off
+        the screen: with more entries than fit, it caps and scrolls."""
+        app = _Host()
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            jobs = [self._job(name=f"job-{i:02d}") for i in range(30)]
+            screen._refresh_cron(self._snap(jobs), self._status("running"))
+            table = app.screen.query_one("#cron-entries", DataTable)
+            # The cap is a layout property, which settles a frame or two after
+            # the rows land; under a loaded suite that can take a few frames.
+            for _ in range(20):
+                await pilot.pause()
+                if table.size.height < 30:
+                    break
+        assert table.row_count == 30
+        assert table.size.height < 30, "table must cap and scroll, not grow"
+
 
 class TestTabBadges:
     def _status(self, name, state_str):
@@ -1838,3 +1924,214 @@ class TestRefreshNowKey:
             screen._edit_sandbox_config()
             await pilot.pause()
         assert any("config.yaml" in str(note) for note in notices)
+
+
+class TestChatTakeover:
+    """`t` on the chat tab copies the highlighted job's resume command.
+
+    Same contract as the History screen's `t`: the row's own
+    (workspace, session_uuid) pair, so the command resumes that exact session
+    rather than whatever the current env points at.
+    """
+
+    def _wire_chat(self, screen: DashboardScreen, monkeypatch, *, uuid="s-1"):
+        screen.action_show_tab("tab-chat")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "telegram:42")
+        screen._chat_workspaces = {"telegram:42": "telegram/hoss"}
+        screen._job_sessions = {"telegram:42": uuid} if uuid else {}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+
+    async def test_an_empty_table_says_no_row(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("no row selected" in msg for msg, _sev in notices)
+
+    async def test_a_row_with_no_session_says_no_takeover(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch, uuid="")
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("no takeover for this row" in msg for msg, _sev in notices)
+
+    async def test_a_resolvable_row_copies_cd_and_resume(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            backend = type(
+                "B", (), {"takeover_command": lambda _s, _w, _u: "claude --resume x"}
+            )()
+            monkeypatch.setattr(dash, "get_backend", lambda: backend)
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        workspace = dash.DATA_DIR / "workspaces" / "telegram/hoss"
+        assert copied == [f"cd -- {shlex.quote(str(workspace))} && claude --resume x"]
+        assert any(
+            "copied takeover cmd for telegram/hoss" in msg for msg, _sev in notices
+        )
+
+    async def test_a_backend_with_no_session_yet_says_so(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            backend = type("B", (), {"takeover_command": lambda _s, _w, _u: None})()
+            monkeypatch.setattr(dash, "get_backend", lambda: backend)
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("agent hasn't run a turn" in msg for msg, _sev in notices)
+
+    async def test_a_backend_that_raises_is_reported(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+
+            def boom(_self, _w, _u):
+                raise RuntimeError("store unreadable")
+
+            backend = type("B", (), {"takeover_command": boom})()
+            monkeypatch.setattr(dash, "get_backend", lambda: backend)
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("takeover failed" in msg for msg, _sev in notices)
+
+    async def test_a_clipboard_that_will_not_write_is_reported(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            backend = type("B", (), {"takeover_command": lambda _s, _w, _u: "claude"})()
+            monkeypatch.setattr(dash, "get_backend", lambda: backend)
+            app.copy_to_clipboard = lambda _t: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                RuntimeError("no clipboard")
+            )
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("clipboard write failed" in msg for msg, _sev in notices)
+
+
+class TestRunNow:
+    """`n` / the Run-now button fire the highlighted cron entry via the
+    daemon's trigger file. The trigger lands under the redirected DATA_DIR, so
+    the tests assert on the file itself rather than on a mocked writer."""
+
+    def _wire_cron(self, screen: DashboardScreen, monkeypatch, *, job="nightly"):
+        screen.action_show_tab("tab-cron")
+        monkeypatch.setattr(screen, "_selected_job", lambda: job)
+
+    async def test_run_now_writes_a_trigger_for_the_selected_entry(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", isolated)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_cron(screen, monkeypatch)
+            monkeypatch.setattr(supervisor, "is_running", lambda _n: True)
+            notices = _capture(screen)
+            await pilot.press("n")
+            await pilot.pause()
+        assert (isolated / "state" / "cron.trigger").is_file()
+        assert any("run-now requested for nightly" in msg for msg, _sev in notices)
+
+    async def test_the_button_fires_the_same_action(self, isolated, monkeypatch):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", isolated)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_cron(screen, monkeypatch)
+            monkeypatch.setattr(supervisor, "is_running", lambda _n: True)
+            notices = _capture(screen)
+            button = app.screen.query_one("#cron-run-now", Button)
+            button.press()
+            await pilot.pause()
+        assert (isolated / "state" / "cron.trigger").is_file()
+        assert any("run-now requested for nightly" in msg for msg, _sev in notices)
+
+    async def test_run_now_refuses_when_the_daemon_is_stopped(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", isolated)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_cron(screen, monkeypatch)
+            monkeypatch.setattr(supervisor, "is_running", lambda _n: False)
+            notices = _capture(screen)
+            await pilot.press("n")
+            await pilot.pause()
+        assert not (isolated / "state" / "cron.trigger").exists()
+        assert any("cron daemon not running" in msg for msg, _sev in notices)
+
+    async def test_run_now_with_no_selection_says_so(self, isolated, monkeypatch):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", isolated)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            monkeypatch.setattr(supervisor, "is_running", lambda _n: True)
+            notices = _capture(screen)
+            await pilot.press("n")
+            await pilot.pause()
+        assert not (isolated / "state" / "cron.trigger").exists()
+        assert any("no cron entry selected" in msg for msg, _sev in notices)
+
+    async def test_run_now_is_gated_by_the_busy_spinner(self, isolated, monkeypatch):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", isolated)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_cron(screen, monkeypatch)
+            screen._busy_msg = "stopping cron"
+            await pilot.press("n")
+            await pilot.pause()
+        assert not (isolated / "state" / "cron.trigger").exists()
+
+    async def test_a_failing_trigger_write_is_reported(self, isolated, monkeypatch):
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", isolated)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_cron(screen, monkeypatch)
+            monkeypatch.setattr(supervisor, "is_running", lambda _n: True)
+            monkeypatch.setattr(
+                dash,
+                "request_run_now",
+                lambda _name: (_ for _ in ()).throw(
+                    RuntimeError("state dir unwritable")
+                ),
+            )
+            notices = _capture(screen)
+            await pilot.press("n")
+            await pilot.pause()
+        assert not (isolated / "state" / "cron.trigger").exists()
+        assert any("run-now failed" in msg for msg, _sev in notices)

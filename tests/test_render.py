@@ -16,28 +16,45 @@ from claude_on_the_fly.tui.render import (
 
 class TestSchedulerHeader:
     def test_running_with_next_fire(self):
-        line = cron_header(state="running", next_fire_str="Mon 09:00  (in 4m)")
+        line = cron_header(state="running", count=3, next_fire_str="Mon 09:00  (in 4m)")
         assert "CRON" in line
+        assert "3 jobs" in line
         assert "next fire" in line
         assert "in 4m" in line
 
     def test_running_no_jobs(self):
-        line = cron_header(state="running", next_fire_str=None)
+        line = cron_header(state="running", count=0, next_fire_str=None)
         assert "no jobs" in line
 
     def test_stopped_omits_next_fire(self):
-        line = cron_header(state="stopped", next_fire_str="Mon 09:00  (in 4m)")
-        assert "next fire" not in line
+        line = cron_header(state="stopped", count=5, next_fire_str="Mon 09:00  (in 4m)")
+        assert "5 jobs" in line
+        assert "Mon 09:00" not in line  # the fire time, not the sort mode
         assert "dim" in line  # stopped state style
 
     def test_error_takes_precedence(self):
         line = cron_header(
             state="running",
+            count=5,
             next_fire_str="Mon 09:00  (in 4m)",
             schedule_error="bad cron",
         )
         assert "bad cron" in line
         assert "next fire" not in line
+        assert "5 jobs" not in line
+
+    def test_a_single_job_is_not_pluralized(self):
+        line = cron_header(state="running", count=1, next_fire_str=None)
+        assert "1 job" in line
+        assert "1 jobs" not in line
+
+    def test_the_sort_mode_is_named(self):
+        line = cron_header(state="running", count=2, next_fire_str=None, sort="name")
+        assert "sort: name" in line
+
+    def test_the_default_sort_is_next_fire(self):
+        line = cron_header(state="running", count=2, next_fire_str=None)
+        assert "sort: next fire" in line
 
 
 class TestReadNewLines:

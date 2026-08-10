@@ -217,13 +217,22 @@ def _state_markup(state: str) -> str:
 def cron_header(
     *,
     state: str,
+    count: int,
     next_fire_str: str | None,
+    sort: str = "next fire",
     schedule_error: str | None = None,
 ) -> str:
-    """Markup line for the CRON panel border-title."""
+    """Markup line for the CRON panel border-title.
+
+    `count` is the number of configured entries, shown whenever the schedule
+    parsed; `sort` names the table's current order ("next fire" or "name").
+    """
     line = f"[bold]CRON[/bold]  {_state_markup(state)}"
     if schedule_error:
         return line + f"  [red]({schedule_error})[/red]"
+    if count:
+        line += f"  ·  {count} job{'s' if count != 1 else ''}"
+    line += f"  ·  [dim]sort: {sort}[/dim]"
     if state != "running":
         return line
     if next_fire_str:
