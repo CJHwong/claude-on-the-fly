@@ -42,8 +42,37 @@ def isolated(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _freeze_refresh_ticks(screen: DashboardScreen) -> None:
+    """Keep the screen's repeating `_refresh` / `_refresh_log` timers from ever
+    being scheduled.
+
+    `_refresh` resets `_job_sessions`, `_chat_workspaces` and `_job_workspaces`
+    and rebuilds the cron table from the live snapshot. The tests below inject
+    that state by hand and then `await pilot.pause()`, which yields the event
+    loop — so a tick landing inside that yield wipes the injection and moves the
+    cron cursor back to row 0, and the assertion reads the daemon's empty state.
+    Locally a test finishes well inside the 1s period and never sees it; on a
+    loaded CI runner it does, tripping whichever test got starved (a different
+    one per run, which is what made it look like nondeterminism rather than a
+    race against a timer).
+
+    `on_mount` still calls `_refresh()` once directly, and every test drives the
+    refreshes it cares about itself, so nothing here depends on the ticks.
+    """
+    real_set_interval = screen.set_interval
+
+    def skip_refresh_timers(*args, **kwargs):
+        callback = args[1] if len(args) > 1 else kwargs.get("callback")
+        if callback in (screen._refresh, screen._refresh_log):
+            return None
+        return real_set_interval(*args, **kwargs)
+
+    screen.set_interval = skip_refresh_timers  # type: ignore[method-assign]
+
+
 async def _open(app: _Host, pilot) -> DashboardScreen:
     screen = DashboardScreen()
+    _freeze_refresh_ticks(screen)
     await app.push_screen(screen)
     await pilot.pause()
     return screen
