@@ -486,6 +486,7 @@ class CodexBackend:
         user_name: str = "unknown",
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
+        nudge_prompt: str | None = None,
     ) -> Response:
         logger.info(
             "session: id=%s platform=%s user=%s context=%s workspace=%s",
@@ -553,14 +554,22 @@ class CodexBackend:
             )
 
         body = (result.get("body") or "").strip()
-        if not body:
+        if not body or not agent.strip_suggestions_blocks(body):
+            # A body that is only a <suggestions> block is an empty reply: the
+            # orchestrator would strip it to the placeholder, so nudge for
+            # real text instead.
             thread_for_retry = result.get("thread_id") or existing_thread
             if thread_for_retry:
                 logger.warning(
-                    "codex: empty result, retrying with nudge, session=%s",
+                    "codex: no visible reply, retrying with nudge, session=%s",
                     session_uuid,
                 )
-                retry_cmd = [*base, "resume", thread_for_retry, NUDGE_PROMPT]
+                retry_cmd = [
+                    *base,
+                    "resume",
+                    thread_for_retry,
+                    nudge_prompt or NUDGE_PROMPT,
+                ]
                 retry_started = time.monotonic()
                 retry_result = await _run_codex_exec(
                     workspace, retry_cmd, timeout=timeout

@@ -86,6 +86,27 @@ OUTBOX_INSTRUCTION = (
 )
 
 
+# The per-turn suggestions block the orchestrator appends to chat prompts, and
+# the code-fence pair that sometimes wraps it. Shared with the backends: a
+# body that is only a suggestions block is an empty reply, and must get the
+# same nudge as a blank one.
+SUGGESTIONS_BLOCK_RE = re.compile(r"<suggestions>(.*?)</suggestions>", re.DOTALL)
+SUGGESTIONS_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n\s*```\s*")
+
+
+def strip_suggestions_blocks(body: str) -> str:
+    """The visible text of a reply: `body` with every <suggestions> block
+    (and the code-fence pair that may wrap one) removed.
+
+    The backends use this to decide whether a turn produced a real reply — a
+    body that is only a block is empty, and gets the nudge a blank one gets.
+    The orchestrator uses the same strip when it splits a reply into text and
+    labels, so the two never disagree about what is visible.
+    """
+    cleaned = SUGGESTIONS_BLOCK_RE.sub("", body)
+    return SUGGESTIONS_FENCE_RE.sub("", cleaned).strip()
+
+
 def sender_marker(sender_id: object, display_name: object = "") -> str:
     """Render a platform-authenticated sender marker for the model prompt.
 
@@ -1123,6 +1144,7 @@ class AgentBackend(Protocol):
         user_name: str = "unknown",
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
+        nudge_prompt: str | None = None,
     ) -> Response: ...
 
     async def compact(
@@ -1380,6 +1402,7 @@ async def run(
     user_name: str = "unknown",
     channel_context: str = "dm",
     timeout: float | None = DEFAULT_TIMEOUT,
+    nudge_prompt: str | None = None,
 ) -> Response:
     return await get_backend().run(
         workspace,
@@ -1389,6 +1412,7 @@ async def run(
         user_name=user_name,
         channel_context=channel_context,
         timeout=timeout,
+        nudge_prompt=nudge_prompt,
     )
 
 

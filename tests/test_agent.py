@@ -3603,6 +3603,44 @@ def test_front_matter_is_parsed_as_real_yaml():
 
 
 # ---------------------------------------------------------------------------
+# Suggestions block stripping
+# ---------------------------------------------------------------------------
+
+
+def test_strip_suggestions_leaves_a_plain_body_untouched():
+    assert agent_mod.strip_suggestions_blocks("plain reply") == "plain reply"
+
+
+def test_strip_suggestions_removes_the_block_keeps_the_text():
+    assert (
+        agent_mod.strip_suggestions_blocks('a\n\n<suggestions>["x?"]</suggestions>')
+        == "a"
+    )
+
+
+def test_strip_suggestions_removes_every_block():
+    assert (
+        agent_mod.strip_suggestions_blocks(
+            'a <suggestions>["x?"]</suggestions> b <suggestions>["y?"]</suggestions>'
+        )
+        == "a  b"
+    )
+
+
+def test_strip_suggestions_removes_the_wrapping_fence_pair():
+    assert (
+        agent_mod.strip_suggestions_blocks(
+            'answer\n```json\n<suggestions>["x?"]</suggestions>\n```'
+        )
+        == "answer"
+    )
+
+
+def test_strip_suggestions_a_block_only_body_is_empty():
+    assert agent_mod.strip_suggestions_blocks('<suggestions>["x?"]</suggestions>') == ""
+
+
+# ---------------------------------------------------------------------------
 # Skills cache
 # ---------------------------------------------------------------------------
 

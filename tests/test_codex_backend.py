@@ -1046,6 +1046,36 @@ class TestCodexBackendNudgeRetry:
         assert NUDGE_PROMPT in retry_cmd
         assert resp.body == "real answer"
 
+    async def test_a_suggestions_only_body_triggers_nudge_retry(self, tmp_path: Path):
+        """A reply that is only a <suggestions> block is an empty reply: the
+        orchestrator would strip it to the placeholder, so the backend nudges
+        for real text instead."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        first = _success_result(
+            thread_id="t1", body='<suggestions>["x?"]</suggestions>'
+        )
+        retry = _success_result(thread_id="t1", body="real answer")
+
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ) as mock:
+            resp = await CodexBackend().run(
+                workspace,
+                "sess-x",
+                "hi",
+                "telegram",
+                nudge_prompt="nudge with template",
+            )
+
+        assert mock.await_count == 2
+        # The retry must carry the caller's nudge prompt, not the bare one.
+        retry_cmd = mock.call_args_list[1][0][1]
+        assert "nudge with template" in retry_cmd
+        assert resp.body == "real answer"
+
     async def test_retry_accumulates_tokens_and_tools(self, tmp_path: Path):
         workspace = tmp_path / "ws"
         workspace.mkdir()

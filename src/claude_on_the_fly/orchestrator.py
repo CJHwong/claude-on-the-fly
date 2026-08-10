@@ -30,9 +30,11 @@ from claude_on_the_fly import (
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
+    SUGGESTIONS_BLOCK_RE,
     ClaudeUnavailableError,
     Response,
     current_backend_key,
+    strip_suggestions_blocks,
 )
 from claude_on_the_fly.approvals import ApprovalBroker
 from claude_on_the_fly.events import (
@@ -85,11 +87,6 @@ SUGGESTIONS_TEMPLATE = (
 MAX_SUGGESTIONS = 5
 MAX_SUGGESTION_LENGTH = 75
 
-_SUGGESTIONS_RE = re.compile(r"<suggestions>(.*?)</suggestions>", re.DOTALL)
-# The agent sometimes wraps the block in a code fence; the fence markers sit
-# outside the tags, so after the block is removed the open and close lines
-# become adjacent and this drops the dangling pair from the visible body.
-_FENCE_PAIR_RE = re.compile(r"```[a-zA-Z]*\s*\n\s*```\s*")
 _SUGGESTIONS_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -105,18 +102,13 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
     come from the last one, since the template tells the agent to end the
     reply with it. A reply that was only blocks gets a placeholder so
     frontends never send an empty message, and its labels are dropped —
-    buttons with no reply above them are blind taps.
+    buttons with no reply above them are blind taps. The backends nudge a
+    block-only reply before it ever reaches here, so this is the last resort.
     """
-    matches = list(_SUGGESTIONS_RE.finditer(body))
+    matches = list(SUGGESTIONS_BLOCK_RE.finditer(body))
     if not matches:
         return body, []
-    parts: list[str] = []
-    cursor = 0
-    for match in matches:
-        parts.append(body[cursor : match.start()])
-        cursor = match.end()
-    parts.append(body[cursor:])
-    cleaned = _FENCE_PAIR_RE.sub("", "".join(parts)).strip()
+    cleaned = strip_suggestions_blocks(body)
     if not cleaned:
         # The agent skipped its reply and emitted only the block. Drop the
         # labels too (a button without a reply carries no context) and log
@@ -661,6 +653,15 @@ class Orchestrator:
                 identity = getattr(self._frontend, "sender_identity", None)
                 suggestions = _suggestions_enabled()
                 prompt = f"{text}\n\n{SUGGESTIONS_TEMPLATE}" if suggestions else text
+                # The backend's nudge retry (an empty or block-only reply)
+                # carries the suggestions instruction too, so the retried
+                # answer comes back with working buttons rather than a bare
+                # reply. None keeps the backend's plain nudge.
+                nudge_prompt = (
+                    f"{agent.NUDGE_PROMPT}\n\n{SUGGESTIONS_TEMPLATE}"
+                    if suggestions
+                    else None
+                )
                 interim = self._start_interim(chat_id)
                 if interim is not None:
                     sink_token = agent.set_progress_sink(interim.emit)
@@ -677,6 +678,7 @@ class Orchestrator:
                         ),
                         channel_context=self._frontend.channel_context(chat_id),
                         timeout=self._frontend.timeout_for(chat_id),
+                        nudge_prompt=nudge_prompt,
                     )
                 except asyncio.CancelledError:
                     # FIRST, and the order is load-bearing rather than stylistic:

@@ -319,6 +319,7 @@ class ClaudeBackend:
         user_name: str = "unknown",
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
+        nudge_prompt: str | None = None,
     ) -> Response:
         logger.info(
             "session: id=%s platform=%s user=%s context=%s workspace=%s",
@@ -400,13 +401,17 @@ class ClaudeBackend:
                 cost=cli_output.get("total_cost_usd", 0),
                 duration=cli_output.get("duration_ms", 0) / 1000,
             )
-        if not body:
+        if not body or not agent.strip_suggestions_blocks(body):
+            # A body that is only a <suggestions> block is an empty reply: the
+            # orchestrator would strip it to the placeholder, so nudge for
+            # real text instead.
             logger.warning(
-                "agent.run: empty result, retrying with nudge, session=%s", session_uuid
+                "agent.run: no visible reply, retrying with nudge, session=%s",
+                session_uuid,
             )
             retry_output = await executor(
                 workspace,
-                [*base, "--resume", session_uuid, agent.NUDGE_PROMPT],
+                [*base, "--resume", session_uuid, nudge_prompt or agent.NUDGE_PROMPT],
                 timeout=timeout,
             )
             if self.pty:

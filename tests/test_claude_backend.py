@@ -253,6 +253,57 @@ class TestRunDoesNotNudgeACompaction:
         assert response.body == "Compacted the conversation."
 
 
+class TestRunNudgesABlockOnlyReply:
+    async def test_a_suggestions_only_body_triggers_the_nudge(
+        self, tmp_path, monkeypatch
+    ):
+        """A reply that is only a <suggestions> block is an empty reply: the
+        orchestrator would strip it to the placeholder, so the backend nudges
+        for real text instead."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        session = (
+            tmp_path
+            / "projects"
+            / claude_mod._workspace_to_claude_hash(tmp_path)
+            / "sid.jsonl"
+        )
+        session.parent.mkdir(parents=True)
+        session.write_text('{"type":"user"}\n', encoding="utf-8")
+
+        backend = claude_mod.ClaudeBackend()
+        first = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": '<suggestions>["x?"]</suggestions>',
+            "tool_counts": {},
+            "skill_counts": {},
+        }
+        retry = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "real answer",
+            "tool_counts": {},
+            "skill_counts": {},
+        }
+        with patch.object(
+            claude_mod.agent,
+            "_exec",
+            new_callable=AsyncMock,
+            side_effect=[first, retry],
+        ) as native_exec:
+            response = await backend.run(
+                tmp_path, "sid", "hi", "slack", nudge_prompt="nudge with template"
+            )
+
+        assert native_exec.await_count == 2
+        # The retry must carry the caller's nudge prompt, not the bare one.
+        retry_cmd = native_exec.call_args_list[1][0][1]
+        assert "nudge with template" in retry_cmd
+        assert response.body == "real answer"
+
+
 class TestNativeContextFields:
     """The auto-compact gate's reading in native mode. pty gets it from the
     statusline; native has to add it up — from the last assistant message, not

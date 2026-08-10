@@ -320,6 +320,7 @@ class TestProcess:
             user_name="user-1",
             channel_context="dm",
             timeout=None,
+            nudge_prompt=None,
         )
 
         # Response was sent
@@ -416,6 +417,29 @@ class TestProcess:
         # A reply that is only buttons is a skipped reply: no body to pair
         # the buttons with, so they are dropped rather than shown blind.
         assert sent.suggestions == []
+
+    async def test_the_nudge_prompt_carries_the_suggestions_template(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The backend's nudge retry must come back with working buttons, so
+        the nudge prompt carries the same suggestions instruction as the
+        turn's own prompt."""
+        monkeypatch.setenv("COTF_SUGGESTIONS_ENABLED", "true")
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        nudge = mock_agent.run.call_args.kwargs["nudge_prompt"]
+        assert nudge is not None
+        assert "<cotf-suggest>" in nudge
+        assert "<suggestions>" in nudge
 
     async def test_command_token_is_bound_to_the_turn_workspace_and_revoked(
         self, frontend: StubFrontend, tmp_path: Path
