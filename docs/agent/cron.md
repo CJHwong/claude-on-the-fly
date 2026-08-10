@@ -88,3 +88,16 @@ Two different limits, both spelled `timeout` in different places:
   print a work list
 - a side-effect command, and the agent run each item becomes, get the entry's own
   `timeout`, which rides to the worker on `Job.timeout`
+
+## Run-now trigger
+
+The TUI's Run-now button (`n` on the cron tab) is a file, not a signal: the
+operator writes `state/cron.trigger` (`request_run_now`) and the daemon polls
+it in `_sleep_to_next_minute` at 1s granularity, so a request lands within a
+second instead of waiting out the minute. `_drain_triggers` renames the file
+to `.draining` before reading it — a request written between the read and the
+remove survives as a fresh file for the next drain instead of being deleted
+unseen — then fires each named entry through `_fire`, so a run-now respects
+the same gates as a scheduled fire (outstanding-job skip, `max_concurrent`,
+key backoff). An unknown entry is logged and ignored; a `.draining` leftover
+from a crashed drain is processed by the next one.

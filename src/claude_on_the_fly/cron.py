@@ -575,6 +575,49 @@ def _log_header(entry_name: str, kind: str, detail: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Run-now trigger
+# ---------------------------------------------------------------------------
+
+
+def _trigger_path() -> Path:
+    """The run-now trigger file, under the *current* data dir's state dir.
+
+    Resolved per call against `agent.DATA_DIR` for the same reason as
+    `config_paths`: redirecting the data dir redirects this too. The state dir
+    is where the heartbeat and pid files live, so the trigger sits with the
+    rest of the control plane.
+    """
+    from claude_on_the_fly.agent import DATA_DIR as data_dir
+
+    return data_dir / "state" / "cron.trigger"
+
+
+def request_run_now(entry_name: str) -> None:
+    """Ask the cron daemon to fire `entry_name` on its next loop wake.
+
+    Writes the trigger file the daemon polls. Atomic (tmp + replace) so the
+    daemon never reads a half-written file; the daemon drains by rename, so a
+    request that lands mid-drain is picked up by the next drain rather than
+    lost. The daemon validates the name against its loaded entries.
+    """
+    path = _trigger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(path.read_text()) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+    entries = [e for e in entries if isinstance(e, str)]
+    if entry_name not in entries:
+        entries.append(entry_name)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"entries": entries}))
+    tmp.replace(path)
+
+
+# ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
 
@@ -647,6 +690,7 @@ class CronDaemon:
             if self._stop.is_set():
                 break
             self._maybe_reload()
+            await self._drain_triggers()
             now = datetime.now()
             for state in list(self._state.values()):
                 if state.next_fire <= now:
@@ -661,10 +705,67 @@ class CronDaemon:
             await asyncio.gather(*self._command_tasks, return_exceptions=True)
 
     async def _sleep_to_next_minute(self) -> None:
+        """Wait until the next minute boundary, waking early for a run-now
+        trigger.
+
+        The trigger file is polled at 1s granularity so a run-now request
+        lands within a second instead of waiting out the rest of the minute.
+        """
         now = datetime.now()
         wait = 60 - now.second - now.microsecond / 1_000_000
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stop.wait(), timeout=wait)
+        deadline = time.monotonic() + wait
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._trigger_pending():
+                return
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=min(1.0, remaining))
+                return
+
+    def _trigger_pending(self) -> bool:
+        """Whether a run-now request is waiting, or a crashed drain left one."""
+        path = _trigger_path()
+        return path.is_file() or path.with_suffix(".draining").is_file()
+
+    async def _drain_triggers(self) -> None:
+        """Fire every entry a run-now request named, then remove the request.
+
+        Rename-then-read: a request written between the read and the remove
+        survives as a fresh file for the next drain instead of being deleted
+        unseen. Fires through `_fire`, so a run-now respects the same gates as
+        a scheduled fire (outstanding-job skip, max_concurrent, key backoff).
+        """
+        path = _trigger_path()
+        drain = path.with_suffix(".draining")
+        source = path if path.is_file() else (drain if drain.is_file() else None)
+        if source is None:
+            return
+        try:
+            os.replace(source, drain)
+        except FileNotFoundError:
+            return
+        try:
+            data = json.loads(drain.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("cron: unreadable run-now trigger: %s", exc)
+            drain.unlink(missing_ok=True)
+            return
+        drain.unlink(missing_ok=True)
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            logger.warning("cron: malformed run-now trigger, ignoring")
+            return
+        for name in entries:
+            if not isinstance(name, str):
+                continue
+            state = self._state.get(name)
+            if state is None:
+                logger.warning("cron: run-now for unknown entry %r", name)
+                continue
+            logger.info("cron: run-now firing %s", name)
+            await self._fire(state.entry)
 
     # --- firing ---
 

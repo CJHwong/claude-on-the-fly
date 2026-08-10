@@ -4,7 +4,9 @@ that decide what a fire actually hands to the queue."""
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from claude_on_the_fly.cron import (
     load_config,
     migrate_legacy_config,
     parse_items,
+    request_run_now,
 )
 from claude_on_the_fly.jobs.core import Job
 from claude_on_the_fly.jobs.key_state import KeyStateStore, fingerprint
@@ -1059,6 +1062,260 @@ class TestRunLoop:
         with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
             await cron._fire(entry)
         assert "fire failed" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestRunNow:
+    """The run-now trigger: `request_run_now` writes it, the daemon drains it.
+
+    The trigger file lives under the redirected DATA_DIR's state dir, so every
+    test here monkeypatches `agent.DATA_DIR` the way the config tests do.
+    """
+
+    def _trigger(self, tmp_path: Path) -> Path:
+        return tmp_path / "state" / "cron.trigger"
+
+    def test_request_writes_the_trigger_file(self, tmp_path: Path, monkeypatch) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        request_run_now("digest")
+        data = json.loads(self._trigger(tmp_path).read_text())
+        assert data == {"entries": ["digest"]}
+
+    def test_request_dedupes_and_appends(self, tmp_path: Path, monkeypatch) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        request_run_now("digest")
+        request_run_now("digest")
+        request_run_now("nightly")
+        data = json.loads(self._trigger(tmp_path).read_text())
+        assert data == {"entries": ["digest", "nightly"]}
+
+    def test_request_recovers_from_a_malformed_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        self._trigger(tmp_path).parent.mkdir(parents=True)
+        self._trigger(tmp_path).write_text("not json")
+        request_run_now("digest")
+        data = json.loads(self._trigger(tmp_path).read_text())
+        assert data == {"entries": ["digest"]}
+
+    async def test_drain_fires_a_prompt_entry_and_removes_the_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        request_run_now("digest")
+
+        await cron._drain_triggers()
+
+        assert [j.key for j in queue.jobs] == ["digest"]
+        assert not self._trigger(tmp_path).exists()
+
+    async def test_drain_ignores_an_unknown_entry(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        request_run_now("ghost")
+
+        await cron._drain_triggers()
+
+        assert queue.jobs == []
+        assert "unknown entry" in caplog.text
+
+    async def test_drain_skips_non_string_entries(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        self._trigger(tmp_path).parent.mkdir(parents=True)
+        self._trigger(tmp_path).write_text(json.dumps({"entries": [1, "digest"]}))
+
+        await cron._drain_triggers()
+
+        assert [j.key for j in queue.jobs] == ["digest"]
+
+    async def test_drain_ignores_a_malformed_file(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        self._trigger(tmp_path).parent.mkdir(parents=True)
+        self._trigger(tmp_path).write_text(json.dumps({"foo": 1}))
+
+        await cron._drain_triggers()
+
+        assert queue.jobs == []
+        assert "malformed" in caplog.text
+
+    async def test_drain_ignores_an_unreadable_file(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        self._trigger(tmp_path).parent.mkdir(parents=True)
+        self._trigger(tmp_path).write_text("not json")
+
+        await cron._drain_triggers()
+
+        assert queue.jobs == []
+        assert "unreadable" in caplog.text
+
+    async def test_drain_with_no_trigger_is_a_noop(self, tmp_path: Path) -> None:
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+
+        await cron._drain_triggers()
+
+        assert queue.jobs == []
+
+    async def test_drain_survives_a_rename_race(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A request that lands between the is_file check and the rename must
+        not crash the drain — the next drain picks it up."""
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        request_run_now("digest")
+        monkeypatch.setattr(
+            "claude_on_the_fly.cron.os.replace",
+            lambda _src, _dst: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+
+        await cron._drain_triggers()  # must not raise
+
+        assert queue.jobs == []
+
+    async def test_a_crashed_drain_leftover_is_processed(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A drain killed between rename and remove leaves a `.draining` file;
+        the next drain must finish the job."""
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"}),
+            queue,
+        )
+        cron.reload()
+        self._trigger(tmp_path).parent.mkdir(parents=True)
+        self._trigger(tmp_path).with_suffix(".draining").write_text(
+            json.dumps({"entries": ["digest"]})
+        )
+
+        await cron._drain_triggers()
+
+        assert [j.key for j in queue.jobs] == ["digest"]
+        assert not self._trigger(tmp_path).with_suffix(".draining").exists()
+
+    async def test_sleep_wakes_early_for_a_trigger(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        cron = daemon(tmp_path, cfg(tmp_path))
+        request_run_now("digest")
+
+        start = time.monotonic()
+        await asyncio.wait_for(cron._sleep_to_next_minute(), timeout=2)
+        assert time.monotonic() - start < 2
+
+    async def test_sleep_wakes_early_for_a_draining_leftover(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        cron = daemon(tmp_path, cfg(tmp_path))
+        self._trigger(tmp_path).parent.mkdir(parents=True)
+        self._trigger(tmp_path).with_suffix(".draining").write_text("{}")
+
+        start = time.monotonic()
+        await asyncio.wait_for(cron._sleep_to_next_minute(), timeout=2)
+        assert time.monotonic() - start < 2
+
+    async def test_sleep_returns_at_the_minute_boundary(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The normal path: no trigger, no stop — the loop exits when the
+        deadline passes. The clock is frozen just before the minute boundary
+        so the wait is a fraction of a second instead of up to 60.
+
+        `time.monotonic` itself is not faked: the event loop reads it for its
+        own timeout bookkeeping, so a fake would poison every wait_for in the
+        test."""
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 1, 1, 12, 0, 59, 900_000)
+
+        monkeypatch.setattr("claude_on_the_fly.cron.datetime", _Frozen)
+        cron = daemon(tmp_path, cfg(tmp_path))
+
+        await asyncio.wait_for(cron._sleep_to_next_minute(), timeout=5)
 
 
 class TestSummary:
