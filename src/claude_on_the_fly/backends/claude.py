@@ -401,10 +401,12 @@ class ClaudeBackend:
                 cost=cli_output.get("total_cost_usd", 0),
                 duration=cli_output.get("duration_ms", 0) / 1000,
             )
-        if not body or not agent.strip_suggestions_blocks(body):
-            # A body that is only a <suggestions> block is an empty reply: the
-            # orchestrator would strip it to the placeholder, so nudge for
-            # real text instead.
+        if not body:
+            # Nothing at all came back: a plausible dead turn, worth one retry.
+            # A body that is only a <suggestions> block is NOT this case — see
+            # the codex backend's note; that block is evidence the turn ran to
+            # completion and chose to say nothing, so it goes to the
+            # orchestrator's placeholder rather than a second billed turn.
             logger.warning(
                 "agent.run: no visible reply, retrying with nudge, session=%s",
                 session_uuid,

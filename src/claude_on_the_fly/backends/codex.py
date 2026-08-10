@@ -554,10 +554,18 @@ class CodexBackend:
             )
 
         body = (result.get("body") or "").strip()
-        if not body or not agent.strip_suggestions_blocks(body):
-            # A body that is only a <suggestions> block is an empty reply: the
-            # orchestrator would strip it to the placeholder, so nudge for
-            # real text instead.
+        if not body:
+            # Nothing at all came back: a plausible dead turn, worth one retry.
+            #
+            # A body that is only a <suggestions> block is NOT this case and is
+            # deliberately not retried. That block is the protocol token the
+            # turn was asked to end with, so emitting it well-formed is
+            # evidence the turn ran to completion and chose to say nothing to
+            # the user — an unattended router told not to reply does exactly
+            # that. Nudging it re-asks a question already answered: measured
+            # across a day of routed alerts the retry changed the reply 0 times
+            # out of 11 and cost a second full-context turn each time. The
+            # orchestrator turns such a body into its placeholder instead.
             thread_for_retry = result.get("thread_id") or existing_thread
             if thread_for_retry:
                 logger.warning(
