@@ -22,6 +22,7 @@ import os
 import signal
 import sys
 import time
+from typing import cast
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -155,6 +156,24 @@ def build_components(
     return queue, runner, notifier, recorder
 
 
+def _running_jobs(runner: OrchestratorAgentRunner) -> dict:
+    """The in-flight jobs for the heartbeat, shaped like the orchestrator's
+    chat `running_jobs` so the dashboard normalizes both the same way."""
+    now = time.monotonic()
+    return {
+        "running_jobs": [
+            {
+                "job_id": job_id,
+                "key": info["key"],
+                "workspace": info["workspace"],
+                "uptime_s": int(now - info["started_at_monotonic"]),
+                "session_uuid": info["session_uuid"],
+            }
+            for job_id, info in runner.in_flight.items()
+        ]
+    }
+
+
 async def _run(token: str) -> None:
     """Wire the heartbeat + signal handlers, and drive the worker loop until
     stopped; then tear the heartbeat down."""
@@ -180,7 +199,13 @@ async def _run(token: str) -> None:
         )
     agent.add_process_listener(ledger.on_process)
 
-    heartbeat = HeartbeatWriter("jobs")
+    # The composition root knows the runner is the concrete
+    # OrchestratorAgentRunner (build_components constructs it); the port type
+    # only promises `run`, so the in_flight access needs the cast.
+    heartbeat = HeartbeatWriter(
+        "jobs",
+        extra_provider=lambda: _running_jobs(cast(OrchestratorAgentRunner, runner)),
+    )
     heartbeat_task = asyncio.create_task(heartbeat.run())
     concurrency = _concurrency()
     logger.info(

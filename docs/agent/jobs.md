@@ -104,7 +104,7 @@ A queue deeper than the row cap gets a trailing `… N more` row, so the cap nev
 
 The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#cron-entries` is a different widget** — the cron tab's cron table — and must not be reused.
 
-There is no watch pane for a running job: that needs the worker to publish the running job's `session_uuid`, and the `run_id` in `agent_runner.py` is ephemeral and never persisted. Until it is, the daemon log takes the full width.
+The watch pane tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
 
 ## Logging
 

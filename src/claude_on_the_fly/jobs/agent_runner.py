@@ -39,7 +39,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -79,6 +80,11 @@ class OrchestratorAgentRunner:
     timeout: float | None = agent.DEFAULT_TIMEOUT
     user_name: str = "jobs"
     channel_context: str = "jobs"
+    # job_id -> {session_uuid, workspace, key, started_at_monotonic}, for the
+    # heartbeat: the dashboard's jobs watch pane resolves a running job's live
+    # session from this. Populated when a run starts, cleared when it ends —
+    # including on cancel, via the finally below.
+    in_flight: dict[str, dict] = field(default_factory=dict)
 
     async def run(self, job: Job) -> Result:
         # A keyed job's run id IS its session key, which is what makes the
@@ -102,6 +108,12 @@ class OrchestratorAgentRunner:
                     f"{job.platform}/{current_backend_key()}/{run_id}",
                 )
             )
+            self.in_flight[job.id] = {
+                "session_uuid": session_uuid,
+                "workspace": str(workspace),
+                "key": job.key,
+                "started_at_monotonic": time.monotonic(),
+            }
             # `None` on the job means "use the runner's configured limit", not
             # "no limit" — only JOBS_TIMEOUT can say the latter.
             timeout = job.timeout if job.timeout is not None else self.timeout
@@ -126,6 +138,7 @@ class OrchestratorAgentRunner:
                 return Result(ok=False, text=f"Job failed: {exc}")
             return Result(ok=True, text=response.body)
         finally:
+            self.in_flight.pop(job.id, None)
             # A keyed job's workspace and session ARE its continuity, so nothing
             # is discarded: the next run with this key has to find them. Growth is
             # bounded by the number of distinct keys rather than by the number of

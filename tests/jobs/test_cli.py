@@ -277,7 +277,7 @@ class TestRunLoopWiring:
         heartbeat = MagicMock()
         heartbeat.run = AsyncMock()
         heartbeat.path = tmp_path / "hb.json"
-        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role: heartbeat)
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
 
         with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
             await cli._run("xoxb-token")
@@ -309,7 +309,7 @@ class TestRunLoopWiring:
         heartbeat = MagicMock()
         heartbeat.run = AsyncMock()
         heartbeat.path = tmp_path / "hb.json"
-        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role: heartbeat)
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
         removed: list[object] = []
         monkeypatch.setattr(
             cli.agent, "remove_process_listener", lambda cb: removed.append(cb)
@@ -333,3 +333,37 @@ def test_setup_logging_names_the_jobs_role(monkeypatch) -> None:
     monkeypatch.setattr(cli, "setup_daemon_logging", lambda role: seen.append(role))
     cli._setup_logging()
     assert seen == ["jobs"]
+
+
+def test_running_jobs_shapes_the_in_flight_dict() -> None:
+    """The heartbeat extra mirrors the orchestrator's chat `running_jobs`
+    shape, so the dashboard normalizes both sources the same way."""
+    import time
+
+    from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
+
+    runner = OrchestratorAgentRunner(data_dir=Path("/tmp/x"))
+    runner.in_flight["1-a"] = {
+        "session_uuid": "s-1",
+        "workspace": "/tmp/x/workspaces/jobs/abc",
+        "key": "k1",
+        "started_at_monotonic": time.monotonic() - 5,
+    }
+
+    out = cli._running_jobs(runner)
+
+    (row,) = out["running_jobs"]
+    assert row == {
+        "job_id": "1-a",
+        "key": "k1",
+        "workspace": "/tmp/x/workspaces/jobs/abc",
+        "uptime_s": 5,
+        "session_uuid": "s-1",
+    }
+
+
+def test_running_jobs_with_nothing_in_flight_is_empty() -> None:
+    from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
+
+    runner = OrchestratorAgentRunner(data_dir=Path("/tmp/x"))
+    assert cli._running_jobs(runner) == {"running_jobs": []}

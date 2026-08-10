@@ -11,9 +11,9 @@ Layout (top → bottom):
 The jobs tab is a read-only observer of the worker's maildir: it renders queue
 depth and the unfinished jobs, and never creates, moves, or writes anything
 under `jobs/`. Its header's liveness half comes from the heartbeat, so a
-stopped worker still shows its backlog. It has no watch pane (that would need
-the worker to publish the running job's session uuid), so the daemon log takes
-the full width.
+stopped worker still shows its backlog. The worker publishes each running
+job's session uuid in its heartbeat, so the highlighted job's live agent
+conversation is watchable like a chat job's.
 
 The chat tab is a live activity monitor, not a daemon roster: the header shows
 every chat frontend's health (the ←/→-selected one reverse-video'd), and the
@@ -259,8 +259,12 @@ class DashboardScreen(Screen):
         # Chat rows key on the unique chat_id (workspace_name is not unique
         # across concurrent jobs), so the watch pane needs the workspace name
         # resolved separately: "<frontend>:<chat_id>" → workspace_name.
+        # Jobs rows carry the full workspace path from the worker's heartbeat
+        # (their workspaces are not under the chat convention), so that gets
+        # its own map: "<frontend>:<job_id>" → workspace.
         self._job_sessions: dict[str, str] = {}
         self._chat_workspaces: dict[str, str] = {}
+        self._job_workspaces: dict[str, Path] = {}
         # job name → raw detail text, rebuilt every tick from the snapshot.
         # The detail block reads from here, not from the table cell, which
         # holds the whitespace-collapsed one-liner.
@@ -965,6 +969,13 @@ class DashboardScreen(Screen):
             if key and key != "__empty__" and ":" in key:
                 source, _, identifier = key.partition(":")
                 target = f"session:{source}:{identifier}"
+        elif name == "jobs":
+            # The worker publishes the running job's session uuid in its
+            # heartbeat, so the highlighted job's live conversation is
+            # watchable like a chat job's.
+            key = self._datatable_cursor_key("#jobs-queue")
+            if key and key != "__empty__":
+                target = f"session:jobs:{key}"
 
         if target is None:
             if col.display:
@@ -1009,9 +1020,10 @@ class DashboardScreen(Screen):
         """
         key = f"{source}:{identifier}"
         # Rows key on chat_id; the workspace_name (e.g. "telegram/H") is
-        # resolved from the side map populated by the chat strip.
+        # resolved from the side map populated by the chat strip. Jobs rows
+        # carry their full workspace path from the worker's heartbeat.
         label = self._chat_workspaces.get(key, identifier)
-        workspace = DATA_DIR / "workspaces" / label
+        workspace = self._job_workspaces.get(key) or (DATA_DIR / "workspaces" / label)
 
         session_uuid = self._job_sessions.get(key)
         if not session_uuid:
@@ -1143,6 +1155,7 @@ class DashboardScreen(Screen):
         # Rebuilt every tick from the heartbeat; reset before repopulating.
         self._job_sessions = {}
         self._chat_workspaces = {}
+        self._job_workspaces = {}
 
         self._refresh_cron(snap, by_name.get("cron"))
         self._refresh_jobs(snap, by_name.get("jobs"))
@@ -1320,7 +1333,25 @@ class DashboardScreen(Screen):
         off the maildir, so a backlog is visible with the worker stopped — the
         state the operator most needs to see. Read-only throughout: nothing
         here creates or moves a file under jobs/.
+
+        The worker publishes each running job's session uuid in its heartbeat,
+        which is what lets the watch pane tail the live agent conversation —
+        the same channel the chat tab uses.
         """
+        running = ((jobs.extra or {}).get("running_jobs") or []) if jobs else []
+        for info in running:
+            job_id = str(info.get("job_id", ""))
+            if not job_id:
+                continue
+            key = f"jobs:{job_id}"
+            session = info.get("session_uuid")
+            if session:
+                self._job_sessions[key] = str(session)
+            workspace = info.get("workspace")
+            if workspace:
+                self._job_workspaces[key] = Path(str(workspace))
+            self._chat_workspaces[key] = _short_job_id(job_id)
+
         view = snap.jobs_queue
         self.query_one("#jobs-queue-header", Static).update(
             render.jobs_header(

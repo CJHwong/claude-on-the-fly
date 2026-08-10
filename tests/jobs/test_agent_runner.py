@@ -469,3 +469,60 @@ async def test_platform_rides_on_the_job(tmp_path: Path) -> None:
         await runner.run(_job("p", platform="cron"))
 
     assert mock_run.call_args.kwargs["platform"] == "cron"
+
+
+async def test_in_flight_is_populated_during_the_run_and_cleared_after(
+    tmp_path: Path,
+) -> None:
+    """The heartbeat's jobs watch pane resolves a running job's live session
+    from this; it must be present while the agent runs and gone when it
+    ends."""
+    runner = OrchestratorAgentRunner(data_dir=tmp_path)
+    during: list[dict] = []
+
+    async def _fake_run(**kwargs):
+        during.append(dict(runner.in_flight))
+        return Response(body="ok")
+
+    with (
+        patch("claude_on_the_fly.jobs.agent_runner.agent.run", side_effect=_fake_run),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        await runner.run(_job("a"))
+
+    (entry,) = during
+    info = entry["1-a"]
+    assert info["session_uuid"]
+    assert info["workspace"].startswith(str(tmp_path / "workspaces" / "jobs"))
+    assert info["key"] == "p" or info["key"] is None  # _job() has no key
+    assert runner.in_flight == {}
+
+
+async def test_in_flight_is_cleared_when_the_run_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    """Shutdown cancels the in-flight job; the finally must clear the entry
+    or the heartbeat would keep advertising a dead session."""
+    runner = OrchestratorAgentRunner(data_dir=tmp_path)
+
+    async def _fake_run(**kwargs):
+        await asyncio.sleep(3600)
+
+    with (
+        patch("claude_on_the_fly.jobs.agent_runner.agent.run", side_effect=_fake_run),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        task = asyncio.create_task(runner.run(_job("a")))
+        await asyncio.sleep(0.05)
+        assert "1-a" in runner.in_flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert runner.in_flight == {}

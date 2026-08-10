@@ -2135,3 +2135,88 @@ class TestRunNow:
             await pilot.pause()
         assert not (isolated / "state" / "cron.trigger").exists()
         assert any("run-now failed" in msg for msg, _sev in notices)
+
+
+class TestWatchJobs:
+    """The jobs tab's watch pane: the worker publishes the running job's
+    session uuid in its heartbeat, so the highlighted job's live agent
+    conversation is tailed like a chat job's."""
+
+    def _wire_jobs(self, screen: DashboardScreen, monkeypatch, isolated, *, uuid="s-1"):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "t1-abc")
+        screen._chat_workspaces = {"jobs:t1-abc": "t1-abc"}
+        screen._job_workspaces = {"jobs:t1-abc": isolated}
+        screen._job_sessions = {"jobs:t1-abc": uuid} if uuid else {}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+
+    async def test_a_running_job_with_a_session_is_watched(self, isolated, monkeypatch):
+        log = _write_session(isolated / "session.jsonl", "hello from the job agent")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_jobs(screen, monkeypatch, isolated)
+            monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
+            await pilot.pause()
+            screen._refresh_watch_pane(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#watch-pane")
+        assert "hello from the job agent" in rendered
+
+    async def test_a_running_job_without_a_session_says_pending(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_jobs(screen, monkeypatch, isolated, uuid="")
+            await pilot.pause()
+            screen._refresh_watch_pane(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#watch-pane")
+        assert "no session uuid" in rendered
+
+    async def test_refresh_jobs_builds_the_watch_maps_from_the_heartbeat(
+        self, isolated
+    ):
+        """The worker's heartbeat `running_jobs` is what resolves a row to
+        its live session."""
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly.tui.state import FrontendStatus, Snapshot
+
+        status = FrontendStatus(
+            name="jobs",
+            state="running",
+            extra={
+                "running_jobs": [
+                    {
+                        "job_id": "t1-abc",
+                        "key": "k1",
+                        "workspace": str(isolated / "workspaces" / "jobs" / "abc"),
+                        "uptime_s": 3,
+                        "session_uuid": "s-1",
+                    },
+                    # A row without a job id cannot be keyed; it is skipped.
+                    {"key": "k2", "workspace": "/tmp/x", "session_uuid": "s-2"},
+                ]
+            },
+        )
+        snap = Snapshot(
+            timestamp=datetime.now(UTC),
+            frontends=[status],
+            jobs=[],
+            schedule_error=None,
+            jobs_queue=None,
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(snap, status)
+            await pilot.pause()
+        assert screen._job_sessions == {"jobs:t1-abc": "s-1"}
+        assert screen._job_workspaces == {
+            "jobs:t1-abc": isolated / "workspaces" / "jobs" / "abc"
+        }
+        # The display label is the short id, the same one the table shows.
+        assert screen._chat_workspaces == {"jobs:t1-abc": "abc"}
