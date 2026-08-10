@@ -253,13 +253,12 @@ class TestRunDoesNotNudgeACompaction:
         assert response.body == "Compacted the conversation."
 
 
-class TestRunNudgesABlockOnlyReply:
-    async def test_a_suggestions_only_body_triggers_the_nudge(
-        self, tmp_path, monkeypatch
-    ):
-        """A reply that is only a <suggestions> block is an empty reply: the
-        orchestrator would strip it to the placeholder, so the backend nudges
-        for real text instead."""
+class TestRunPassesThroughABlockOnlyReply:
+    async def test_a_suggestions_only_body_is_not_retried(self, tmp_path, monkeypatch):
+        """A well-formed <suggestions> block means the turn reached the end of
+        its instructions and chose to say nothing. That is a completed turn,
+        not a dead one, so it is passed through for the orchestrator to strip
+        rather than nudged."""
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         session = (
             tmp_path
@@ -279,29 +278,19 @@ class TestRunNudgesABlockOnlyReply:
             "tool_counts": {},
             "skill_counts": {},
         }
-        retry = {
-            "type": "result",
-            "subtype": "success",
-            "is_error": False,
-            "result": "real answer",
-            "tool_counts": {},
-            "skill_counts": {},
-        }
         with patch.object(
             claude_mod.agent,
             "_exec",
             new_callable=AsyncMock,
-            side_effect=[first, retry],
+            side_effect=[first],
         ) as native_exec:
             response = await backend.run(
                 tmp_path, "sid", "hi", "slack", nudge_prompt="nudge with template"
             )
 
-        assert native_exec.await_count == 2
-        # The retry must carry the caller's nudge prompt, not the bare one.
-        retry_cmd = native_exec.call_args_list[1][0][1]
-        assert "nudge with template" in retry_cmd
-        assert response.body == "real answer"
+        assert native_exec.await_count == 1
+        # Handed on verbatim; the orchestrator owns the placeholder.
+        assert response.body == '<suggestions>["x?"]</suggestions>'
 
 
 class TestNativeContextFields:

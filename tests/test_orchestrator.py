@@ -413,7 +413,9 @@ class TestProcess:
             await orch._process(1, Turn("question"))
 
         sent = frontend.sent[0][1]
-        assert sent.body == "Suggestions:"
+        # Not "Suggestions:" — the labels are dropped below, so naming them
+        # would promise buttons that are not there.
+        assert sent.body == "No response"
         # A reply that is only buttons is a skipped reply: no body to pair
         # the buttons with, so they are dropped rather than shown blind.
         assert sent.suggestions == []
@@ -2284,7 +2286,7 @@ class TestSuggestionsParsing:
     def test_block_only_reply_gets_placeholder_and_drops_labels(self, caplog):
         with caplog.at_level("WARNING", logger="claude_on_the_fly.orchestrator"):
             body, labels = _extract_suggestions('<suggestions>["x?"]</suggestions>')
-        assert body == "Suggestions:"
+        assert body == "No response"
         assert labels == []
         assert "reply body empty" in "\n".join(r.getMessage() for r in caplog.records)
 

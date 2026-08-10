@@ -112,9 +112,11 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
     if not cleaned:
         # The agent skipped its reply and emitted only the block. Drop the
         # labels too (a button without a reply carries no context) and log
-        # so the frequency of the failure stays measurable.
+        # so the frequency of the failure stays measurable. The text matches
+        # the backends' own empty-reply fallback: naming the buttons here
+        # would promise an affordance the line above just deleted.
         logger.warning("suggestions: reply body empty; dropping suggestion labels")
-        return "Suggestions:", []
+        return "No response", []
     return cleaned, _parse_suggestion_block(matches[-1].group(1))
 
 

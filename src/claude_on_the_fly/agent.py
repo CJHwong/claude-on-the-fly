@@ -87,9 +87,7 @@ OUTBOX_INSTRUCTION = (
 
 
 # The per-turn suggestions block the orchestrator appends to chat prompts, and
-# the code-fence pair that sometimes wraps it. Shared with the backends: a
-# body that is only a suggestions block is an empty reply, and must get the
-# same nudge as a blank one.
+# the code-fence pair that sometimes wraps it.
 SUGGESTIONS_BLOCK_RE = re.compile(r"<suggestions>(.*?)</suggestions>", re.DOTALL)
 SUGGESTIONS_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n\s*```\s*")
 
@@ -98,10 +96,10 @@ def strip_suggestions_blocks(body: str) -> str:
     """The visible text of a reply: `body` with every <suggestions> block
     (and the code-fence pair that may wrap one) removed.
 
-    The backends use this to decide whether a turn produced a real reply — a
-    body that is only a block is empty, and gets the nudge a blank one gets.
-    The orchestrator uses the same strip when it splits a reply into text and
-    labels, so the two never disagree about what is visible.
+    The orchestrator uses this to split a reply into text and labels. The
+    backends deliberately do NOT: a body that is only a block still reached
+    the end of its instructions, so it is a completed turn that said nothing
+    rather than a dead one, and it is not retried.
     """
     cleaned = SUGGESTIONS_BLOCK_RE.sub("", body)
     return SUGGESTIONS_FENCE_RE.sub("", cleaned).strip()
