@@ -213,6 +213,11 @@ def test_guidance_deny_most_lists_granted_paths(monkeypatch, tmp_path):
 
 
 def test_guidance_broker_only_loopback_note(monkeypatch, tmp_path):
+    # macOS wording. Linux never uses it -- the namespace reaches the brokered
+    # services and external hosts through the proxy, so "external hosts are
+    # blocked" would be wrong there. Its counterpart is
+    # test_guidance_network_line_is_accurate_on_linux.
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:5/anthropic")
@@ -1525,3 +1530,49 @@ async def test_preflight_does_not_guess_a_remedy_for_other_failures(linux, monke
     with pytest.raises(sandbox.SandboxBoundaryError) as caught:
         await sandbox.preflight()
     assert "apparmor" not in str(caught.value)
+
+
+def test_guidance_read_scope_ignores_sandbox_fs_on_linux(monkeypatch, tmp_path):
+    """`sandbox.fs` cannot take effect on Linux, so reading it produced a prompt
+    that contradicted itself: the agent was told it could read most of the
+    filesystem while $HOME was an opaque tmpfs, and separately told not to read
+    "No such file" as proof a path is absent."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    text = sandbox.agent_guidance(tmp_path)
+    assert "You can read only these paths" in text
+    assert "read most of the filesystem" not in text
+    # Derived from the real grants, not a restated list that can drift.
+    assert str(tmp_path.resolve()) in text
+
+
+def test_guidance_network_line_is_accurate_on_linux(monkeypatch, tmp_path):
+    """The macOS broker-only wording claims external hosts are blocked. On Linux
+    they are reachable through the proxy, and telling the agent otherwise would
+    make it decline work it can do."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    text = sandbox.agent_guidance(tmp_path)
+    assert "no other port on the host is reachable" in text
+    assert "external hosts are blocked" not in text
+
+
+def test_inert_linux_settings_are_announced(monkeypatch, caplog):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        sandbox._log_inert_settings()
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "sandbox.fs has no effect on Linux" in logged
+    assert "sandbox.broker_only_loopback has no effect on Linux" in logged
+
+
+def test_nothing_is_announced_as_inert_on_macos(monkeypatch, caplog):
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        sandbox._log_inert_settings()
+    assert "no effect" not in "\n".join(r.getMessage() for r in caplog.records)

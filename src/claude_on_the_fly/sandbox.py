@@ -479,6 +479,49 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     return [os.path.realpath(p) for p in paths]
 
 
+def _deny_most_in_force() -> bool:
+    """Whether the least-privilege filesystem shape applies.
+
+    On Linux it always does, whatever `sandbox.fs` says, because a mount
+    namespace cannot express "readable except for these forty files". Reading the
+    setting directly is how the agent came to be told it could read most of the
+    filesystem while $HOME was an opaque tmpfs -- a prompt that contradicted its
+    own error section, since it also tells the agent not to read "No such file"
+    as proof a file is absent.
+    """
+    if _platform().startswith("linux"):
+        return True
+    return settings.get("COTF_SANDBOX_FS").lower() == "deny-most"
+
+
+def _readable_paths(workspace: Path | str) -> list[str]:
+    """The paths the agent may read, for the guidance note.
+
+    Derived from the real grants on Linux rather than restated. The macOS side is
+    still a hand-maintained mirror of fs-deny-most.sb, and under-listing there is
+    not harmless: the note tells the agent not to narrow its reads, so a path
+    missing here is one it will decline to try.
+    """
+    from claude_on_the_fly.agent import MEMORY_DIR
+
+    if _platform().startswith("linux"):
+        grants = _linux_grants(Path(workspace))
+        readable = [*grants["read_only"], *grants["read_write"]]
+        masked = {str(path) for path in grants["masked"]}
+        return [str(path) for path in readable if str(path) not in masked]
+    home = Path.home()
+    return [
+        str(workspace),
+        str(MEMORY_DIR),
+        f"{home}/.claude",
+        f"{home}/.claude.json",
+        f"{home}/.codex",
+        f"{home}/.cache/uv",
+        str(shim_dir()),
+        *_extra_read_paths(),
+    ]
+
+
 def agent_guidance(workspace: Path | None = None) -> str:
     """Sandbox-awareness note for the agent's system prompt, agnostic across
     backends (all of them build their prompt through build_system_prompt).
@@ -495,7 +538,6 @@ def agent_guidance(workspace: Path | None = None) -> str:
     if current == "env":
         return _ENV_GUIDANCE
     project = os.path.realpath(workspace) if workspace is not None else "the workspace"
-    home = Path.home()
     # Deferred like shim_dir(): agent imports this module, so a top-level import
     # of DATA_DIR would be a cycle. commands is deferred for the same reason, one
     # hop further out (commands -> settings -> agent -> sandbox).
@@ -513,23 +555,10 @@ def agent_guidance(workspace: Path | None = None) -> str:
     writes = (
         f"the workspace ({project}), your memory ({MEMORY_DIR}), and your temp dir."
     )
-    if settings.get("COTF_SANDBOX_FS").lower() == "deny-most":
-        # Must stay in step with the re-grants in fs-deny-most.sb. Under-listing
-        # is not harmless: the note below tells the agent not to narrow its reads,
-        # and a path missing here is one it will decline to try.
-        grants = [
-            project,
-            str(MEMORY_DIR),
-            f"{home}/.claude",
-            f"{home}/.claude.json",
-            f"{home}/.codex",
-            f"{home}/.cache/uv",
-            str(shim_dir()),
-            *_extra_read_paths(),
-        ]
+    if _deny_most_in_force():
         reads = (
             "You can read only these paths: "
-            + ", ".join(grants)
+            + ", ".join(_readable_paths(project))
             + ", and your temp dir. Reads elsewhere under your home directory are "
             "blocked."
         )
@@ -539,7 +568,18 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "the keychain, SSH private keys, cloud credentials (~/.aws/credentials), "
             "and token files (~/.npmrc, ~/.netrc, ~/.env)."
         )
-    if settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() in _TRUTHY:
+    if _platform().startswith("linux"):
+        # Accurate for the namespace: no host service beyond the brokered ones is
+        # reachable, but external hosts are, through the proxy. Saying "external
+        # hosts are blocked" here would make the agent decline work it can do.
+        net = (
+            "Your network namespace reaches only the local broker services; no other "
+            "port on the host is reachable. External hosts go through the local "
+            "egress proxy, which gates them by destination: pre-approved hosts just "
+            "work, an unknown one pauses while the operator is asked. Ports you bind "
+            "yourself are private to this session and work normally."
+        )
+    elif settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() in _TRUTHY:
         net = (
             "Outbound network reaches ONLY the local broker; other local ports and "
             "external hosts are blocked."
@@ -1011,6 +1051,27 @@ def _userns_hint(output: str) -> str:
     return _USERNS_HINT if _USERNS_SIGNATURE in output.lower() else ""
 
 
+def _log_inert_settings() -> None:
+    """Say so when a setting the operator wrote cannot take effect here.
+
+    Neither of these weakens anything (Linux is at or above the macOS posture
+    under either value), but an operator who set one and got no behaviour change
+    deserves to learn that from a log rather than from reading the source.
+    """
+    if not _platform().startswith("linux"):
+        return
+    if settings.get("COTF_SANDBOX_FS"):
+        logger.info(
+            "sandbox: sandbox.fs has no effect on Linux; a mount namespace cannot "
+            "express allow-reads, so deny-most is always in force"
+        )
+    if settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK"):
+        logger.info(
+            "sandbox: sandbox.broker_only_loopback has no effect on Linux; the "
+            "namespace only ever contains the brokered services, so it is always on"
+        )
+
+
 async def preflight() -> None:
     """Prove the jail starts and holds its egress deny, before serving anything.
 
@@ -1032,6 +1093,7 @@ async def preflight() -> None:
     """
     if mode() != "jail":
         return
+    _log_inert_settings()
     workspace = _probe_workspace()
     try:
         code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
