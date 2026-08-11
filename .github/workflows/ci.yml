@@ -57,6 +57,48 @@ jobs:
       - name: Sync dev env
         run: uv sync --locked
 
+      # Two suites run a real jail rather than asserting about argv:
+      # test_sandbox_jail_live.py (the Linux boundary) and test_sandbox_parity.py
+      # (the same contract on whichever jail the host provides). Both skip
+      # themselves when bubblewrap is absent, so without this the suite goes green
+      # having tested nothing.
+      - name: Install bubblewrap
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
+      # Ubuntu 23.10 and later gate unprivileged user namespaces behind AppArmor.
+      # The namespace is still created, so this does not look like "userns is
+      # off"; it surfaces later as bwrap being refused netlink when it brings up
+      # loopback in the new netns ("Failed RTM_NEWADDR: Operation not permitted").
+      # This is the same one-line change an operator makes on such a host, and it
+      # is recorded in docs/how-to/enable-sandboxing.md.
+      - name: Allow unprivileged user namespaces
+        run: |
+          echo "kernel: $(uname -r)"
+          echo "lsm: $(cat /sys/kernel/security/lsm 2>/dev/null)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          if bwrap --ro-bind / / --unshare-net /bin/true; then
+            echo "jail starts: yes"
+          else
+            echo "jail starts: NO (the next step will fail and say so)"
+          fi
+
+      # A skipped boundary test is indistinguishable from a passing one, which is
+      # the failure this whole subsystem is built to avoid. Runners have permitted
+      # unprivileged user namespaces so far; if that changes, this step says so
+      # instead of the suite quietly covering less than it claims.
+      - name: Linux jail and parity contracts must actually run
+        env:
+          # Turns "no jail available" from a skip into a collection error, so the
+          # suites cannot go green having tested nothing. Enforced by the test
+          # files rather than by grepping their output: a case may legitimately
+          # skip for an unrelated reason (no ssh-agent on a runner) and that must
+          # not read as an unexercised boundary.
+          COTF_REQUIRE_JAIL: "1"
+        run: |
+          uv run --no-sync pytest \
+            tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py -q -rs
+
       # A hung test must name itself. Left to the job's own `timeout-minutes`,
       # the step is *cancelled* rather than failed, and GitHub archives no log
       # for a cancelled step -- so a suite that stops making progress produces

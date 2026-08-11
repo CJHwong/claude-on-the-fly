@@ -238,6 +238,11 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+;; Per-thread writer lock directory, added by a codex release after this list
+;; was measured. Without it codex 0.147 exits before any network call with
+;; "Operation not permitted": it cannot create the coordination lock and so
+;; cannot initialise thread persistence, which is what session resume needs.
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/thread-writer-locks")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
 (allow file-write*
   (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
