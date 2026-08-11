@@ -49,7 +49,20 @@ def _why_not() -> str | None:
     return f"no jail implementation for {sys.platform}"
 
 
-pytestmark = pytest.mark.skipif(_why_not() is not None, reason=_why_not() or "")
+# Set by CI. A skipped boundary suite reads exactly like a passing one, so where
+# the jail is *expected* to work, its absence has to be an error rather than a
+# skip. Raising at import fails collection loudly and names the missing piece.
+#
+# Scoped to the mechanism, deliberately. An individual case may still skip for a
+# reason that says nothing about the boundary -- there is no ssh-agent to test
+# against on a CI runner -- and an earlier version of this guard grepped the log
+# for "skipped", which could not tell those apart and failed a run where all 29
+# real assertions had passed.
+_REASON = _why_not()
+if _REASON is not None and os.environ.get("COTF_REQUIRE_JAIL"):
+    raise RuntimeError(f"COTF_REQUIRE_JAIL is set but {_REASON}")
+
+pytestmark = pytest.mark.skipif(_REASON is not None, reason=_REASON or "")
 
 
 @dataclass(frozen=True)
