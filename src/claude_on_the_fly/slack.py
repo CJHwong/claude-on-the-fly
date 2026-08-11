@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import random
 import re
 import time
@@ -53,6 +54,17 @@ logger = logging.getLogger(__name__)
 # counter.
 DEFAULT_REPLY_SOFT_LIMIT = 10
 CONTINUE_COMMAND = "$continue"
+# The gate notice is held back this long before it is posted. Posting it the
+# instant the message arrives is what loses it: the sender is still looking at
+# the thread, Slack marks it read on arrival, and they walk away with no unread
+# badge believing the message is being worked on. A few seconds is enough for
+# them to have moved on, so the notice lands as an unread thread reply.
+DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 4.2
+# Ceiling on the debounce above, timed from the first gated message. Somebody
+# firing a message every three seconds would otherwise defer the notice for as
+# long as they kept typing, and never learn the thread is gated. Not an operator
+# setting: it is a guard on the delay, not a second thing to tune.
+REPLY_LIMIT_NOTICE_MAX_HOLD = 30.0
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
@@ -114,9 +126,39 @@ def _positive_int(name: str, fallback: int) -> int:
     return value
 
 
+def _non_negative_float(name: str, fallback: float) -> float:
+    """A duration setting, read per use. Same fallback-and-say-so contract as
+    `_positive_int`, but zero is a meaningful value (post with no delay)."""
+    raw = settings.get(name).strip()
+    if not raw:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %s", name, raw, fallback)
+        return fallback
+    if not math.isfinite(value):
+        # `float()` takes "nan" and "inf". A NaN hold survives `min()` against the
+        # ceiling -- min(nan, 30) is nan -- and `asyncio.sleep(nan)` never wakes,
+        # so the notice would be lost for every thread until a restart.
+        logger.warning("%s=%s is not a finite number; using %s", name, value, fallback)
+        return fallback
+    if value < 0:
+        logger.warning("%s=%s cannot be negative; using %s", name, value, fallback)
+        return fallback
+    return value
+
+
 def reply_soft_limit() -> int:
     """Agent replies allowed per thread before inbound messages are gated."""
     return _positive_int("SLACK_REPLY_SOFT_LIMIT", DEFAULT_REPLY_SOFT_LIMIT)
+
+
+def reply_limit_notice_seconds() -> float:
+    """Seconds to hold the gate notice back before posting it."""
+    return _non_negative_float(
+        "SLACK_REPLY_LIMIT_NOTICE_SECONDS", DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
+    )
 
 
 def session_cap() -> int:
@@ -885,6 +927,14 @@ class SlackFrontend(Frontend):
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
         self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
+        # session -> the gate notice waiting out its delay. One per thread, so a
+        # sender who fires three messages into a gated thread gets one warning.
+        self._gate_notices: dict[int, asyncio.Task[None]] = {}
+        # session -> monotonic time the notice can no longer be deferred past.
+        # Held across reschedules, which is what bounds the debounce.
+        self._gate_deadlines: dict[int, float] = {}
+        # Threads already told that a channel needs an @mention. Once each.
+        self._mention_hinted: set[int] = set()
         # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
         # button's `value` stays opaque and a subject never has to be encoded
         # into a client-supplied field.
@@ -1041,6 +1091,8 @@ class SlackFrontend(Frontend):
         self._channel_names.pop(session_id, None)
         self._session_sender_ids.pop(session_id, None)
         self._reply_counts.pop(session_id, None)
+        self._cancel_gate_notice(session_id)
+        self._mention_hinted.discard(session_id)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
         self._in_flight.pop(session_id, None)
@@ -1698,6 +1750,7 @@ class SlackFrontend(Frontend):
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
                     logger.debug("skipped: no mention of %s in text", self._user_id)
+                    await self._hint_mention_required(channel, thread_ts)
                     return
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
@@ -1857,6 +1910,9 @@ class SlackFrontend(Frontend):
         stripped = text.strip()
         if stripped == CONTINUE_COMMAND or stripped.startswith(CONTINUE_COMMAND + " "):
             self._reply_counts[session_id] = 0
+            # A notice still waiting out its delay would land after the thread
+            # has already resumed, telling the user to send what they just sent.
+            self._cancel_gate_notice(session_id)
             text = stripped[len(CONTINUE_COMMAND) :].strip()
             logger.info(
                 "slack %s/%s: reply count reset via continue", channel, thread_ts
@@ -1868,7 +1924,9 @@ class SlackFrontend(Frontend):
                 thread_ts,
                 reply_soft_limit(),
             )
-            await self._warn_reply_limit(channel, thread_ts)
+            self._schedule_reply_limit_warning(
+                session_id, channel, thread_ts, sender_id
+            )
             return
 
         thread_context = ""
@@ -1958,6 +2016,8 @@ class SlackFrontend(Frontend):
                 await self._ingest_event(msg)
 
     async def stop(self) -> None:
+        for session_id in list(self._gate_notices):
+            self._cancel_gate_notice(session_id)
         if self._handler:
             await self._handler.close_async()
 
@@ -2076,10 +2136,109 @@ class SlackFrontend(Frontend):
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
 
-    async def _warn_reply_limit(self, channel: str, thread_ts: str | None) -> None:
-        """Tell the user the thread hit the reply soft-limit and how to resume."""
+    def _schedule_reply_limit_warning(
+        self,
+        session_id: int,
+        channel: str,
+        thread_ts: str | None,
+        sender_id: str,
+    ) -> None:
+        """Queue the gate notice, held back by `reply_limit_notice_seconds`.
+
+        Deliberately not awaited by the caller: the message is already gated, and
+        sitting on the delay inside `_ingest_event` would stall the events behind
+        it (`_catchup` ingests serially).
+
+        Each further gated message restarts the wait (debounce), so the quiet gap
+        falls after the sender stopped typing instead of in the middle of their
+        burst — a notice that lands mid-burst is read on arrival, which is the
+        whole failure this delay exists to avoid. `REPLY_LIMIT_NOTICE_MAX_HOLD`
+        keeps a fast talker from deferring it forever: the ceiling is set by the
+        *first* gated message and survives every reschedule.
+        """
+        deadline = self._gate_deadlines.setdefault(
+            session_id, time.monotonic() + REPLY_LIMIT_NOTICE_MAX_HOLD
+        )
+        self._drop_gate_task(session_id)
+        self._gate_notices[session_id] = asyncio.create_task(
+            self._warn_reply_limit_later(
+                session_id, channel, thread_ts, sender_id, deadline
+            )
+        )
+
+    def _drop_gate_task(self, session_id: int) -> None:
+        """Cancel a pending notice, leaving its ceiling in place for a reschedule."""
+        task = self._gate_notices.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _cancel_gate_notice(self, session_id: int) -> None:
+        """Drop a pending notice and forget the thread's ceiling with it."""
+        self._drop_gate_task(session_id)
+        self._gate_deadlines.pop(session_id, None)
+
+    async def _warn_reply_limit_later(
+        self,
+        session_id: int,
+        channel: str,
+        thread_ts: str | None,
+        sender_id: str,
+        deadline: float,
+    ) -> None:
+        try:
+            hold = min(
+                reply_limit_notice_seconds(),
+                max(0.0, deadline - time.monotonic()),
+            )
+            await asyncio.sleep(hold)
+        finally:
+            # Deregister before posting, not after: while this task is still the
+            # thread's notice, the next gated message cancels it, and a cancel
+            # landing inside `chat_postMessage` aborts the request with the
+            # notice half-sent. Only clean up if this task is still the thread's
+            # notice — a debounce cancels us *after* the replacement is stored,
+            # and popping blind would throw away that reschedule.
+            if self._gate_notices.get(session_id) is asyncio.current_task():
+                self._gate_notices.pop(session_id, None)
+                self._gate_deadlines.pop(session_id, None)
+        await self._warn_reply_limit(channel, thread_ts, sender_id)
+
+    async def _hint_mention_required(self, channel: str, thread_ts: str | None) -> None:
+        """Say once, in a thread the bot is already in, that a channel message
+        without a tag is invisible to it.
+
+        Scoped to threads with a live session because those are the ones where
+        somebody is talking *to* the bot and the missing tag is a slip. Without
+        that check this fires on ordinary channel chatter the bot was never part
+        of. Sent from inside the channel/group branch, so a DM (where no tag is
+        needed) can never reach it.
+        """
+        session_id = _session_key(channel, thread_ts)
+        if session_id not in self._sessions or session_id in self._mention_hinted:
+            return
+        self._mention_hinted.add(session_id)
+        logger.info(
+            "slack %s/%s: hinted that a channel needs a tag", channel, thread_ts
+        )
+        await self._post_notice(
+            channel,
+            thread_ts,
+            f"In a channel I only see messages that tag me. Add <@{self._user_id}> "
+            "and I'll pick it up.",
+        )
+
+    async def _warn_reply_limit(
+        self, channel: str, thread_ts: str | None, sender_id: str = ""
+    ) -> None:
+        """Tell the user the thread hit the reply soft-limit and how to resume.
+
+        Addressed to the sender when there is one, so it arrives as a real
+        notification rather than a thread reply Slack can mark read on arrival.
+        A trusted bot has no user id, hence the plain form.
+        """
+        who = f"<@{sender_id}> " if sender_id else ""
         note = (
-            f"Hit the {reply_soft_limit()}-message limit for this thread. "
+            f"{who}Hit the {reply_soft_limit()}-message limit for this thread. "
             f"Reply `{CONTINUE_COMMAND}` to keep going, or "
             f"`{CONTINUE_COMMAND} <your next message>` to continue and ask in one go."
         )
