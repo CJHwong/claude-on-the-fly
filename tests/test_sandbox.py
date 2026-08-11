@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,7 @@ def test_wrap_jail_builds_sandbox_exec(monkeypatch, tmp_path):
     monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     out = sandbox.wrap(["claude", "-p"], tmp_path)
     assert out[0] == "sandbox-exec"
     assert "-f" in out and str(sandbox._JAIL_PROFILE) in out
@@ -132,12 +134,27 @@ def test_wrap_jail_builds_sandbox_exec(monkeypatch, tmp_path):
     assert out[-2:] == ["claude", "-p"]
 
 
-def test_wrap_jail_degrades_without_sandbox_exec(monkeypatch):
+def test_wrap_jail_refuses_without_sandbox_exec(monkeypatch):
+    """A configured jail that cannot apply must fail, not quietly run unjailed.
+
+    This used to hand back the bare argv, on the reading that a missing
+    sandbox-exec meant "not macOS". With a Linux jail that reading is gone, and
+    what is left is a turn running with no sandbox because of a warning nobody
+    reads until afterwards.
+    """
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     monkeypatch.setattr(shutil, "which", lambda _name: None)
-    argv = ["claude", "-p"]
-    # No sandbox-exec (non-macOS) degrades to bare argv; env is still curated.
-    assert sandbox.wrap(argv, Path("/w")) == argv
+    with pytest.raises(sandbox.SandboxBoundaryError, match="sandbox-exec"):
+        sandbox.wrap(["claude", "-p"], Path("/w"))
+
+
+def test_wrap_jail_refuses_on_linux_without_bwrap(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="bubblewrap"):
+        sandbox.wrap(["codex", "exec"], Path("/w"))
 
 
 def test_vendored_profiles_present():
@@ -164,6 +181,7 @@ def test_guidance_env_mode_only_mentions_curation(monkeypatch):
 
 def test_guidance_jail_covers_all_denial_scenarios(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
     text = sandbox.agent_guidance(tmp_path)
@@ -229,6 +247,7 @@ def test_wrap_deny_most_passes_capped_extra_paths(monkeypatch, tmp_path):
     # Four grants supplied; only three fit (SBPL has no arrays).
     monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", "/a:/b:/c:/d")
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     out = sandbox.wrap(["claude"], tmp_path)
     assert f"_BASE={sandbox._DENY_MOST_PROFILE}" in out
     extras = [a for a in out if a.startswith("_EXTRA_")]
@@ -247,6 +266,7 @@ def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
     monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     out = sandbox.wrap(["claude"], tmp_path)
     project = str(tmp_path.resolve())
     # No grants => all three slots resolve to the (already-allowed) project dir.
@@ -367,6 +387,7 @@ def test_wrap_jail_passes_three_loopback_slots(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     out = sandbox.wrap(["claude"], tmp_path)
     for param in ("_LOOPBACK=", "_LOOPBACK_ALT=", "_LOOPBACK_ALT2="):
         assert any(a.startswith(param) for a in out), param
@@ -454,10 +475,37 @@ def test_guidance_warns_keychain_denial_is_not_an_eperm(monkeypatch, tmp_path):
     not be found", not EPERM, so an agent taught EPERM-means-policy would read
     it as "the credential does not exist" and hunt for it elsewhere."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
     text = sandbox.agent_guidance(tmp_path)
     assert "could not be found" in text
     assert "does not exist" in text
+
+
+def test_guidance_teaches_the_linux_signatures_not_the_macos_ones(
+    monkeypatch, tmp_path
+):
+    """The errno lesson inverts across platforms, so shipping one text would be
+    actively wrong on the other.
+
+    Measured against a live bubblewrap jail: a denied read reports "No such file
+    or directory" because the path is never mounted, and a denied write reports
+    "Read-only file system". An agent taught the seatbelt story would read the
+    first as "this file does not exist on the machine" and go looking elsewhere,
+    which is the exact failure the macOS keychain bullet exists to prevent.
+    """
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    text = sandbox.agent_guidance(tmp_path)
+    assert "No such file or directory" in text
+    assert "Read-only file system" in text
+    assert "do not go looking for it elsewhere" in text
+    # The seatbelt-only wording must not leak onto Linux.
+    assert "Operation not permitted" not in text
+    assert "security find-generic-password" not in text
+    # D-Bus is the Linux keychain path, and it is gone with /run.
+    assert "D-Bus" in text
 
 
 def test_guidance_separates_read_scope_from_write_scope(monkeypatch, tmp_path):
@@ -549,7 +597,10 @@ def test_jail_spawn_is_logged(monkeypatch, tmp_path, caplog):
     # not sandbox-exec's presence, so there is no reason for this one to be
     # platform-gated.
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
-    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    # The record comes from sandbox_macos now: the seatbelt argv builder moved
+    # there, and the log line moved with the code that emits it.
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox_macos"):
         sandbox.wrap(["/bin/echo", "hi"], tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "sandbox: jailed echo" in logged
@@ -624,7 +675,32 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     assert f"0/{len(sandbox._DENY_PROBES)} probed" in logged
 
 
-async def test_broken_profile_is_not_reported_as_absent(monkeypatch, tmp_path, caplog):
+@pytest.fixture
+def probe_paths_exist():
+    """Put every credential path the deny probes look for on disk.
+
+    The probes settle absent-versus-denied from *outside* the jail now, because
+    bubblewrap hides a path by not mounting it and the resulting "No such file or
+    directory" is indistinguishable from the file never having been there. A spec
+    that is not on disk is therefore answered ABSENT without spawning anything,
+    so a test asserting on probe behaviour has to create the files first.
+    """
+    created = []
+    for spec in sandbox._deny_probe_specs():
+        path = Path(os.path.expanduser(spec))
+        if path.exists():
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("probe fixture\n")
+        created.append(path)
+    yield
+    for path in created:
+        path.unlink(missing_ok=True)
+
+
+async def test_broken_profile_is_not_reported_as_absent(
+    monkeypatch, tmp_path, caplog, probe_paths_exist
+):
     """A profile that will not parse is a hard failure, not a missing file.
 
     The first version of verify_denials reported it as six "absent" paths, which
@@ -661,6 +737,7 @@ def test_home_param_is_realpathed(monkeypatch, tmp_path):
     linked_home = tmp_path / "linked-home"
     linked_home.symlink_to(real_home)
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     monkeypatch.setenv("HOME", str(linked_home))
     monkeypatch.setattr(sandbox.shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
     argv = sandbox.wrap(["/bin/echo", "hi"], tmp_path)
@@ -680,6 +757,7 @@ def test_data_dir_param_is_realpathed(monkeypatch, tmp_path):
     linked = tmp_path / "linked-data"
     linked.symlink_to(real)
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", linked)
     monkeypatch.setattr(sandbox.shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
     argv = sandbox.wrap(["/bin/echo", "hi"], tmp_path)
@@ -806,7 +884,7 @@ class TestInertWhenOff:
 
 
 async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
-    monkeypatch, tmp_path, caplog
+    monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
     """Not an outcome: a probe that never ran is evidence about the probe, not
     about the boundary, so it must not land in the results dict at all."""
@@ -822,7 +900,7 @@ async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
 
 
 async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
-    monkeypatch, tmp_path, caplog
+    monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
     """These run on the daemon's startup path, before it serves anything."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -852,7 +930,7 @@ async def _immediate_timeout(awaitable, timeout=None):
 
 
 async def test_a_readable_credential_path_is_an_error_not_a_pass(
-    monkeypatch, tmp_path, caplog
+    monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
     """The one outcome that means the boundary is not in force. It cannot be
     produced on a correctly configured machine, so it is faked here rather than
@@ -882,7 +960,9 @@ async def test_a_readable_credential_path_is_an_error_not_a_pass(
     assert "confirmed denied" not in logged
 
 
-async def test_probes_run_concurrently_not_one_after_another(monkeypatch, tmp_path):
+async def test_probes_run_concurrently_not_one_after_another(
+    monkeypatch, tmp_path, probe_paths_exist
+):
     """Six independent subprocesses, each with its own 15s ceiling, on the
     daemon's startup path. In sequence the worst case was a minute and a half of a
     daemon that had not begun serving."""
@@ -1220,3 +1300,201 @@ def test_an_unset_sandbox_mode_is_silent(monkeypatch, caplog):
     with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
         assert sandbox.mode() == "off"
     assert caplog.text == ""
+
+
+# --- Linux jail: grants, wrapping, relay, preflight ---
+
+
+@pytest.fixture
+def linux(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+
+def test_extra_paths_are_uncapped_on_linux(monkeypatch):
+    """The cap is a seatbelt artifact -- SBPL has no arrays -- so carrying it onto
+    a mount namespace would be inventing a limit to look consistent."""
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", "/a:/b:/c:/d:/e")
+    assert len(sandbox._extra_read_paths(cap=None)) == 5
+    assert len(sandbox._extra_read_paths()) == sandbox._MAX_EXTRA_PATHS
+
+
+def test_linux_grants_hide_the_data_dir_and_keep_memory(tmp_path):
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    home = Path(os.path.realpath(Path.home()))
+    assert home in grants["opaque"]
+    resolved = [Path(os.path.realpath(p)) for p in grants["opaque"]]
+    assert Path(os.path.realpath(agent.DATA_DIR)) in resolved
+    # memory/ is re-granted deeper than the opaque data dir, so the sibling .env
+    # and logs/ stay hidden while the agent's memory stays writable.
+    assert Path(os.path.realpath(agent.MEMORY_DIR)) in grants["read_write"]
+
+
+def test_linux_grants_protect_what_codex_executes_or_is_told(tmp_path):
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    assert codex in grants["read_write"], "writable so codex can create its own state"
+    for name in (
+        "config.toml",
+        "hooks.json",
+        "AGENTS.md",
+        "rules",
+        "plugins",
+        "agents",
+    ):
+        assert codex / name in grants["write_denied"]
+
+
+def test_linux_wrap_grants_the_backend_binarys_directory(linux, tmp_path, monkeypatch):
+    """$HOME is an opaque tmpfs, so an npm-global or ~/bin backend vanishes and the
+    spawn dies with "No such file or directory: codex" before any policy runs."""
+    fake = tmp_path / "opt" / "bin" / "codex"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(fake) if name == "codex" else "/usr/bin/bwrap"
+    )
+    out = sandbox.wrap(["codex", "exec"], tmp_path / "ws")
+    assert str(fake.parent) in out
+    assert out[0] == "bwrap"
+    assert out[-2:] == ["codex", "exec"]
+
+
+def test_linux_wrap_materialises_project_write_denies(linux, tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sandbox.wrap(["codex"], workspace)
+    assert (workspace / ".mcp.json").read_text() == "{}\n"
+    assert (workspace / ".vscode").is_dir()
+
+
+async def test_session_relay_is_inert_off_linux(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    relay = await sandbox.open_session_relay(
+        {"HTTPS_PROXY": "http://127.0.0.1:1/"}, "chat"
+    )
+    await relay.close()  # always safe, whatever the platform
+
+
+async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog):
+    """A jail the agent cannot reach any host service from is working, not broken
+    -- but it is never what a deployment wants, so it must not pass silently."""
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        relay = await sandbox.open_session_relay({}, "chat")
+    await relay.close()
+    assert "no brokered loopback port" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+async def test_session_relay_bridges_the_ports_from_the_overrides(linux, monkeypatch):
+    """Ports come from the overrides about to be published, not os.environ: a
+    per-session egress proxy lives only in the ContextVar."""
+    # sun_path caps out near 104 bytes and the fake home used by these tests is
+    # already most of that, so point the relay at a short directory.
+    with tempfile.TemporaryDirectory(dir="/tmp") as short:
+        monkeypatch.setattr(agent, "DATA_DIR", Path(short))
+        relay = await sandbox.open_session_relay(
+            {"HTTPS_PROXY": "http://127.0.0.1:19099/"}, "chat"
+        )
+        try:
+            assert sandbox._SESSION_SOCKETS.get() == {
+                19099: relay._relay.sockets[19099]
+            }
+        finally:
+            await relay.close()
+        assert sandbox._SESSION_SOCKETS.get() is None
+
+
+async def test_preflight_is_a_noop_when_not_jailed(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    await sandbox.preflight()
+
+
+async def test_preflight_refuses_when_the_jail_cannot_run(linux, monkeypatch):
+    async def broken(argv, workspace, timeout=20):
+        return 1, "bwrap: No permissions to creating new namespace"
+
+    monkeypatch.setattr(sandbox, "_run_jailed", broken)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="trivial command"):
+        await sandbox.preflight()
+
+
+async def test_preflight_refuses_when_egress_is_open(linux, monkeypatch):
+    """The load-bearing claim of the design is that the egress proxy cannot be
+    bypassed. Until this existed, nothing checked it on either platform."""
+
+    async def leaky(argv, workspace, timeout=20):
+        return (0, "cotf") if "echo" in argv[0] else (0, "REACHED")
+
+    monkeypatch.setattr(sandbox, "_run_jailed", leaky)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="reached the internet"):
+        await sandbox.preflight()
+
+
+async def test_preflight_refuses_an_inconclusive_egress_probe(linux, monkeypatch):
+    async def mute(argv, workspace, timeout=20):
+        return (0, "cotf") if "echo" in argv[0] else (1, "ModuleNotFoundError")
+
+    monkeypatch.setattr(sandbox, "_run_jailed", mute)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="inconclusive"):
+        await sandbox.preflight()
+
+
+async def test_preflight_passes_when_the_jail_holds(linux, monkeypatch, caplog):
+    async def healthy(argv, workspace, timeout=20):
+        return (
+            (0, "cotf") if "echo" in argv[0] else (1, "BLOCKED:Network is unreachable")
+        )
+
+    monkeypatch.setattr(sandbox, "_run_jailed", healthy)
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        await sandbox.preflight()
+    assert "preflight ok" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("boom", [OSError("no exec"), TimeoutError()])
+async def test_preflight_reports_a_probe_that_could_not_run(linux, monkeypatch, boom):
+    async def raiser(argv, workspace, timeout=20):
+        raise boom
+
+    monkeypatch.setattr(sandbox, "_run_jailed", raiser)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="could not run"):
+        await sandbox.preflight()
+
+
+async def test_egress_preflight_failure_is_distinguished(linux, monkeypatch):
+    async def half(argv, workspace, timeout=20):
+        if "echo" in argv[0]:
+            return 0, "cotf"
+        raise TimeoutError()
+
+    monkeypatch.setattr(sandbox, "_run_jailed", half)
+    with pytest.raises(
+        sandbox.SandboxBoundaryError, match="egress preflight could not run"
+    ):
+        await sandbox.preflight()
+
+
+async def test_an_absent_path_is_absent_without_spawning_anything(
+    monkeypatch, tmp_path
+):
+    """bubblewrap hides a path by not mounting it, so a denied read reports "No
+    such file or directory" -- identical to a missing file. Settling that outside
+    the jail is what keeps DENIED and ABSENT distinguishable."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+
+    async def must_not_spawn(*_a, **_k):
+        raise AssertionError("probed a path that is not on this machine")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", must_not_spawn)
+    assert await sandbox._probe_deny(str(tmp_path / "nope"), tmp_path) == sandbox.ABSENT
+
+
+def test_probe_workspace_is_scratch_not_the_daemons_cwd():
+    """The Linux jail materialises .mcp.json and .vscode/ in whatever workspace it
+    is handed, so probing in cwd would leave those in somebody's checkout."""
+    assert sandbox._probe_workspace().is_dir()
+    assert agent.DATA_DIR in sandbox._probe_workspace().parents

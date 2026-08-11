@@ -65,6 +65,33 @@ Codex requires the hook trust bypass because inline hooks have no persisted trus
 Seatbelt therefore denies writes to Codex execution-control paths and re-grants only the
 runtime paths measured as necessary.
 
+## Linux jail
+
+`sandbox_linux.py` builds bubblewrap argv; `sandbox.py` owns which paths, beside the
+Seatbelt profile selection. The mechanisms differ in ways that reach the rest of the
+system, so they are worth stating rather than discovering:
+
+- A denied read reports `ENOENT` and a denied write `EROFS`, where Seatbelt reports
+  `EPERM` for both. `agent_guidance` therefore ships per-platform error text, and
+  `_probe_deny` settles absent-versus-denied by stat'ing outside the jail first: a
+  hidden path and a missing one are character-identical from inside.
+- Mounts are ordered by path depth, not by argument order, so a read grant on a parent
+  cannot re-expose an opaque child.
+- A tmpfs is writable, so each opaque path is remounted read-only in a trailing pass.
+  It has to be trailing: an early remount leaves bwrap unable to create the mount
+  points beneath it.
+- Write denies need something to mount over, so absent ones are materialised on the
+  host first. The stand-in must parse as whatever reads it, which is why there is an
+  empty-JSON placeholder as well as an empty file.
+- `~/.codex` is writable with its execution-control entries mounted read-only back over
+  it, inverting the Seatbelt posture. Seatbelt's sqlite regex matches files that do not
+  exist yet; a mount namespace cannot, and codex creates `state_N.sqlite` on first run.
+
+`netns_relay.py` bridges the brokered loopback ports into the namespace over unix
+sockets, one per port, same port number on both ends so published URLs need no
+rewriting. It fails closed: `--unshare-net` leaves no route anywhere, and only what the
+relay bridges exists. A port mapper would fail open, which is why one is not used.
+
 ## Verification invariants
 
 - Every failure path denies.
@@ -74,6 +101,16 @@ runtime paths measured as necessary.
 - Shim transport timeout exceeds the broker answer window.
 - `sandbox.verify_denials` probes credential paths because macOS exposes no useful
   Seatbelt denial audit stream.
+- `sandbox.preflight` proves the jail starts and refuses external egress before the
+  daemon serves. `verify_denials` alone cannot: it settles absent-versus-denied outside
+  the jail, so on a machine with none of the probed credentials it spawns nothing.
+- A missing or unusable mechanism is fatal on both platforms.
 
-Tests for these invariants live in `test_sandbox.py`, `test_approvals.py`,
-`test_permissions.py`, `test_cotf_approve.py`, and `test_orchestrator.py`.
+Tests for these invariants live in `test_sandbox.py`, `test_sandbox_linux.py`,
+`test_netns_relay.py`, `test_approvals.py`, `test_permissions.py`, `test_cotf_approve.py`,
+and `test_orchestrator.py`.
+
+`test_sandbox_jail_live.py` is the only suite that runs the argv rather than asserting
+about it, and so the only one that answers whether the kernel actually refuses. It skips
+where bubblewrap or user namespaces are absent, and CI fails on a skip rather than
+counting it green.

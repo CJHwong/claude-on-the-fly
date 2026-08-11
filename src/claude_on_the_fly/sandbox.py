@@ -22,10 +22,11 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 from contextvars import ContextVar, Token
 from pathlib import Path
 
-from claude_on_the_fly import settings
+from claude_on_the_fly import sandbox_linux, sandbox_macos, settings
 
 logger = logging.getLogger(__name__)
 
@@ -99,34 +100,88 @@ _SESSION_ENV: ContextVar[dict[str, str] | None] = ContextVar(
 )
 
 
+# The Linux relay's unix sockets for this turn, port -> host socket path. A
+# ContextVar for the same reason as _SESSION_ENV: the spawn is several frames
+# below the orchestrator, and a per-session value must not reach another session.
+# Empty on macOS, where seatbelt reaches the host's loopback directly and there
+# is nothing to bridge.
+_SESSION_SOCKETS: ContextVar[dict[int, Path] | None] = ContextVar(
+    "cotf_session_sockets", default=None
+)
+
+
 def session_env(values: dict[str, str]) -> Token[dict[str, str] | None]:
     """Layer `values` onto agent_env() for this task's turn. Reset with the token."""
     return _SESSION_ENV.set(values)
+
+
+class SessionRelay:
+    """Per-turn handle for the Linux netns bridge. A no-op on macOS.
+
+    The orchestrator holds one of these across a turn so the platform difference
+    stays here rather than in the turn loop: `open_session_relay` decides whether
+    anything is needed at all, and `close` is always safe to call.
+    """
+
+    def __init__(
+        self, relay: object | None, token: Token[dict[int, Path] | None] | None
+    ):
+        self._relay = relay
+        self._token = token
+
+    async def close(self) -> None:
+        if self._token is not None:
+            _SESSION_SOCKETS.reset(self._token)
+        if self._relay is not None:
+            await self._relay.stop()  # ty: ignore[unresolved-attribute]
+
+
+async def open_session_relay(overrides: dict[str, str], key: str) -> SessionRelay:
+    """Bridge the host's brokered loopback ports into this turn's namespace.
+
+    Returns an inert handle unless this is a Linux jail. The ports come from the
+    same `_loopback_ports` the seatbelt profile uses, computed against the
+    overrides the caller is about to publish -- so a per-session egress proxy is
+    included, which reading os.environ alone would miss.
+    """
+    if mode() != "jail" or not _platform().startswith("linux"):
+        return SessionRelay(None, None)
+    from claude_on_the_fly.agent import DATA_DIR
+    from claude_on_the_fly.netns_relay import LoopbackRelay
+
+    env_token = _SESSION_ENV.set(overrides)
+    try:
+        ports = [int(port) for port in _loopback_ports()]
+    finally:
+        _SESSION_ENV.reset(env_token)
+    if not ports:
+        # Nothing to bridge means the agent reaches no host service at all. That
+        # is a working jail, not a broken one, but it is never what a deployment
+        # wants, so it must not pass silently.
+        logger.warning(
+            "sandbox: no brokered loopback port for this turn; the agent will "
+            "reach no host service from inside the namespace"
+        )
+        return SessionRelay(None, None)
+    relay = LoopbackRelay(DATA_DIR / "relay" / key)
+    sockets = await relay.start(ports)
+    return SessionRelay(relay, _SESSION_SOCKETS.set(sockets))
 
 
 def reset_session_env(token: Token[dict[str, str] | None]) -> None:
     _SESSION_ENV.reset(token)
 
 
-# Seatbelt profiles vendored from agent-seatbelt (see docs/agent/broker.md).
-# The jail profile imports the base via the _BASE param.
-_SEATBELT_DIR = Path(__file__).parent / "seatbelt"
-_BASE_PROFILE = _SEATBELT_DIR / "fs-allow-reads.sb"
-_DENY_MOST_PROFILE = _SEATBELT_DIR / "fs-deny-most.sb"
-_JAIL_PROFILE = _SEATBELT_DIR / "jail.sb"
-
-# SBPL has no arrays, so operator read grants are a fixed, documented cap.
-_MAX_EXTRA_PATHS = 3
-# Default loopback allow: every loopback port (agent dev servers/tests work).
-_DEFAULT_LOOPBACK = "localhost:*"
-# Fixed loopback allow slots in the jail profile, since SBPL has no arrays. One
-# each for the credential broker, the egress proxy, and the command broker.
-# Four because SBPL has no arrays: each loopback grant is a separate parameter, so
-# the profile has to declare a fixed number of slots. The services are the
-# credential broker, the command broker, the CONNECT egress proxy, and -- when
-# permissions mode is `ask` -- the approval service the backends ask about tool
-# calls. A fifth service would need a fifth slot here and in both profiles.
-_LOOPBACK_SLOTS = 4
+# Re-exported from sandbox_macos so the seatbelt profile paths and the SBPL slot
+# caps have one home. They stay reachable under their old names here because the
+# shared layer still reports them: the startup log names the profile in force and
+# `_extra_read_paths` defaults to the cap.
+_BASE_PROFILE = sandbox_macos._BASE_PROFILE
+_DENY_MOST_PROFILE = sandbox_macos._DENY_MOST_PROFILE
+_JAIL_PROFILE = sandbox_macos._JAIL_PROFILE
+_MAX_EXTRA_PATHS = sandbox_macos._MAX_EXTRA_PATHS
+_DEFAULT_LOOPBACK = sandbox_macos._DEFAULT_LOOPBACK
+_LOOPBACK_SLOTS = sandbox_macos._LOOPBACK_SLOTS
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # Backend-agnostic sandbox note appended to the system prompt (see
@@ -141,17 +196,14 @@ secrets in the environment or try to read them from it."""
 
 _JAIL_GUIDANCE = """## Sandbox
 
-This session runs under a macOS seatbelt sandbox with a credential broker. Some \
+This session runs under {mechanism} with a credential broker. Some \
 operations are blocked by policy. A policy block is not a transient error and \
 cannot be worked around with chmod, sudo, or retrying: the only fix is an \
 operator configuration change. When you hit one, tell the user the specific \
 change needed, then continue with whatever you can still do.
 
 Telling a policy block from a real error:
-- "Operation not permitted" (EPERM) means sandbox policy (the target is outside \
-your allowed set).
-- "Permission denied" (EACCES) means a genuine file-permission problem, not the \
-sandbox.
+{errors}
 - A network call that cannot connect or resolve, an error tagged "[sandbox] ... \
 egress policy", or an HTTP 451 means egress policy. For HTTPS the message arrives \
 as a proxy/tunnel error whose status line carries the reason, e.g. "403 Forbidden \
@@ -170,21 +222,16 @@ If policy blocks it you get a clear error and can report that; declining without
 trying tells the user nothing about what is actually possible.
 
 Common blocked scenarios and the remedy to relay to the user:
-- Reading a file outside the allowed set (e.g. `cat ~/.aws/credentials`) fails \
-with "Operation not permitted". Remedy: the operator adds the path to \
-`sandbox.extra_paths`.
-- Writing a file outside the workspace fails with "Operation not permitted". \
-Remedy: the operator widens the sandbox write profile.
+- Reading a file outside the allowed set (e.g. `cat ~/.aws/credentials`) \
+{block_read}. Remedy: the operator adds the path to `sandbox.extra_paths`.
+- Writing a file outside the workspace {block_write}. Remedy: the operator \
+widens the sandbox write profile.
 - Reaching an external host that is not yet approved pauses while the operator \
 is asked, then either succeeds or returns 403 with an "[sandbox] egress policy" \
 body. A 403 means they declined: say which host you needed and why, then carry \
 on with what you can. Do not retry in a loop, and do not look for another route \
 to the same host.
-- Reading the keychain (e.g. `security find-generic-password`) is denied, but it \
-reports as "The specified item could not be found" rather than "Operation not \
-permitted". Do not read that as "the credential does not exist" and do not go \
-looking for it elsewhere: the item may well exist and you are simply not \
-permitted to see it. You do not need it; credentials are injected by the broker.
+{keychain}
 - {brokered} A credentialed CLI that is not on that list will fail on its own \
 config or token file, because the sandbox denies credential stores. That is \
 policy, not a broken install, and the remedy is NOT a read grant: adding the \
@@ -194,6 +241,44 @@ of {settings_path}. Report which command you needed and stop there — do not lo
 for the credential yourself, and do not reach the same service by another route \
 (a different host, another tool's token, a provider-side integration). Doing that \
 launders the boundary rather than respecting it."""
+
+
+# How a policy block actually reads, per platform. Both sets are measured against
+# a live jail, not inferred: seatbelt refuses in place, so the path still exists
+# and the errno is EPERM; bubblewrap denies by never mounting the path, so the
+# read fails as if the file were not there, and a blocked write lands on a
+# read-only mount instead. Telling the agent the macOS story on Linux would send
+# it hunting for a file it was simply not shown.
+_MACOS_ERRORS = """\
+- "Operation not permitted" (EPERM) means sandbox policy (the target is outside \
+your allowed set).
+- "Permission denied" (EACCES) means a genuine file-permission problem, not the \
+sandbox."""
+
+_LINUX_ERRORS = """\
+- "No such file or directory" for a path you have good reason to think exists \
+means sandbox policy: files outside your allowed set are not hidden behind an \
+error, they are simply absent from your view of the filesystem. Do not conclude \
+the file does not exist on the machine, and do not go looking for it elsewhere.
+- "Read-only file system" (EROFS) means sandbox policy: the location is outside \
+your write set.
+- "Permission denied" (EACCES) means a genuine file-permission problem, not the \
+sandbox."""
+
+_MACOS_KEYCHAIN = """\
+- Reading the keychain (e.g. `security find-generic-password`) is denied, but it \
+reports as "The specified item could not be found" rather than "Operation not \
+permitted". Do not read that as "the credential does not exist" and do not go \
+looking for it elsewhere: the item may well exist and you are simply not \
+permitted to see it. You do not need it; credentials are injected by the broker."""
+
+_LINUX_KEYCHAIN = """\
+- The desktop credential stores (gnome-keyring, kwallet, anything via libsecret \
+or `secret-tool`) are unreachable: they are reached over the D-Bus session bus, \
+and this session has no bus. Expect "Cannot autolaunch D-Bus without X11" or a \
+connection error rather than a permission error, and do not read it as "no \
+credential is stored". You do not need one; credentials are injected by the \
+broker."""
 
 
 def mode() -> str:
@@ -318,14 +403,6 @@ def _with_shims_on_path(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _fs_base_profile() -> Path:
-    """Filesystem base that jail.sb imports. `sandbox.fs: deny-most` selects
-    fs-deny-most.sb; anything else keeps fs-allow-reads.sb (the default)."""
-    if settings.get("COTF_SANDBOX_FS").lower() == "deny-most":
-        return _DENY_MOST_PROFILE
-    return _BASE_PROFILE
-
-
 def _port_from_url(value: str) -> str | None:
     """Loopback port out of a http://127.0.0.1:<port>... URL, or None."""
     if not value.startswith("http://127.0.0.1:"):
@@ -370,54 +447,36 @@ def _loopback_ports() -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _fs_base_profile() -> Path:
+    """The seatbelt base in force. Shared because the startup log and the agent's
+    own guidance both name it, on either platform."""
+    return sandbox_macos._fs_base_profile()
+
+
 def _loopback_specs() -> tuple[str, str, str, str]:
-    """The remote-ip values for the jail's loopback allows, one per slot.
+    """This turn's loopback allows. Resolves the ports here and hands them to the
+    profile builder, which stays pure."""
+    return sandbox_macos._loopback_specs(_loopback_ports())
 
-    Narrows to just the local services the agent was handed when
-    `sandbox.broker_only_loopback` is set, closing the arbitrary-local-sink
-    path. Every slot is always filled because SBPL has no arrays: spare slots
-    repeat the first port, which is a harmless duplicate allow. If no port is
-    known at all, loopback stays open rather than locking the agent out of a
-    service it needs.
 
-    A port past _LOOPBACK_SLOTS would be silently unreachable, so that case warns
-    loudly instead — the same fixed-slot trade as `sandbox.extra_paths`.
+def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
+    """Operator read grants for deny-most, from `sandbox.extra_paths`, realpath'd.
+
+    `cap` is the seatbelt slot limit. Linux passes None: the cap exists only
+    because SBPL has no arrays, and a mount namespace takes a list of any length.
+    Carrying the limit onto a platform that does not have it would be inventing a
+    restriction to look consistent.
     """
-    if settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() not in _TRUTHY:
-        return (_DEFAULT_LOOPBACK,) * _LOOPBACK_SLOTS  # ty: ignore[invalid-return-type]
-    ports = _loopback_ports()
-    if not ports:
-        logger.warning(
-            "sandbox.broker_only_loopback set but no broker base-url, "
-            "HTTPS_PROXY, COTF_CMD_ENDPOINT, or COTF_APPROVE_URL in env; "
-            "leaving loopback open"
-        )
-        return (_DEFAULT_LOOPBACK,) * _LOOPBACK_SLOTS  # ty: ignore[invalid-return-type]
-    if len(ports) > _LOOPBACK_SLOTS:
-        logger.warning(
-            "%d loopback services but only %d profile slots; %s would be "
-            "unreachable. Turn off sandbox.broker_only_loopback or add a slot.",
-            len(ports),
-            _LOOPBACK_SLOTS,
-            ports[_LOOPBACK_SLOTS:],
-        )
-    specs = [f"localhost:{port}" for port in ports[:_LOOPBACK_SLOTS]]
-    specs += [specs[0]] * (_LOOPBACK_SLOTS - len(specs))
-    return specs[0], specs[1], specs[2], specs[3]
-
-
-def _extra_read_paths() -> list[str]:
-    """Operator read grants for deny-most, from `sandbox.extra_paths`,
-    realpath'd and capped at _MAX_EXTRA_PATHS."""
     paths = [p for p in settings.get("COTF_SANDBOX_EXTRA_PATHS").split(":") if p]
-    if len(paths) > _MAX_EXTRA_PATHS:
+    if cap is not None and len(paths) > cap:
         logger.warning(
             "sandbox.extra_paths has %d entries; granting only the first %d "
             "(seatbelt has no arrays)",
             len(paths),
-            _MAX_EXTRA_PATHS,
+            cap,
         )
-    return [os.path.realpath(p) for p in paths[:_MAX_EXTRA_PATHS]]
+        paths = paths[:cap]
+    return [os.path.realpath(p) for p in paths]
 
 
 def agent_guidance(workspace: Path | None = None) -> str:
@@ -492,95 +551,287 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "pauses the request while the operator is asked to approve it, so a "
             "first call to a new host may take up to a minute."
         )
+    linux = _platform().startswith("linux")
     return _JAIL_GUIDANCE.format(
+        mechanism=(
+            "a Linux bubblewrap sandbox in its own network namespace"
+            if linux
+            else "a macOS seatbelt sandbox"
+        ),
+        block_read=(
+            'reports "No such file or directory" even though the file is there'
+            if linux
+            else 'fails with "Operation not permitted"'
+        ),
+        block_write=(
+            'fails with "Read-only file system"'
+            if linux
+            else 'fails with "Operation not permitted"'
+        ),
         reads=reads,
         writes=writes,
         net=net,
         brokered=brokered,
+        errors=_LINUX_ERRORS if linux else _MACOS_ERRORS,
+        keychain=_LINUX_KEYCHAIN if linux else _MACOS_KEYCHAIN,
         settings_path=settings.operator_settings(),
     )
 
 
+def _platform() -> str:
+    """Which jail mechanism applies.
+
+    A function rather than a module constant so a test can drive either branch on
+    either OS. Coverage is enforced at 100%, and a platform read frozen at import
+    would leave the other platform's jail permanently unreachable -- which is
+    exactly the code you least want untested.
+    """
+    return sys.platform
+
+
+# ~/.codex is writable on Linux, with the dangerous entries mounted read-only back
+# over it. That inverts the seatbelt profile, which denies the directory and
+# re-grants a measured list, and the inversion is forced rather than chosen.
+#
+# Seatbelt can write `(deny file-write* (regex ".../[^/]*\\.sqlite(-wal|-shm)?$"))`
+# and have it cover a file that does not exist yet. A mount namespace has nothing
+# to mount over an absent path, so the re-grant list cannot. Measured under a live
+# jail: codex opens `~/.codex/state_5.sqlite` with O_CREAT on a fresh install and
+# exits with "failed to initialize in-process app-server client: Read-only file
+# system" when it cannot. The `5` is a schema version, so pre-creating the file by
+# name is a race against the next codex release.
+#
+# What must NOT become writable is anything deciding what codex executes or is
+# told, because those outlive the session. Each is mounted read-only whether or
+# not it exists (an absent one gets a placeholder), so a jailed turn cannot create
+# an AGENTS.md to leave itself standing orders for the next run.
+_CODEX_PROTECTED = (
+    "config.toml",
+    "hooks.json",
+    "AGENTS.md",
+    "rules",
+    "plugins",
+    "agents",
+)
+
+
+# Written inside an area the agent may otherwise write, so each needs an explicit
+# read-only mount back over it. Everything else on macOS's write-deny list
+# (~/.ssh, ~/.gnupg, ~/.gitconfig, the shell rc files) needs no equivalent here:
+# $HOME is a read-only tmpfs under this profile, so those are already unwritable.
+_PROJECT_WRITE_DENIES = (
+    ".git/hooks",
+    ".git/config",
+    ".mcp.json",
+    ".vscode",
+    ".idea",
+    # A shell rc or git identity inside the workspace is read by the next command
+    # run there, so it persists instructions the same way .git/hooks does.
+    ".bashrc",
+    ".zshrc",
+    ".gitconfig",
+)
+
+
+def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
+    """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
+    from claude_on_the_fly.agent import DATA_DIR, MEMORY_DIR
+
+    home = Path(os.path.realpath(Path.home()))
+    data_dir = Path(os.path.realpath(DATA_DIR))
+    project = Path(os.path.realpath(workspace))
+    tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
+    codex = home / ".codex"
+    read_write = [
+        project,
+        Path(os.path.realpath(MEMORY_DIR)),
+        tmpdir,
+        home / ".claude.json",
+        home / ".cache/uv",
+        home / ".ollama",
+        home / ".Trash",
+        # Writable so codex can create new state files it names itself; the
+        # entries below take the dangerous parts back. plugins/cache is deeper
+        # than the read-only plugins/ mount, so depth ordering restores it.
+        codex,
+        codex / "plugins/cache",
+        codex / "plugins/.remote-plugin-install-staging",
+    ]
+    return {
+        # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
+        # $HOME gets the same treatment. memory/ and shims/ are granted back below
+        # at greater depth, so the sibling .env and logs/ stay hidden either way.
+        "opaque": [home, data_dir],
+        "read_only": [
+            home / ".claude",
+            codex,
+            data_dir / "shims",
+            *sandbox_linux.interpreter_read_paths(),
+            *(Path(p) for p in _extra_read_paths(cap=None)),
+        ],
+        "read_write": read_write,
+        "write_denied": [
+            *(project / name for name in _PROJECT_WRITE_DENIES),
+            *_codex_protected(codex),
+        ],
+        "masked": _linux_masked(data_dir),
+    }
+
+
+def _linux_masked(data_dir: Path) -> list[Path]:
+    """Paths a coarser grant would otherwise expose, named individually.
+
+    Two of them, and neither has a macOS counterpart because seatbelt expresses
+    both with a rule rather than a mount.
+
+    The ssh-agent socket is the sharper one. `SSH_AUTH_SOCK` is forwarded to the
+    agent on both platforms, and on macOS the socket behind it is unusable
+    because the jail profile permits no unix socket at all -- a decision jail.sb
+    records as deliberate, since `(remote unix)` is not path-scopeable. A mount
+    namespace has the opposite default: `--ro-bind / /` reaches every socket on
+    the machine, so a jailed turn could connect to the agent and sign as the
+    operator. Found by running one contract against both jails; reading either
+    profile would not have shown it.
+
+    The `.env` sweep covers the daemon's own secrets landing beneath a granted
+    subtree. The data dir is opaque, but `memory/` is granted back read-write, so
+    a `.env` inside it reappears. Seatbelt covers this with one regex over the
+    whole data dir; there is no pattern matching here, so the files are resolved
+    now. Glob rather than an exact name because the macOS regex is unanchored at
+    the end and so already covers `.env.bak` and friends -- which is the shape a
+    backup taken before an edit actually has.
+    """
+    masked: list[Path] = []
+    auth_sock = os.environ.get("SSH_AUTH_SOCK")
+    if auth_sock:
+        masked.append(Path(os.path.realpath(auth_sock)))
+    for granted in ("memory", "shims"):
+        base = data_dir / granted
+        if base.is_dir():
+            masked += sorted(base.rglob(".env*"))
+    return masked
+
+
+def _codex_protected(codex: Path) -> list[Path]:
+    """Entries under ~/.codex to mount read-only over the writable directory.
+
+    The named ones, existing or not, so the file cannot be created either.
+
+    An earlier version also swept in every other entry already at the root, on
+    the theory that a config file a future codex release introduces should be
+    protected the day it appears. That is the safer-sounding rule and it is
+    wrong: codex creates new *state* under this directory as it runs, and the
+    sweep froze it. Measured on the second live run, where the first run's own
+    `thread-writer-locks/` had appeared and codex then died with "failed to open
+    thread writer coordination lock ... Read-only file system", unable to resume
+    any conversation.
+
+    So the list is deliberately named-only. It covers what actually carries the
+    threat -- config, hooks, standing instructions, plugin and rule loading, all
+    of which outlive the session -- and lets codex own the rest of its directory.
+    Extending it is a one-line change when a release adds another such file.
+    """
+    return [codex / name for name in _CODEX_PROTECTED]
+
+
+def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
+    """Wrap argv in a bubblewrap jail. Raises if bwrap is not installed."""
+    from claude_on_the_fly.agent import DATA_DIR
+
+    if not shutil.which("bwrap"):
+        raise SandboxBoundaryError(
+            "sandbox.mode is jail but bubblewrap is not installed, so there is no "
+            "jail to run in. Install it (apt install bubblewrap) or set "
+            f"sandbox.mode to env or off in {settings.operator_settings()}."
+        )
+    grants = _linux_grants(workspace)
+    # The jail has to be able to read the thing it is jailing. $HOME is an opaque
+    # tmpfs here, so a backend installed under it -- an npm global into
+    # ~/.local/bin, a release binary dropped in ~/bin -- disappears, and the spawn
+    # dies with "No such file or directory: codex" before any policy is exercised.
+    # A package manager install into /usr/local/bin happens to be unaffected,
+    # which is exactly why this is worth handling rather than leaving to whoever
+    # installs it somewhere else.
+    #
+    # The parent directory rather than the file: an npm-installed CLI is a shim
+    # next to the package tree it loads. Read-only, and it holds executables
+    # rather than secrets.
+    binary = shutil.which(argv[0]) if argv else None
+    if binary:
+        grants["read_only"].append(Path(os.path.realpath(binary)).parent)
+    placeholders = sandbox_linux.prepare_placeholders(DATA_DIR / "jail")
+    sandbox_linux.ensure_write_deny_targets(grants["write_denied"], placeholders)
+    sockets = _SESSION_SOCKETS.get() or {}
+    argv = sandbox_linux.jail_argv(
+        argv,
+        opaque=grants["opaque"],
+        read_only=grants["read_only"],
+        read_write=grants["read_write"],
+        write_denied=grants["write_denied"],
+        masked=grants["masked"],
+        sockets=sockets,
+        placeholders=placeholders,
+    )
+    logger.info(
+        "sandbox: jailed %s under bubblewrap (project=%s, brokered ports=%s)",
+        Path(argv[-1]).name if argv else "?",
+        grants["write_denied"][0].parent if grants["write_denied"] else workspace,
+        sorted(sockets) or "none (no host service reachable)",
+    )
+    return argv
+
+
 def wrap(argv: list[str], workspace: Path) -> list[str]:
-    """Wrap argv in the vendored seatbelt jail when `sandbox.mode: jail`, else
-    return it unchanged.
+    """Wrap argv in the platform's jail when `sandbox.mode: jail`, else return it
+    unchanged.
 
-    Invokes sandbox-exec against the vendored jail profile directly; the agent's
-    environment is curated separately by agent_env(). If sandbox-exec is missing
-    (non-macOS), logs and returns the bare argv so jail degrades to env-only
-    rather than failing the run.
+    macOS gets the vendored seatbelt profile, Linux gets bubblewrap plus a network
+    namespace (see sandbox_linux). Both refuse to run rather than degrade: a
+    configured jail that silently did not apply is the one outcome worth failing
+    startup over.
 
-    `sandbox.fs: deny-most` swaps the read-permissive base for a least-privilege
-    one and forwards `sandbox.extra_paths` grants. `sandbox.broker_only_loopback`
-    narrows egress from all loopback to just the broker port.
+    On macOS this invokes sandbox-exec against the vendored jail profile; the
+    agent's environment is curated separately by agent_env(). `sandbox.fs:
+    deny-most` swaps the read-permissive base for a least-privilege one and
+    forwards `sandbox.extra_paths` grants. `sandbox.broker_only_loopback` narrows
+    egress from all loopback to just the broker port.
+
+    Neither of those two settings applies on Linux, and the reasons differ.
+    `sandbox.fs` has no allow-reads equivalent: a mount namespace cannot express
+    "readable except for these forty files", so deny-most is the only shape and
+    the setting resolves to it with a log line. `broker_only_loopback` is
+    permanently in force: the namespace only ever contains the relay's sockets,
+    so no other host service is reachable to narrow away. Linux is at or above
+    the macOS posture under either value of either setting.
     """
     if mode() != "jail":
         return argv
+    if _platform().startswith("linux"):
+        return _linux_wrap(argv, workspace)
     if not shutil.which("sandbox-exec"):
-        logger.warning(
-            "sandbox.mode is jail but sandbox-exec was not found (macOS only); "
-            "running with curated env but no seatbelt"
+        # Used to warn and hand back the bare argv, which on a Mac missing
+        # sandbox-exec meant "run this turn unjailed" and said so only in a log
+        # nobody reads until afterwards. A jail that was configured and did not
+        # apply is worth failing on, and now that a second platform exists this
+        # branch can no longer mean "you are simply not on macOS" either.
+        raise SandboxBoundaryError(
+            "sandbox.mode is jail but sandbox-exec was not found, so there is no "
+            "jail to run in. Set sandbox.mode to env or off in "
+            f"{settings.operator_settings()} to run without one deliberately."
         )
-        return argv
-    tmpdir = os.path.realpath(os.environ.get("TMPDIR", "/tmp"))
-    project = os.path.realpath(workspace)
-    base = _fs_base_profile()
     # Deferred like shim_dir(): agent imports this module, so a top-level import
     # of DATA_DIR would be a cycle.
     from claude_on_the_fly.agent import DATA_DIR
 
-    loopback, loopback_2, loopback_3, loopback_4 = _loopback_specs()
-    params = [
-        "-D",
-        # realpath, like _TMPDIR and _PROJECT_DIR below. Seatbelt matches the
-        # resolved path, so an unresolved param silently matches nothing: on any
-        # host whose home is behind a symlink (network homes, a relocated macOS
-        # home, /home/x -> /System/Volumes/Data/home/x) every credential deny in
-        # the base profile would no-op while the profile still loaded and the log
-        # still said "jailed". The write grants under $HOME would fail the same
-        # way, which is what makes this a correctness bug and not only a leak.
-        f"_HOME={os.path.realpath(Path.home())}",
-        "-D",
-        # Same realpath contract as _HOME: the profile's data-dir rules are
-        # parameterized on _DATA_DIR, so a redirected DATA_DIR (COTF_DATA_DIR)
-        # behind a symlink would silently match nothing -- the re-grants that
-        # keep memory reachable and the denies that keep the other daemon's .env
-        # out would both no-op.
-        f"_DATA_DIR={os.path.realpath(DATA_DIR)}",
-        "-D",
-        f"_PROJECT_DIR={project}",
-        "-D",
-        f"_TMPDIR={tmpdir}",
-        "-D",
-        f"_BASE={base}",
-        "-D",
-        f"_LOOPBACK={loopback}",
-        "-D",
-        f"_LOOPBACK_ALT={loopback_2}",
-        "-D",
-        f"_LOOPBACK_ALT2={loopback_3}",
-        "-D",
-        f"_LOOPBACK_ALT3={loopback_4}",
-    ]
-    # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
-    # so only pass them there. Pad unused slots with the project dir (a no-op).
-    if base == _DENY_MOST_PROFILE:
-        extra = _extra_read_paths()
-        extra += [project] * (_MAX_EXTRA_PATHS - len(extra))
-        for index, path in enumerate(extra, start=1):
-            params += ["-D", f"_EXTRA_{index}={path}"]
-    # The one positive record that the jail was applied. Without it a run with
-    # An unset sandbox mode produces a log indistinguishable from a jailed one:
-    # both are simply free of denials, and no denials also reads as success.
-    logger.info(
-        "sandbox: jailed %s (fs=%s, loopback=%s, project=%s)",
-        Path(argv[0]).name,
-        base.name,
-        [loopback, loopback_2, loopback_3],
-        project,
+    base = _fs_base_profile()
+    return sandbox_macos.jail_argv(
+        argv,
+        **sandbox_macos.realpaths(workspace, DATA_DIR),
+        base=base,
+        profile=_JAIL_PROFILE,
+        loopback=sandbox_macos._loopback_specs(_loopback_ports()),
+        extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
     )
-    logger.debug("sandbox: seatbelt params %s", params)
-    return ["sandbox-exec", "-f", str(_JAIL_PROFILE), *params, *argv]
 
 
 # Credential stores the profile is expected to deny. Probed at startup so the
@@ -629,6 +880,15 @@ def _deny_probe_specs() -> tuple[str, ...]:
     return (*_DENY_PROBES, own)
 
 
+def _probe_workspace() -> Path:
+    """Throwaway workspace for the startup probes, under the data dir."""
+    from claude_on_the_fly.agent import DATA_DIR
+
+    path = DATA_DIR / "jail" / "probe"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 DENIED = "denied"
 ABSENT = "absent"
 READABLE = "READABLE"
@@ -643,6 +903,22 @@ async def _probe_deny(spec: str, workspace: Path) -> str | None:
     """Attempt one expected-denied read under the live profile. Outcome, or None
     if the probe itself never ran and so says nothing either way."""
     path = os.path.expanduser(spec)
+    # Settle absent-versus-denied from OUTSIDE the jail, before probing.
+    #
+    # The message alone cannot do it on Linux. bubblewrap hides a path by not
+    # mounting it, so a successfully denied read reports "No such file or
+    # directory" -- character for character what a genuinely missing file
+    # reports. Classifying on the message would file every hidden credential as
+    # ABSENT, and ABSENT is the outcome that proves nothing, so a jail working
+    # perfectly would report a boundary it had never tested. That is worse than
+    # the bug it hides, because it reads as success.
+    #
+    # Existence out here is not a guess about the mechanism, so it works the same
+    # on both platforms and leaves the probe below one question: given that this
+    # file is really there, could the agent read it?
+    if not os.path.exists(path):
+        logger.info("sandbox: probe %s not present, deny untested", spec)
+        return ABSENT
     argv = wrap(["/bin/cat", path], workspace)
     try:
         probe = await asyncio.create_subprocess_exec(
@@ -656,7 +932,7 @@ async def _probe_deny(spec: str, workspace: Path) -> str | None:
         logger.warning("sandbox: deny probe for %s failed to run: %s", spec, exc)
         return None
     message = err.decode("utf-8", "replace").lower()
-    if "sandbox-exec:" in message:
+    if "sandbox-exec:" in message or "bwrap:" in message:
         # The wrapper itself rejected the profile, so this probe says nothing
         # about the boundary and neither will any other. Called out as its own
         # outcome because the first version of this reported a profile that
@@ -674,17 +950,101 @@ async def _probe_deny(spec: str, workspace: Path) -> str | None:
             spec,
         )
         return READABLE
-    if "not permitted" in message:
-        logger.info("sandbox: probe %s denied by the profile", spec)
-        return DENIED
-    # Most often "No such file or directory". Reported plainly rather than
-    # counted as a win, so an empty machine cannot look like a tested boundary.
+    # The file is on this machine (checked above) and the jailed process could
+    # not read it, so the boundary held. Which errno says so is the platform's
+    # business: seatbelt refuses in place and says "Operation not permitted",
+    # bubblewrap never mounts it and says "No such file or directory". Requiring
+    # a particular wording here would make the check pass on one platform and
+    # silently under-report on the other.
     logger.info(
-        "sandbox: probe %s not present, deny untested (%s)",
+        "sandbox: probe %s denied by the profile (%s)",
         spec,
-        message.strip() or f"rc={probe.returncode}",
+        message.strip().splitlines()[0]
+        if message.strip()
+        else f"rc={probe.returncode}",
     )
-    return ABSENT
+    return DENIED
+
+
+# Attempted from inside the jail at startup. Any external host would do; this one
+# is a well-known anycast resolver, so a *success* here means egress is open
+# rather than that one host happened to be up.
+_EGRESS_PROBE = (
+    "import socket,sys\n"
+    "try:\n"
+    "    socket.create_connection(('1.1.1.1', 443), 5).close()\n"
+    "    sys.stdout.write('REACHED')\n"
+    "except OSError as exc:\n"
+    "    sys.stdout.write('BLOCKED:%s' % exc)\n"
+)
+
+
+async def _run_jailed(argv: list[str], workspace: Path, timeout: int = 20):
+    """Run argv under the live jail. Returns (returncode, combined output)."""
+    proc = await asyncio.create_subprocess_exec(
+        *wrap(argv, workspace),
+        env=agent_env() or {},
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return proc.returncode, (out + err).decode("utf-8", "replace")
+
+
+async def preflight() -> None:
+    """Prove the jail starts and holds its egress deny, before serving anything.
+
+    `verify_denials` cannot stand in for this. It now settles absent-versus-denied
+    outside the jail, so on a machine that happens to have none of the probed
+    credential files it spawns nothing at all -- and a jail that never starts
+    would go unnoticed precisely because there was nothing to notice.
+
+    Two checks, both cheap and both startup-fatal:
+
+      1. The jail runs a trivial command. Catches a missing mechanism, a profile
+         that will not parse, and on Linux the case this cannot be reasoned about
+         from config alone: bubblewrap installed but unprivileged user namespaces
+         disabled, which is the default posture on some distributions.
+      2. An external connection from inside is refused. This is the load-bearing
+         claim of the whole design -- that the egress proxy cannot be bypassed --
+         and until now nothing checked it on either platform. A jail whose network
+         rules silently did not apply looks exactly like one whose did.
+    """
+    if mode() != "jail":
+        return
+    workspace = _probe_workspace()
+    try:
+        code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
+    except (OSError, TimeoutError) as exc:
+        raise SandboxBoundaryError(
+            f"sandbox preflight could not run the jail: {exc}"
+        ) from exc
+    if code != 0 or "cotf" not in output:
+        raise SandboxBoundaryError(
+            "sandbox preflight failed: the jail could not run a trivial command "
+            f"(rc={code}): {output.strip()[:400]}"
+        )
+    try:
+        _code, output = await _run_jailed(
+            [sys.executable, "-c", _EGRESS_PROBE], workspace
+        )
+    except (OSError, TimeoutError) as exc:
+        raise SandboxBoundaryError(
+            f"sandbox egress preflight could not run: {exc}"
+        ) from exc
+    if "REACHED" in output:
+        raise SandboxBoundaryError(
+            "sandbox preflight failed: a jailed process reached the internet "
+            "directly, so the egress proxy can be bypassed and every host "
+            "allowlist is advisory. Refusing to start autonomous work."
+        )
+    if "BLOCKED" not in output:
+        # Neither answer means the probe never got far enough to be evidence,
+        # most likely because the interpreter is not readable inside the jail.
+        raise SandboxBoundaryError(
+            f"sandbox egress preflight was inconclusive: {output.strip()[:400]}"
+        )
+    logger.info("sandbox: preflight ok, jail starts and external egress is refused")
 
 
 async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
@@ -713,8 +1073,14 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     # ceiling, and they sit on the daemon's startup path. Run in sequence the
     # worst case was a minute and a half of a daemon that had not begun serving.
     specs = _deny_probe_specs()
+    # A scratch directory rather than the caller's cwd. These probes only read
+    # paths well outside any workspace, and the Linux jail materialises write-deny
+    # placeholders (.mcp.json, .vscode/) in whatever workspace it is handed -- so
+    # defaulting to cwd would leave those in whichever directory the daemon
+    # happened to start in, usually somebody's checkout.
+    probe_workspace = workspace or _probe_workspace()
     outcomes = await asyncio.gather(
-        *(_probe_deny(spec, workspace or Path.cwd()) for spec in specs)
+        *(_probe_deny(spec, probe_workspace) for spec in specs)
     )
     results: dict[str, str] = {
         spec: outcome

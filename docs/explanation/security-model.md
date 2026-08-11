@@ -17,8 +17,34 @@ than offered for approval.
 ## Sandbox modes
 
 `off` inherits the daemon environment. `env` removes credentials and routes supported
-provider traffic through a loopback broker. `jail` adds macOS Seatbelt restrictions for
-filesystem, keychain, and network access; without `sandbox-exec`, it degrades to `env`.
+provider traffic through a loopback broker. `jail` adds filesystem, credential-store, and
+network restrictions: Seatbelt on macOS, bubblewrap plus a network namespace on Linux.
+
+`jail` does not degrade. If the mechanism is missing or unusable the daemon refuses to
+start, and it proves at startup both that the jail runs and that a jailed process cannot
+reach the internet directly.
+
+The two implementations hold the same contract but not the same behaviour, and the
+difference is worth knowing before reading a log:
+
+| | macOS | Linux |
+|---|---|---|
+| Blocked read | `EPERM`, path still exists | `ENOENT`, path is absent from the namespace |
+| Blocked write | `EPERM` | `EROFS` |
+| Credential store | Keychain denied | No D-Bus session bus, so libsecret and friends are unreachable |
+| Reachable host ports | Every loopback port by default | Only the brokered services, always |
+| `sandbox.fs` | `allow-reads` or `deny-most` | `deny-most` only; a mount namespace cannot express a denylist over a global allow |
+
+Under either setting Linux is at or above the macOS posture.
+
+`SSH_AUTH_SOCK` is forwarded to the agent on both platforms and the socket behind it is
+unreachable on both, so a jailed turn cannot sign as you. That is free on macOS, where
+the profile permits no unix socket at all, and explicit on Linux, where the socket is a
+real path a mount namespace would otherwise expose.
+
+Parity between the two is enforced by `tests/test_sandbox_parity.py`, which runs one
+contract against whichever real jail the host provides. Reading the two profiles
+side by side is not a control; they have drifted before.
 
 An approved HTTPS host remains a covert channel because the CONNECT proxy does not
 intercept TLS. A brokered CLI runs outside the jail, so its provider-side token scope is
@@ -37,7 +63,7 @@ and redirect the client through a base URL.
 | Codex with ChatGPT login | Uses its own OAuth endpoints and token store |
 
 Provider-side tools and browsing may execute outside the local process entirely. Local
-Seatbelt and egress logs cannot observe or confine provider infrastructure.
+sandbox and egress logs cannot observe or confine provider infrastructure.
 
 ## Unattended work
 

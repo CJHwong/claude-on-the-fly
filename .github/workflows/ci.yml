@@ -57,6 +57,28 @@ jobs:
       - name: Sync dev env
         run: uv sync --locked
 
+      # Two suites run a real jail rather than asserting about argv:
+      # test_sandbox_jail_live.py (the Linux boundary) and test_sandbox_parity.py
+      # (the same contract on whichever jail the host provides). Both skip
+      # themselves when bubblewrap is absent, so without this the suite goes green
+      # having tested nothing.
+      - name: Install bubblewrap
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
+      # A skipped boundary test is indistinguishable from a passing one, which is
+      # the failure this whole subsystem is built to avoid. Runners have permitted
+      # unprivileged user namespaces so far; if that changes, this step says so
+      # instead of the suite quietly covering less than it claims.
+      - name: Linux jail and parity contracts must actually run
+        run: |
+          uv run --no-sync pytest \
+            tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py \
+            -q -rs | tee /tmp/jail.log
+          if grep -qi "skipped" /tmp/jail.log; then
+            echo "::error::jail or parity contract tests skipped; the sandbox boundary was never exercised"
+            exit 1
+          fi
+
       # A hung test must name itself. Left to the job's own `timeout-minutes`,
       # the step is *cancelled* rather than failed, and GitHub archives no log
       # for a cancelled step -- so a suite that stops making progress produces

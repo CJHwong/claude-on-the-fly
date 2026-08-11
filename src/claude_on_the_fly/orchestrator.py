@@ -619,6 +619,7 @@ class Orchestrator:
         # any partially-applied frontend status/reaction.
         typing_task: asyncio.Task | None = None
         env_token = None
+        relay: sandbox.SessionRelay | None = None
         command_token: str | None = None
         interim: InterimProgress | None = None
         sink_token = None
@@ -643,6 +644,12 @@ class Orchestrator:
                 command_env = self._commands.agent_env(workspace)
                 command_token = command_env[commands.TOKEN_ENV]
                 session_overrides.update(command_env)
+            # Must come before the spawn and after the overrides are known: on a
+            # Linux jail the agent's network namespace contains nothing until
+            # this bridges the brokered ports into it, and one of those ports
+            # belongs to this session's own egress proxy. Inert on macOS, where
+            # seatbelt reaches the host's loopback directly.
+            relay = await sandbox.open_session_relay(session_overrides, str(chat_id))
             if session_overrides:
                 env_token = sandbox.session_env(session_overrides)
             await self._frontend.notify_start(chat_id)
@@ -803,6 +810,11 @@ class Orchestrator:
                 interim.cancel()
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
+            if relay is not None:
+                # Closing this drops the namespace's only route to the host, so
+                # it has to outlive the spawn. Safe on every path including the
+                # abort one, and a no-op unless this was a Linux jail.
+                await relay.close()
             if command_token is not None and self._commands is not None:
                 self._commands.revoke_token(command_token)
             await self._frontend.notify_complete(chat_id)
@@ -1003,6 +1015,11 @@ async def _start_sandbox(
     # permanently invisible. Probing the denies here is the substitute: it records,
     # per run, that the boundary was actually in force rather than inferring it
     # from an absence of errors.
+    # Order matters: preflight proves the jail runs and its egress deny holds, and
+    # verify_denials proves the credential reads are refused. The first is what
+    # makes the second's silence meaningful, since a jail that never started
+    # would otherwise report a clean sheet.
+    await sandbox.preflight()
     await sandbox.verify_denials()
     return broker_instance, SessionEgress(frontend), command_broker
 

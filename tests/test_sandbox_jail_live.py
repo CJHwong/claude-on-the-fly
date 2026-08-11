@@ -1,0 +1,205 @@
+"""The Linux jail's contract, asserted against a real bubblewrap jail.
+
+Everything else about sandbox_linux is a pure function producing argv, and argv
+is not a boundary. These tests run the argv. They are the only place that answers
+"does the kernel actually refuse this", which is the question the whole module
+exists to make true.
+
+Skipped wherever the mechanism is absent, and the skip reason says which piece is
+missing rather than reporting a pass. A machine without unprivileged user
+namespaces cannot run a jail at all, and quietly counting that as green is the
+failure mode this suite is guarding against everywhere else.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from claude_on_the_fly import netns_relay, sandbox, sandbox_linux
+
+
+def _why_not() -> str | None:
+    if not sys.platform.startswith("linux"):
+        return "the bubblewrap jail is Linux-only"
+    import shutil
+
+    if not shutil.which("bwrap"):
+        return "bubblewrap is not installed"
+    probe = subprocess.run(
+        ["bwrap", "--ro-bind", "/", "/", "--unshare-net", "/bin/true"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return f"unprivileged user namespaces unusable: {probe.stderr.strip()[:120]}"
+    return None
+
+
+pytestmark = pytest.mark.skipif(_why_not() is not None, reason=_why_not() or "")
+
+
+@pytest.fixture
+def jail(tmp_path):
+    """A workspace plus the grant set the real profile uses, minus the daemon."""
+    home = tmp_path / "home"
+    data = home / ".claude-on-the-fly"
+    workspace = data / "workspaces" / "proj"
+    workspace.mkdir(parents=True)
+    (home / ".aws").mkdir(parents=True)
+    (home / ".aws" / "credentials").write_text("aws_secret_access_key=LIVE\n")
+    (data / ".env").write_text("TELEGRAM_BOT_TOKEN=xxx\n")
+    (data / "memory").mkdir()
+    places = sandbox_linux.prepare_placeholders(data / "jail")
+    return {
+        "home": home,
+        "data": data,
+        "workspace": workspace,
+        "grants": {
+            "opaque": [home, data],
+            "read_only": [*sandbox_linux.interpreter_read_paths()],
+            "read_write": [workspace, data / "memory"],
+            "write_denied": [workspace / ".mcp.json"],
+            "masked": [],
+        },
+        "places": places,
+    }
+
+
+async def run_async(jail, shell: str, sockets=None) -> str:
+    """Async spawn, for tests whose relay lives on this event loop.
+
+    `subprocess.run` would block it, so the LoopbackRelay could never service the
+    connection the jailed process is making and the probe would time out looking
+    exactly like a boundary denial.
+    """
+    argv = sandbox_linux.jail_argv(
+        ["/bin/sh", "-c", shell],
+        **jail["grants"],
+        sockets=sockets or {},
+        placeholders=jail["places"],
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    return (out + err).decode()
+
+
+def run(jail, shell: str, sockets=None) -> subprocess.CompletedProcess:
+    argv = sandbox_linux.jail_argv(
+        ["/bin/sh", "-c", shell],
+        **jail["grants"],
+        sockets=sockets or {},
+        placeholders=jail["places"],
+    )
+    return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+
+def test_a_credential_outside_the_grant_set_is_unreachable(jail):
+    out = run(jail, f"cat {jail['home']}/.aws/credentials")
+    assert out.returncode != 0
+    assert "LIVE" not in out.stdout
+
+
+def test_the_daemons_own_env_stays_hidden_beneath_an_opaque_data_dir(jail):
+    """memory/ is granted back at greater depth; the sibling .env must not be."""
+    assert "TELEGRAM_BOT_TOKEN" not in run(jail, f"cat {jail['data']}/.env").stdout
+
+
+def test_the_workspace_is_writable_and_everywhere_else_is_not(jail):
+    assert (
+        run(jail, f"echo ok > {jail['workspace']}/f.txt && echo WROTE").returncode == 0
+    )
+    outside = run(jail, f"echo x > {jail['home']}/escape.txt")
+    assert outside.returncode != 0
+    # A tmpfs is writable by default, so this is the --remount-ro pass working.
+    assert "Read-only file system" in outside.stderr
+
+
+def test_an_absent_write_deny_cannot_be_created(jail):
+    sandbox_linux.ensure_write_deny_targets(
+        jail["grants"]["write_denied"], jail["places"]
+    )
+    denied = run(jail, f"echo evil > {jail['workspace']}/.mcp.json")
+    assert denied.returncode != 0
+    assert "Read-only file system" in denied.stderr
+
+
+def test_the_internet_is_unreachable_without_the_relay(jail):
+    probe = (
+        "import socket,sys\n"
+        "try:\n"
+        "    socket.create_connection(('1.1.1.1',443),5); sys.stdout.write('REACHED')\n"
+        "except OSError: sys.stdout.write('BLOCKED')\n"
+    )
+    assert "BLOCKED" in run(jail, f'{sys.executable} -c "{probe}"').stdout
+
+
+def test_the_agents_own_loopback_still_works(jail):
+    """lo comes up on its own inside the namespace, so dev servers and tests keep
+    working -- the capability the macOS default (`localhost:*`) preserves."""
+    probe = (
+        "import socket,threading,sys\n"
+        "srv=socket.socket(); srv.bind(('127.0.0.1',0)); srv.listen(1)\n"
+        "threading.Thread(target=lambda: srv.accept()[0].send(b'OWN'),daemon=True).start()\n"
+        "s=socket.create_connection(('127.0.0.1',srv.getsockname()[1]),5)\n"
+        "sys.stdout.write(s.recv(8).decode())\n"
+    )
+    assert "OWN" in run(jail, f'{sys.executable} -c "{probe}"').stdout
+
+
+async def test_the_relay_is_the_only_way_to_a_host_service(jail):
+    async def handle(reader, writer):
+        writer.write(b"HOSTSVC")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    probe = (
+        "import socket,sys\n"
+        "try:\n"
+        f"    s=socket.create_connection(('127.0.0.1',{port}),5)\n"
+        "    sys.stdout.write(s.recv(16).decode())\n"
+        "except OSError as e: sys.stdout.write('BLOCKED:%s' % e)\n"
+    )
+    command = f'{sys.executable} -c "{probe}"'
+    with tempfile.TemporaryDirectory(dir="/tmp") as short:
+        relay = netns_relay.LoopbackRelay(Path(short))
+        sockets = await relay.start([port])
+        try:
+            jail["grants"]["read_only"].append(Path(sys.prefix))
+            assert "HOSTSVC" in await run_async(jail, command, sockets=sockets)
+            assert "BLOCKED" in await run_async(jail, command)
+        finally:
+            await relay.stop()
+            server.close()
+
+
+async def test_verify_denials_reports_denied_not_absent(jail, monkeypatch):
+    """The bug this suite was written to catch. bubblewrap hides a path by not
+    mounting it, so a denied read reports "No such file or directory" -- identical
+    to a file that was never there. Classifying on the message would file every
+    hidden credential as ABSENT, and ABSENT proves nothing."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    # The probes read the real home, not this fixture's. Absent-versus-denied is
+    # settled outside the jail, so a spec that is not on disk is answered ABSENT
+    # without proving anything -- put one there.
+    for spec in sandbox._deny_probe_specs():
+        target = Path(os.path.expanduser(spec))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text("probe fixture\n")
+    outcomes = await sandbox.verify_denials(jail["workspace"])
+    assert sandbox.READABLE not in outcomes.values()
+    assert sandbox.DENIED in outcomes.values(), (
+        "a real credential path must test as DENIED"
+    )
