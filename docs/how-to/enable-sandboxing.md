@@ -48,9 +48,19 @@ equivalent), and note two differences the daemon logs at startup:
 
 Linux is at or above the macOS posture under either value of either setting.
 
-Unprivileged user namespaces must be enabled. Some distributions restrict them by
-default (Ubuntu 23.10 and later do, via AppArmor); the daemon refuses to start with
-`jail` when they are unusable rather than running a turn unsandboxed.
+Unprivileged user namespaces must be enabled. Ubuntu 23.10 and later restrict them
+by default via AppArmor, and the failure does not look like the cause: bubblewrap
+still creates the namespace and is then refused netlink bringing up loopback
+inside it, so the error mentions `Failed RTM_NEWADDR` rather than namespaces.
+
+```bash
+sysctl kernel.apparmor_restrict_unprivileged_userns          # 1 means restricted
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+Persist it in `/etc/sysctl.d/` if you want it across reboots. Startup preflight
+detects this specific case and prints the same remedy. The daemon refuses to start
+with `jail` when the mechanism is unusable rather than running a turn unsandboxed.
 
 ## 3. Verify
 

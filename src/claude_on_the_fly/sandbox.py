@@ -991,6 +991,26 @@ async def _run_jailed(argv: list[str], workspace: Path, timeout: int = 20):
     return proc.returncode, (out + err).decode("utf-8", "replace")
 
 
+# What bubblewrap says when the kernel let it make the namespace and then refused
+# it netlink inside. Confirmed on a GitHub runner: apparmor in the LSM list and
+# kernel.apparmor_restrict_unprivileged_userns=1, which is the stock posture on
+# Ubuntu 23.10 and later. Worth matching because it is the failure most operators
+# on a current Ubuntu will hit, and the message alone points at networking rather
+# than at the setting that actually caused it.
+_USERNS_SIGNATURE = "rtm_newaddr"
+_USERNS_HINT = (
+    " -- this host restricts unprivileged user namespaces, which is the default on "
+    "Ubuntu 23.10 and later. Allow them with "
+    "`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist it in "
+    "/etc/sysctl.d/), or set sandbox.mode to env to run without a jail deliberately."
+)
+
+
+def _userns_hint(output: str) -> str:
+    """The remedy, appended only when the failure actually looks like that one."""
+    return _USERNS_HINT if _USERNS_SIGNATURE in output.lower() else ""
+
+
 async def preflight() -> None:
     """Prove the jail starts and holds its egress deny, before serving anything.
 
@@ -1022,7 +1042,7 @@ async def preflight() -> None:
     if code != 0 or "cotf" not in output:
         raise SandboxBoundaryError(
             "sandbox preflight failed: the jail could not run a trivial command "
-            f"(rc={code}): {output.strip()[:400]}"
+            f"(rc={code}): {output.strip()[:400]}{_userns_hint(output)}"
         )
     try:
         _code, output = await _run_jailed(

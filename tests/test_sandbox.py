@@ -1498,3 +1498,30 @@ def test_probe_workspace_is_scratch_not_the_daemons_cwd():
     is handed, so probing in cwd would leave those in somebody's checkout."""
     assert sandbox._probe_workspace().is_dir()
     assert agent.DATA_DIR in sandbox._probe_workspace().parents
+
+
+async def test_preflight_names_the_userns_remedy_when_that_is_the_cause(
+    linux, monkeypatch
+):
+    """The failure most operators on a current Ubuntu will hit, and the one whose
+    message points somewhere else: bubblewrap creates the namespace, is refused
+    netlink inside it, and reports RTM_NEWADDR. Nothing in that names the sysctl."""
+
+    async def apparmor_blocked(argv, workspace, timeout=20):
+        return 1, "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+
+    monkeypatch.setattr(sandbox, "_run_jailed", apparmor_blocked)
+    with pytest.raises(
+        sandbox.SandboxBoundaryError, match="apparmor_restrict_unprivileged_userns"
+    ):
+        await sandbox.preflight()
+
+
+async def test_preflight_does_not_guess_a_remedy_for_other_failures(linux, monkeypatch):
+    async def other(argv, workspace, timeout=20):
+        return 1, "bwrap: execvp /bin/echo: No such file or directory"
+
+    monkeypatch.setattr(sandbox, "_run_jailed", other)
+    with pytest.raises(sandbox.SandboxBoundaryError) as caught:
+        await sandbox.preflight()
+    assert "apparmor" not in str(caught.value)
