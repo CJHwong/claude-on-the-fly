@@ -107,6 +107,11 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+;; Per-thread writer lock directory, added by a codex release after this list
+;; was measured. Without it codex 0.147 exits before any network call with
+;; "Operation not permitted": it cannot create the coordination lock and so
+;; cannot initialise thread persistence, which is what session resume needs.
+(allow file-write* (subpath (string-append (param "_HOME") "/.codex/thread-writer-locks")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
 (allow file-write*
   (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
@@ -135,6 +140,13 @@
 ;; -- Mandatory write denies within allowed areas (mirrors fs-allow-reads.sb) --
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.git/hooks")))
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.git/config")))
+;; Shell and git config inside the workspace. Denied by fs-allow-reads.sb but
+;; not here until a cross-platform parity test ran both profiles against the
+;; same contract: the least-privilege profile was the more permissive of the
+;; two for these three paths, which is the opposite of what its name promises.
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.bashrc")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.zshrc")))
+(deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.gitconfig")))
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.vscode")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.idea")))
