@@ -20,7 +20,8 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; and _EXTRA_1.._EXTRA_3 (unused slots resolve to _PROJECT_DIR, a harmless no-op).
+;; _EXTRA_1.._EXTRA_3 and _RUNTIME_1.._RUNTIME_4 (unused slots resolve to
+;; _PROJECT_DIR, a harmless no-op).
 
 (version 1)
 (deny default)
@@ -63,6 +64,20 @@
 (allow file-read* (subpath (string-append (param "_DATA_DIR") "/memory")))
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-read* (subpath (param "_TMPDIR")))
+;; The runtime this jail has to be able to run: the agent binary's directory and
+;; the interpreter behind it. Both routinely live under $HOME -- an npm global in
+;; ~/.local/bin, a uv virtualenv beside the project -- and this profile makes $HOME
+;; opaque, so without these the backend cannot be exec'd at all. Measured: a
+;; backend under ~/.local/bin exits 126 and `sandbox-exec` refuses the venv
+;; interpreter with "execvp() ... Operation not permitted" (rc 71), which is how
+;; the startup egress probe came to block the daemon entirely.
+;;
+;; Four slots because SBPL has no arrays, same trade as _EXTRA_*. Unused slots
+;; repeat _PROJECT_DIR, which is already allowed.
+(allow file-read* (subpath (param "_RUNTIME_1")))
+(allow file-read* (subpath (param "_RUNTIME_2")))
+(allow file-read* (subpath (param "_RUNTIME_3")))
+(allow file-read* (subpath (param "_RUNTIME_4")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
 ;; at _PROJECT_DIR, already allowed above, so they add nothing.
 (allow file-read* (subpath (param "_EXTRA_1")))

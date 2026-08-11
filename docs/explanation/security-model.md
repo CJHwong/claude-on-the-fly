@@ -100,6 +100,14 @@ its own state there.
 in `git status`, which is the intended trade: the alternative is a real hole,
 since MCP config decides what later runs load.
 
+**`jail` does not support the background jobs daemon, on either platform.** That
+process runs on its own and starts no credential broker and no egress proxy, so a
+jailed job has nothing on loopback to reach and no route to the internet. macOS
+denies the outbound connection and Linux has no route at all; the outcome is the
+same. Linux appeared to work before it had a real jail, because the mode silently
+degraded. Run the jobs daemon with `sandbox.mode: env` until it grows brokers of
+its own; the jail logs a warning naming this whenever it spawns without a relay.
+
 **The Linux jail has an availability failure mode macOS does not.** It needs
 bubblewrap installed and unprivileged user namespaces permitted. Where they are
 not, the daemon refuses to serve rather than running unsandboxed. That refusal

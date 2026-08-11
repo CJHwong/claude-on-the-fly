@@ -618,6 +618,34 @@ def agent_guidance(workspace: Path | None = None) -> str:
     )
 
 
+_RUNTIME_SLOTS = 4
+
+
+def _runtime_read_paths(argv: list[str]) -> list[Path]:
+    """Directories the jail must read to run the thing it is jailing.
+
+    The agent binary's directory and the interpreter behind it. Both commonly sit
+    under `$HOME`, which every least-privilege profile makes opaque, so omitting
+    them does not weaken the jail -- it stops the backend starting at all.
+
+    `sys.prefix` and `sys.base_prefix` differ inside a virtualenv; both are
+    needed, and outside one they collapse to the same path harmlessly. The
+    package directory is listed separately because an editable install leaves it
+    outside either prefix, and the Linux relay launcher imports from it.
+    """
+    paths: list[Path] = []
+    binary = shutil.which(argv[0]) if argv else None
+    if binary:
+        # The parent, not the file: an npm-installed CLI is a shim beside the
+        # package tree it loads. Read-only, and it holds executables not secrets.
+        paths.append(Path(os.path.realpath(binary)).parent)
+    paths += [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
+    seen: dict[str, Path] = {}
+    for path in paths:
+        seen.setdefault(str(path), path)
+    return list(seen.values())
+
+
 def _platform() -> str:
     """Which jail mechanism applies.
 
@@ -654,6 +682,11 @@ _CODEX_PROTECTED = (
     "agents",
 )
 
+# Which of the entries above are directories. Named rather than derived: the
+# extension-less ones are a mix of both kinds, so a stand-in created for an
+# absent target has to be told which it is.
+_CODEX_PROTECTED_DIRS = ("rules", "plugins", "agents")
+
 
 # Written inside an area the agent may otherwise write, so each needs an explicit
 # read-only mount back over it. Everything else on macOS's write-deny list
@@ -671,6 +704,26 @@ _PROJECT_WRITE_DENIES = (
     ".zshrc",
     ".gitconfig",
 )
+
+# Same distinction as _CODEX_PROTECTED_DIRS. `.vscode` and `.bashrc` are both
+# extension-less and only one of them is a directory, so guessing from the name
+# put a directory called `.bashrc` in the operator's workspace and a directory at
+# `.git/config`, which makes `git init` there fail outright.
+_PROJECT_WRITE_DENY_DIRS = (".git/hooks", ".vscode", ".idea")
+
+
+def _project_write_denies(project: Path, names: tuple[str, ...]) -> list[Path]:
+    """`names` under `project`, minus the `.git/` ones for a linked worktree.
+
+    In a worktree or a submodule `.git` is a *file* naming a gitdir that lives
+    outside the workspace, and so is already read-only under `--ro-bind / /`.
+    Mounting over `<project>/.git/hooks` there is not merely redundant: creating
+    the mount point raises NotADirectoryError and takes the whole turn with it.
+    """
+    dot_git = project / ".git"
+    if dot_git.exists() and not dot_git.is_dir():
+        names = tuple(name for name in names if not name.startswith(".git/"))
+    return [project / name for name in names]
 
 
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
@@ -706,13 +759,16 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             home / ".claude",
             codex,
             data_dir / "shims",
-            *sandbox_linux.interpreter_read_paths(),
             *(Path(p) for p in _extra_read_paths(cap=None)),
         ],
         "read_write": read_write,
         "write_denied": [
-            *(project / name for name in _PROJECT_WRITE_DENIES),
+            *_project_write_denies(project, _PROJECT_WRITE_DENIES),
             *_codex_protected(codex),
+        ],
+        "write_denied_dirs": [
+            *_project_write_denies(project, _PROJECT_WRITE_DENY_DIRS),
+            *(codex / name for name in _CODEX_PROTECTED_DIRS),
         ],
         "masked": _linux_masked(data_dir),
     }
@@ -796,29 +852,47 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # The parent directory rather than the file: an npm-installed CLI is a shim
     # next to the package tree it loads. Read-only, and it holds executables
     # rather than secrets.
-    binary = shutil.which(argv[0]) if argv else None
-    if binary:
-        grants["read_only"].append(Path(os.path.realpath(binary)).parent)
+    grants["read_only"] += _runtime_read_paths(argv)
     placeholders = sandbox_linux.prepare_placeholders(DATA_DIR / "jail")
-    sandbox_linux.ensure_write_deny_targets(grants["write_denied"], placeholders)
+    sandbox_linux.ensure_write_deny_targets(
+        grants["write_denied"], placeholders, grants["write_denied_dirs"]
+    )
     sockets = _SESSION_SOCKETS.get() or {}
-    argv = sandbox_linux.jail_argv(
+    if not sockets:
+        # Reached by any caller that spawns without opening a relay first -- the
+        # jobs daemon is the live example, since it runs as its own process and
+        # builds no broker or proxy at all. The namespace then has no route to
+        # any host service, so the agent cannot reach a brokered model endpoint.
+        #
+        # macOS is in the same position for the same reason (nothing in that
+        # process is listening on loopback, and the profile denies the internet),
+        # so this is not a Linux regression. It is only invisible there, which is
+        # why it is said out loud here rather than left to look like a hang.
+        logger.warning(
+            "sandbox: jailing %s with no brokered loopback port. Nothing on the "
+            "host is reachable from inside the namespace, so a backend needing a "
+            "model endpoint will fail. Chat turns open a relay; the jobs daemon "
+            "does not, and `sandbox.mode: jail` does not support it.",
+            argv[0] if argv else "?",
+        )
+    jailed = sandbox_linux.jail_argv(
         argv,
         opaque=grants["opaque"],
         read_only=grants["read_only"],
         read_write=grants["read_write"],
         write_denied=grants["write_denied"],
+        write_denied_dirs=grants["write_denied_dirs"],
         masked=grants["masked"],
         sockets=sockets,
         placeholders=placeholders,
     )
     logger.info(
         "sandbox: jailed %s under bubblewrap (project=%s, brokered ports=%s)",
-        Path(argv[-1]).name if argv else "?",
-        grants["write_denied"][0].parent if grants["write_denied"] else workspace,
+        Path(argv[0]).name if argv else "?",
+        os.path.realpath(workspace),
         sorted(sockets) or "none (no host service reachable)",
     )
-    return argv
+    return jailed
 
 
 def wrap(argv: list[str], workspace: Path) -> list[str]:
@@ -869,6 +943,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         **sandbox_macos.realpaths(workspace, DATA_DIR),
         base=base,
         profile=_JAIL_PROFILE,
+        runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
     )

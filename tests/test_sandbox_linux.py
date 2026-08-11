@@ -43,9 +43,18 @@ def test_placeholder_kind_follows_the_extension(places):
     assert places.for_path(Path("/x/.mcp.json")) == places.json
     assert places.for_path(Path("/x/config.toml")) == places.empty
     assert places.for_path(Path("/x/AGENTS.md")) == places.empty
-    assert places.for_path(Path("/x/.vscode")) == places.directory
     assert places.json.read_text() == "{}\n"
     assert places.empty.read_text() == ""
+
+
+def test_directory_placeholders_are_declared_not_guessed(places):
+    """`.vscode` is a directory and `.bashrc` is a file, and neither has a
+    suffix. Guessing from the name made every extension-less deny a directory,
+    so a jailed turn left a directory called `.bashrc` in the workspace and a
+    directory at `.git/config`, which makes `git init` there fail outright."""
+    assert places.for_path(Path("/x/.vscode"), directory=True) == places.directory
+    assert places.for_path(Path("/x/.bashrc")) == places.empty
+    assert places.for_path(Path("/x/.git/config")) == places.empty
 
 
 def test_prepare_placeholders_is_idempotent(tmp_path):
@@ -66,11 +75,15 @@ def test_absent_write_denies_are_materialised(tmp_path, places):
     project = tmp_path / "ws"
     project.mkdir()
     made = sandbox_linux.ensure_write_deny_targets(
-        [project / ".mcp.json", project / ".vscode"], places
+        [project / ".mcp.json", project / ".vscode", project / ".bashrc"],
+        places,
+        [project / ".vscode"],
     )
-    assert made == [project / ".mcp.json", project / ".vscode"]
+    assert made == [project / ".mcp.json", project / ".vscode", project / ".bashrc"]
     assert (project / ".mcp.json").read_text() == "{}\n"
     assert (project / ".vscode").is_dir()
+    # Not a directory: the deny covers a shell rc the next command would read.
+    assert (project / ".bashrc").is_file()
 
 
 def test_existing_write_denies_are_left_alone(tmp_path, places):
@@ -209,12 +222,3 @@ def test_no_sockets_means_no_launcher(places):
 
 def test_socket_path_is_the_shared_convention():
     assert sandbox_linux.socket_path(8931) == "/run/cotf/8931.sock"
-
-
-def test_interpreter_paths_cover_a_venv_and_an_editable_install():
-    """$HOME is an opaque tmpfs, which hides a virtualenv living under it -- where
-    a uv install normally puts one. Without these the launcher dies on
-    ModuleNotFoundError before the agent starts."""
-    paths = sandbox_linux.interpreter_read_paths()
-    assert Path(sandbox_linux.__file__).parent in paths
-    assert len(paths) == 3

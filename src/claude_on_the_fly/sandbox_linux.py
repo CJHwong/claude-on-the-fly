@@ -61,8 +61,15 @@ class Placeholders(NamedTuple):
     directory: Path
     unreadable: Path
 
-    def for_path(self, target: Path) -> Path:
-        if target.suffix == "":
+    def for_path(self, target: Path, *, directory: bool = False) -> Path:
+        """The stand-in for `target`. Whether a missing one should be a directory
+        comes from the caller, because the name cannot say: `.vscode` is a
+        directory and `.bashrc` is a file, and neither has a suffix. Deciding it
+        from the suffix made every extension-less deny a directory, so a jailed
+        turn left a directory called `.bashrc` in the operator's workspace and a
+        directory at `.git/config`, which makes `git init` there fail outright.
+        """
+        if directory:
             return self.directory
         return self.json if target.suffix == ".json" else self.empty
 
@@ -107,20 +114,24 @@ def _mounts(
     masked: Iterable[Path | str],
     *,
     placeholders: Placeholders,
+    deny_dirs: frozenset[str],
 ) -> list[tuple[int, int, list[str]]]:
     """Every mount tagged with its path depth, for ordering by `sorted`.
 
     Mount order decides the policy, and getting it from the caller's list order
     is a trap: a read grant on a parent silently re-exposes an opaque child.
-    Granting `extra_paths: /home/me` would have undone the tmpfs over `$HOME` and
-    handed back every credential the profile exists to hide, with nothing in the
-    argv looking wrong.
+    Without ordering, granting `extra_paths: /home/me` would also have re-exposed
+    the deeper data dir holding this daemon's tokens, with nothing in the argv
+    looking wrong.
 
-    Sorting by depth makes that unrepresentable. A parent is always mounted
-    before its children, so a deeper rule always wins over a shallower one
-    whichever way it points: an opaque data dir still hides a `.env` beneath a
-    granted home, and a granted `memory/` still surfaces beneath an opaque data
-    dir. The caller can pass its lists in any order and get the same jail.
+    Sorting by depth settles it. A parent is always mounted before its children,
+    so a deeper rule always wins over a shallower one whichever way it points: an
+    opaque data dir still hides a `.env` beneath a granted home, and a granted
+    `memory/` still surfaces beneath an opaque data dir. The caller can pass its
+    lists in any order and get the same jail. What depth does NOT do is override a
+    grant aimed at an opaque path itself -- `extra_paths: $HOME` does re-expose
+    `$HOME`, exactly as it does on macOS, where the extras rule sits after the
+    home deny and last-match-wins.
     """
     out: list[tuple[int, int, list[str]]] = []
     groups = (
@@ -134,12 +145,18 @@ def _mounts(
         for path in paths:
             target = Path(path)
             out.append(
-                (len(target.parts), rank, _mount_args(rank, target, placeholders))
+                (
+                    len(target.parts),
+                    rank,
+                    _mount_args(rank, target, placeholders, deny_dirs),
+                )
             )
     return out
 
 
-def _mount_args(rank: int, target: Path, placeholders: Placeholders) -> list[str]:
+def _mount_args(
+    rank: int, target: Path, placeholders: Placeholders, deny_dirs: frozenset[str]
+) -> list[str]:
     """The bwrap flags for one mount.
 
     `-try` on the grants because a grant for a path that is not there is a
@@ -167,12 +184,18 @@ def _mount_args(rank: int, target: Path, placeholders: Placeholders) -> list[str
         # stops the socket being a socket.
         source = placeholders.directory if target.is_dir() else placeholders.unreadable
         return ["--ro-bind", str(source), str(target)]
-    source = target if target.exists() else placeholders.for_path(target)
+    source = (
+        target
+        if target.exists()
+        else placeholders.for_path(target, directory=str(target) in deny_dirs)
+    )
     return ["--ro-bind", str(source), str(target)]
 
 
 def ensure_write_deny_targets(
-    write_denied: Iterable[Path | str], placeholders: Placeholders
+    write_denied: Iterable[Path | str],
+    placeholders: Placeholders,
+    directories: Iterable[Path | str] = (),
 ) -> list[Path]:
     """Materialise any write-denied path that does not exist yet. Returns what it made.
 
@@ -188,12 +211,13 @@ def ensure_write_deny_targets(
     session" problem the codex write grants exist to close. A visible inert `{}`
     in the workspace is the smaller cost, and it is one an operator can see.
     """
+    deny_dirs = {str(Path(p)) for p in directories}
     created: list[Path] = []
     for path in write_denied:
         target = Path(path)
         if target.exists():
             continue
-        source = placeholders.for_path(target)
+        source = placeholders.for_path(target, directory=str(target) in deny_dirs)
         if source.is_dir():
             target.mkdir(parents=True, exist_ok=True)
         else:
@@ -220,6 +244,7 @@ def jail_argv(
     masked: Iterable[Path | str],
     sockets: Mapping[int, Path | str],
     placeholders: Placeholders,
+    write_denied_dirs: Iterable[Path | str] = (),
     bwrap: str = "bwrap",
     python: str | None = None,
 ) -> list[str]:
@@ -244,7 +269,8 @@ def jail_argv(
       * `read_write` — the write allowlist.
       * `write_denied` — read-only laid back over a writable area. The only way
         to express `(deny file-write* ...)` inside an allowed one, e.g.
-        `.git/hooks` within a writable workspace.
+        `.git/hooks` within a writable workspace. `write_denied_dirs` names the
+        subset that are directories, which the path cannot say for itself.
       * `masked` — unreadable outright, for a path that a coarser grant would
         otherwise expose. `--ro-bind / /` reaches every unix socket on the
         machine, and a mount namespace has no pattern matching, so both the
@@ -289,6 +315,7 @@ def jail_argv(
             write_denied,
             masked,
             placeholders=placeholders,
+            deny_dirs=frozenset(str(Path(p)) for p in write_denied_dirs),
         )
     ):
         args += mount
@@ -331,22 +358,6 @@ def jail_argv(
     args += ["--unshare-net"]
     args += ["--", *inner]
     return args
-
-
-def interpreter_read_paths() -> list[Path]:
-    """Paths the relay launcher needs readable to import itself inside the jail.
-
-    `--tmpfs $HOME` hides a virtualenv that lives under the home directory, which
-    is where a `uv` install of this package normally puts one. Without these
-    grants the launcher dies on `ModuleNotFoundError` before the agent starts,
-    and the failure looks like a broken jail rather than a hidden interpreter.
-
-    `sys.prefix` and `sys.base_prefix` differ inside a venv (the venv and the
-    interpreter it was built from); both are needed, and outside a venv they are
-    the same path and the duplicate is harmless. The package directory is listed
-    separately because an editable install leaves it outside either prefix.
-    """
-    return [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
 
 
 def socket_path(port: int) -> str:

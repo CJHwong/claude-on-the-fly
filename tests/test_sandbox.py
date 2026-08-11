@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly import agent, egress, sandbox
+from claude_on_the_fly import agent, egress, sandbox, sandbox_macos
 
 
 def test_mode_defaults_off(monkeypatch):
@@ -1351,6 +1351,34 @@ def test_linux_grants_protect_what_codex_executes_or_is_told(tmp_path):
         assert codex / name in grants["write_denied"]
 
 
+def test_linux_grants_name_which_write_denies_are_directories(tmp_path):
+    """`.vscode` is a directory and `.bashrc` is a file, and neither has a suffix
+    to say so. Every declared directory has to be in the deny list too, or the
+    stand-in for an absent one is created as the wrong kind."""
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    assert grants["write_denied_dirs"]
+    assert set(grants["write_denied_dirs"]) <= set(grants["write_denied"])
+    project = Path(os.path.realpath(tmp_path / "ws"))
+    assert project / ".vscode" in grants["write_denied_dirs"]
+    assert project / ".bashrc" not in grants["write_denied_dirs"]
+
+
+def test_linux_grants_skip_the_git_denies_in_a_linked_worktree(tmp_path):
+    """In a worktree or submodule `.git` is a file naming a gitdir elsewhere, so
+    there is no `<project>/.git/hooks` to mount over -- and materialising one
+    raises NotADirectoryError, which would take the whole turn with it."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / ".git").write_text("gitdir: /elsewhere/.git/worktrees/ws\n")
+    grants = sandbox._linux_grants(workspace)
+    project = Path(os.path.realpath(workspace))
+    assert project / ".git/hooks" not in grants["write_denied"]
+    assert project / ".git/config" not in grants["write_denied"]
+    assert project / ".git/hooks" not in grants["write_denied_dirs"]
+    # The rest of the contract is untouched.
+    assert project / ".mcp.json" in grants["write_denied"]
+
+
 def test_linux_wrap_grants_the_backend_binarys_directory(linux, tmp_path, monkeypatch):
     """$HOME is an opaque tmpfs, so an npm-global or ~/bin backend vanishes and the
     spawn dies with "No such file or directory: codex" before any policy runs."""
@@ -1576,3 +1604,63 @@ def test_nothing_is_announced_as_inert_on_macos(monkeypatch, caplog):
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         sandbox._log_inert_settings()
     assert "no effect" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_runtime_read_paths_cover_the_binary_and_its_interpreter(monkeypatch, tmp_path):
+    """The jail has to read the thing it is jailing. Both the agent binary and the
+    interpreter routinely live under $HOME, which every least-privilege profile
+    makes opaque, so omitting them does not tighten the jail -- it stops the
+    backend starting. Measured before this existed: a backend under ~/.local/bin
+    exited 126 and sandbox-exec refused the venv interpreter with rc 71, which
+    made the startup egress probe block the daemon outright."""
+    fake = tmp_path / "opt" / "bin" / "codex"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(fake) if name == "codex" else None
+    )
+    paths = sandbox._runtime_read_paths(["codex", "exec"])
+    assert fake.parent in paths
+    assert Path(sandbox.__file__).parent in paths
+    assert len(paths) == len({str(p) for p in paths}), "duplicates waste fixed slots"
+
+
+def test_runtime_read_paths_tolerate_an_unresolvable_binary(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    assert sandbox._runtime_read_paths([]) == sandbox._runtime_read_paths(["nope"])
+
+
+def test_macos_deny_most_passes_the_runtime_slots(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    out = sandbox.wrap(["claude", "-p"], tmp_path)
+    slots = [a for a in out if a.startswith("_RUNTIME_")]
+    assert len(slots) == sandbox_macos._RUNTIME_SLOTS, "every slot must be filled"
+
+
+def test_allow_reads_does_not_pass_runtime_slots(monkeypatch, tmp_path):
+    """fs-allow-reads.sb does not reference them; it allows reads globally."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_FS", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    assert not [
+        a for a in sandbox.wrap(["claude"], tmp_path) if a.startswith("_RUNTIME_")
+    ]
+
+
+def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog):
+    """The jobs daemon spawns without opening a relay, because it runs as its own
+    process and builds no broker. The namespace then reaches nothing on the host.
+    macOS is in the same position for the same reason, so this is not a Linux
+    regression -- but there it merely fails, where here it would look like a hang."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        sandbox.wrap(["codex", "exec"], tmp_path)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "no brokered loopback port" in logged
+    assert "jobs daemon" in logged

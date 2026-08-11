@@ -271,3 +271,34 @@ async def test_ssh_agent_is_not_reachable(world):
         pytest.skip("no ssh-agent in this environment")
     probe = f"import socket,sys\ns=socket.socket(socket.AF_UNIX); s.connect({sock!r})\n"
     assert _run([sys.executable, "-c", probe], world["project"]) != 0
+
+
+def test_the_jail_can_run_a_backend_installed_under_home(world):
+    """The gap a code review caught and this suite had not: every profile makes
+    $HOME opaque, and both the agent binary and the interpreter routinely live
+    there (npm global, uv virtualenv). Measured before the fix: a backend under
+    ~/.local/bin exited 126, and macOS refused the venv interpreter with rc 71,
+    which made the startup egress probe block the daemon outright."""
+    binary = world["home"] / ".local" / "bin" / "fake-backend"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\necho BACKEND_RAN\n")
+    binary.chmod(0o755)
+    project = world["project"]
+    proc = subprocess.run(
+        sandbox.wrap([str(binary)], project), capture_output=True, text=True, timeout=60
+    )
+    assert "BACKEND_RAN" in proc.stdout, proc.stderr[:300]
+
+
+def test_the_jail_can_run_the_interpreter_it_was_started_from(world):
+    """preflight's egress probe needs this, and it is the check that turns a
+    misconfigured jail into a refused startup rather than a silent one."""
+    proc = subprocess.run(
+        sandbox.wrap(
+            [sys.executable, "-c", "print('INTERPRETER_RAN')"], world["project"]
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert "INTERPRETER_RAN" in proc.stdout, proc.stderr[:300]

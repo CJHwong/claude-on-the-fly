@@ -80,7 +80,7 @@ def jail(tmp_path):
         "workspace": workspace,
         "grants": {
             "opaque": [home, data],
-            "read_only": [*sandbox_linux.interpreter_read_paths()],
+            "read_only": [*sandbox._runtime_read_paths([sys.executable])],
             "read_write": [workspace, data / "memory"],
             "write_denied": [workspace / ".mcp.json"],
             "masked": [],

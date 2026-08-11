@@ -45,6 +45,9 @@ _DEFAULT_LOOPBACK = "localhost:*"
 # `ask` -- the approval service the backends ask about tool calls. A fifth
 # service would need a fifth slot here and in both profiles.
 _LOOPBACK_SLOTS = 4
+# Runtime read slots in fs-deny-most.sb: agent binary dir, sys.prefix,
+# sys.base_prefix, package dir.
+_RUNTIME_SLOTS = 4
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -101,6 +104,7 @@ def jail_argv(
     base: Path,
     loopback: tuple[str, str, str, str],
     extra_paths: list[str],
+    runtime_paths: list[str] | None = None,
     profile: Path | None = None,
     sandbox_exec: str = "sandbox-exec",
 ) -> list[str]:
@@ -150,6 +154,14 @@ def jail_argv(
         extra += [str(project)] * (_MAX_EXTRA_PATHS - len(extra))
         for index, path in enumerate(extra, start=1):
             params += ["-D", f"_EXTRA_{index}={path}"]
+        # Without these the profile cannot exec a backend or interpreter living
+        # under the opaque $HOME, which is where npm globals and uv virtualenvs
+        # normally are. Truncated rather than warned on: the caller supplies a
+        # fixed, known set, unlike operator-supplied extra paths.
+        runtime = [*(runtime_paths or [])][:_RUNTIME_SLOTS]
+        runtime += [str(project)] * (_RUNTIME_SLOTS - len(runtime))
+        for index, path in enumerate(runtime, start=1):
+            params += ["-D", f"_RUNTIME_{index}={path}"]
     # The one positive record that the jail was applied. Without it a run with an
     # unset sandbox mode produces a log indistinguishable from a jailed one: both
     # are simply free of denials, and no denials also reads as success.
