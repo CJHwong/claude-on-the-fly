@@ -38,7 +38,11 @@ def _why_not() -> str | None:
         text=True,
     )
     if probe.returncode != 0:
-        return f"unprivileged user namespaces unusable: {probe.stderr.strip()[:120]}"
+        # Not necessarily user namespaces: on a host with the Ubuntu AppArmor
+        # restriction the namespace is created and then netlink is refused
+        # ("Failed RTM_NEWADDR"), which is a different remedy. Report what
+        # bwrap actually said rather than naming a cause.
+        return f"bubblewrap cannot start a jail here: {probe.stderr.strip()[:160]}"
     return None
 
 
