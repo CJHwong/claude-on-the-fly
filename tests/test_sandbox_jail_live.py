@@ -220,3 +220,53 @@ async def test_verify_denials_reports_denied_not_absent(jail, monkeypatch):
     assert sandbox.DENIED in outcomes.values(), (
         "a real credential path must test as DENIED"
     )
+
+
+async def test_the_group_kill_still_reaches_the_agent_through_the_jail(
+    jail, monkeypatch
+):
+    """Security finding `normal-exit-descendant-survival`: an agent process group
+    must be reaped whole, so no descendant outlives the turn.
+
+    The Linux jail puts two processes between the daemon and the agent (bwrap,
+    then the relay launcher), and the control depends on all three sharing the
+    process group the daemon kills. That holds only because nothing here passes
+    `--new-session` or `--unshare-pid`; either would move the agent out of reach
+    of `killpg` and the daemon would go on believing it had cleaned up.
+    """
+    from claude_on_the_fly import agent, netns_relay, sandbox
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    workspace = jail["workspace"]
+    pidfile = workspace / "inner.pid"
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as short:
+        relay = netns_relay.LoopbackRelay(Path(short))
+        sockets = await relay.start([19556])
+        token = sandbox._SESSION_SOCKETS.set(sockets)
+        try:
+            inner = (
+                f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid()));"
+                " time.sleep(600)"
+            )
+            argv = sandbox.wrap([sys.executable, "-c", inner], workspace)
+            assert any("netns_relay" in a for a in argv), (
+                "launcher missing; proves nothing"
+            )
+
+            proc = await asyncio.create_subprocess_exec(*argv, start_new_session=True)
+            for _ in range(100):
+                if pidfile.exists() and pidfile.read_text().strip():
+                    break
+                await asyncio.sleep(0.1)
+            inner_pid = int(pidfile.read_text().strip())
+            os.kill(inner_pid, 0)  # raises if the agent never came up
+
+            await agent._kill_process_tree(proc)
+            await asyncio.sleep(0.5)
+            with pytest.raises(ProcessLookupError):
+                os.kill(inner_pid, 0)
+        finally:
+            sandbox._SESSION_SOCKETS.reset(token)
+            await relay.stop()
