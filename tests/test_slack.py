@@ -343,6 +343,47 @@ class TestIngestEvent:
         await frontend._ingest_event(event)
         frontend._on_message.assert_not_awaited()
 
+    async def test_an_untagged_channel_message_schedules_a_notice(
+        self, frontend, monkeypatch
+    ):
+        """Dropped, but not silently, once the notice is switched on: a thread the
+        bot is already in gets told it needs a tag. Posted later (see
+        TestMentionNotice), never inline."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "5.1")
+        frontend._sessions[session_id] = ("C1", "5.1")
+        event = {
+            "ts": "5.2",
+            "thread_ts": "5.1",
+            "text": "and one more thing",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_not_called()
+        assert session_id in frontend._mention_notices
+        frontend._cancel_mention_notice(session_id)
+
+    async def test_an_untagged_message_in_an_unknown_thread_is_silent(self, frontend):
+        """Ordinary channel chatter the bot was never part of. Answering it would make
+        the bot talk in threads nobody invited it into."""
+        event = {
+            "ts": "5.4",
+            "text": "unrelated chatter",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_not_called()
+
     async def test_channel_strips_mention(self, frontend):
         event = {
             "ts": "6.0",
@@ -1519,8 +1560,222 @@ class TestWorkspacePath:
 
 
 # ---------------------------------------------------------------------------
+# Forgot-to-tag notice (channel threads only)
+# ---------------------------------------------------------------------------
+
+
+class TestNoticeToggles:
+    """Both notices ship off. An install that never opens config.yaml sees exactly
+    what it saw before this feature existed."""
+
+    def test_the_gate_notice_is_not_held_by_default(
+        self, operator_settings, monkeypatch
+    ):
+        monkeypatch.delenv("SLACK_REPLY_LIMIT_NOTICE_SECONDS", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert slack_mod.reply_limit_notice_seconds() == 0
+
+    def test_the_mention_notice_is_off_by_default(self, operator_settings, monkeypatch):
+        monkeypatch.delenv("SLACK_MENTION_NOTICE_SECONDS", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert slack_mod.mention_notice_seconds() == 0
+
+    def test_a_configured_mention_notice_is_used(self, operator_settings):
+        operator_settings.write_text("slack:\n  mention_notice_seconds: 120\n")
+        assert slack_mod.mention_notice_seconds() == 120
+
+    async def test_while_off_an_untagged_message_records_nothing(self, frontend):
+        """Not just "posts nothing": an install that does not want the bot speaking
+        unprompted should not be paying per-thread memory for the feature either."""
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+
+        await frontend._ingest_event(
+            {
+                "ts": "t2",
+                "thread_ts": "t1",
+                "text": "no tag here",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U_ALLOWED",
+            }
+        )
+
+        assert not frontend._mention_notices
+        assert not frontend._mention_hinted
+        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._on_message.assert_not_awaited()
+
+    async def test_switching_it_off_mid_flight_does_not_post(
+        self, frontend, monkeypatch
+    ):
+        """The delay is read when the notice is scheduled and carried into the task,
+        so a turned-off setting cannot be outlived by a task that posts anyway."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+
+        await frontend._ingest_event(
+            {
+                "ts": "t2",
+                "thread_ts": "t1",
+                "text": "no tag here",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U_ALLOWED",
+            }
+        )
+        pending = frontend._mention_notices[session_id]
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0)
+        frontend._cancel_mention_notice(session_id)
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+
+class TestMentionNotice:
+    """One notice, and only for somebody who forgot the tag *and* left. While they
+    are still typing they are still watching, and a notice read on arrival is one
+    they never register."""
+
+    def _event(self, ts: str, text: str = "and one more thing") -> dict:
+        return {
+            "ts": ts,
+            "thread_ts": "t1",
+            "text": text,
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+    def _live_thread(self, frontend) -> int:
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        return session_id
+
+    async def test_an_untagged_message_is_answered_after_the_wait(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        # Held back, not posted inline.
+        frontend._app.client.chat_postMessage.assert_not_called()
+        await frontend._mention_notices[session_id]
+
+        note = frontend._app.client.chat_postMessage.call_args[1]["text"]
+        assert note.startswith("<@U_ALLOWED> ")  # pings whoever forgot
+        assert "<@U_SELF>" in note  # and names the tag to use
+        assert session_id in frontend._mention_hinted
+        frontend._on_message.assert_not_awaited()
+
+    async def test_the_wait_is_the_configured_one(self, frontend, monkeypatch):
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(slack_mod.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 120.0)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id]
+
+        assert slept == [120.0]
+
+    async def test_another_untagged_message_restarts_the_wait(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        first = frontend._mention_notices[session_id]
+        await asyncio.sleep(0)
+        await frontend._ingest_event(self._event("t3", "hello?"))
+        second = frontend._mention_notices[session_id]
+
+        assert second is not first
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # The replaced task's cleanup must not take the reschedule down with it.
+        assert frontend._mention_notices[session_id] is second
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_a_tagged_message_cancels_it(self, frontend, monkeypatch):
+        """They corrected themselves. Saying it anyway is the bot lecturing."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        pending = frontend._mention_notices[session_id]
+        await asyncio.sleep(0)
+        await frontend._ingest_event(self._event("t3", "<@U_SELF> sorry, this"))
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
+        assert session_id not in frontend._mention_hinted  # still tellable later
+        frontend._on_message.assert_awaited_once()
+
+    async def test_it_is_said_once_per_thread(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id]
+        await frontend._ingest_event(self._event("t3", "still forgetting"))
+
+        assert not frontend._mention_notices
+        assert frontend._app.client.chat_postMessage.call_count == 1
+
+    async def test_a_thread_the_bot_is_not_in_gets_nothing(self, frontend):
+        """Ordinary channel chatter. Answering it would make the bot talk in
+        threads nobody invited it into."""
+        await frontend._ingest_event(self._event("t2"))
+
+        assert not frontend._mention_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_an_evicted_thread_drops_its_notice(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        pending = frontend._mention_notices[session_id]
+        frontend._forget_session(session_id)
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
+
+    async def test_stop_drops_it_too(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        pending = frontend._mention_notices[session_id]
+        await frontend.stop()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
+
+
+# ---------------------------------------------------------------------------
 # Reply soft-limit gate
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_notice_delay(monkeypatch):
+    """Post the gate notice as soon as its task is awaited."""
+    monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 0)
 
 
 class TestReplySoftLimit:
@@ -1533,7 +1788,7 @@ class TestReplySoftLimit:
             "user": "U_ALLOWED",
         }
 
-    async def test_gates_inbound_when_over_limit(self, frontend):
+    async def test_gates_inbound_when_over_limit(self, frontend, no_notice_delay):
         session_id = _session_key("D1", "200.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
         frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.0"}
@@ -1541,8 +1796,137 @@ class TestReplySoftLimit:
         await frontend._ingest_event(self._dm_event("200.0", "another question"))
 
         frontend._on_message.assert_not_awaited()
+        # Held back, not posted inline: `_ingest_event` returns before the notice
+        # task has had a chance to run.
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+        await frontend._gate_notices[session_id]
+
         warning = frontend._app.client.chat_postMessage.call_args[1]["text"]
         assert CONTINUE_COMMAND in warning
+        # Addressed to the sender, so it pings instead of relying on the thread
+        # being unread.
+        assert warning.startswith("<@U_ALLOWED> ")
+        assert session_id not in frontend._gate_notices
+
+    async def test_the_notice_waits_the_configured_delay(self, frontend, monkeypatch):
+        """The delay is the whole point of the change: a notice that lands while the
+        sender is still in the thread is marked read on arrival and never seen."""
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(slack_mod.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 4.2)
+        session_id = _session_key("D1", "204.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.1"}
+
+        await frontend._ingest_event(self._dm_event("204.0", "hello?"))
+        await frontend._gate_notices[session_id]
+
+        assert slept == [4.2]
+
+    async def test_a_second_gated_message_restarts_the_wait(
+        self, frontend, monkeypatch
+    ):
+        """Debounce. A burst of messages means the sender is still typing, and a notice
+        that lands mid-burst is read on arrival — the failure the delay exists to
+        avoid. The wait has to fall after their *last* message, and they are still
+        told only once."""
+        monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 3600)
+        session_id = _session_key("D1", "205.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.2"}
+
+        await frontend._ingest_event(self._dm_event("205.0", "one"))
+        first = frontend._gate_notices[session_id]
+        await asyncio.sleep(0)  # let it reach its sleep, so cancelling runs its finally
+        await frontend._ingest_event(
+            self._dm_event("205.1", "two") | {"thread_ts": "205.0"}
+        )
+        second = frontend._gate_notices[session_id]
+
+        assert second is not first
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # The replaced task's cleanup must not take the reschedule down with it.
+        assert frontend._gate_notices[session_id] is second
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+        monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 0)
+        await frontend._ingest_event(
+            self._dm_event("205.2", "three") | {"thread_ts": "205.0"}
+        )
+        await frontend._gate_notices[session_id]
+        assert frontend._app.client.chat_postMessage.call_count == 1
+        assert session_id not in frontend._gate_deadlines
+
+    async def test_the_debounce_cannot_defer_past_the_ceiling(
+        self, frontend, monkeypatch
+    ):
+        """Otherwise somebody typing every three seconds never learns the thread is
+        gated."""
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(slack_mod.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 4.2)
+        monkeypatch.setattr(slack_mod, "REPLY_LIMIT_NOTICE_MAX_HOLD", 0.0)
+        session_id = _session_key("D1", "209.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.3"}
+
+        await frontend._ingest_event(self._dm_event("209.0", "hello?"))
+        await frontend._gate_notices[session_id]
+
+        # Ceiling already spent, so the notice goes out now rather than in 4.2s.
+        assert slept == [0.0]
+        frontend._app.client.chat_postMessage.assert_called_once()
+
+    async def test_continue_cancels_a_pending_notice(self, frontend):
+        """Otherwise it arrives after the thread resumed and tells the user to send
+        what they just sent."""
+        session_id = _session_key("D1", "206.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+
+        await frontend._ingest_event(self._dm_event("206.0", "hello?"))
+        pending = frontend._gate_notices[session_id]
+        await frontend._ingest_event(
+            self._dm_event("206.1", CONTINUE_COMMAND) | {"thread_ts": "206.0"}
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert session_id not in frontend._gate_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_stop_cancels_pending_notices(self, frontend):
+        session_id = _session_key("D1", "207.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+
+        await frontend._ingest_event(self._dm_event("207.0", "hello?"))
+        pending = frontend._gate_notices[session_id]
+        await frontend.stop()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._gate_notices
+
+    async def test_forgetting_a_session_cancels_its_notice(self, frontend):
+        session_id = _session_key("D1", "208.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+
+        await frontend._ingest_event(self._dm_event("208.0", "hello?"))
+        pending = frontend._gate_notices[session_id]
+        frontend._forget_session(session_id)
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._gate_notices
 
     async def test_under_limit_processes_normally(self, frontend):
         session_id = _session_key("D1", "201.0")
@@ -3642,6 +4026,57 @@ class TestNumericLimits:
         with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
             assert slack_mod.session_cap() == slack_mod.DEFAULT_SESSION_CAP
         assert "must be positive" in caplog.text
+
+    def test_the_notice_delay_defaults_and_takes_a_fraction(
+        self, operator_settings, monkeypatch
+    ):
+        monkeypatch.delenv("SLACK_REPLY_LIMIT_NOTICE_SECONDS", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert (
+            slack_mod.reply_limit_notice_seconds()
+            == slack_mod.DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
+        )
+        operator_settings.write_text("slack:\n  reply_limit_notice_seconds: 1.5\n")
+        assert slack_mod.reply_limit_notice_seconds() == 1.5
+
+    def test_a_zero_notice_delay_is_honoured(self, operator_settings):
+        """Unlike the counts, 0 is a real choice here: post it immediately."""
+        operator_settings.write_text("slack:\n  reply_limit_notice_seconds: 0\n")
+        assert slack_mod.reply_limit_notice_seconds() == 0
+
+    def test_a_junk_notice_delay_falls_back_and_says_so(
+        self, operator_settings, caplog
+    ):
+        operator_settings.write_text("slack:\n  reply_limit_notice_seconds: soon\n")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert (
+                slack_mod.reply_limit_notice_seconds()
+                == slack_mod.DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
+            )
+        assert "is not a number" in caplog.text
+
+    def test_a_negative_notice_delay_falls_back_and_says_so(
+        self, operator_settings, caplog
+    ):
+        operator_settings.write_text("slack:\n  reply_limit_notice_seconds: -3\n")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert (
+                slack_mod.reply_limit_notice_seconds()
+                == slack_mod.DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
+            )
+        assert "cannot be negative" in caplog.text
+
+    def test_a_nan_notice_delay_falls_back_and_says_so(self, operator_settings, caplog):
+        """`float()` accepts "nan", and it defeats the ceiling: min(nan, 30) is nan
+        and asyncio.sleep(nan) never wakes, so every thread's notice would be lost
+        until a restart."""
+        operator_settings.write_text("slack:\n  reply_limit_notice_seconds: nan\n")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert (
+                slack_mod.reply_limit_notice_seconds()
+                == slack_mod.DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
+            )
+        assert "is not a finite number" in caplog.text
 
 
 class TestJobCommand:

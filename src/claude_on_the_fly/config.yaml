@@ -294,16 +294,13 @@ interim:
   # min_gap_seconds: 300
 
 slack:
-  # Who may reach the agent. Read on every message, so adding a sender takes effect
-  # on their next one without a restart.
-  #
-  # One list, routed by Slack id prefix: B... is a bot and bypasses the @mention
-  # gate, anything else (U.../W.../"*") is a human. Empty is fail-closed except for
-  # the token's own id -- under a bot token that is the BOT's, not yours, so list
-  # your own U... id or your DMs are dropped. The startup log shows what is live.
+  # Who may reach the agent. Read per message, so adding a sender takes effect on their
+  # next one, no restart. One list, routed by Slack id prefix: B... is a bot and bypasses
+  # the @mention gate, anything else (U.../W.../"*") is a human. Empty is fail-closed
+  # except for the token's own id -- under a bot token that is the BOT's, not yours, so
+  # list your own U... id or your DMs are dropped. The startup log shows what is live.
   # allowed_senders: [U012ABCDEF, B07JPABE2]
-  # To allow everyone, quote the wildcard: allowed_senders: ["*"]
-  # A bare `*` is YAML alias syntax and makes the whole file invalid.
+  # Everyone: allowed_senders: ["*"] -- must be quoted; a bare * is YAML alias syntax
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
   # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
 
@@ -317,10 +314,13 @@ slack:
   # Trigger and queue are constructed at Slack startup, so changing it needs a restart.
   # job_command: "$job"
 
-  # Threads retained before LRU eviction, and replies per thread before inbound
-  # messages are gated ($continue resets the counter).
+  # Threads retained before LRU eviction, replies per thread before the $continue gate,
+  # seconds that gate notice is held so it lands after the sender left (0 posts it now),
+  # and seconds an untagged channel message waits for a "tag me" notice (0 = never).
   # session_cap: 1000
   # reply_soft_limit: 10
+  # reply_limit_notice_seconds: 0
+  # mention_notice_seconds: 0
 
   # Per-chat persona: a file, relative to the data root, that REPLACES the
   # data-root CLAUDE.md for one chat. Key it by channel id (survives renames; the
