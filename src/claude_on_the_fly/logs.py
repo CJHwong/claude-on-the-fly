@@ -34,8 +34,10 @@ from pathlib import Path
 from claude_on_the_fly import agent, settings
 
 _FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-# Matches the retention the TimedRotatingFileHandler used to give (backupCount=7).
-DEFAULT_KEEP_DAYS = 7
+# Long enough that a daemon which misbehaved a few weeks ago can still be read
+# back. Matches the window finished job workspaces keep, so an operator has one
+# number in mind rather than two.
+DEFAULT_KEEP_DAYS = 30
 
 # How much of a redacted string survives when content logging is enabled.
 CONTENT_PREVIEW_CHARS = 80

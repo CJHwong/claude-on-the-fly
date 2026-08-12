@@ -4,6 +4,7 @@ CancelledError propagate."""
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -11,8 +12,13 @@ from unittest.mock import patch
 import pytest
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, Response
-from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
+from claude_on_the_fly.jobs.agent_runner import (
+    RUNS_DIRNAME,
+    OrchestratorAgentRunner,
+    sweep_run_workspaces,
+)
 from claude_on_the_fly.jobs.core import Job
+from claude_on_the_fly.jobs.keys import safe_segment
 from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
 
@@ -39,8 +45,8 @@ async def test_run_calls_agent_run_for_jobs_platform(tmp_path: Path) -> None:
     assert kwargs["platform"] == "jobs"
     assert kwargs["prompt"] == "what is 2+2?"
     assert kwargs["timeout"] == 42.0
-    # Fresh workspace under data_dir/workspaces/jobs/<run_id>.
-    assert kwargs["workspace"].parent == tmp_path / "workspaces" / "jobs"
+    # Fresh workspace under data_dir/workspaces/jobs/__runs/<run_id>.
+    assert kwargs["workspace"].parent == tmp_path / "workspaces" / "jobs" / "__runs"
 
 
 async def test_fresh_workspace_and_persona_per_call(tmp_path: Path) -> None:
@@ -67,7 +73,7 @@ async def test_fresh_workspace_and_persona_per_call(tmp_path: Path) -> None:
     assert len(seen) == 2
     assert seen[0] != seen[1]  # independent one-shot runs
     for ws in seen:
-        assert not ws.exists()  # each throwaway workspace is cleaned up after run
+        assert ws.exists()  # kept for inspection; the sweep retires them later
     assert persona.call_count == 2
 
 
@@ -134,9 +140,10 @@ async def test_claude_unavailable_becomes_failure_result(tmp_path: Path) -> None
     assert "unavailable" in result.text.lower()
 
 
-async def test_workspace_removed_after_successful_run(tmp_path: Path) -> None:
-    """The throwaway per-job workspace must not linger — a long-lived worker would
-    otherwise grow data_dir/workspaces/jobs without bound."""
+async def test_workspace_survives_a_successful_run(tmp_path: Path) -> None:
+    """A finished one-shot workspace is kept, not deleted at the end of the run.
+    Isolation does not depend on the delete — the next run gets its own uuid — so
+    keeping it costs nothing and leaves the run inspectable until the sweep."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
 
@@ -156,11 +163,12 @@ async def test_workspace_removed_after_successful_run(tmp_path: Path) -> None:
         result = await runner.run(_job("p"))
 
     assert result.ok is True
-    assert not captured["ws"].exists()
+    assert captured["ws"].exists()
 
 
-async def test_workspace_removed_when_agent_run_raises(tmp_path: Path) -> None:
-    """Cleanup runs on the handled-failure path too, not just on success."""
+async def test_workspace_survives_when_agent_run_raises(tmp_path: Path) -> None:
+    """Most of all on the failure path: a run that died at 3am is the one whose
+    files an operator actually wants to read."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
 
@@ -179,7 +187,7 @@ async def test_workspace_removed_when_agent_run_raises(tmp_path: Path) -> None:
         result = await runner.run(_job("p"))
 
     assert result.ok is False
-    assert not captured["ws"].exists()
+    assert captured["ws"].exists()
 
 
 async def test_cancelled_error_propagates(tmp_path: Path) -> None:
@@ -200,13 +208,11 @@ async def test_cancelled_error_propagates(tmp_path: Path) -> None:
         await runner.run(_job("p"))
 
 
-async def test_backend_session_dir_removed_with_the_workspace(
+async def test_backend_session_dir_survives_the_run_too(
     tmp_path: Path, claude_projects_dir: Path
 ) -> None:
-    """Deleting the workspace is not enough: claude names a directory in its own
-    config tree after the workspace path, and the name encodes a path that will
-    never exist again — so anything left there is unreclaimable, one dead
-    directory per job."""
+    """The transcript is half of what makes a finished run worth keeping, so it
+    outlives the run with the workspace. `sweep_run_workspaces` takes both."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
 
@@ -229,16 +235,15 @@ async def test_backend_session_dir_removed_with_the_workspace(
 
     assert result.ok is True
     workspace = captured["ws"]
-    assert not (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
+    assert (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
 
 
-async def test_cleanup_runs_when_the_task_is_cancelled_from_outside(
+async def test_a_cancelled_run_leaves_its_workspace_behind(
     tmp_path: Path, claude_projects_dir: Path
 ) -> None:
     """The shape the real shutdown takes: `run_loop` cancels the task rather than
-    letting the agent raise. Teardown now awaits, and an await inside a `finally`
-    is exactly what a careless cancel would skip — so assert it still runs, or
-    every stop leaks a workspace and a session directory."""
+    letting the agent raise. Nothing is deleted while that unwinds, which is what
+    keeps a stop from spending the supervisor's 5s grace on an rmtree."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
     running = asyncio.Event()
@@ -265,25 +270,20 @@ async def test_cleanup_runs_when_the_task_is_cancelled_from_outside(
             await task
 
     workspace = captured["ws"]
-    assert not workspace.exists()
-    assert not (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
+    assert workspace.exists()
+    assert (claude_projects_dir / _workspace_to_claude_hash(workspace)).exists()
 
 
-async def test_cleanup_does_not_block_the_event_loop(tmp_path: Path) -> None:
-    """Teardown is on the shutdown path, where the supervisor allows 5s before
-    SIGKILL. A synchronous rmtree of a tree an agent just built spends that
-    window on file deletion and gets the worker killed with its agent CLI still
-    running — orphaned, since `_exec` spawns it into its own session. Assert the
-    loop keeps turning by having a slow removal run concurrently with a tick."""
+async def test_a_run_never_discards_a_workspace_itself(tmp_path: Path) -> None:
+    """Regression guard for putting deletion back on the run path.
+
+    Teardown there lands on the shutdown path, where the supervisor allows 5s
+    before SIGKILL. An rmtree of a tree the agent just built (a repo clone takes
+    seconds) competes with the in-flight cancel for that window, and losing means
+    a killed worker with an orphaned agent CLI still holding bypassPermissions —
+    `_exec` spawns it into its own session, so nothing else reaps it. Retention
+    belongs in the startup sweep, where it races nothing."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
-    ticked = asyncio.Event()
-
-    def _slow_discard(workspace: Path) -> None:
-        time.sleep(0.2)  # a big tree, in a thread
-
-    async def _tick() -> None:
-        await asyncio.sleep(0.01)
-        ticked.set()
 
     with (
         patch(
@@ -297,19 +297,16 @@ async def test_cleanup_does_not_block_the_event_loop(tmp_path: Path) -> None:
         ),
         patch(
             "claude_on_the_fly.jobs.agent_runner._discard_workspace",
-            side_effect=_slow_discard,
-        ),
+        ) as discard,
     ):
-        tick = asyncio.create_task(_tick())
         await runner.run(_job("p"))
-        # A blocking cleanup would have starved this until after the sleep.
-        assert ticked.is_set()
-        await tick
+
+    discard.assert_not_called()
 
 
-async def test_workspace_removed_on_cancel_path(tmp_path: Path) -> None:
-    """Cleanup runs while CancelledError unwinds — a cancel-in-flight shutdown must
-    not leak the per-job workspace, which `run`'s `finally: rmtree` guarantees."""
+async def test_workspace_survives_the_cancel_path(tmp_path: Path) -> None:
+    """Same for the agent raising CancelledError itself rather than the task being
+    cancelled from outside."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
     captured: dict[str, Path] = {}
 
@@ -329,7 +326,7 @@ async def test_workspace_removed_on_cancel_path(tmp_path: Path) -> None:
     ):
         await runner.run(_job("p"))
 
-    assert not captured["ws"].exists()  # torn down on the cancel path
+    assert captured["ws"].exists()  # nothing is torn down on the cancel path
 
 
 # --- keyed jobs ------------------------------------------------------------
@@ -526,3 +523,131 @@ async def test_in_flight_is_cleared_when_the_run_is_cancelled(
             await task
 
     assert runner.in_flight == {}
+
+
+# --- retention sweep -------------------------------------------------------
+
+
+DAY_S = 86400.0
+
+
+def _aged_workspace(root: Path, *, age_days: float) -> Path:
+    """A workspace directory whose mtime is `age_days` in the past."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "notes.md").write_text("what the run left behind")
+    stamp = time.time() - age_days * DAY_S
+    os.utime(root, (stamp, stamp))
+    return root
+
+
+def test_sweep_removes_a_one_shot_workspace_past_the_window(tmp_path: Path) -> None:
+    runs = tmp_path / "workspaces" / "cron" / "__runs"
+    old = _aged_workspace(runs / "deadbeef", age_days=31)
+
+    removed = sweep_run_workspaces(tmp_path, days=30)
+
+    assert removed == [old]
+    assert not old.exists()
+
+
+def test_sweep_keeps_a_one_shot_workspace_inside_the_window(tmp_path: Path) -> None:
+    """Retention is the whole point of keeping them: a run from this morning must
+    still be there to read."""
+    runs = tmp_path / "workspaces" / "jobs" / "__runs"
+    recent = _aged_workspace(runs / "cafe", age_days=29)
+
+    assert sweep_run_workspaces(tmp_path, days=30) == []
+    assert (recent / "notes.md").exists()
+
+
+def test_sweep_never_touches_a_keyed_workspace_however_old(tmp_path: Path) -> None:
+    """A keyed workspace IS the continuity for the next job with that key, and age
+    cannot tell "abandoned" from "waiting" — a ticket nobody has touched in a year
+    still wants turn 2 to resume turn 1. Sweeping it would silently destroy the
+    resume, so the sweep is scoped to `__runs/` by path, not filtered by age."""
+    keyed = _aged_workspace(
+        tmp_path / "workspaces" / "cron" / "jira_ACE-1234", age_days=400
+    )
+
+    assert sweep_run_workspaces(tmp_path, days=30) == []
+    assert (keyed / "notes.md").exists()
+
+
+def test_sweep_cannot_be_aimed_at_a_keyed_workspace_by_a_crafted_key(
+    tmp_path: Path,
+) -> None:
+    """`safe_segment` maps unsafe characters to `_`, so a `session_key` of `/runs`
+    would land on `_runs`. Were that the sweep's directory, the sweep would walk a
+    live keyed workspace and delete the files inside it as dead runs. `__runs` is
+    unreachable from any sanitized key, because sanitizing collapses runs of
+    unsafe characters to a single `_`."""
+    assert safe_segment("/runs") != RUNS_DIRNAME
+    assert safe_segment("__runs") != RUNS_DIRNAME
+    assert "__" not in safe_segment("anything/at\\all??here")
+
+
+def test_sweep_takes_the_backend_session_dir_with_it(
+    tmp_path: Path, claude_projects_dir: Path
+) -> None:
+    """Deleting the workspace alone is not enough: claude names a directory in its
+    own config tree after the workspace path, and that name encodes a path that
+    will never exist again — so anything left there is unreclaimable, one dead
+    directory per job."""
+    old = _aged_workspace(
+        tmp_path / "workspaces" / "jobs" / "__runs" / "beef", age_days=31
+    )
+    session_dir = claude_projects_dir / _workspace_to_claude_hash(old)
+    session_dir.mkdir(parents=True)
+
+    sweep_run_workspaces(tmp_path, days=30)
+
+    assert not session_dir.exists()
+
+
+def test_sweep_is_disabled_by_a_non_positive_window(tmp_path: Path) -> None:
+    """`workspace_keep_days: 0` means keep them forever, for an operator with the
+    disk who wants the history."""
+    old = _aged_workspace(
+        tmp_path / "workspaces" / "jobs" / "__runs" / "beef", age_days=9999
+    )
+
+    assert sweep_run_workspaces(tmp_path, days=0) == []
+    assert old.exists()
+
+
+def test_sweep_on_a_data_dir_with_no_workspaces_yet(tmp_path: Path) -> None:
+    """First start on a fresh install: nothing has run, so there is no directory."""
+    assert sweep_run_workspaces(tmp_path, days=30) == []
+
+
+def test_sweep_ignores_a_file_sitting_in_the_runs_dir(tmp_path: Path) -> None:
+    runs = tmp_path / "workspaces" / "jobs" / "__runs"
+    runs.mkdir(parents=True)
+    stray = runs / "not-a-workspace.txt"
+    stray.write_text("x")
+    os.utime(stray, (time.time() - 400 * DAY_S,) * 2)
+
+    assert sweep_run_workspaces(tmp_path, days=30) == []
+    assert stray.exists()
+
+
+def test_sweep_skips_an_entry_it_cannot_stat(tmp_path: Path) -> None:
+    """A workspace that vanishes between the listing and the stat, or that the
+    worker cannot read, must not take retention down with it — the next entry
+    still deserves to be swept."""
+    runs = tmp_path / "workspaces" / "jobs" / "__runs"
+    _aged_workspace(runs / "aaa-unreadable", age_days=31)
+    good = _aged_workspace(runs / "bbb-fine", age_days=31)
+
+    real_stat = Path.stat
+
+    def _stat(self, *args, **kwargs):
+        if self.name == "aaa-unreadable":
+            raise OSError("gone")
+        return real_stat(self, *args, **kwargs)
+
+    with patch.object(Path, "stat", _stat):
+        removed = sweep_run_workspaces(tmp_path, days=30)
+
+    assert removed == [good]
+    assert not good.exists()

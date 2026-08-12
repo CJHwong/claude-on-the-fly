@@ -152,6 +152,7 @@ shortcut list is suppressed; a reply without a suggestions block shows no button
 | `concurrency` | integer / `1` | Concurrent agent processes; below 1 uses 1 | Restart jobs |
 | `poll_interval_s` | number / `2.0` | Idle queue polling interval | Restart jobs |
 | `timeout` | number / agent default | Per-job wall clock; `<=0` means unlimited | Restart jobs |
+| `workspace_keep_days` | integer / `30` | Retention for finished one-shot job workspaces; `0` keeps them forever. A job with a session key keeps its workspace indefinitely | Restart jobs |
 | `personas` | mapping / empty | Per-job instructions file, keyed by the job key or `default` | Immediate |
 
 A timeout carried by a cron job overrides the worker default for that job.
@@ -160,5 +161,5 @@ A timeout carried by a cron job overrides the worker default for that job.
 
 | Key | Type / default | Effect | Lifecycle |
 |---|---|---|---|
-| `keep_days` | integer / `7` | Retention; `0` disables pruning, invalid uses default | Next prune/startup |
+| `keep_days` | integer / `30` | Retention; `0` disables pruning, invalid uses default | Next prune/startup |
 | `host_tag` | string / short hostname | Host component in log filenames | Startup and daily rollover |

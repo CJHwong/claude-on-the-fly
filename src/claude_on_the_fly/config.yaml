@@ -361,6 +361,13 @@ jobs:
   # poll_interval_s: 2.0
   # timeout: 3600
 
+  # How long a finished one-shot job workspace is kept before the worker retires
+  # it at startup, in days; 0 keeps them forever. Only workspaces under
+  # workspaces/<platform>/__runs are swept. A job with a session key keeps its
+  # workspace indefinitely, however old: that is what turn 2 resumes from.
+  # Needs a claude-jobs restart.
+  # workspace_keep_days: 30
+
   # Per-job persona, keyed by the job key exactly as the producer set it. Only cron
   # sets one: the entry name, or <entry>/<item key> for a producer entry. A job with
   # no key ($job, claude-jobs enqueue) or an unlisted one gets `default`.
@@ -377,7 +384,7 @@ logs:
   # Retention in days for ~/.claude-on-the-fly/logs; 0 disables pruning. Assume
   # anything written there leaves the machine and sits for this long.
   # Applied the next time pruning runs, normally daemon startup.
-  # keep_days: 7
+  # keep_days: 30
 
   # Machine name in <role>-<host>-<date>.log. Defaults to the short hostname.
   # Applied at logger startup and again at daily rollover.

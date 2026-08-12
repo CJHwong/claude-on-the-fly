@@ -287,6 +287,79 @@ class TestRunLoopWiring:
             r.getMessage() for r in caplog.records
         )
 
+    async def test_finished_workspaces_are_retired_before_the_loop_claims_work(
+        self, monkeypatch, caplog, tmp_path
+    ) -> None:
+        """Retention runs at startup, not per job: an rmtree on the run path
+        competes with the in-flight cancel for the supervisor's 5s grace. Before
+        the loop claims anything, so it also never competes with a live job."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        ledger = MagicMock()
+        ledger.sweep.return_value = 0
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+        )
+        order: list[str] = []
+        seen: dict[str, object] = {}
+
+        def fake_sweep(data_dir, *, days):
+            order.append("workspaces")
+            seen["data_dir"], seen["days"] = data_dir, days
+            return [tmp_path / "dead-run"]
+
+        async def fake_run_loop(*_args, **_kwargs):
+            order.append("run_loop")
+
+        monkeypatch.setattr(cli, "sweep_run_workspaces", fake_sweep)
+        monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.jobs.cli"):
+            await cli._run("xoxb-token")
+
+        assert order == ["workspaces", "run_loop"]
+        assert seen == {"data_dir": cli.agent.DATA_DIR, "days": 30}
+        assert "retired 1 finished job workspace(s)" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_sweep_that_retires_nothing_stays_quiet(
+        self, monkeypatch, caplog, tmp_path
+    ) -> None:
+        """Every restart would otherwise log a line saying nothing happened."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        ledger = MagicMock()
+        ledger.sweep.return_value = 0
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+        )
+        monkeypatch.setattr(cli, "sweep_run_workspaces", lambda *_a, **_k: [])
+
+        async def fake_run_loop(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.jobs.cli"):
+            await cli._run("xoxb-token")
+
+        assert "retired" not in "\n".join(r.getMessage() for r in caplog.records)
+
     async def test_the_process_listener_is_removed_even_if_the_loop_raises(
         self, monkeypatch, tmp_path
     ) -> None:
@@ -367,3 +440,26 @@ def test_running_jobs_with_nothing_in_flight_is_empty() -> None:
 
     runner = OrchestratorAgentRunner(data_dir=Path("/tmp/x"))
     assert cli._running_jobs(runner) == {"running_jobs": []}
+
+
+def test_workspace_keep_days_defaults_to_thirty() -> None:
+    """Matches the log retention window, so an operator holds one number for how
+    far back they can look."""
+    assert cli._workspace_keep_days() == 30
+
+
+def test_workspace_keep_days_reads_the_setting(monkeypatch) -> None:
+    monkeypatch.setenv("JOBS_WORKSPACE_KEEP_DAYS", "7")
+    assert cli._workspace_keep_days() == 7
+
+
+def test_workspace_keep_days_of_zero_disables_the_sweep(monkeypatch) -> None:
+    """An operator with the disk can keep every run forever."""
+    monkeypatch.setenv("JOBS_WORKSPACE_KEEP_DAYS", "0")
+    assert cli._workspace_keep_days() == 0
+
+
+def test_workspace_keep_days_falls_back_when_unparseable(monkeypatch) -> None:
+    """A typo must not delete everything by resolving to 0, nor stop the worker."""
+    monkeypatch.setenv("JOBS_WORKSPACE_KEEP_DAYS", "a month")
+    assert cli._workspace_keep_days() == 30

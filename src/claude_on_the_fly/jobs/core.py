@@ -31,7 +31,9 @@ class Job:
     `key` and `session_key` are deliberately separate, because dedup identity
     and transcript identity are different questions. A cron entry firing hourly
     wants at most one job outstanding (`key` = the entry), but each fire should
-    start clean (`session_key` = None). A ticket polled off a tracker wants both
+    start clean (`session_key` = None), which it does by getting its own workspace
+    and session uuid, not by anything being deleted. A ticket polled off a tracker
+    wants both
     (`key` = `session_key` = the ticket), so turn 2 resumes turn 1 rather than
     re-reading the world from nothing. Collapsing them into one field would make
     the hourly job resume forever and grow its context without bound.
