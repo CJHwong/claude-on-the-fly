@@ -147,6 +147,7 @@ FIELDS: dict[str, Field] = {
     "jobs.concurrency": Field("JOBS_CONCURRENCY"),
     "jobs.poll_interval_s": Field("JOBS_POLL_INTERVAL_S"),
     "jobs.timeout": Field("JOBS_TIMEOUT"),
+    "jobs.workspace_keep_days": Field("JOBS_WORKSPACE_KEEP_DAYS"),
     "logs.keep_days": Field("COTF_LOG_KEEP_DAYS"),
     "logs.host_tag": Field("COTF_HOST_TAG"),
     "suggestions.enabled": Field("COTF_SUGGESTIONS_ENABLED"),
@@ -177,6 +178,8 @@ RESTART_REQUIRED = (
     "jobs.concurrency",
     "jobs.poll_interval_s",
     "jobs.timeout",
+    # Read once, when the startup sweep runs. An edit lands at the next restart.
+    "jobs.workspace_keep_days",
 )
 
 

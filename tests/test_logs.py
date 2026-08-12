@@ -260,7 +260,7 @@ class TestPrune:
         return path
 
     def test_removes_files_past_the_window(self, log_root):
-        stale = self._write(log_root, "slack", date.today() - timedelta(days=30))
+        stale = self._write(log_root, "slack", date.today() - timedelta(days=40))
         fresh = self._write(log_root, "slack", date.today())
         removed = logs.prune()
         assert removed == [stale]
@@ -269,7 +269,7 @@ class TestPrune:
 
     def test_prunes_every_host_not_just_this_one(self, log_root, monkeypatch):
         monkeypatch.setenv("COTF_HOST_TAG", "otherbox")
-        theirs = self._write(log_root, "slack", date.today() - timedelta(days=30))
+        theirs = self._write(log_root, "slack", date.today() - timedelta(days=40))
         monkeypatch.setenv("COTF_HOST_TAG", "testbox")
         assert logs.prune() == [theirs]
 

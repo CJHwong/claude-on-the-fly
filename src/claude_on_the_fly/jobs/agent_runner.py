@@ -1,13 +1,14 @@
 """Default `AgentRunner` — one agent run per job, reusing `agent.run`.
 
-A job with no `session_key` is an independent one-shot: a fresh workspace and a
-fresh session uuid per call, discarded on the way out, so no prior transcript
-bleeds in (hence `"jobs"` is in `agent.NO_HANDOFF_PLATFORMS`). That is every
-Slack-triggered job.
+A job with no `session_key` is an independent one-shot: a fresh workspace under
+`<platform>/__runs/<uuid>` and a fresh session uuid per call, so no prior
+transcript bleeds in. Isolation comes from the uuid, not from any cleanup — the
+workspace is new whatever happened to the last one. That is every Slack-triggered
+job.
 
 A job that carries a `session_key` is one step of something longer — turn 2 on a
 ticket a poller keeps returning — so its workspace and session uuid derive from
-that key instead of a random id, and neither is discarded when the run ends. The
+that key instead of a random id, and it sits directly under `<platform>/`. The
 next job with the same key resumes the same transcript rather than re-deriving
 the world from nothing. Both the workspace path and the session uuid include the
 key, so nothing else has to be persisted to make the resume happen.
@@ -20,11 +21,12 @@ the supervisor's grace.
 A handled agent failure becomes a `Result(ok=False, ...)`; `CancelledError`
 (a `BaseException`, not caught here) still propagates so cancel-in-flight works.
 
-Teardown of an unkeyed job removes the workspace *and* the session directory the
-active backend named after it (claude keeps one outside the workspace), and runs
-in a worker thread so it cannot eat the shutdown grace — see
-`_discard_workspace`. A keyed job skips teardown entirely; its workspace is the
-continuity.
+No run deletes a workspace. Finished one-shots are retired later, in bulk, by
+`sweep_run_workspaces` at worker startup: it takes the workspace *and* the
+session directory the active backend named after it (claude keeps one outside the
+workspace), for every `__runs/` entry past the retention window. Keeping them
+until then means a run that failed overnight can still be inspected. A keyed
+workspace is never swept; it is the continuity.
 
 NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
 so the child inherits this process's stdin. That is harmless for the supervised
@@ -36,7 +38,6 @@ stdin, and it may consume input meant for the shell. Run the worker detached
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 import time
@@ -53,6 +54,19 @@ from claude_on_the_fly.transcript import remove_workspace_sessions
 logger = logging.getLogger(__name__)
 
 
+# One-shot runs live under this segment, one level below the platform, so a
+# sweep can tell them from a keyed workspace by path alone. A marker file inside
+# the workspace would not do: the agent runs there under bypassPermissions and
+# can delete anything it can see, which would make its own workspace immortal.
+#
+# The `__` is load-bearing, not decoration. Keyed workspaces are named by
+# `safe_segment`, which collapses runs of unsafe characters to a *single* `_`, so
+# no sanitized key can ever produce this name. A single-underscore `_runs` would
+# be reachable from a `session_key` of `/runs`, and the sweep would then walk a
+# live keyed workspace deleting the files inside it as if they were dead runs.
+RUNS_DIRNAME = "__runs"
+
+
 def _discard_workspace(workspace: Path) -> None:
     """Remove a finished job's workspace and the session directory the backend
     keyed to it. Blocking; call it off the event loop.
@@ -65,11 +79,45 @@ def _discard_workspace(workspace: Path) -> None:
     shutil.rmtree(workspace, ignore_errors=True)
 
 
+def sweep_run_workspaces(data_dir: Path, *, days: int) -> list[Path]:
+    """Delete one-shot workspaces last touched over `days` ago; return what went.
+    `days` of 0 or less disables the sweep. Blocking; call it off the event loop.
+
+    Scoped to `__runs/`, so a keyed job's workspace is never a candidate however
+    long its key stays quiet. That workspace *is* the continuity for the next job
+    with the same key, and age cannot tell "abandoned" from "waiting" — a ticket
+    nobody touched for two months still wants turn 2 to resume turn 1.
+
+    Modification time, not the directory name: a run id is a uuid and carries no
+    date. A run still executing has a fresh mtime, so it cannot be swept out from
+    under itself even if this is called on a live worker.
+
+    Errors are ignored, as in `logs.prune`: retention must never take the worker
+    down.
+    """
+    root = data_dir / "workspaces"
+    if days <= 0 or not root.is_dir():
+        return []
+    cutoff = time.time() - days * 86400.0
+    removed: list[Path] = []
+    for runs_dir in sorted(root.glob(f"*/{RUNS_DIRNAME}")):
+        for workspace in sorted(runs_dir.iterdir()):
+            try:
+                if not workspace.is_dir() or workspace.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            _discard_workspace(workspace)
+            removed.append(workspace)
+    return removed
+
+
 @dataclass
 class OrchestratorAgentRunner:
     """`AgentRunner` that drives `agent.run` in a fresh per-job workspace.
 
-    `data_dir` roots the throwaway workspaces (`<data_dir>/workspaces/jobs/<run>`).
+    `data_dir` roots the workspaces: `<data_dir>/workspaces/<platform>/__runs/<run>`
+    for a one-shot, `<data_dir>/workspaces/<platform>/<key>` for a keyed job.
     `user_name` / `channel_context` / `timeout` are passed straight to
     `agent.run`. The composition root (`cli.py`) fills `timeout` from `jobs.timeout`;
     the
@@ -92,7 +140,10 @@ class OrchestratorAgentRunner:
         # gets a random id it will never see again.
         keyed = job.session_key is not None
         run_id = safe_segment(job.session_key) if job.session_key else uuid4().hex
-        workspace = self.data_dir / "workspaces" / job.platform / run_id
+        platform_dir = self.data_dir / "workspaces" / job.platform
+        workspace = (
+            platform_dir / run_id if keyed else platform_dir / RUNS_DIRNAME / run_id
+        )
         workspace.mkdir(parents=True, exist_ok=True)
         try:
             # Keyed on `job.key`, the same field that names the unit of work in the
@@ -139,22 +190,22 @@ class OrchestratorAgentRunner:
             return Result(ok=True, text=response.body)
         finally:
             self.in_flight.pop(job.id, None)
-            # A keyed job's workspace and session ARE its continuity, so nothing
-            # is discarded: the next run with this key has to find them. Growth is
-            # bounded by the number of distinct keys rather than by the number of
-            # runs, and a key that stops being produced stops being written to.
+            # No workspace is deleted here, keyed or not.
             #
-            # An unkeyed job gets a throwaway workspace; a long-lived worker would
-            # grow data_dir/workspaces without bound otherwise. `finally` cleans up
-            # on success, on handled failure, and while CancelledError unwinds —
-            # the await neither catches nor masks that propagation.
+            # A keyed job's workspace and session ARE its continuity: the next run
+            # with this key has to find them. Growth is bounded by the number of
+            # distinct keys rather than by the number of runs.
             #
-            # Off the event loop, because this is on the shutdown path: an agent
-            # that cloned a repo leaves a tree whose rmtree takes seconds, and
-            # blocking the loop here spends the supervisor's 5s grace on file
-            # deletion — the same window the in-flight cancel needs to reap the
-            # agent's process tree. Blowing it means a SIGKILLed worker and an
-            # orphaned agent CLI. It also keeps the heartbeat coroutine fed, so
-            # the dashboard does not flip to `broken` mid-cleanup.
-            if not keyed:
-                await asyncio.to_thread(_discard_workspace, workspace)
+            # An unkeyed job's workspace is dead the moment the run ends — the run
+            # id is a uuid nothing records, so nothing can ask for it again — but
+            # it is kept anyway, until `sweep_run_workspaces` retires it at
+            # startup. What a failed 3am run left on disk is worth more than the
+            # bytes, and isolation does not depend on the delete: the next run
+            # gets its own uuid regardless.
+            #
+            # Deleting here was also the wrong place for it. This runs on the
+            # shutdown path, where an agent that cloned a repo leaves a tree whose
+            # rmtree takes seconds, and that is the same 5s grace the in-flight
+            # cancel needs to reap the agent's process tree. Losing that race meant
+            # a SIGKILLed worker and an orphaned agent CLI still holding
+            # bypassPermissions.

@@ -59,7 +59,7 @@ That is why `Notifier.notify` **raises** on a failed post rather than swallowing
 
 **Execution is at-least-once.** A crashed worker leaves its job in `cur/`; `recover_stale` moves it back to `new/` on the next start, and shutdown deliberately *cancels* an in-flight job rather than finishing it (so the process tree is reaped inside the supervisor's grace). A job must therefore be safe to re-run.
 
-**`done/` is pruned to 7 days on completion** (`DONE_RETENTION_S`), matching the log retention so an archive and the logs covering it expire together. By age rather than count, so a burst of small jobs cannot evict this morning's.
+**`done/` is pruned to 7 days on completion** (`DONE_RETENTION_S`), deliberately shorter than the 30-day log and workspace windows: the archive is rescanned in full on every completion, so widening it charges the hot path rather than the disk. By age rather than count, so a burst of small jobs cannot evict this morning's.
 
 **`complete()` writes two files into `done/`** — `<id>.result.json` first (so a crash between the two still leaves a durable result), then the job file moves in. Anything counting finished jobs must count `*.result.json`; counting `*.json` double-counts every one of them.
 
@@ -106,6 +106,23 @@ The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-qu
 
 The watch pane tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
 
+## Workspaces
+
+`session_key` decides where a job runs and how long that directory lives.
+
+- **Unkeyed** (`session_key is None`): `workspaces/<platform>/__runs/<uuid4>`. A one-shot. Nothing records the run id, so nothing can ask for that workspace again.
+- **Keyed**: `workspaces/<platform>/<safe_segment(session_key)>`, reused by every later job with the same key. Both the path and the session uuid derive from the key, so the resume needs nothing else persisted.
+
+**No run deletes its own workspace**, keyed or not. Finished one-shots are retired in bulk by `sweep_run_workspaces` at worker startup (`jobs/cli.py`), which drops `__runs/` entries whose mtime is older than `jobs.workspace_keep_days` and takes each one's backend session directory with it — `remove_workspace_sessions` first, while the path still resolves, or `~/.claude/projects/<hash>/` keeps a dead directory per job that nothing can name again.
+
+Three things about that split are load-bearing:
+
+- **Isolation does not come from the delete.** Each one-shot gets its own uuid, so the next run is clean whatever happened to the last one. Keeping a finished workspace only costs disk, and buys an operator the files a run that failed overnight left behind.
+- **Retention is at startup, never on the run path.** A per-run rmtree lands during shutdown, where an agent that cloned a repo leaves a tree that takes seconds to remove, competing with the in-flight cancel for the supervisor's 5s grace. Losing that race means a SIGKILLed worker with an orphaned agent CLI still holding `bypassPermissions`. `tests/jobs/test_agent_runner.py::test_a_run_never_discards_a_workspace_itself` guards it.
+- **`__runs` has two underscores on purpose.** `safe_segment` collapses runs of unsafe characters to a single `_`, so no sanitized key can produce that name. A single-underscore `_runs` is reachable from a `session_key` of `/runs`, which would point the sweep at a live keyed workspace and have it delete the files inside as if they were dead runs.
+
+A keyed workspace is never swept, however old. It *is* the continuity for the next job with that key, and age cannot distinguish "abandoned" from "waiting" — a ticket nobody has touched in a year still expects turn 2 to resume turn 1. Growth is bounded by the number of distinct keys, which an operator controls, rather than by the number of runs.
+
 ## Logging
 
 `preflight.setup_daemon_logging("jobs")` adds a midnight-rotating file handler (7 backups) beside the console, which `preflight._setup_logging` — console-only — does not: without it `logs/jobs.log` is never written and the tab's log pane has nothing to tail. Every supervised daemon uses the same helper. Console and file share one level: `basicConfig` sets the *root* logger from `LOG_LEVEL`, so the file handler's own `DEBUG` floor only bites when `LOG_LEVEL=DEBUG`.
@@ -118,6 +135,7 @@ The watch pane tails a running job's live agent session: the runner publishes ea
 | `jobs.poll_interval_s` | `2.0` | Idle wait between drain attempts |
 | `jobs.timeout` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit. A `Job.timeout` from a producer overrides it |
 | `jobs.concurrency` | `1` | How many jobs run at once. A property of the machine, deliberately separate from a producer's own `max_concurrent` |
+| `jobs.workspace_keep_days` | `30` | How long a finished one-shot workspace is kept before the startup sweep retires it; `0` keeps them forever. Keyed workspaces are never swept |
 | `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token. Stays in `.env`: it is a credential |
 
 Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`) token from `SLACK_TOKEN` makes the worker post results as that user, and the Slack frontend — a separate process with its own dedup set — re-ingests them as new input, one spurious agent turn per job. `cli._notifier_loop_warning` warns about exactly this at startup.

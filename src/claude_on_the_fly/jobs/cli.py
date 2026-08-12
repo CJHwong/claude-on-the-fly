@@ -29,7 +29,10 @@ from dotenv import load_dotenv
 
 from claude_on_the_fly import agent, checks, settings
 from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
-from claude_on_the_fly.jobs.agent_runner import OrchestratorAgentRunner
+from claude_on_the_fly.jobs.agent_runner import (
+    OrchestratorAgentRunner,
+    sweep_run_workspaces,
+)
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
     Job,
@@ -53,6 +56,9 @@ logger = logging.getLogger(__name__)
 SUBCOMMANDS = ("run", "doctor", "enqueue")
 DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_CONCURRENCY = 1
+# Matches the log retention window, so an operator holds one number for "how far
+# back can I look", not two.
+DEFAULT_WORKSPACE_KEEP_DAYS = 30
 
 
 def _setup_logging() -> None:
@@ -90,6 +96,14 @@ def _concurrency() -> int:
         logger.warning("JOBS_CONCURRENCY=%s is below 1, using 1", value)
         return 1
     return value
+
+
+def _workspace_keep_days() -> int:
+    """How long a finished one-shot job workspace is kept, from
+    `JOBS_WORKSPACE_KEEP_DAYS`. 0 or less disables the sweep and keeps them
+    forever, which is a choice an operator with the disk for it may want.
+    """
+    return int(_env_float("JOBS_WORKSPACE_KEEP_DAYS", DEFAULT_WORKSPACE_KEEP_DAYS))
 
 
 def _timeout_s() -> float | None:
@@ -198,6 +212,17 @@ async def _run(token: str) -> None:
             killed,
         )
     agent.add_process_listener(ledger.on_process)
+
+    # Retention for finished one-shot workspaces. Startup is the whole cadence:
+    # the sweep is bounded by what one worker's lifetime accumulated, and a worker
+    # that never restarts is not accumulating either. Before the loop claims
+    # anything, so a long rmtree cannot compete with a running job for the disk.
+    retired = sweep_run_workspaces(agent.DATA_DIR, days=_workspace_keep_days())
+    if retired:
+        logger.info(
+            "claude-jobs: retired %d finished job workspace(s) past retention",
+            len(retired),
+        )
 
     # The composition root knows the runner is the concrete
     # OrchestratorAgentRunner (build_components constructs it); the port type

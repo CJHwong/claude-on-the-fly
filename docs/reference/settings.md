@@ -47,6 +47,7 @@ falls back for that section without discarding unrelated sections.
 | `jobs.concurrency` | Jobs daemon | Worker pool size is fixed for the run |
 | `jobs.poll_interval_s` | Jobs daemon | Worker loop receives it at startup |
 | `jobs.timeout` | Jobs daemon | Agent runner is constructed with it |
+| `jobs.workspace_keep_days` | Jobs daemon | Read once, by the startup workspace sweep |
 
 The chat frontend reports changes represented by `settings.RESTART_REQUIRED` on the
 next turn. The jobs worker cannot post that notice; restart it explicitly after editing

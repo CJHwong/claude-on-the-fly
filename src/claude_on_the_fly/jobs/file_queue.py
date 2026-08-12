@@ -59,8 +59,10 @@ logger = logging.getLogger(__name__)
 # Cap on how many queued jobs an observer parses per read. A deep queue must not
 # turn a 1Hz dashboard tick into hundreds of file reads.
 DEFAULT_ROW_LIMIT = 20
-# How long a completed job's record and reply stay in `done/`. Matches the
-# 7-day log retention in `jobs/cli._setup_logging`.
+# How long a completed job's record and reply stay in `done/`. Shorter than the
+# log and workspace windows (30 days) on purpose: this is one JSON record per
+# finished job, scanned in full on every completion, so the cost of widening it
+# is paid by the hot path rather than by the disk.
 DONE_RETENTION_S = 7 * 24 * 60 * 60
 # How long an undelivered result stays worth re-posting. A permanently
 # undeliverable one — archived channel, revoked token — must not be retried on
