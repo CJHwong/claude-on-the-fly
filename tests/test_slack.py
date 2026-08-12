@@ -343,12 +343,11 @@ class TestIngestEvent:
         await frontend._ingest_event(event)
         frontend._on_message.assert_not_awaited()
 
-    async def test_an_untagged_channel_message_is_hinted_once(self, frontend):
-        """A channel needs a tag and people forget mid-conversation. Say so once, in
-        a thread the bot is already in, then never again for that thread."""
+    async def test_an_untagged_channel_message_schedules_a_notice(self, frontend):
+        """Dropped, but not silently: a thread the bot is already in gets told it
+        needs a tag. Posted later (see TestMentionNotice), never inline."""
         session_id = _session_key("C1", "5.1")
         frontend._sessions[session_id] = ("C1", "5.1")
-        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "h.0"}
         event = {
             "ts": "5.2",
             "thread_ts": "5.1",
@@ -359,12 +358,11 @@ class TestIngestEvent:
         }
 
         await frontend._ingest_event(event)
-        await frontend._ingest_event(event | {"ts": "5.3"})
 
         frontend._on_message.assert_not_awaited()
-        assert frontend._app.client.chat_postMessage.call_count == 1
-        hint = frontend._app.client.chat_postMessage.call_args[1]["text"]
-        assert "<@U_SELF>" in hint
+        frontend._app.client.chat_postMessage.assert_not_called()
+        assert session_id in frontend._mention_notices
+        frontend._cancel_mention_notice(session_id)
 
     async def test_an_untagged_message_in_an_unknown_thread_is_silent(self, frontend):
         """Ordinary channel chatter the bot was never part of. Answering it would make
@@ -1555,6 +1553,143 @@ class TestWorkspacePath:
         fe._workspace_names[42] = "my-ws"
         result = fe._workspace_path(42)
         assert result == Path("/data/workspaces/slack/my-ws")
+
+
+# ---------------------------------------------------------------------------
+# Forgot-to-tag notice (channel threads only)
+# ---------------------------------------------------------------------------
+
+
+class TestMentionNotice:
+    """One notice, and only for somebody who forgot the tag *and* left. While they
+    are still typing they are still watching, and a notice read on arrival is one
+    they never register."""
+
+    def _event(self, ts: str, text: str = "and one more thing") -> dict:
+        return {
+            "ts": ts,
+            "thread_ts": "t1",
+            "text": text,
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+    def _live_thread(self, frontend) -> int:
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        return session_id
+
+    async def test_an_untagged_message_is_answered_after_the_wait(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 0)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        # Held back, not posted inline.
+        frontend._app.client.chat_postMessage.assert_not_called()
+        await frontend._mention_notices[session_id]
+
+        note = frontend._app.client.chat_postMessage.call_args[1]["text"]
+        assert note.startswith("<@U_ALLOWED> ")  # pings whoever forgot
+        assert "<@U_SELF>" in note  # and names the tag to use
+        assert session_id in frontend._mention_hinted
+        frontend._on_message.assert_not_awaited()
+
+    async def test_the_wait_is_the_configured_one(self, frontend, monkeypatch):
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(slack_mod.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 120.0)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id]
+
+        assert slept == [120.0]
+
+    async def test_another_untagged_message_restarts_the_wait(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        first = frontend._mention_notices[session_id]
+        await asyncio.sleep(0)
+        await frontend._ingest_event(self._event("t3", "hello?"))
+        second = frontend._mention_notices[session_id]
+
+        assert second is not first
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # The replaced task's cleanup must not take the reschedule down with it.
+        assert frontend._mention_notices[session_id] is second
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_a_tagged_message_cancels_it(self, frontend, monkeypatch):
+        """They corrected themselves. Saying it anyway is the bot lecturing."""
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        pending = frontend._mention_notices[session_id]
+        await asyncio.sleep(0)
+        await frontend._ingest_event(self._event("t3", "<@U_SELF> sorry, this"))
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
+        assert session_id not in frontend._mention_hinted  # still tellable later
+        frontend._on_message.assert_awaited_once()
+
+    async def test_it_is_said_once_per_thread(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 0)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id]
+        await frontend._ingest_event(self._event("t3", "still forgetting"))
+
+        assert not frontend._mention_notices
+        assert frontend._app.client.chat_postMessage.call_count == 1
+
+    async def test_a_thread_the_bot_is_not_in_gets_nothing(self, frontend):
+        """Ordinary channel chatter. Answering it would make the bot talk in
+        threads nobody invited it into."""
+        await frontend._ingest_event(self._event("t2"))
+
+        assert not frontend._mention_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_an_evicted_thread_drops_its_notice(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        pending = frontend._mention_notices[session_id]
+        frontend._forget_session(session_id)
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
+
+    async def test_stop_drops_it_too(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        pending = frontend._mention_notices[session_id]
+        await frontend.stop()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
 
 
 # ---------------------------------------------------------------------------

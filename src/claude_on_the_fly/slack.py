@@ -65,6 +65,16 @@ DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 4.2
 # long as they kept typing, and never learn the thread is gated. Not an operator
 # setting: it is a guard on the delay, not a second thing to tune.
 REPLY_LIMIT_NOTICE_MAX_HOLD = 30.0
+# Channel kinds where a message only reaches the bot if it tags it. The one
+# source of truth for the mention gate and for the reminder below.
+TAG_REQUIRED_CHANNEL_TYPES = frozenset({"channel", "group"})
+# How long an untagged message sits unanswered before the bot says why. Long on
+# purpose: the sender is watching the thread for the reply they think is coming,
+# and a notice posted into that wait is read on arrival and forgotten. Two
+# minutes of nothing means they have moved on, so it lands as an unread ping they
+# will actually see. Not an operator setting — it is a nicety, and the `slack:`
+# config block is at prek's comment-line ceiling.
+MENTION_NOTICE_DELAY_SECONDS = 120.0
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
@@ -935,6 +945,8 @@ class SlackFrontend(Frontend):
         self._gate_deadlines: dict[int, float] = {}
         # Threads already told that a channel needs an @mention. Once each.
         self._mention_hinted: set[int] = set()
+        # session -> the idle reminder waiting for the thread to stay quiet.
+        self._mention_notices: dict[int, asyncio.Task[None]] = {}
         # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
         # button's `value` stays opaque and a subject never has to be encoded
         # into a client-supplied field.
@@ -1092,6 +1104,7 @@ class SlackFrontend(Frontend):
         self._session_sender_ids.pop(session_id, None)
         self._reply_counts.pop(session_id, None)
         self._cancel_gate_notice(session_id)
+        self._cancel_mention_notice(session_id)
         self._mention_hinted.discard(session_id)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
@@ -1746,11 +1759,11 @@ class SlackFrontend(Frontend):
                 return
 
             # Channels and groups additionally require an @mention.
-            if channel_type in ("channel", "group"):
+            if channel_type in TAG_REQUIRED_CHANNEL_TYPES:
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
                     logger.debug("skipped: no mention of %s in text", self._user_id)
-                    await self._hint_mention_required(channel, thread_ts)
+                    await self._hint_mention_required(channel, thread_ts, sender_id)
                     return
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
@@ -1769,6 +1782,10 @@ class SlackFrontend(Frontend):
         is_new_session = session_id not in self._sessions
         is_mid_thread = bool(event.get("thread_ts")) and event["thread_ts"] != ts
         self._remember_session(session_id, channel, thread_ts)
+        # They tagged the bot, so they know how this works: drop any pending
+        # "you need to tag me" notice rather than lecturing them about a mistake
+        # they have already corrected.
+        self._cancel_mention_notice(session_id)
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
@@ -2018,6 +2035,8 @@ class SlackFrontend(Frontend):
     async def stop(self) -> None:
         for session_id in list(self._gate_notices):
             self._cancel_gate_notice(session_id)
+        for session_id in list(self._mention_notices):
+            self._cancel_mention_notice(session_id)
         if self._handler:
             await self._handler.close_async()
 
@@ -2203,28 +2222,63 @@ class SlackFrontend(Frontend):
                 self._gate_deadlines.pop(session_id, None)
         await self._warn_reply_limit(channel, thread_ts, sender_id)
 
-    async def _hint_mention_required(self, channel: str, thread_ts: str | None) -> None:
+    async def _hint_mention_required(
+        self, channel: str, thread_ts: str | None, sender_id: str
+    ) -> None:
         """Say once, in a thread the bot is already in, that a channel message
         without a tag is invisible to it.
 
         Scoped to threads with a live session because those are the ones where
         somebody is talking *to* the bot and the missing tag is a slip. Without
         that check this fires on ordinary channel chatter the bot was never part
-        of. Sent from inside the channel/group branch, so a DM (where no tag is
+        of. Called from inside the channel/group branch, so a DM (where no tag is
         needed) can never reach it.
+
+        Held for `MENTION_NOTICE_DELAY_SECONDS` rather than posted now, and each
+        further untagged message restarts the wait: while they are still typing
+        they are also still watching, and a notice read on arrival is one they
+        never register. A tagged message cancels it outright -- somebody who got
+        it right does not need telling -- so this only reaches the person who
+        forgot *and* walked away, which is exactly who comes back to an unread
+        thread.
         """
         session_id = _session_key(channel, thread_ts)
         if session_id not in self._sessions or session_id in self._mention_hinted:
             return
-        self._mention_hinted.add(session_id)
-        logger.info(
-            "slack %s/%s: hinted that a channel needs a tag", channel, thread_ts
+        self._cancel_mention_notice(session_id)
+        self._mention_notices[session_id] = asyncio.create_task(
+            self._notice_mention_later(session_id, channel, thread_ts, sender_id)
         )
+
+    def _cancel_mention_notice(self, session_id: int) -> None:
+        """Drop a notice that has not fired yet."""
+        task = self._mention_notices.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _notice_mention_later(
+        self,
+        session_id: int,
+        channel: str,
+        thread_ts: str | None,
+        sender_id: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(MENTION_NOTICE_DELAY_SECONDS)
+            self._mention_hinted.add(session_id)
+        finally:
+            # Deregister before posting, for the same reason the gate notice
+            # does: a cancel landing inside `chat_postMessage` aborts a half-sent
+            # request. Only if this task is still the thread's notice — a restart
+            # cancels us *after* the replacement is stored.
+            if self._mention_notices.get(session_id) is asyncio.current_task():
+                self._mention_notices.pop(session_id, None)
+        logger.info("slack %s/%s: told the thread it needs a tag", channel, thread_ts)
         await self._post_notice(
             channel,
             thread_ts,
-            f"In a channel I only see messages that tag me. Add <@{self._user_id}> "
-            "and I'll pick it up.",
+            f"<@{sender_id}> I only see messages in a channel that tag me. "
+            f"Add <@{self._user_id}> and I'll pick it up.",
         )
 
     async def _warn_reply_limit(
