@@ -54,12 +54,13 @@ logger = logging.getLogger(__name__)
 # counter.
 DEFAULT_REPLY_SOFT_LIMIT = 10
 CONTINUE_COMMAND = "$continue"
-# The gate notice is held back this long before it is posted. Posting it the
-# instant the message arrives is what loses it: the sender is still looking at
-# the thread, Slack marks it read on arrival, and they walk away with no unread
-# badge believing the message is being worked on. A few seconds is enough for
-# them to have moved on, so the notice lands as an unread thread reply.
-DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 4.2
+# How long the gate notice is held before it is posted. Off by default: 0 posts
+# it the moment the message is gated, which is what this always did. Set it to a
+# few seconds where people fire a question and leave -- posted instantly, the
+# notice arrives while the sender still has the thread open, Slack marks it read
+# on arrival, and they walk away with no unread badge believing the message is
+# being worked on. Waiting until they have gone makes it an unread thread reply.
+DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 0.0
 # Ceiling on the debounce above, timed from the first gated message. Somebody
 # firing a message every three seconds would otherwise defer the notice for as
 # long as they kept typing, and never learn the thread is gated. Not an operator
@@ -68,13 +69,14 @@ REPLY_LIMIT_NOTICE_MAX_HOLD = 30.0
 # Channel kinds where a message only reaches the bot if it tags it. The one
 # source of truth for the mention gate and for the reminder below.
 TAG_REQUIRED_CHANNEL_TYPES = frozenset({"channel", "group"})
-# How long an untagged message sits unanswered before the bot says why. Long on
-# purpose: the sender is watching the thread for the reply they think is coming,
-# and a notice posted into that wait is read on arrival and forgotten. Two
-# minutes of nothing means they have moved on, so it lands as an unread ping they
-# will actually see. Not an operator setting — it is a nicety, and the `slack:`
-# config block is at prek's comment-line ceiling.
-MENTION_NOTICE_DELAY_SECONDS = 120.0
+# How long an untagged channel message sits unanswered before the bot says why.
+# 0, the default, turns the notice off entirely -- nothing is scheduled and no
+# per-thread state is recorded, so an install that does not want the bot speaking
+# unprompted in a channel pays nothing for it. When set, make it long: the sender
+# is watching the thread for the reply they think is coming, and a notice posted
+# into that wait is read on arrival and forgotten, while a couple of minutes of
+# nothing means they have moved on and it lands as an unread ping.
+DEFAULT_MENTION_NOTICE_SECONDS = 0.0
 # Abort the in-flight turn. A plain-text prefix (not a slash command) so it
 # works inside threads, where Slack blocks custom slash commands.
 STOP_COMMAND = "$stop"
@@ -165,9 +167,17 @@ def reply_soft_limit() -> int:
 
 
 def reply_limit_notice_seconds() -> float:
-    """Seconds to hold the gate notice back before posting it."""
+    """Seconds to hold the gate notice back before posting it. 0 posts it now."""
     return _non_negative_float(
         "SLACK_REPLY_LIMIT_NOTICE_SECONDS", DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
+    )
+
+
+def mention_notice_seconds() -> float:
+    """Seconds an untagged channel message waits for a "you need to tag me"
+    notice. 0 disables the notice."""
+    return _non_negative_float(
+        "SLACK_MENTION_NOTICE_SECONDS", DEFAULT_MENTION_NOTICE_SECONDS
     )
 
 
@@ -2234,20 +2244,24 @@ class SlackFrontend(Frontend):
         of. Called from inside the channel/group branch, so a DM (where no tag is
         needed) can never reach it.
 
-        Held for `MENTION_NOTICE_DELAY_SECONDS` rather than posted now, and each
-        further untagged message restarts the wait: while they are still typing
-        they are also still watching, and a notice read on arrival is one they
-        never register. A tagged message cancels it outright -- somebody who got
+        Opt-in (`slack.mention_notice_seconds`, off by default) and, when on, held
+        for that many seconds rather than posted now. Each further untagged
+        message restarts the wait: while they are still typing they are also
+        still watching, and a notice read on arrival is one they never register.
+        While it is off nothing is scheduled and no per-thread state is recorded. A tagged message cancels it outright -- somebody who got
         it right does not need telling -- so this only reaches the person who
         forgot *and* walked away, which is exactly who comes back to an unread
         thread.
         """
+        delay = mention_notice_seconds()
+        if delay <= 0:
+            return
         session_id = _session_key(channel, thread_ts)
         if session_id not in self._sessions or session_id in self._mention_hinted:
             return
         self._cancel_mention_notice(session_id)
         self._mention_notices[session_id] = asyncio.create_task(
-            self._notice_mention_later(session_id, channel, thread_ts, sender_id)
+            self._notice_mention_later(session_id, channel, thread_ts, sender_id, delay)
         )
 
     def _cancel_mention_notice(self, session_id: int) -> None:
@@ -2262,9 +2276,12 @@ class SlackFrontend(Frontend):
         channel: str,
         thread_ts: str | None,
         sender_id: str,
+        delay: float,
     ) -> None:
+        # Read at schedule time and carried in, so switching the notice off does
+        # not leave a task that wakes minutes later and posts anyway.
         try:
-            await asyncio.sleep(MENTION_NOTICE_DELAY_SECONDS)
+            await asyncio.sleep(delay)
             self._mention_hinted.add(session_id)
         finally:
             # Deregister before posting, for the same reason the gate notice

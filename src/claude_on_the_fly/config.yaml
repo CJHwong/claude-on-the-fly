@@ -300,8 +300,7 @@ slack:
   # except for the token's own id -- under a bot token that is the BOT's, not yours, so
   # list your own U... id or your DMs are dropped. The startup log shows what is live.
   # allowed_senders: [U012ABCDEF, B07JPABE2]
-  # To allow everyone, quote the wildcard: allowed_senders: ["*"]
-  # A bare `*` is YAML alias syntax and makes the whole file invalid.
+  # Everyone: allowed_senders: ["*"] -- must be quoted; a bare * is YAML alias syntax
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
   # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
 
@@ -315,12 +314,13 @@ slack:
   # Trigger and queue are constructed at Slack startup, so changing it needs a restart.
   # job_command: "$job"
 
-  # Threads retained before LRU eviction, replies per thread before inbound messages
-  # are gated ($continue resets the counter), and the seconds that gate notice waits
-  # so it lands after the sender left rather than read-on-arrival (0 = immediate).
+  # Threads retained before LRU eviction, replies per thread before the $continue gate,
+  # seconds that gate notice is held so it lands after the sender left (0 posts it now),
+  # and seconds an untagged channel message waits for a "tag me" notice (0 = never).
   # session_cap: 1000
   # reply_soft_limit: 10
-  # reply_limit_notice_seconds: 4.2
+  # reply_limit_notice_seconds: 0
+  # mention_notice_seconds: 0
 
   # Per-chat persona: a file, relative to the data root, that REPLACES the
   # data-root CLAUDE.md for one chat. Key it by channel id (survives renames; the

@@ -140,6 +140,7 @@ FIELDS: dict[str, Field] = {
     "slack.session_cap": Field("SLACK_SESSION_CAP"),
     "slack.reply_soft_limit": Field("SLACK_REPLY_SOFT_LIMIT"),
     "slack.reply_limit_notice_seconds": Field("SLACK_REPLY_LIMIT_NOTICE_SECONDS"),
+    "slack.mention_notice_seconds": Field("SLACK_MENTION_NOTICE_SECONDS"),
     "telegram.allowed_user_id": Field("TELEGRAM_ALLOWED_USER_ID"),
     "telegram.stats": Field("TELEGRAM_STATS_MODE"),
     "jobs.queue_kind": Field("JOBS_QUEUE_KIND"),

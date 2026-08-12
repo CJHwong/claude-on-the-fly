@@ -343,9 +343,13 @@ class TestIngestEvent:
         await frontend._ingest_event(event)
         frontend._on_message.assert_not_awaited()
 
-    async def test_an_untagged_channel_message_schedules_a_notice(self, frontend):
-        """Dropped, but not silently: a thread the bot is already in gets told it
-        needs a tag. Posted later (see TestMentionNotice), never inline."""
+    async def test_an_untagged_channel_message_schedules_a_notice(
+        self, frontend, monkeypatch
+    ):
+        """Dropped, but not silently, once the notice is switched on: a thread the
+        bot is already in gets told it needs a tag. Posted later (see
+        TestMentionNotice), never inline."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = _session_key("C1", "5.1")
         frontend._sessions[session_id] = ("C1", "5.1")
         event = {
@@ -1560,6 +1564,77 @@ class TestWorkspacePath:
 # ---------------------------------------------------------------------------
 
 
+class TestNoticeToggles:
+    """Both notices ship off. An install that never opens config.yaml sees exactly
+    what it saw before this feature existed."""
+
+    def test_the_gate_notice_is_not_held_by_default(
+        self, operator_settings, monkeypatch
+    ):
+        monkeypatch.delenv("SLACK_REPLY_LIMIT_NOTICE_SECONDS", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert slack_mod.reply_limit_notice_seconds() == 0
+
+    def test_the_mention_notice_is_off_by_default(self, operator_settings, monkeypatch):
+        monkeypatch.delenv("SLACK_MENTION_NOTICE_SECONDS", raising=False)
+        operator_settings.write_text("slack: {}\n")
+        assert slack_mod.mention_notice_seconds() == 0
+
+    def test_a_configured_mention_notice_is_used(self, operator_settings):
+        operator_settings.write_text("slack:\n  mention_notice_seconds: 120\n")
+        assert slack_mod.mention_notice_seconds() == 120
+
+    async def test_while_off_an_untagged_message_records_nothing(self, frontend):
+        """Not just "posts nothing": an install that does not want the bot speaking
+        unprompted should not be paying per-thread memory for the feature either."""
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+
+        await frontend._ingest_event(
+            {
+                "ts": "t2",
+                "thread_ts": "t1",
+                "text": "no tag here",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U_ALLOWED",
+            }
+        )
+
+        assert not frontend._mention_notices
+        assert not frontend._mention_hinted
+        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._on_message.assert_not_awaited()
+
+    async def test_switching_it_off_mid_flight_does_not_post(
+        self, frontend, monkeypatch
+    ):
+        """The delay is read when the notice is scheduled and carried into the task,
+        so a turned-off setting cannot be outlived by a task that posts anyway."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+
+        await frontend._ingest_event(
+            {
+                "ts": "t2",
+                "thread_ts": "t1",
+                "text": "no tag here",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U_ALLOWED",
+            }
+        )
+        pending = frontend._mention_notices[session_id]
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0)
+        frontend._cancel_mention_notice(session_id)
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+
 class TestMentionNotice:
     """One notice, and only for somebody who forgot the tag *and* left. While they
     are still typing they are still watching, and a notice read on arrival is one
@@ -1584,7 +1659,7 @@ class TestMentionNotice:
     async def test_an_untagged_message_is_answered_after_the_wait(
         self, frontend, monkeypatch
     ):
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 0)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
@@ -1605,7 +1680,7 @@ class TestMentionNotice:
             slept.append(seconds)
 
         monkeypatch.setattr(slack_mod.asyncio, "sleep", fake_sleep)
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 120.0)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 120.0)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
@@ -1616,7 +1691,7 @@ class TestMentionNotice:
     async def test_another_untagged_message_restarts_the_wait(
         self, frontend, monkeypatch
     ):
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
@@ -1634,7 +1709,7 @@ class TestMentionNotice:
 
     async def test_a_tagged_message_cancels_it(self, frontend, monkeypatch):
         """They corrected themselves. Saying it anyway is the bot lecturing."""
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
@@ -1649,7 +1724,7 @@ class TestMentionNotice:
         frontend._on_message.assert_awaited_once()
 
     async def test_it_is_said_once_per_thread(self, frontend, monkeypatch):
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 0)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
@@ -1668,7 +1743,7 @@ class TestMentionNotice:
         frontend._app.client.chat_postMessage.assert_not_called()
 
     async def test_an_evicted_thread_drops_its_notice(self, frontend, monkeypatch):
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
@@ -1680,7 +1755,7 @@ class TestMentionNotice:
         assert not frontend._mention_notices
 
     async def test_stop_drops_it_too(self, frontend, monkeypatch):
-        monkeypatch.setattr(slack_mod, "MENTION_NOTICE_DELAY_SECONDS", 3600)
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
