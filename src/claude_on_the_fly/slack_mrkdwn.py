@@ -9,13 +9,17 @@ node as mrkdwn, degrading gracefully where mrkdwn has no equivalent:
     tables        -> aligned monospace inside a code fence
     deep nesting  -> flattened, indented bullets
 
-Code fences and inline code pass through untouched, so asterisks/pipes inside
-them survive. Raw inline HTML (e.g. Slack ``<@U123>`` mentions) is preserved.
+The content of a code fence or an inline code span passes through untouched, so
+asterisks/pipes inside one survive; the spacing *around* an inline span is still
+adjusted, because Slack needs a boundary there. Raw inline HTML (e.g. Slack
+``<@U123>`` mentions) is preserved.
 """
 
 from __future__ import annotations
 
 import string
+import unicodedata
+from collections.abc import Callable
 
 from markdown_it import MarkdownIt
 from markdown_it.tree import SyntaxTreeNode
@@ -24,16 +28,39 @@ from markdown_it.tree import SyntaxTreeNode
 # through as text instead of being rewritten into <url|url> links.
 _MD = MarkdownIt("commonmark").enable("table").enable("strikethrough")
 
-# Slack parses *bold* / _italic_ / ~strike~ only when the character outside
-# each marker is whitespace, a line boundary, or half-width punctuation. CJK
-# text has none of those between words, so a converted marker would arrive as
-# a literal character; the guard inserts a space to give the marker a
-# boundary. Backtick is half-width but not in string.punctuation.
+# Slack has two boundary rules, and a marker with no boundary beside it arrives
+# as a literal character.
+#
+# For *bold* / _italic_ / ~strike~ the boundary is whitespace, a line boundary,
+# or half-width punctuation. CJK text has none of those between words, so the
+# guard inserts a space to give the marker one. Backtick is half-width but not
+# in string.punctuation.
 _BOUNDARY = frozenset(string.punctuation + "`")
+
+# For a `code span` the set is wider: punctuation counts at any width, so `x`。
+# renders where *x*。 does not. Only a letter, a number, or a mark breaks a span,
+# which leaves the categories below. Half-width is no exemption -- run`pytest`now
+# fails in Slack exactly as 前面`x`後面 does.
+_WORD_CATEGORIES = frozenset("LNM")
+
+# `_` is the one hand-cut exception, and it is here for its meaning rather than
+# its category: it is Pc, punctuation, so the rule above would call it a
+# boundary, but it also opens italics in Slack and a span closing onto one does
+# not render. Only the closing side was seen to fail; the guard fires on both
+# because over-guarding costs a cosmetic space and under-guarding costs a broken
+# span, and the opening side is untested rather than known good.
+_CODE_NON_BOUNDARY = frozenset("_")
 
 
 def _is_boundary(char: str) -> bool:
     return char.isspace() or char in _BOUNDARY
+
+
+def _is_code_boundary(char: str) -> bool:
+    """The same question for a code span, which Slack parses more loosely."""
+    if char in _CODE_NON_BOUNDARY:
+        return False
+    return char.isspace() or unicodedata.category(char)[0] not in _WORD_CATEGORIES
 
 
 def to_mrkdwn(text: str) -> str:
@@ -136,10 +163,11 @@ def _inline(
 ) -> str:
     """Render the inline children of a block node (paragraph, heading, cell).
 
-    Emphasis markers need a boundary on each side or Slack renders them
-    literally, so the guard lives at this join point, where the neighbouring
-    characters are known. `guard=False` turns it off for content bound for a
-    fence, and has to travel down with `flatten_strong` because emphasis nests.
+    Emphasis markers and code spans need a boundary on each side or Slack
+    renders them literally, so the guard lives at this join point, where the
+    neighbouring characters are known. Each form brings its own boundary test.
+    `guard=False` turns it off for content bound for a fence, and has to travel
+    down with `flatten_strong` because emphasis nests.
     """
     pairs = []
     for child in node.children or []:
@@ -148,19 +176,26 @@ def _inline(
             pairs.append((child, part))
     out = []
     for index, (child, part) in enumerate(pairs):
-        if guard and _emits_markers(child, flatten_strong):
-            if index and not _is_boundary(pairs[index - 1][1][-1]):
+        boundary = _boundary_test(child, flatten_strong) if guard else None
+        if boundary:
+            if index and not boundary(pairs[index - 1][1][-1]):
                 part = f" {part}"
-            if index + 1 < len(pairs) and not _is_boundary(pairs[index + 1][1][0]):
+            if index + 1 < len(pairs) and not boundary(pairs[index + 1][1][0]):
                 part = f"{part} "
         out.append(part)
     return "".join(out)
 
 
-def _emits_markers(node: SyntaxTreeNode, flatten_strong: bool) -> bool:
-    """True when this child rendered as *…* / _…_ / ~…~ — the marker forms
-    that need a boundary. A flattened strong renders as plain text instead."""
-    return node.type in ("em", "s") or (node.type == "strong" and not flatten_strong)
+def _boundary_test(
+    node: SyntaxTreeNode, flatten_strong: bool
+) -> Callable[[str], bool] | None:
+    """The boundary rule this child's markers answer to, or None when it
+    emitted none. A flattened strong renders as plain text instead."""
+    if node.type in ("em", "s") or (node.type == "strong" and not flatten_strong):
+        return _is_boundary
+    if node.type == "code_inline":
+        return _is_code_boundary
+    return None
 
 
 def _render_inline(
