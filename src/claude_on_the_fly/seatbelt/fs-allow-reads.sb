@@ -206,6 +206,10 @@
 ;; than built from _HOME because CLAUDE_CONFIG_DIR can move the tree outside $HOME.
 (deny file-read* (subpath (param "_CLAUDE_PROJECTS")))
 (allow file-read* (subpath (param "_CLAUDE_PROJECT")))
+;; Every prompt typed in every project on this host, so it crosses threads the same
+;; way projects/ does. Denied by name, like the credentials above, because it is one
+;; file rather than a tree. No measured turn writes it, so nothing is lost.
+(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
 ;; codex, same boundary and the wider hole of the two: its rollouts sit in one flat
 ;; date tree that the global read allow reached in full, 1088 files on the host this
 ;; was measured on. codex chooses the rollout name at startup, so there is nothing
@@ -237,8 +241,22 @@
 ;; process that writes it. The re-grant is that directory for the running thread
 ;; only, so persistence works without reopening the other threads.
 (deny file-write* (subpath (string-append (param "_HOME") "/.claude")))
+;; The same deny against the resolved config directory, because CLAUDE_CONFIG_DIR
+;; can move it outside $HOME where the rule above reaches nothing. Every claude
+;; re-grant below is written against this param for the same reason.
+(deny file-write* (subpath (param "_CLAUDE_CONFIG")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
+(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/.claude.json")))
 (allow file-write* (subpath (param "_CLAUDE_PROJECT")))
+;; Runtime scratch a real turn was measured writing. See _CLAUDE_RUNTIME_WRITES in
+;; sandbox.py for how the list was taken and why each entry is not
+;; instruction-bearing. settings.json, hooks, commands, skills, agents and the
+;; plugins/ root are absent on purpose and stay denied by the rules above.
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/shell-snapshots")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/session-env")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/sessions")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/plugins/cache")))
+(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/policy-limits.json")))
 ;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
 ;; dies at startup with "failed to initialize in-process app-server client:
 ;; Operation not permitted" before it makes any network call, because its

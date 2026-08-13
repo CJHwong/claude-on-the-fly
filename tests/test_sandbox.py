@@ -1799,6 +1799,7 @@ def test_both_profiles_receive_the_session_grant_params(tmp_path):
             data_dir=tmp_path,
             project=tmp_path,
             tmpdir=tmp_path,
+            claude_config=tmp_path / "config",
             claude_projects=tmp_path / "projects",
             claude_project=tmp_path / "projects" / "thread",
             codex_sessions=tmp_path / "codex" / "sessions",
@@ -1819,7 +1820,7 @@ def test_the_session_grant_follows_a_redirected_config_dir(monkeypatch, tmp_path
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(redirected))
     workspace = tmp_path / "workspaces" / "slack" / "thread"
     workspace.mkdir(parents=True)
-    projects, thread = sandbox._claude_session_paths(workspace)
+    _, projects, thread = sandbox._claude_session_paths(workspace)
     assert projects == Path(os.path.realpath(redirected / "projects"))
     assert thread.parent == projects
     assert thread.name == str(workspace.resolve()).replace("/", "-").replace(
@@ -1848,7 +1849,7 @@ def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(tmp_path):
     same depth-ordering trade the plugins/cache entry makes."""
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    projects, thread = sandbox._claude_session_paths(workspace)
+    _, projects, thread = sandbox._claude_session_paths(workspace)
     # Masked only when present, so make it present rather than depending on
     # whatever another test in this session happened to create.
     projects.mkdir(parents=True, exist_ok=True)
@@ -2005,7 +2006,7 @@ def test_an_absent_session_store_is_not_named_as_a_mount(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    claude_projects, _ = sandbox._claude_session_paths(workspace)
+    _, claude_projects, _ = sandbox._claude_session_paths(workspace)
     codex_sessions, _ = sandbox._codex_session_paths(workspace)
     assert not claude_projects.exists() and not codex_sessions.exists()
     opaque = sandbox._linux_grants(workspace)["opaque"]
@@ -2026,11 +2027,148 @@ def test_the_linux_wrap_creates_the_session_mounts_it_binds(tmp_path, monkeypatc
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    claude_project, codex_home = sandbox._session_mount_sources(workspace)
-    assert not claude_project.exists() and not codex_home.exists()
-    for source in sandbox._session_mount_sources(workspace):
+    directories, files = sandbox._session_mount_sources(workspace)
+    assert not any(path.exists() for path in (*directories, *files))
+    for source in directories:
         source.mkdir(parents=True, exist_ok=True)
-    # Both are now real directories, so bwrap has something to bind, and the
-    # opaque parent exists as a side effect of creating the claude child.
-    assert claude_project.is_dir() and codex_home.is_dir()
-    assert sandbox._claude_session_paths(workspace)[0].is_dir()
+    for source in files:
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.touch(exist_ok=True)
+    # Every source is now bindable, and the opaque projects/ parent exists as a
+    # side effect of creating the claude child.
+    assert all(path.is_dir() for path in directories)
+    # Files stay files. Creating a directory called policy-limits.json would leave
+    # the CLI unable to write its own state, which is why the two lists are split.
+    assert all(path.is_file() for path in files)
+    assert sandbox._claude_session_paths(workspace)[1].is_dir()
+
+
+# --- what a claude turn is allowed to write under its config dir ---
+
+# Instruction-bearing entries: read on later invocations, so a write outlives the
+# session. None may appear in the measured runtime-write list, and each is probed
+# live below.
+_CLAUDE_MUST_NOT_WRITE = (
+    "settings.json",
+    "settings.local.json",
+    "CLAUDE.md",
+    "hooks.json",
+)
+
+# The same class, but directories. Probed by creating a child rather than appending
+# to a file: the nested parents do not exist on a real host, so an append reports
+# ENOENT and cannot tell "denied" from "absent" -- the ambiguity `_probe_deny`
+# exists to settle. mkdir reports EPERM either way.
+_CLAUDE_MUST_NOT_CREATE_IN = (
+    "commands",
+    "skills",
+    "agents",
+    "plugins",
+)
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_claude_runtime_writes_are_granted_against_the_config_param(profile):
+    """Every measured entry must be granted, or the agent silently loses that
+    capability under the jail. Written against _CLAUDE_CONFIG rather than
+    _HOME/.claude, because CLAUDE_CONFIG_DIR can move the tree outside $HOME where
+    a _HOME-derived rule matches nothing while the profile still loads."""
+    text = profile.read_text()
+    for name in sandbox._CLAUDE_RUNTIME_WRITE_DIRS:
+        rule = f'(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/{name}")))'
+        assert rule in text, f"{name} is not granted; the agent loses it under jail"
+    for name in sandbox._CLAUDE_RUNTIME_WRITE_FILES:
+        rule = f'(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/{name}")))'
+        assert rule in text, f"{name} is not granted"
+    assert '(deny file-write* (subpath (param "_CLAUDE_CONFIG")))' in text
+
+
+def test_the_runtime_write_list_holds_nothing_instruction_bearing():
+    """The line that makes the grants safe. Anything here is read on a later
+    invocation, so a turn that could write it would leave itself standing orders,
+    which is the whole reason the config directory is deny-default."""
+    granted = set(sandbox._CLAUDE_RUNTIME_WRITES)
+    for name in _CLAUDE_MUST_NOT_WRITE:
+        top = name.split("/")[0]
+        assert name not in granted and top not in granted, f"{name} became writable"
+    # projects/ is conversation-bearing and is granted per thread, never wholesale.
+    assert "projects" not in granted
+
+
+@pytest.mark.parametrize("target", _CLAUDE_MUST_NOT_WRITE)
+def test_claude_instruction_paths_stay_unwritable_in_the_jail(
+    monkeypatch, tmp_path, original_home, target
+):
+    """Live counterpart, against the real home so the deny is why the write fails
+    rather than the path being absent. Never creates anything under the real home:
+    a successful write is the failure this asserts against."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    path = original_home / ".claude" / target
+    done = _run_jailed(["/bin/sh", "-c", f"printf x >> {path}"], tmp_path)
+    assert done.returncode != 0, f"{target} was writable inside the jail"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+
+
+@pytest.mark.parametrize("target", _CLAUDE_MUST_NOT_CREATE_IN)
+def test_claude_instruction_dirs_stay_unwritable_in_the_jail(
+    monkeypatch, tmp_path, original_home, target
+):
+    """A turn must not be able to drop a new command, skill, agent or plugin
+    manifest, each of which the next invocation would load."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    # Aim at a path whose parent exists, or the error is ENOENT and says nothing
+    # about the policy: create the directory itself when it is absent, a child
+    # inside it when it is already there.
+    entry = original_home / ".claude" / target
+    probe = entry / "cotf-suite-probe" if entry.is_dir() else entry
+    done = _run_jailed(["/bin/mkdir", str(probe)], tmp_path)
+    assert done.returncode != 0, f"{target} accepted a new entry inside the jail"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+    assert not probe.exists()
+
+
+def test_the_prompt_history_of_other_threads_is_unreadable_in_the_jail(
+    monkeypatch, tmp_path, original_home
+):
+    """history.jsonl is every prompt typed in every project on the host, so it
+    crosses threads the same way projects/ does. Read-only probe against the real
+    file, so the deny is the reason it fails."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    history = original_home / ".claude" / "history.jsonl"
+    if not history.is_file():
+        pytest.skip("no real history.jsonl on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    done = _run_jailed(["/bin/cat", str(history)], tmp_path)
+    assert done.returncode != 0, "cross-project prompt history was readable"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+
+
+def test_linux_grants_mirror_the_claude_runtime_writes_and_mask_history(tmp_path):
+    """The bubblewrap half. ~/.claude is a read-only mount here, so each measured
+    entry needs its own deeper read-write mount, and hiding one file inside it needs
+    a mount over that file rather than a rule."""
+    monkeypatch_free_config = tmp_path / "config"
+    (monkeypatch_free_config / "shell-snapshots").mkdir(parents=True)
+    history = monkeypatch_free_config / "history.jsonl"
+    history.write_text("{}\n")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(monkeypatch_free_config)
+    try:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        grants = sandbox._linux_grants(workspace)
+        for name in sandbox._CLAUDE_RUNTIME_WRITES:
+            assert monkeypatch_free_config / name in grants["read_write"], name
+        assert history in grants["masked"]
+    finally:
+        del os.environ["CLAUDE_CONFIG_DIR"]

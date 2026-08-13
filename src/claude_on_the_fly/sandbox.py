@@ -657,8 +657,13 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     return list(seen.values())
 
 
-def _claude_session_paths(workspace: Path) -> tuple[Path, Path]:
-    """(the session store to deny, this thread's directory to grant).
+def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
+    """(the config dir, the session store to deny, this thread's dir to grant).
+
+    The config dir comes first because every other claude rule in both profiles is
+    written against it rather than against `$HOME/.claude`: CLAUDE_CONFIG_DIR can
+    move the whole tree outside `$HOME`, where a `_HOME`-derived rule matches
+    nothing while the profile still loads.
 
     claude writes its session JSONL to `<config dir>/projects/<workspace hash>/`,
     and one workspace is one chat thread. Two paths rather than one because the
@@ -674,9 +679,10 @@ def _claude_session_paths(workspace: Path) -> tuple[Path, Path]:
     Neither path has to exist yet -- realpath resolves the existing prefix, and
     the grant covers the directory itself, so the CLI may create it.
     """
-    from claude_on_the_fly import transcript
+    from claude_on_the_fly import envfile, transcript
 
     return (
+        Path(os.path.realpath(envfile.claude_config_dir())),
         Path(os.path.realpath(transcript.claude_projects_dir())),
         Path(os.path.realpath(transcript.claude_session_dir(workspace))),
     )
@@ -713,6 +719,52 @@ def _platform() -> str:
     exactly the code you least want untested.
     """
     return sys.platform
+
+
+# What a real claude turn writes under its config directory, besides its own
+# session directory. Measured the way the codex list below was: two turns against
+# the real CLI, one making a Bash tool call and one resuming with `--continue`,
+# diffing the config tree either side. A grant missing from here is a capability
+# the agent silently loses under the jail; a grant here it does not need is attack
+# surface, so the list is the measurement and not a guess.
+#
+# None of these decides what the agent executes or is told, which is the line that
+# keeps them separable from settings.json, hooks, commands, skills, agents and the
+# plugins/ root. Those stay denied: they are read on later invocations, so a write
+# there outlives the session.
+#
+# Deliberately NOT here:
+#   projects/         conversation-bearing, granted per thread instead
+#   history.jsonl     cross-project prompt history, and a read leak of its own
+#   todos/, statsig/  no real turn was observed writing them
+_CLAUDE_RUNTIME_WRITE_DIRS = (
+    # The Bash tool writes a shell script and then sources it. Same
+    # execution-adjacent trade the codex shell_snapshots grant records, and it
+    # cannot be closed without taking the tool with it.
+    "shell-snapshots",
+    "session-env",
+    # Distinct from projects/, despite the name.
+    "sessions",
+    # cache/ only, so a manifest at the plugins/ root stays denied.
+    "plugins/cache",
+)
+
+# Split from the directories rather than derived from the name, the same
+# distinction _CODEX_PROTECTED_DIRS makes and for the same reason: creating a
+# mount source with mkdir when the target is a file leaves a *directory* called
+# policy-limits.json, and the CLI then cannot write its own state.
+_CLAUDE_RUNTIME_WRITE_FILES = ("policy-limits.json",)
+
+_CLAUDE_RUNTIME_WRITES = (
+    *_CLAUDE_RUNTIME_WRITE_DIRS,
+    *_CLAUDE_RUNTIME_WRITE_FILES,
+)
+
+# Files under the claude config directory a turn must not read, named one by one
+# the way the credential denies are. history.jsonl is every prompt typed in every
+# project on the host, so it crosses threads exactly like projects/ does, and no
+# measured turn writes it.
+_CLAUDE_READ_DENIED = ("history.jsonl",)
 
 
 # ~/.codex is writable on Linux, with the dangerous entries mounted read-only back
@@ -784,16 +836,22 @@ def _project_write_denies(project: Path, names: tuple[str, ...]) -> list[Path]:
     return [project / name for name in names]
 
 
-def _session_mount_sources(workspace: Path) -> tuple[Path, Path]:
-    """The per-thread session directories bubblewrap binds read-write.
+def _session_mount_sources(workspace: Path) -> tuple[list[Path], list[Path]]:
+    """(directories, files) bubblewrap binds read-write, which must exist first.
 
     Named separately from the grants so the Linux wrap can create them without
     `_linux_grants` acquiring a side effect: `_readable_paths` calls it purely to
     build the agent's guidance note, and that must not touch the filesystem.
     """
-    _, claude_project = _claude_session_paths(workspace)
+    claude_config, _, claude_project = _claude_session_paths(workspace)
     _, codex_home = _codex_session_paths(workspace)
-    return claude_project, codex_home
+    directories = [
+        claude_project,
+        codex_home,
+        *(claude_config / name for name in _CLAUDE_RUNTIME_WRITE_DIRS),
+    ]
+    files = [claude_config / name for name in _CLAUDE_RUNTIME_WRITE_FILES]
+    return directories, files
 
 
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
@@ -805,7 +863,7 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     project = Path(os.path.realpath(workspace))
     tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
     codex = home / ".codex"
-    claude_projects, claude_project = _claude_session_paths(workspace)
+    claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
     read_write = [
         project,
@@ -816,6 +874,11 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # the CLI cannot write the session file resume reads, and the turn still
         # succeeds, so the loss is silent.
         claude_project,
+        # The measured runtime scratch. Deeper than the read-only ~/.claude mount,
+        # so depth ordering restores exactly these. They are created on the host
+        # before the wrap for the same reason the session dirs are: bwrap cannot
+        # make a mount point under a read-only root.
+        *(claude_config / name for name in _CLAUDE_RUNTIME_WRITES),
         tmpdir,
         home / ".claude.json",
         home / ".cache/uv",
@@ -869,7 +932,18 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             *_project_write_denies(project, _PROJECT_WRITE_DENY_DIRS),
             *(codex / name for name in _CODEX_PROTECTED_DIRS),
         ],
-        "masked": _linux_masked(data_dir),
+        # history.jsonl joins the ssh-agent socket and the stray .env files: a file
+        # a coarser grant exposes, named individually. ~/.claude is a read-only
+        # mount here rather than a global read allow, so hiding one file inside it
+        # needs a mount over that file, which is what masked does.
+        "masked": [
+            *_linux_masked(data_dir),
+            *(
+                path
+                for name in _CLAUDE_READ_DENIED
+                if (path := claude_config / name).exists()
+            ),
+        ],
     }
 
 
@@ -958,9 +1032,14 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # them is what the turn was going to do anyway; a claude turn gets an empty
     # codex home and vice versa, which costs one directory and keeps the wrap
     # independent of which backend is running.
-    for source in _session_mount_sources(workspace):
+    directories, files = _session_mount_sources(workspace)
+    for source in directories:
         with contextlib.suppress(OSError):
             source.mkdir(parents=True, exist_ok=True)
+    for source in files:
+        with contextlib.suppress(OSError):
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.touch(exist_ok=True)
     placeholders = sandbox_linux.prepare_placeholders(DATA_DIR / "jail")
     sandbox_linux.ensure_write_deny_targets(
         grants["write_denied"], placeholders, grants["write_denied_dirs"]
@@ -1046,11 +1125,12 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     from claude_on_the_fly.agent import DATA_DIR
 
     base = _fs_base_profile()
-    claude_projects, claude_project = _claude_session_paths(workspace)
+    claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
     return sandbox_macos.jail_argv(
         argv,
         **sandbox_macos.realpaths(workspace, DATA_DIR),
+        claude_config=claude_config,
         claude_projects=claude_projects,
         claude_project=claude_project,
         codex_sessions=codex_sessions,

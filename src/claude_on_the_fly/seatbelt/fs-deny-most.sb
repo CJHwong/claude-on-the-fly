@@ -62,6 +62,10 @@
 ;; would not reach.
 (deny file-read* (subpath (param "_CLAUDE_PROJECTS")))
 (allow file-read* (subpath (param "_CLAUDE_PROJECT")))
+;; Every prompt typed in every project on this host, so it crosses threads the same
+;; way projects/ does. Denied by name, like the credentials further down, because it
+;; is one file rather than a tree. No measured turn writes it, so nothing is lost.
+(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
 ;; The same boundary for the other backend, and codex was the wider hole: the
 ;; ~/.codex grant above reached every rollout in one flat date tree, 1088 of them
 ;; on the host this was measured on. codex picks the rollout name at startup, so
@@ -127,14 +131,28 @@
 ;; sandboxed turn must not persist instructions there. The deny is explicit even
 ;; though deny-most already denies HOME, keeping the policy invariant visible.
 (deny file-write* (subpath (string-append (param "_HOME") "/.claude")))
+;; The same deny against the resolved config directory, because CLAUDE_CONFIG_DIR
+;; can move it outside $HOME where the rule above reaches nothing. Every claude
+;; re-grant below is written against this param for the same reason.
+(deny file-write* (subpath (param "_CLAUDE_CONFIG")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
-;; The deny above covers ~/.claude/projects, where the claude CLI writes the
-;; session JSONL that makes resume work -- and the CLI is the jailed process, so
-;; it was denied its own session file. Turns still completed, which is why this
-;; went unnoticed: the persistence failure is silent and only resume shows it.
-;; Re-granted for the running thread alone, so a turn still cannot write into
-;; another thread's directory or anywhere else under the global config.
+(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/.claude.json")))
+;; The denies above cover projects/, where the claude CLI writes the session JSONL
+;; that makes resume work, and its per-project memory directory. The CLI is the
+;; jailed process, so it was denied both. Turns still completed, which is why this
+;; went unnoticed: the failure is silent and only a resume or a lost memory shows
+;; it. Re-granted for the running thread alone, so a turn still cannot reach
+;; another thread's conversation or memory.
 (allow file-write* (subpath (param "_CLAUDE_PROJECT")))
+;; Runtime scratch a real turn was measured writing. See _CLAUDE_RUNTIME_WRITES in
+;; sandbox.py for how the list was taken and why each entry is not
+;; instruction-bearing. settings.json, hooks, commands, skills, agents and the
+;; plugins/ root are absent on purpose and stay denied by the rules above.
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/shell-snapshots")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/session-env")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/sessions")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/plugins/cache")))
+(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/policy-limits.json")))
 ;; codex needs this to start at all; see the note in fs-allow-reads.sb.
 ;; codex needs to write under ~/.codex or it will not start, but the directory also
 ;; holds everything that decides what codex *executes* and what it is *told*. So this

@@ -72,10 +72,38 @@ and realpath'd like every other one:
 
 | Parameter | Value | Rule |
 |---|---|---|
+| `_CLAUDE_CONFIG` | `envfile.claude_config_dir()` | write denied, then re-granted below |
 | `_CLAUDE_PROJECTS` | `<config dir>/projects` | read denied |
 | `_CLAUDE_PROJECT` | `…/projects/<workspace hash>` | read and write granted |
 | `_CODEX_SESSIONS` | `<shared codex home>/sessions` | read denied |
 | `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>` | read and write granted |
+
+Every claude rule is written against `_CLAUDE_CONFIG` rather than `$HOME/.claude`,
+because `CLAUDE_CONFIG_DIR` can move the tree outside `$HOME` where a `_HOME`-derived
+rule matches nothing while the profile still loads.
+
+## What a claude turn may write
+
+`_CLAUDE_RUNTIME_WRITES` in `sandbox.py` is the re-grant list, and it is a
+measurement: two real turns, one making a Bash tool call and one resuming with
+`--continue`, diffing the config tree either side. The codex list above was built the
+same way. Three buckets decide what goes in it:
+
+| Bucket | Examples | Policy |
+|---|---|---|
+| Instruction-bearing | `settings.json`, `hooks.json`, `CLAUDE.md`, `commands/`, `skills/`, `agents/`, `plugins/` root | write denied; read on later invocations, so a write outlives the session |
+| Conversation-bearing | `projects/<hash>/` (session JSONL **and** the per-project memory dir), `history.jsonl` | per-thread only, or denied outright |
+| Runtime scratch | `shell-snapshots/`, `session-env/`, `sessions/`, `plugins/cache/`, `policy-limits.json` | granted machine-wide; none decides what the agent executes or is told |
+
+`_CLAUDE_RUNTIME_WRITE_FILES` is split from `_CLAUDE_RUNTIME_WRITE_DIRS` because the
+Linux wrap creates each mount source, and `mkdir` on a file target leaves a
+*directory* called `policy-limits.json` that the CLI then cannot write. Same
+distinction, and same reason, as `_CODEX_PROTECTED_DIRS`.
+
+Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside the
+per-thread grant, so it is isolated by the same rule as the transcript and needs no
+grant of its own. Before the per-thread grant existed it was denied along with the
+session file, so memory was silently off under `jail` too.
 
 Both bases reference all four, unlike `_EXTRA_*`, so `jail_argv` always passes them. A
 profile referencing an unpassed `-D` is refused outright, which is the failure worth

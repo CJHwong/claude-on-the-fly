@@ -71,6 +71,23 @@ file it is currently writing. A blanket deny over the whole store looks safer an
 it stops the CLI persisting the session, the turn still completes, and nothing surfaces
 until a later resume comes back with no memory of the conversation.
 
+Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside that same
+per-thread directory, so it is covered by the same grant and isolated by the same rule.
+That is also why a blanket deny cost more than resume: the agent's memory was off too,
+just as quietly. This is separate from cotf's own memory under `DATA_DIR/memory`, which
+has its own grant.
+
+Beyond its session directory, a turn writes runtime scratch: shell snapshots for the
+Bash tool, per-session env, plugin cache, rate-limit state. Those are granted from a
+measured list, on the principle that separates them from `settings.json`, hooks,
+commands, skills, agents and the plugins root. Nothing in the granted set decides what
+the agent executes or is told, so nothing in it survives into the next invocation as
+instructions. `docs/agent/broker.md` records the list and how it was measured.
+
+`history.jsonl` is denied for reading, not merely unwritable. It holds every prompt
+typed in every project on the host, so it crosses threads the same way `projects/` does,
+and no measured turn writes it.
+
 A codex home holds links back to the operator's `config.toml`, `AGENTS.md`, hooks, rules,
 plugins, prompts and `auth.json`. Writes through those links resolve onto the shared paths
 the profile already governs, so the execution and instruction surface stays read-only

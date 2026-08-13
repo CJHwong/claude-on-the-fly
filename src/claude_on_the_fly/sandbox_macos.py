@@ -101,6 +101,7 @@ def jail_argv(
     data_dir: Path | str,
     project: Path | str,
     tmpdir: Path | str,
+    claude_config: Path | str,
     claude_projects: Path | str,
     claude_project: Path | str,
     codex_sessions: Path | str,
@@ -144,6 +145,8 @@ def jail_argv(
         # passed. A missing -D makes sandbox-exec refuse the profile outright,
         # which is the failure mode worth having: the alternative is a jail that
         # loads with the session grant silently absent.
+        "-D",
+        f"_CLAUDE_CONFIG={claude_config}",
         "-D",
         f"_CLAUDE_PROJECTS={claude_projects}",
         "-D",
