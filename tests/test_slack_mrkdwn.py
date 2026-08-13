@@ -146,10 +146,13 @@ def test_an_entity_renders_as_its_decoded_character():
     assert to_mrkdwn("a &lt; b") == "a < b"
 
 
-# Slack's boundary rule is half-width punctuation, whitespace, or a line
-# boundary. Full-width forms (U+FF01-FF5E punctuation) and CJK punctuation look
-# like boundaries but are not, so the guard must insert a space before them.
-# U+3000 is the one full-width character that IS a boundary — it is whitespace.
+# Slack has two boundary rules, not one. For EMPHASIS it is half-width
+# punctuation, whitespace, or a line boundary: full-width forms (U+FF01-FF5E
+# punctuation) and CJK punctuation look like boundaries but are not, so the
+# guard must insert a space before them. U+3000 is the one full-width character
+# that IS a boundary — it is whitespace. For a CODE SPAN the set is wider and
+# takes punctuation at any width, so the same list below asserts the opposite
+# result. Both rules were checked by hand in a real Slack client.
 _FULL_WIDTH_PUNCT = (
     "！＂＃＄％＆＇（）＊＋，－．／：；＜＝＞？＠［＼］＾＿｀｛｜｝～"
     "、。〃〈〉《》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟・…—"
@@ -179,6 +182,91 @@ def test_ascii_punctuation_is_a_boundary(punct):
 def test_full_width_space_is_a_boundary():
     assert to_mrkdwn("**粗體**　後") == "*粗體*　後"
     assert to_mrkdwn("前　**粗體**") == "前　*粗體*"
+
+
+def test_code_span_gets_a_boundary_space_around_cjk():
+    assert to_mrkdwn("前面`target_date`後面") == "前面 `target_date` 後面"
+    assert to_mrkdwn("`target_date`後面") == "`target_date` 後面"
+    assert to_mrkdwn("前面`target_date`") == "前面 `target_date`"
+
+
+def test_code_span_gets_a_boundary_space_between_ascii_word_characters():
+    """Half-width is no exemption: a letter or a digit ends the span for Slack
+    the same way a CJK ideograph does."""
+    assert to_mrkdwn("run`pytest`now") == "run `pytest` now"
+    assert to_mrkdwn("v`2.1`x") == "v `2.1` x"
+
+
+def test_full_width_letters_are_not_a_boundary_for_a_code_span():
+    assert to_mrkdwn("看`x`Ａ後") == "看 `x` Ａ後"
+
+
+def test_an_underscore_is_not_a_boundary_for_a_code_span():
+    """`_` is punctuation by category but an italic marker to Slack, and a span
+    closing onto one does not render. Only that side was seen to fail; both are
+    guarded, because a stray space is cheaper than a broken span."""
+    assert to_mrkdwn("x`code`_y") == "x `code` _y"
+    assert to_mrkdwn("y_`code`x") == "y_ `code` x"
+
+
+@pytest.mark.parametrize("punct", _FULL_WIDTH_PUNCT)
+def test_full_width_punctuation_is_a_boundary_for_a_code_span(punct):
+    """The one place the two rules disagree, so the guard must stay out."""
+    assert to_mrkdwn(f"`code`{punct}後") == f"`code`{punct}後"
+    assert to_mrkdwn(f"前{punct}`code`") == f"前{punct}`code`"
+
+
+# Backslash escapes the backtick and a backtick reopens the span, so either
+# neighbour changes the tree instead of sitting next to the span as a plain
+# character. Same exclusion, and the same reason, as the emphasis case above.
+# `_` is left out for a different reason: it is a boundary by category but not
+# to Slack, which is its own test.
+@pytest.mark.parametrize(
+    "punct", string.punctuation.replace("\\", "").replace("`", "").replace("_", "")
+)
+def test_ascii_punctuation_is_a_boundary_for_a_code_span(punct):
+    assert to_mrkdwn(f"`code`{punct}後") == f"`code`{punct}後"
+    assert to_mrkdwn(f"前{punct}`code`") == f"前{punct}`code`"
+
+
+def test_code_span_keeps_an_existing_boundary():
+    assert to_mrkdwn("before `code` after") == "before `code` after"
+    assert to_mrkdwn("(`pytest`)") == "(`pytest`)"
+    assert to_mrkdwn("`code`　後") == "`code`　後"
+
+
+def test_code_span_gets_a_boundary_space_inside_a_list_item():
+    assert to_mrkdwn("- 前面`target_date`後面") == "- 前面 `target_date` 後面"
+
+
+def test_code_span_in_a_heading_gets_a_boundary_space():
+    assert to_mrkdwn("# 前面`target_date`後面") == "*前面 `target_date` 後面*"
+
+
+def test_code_span_in_a_blockquote_gets_a_boundary_space():
+    assert to_mrkdwn("> 前面`target_date`後面") == "> 前面 `target_date` 後面"
+
+
+def test_code_span_in_a_link_label_gets_a_boundary_space():
+    """A link label parses as mrkdwn, so a span hugged inside one breaks too."""
+    assert to_mrkdwn("[前面`x`後面](https://x.dev)") == "<https://x.dev|前面 `x` 後面>"
+
+
+def test_adjacent_code_spans_each_get_boundary_spaces():
+    assert to_mrkdwn("前面`a`中間`b`後面") == "前面 `a` 中間 `b` 後面"
+
+
+def test_a_code_span_next_to_emphasis_guards_only_its_outer_side():
+    """The shared join already has a boundary from both directions: '*' ends
+    the span and '`' ends the emphasis. Only the outer sides need a space."""
+    assert to_mrkdwn("前面`code`**粗體**後面") == "前面 `code`*粗體* 後面"
+    assert to_mrkdwn("前面**粗體**`code`後面") == "前面 *粗體*`code` 後面"
+
+
+def test_a_table_cell_gets_no_boundary_spaces_around_a_code_span():
+    """Same reason as the emphasis case: a fenced cell has nothing to guard."""
+    src = "| 欄位 |\n| --- |\n| 前面`target_date`後面 |"
+    assert to_mrkdwn(src) == "```\n欄位\n前面`target_date`後面\n```"
 
 
 def test_nested_emphasis_needs_no_boundary():
@@ -214,6 +302,31 @@ def test_an_empty_table_renders_as_nothing():
     """A header-only table has no rows to align, and an empty code fence is worse
     than no table."""
     assert to_mrkdwn("|  |\n|--|") == ""
+
+
+def test_a_table_cell_gets_no_boundary_spaces():
+    """The table lands in a fence, where Slack parses nothing, so a boundary
+    space there is a stray character rather than a guard."""
+    src = "| 欄位 |\n| --- |\n| 前面**粗**後面 |"
+    assert to_mrkdwn(src) == "```\n欄位\n前面*粗*後面\n```"
+
+
+def test_a_table_cell_gets_no_boundary_spaces_in_nested_emphasis():
+    """The guard is off for the whole subtree, not just the cell's top level."""
+    src = "| 欄位 |\n| --- |\n| **粗前*斜*粗後** |"
+    assert to_mrkdwn(src) == "```\n欄位\n*粗前_斜_粗後*\n```"
+
+
+def test_a_table_cell_gets_no_boundary_spaces_inside_a_link_label():
+    src = "| 欄位 |\n| --- |\n| [前**粗**後](https://x.dev) |"
+    assert to_mrkdwn(src) == "```\n欄位\n<https://x.dev|前*粗*後>\n```"
+
+
+def test_table_columns_are_measured_without_boundary_spaces():
+    """The guard used to widen the cell it touched, which pushed every other
+    row in that column out by the same two characters."""
+    src = "| a | b |\n| --- | --- |\n| 前**粗**後 | x |\n| yy | z |"
+    assert to_mrkdwn(src) == "```\na     | b\n前*粗*後 | x\nyy    | z\n```"
 
 
 def test_raw_slack_markup_survives_untouched():
