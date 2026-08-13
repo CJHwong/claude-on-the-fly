@@ -263,7 +263,11 @@ def test_wrap_deny_most_passes_capped_extra_paths(monkeypatch, tmp_path):
         "_EXTRA_3",
     ]
     assert "_EXTRA_1=/a" in out and "_EXTRA_2=/b" in out and "_EXTRA_3=/c" in out
-    assert "/d" not in " ".join(out)  # the 4th grant is dropped
+    # Scoped to the _EXTRA_ slots rather than the whole argv. Matching "/d" across
+    # every parameter made this fail about one run in sixteen once the session
+    # params arrived: _CODEX_HOME ends in a sha256 of the workspace, so a hash
+    # beginning with "d" contains "/d" and has nothing to do with the 4th grant.
+    assert "/d" not in " ".join(extras)  # the 4th grant is dropped
 
 
 def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
@@ -1844,8 +1848,11 @@ def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(tmp_path):
     same depth-ordering trade the plugins/cache entry makes."""
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    grants = sandbox._linux_grants(workspace)
     projects, thread = sandbox._claude_session_paths(workspace)
+    # Masked only when present, so make it present rather than depending on
+    # whatever another test in this session happened to create.
+    projects.mkdir(parents=True, exist_ok=True)
+    grants = sandbox._linux_grants(workspace)
     assert projects in grants["opaque"]
     assert thread in grants["read_write"]
     # The claude config stays readable (settings, plugins, the agent's own
@@ -1974,7 +1981,56 @@ def test_linux_grants_hide_other_threads_rollouts_and_keep_this_ones(tmp_path):
     source that is absent takes the whole turn with it."""
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    grants = sandbox._linux_grants(workspace)
     codex_sessions, codex_home = sandbox._codex_session_paths(workspace)
+    # The shared tree is masked only when it is there, because bwrap cannot create
+    # a mount point under a read-only root. Make it exist, as a host that has run
+    # codex would have.
+    codex_sessions.mkdir(parents=True, exist_ok=True)
+    grants = sandbox._linux_grants(workspace)
     assert codex_sessions in grants["opaque"]
     assert codex_home in grants["read_write"]
+
+
+def test_an_absent_session_store_is_not_named_as_a_mount(tmp_path, monkeypatch):
+    """bwrap creates its mount points inside a `--ro-bind / /` root, so naming a
+    path that does not exist on the host fails the whole spawn with "Can't mkdir
+    parents ... Read-only file system" rather than being skipped.
+
+    Caught by CI on a fresh runner, not by a local probe: a developer machine has
+    run claude and codex already, so every one of these paths happens to exist and
+    the bug is invisible there. A tree that is absent holds no other thread's
+    transcripts either, so masking it buys nothing.
+    """
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "never-made"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    claude_projects, _ = sandbox._claude_session_paths(workspace)
+    codex_sessions, _ = sandbox._codex_session_paths(workspace)
+    assert not claude_projects.exists() and not codex_sessions.exists()
+    opaque = sandbox._linux_grants(workspace)["opaque"]
+    assert claude_projects not in opaque
+    assert codex_sessions not in opaque
+    # And present ones are masked, or the whole boundary would be conditional.
+    claude_projects.mkdir(parents=True)
+    codex_sessions.mkdir(parents=True)
+    opaque = sandbox._linux_grants(workspace)["opaque"]
+    assert claude_projects in opaque and codex_sessions in opaque
+
+
+def test_the_linux_wrap_creates_the_session_mounts_it_binds(tmp_path, monkeypatch):
+    """The read-write half of the same constraint. These two cannot be skipped when
+    absent the way an opaque tree can: the turn needs them writable, so they are
+    created on the host first, exactly as the write-deny targets are."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    claude_project, codex_home = sandbox._session_mount_sources(workspace)
+    assert not claude_project.exists() and not codex_home.exists()
+    for source in sandbox._session_mount_sources(workspace):
+        source.mkdir(parents=True, exist_ok=True)
+    # Both are now real directories, so bwrap has something to bind, and the
+    # opaque parent exists as a side effect of creating the claude child.
+    assert claude_project.is_dir() and codex_home.is_dir()
+    assert sandbox._claude_session_paths(workspace)[0].is_dir()

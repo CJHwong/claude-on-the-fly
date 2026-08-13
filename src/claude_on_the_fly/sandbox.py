@@ -19,6 +19,7 @@ in _BASE_URL. The real keys never enter this process's child env.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -783,6 +784,18 @@ def _project_write_denies(project: Path, names: tuple[str, ...]) -> list[Path]:
     return [project / name for name in names]
 
 
+def _session_mount_sources(workspace: Path) -> tuple[Path, Path]:
+    """The per-thread session directories bubblewrap binds read-write.
+
+    Named separately from the grants so the Linux wrap can create them without
+    `_linux_grants` acquiring a side effect: `_readable_paths` calls it purely to
+    build the agent's guidance note, and that must not touch the filesystem.
+    """
+    _, claude_project = _claude_session_paths(workspace)
+    _, codex_home = _codex_session_paths(workspace)
+    return claude_project, codex_home
+
+
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
     from claude_on_the_fly.agent import DATA_DIR, MEMORY_DIR
@@ -828,7 +841,19 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # turns, which is worse in kind than the credentials this profile denies.
         # An empty tmpfs also keeps the directory listable, so a CLI that stats it
         # sees a plausible store rather than a missing one.
-        "opaque": [home, data_dir, claude_projects, codex_sessions],
+        #
+        # Each is masked only if it is actually there. bwrap creates its mount
+        # points inside a `--ro-bind / /` root, so naming an absent one fails the
+        # whole spawn with "Can't mkdir parents ... Read-only file system" rather
+        # than being ignored. A tree that does not exist holds no other thread's
+        # transcripts either, so there is nothing to hide. The read-write sources
+        # above are different: those are created on the host before the wrap,
+        # because the turn needs them whether or not anything made them yet.
+        "opaque": [
+            home,
+            data_dir,
+            *(path for path in (claude_projects, codex_sessions) if path.is_dir()),
+        ],
         "read_only": [
             home / ".claude",
             codex,
@@ -927,6 +952,15 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # next to the package tree it loads. Read-only, and it holds executables
     # rather than secrets.
     grants["read_only"] += _runtime_read_paths(argv)
+    # Same reason `ensure_write_deny_targets` materialises its targets: a mount
+    # source has to exist on the host, because bwrap cannot create one inside the
+    # read-only root. Both are this turn's own session directories, so creating
+    # them is what the turn was going to do anyway; a claude turn gets an empty
+    # codex home and vice versa, which costs one directory and keeps the wrap
+    # independent of which backend is running.
+    for source in _session_mount_sources(workspace):
+        with contextlib.suppress(OSError):
+            source.mkdir(parents=True, exist_ok=True)
     placeholders = sandbox_linux.prepare_placeholders(DATA_DIR / "jail")
     sandbox_linux.ensure_write_deny_targets(
         grants["write_denied"], placeholders, grants["write_denied_dirs"]
