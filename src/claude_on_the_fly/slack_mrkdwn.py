@@ -101,8 +101,13 @@ def _render_blockquote(node: SyntaxTreeNode, depth: int) -> str:
 
 
 def _render_table(node: SyntaxTreeNode) -> str:
+    # A cell is rendered with the boundary guard off. The table lands inside a
+    # fence, where Slack parses no mrkdwn at all, so a guard space buys nothing
+    # there and costs twice: it shows up as a stray space in the cell, and it
+    # widens the string the column arithmetic below measures, so it pushes every
+    # other row's padding out with it.
     rows = [
-        [_inline(cell) for cell in row.children]
+        [_inline(cell, guard=False) for cell in row.children]
         for section in node.children
         for row in section.children
     ]
@@ -126,21 +131,24 @@ def _fence(content: str) -> str:
     return f"```\n{content.rstrip(chr(10))}\n```"
 
 
-def _inline(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
+def _inline(
+    node: SyntaxTreeNode, flatten_strong: bool = False, guard: bool = True
+) -> str:
     """Render the inline children of a block node (paragraph, heading, cell).
 
     Emphasis markers need a boundary on each side or Slack renders them
     literally, so the guard lives at this join point, where the neighbouring
-    characters are known.
+    characters are known. `guard=False` turns it off for content bound for a
+    fence, and has to travel down with `flatten_strong` because emphasis nests.
     """
     pairs = []
     for child in node.children or []:
-        part = _render_inline(child, flatten_strong)
+        part = _render_inline(child, flatten_strong, guard)
         if part:
             pairs.append((child, part))
     out = []
     for index, (child, part) in enumerate(pairs):
-        if _emits_markers(child, flatten_strong):
+        if guard and _emits_markers(child, flatten_strong):
             if index and not _is_boundary(pairs[index - 1][1][-1]):
                 part = f" {part}"
             if index + 1 < len(pairs) and not _is_boundary(pairs[index + 1][1][0]):
@@ -155,7 +163,9 @@ def _emits_markers(node: SyntaxTreeNode, flatten_strong: bool) -> bool:
     return node.type in ("em", "s") or (node.type == "strong" and not flatten_strong)
 
 
-def _render_inline(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
+def _render_inline(
+    node: SyntaxTreeNode, flatten_strong: bool = False, guard: bool = True
+) -> str:
     kind = node.type
     if kind == "text":
         return node.content
@@ -169,25 +179,28 @@ def _render_inline(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
         # node, so `_render_block` handles it, and its fallthrough drops it.
         return node.content
     if kind == "strong":
-        return _inline(node) if flatten_strong else f"*{_inline(node)}*"
+        inner = _inline(node, guard=guard)
+        return inner if flatten_strong else f"*{inner}*"
     if kind == "em":
-        return f"_{_inline(node, flatten_strong)}_"
+        return f"_{_inline(node, flatten_strong, guard)}_"
     if kind == "s":
-        return f"~{_inline(node, flatten_strong)}~"
+        return f"~{_inline(node, flatten_strong, guard)}~"
     if kind == "link":
-        return _render_link(node, flatten_strong)
+        return _render_link(node, flatten_strong, guard)
     if kind == "image":
-        return str(node.attrs.get("src", "")) or _inline(node)
+        return str(node.attrs.get("src", "")) or _inline(node, guard=guard)
     # `node.content` is the raw source, meant for leaf unknowns like entity.
     # For a container whose children all render empty (an image with no src and
     # no alt), resurrecting the source would leak literal `![]()` into the
     # message — same class of noise as a literal `---` or `<div>`.
-    return _inline(node, flatten_strong) if node.children else node.content
+    return _inline(node, flatten_strong, guard) if node.children else node.content
 
 
-def _render_link(node: SyntaxTreeNode, flatten_strong: bool = False) -> str:
+def _render_link(
+    node: SyntaxTreeNode, flatten_strong: bool = False, guard: bool = True
+) -> str:
     href = node.attrs.get("href", "")
-    label = _inline(node, flatten_strong)
+    label = _inline(node, flatten_strong, guard)
     if not href:
         return label
     return f"<{href}|{label}>" if label and label != href else f"<{href}>"

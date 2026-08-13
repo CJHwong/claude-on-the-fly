@@ -216,6 +216,31 @@ def test_an_empty_table_renders_as_nothing():
     assert to_mrkdwn("|  |\n|--|") == ""
 
 
+def test_a_table_cell_gets_no_boundary_spaces():
+    """The table lands in a fence, where Slack parses nothing, so a boundary
+    space there is a stray character rather than a guard."""
+    src = "| 欄位 |\n| --- |\n| 前面**粗**後面 |"
+    assert to_mrkdwn(src) == "```\n欄位\n前面*粗*後面\n```"
+
+
+def test_a_table_cell_gets_no_boundary_spaces_in_nested_emphasis():
+    """The guard is off for the whole subtree, not just the cell's top level."""
+    src = "| 欄位 |\n| --- |\n| **粗前*斜*粗後** |"
+    assert to_mrkdwn(src) == "```\n欄位\n*粗前_斜_粗後*\n```"
+
+
+def test_a_table_cell_gets_no_boundary_spaces_inside_a_link_label():
+    src = "| 欄位 |\n| --- |\n| [前**粗**後](https://x.dev) |"
+    assert to_mrkdwn(src) == "```\n欄位\n<https://x.dev|前*粗*後>\n```"
+
+
+def test_table_columns_are_measured_without_boundary_spaces():
+    """The guard used to widen the cell it touched, which pushed every other
+    row in that column out by the same two characters."""
+    src = "| a | b |\n| --- | --- |\n| 前**粗**後 | x |\n| yy | z |"
+    assert to_mrkdwn(src) == "```\na     | b\n前*粗*後 | x\nyy    | z\n```"
+
+
 def test_raw_slack_markup_survives_untouched():
     """`<@U123>` and `<#C123>` are Slack's own mention syntax. Escaping them would
     turn a working mention into visible noise."""
