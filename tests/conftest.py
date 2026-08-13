@@ -190,10 +190,23 @@ def claude_projects_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def codex_sessions_dir(tmp_path, monkeypatch):
-    """Redirect transcript module's CODEX_SESSIONS_DIR to a tmp_path subdir."""
-    root = tmp_path / "codex-sessions"
-    root.mkdir()
-    monkeypatch.setattr("claude_on_the_fly.transcript.CODEX_SESSIONS_DIR", root)
+    """Redirect codex's rollout store to a tmp_path subdir.
+
+    Mirrors the claude fixture above by redirecting with the same environment
+    variable a deployment would set, so tests exercise the resolver rather than a
+    constant patched into the module. The old constant was read at import, which
+    is what let the daemon and a viewer disagree about where rollouts live.
+
+    Per-workspace homes are redirected as well: `transcript.codex_sessions_dirs`
+    scans them, and without this the scan would reach the developer's real ones.
+    """
+    home = tmp_path / "codex-home"
+    root = home / "sessions"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(
+        "claude_on_the_fly.codex_state.HOMES_DIR", tmp_path / "codex-homes"
+    )
     return root
 
 

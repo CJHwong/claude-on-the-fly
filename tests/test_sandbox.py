@@ -1089,7 +1089,10 @@ def test_the_daemons_own_env_file_is_unreadable_in_the_jail(
 # here is a codex that cannot run; a grant here that codex does not need is attack
 # surface, so the list is the measurement and not a guess.
 _CODEX_MUST_WRITE = (
-    "/.codex/sessions",
+    # "/.codex/sessions" used to be here. Rollouts now go to the workspace's own
+    # CODEX_HOME, so the shared tree is denied both ways on purpose: it held every
+    # other thread's verbatim turns, and leaving it writable while denying the read
+    # would mean codex could write a rollout it cannot then resume from.
     "/.codex/tmp",
     "/.codex/cache",
     "/.codex/log",
@@ -1242,14 +1245,20 @@ def test_codex_can_still_write_what_a_real_turn_needs(
 ):
     """The other half: deny-default is only correct if the re-grants are complete.
     Every path here was observed being written by a real `codex exec` turn, so a deny
-    creeping over one of them is a codex that cannot run."""
+    creeping over one of them is a codex that cannot run.
+
+    The rollout probe moved to the workspace's own CODEX_HOME, which is where codex
+    writes them now. Measured against codex-cli 0.147.0: a real `codex exec` turn
+    with CODEX_HOME redirected wrote its rollout under that directory, so the
+    redirect is the mechanism and not an assumption.
+    """
     if not shutil.which("sandbox-exec"):
         pytest.skip("macOS only")
-    sessions = original_home / ".codex" / "sessions"
-    if not sessions.is_dir():
-        pytest.skip("no real ~/.codex/sessions on this machine to probe")
+    from claude_on_the_fly import codex_state
+
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
+    sessions = codex_state.ensure_home(tmp_path) / "sessions"
     probe = sessions / ".cotf-suite-probe"
     try:
         done = _run_jailed(["/bin/sh", "-c", f"printf '' > {probe}"], tmp_path)
@@ -1664,3 +1673,308 @@ def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "no brokered loopback port" in logged
     assert "jobs daemon" in logged
+
+
+# --- one thread's transcripts must not be another thread's to read ---
+
+
+def _session_dirs(home: Path, workspace: Path) -> tuple[Path, Path]:
+    """(this workspace's session dir, a second workspace's) under `home`."""
+    from claude_on_the_fly import transcript
+
+    other = workspace.parent / f"{workspace.name}-second-thread"
+    other.mkdir(parents=True, exist_ok=True)
+    return transcript.claude_session_dir(workspace), transcript.claude_session_dir(
+        other
+    )
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_running_threads_claude_session_dir_is_writable_under_the_jail(
+    monkeypatch, tmp_path, original_home, fs_base
+):
+    """The claude CLI is the jailed process, and it writes its own session JSONL to
+    `<config dir>/projects/<workspace hash>/`. The blanket deny on ~/.claude covered
+    that path, so under `jail` the session never persisted and resume could not work.
+    Turns still completed, which is why it stayed hidden.
+
+    Against the real home on purpose: the suite's tmpdir HOME sits inside _TMPDIR,
+    which both profiles grant wholesale, so a write there would pass for the wrong
+    reason. Creates only its own session directory and removes it again.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "thread-one"
+    workspace.mkdir()
+    own, _ = _session_dirs(original_home, workspace)
+    if not own.parent.is_dir():
+        pytest.skip("no real claude projects dir on this machine to probe")
+    try:
+        # The CLI creates this directory itself, so the jail has to permit that
+        # and not merely writes inside a directory something else prepared.
+        made = _run_jailed(["/bin/mkdir", str(own)], workspace)
+        assert made.returncode == 0, made.stderr
+        target = own / "session.jsonl"
+        wrote = _run_jailed(
+            ["/bin/sh", "-c", f"echo '{{}}' > {target} && cat {target}"], workspace
+        )
+        assert wrote.returncode == 0, wrote.stderr
+        assert wrote.stdout.strip() == "{}"
+    finally:
+        shutil.rmtree(own, ignore_errors=True)
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_another_threads_claude_session_file_is_unreadable_under_the_jail(
+    monkeypatch, tmp_path, original_home, fs_base
+):
+    """Every workspace is one chat thread, so the session store held every other
+    thread's verbatim turns and both profiles let a jailed turn read all of them.
+    Worse in kind than the credentials each profile denies one by one: those are
+    tokens, these are the message bodies themselves, other senders' included.
+
+    Against the real home for the same reason as the test above, and this direction
+    needs it more: a tmpdir home would make the read succeed via the _TMPDIR grant
+    and the assertion would be measuring nothing.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "thread-one"
+    workspace.mkdir()
+    own, other = _session_dirs(original_home, workspace)
+    if not own.parent.is_dir():
+        pytest.skip("no real claude projects dir on this machine to probe")
+    other.mkdir(parents=True, exist_ok=True)
+    victim = other / "transcript.jsonl"
+    victim.write_text("{}\n")
+    try:
+        done = _run_jailed(["/bin/cat", str(victim)], workspace)
+        assert done.returncode != 0, "another thread's transcript was readable"
+        assert "not permitted" in done.stderr.lower(), done.stderr
+        # The store must not even be enumerable: the directory names are the
+        # workspace paths, which leak who the daemon is talking to.
+        listed = _run_jailed(["/bin/ls", str(own.parent)], workspace)
+        assert listed.returncode != 0, "the session store was listable"
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_claude_session_grant_names_one_thread_not_the_whole_store(profile):
+    """Structural counterpart to the two live probes.
+
+    The grant has to be the parameterised per-run path. A rule written against
+    `_HOME/.claude/projects` would look equivalent and would not be: CLAUDE_CONFIG_DIR
+    can move the store outside $HOME, where the deny would match nothing while the
+    profile still loaded and the log still said "jailed".
+    """
+    text = profile.read_text()
+    assert '(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))' in text
+    assert '(allow file-read* (subpath (param "_CLAUDE_PROJECT")))' in text
+    assert '(allow file-write* (subpath (param "_CLAUDE_PROJECT")))' in text
+    # Nothing may re-grant the store itself, in either direction.
+    assert '(subpath (string-append (param "_HOME") "/.claude/projects"))' not in text
+
+
+def test_both_profiles_receive_the_session_grant_params(tmp_path):
+    """Unlike _EXTRA_*, these are referenced by both bases, so both must be passed.
+    A profile referencing an unpassed -D is refused by sandbox-exec outright, which
+    would take the daemon down rather than silently drop the grant."""
+    for base in (sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE):
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=tmp_path,
+            data_dir=tmp_path,
+            project=tmp_path,
+            tmpdir=tmp_path,
+            claude_projects=tmp_path / "projects",
+            claude_project=tmp_path / "projects" / "thread",
+            codex_sessions=tmp_path / "codex" / "sessions",
+            codex_home=tmp_path / "codex-homes" / "thread",
+            base=base,
+            loopback=("localhost:*",) * 4,
+            extra_paths=[],
+        )
+        assert f"_CLAUDE_PROJECTS={tmp_path / 'projects'}" in argv
+        assert f"_CLAUDE_PROJECT={tmp_path / 'projects' / 'thread'}" in argv
+
+
+def test_the_session_grant_follows_a_redirected_config_dir(monkeypatch, tmp_path):
+    """CLAUDE_CONFIG_DIR moves the store, so the grant must move with it. Derived
+    from transcript, which owns the hash scheme the CLI computes, so the path the
+    jail grants and the path the daemon later reads cannot drift apart."""
+    redirected = tmp_path / "elsewhere"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(redirected))
+    workspace = tmp_path / "workspaces" / "slack" / "thread"
+    workspace.mkdir(parents=True)
+    projects, thread = sandbox._claude_session_paths(workspace)
+    assert projects == Path(os.path.realpath(redirected / "projects"))
+    assert thread.parent == projects
+    assert thread.name == str(workspace.resolve()).replace("/", "-").replace(
+        ".", "-"
+    ).replace("_", "-")
+
+
+def test_the_spawned_agent_is_told_which_config_dir_the_daemon_resolved(
+    monkeypatch, tmp_path
+):
+    """CLAUDE_CONFIG_DIR is not a passthrough key, so a deployment setting it in
+    DATA_DIR/.env had the daemon resolving one store and the spawned CLI defaulting
+    to ~/.claude. The jail grant is derived from the daemon's answer, so a child
+    using a different one would write where nothing is granted."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "elsewhere"))
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "elsewhere")
+
+
+def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(tmp_path):
+    """The bubblewrap mirror of the seatbelt pair. projects/ is opaque rather than
+    read-only, because the read-only ~/.claude mount would otherwise expose every
+    other thread's turns. The running thread's directory is granted back deeper, the
+    same depth-ordering trade the plugins/cache entry makes."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    grants = sandbox._linux_grants(workspace)
+    projects, thread = sandbox._claude_session_paths(workspace)
+    assert projects in grants["opaque"]
+    assert thread in grants["read_write"]
+    # The claude config stays readable (settings, plugins, the agent's own
+    # credential), so the narrowing must come from the opaque child, not from
+    # dropping the parent mount.
+    assert Path(os.path.realpath(Path.home())) / ".claude" in grants["read_only"]
+
+
+# --- codex rollouts are per thread too ---
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_codex_rollout_deny_comes_after_the_codex_read_grant(profile):
+    """SBPL is last-match-wins, so ordering is the policy here and not a style
+    question. Measured with the pair placed before the `~/.codex` read allow: the
+    allow won, and a jailed turn read 91855 bytes of another thread's rollout while
+    the profile still loaded and the startup log still said "jailed".
+    """
+    lines = profile.read_text().splitlines()
+
+    def index_of(needle: str) -> int:
+        for number, line in enumerate(lines):
+            if needle in line and not line.strip().startswith(";;"):
+                return number
+        return -1
+
+    deny = index_of('(deny file-read* (subpath (param "_CODEX_SESSIONS")))')
+    grant = index_of('(allow file-read* (subpath (param "_CODEX_HOME")))')
+    assert deny >= 0 and grant >= 0, "the codex session rules are missing"
+    assert grant > deny, "the per-thread grant must win over the tree deny"
+    shared = index_of(
+        '(allow file-read* (subpath (string-append (param "_HOME") "/.codex")))'
+    )
+    if shared >= 0:
+        assert deny > shared, "the deny is overridden by the wider ~/.codex allow"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_shared_codex_rollout_tree_is_no_longer_writable(profile):
+    """Rollouts go to the per-thread home now. Denying the shared tree both ways is
+    deliberate: if the redirect ever failed to reach the child, codex would write
+    here and then be refused the read back, and a resume that silently forgets the
+    conversation is the failure this change exists to remove."""
+    text = profile.read_text()
+    assert '"/.codex/sessions"' not in text, "the shared rollout tree is writable again"
+    assert '(allow file-write* (subpath (param "_CODEX_HOME")))' in text
+
+
+def test_each_workspace_gets_its_own_codex_home(tmp_path):
+    """The isolation boundary. codex names a rollout at startup from the date and
+    thread id, so there is nothing per-workspace to grant inside one shared tree."""
+    from claude_on_the_fly import codex_state
+
+    first, second = tmp_path / "thread-one", tmp_path / "thread-two"
+    first.mkdir()
+    second.mkdir()
+    assert codex_state.home_dir(first) != codex_state.home_dir(second)
+    # Stable across calls, or a resume would look in a directory nothing wrote to.
+    assert codex_state.home_dir(first) == codex_state.home_dir(first)
+
+
+def test_the_codex_home_links_the_operators_config_and_credential(tmp_path):
+    """codex must still read the operator's configuration and its own credential.
+    Links rather than copies, so an operator's edit applies on the next turn, and a
+    write through the link resolves onto a path the profile already governs."""
+    from claude_on_the_fly import codex_state
+
+    shared = tmp_path / "shared-codex"
+    (shared / "prompts").mkdir(parents=True)
+    (shared / "config.toml").write_text("model = 'x'\n")
+    (shared / "auth.json").write_text("{}\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = codex_state.ensure_home(workspace, shared=shared)
+    assert (home / "config.toml").resolve() == (shared / "config.toml").resolve()
+    assert (home / "auth.json").resolve() == (shared / "auth.json").resolve()
+    assert (home / "prompts").resolve() == (shared / "prompts").resolve()
+    # Created here rather than left to codex: a recursive mkdir under an opaque
+    # $HOME walks up and tries to create an ancestor it cannot stat.
+    assert (home / "sessions").is_dir()
+    # An entry the operator does not have must not become a dangling link.
+    assert not (home / "hooks.json").exists()
+
+
+def test_ensure_home_is_idempotent_and_relinks_a_moved_target(tmp_path):
+    """It runs before every spawn, so a second call must not fail, and an operator
+    who repoints a shared entry gets the new target without a restart."""
+    from claude_on_the_fly import codex_state
+
+    shared = tmp_path / "shared-codex"
+    shared.mkdir()
+    (shared / "config.toml").write_text("a\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = codex_state.ensure_home(workspace, shared=shared)
+    again = codex_state.ensure_home(workspace, shared=shared)
+    assert home == again
+    moved = tmp_path / "other-codex"
+    moved.mkdir()
+    (moved / "config.toml").write_text("b\n")
+    relinked = codex_state.ensure_home(workspace, shared=moved)
+    assert (relinked / "config.toml").readlink() == moved / "config.toml"
+
+
+def test_removing_a_workspace_takes_its_codex_home_without_following_links(tmp_path):
+    """The home holds that thread's rollouts and its name encodes a path that will
+    never exist again, so nothing else could reclaim it. The links are unlinked
+    first, or the tree walk would delete the operator's shared config."""
+    from claude_on_the_fly import codex_state
+
+    shared = tmp_path / "shared-codex"
+    shared.mkdir()
+    (shared / "config.toml").write_text("keep me\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = codex_state.ensure_home(workspace, shared=shared)
+    (home / "sessions" / "rollout-x.jsonl").write_text("{}\n")
+    codex_state.remove_workspace(workspace)
+    assert not home.exists()
+    assert (shared / "config.toml").read_text() == "keep me\n"
+
+
+def test_linux_grants_hide_other_threads_rollouts_and_keep_this_ones(tmp_path):
+    """The bubblewrap mirror. The shared tree is masked with an empty tmpfs; the
+    thread's own home is a read-write mount, and it has to exist because a mount
+    source that is absent takes the whole turn with it."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    grants = sandbox._linux_grants(workspace)
+    codex_sessions, codex_home = sandbox._codex_session_paths(workspace)
+    assert codex_sessions in grants["opaque"]
+    assert codex_home in grants["read_write"]

@@ -44,7 +44,42 @@ BackendName = Literal["claude", "codex"]
 # prompt. We rsplit on it to recover the raw user text from a codex transcript.
 _CODEX_PROMPT_SEPARATOR = "\n\n---\n\n"
 
-CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+
+def codex_sessions_dirs() -> list[Path]:
+    """Every directory a codex rollout may be in, newest layout first.
+
+    Resolved per call rather than bound at import, for the reason
+    `claude_projects_dir` documents: a module constant answers according to
+    whoever imported the module, and the daemon that writes and the viewer that
+    reads are not the same process.
+
+    Each workspace now gets its own `CODEX_HOME` (see `codex_state.home_dir`), so
+    the rollouts are spread across one directory per thread. The daemon is not
+    jailed and owns all of them, so it searches the lot: the isolation is enforced
+    by the jail granting one home per turn, not by narrowing this lookup. Keeping
+    the search wide is what lets `_find_codex_rollout(thread_id)` and its five
+    callers stay as they are -- several hold only a thread id, never a workspace.
+
+    The shared tree is still searched, and last: rollouts written before this
+    existed live there, and dropping it would make old threads look empty.
+    """
+    dirs: list[Path] = []
+    try:
+        dirs = sorted(
+            path / "sessions"
+            for path in codex_state.HOMES_DIR.iterdir()
+            if path.is_dir()
+        )
+    except OSError:
+        dirs = []
+    dirs.append(envfile.codex_home() / "sessions")
+    return dirs
+
+
+def _iter_rollouts(pattern: str):
+    """`pattern` matched across every codex sessions directory."""
+    for base in codex_sessions_dirs():
+        yield from base.glob(pattern)
 
 
 def claude_projects_dir() -> Path:
@@ -84,6 +119,18 @@ def _workspace_to_claude_hash(workspace: Path) -> str:
     )
 
 
+def claude_session_dir(workspace: Path) -> Path:
+    """The `projects/` subdirectory holding this workspace's session JSONL.
+
+    One workspace is one chat thread (`orchestrator._process` derives it from the
+    frontend's chat id), so this path is also the boundary between one thread's
+    transcripts and every other thread's. The jail grants it by name for exactly
+    that reason: the claude CLI runs *inside* the jail and writes its own session
+    file, so it needs this directory and nothing else under `projects/`.
+    """
+    return claude_projects_dir() / _workspace_to_claude_hash(workspace)
+
+
 def remove_workspace_sessions(workspace: Path) -> None:
     """Delete the session directory a backend keys to `workspace` but keeps
     outside it.
@@ -101,10 +148,7 @@ def remove_workspace_sessions(workspace: Path) -> None:
     Best-effort by design — a cleanup that cannot run must not mask the
     caller's real outcome.
     """
-    shutil.rmtree(
-        claude_projects_dir() / _workspace_to_claude_hash(workspace),
-        ignore_errors=True,
-    )
+    shutil.rmtree(claude_session_dir(workspace), ignore_errors=True)
     codex_state.remove_workspace(workspace)
 
 
@@ -126,11 +170,7 @@ def _iter_jsonl(path: Path):
 
 def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     """Return the user/assistant turns from claude's session JSONL, or None."""
-    session_path = (
-        claude_projects_dir()
-        / _workspace_to_claude_hash(workspace)
-        / f"{session_uuid}.jsonl"
-    )
+    session_path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
     if not session_path.is_file():
         return None
     turns: list[Turn] = []
@@ -155,7 +195,7 @@ def _find_codex_rollout(thread_id: str) -> Path | None:
     if not thread_id:
         return None
     matches = sorted(
-        CODEX_SESSIONS_DIR.glob(f"**/rollout-*-{thread_id}.jsonl"),
+        _iter_rollouts(f"**/rollout-*-{thread_id}.jsonl"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -190,7 +230,7 @@ def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | 
         return None
     cutoff = time.time() - max_age_s
     freshest: tuple[float, Path] | None = None
-    for path in CODEX_SESSIONS_DIR.glob("**/rollout-*.jsonl"):
+    for path in _iter_rollouts("**/rollout-*.jsonl"):
         try:
             mtime = path.stat().st_mtime
         except OSError:

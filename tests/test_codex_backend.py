@@ -1900,3 +1900,32 @@ def test_an_error_item_is_not_counted_as_a_tool():
         ]
     )
     assert parse_codex_stream(stream)["tool_counts"] == {"command_execution": 1}
+
+
+class TestCodexHomeReachesEverySpawn:
+    """Rollouts only land in the per-thread home if the child is actually told
+    about it, and the chat frontend is not the only caller."""
+
+    async def test_the_spawn_is_told_its_per_thread_codex_home(self, tmp_path):
+        """Set on the child rather than published as a session override, because
+        the jobs and cron daemons never open a session. A codex turn there would
+        otherwise write its rollout into the shared tree the jail no longer grants,
+        and then be refused the read back on resume."""
+        proc = _exec_proc(0, b"")
+        captured: dict = {}
+
+        async def capture(*args, **kwargs):
+            captured.update(kwargs)
+            return proc
+
+        with (
+            patch("asyncio.create_subprocess_exec", capture),
+            patch.object(codex_mod.agent, "track_agent_process"),
+            patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()),
+        ):
+            await codex_mod._run_codex_exec(tmp_path, ["codex", "exec"], timeout=None)
+        expected = codex_mod.codex_state.home_dir(tmp_path)
+        assert captured["env"]["CODEX_HOME"] == str(expected)
+        # And it exists, because on Linux the jail mounts it and an absent mount
+        # source takes the whole turn down.
+        assert (expected / "sessions").is_dir()

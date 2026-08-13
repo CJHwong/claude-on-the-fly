@@ -10,6 +10,8 @@
 ;;   _DATA_DIR    — daemon data directory (COTF_DATA_DIR when redirected)
 ;;   _PROJECT_DIR — resolved project working directory
 ;;   _TMPDIR      — macOS per-user temp directory
+;;   _CLAUDE_PROJECTS — claude's session store root (denied)
+;;   _CLAUDE_PROJECT  — the running thread's session directory inside it (granted)
 
 (version 1)
 (deny default)
@@ -192,6 +194,26 @@
 (deny file-read* (literal (string-append (param "_HOME") "/.zhistory")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.zsh")))
 
+;; -- Other threads' conversations --
+;; claude keeps one directory of session JSONL per workspace, and a workspace is
+;; one chat thread. Reads are global in this profile, so without these two rules a
+;; jailed turn could read the verbatim turns of every other thread on the host,
+;; including message bodies from other senders. Sharper in kind than the secrets
+;; denied above: those are credentials, this is the conversation itself.
+;;
+;; The re-grant is the running thread's own directory, which the CLI needs because
+;; it is the jailed process and writes its own session file. Parameterised rather
+;; than built from _HOME because CLAUDE_CONFIG_DIR can move the tree outside $HOME.
+(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))
+(allow file-read* (subpath (param "_CLAUDE_PROJECT")))
+;; codex, same boundary and the wider hole of the two: its rollouts sit in one flat
+;; date tree that the global read allow reached in full, 1088 files on the host this
+;; was measured on. codex chooses the rollout name at startup, so there is nothing
+;; per-workspace to re-grant inside the shared tree; the workspace gets its own
+;; CODEX_HOME and only its own rollouts are in it.
+(deny file-read* (subpath (param "_CODEX_SESSIONS")))
+(allow file-read* (subpath (param "_CODEX_HOME")))
+
 ;; -- macOS Sensitive Data --
 ;; Allowed to enable macOS Security framework (Keychain) for tool authentication (e.g., Claude login)
 (allow file-read* (subpath (string-append (param "_HOME") "/Library/Keychains")))
@@ -206,10 +228,17 @@
 ;; ---------------------------------------------------------------------------
 ;; Claude's global config contains settings, hooks, commands, and plugins that
 ;; the agent reads on later invocations. Do not let an untrusted turn persist
-;; instructions there. Claude can still read its config and write its session
-;; state in the workspace; global config changes are an operator action.
+;; instructions there. Claude can still read its config; global config changes are
+;; an operator action.
+;;
+;; Its session state does NOT live in the workspace, which this comment used to
+;; claim. It lives in `projects/<workspace hash>/` under the config directory, so
+;; the deny below covered the one file resume depends on, and the CLI is the jailed
+;; process that writes it. The re-grant is that directory for the running thread
+;; only, so persistence works without reopening the other threads.
 (deny file-write* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
+(allow file-write* (subpath (param "_CLAUDE_PROJECT")))
 ;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
 ;; dies at startup with "failed to initialize in-process app-server client:
 ;; Operation not permitted" before it makes any network call, because its
@@ -233,7 +262,12 @@
 ;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
 ;;                     manifest at the plugins/ root stays denied
 (deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/sessions")))
+;; Rollouts land in this thread's own CODEX_HOME now, so the shared tree stops
+;; being writable. Deliberately fail-closed: if the redirect ever did not reach the
+;; child, codex would write here and then be refused the read back, and a resume
+;; that silently forgets the conversation is the failure this whole change exists
+;; to remove. Denied both ways, it fails at startup instead.
+(allow file-write* (subpath (param "_CODEX_HOME")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))

@@ -65,6 +65,39 @@ Codex requires the hook trust bypass because inline hooks have no persisted trus
 Seatbelt therefore denies writes to Codex execution-control paths and re-grants only the
 runtime paths measured as necessary.
 
+## Per-thread session grants
+
+Four profile parameters carry the session boundary, resolved per run from the workspace
+and realpath'd like every other one:
+
+| Parameter | Value | Rule |
+|---|---|---|
+| `_CLAUDE_PROJECTS` | `<config dir>/projects` | read denied |
+| `_CLAUDE_PROJECT` | `…/projects/<workspace hash>` | read and write granted |
+| `_CODEX_SESSIONS` | `<shared codex home>/sessions` | read denied |
+| `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>` | read and write granted |
+
+Both bases reference all four, unlike `_EXTRA_*`, so `jail_argv` always passes them. A
+profile referencing an unpassed `-D` is refused outright, which is the failure worth
+having: the alternative is a jail that loads with the session grant silently absent.
+
+Two ordering constraints, both found by a live probe rather than by reading:
+
+- The codex pair must come *after* the `~/.codex` read allow. SBPL is last-match-wins, so
+  placed before it the allow won and a jailed turn still read another thread's rollout
+  while the profile looked correct.
+- `codex_state.ensure_home` creates `sessions/` before the spawn. A recursive mkdir that
+  cannot stat an ancestor walks up and tries to create it, which under an opaque `$HOME`
+  fails at `/Users/<name>` on a path whose leaf was granted.
+
+The claude grant is derived from `envfile.claude_config_dir()`, and `agent_env` states
+`CLAUDE_CONFIG_DIR` on the child for the same reason: it is not a passthrough key, so a
+deployment setting it in `DATA_DIR/.env` would leave the daemon and the CLI resolving
+different stores, and the grant pointing at a directory the CLI never writes.
+
+`CODEX_HOME` is set on the child by the codex backend rather than published as a session
+override, because the jobs and cron daemons never open a session.
+
 ## Linux jail
 
 `sandbox_linux.py` builds bubblewrap argv; `sandbox.py` owns which paths, beside the

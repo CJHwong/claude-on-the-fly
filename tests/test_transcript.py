@@ -849,7 +849,7 @@ class TestExtractCodexPromptTokens:
     compaction did anything — codex publishes no in-band signal."""
 
     def _rollout(self, tmp_path, monkeypatch, *turns: tuple[int, int]):
-        root = tmp_path / "codex-sessions" / "2026" / "07" / "28"
+        root = tmp_path / "codex-home" / "sessions" / "2026" / "07" / "28"
         root.mkdir(parents=True)
         path = root / "rollout-2026-07-28T19-58-02-thread-1.jsonl"
         lines = [
@@ -868,8 +868,12 @@ class TestExtractCodexPromptTokens:
             for prompt, window in turns
         ]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Redirected the way a deployment does it, not by patching a module
+        # constant: the store is resolved per call now, so the environment is what
+        # the resolver reads.
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
         monkeypatch.setattr(
-            transcript, "CODEX_SESSIONS_DIR", tmp_path / "codex-sessions"
+            "claude_on_the_fly.codex_state.HOMES_DIR", tmp_path / "codex-homes"
         )
         return path
 
@@ -891,8 +895,9 @@ class TestExtractCodexPromptTokens:
         assert transcript.extract_codex_prompt_tokens("thread-1") == (18_507, 258_400)
 
     def test_missing_rollout_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
         monkeypatch.setattr(
-            transcript, "CODEX_SESSIONS_DIR", tmp_path / "codex-sessions"
+            "claude_on_the_fly.codex_state.HOMES_DIR", tmp_path / "codex-homes"
         )
         assert transcript.extract_codex_prompt_tokens("nope") is None
 
@@ -1346,3 +1351,54 @@ def test_a_mapping_whose_thread_id_no_longer_validates_is_skipped(
         transcript.codex_state, "read_thread_id", lambda _ws, _uuid: None
     )
     assert transcript._list_codex_session_files(workspace) == []
+
+
+class TestCodexSessionsDirsResolution:
+    """The store is resolved per call now, not bound at import."""
+
+    def test_a_rollout_in_a_per_thread_home_is_found(self, tmp_path, monkeypatch):
+        """`_find_codex_rollout` takes a thread id and never a workspace, and five
+        callers hold only the id. So the daemon searches every per-thread home
+        rather than being told which one; the jail is what isolates them."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "shared"))
+        homes = tmp_path / "codex-homes"
+        monkeypatch.setattr("claude_on_the_fly.codex_state.HOMES_DIR", homes)
+        day = homes / "abc" / "sessions" / "2026" / "08" / "13"
+        day.mkdir(parents=True)
+        rollout = day / "rollout-2026-08-13T00-00-00-thread-9.jsonl"
+        rollout.write_text('{"type":"session_meta"}\n')
+        assert transcript._find_codex_rollout("thread-9") == rollout
+
+    def test_a_rollout_in_the_shared_tree_is_still_found(self, tmp_path, monkeypatch):
+        """Rollouts written before per-thread homes existed live in the shared tree.
+        Dropping it from the search would make every older thread look empty."""
+        shared = tmp_path / "shared"
+        monkeypatch.setenv("CODEX_HOME", str(shared))
+        monkeypatch.setattr(
+            "claude_on_the_fly.codex_state.HOMES_DIR", tmp_path / "codex-homes"
+        )
+        day = shared / "sessions" / "2026" / "01" / "02"
+        day.mkdir(parents=True)
+        rollout = day / "rollout-2026-01-02T00-00-00-legacy-1.jsonl"
+        rollout.write_text('{"type":"session_meta"}\n')
+        assert transcript._find_codex_rollout("legacy-1") == rollout
+
+    def test_an_absent_homes_dir_is_not_an_error(self, tmp_path, monkeypatch):
+        """A deployment that has never run codex has no homes directory at all."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "shared"))
+        monkeypatch.setattr(
+            "claude_on_the_fly.codex_state.HOMES_DIR", tmp_path / "never-created"
+        )
+        assert transcript.codex_sessions_dirs() == [tmp_path / "shared" / "sessions"]
+
+    def test_the_reader_follows_a_redirected_codex_home(self, tmp_path, monkeypatch):
+        """The bug class the claude_projects_dir docstring describes: a constant read
+        at import answers according to whoever imported the module, so the daemon
+        that writes and the viewer that reads could disagree."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "elsewhere"))
+        monkeypatch.setattr(
+            "claude_on_the_fly.codex_state.HOMES_DIR", tmp_path / "codex-homes"
+        )
+        assert (
+            transcript.codex_sessions_dirs()[-1] == tmp_path / "elsewhere" / "sessions"
+        )

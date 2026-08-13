@@ -85,3 +85,15 @@ def claude_config_dir(env: Mapping[str, str] | None = None) -> Path:
     """
     resolved = daemon_environment() if env is None else env
     return Path(resolved.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def codex_home(env: Mapping[str, str] | None = None) -> Path:
+    """`CODEX_HOME`, or codex's default.
+
+    The shared one. Each workspace gets its own home for the rollouts it writes
+    (`codex_state.home_dir`); this is the operator-level directory those link
+    their config and credential back to, and where rollouts written before
+    per-workspace homes existed still live.
+    """
+    resolved = daemon_environment() if env is None else env
+    return Path(resolved.get("CODEX_HOME") or Path.home() / ".codex")

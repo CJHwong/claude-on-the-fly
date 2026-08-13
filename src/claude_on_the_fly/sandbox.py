@@ -352,6 +352,16 @@ def agent_env() -> dict[str, str] | None:
         return {**os.environ, **overrides}
     env = {key: value for key, value in os.environ.items() if _is_passthrough(key)}
     dropped = len(os.environ) - len(env)
+    # The jail grants the claude session directory by name, derived from the
+    # config dir the *daemon* resolves. CLAUDE_CONFIG_DIR is not a passthrough
+    # key, so a deployment that sets it in DATA_DIR/.env had the daemon pointing
+    # one way and the spawned CLI defaulting to ~/.claude -- which would leave the
+    # grant on a directory the CLI never writes, and the session unpersisted with
+    # nothing in the log. Stated explicitly so the two cannot disagree. Resolving
+    # to claude's own default when unset is what the CLI would have done anyway.
+    from claude_on_the_fly import envfile
+
+    env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
@@ -646,6 +656,53 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     return list(seen.values())
 
 
+def _claude_session_paths(workspace: Path) -> tuple[Path, Path]:
+    """(the session store to deny, this thread's directory to grant).
+
+    claude writes its session JSONL to `<config dir>/projects/<workspace hash>/`,
+    and one workspace is one chat thread. Two paths rather than one because the
+    policy is a pair: deny the store, re-grant the running thread. Granting
+    without the deny leaves every other thread readable; denying without the
+    grant stops the CLI persisting the session it is currently writing, and the
+    turn still completes, so nothing surfaces until a resume comes back empty.
+
+    Resolved through `transcript`, which owns the hash scheme the CLI uses, so
+    the grant and the daemon's own reader cannot drift apart. Realpath'd like
+    every other profile parameter: seatbelt matches the resolved path, and a
+    home behind a symlink would otherwise leave the grant matching nothing.
+    Neither path has to exist yet -- realpath resolves the existing prefix, and
+    the grant covers the directory itself, so the CLI may create it.
+    """
+    from claude_on_the_fly import transcript
+
+    return (
+        Path(os.path.realpath(transcript.claude_projects_dir())),
+        Path(os.path.realpath(transcript.claude_session_dir(workspace))),
+    )
+
+
+def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
+    """(the shared rollout tree to deny, this thread's codex home to grant).
+
+    codex names a rollout by date and thread id in one flat tree and picks the
+    name at startup, so there is no per-workspace path to grant the way claude's
+    `projects/<hash>` can be. The workspace gets its own `CODEX_HOME` instead
+    (`codex_state.home_dir`), which is what makes the location predictable before
+    the run, and the backend points the child at it.
+
+    The shared tree still has to be denied: it holds every rollout written before
+    per-workspace homes existed, and a jailed turn could otherwise read the raw
+    turns of every other thread. 1088 of them were readable on the host this was
+    measured on.
+    """
+    from claude_on_the_fly import codex_state, envfile
+
+    return (
+        Path(os.path.realpath(envfile.codex_home() / "sessions")),
+        Path(os.path.realpath(codex_state.home_dir(workspace))),
+    )
+
+
 def _platform() -> str:
     """Which jail mechanism applies.
 
@@ -735,9 +792,17 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     project = Path(os.path.realpath(workspace))
     tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
     codex = home / ".codex"
+    claude_projects, claude_project = _claude_session_paths(workspace)
+    codex_sessions, codex_home = _codex_session_paths(workspace)
     read_write = [
         project,
         Path(os.path.realpath(MEMORY_DIR)),
+        # The running thread's claude session directory. Deeper than the opaque
+        # projects/ tmpfs below, so depth ordering restores exactly this one --
+        # the same trade the plugins/cache entry makes further down. Without it
+        # the CLI cannot write the session file resume reads, and the turn still
+        # succeeds, so the loss is silent.
+        claude_project,
         tmpdir,
         home / ".claude.json",
         home / ".cache/uv",
@@ -749,12 +814,21 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         codex,
         codex / "plugins/cache",
         codex / "plugins/.remote-plugin-install-staging",
+        # This thread's codex home, where its rollouts and sqlite state go. Under
+        # the data dir, which is opaque, so without this the directory the backend
+        # just pointed the child at would not exist inside the namespace.
+        codex_home,
     ]
     return {
         # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
         # $HOME gets the same treatment. memory/ and shims/ are granted back below
         # at greater depth, so the sibling .env and logs/ stay hidden either way.
-        "opaque": [home, data_dir],
+        # projects/ is opaque rather than merely read-only: the read-only mount of
+        # ~/.claude below would otherwise expose every other thread's verbatim
+        # turns, which is worse in kind than the credentials this profile denies.
+        # An empty tmpfs also keeps the directory listable, so a CLI that stats it
+        # sees a plausible store rather than a missing one.
+        "opaque": [home, data_dir, claude_projects, codex_sessions],
         "read_only": [
             home / ".claude",
             codex,
@@ -938,9 +1012,15 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     from claude_on_the_fly.agent import DATA_DIR
 
     base = _fs_base_profile()
+    claude_projects, claude_project = _claude_session_paths(workspace)
+    codex_sessions, codex_home = _codex_session_paths(workspace)
     return sandbox_macos.jail_argv(
         argv,
         **sandbox_macos.realpaths(workspace, DATA_DIR),
+        claude_projects=claude_projects,
+        claude_project=claude_project,
+        codex_sessions=codex_sessions,
+        codex_home=codex_home,
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],

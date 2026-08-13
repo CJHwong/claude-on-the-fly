@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 from contextlib import suppress
 from pathlib import Path
@@ -18,7 +19,91 @@ from pathlib import Path
 from claude_on_the_fly.agent import DATA_DIR
 
 MAPPINGS_DIR = DATA_DIR / "codex-sessions"
+HOMES_DIR = DATA_DIR / "codex-homes"
 _MAX_THREAD_ID = 512
+
+# Everything under a shared ~/.codex that the per-workspace home has to expose so
+# codex starts and behaves the way the operator configured it. Linked rather than
+# copied, so an operator's edit to the real file takes effect on the next turn and
+# a jailed turn writing through the link lands on a path the profile already
+# governs: the instruction and execution entries stay write-denied there, and
+# auth.json stays writable so token refresh still works.
+#
+# Measured against codex-cli 0.147.0: a home holding only an auth.json link and an
+# empty config.toml completed a real `codex exec` turn, so the rest of this list is
+# about honouring the operator's configuration rather than about starting at all.
+_SHARED_ENTRIES = (
+    "config.toml",
+    "AGENTS.md",
+    "hooks.json",
+    "rules",
+    "plugins",
+    "agents",
+    "prompts",
+    "auth.json",
+)
+
+
+def _home_key(workspace: Path) -> str:
+    return hashlib.sha256(
+        str(workspace.resolve(strict=False)).encode("utf-8")
+    ).hexdigest()
+
+
+def home_dir(workspace: Path) -> Path:
+    """This workspace's own `CODEX_HOME`.
+
+    codex names its rollouts by date and thread id in one flat tree, and it
+    chooses the name at startup, so there is no per-workspace path to grant the
+    way claude's `projects/<hash>` can be granted. Giving each workspace its own
+    home is what makes the rollout location predictable before the run, and one
+    workspace is one chat thread, so it is also the isolation boundary: a jailed
+    turn is granted this directory and cannot see any other thread's rollouts.
+
+    Daemon-owned under DATA_DIR, beside the mappings and outside the
+    agent-writable workspace, for the reason this module exists.
+    """
+    return HOMES_DIR / _home_key(workspace)
+
+
+def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
+    """Create this workspace's `CODEX_HOME` and link the shared entries into it.
+
+    Idempotent: it runs before every codex spawn, and an operator who adds a
+    prompts/ directory later gets it linked on the next turn without a restart.
+    Absent shared entries are skipped rather than stubbed, because codex treats a
+    missing config as "use the defaults" and a dangling link as an error.
+    """
+    home = home_dir(workspace)
+    # sessions/ is created here rather than left to codex because the jail makes
+    # $HOME opaque, and a recursive mkdir that cannot stat an ancestor walks up and
+    # tries to create it instead: measured as `mkdir: /Users/hoss: Operation not
+    # permitted` on a path whose leaf was granted. Creating the chain now leaves
+    # codex writing files inside a directory that already exists.
+    (home / "sessions").mkdir(parents=True, exist_ok=True)
+    source_root = Path.home() / ".codex" if shared is None else shared
+    for name in _SHARED_ENTRIES:
+        link, target = home / name, source_root / name
+        if not target.exists():
+            continue
+        if link.is_symlink():
+            if link.readlink() == target:
+                continue
+            with suppress(OSError):
+                link.unlink()
+        elif link.exists():
+            # A real file where the link belongs is removed, not left alone. This
+            # home is writable by the jailed turn, so a real AGENTS.md or
+            # config.toml here would be an execution-control file the agent can
+            # write -- standing orders it leaves itself for the next run, which is
+            # the thing the shared ~/.codex deny list exists to prevent. Replacing
+            # it with the link puts the name back on a path the profile denies
+            # writes to.
+            with suppress(OSError):
+                link.unlink()
+        with suppress(OSError):
+            link.symlink_to(target)
+    return home
 
 
 def _mapping_key(workspace: Path, session_uuid: str) -> str:
@@ -149,8 +234,22 @@ def mappings_for_workspace(workspace: Path) -> list[tuple[Path, str, float]]:
 
 
 def remove_workspace(workspace: Path) -> None:
-    """Best-effort removal of all daemon-owned mappings for ``workspace``."""
+    """Best-effort removal of all daemon-owned mappings for ``workspace``.
+
+    The workspace's codex home goes too. It holds that thread's rollouts, and its
+    name is derived from a path that will never exist again, so nothing else could
+    ever reclaim it -- the same argument `transcript.remove_workspace_sessions`
+    makes for claude's `projects/` directory.
+    """
     canonical_workspace = workspace.resolve(strict=False)
+    # Links first, so removing the tree cannot follow one into the shared ~/.codex.
+    home = home_dir(workspace)
+    for name in _SHARED_ENTRIES:
+        link = home / name
+        if link.is_symlink():
+            with suppress(OSError):
+                link.unlink()
+    shutil.rmtree(home, ignore_errors=True)
     try:
         paths = list(MAPPINGS_DIR.glob("*.json"))
     except OSError:
