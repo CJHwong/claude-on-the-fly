@@ -844,14 +844,54 @@ def _session_mount_sources(workspace: Path) -> tuple[list[Path], list[Path]]:
     build the agent's guidance note, and that must not touch the filesystem.
     """
     claude_config, _, claude_project = _claude_session_paths(workspace)
-    _, codex_home = _codex_session_paths(workspace)
+    codex_sessions, codex_home = _codex_session_paths(workspace)
     directories = [
         claude_project,
         codex_home,
+        # Where codex actually writes rollouts. `codex_state.ensure_home` creates it
+        # too, but only when the codex backend is the one spawning; the jail must not
+        # depend on which backend ran first, and the preflight probe writes here.
+        codex_home / "sessions",
+        # Not writable, and created for exactly that reason: the shared rollout
+        # tree is masked with a tmpfs, and a mask can only be mounted over a path
+        # that exists. Absent, it was left unmasked, and because Linux binds
+        # ~/.codex read-write a jailed turn could then create the tree itself and
+        # write into it -- working but unisolated, where macOS refuses outright.
+        # Measured on a host that had never run codex.
+        codex_sessions,
         *(claude_config / name for name in _CLAUDE_RUNTIME_WRITE_DIRS),
     ]
     files = [claude_config / name for name in _CLAUDE_RUNTIME_WRITE_FILES]
     return directories, files
+
+
+def _ensure_session_mount_sources(workspace: Path) -> None:
+    """Materialise every per-thread mount source, before the grants are computed.
+
+    Two reasons a source has to exist, and they pull in opposite directions, which
+    is why this cannot be skipped when a path is absent:
+
+      - A read-write bind needs something to bind, or bwrap fails the whole spawn
+        with "Can't mkdir parents ... Read-only file system".
+      - A mask needs something to mount over. An absent one is silently left
+        unmasked, and for the shared codex tree that is a real hole, because Linux
+        binds ~/.codex read-write.
+    """
+    directories, files = _session_mount_sources(workspace)
+    for source in directories:
+        try:
+            source.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Never silent: a source that cannot be created is either a mount the
+            # turn then lacks, or a mask that then does not apply, and the second
+            # one is a boundary quietly going missing.
+            logger.warning("sandbox: could not create mount source %s: %s", source, exc)
+    for source in files:
+        try:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.touch(exist_ok=True)
+        except OSError as exc:
+            logger.warning("sandbox: could not create mount source %s: %s", source, exc)
 
 
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
@@ -1032,14 +1072,6 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # them is what the turn was going to do anyway; a claude turn gets an empty
     # codex home and vice versa, which costs one directory and keeps the wrap
     # independent of which backend is running.
-    directories, files = _session_mount_sources(workspace)
-    for source in directories:
-        with contextlib.suppress(OSError):
-            source.mkdir(parents=True, exist_ok=True)
-    for source in files:
-        with contextlib.suppress(OSError):
-            source.parent.mkdir(parents=True, exist_ok=True)
-            source.touch(exist_ok=True)
     placeholders = sandbox_linux.prepare_placeholders(DATA_DIR / "jail")
     sandbox_linux.ensure_write_deny_targets(
         grants["write_denied"], placeholders, grants["write_denied_dirs"]
@@ -1107,6 +1139,19 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     """
     if mode() != "jail":
         return argv
+    # Before either platform branch, and before `_linux_grants` in particular, which
+    # decides whether to mask a session store by whether it exists: creating these
+    # afterwards left the shared codex tree unmasked and then created it, and since
+    # Linux binds ~/.codex read-write a jailed turn could write a rollout straight
+    # into it. Measured at rc 0 with the file landing on the host.
+    #
+    # Both platforms, not only the one that needs mount sources. A jailed process
+    # creating its own directory chain hits the same wall the probes kept finding: a
+    # recursive mkdir that cannot stat an ancestor walks up and tries to create it,
+    # which under an opaque $HOME fails at the home directory itself. Creating the
+    # chain here means the CLI only ever writes files into a directory that is
+    # already there.
+    _ensure_session_mount_sources(workspace)
     if _platform().startswith("linux"):
         return _linux_wrap(argv, workspace)
     if not shutil.which("sandbox-exec"):
@@ -1349,7 +1394,7 @@ async def preflight() -> None:
     credential files it spawns nothing at all -- and a jail that never starts
     would go unnoticed precisely because there was nothing to notice.
 
-    Two checks, both cheap and both startup-fatal:
+    Three checks, all cheap and all startup-fatal:
 
       1. The jail runs a trivial command. Catches a missing mechanism, a profile
          that will not parse, and on Linux the case this cannot be reasoned about
@@ -1359,6 +1404,14 @@ async def preflight() -> None:
          claim of the whole design -- that the egress proxy cannot be bypassed --
          and until now nothing checked it on either platform. A jail whose network
          rules silently did not apply looks exactly like one whose did.
+      3. A jailed process can write the session directory the agent CLI persists
+         to. The only positive check of the three, and it exists because the
+         failure it catches is invisible: the CLI *is* the jailed process, so a
+         profile that denies its session file still completes every turn and only
+         shows up as a resume that has forgotten the conversation, or a memory
+         that silently stopped being kept. That shipped once. The other two
+         checks would not have caught it, because nothing was denied that the
+         jail was asked to deny.
     """
     if mode() != "jail":
         return
@@ -1395,7 +1448,55 @@ async def preflight() -> None:
         raise SandboxBoundaryError(
             f"sandbox egress preflight was inconclusive: {output.strip()[:400]}"
         )
-    logger.info("sandbox: preflight ok, jail starts and external egress is refused")
+    await _preflight_session_write(workspace)
+    logger.info(
+        "sandbox: preflight ok, jail starts, external egress is refused, and the "
+        "agent can persist its session"
+    )
+
+
+_SESSION_PROBE_NAME = ".cotf-preflight"
+
+
+async def _preflight_session_write(workspace: Path) -> None:
+    """Prove a jailed process can write the store the agent CLI persists to.
+
+    Probes the same path `wrap` grants for this workspace, so it exercises the real
+    grant rather than a stand-in. The probe workspace is the daemon's own, so the
+    directory this creates is not a live thread's.
+
+    Both backends are checked because the two stores are granted by different
+    mechanisms -- claude by a path derived from the workspace, codex by a per-thread
+    home the backend also has to publish -- and either can be broken alone.
+    """
+    _, _, claude_project = _claude_session_paths(workspace)
+    _, codex_home = _codex_session_paths(workspace)
+    for label, directory in (
+        ("claude session", claude_project),
+        ("codex home", codex_home / "sessions"),
+    ):
+        target = directory / _SESSION_PROBE_NAME
+        try:
+            # No mkdir: `wrap` created the chain on the host, and a recursive mkdir
+            # from inside would walk up into the opaque $HOME and fail there
+            # instead, reporting a denial that says nothing about this grant.
+            code, output = await _run_jailed(
+                ["/bin/sh", "-c", f"printf ok > {target}"], workspace
+            )
+        except (OSError, TimeoutError) as exc:
+            raise SandboxBoundaryError(
+                f"sandbox session preflight could not run: {exc}"
+            ) from exc
+        wrote = target.is_file()
+        with contextlib.suppress(OSError):
+            target.unlink()
+        if code != 0 or not wrote:
+            raise SandboxBoundaryError(
+                f"sandbox preflight failed: a jailed process cannot write its "
+                f"{label} directory ({directory}), so the agent would complete "
+                "turns and silently lose its conversation and memory. "
+                f"(rc={code}): {output.strip()[:400]}"
+            )
 
 
 async def verify_denials(workspace: Path | None = None) -> dict[str, str]:

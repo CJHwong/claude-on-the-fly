@@ -109,7 +109,13 @@ Both bases reference all four, unlike `_EXTRA_*`, so `jail_argv` always passes t
 profile referencing an unpassed `-D` is refused outright, which is the failure worth
 having: the alternative is a jail that loads with the session grant silently absent.
 
-Two ordering constraints, both found by a live probe rather than by reading:
+Three ordering constraints, all found by a live probe rather than by reading:
+
+- On Linux, `_ensure_session_mount_sources` runs **before** `_linux_grants`. The grants
+  decide whether to mask a session store by whether it exists, so creating the sources
+  afterwards left the shared codex tree unmasked and then created it. Since Linux binds
+  `~/.codex` read-write, a jailed turn could write a rollout straight into it: measured
+  at rc 0 with the file landing on the host, while the whole suite stayed green.
 
 - The codex pair must come *after* the `~/.codex` read allow. SBPL is last-match-wins, so
   placed before it the allow won and a jailed turn still read another thread's rollout

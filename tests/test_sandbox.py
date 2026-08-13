@@ -1491,9 +1491,16 @@ async def test_preflight_refuses_an_inconclusive_egress_probe(linux, monkeypatch
 
 async def test_preflight_passes_when_the_jail_holds(linux, monkeypatch, caplog):
     async def healthy(argv, workspace, timeout=20):
-        return (
-            (0, "cotf") if "echo" in argv[0] else (1, "BLOCKED:Network is unreachable")
-        )
+        if "echo" in argv[0]:
+            return 0, "cotf"
+        # The session probe asserts the file actually appeared rather than trusting
+        # the exit code, so a stub has to do the write a real jail would have done.
+        if "printf ok >" in argv[-1]:
+            target = Path(argv[-1].rsplit("printf ok > ", 1)[1].strip())
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("ok")
+            return 0, ""
+        return 1, "BLOCKED:Network is unreachable"
 
     monkeypatch.setattr(sandbox, "_run_jailed", healthy)
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
@@ -1718,10 +1725,11 @@ def test_the_running_threads_claude_session_dir_is_writable_under_the_jail(
     if not own.parent.is_dir():
         pytest.skip("no real claude projects dir on this machine to probe")
     try:
-        # The CLI creates this directory itself, so the jail has to permit that
-        # and not merely writes inside a directory something else prepared.
-        made = _run_jailed(["/bin/mkdir", str(own)], workspace)
-        assert made.returncode == 0, made.stderr
+        # `wrap` creates the chain on the host before the spawn, so the directory is
+        # there by the time the CLI runs. It has to be: a recursive mkdir from inside
+        # walks up into the opaque $HOME and fails at the home directory itself.
+        _run_jailed(["/bin/true"], workspace)
+        assert own.is_dir(), "wrap did not create this thread's session directory"
         target = own / "session.jsonl"
         wrote = _run_jailed(
             ["/bin/sh", "-c", f"echo '{{}}' > {target} && cat {target}"], workspace
@@ -2172,3 +2180,151 @@ def test_linux_grants_mirror_the_claude_runtime_writes_and_mask_history(tmp_path
         assert history in grants["masked"]
     finally:
         del os.environ["CLAUDE_CONFIG_DIR"]
+
+
+async def test_preflight_refuses_when_the_agent_cannot_persist_its_session(
+    linux, monkeypatch
+):
+    """The failure this probe exists for. It is the only positive check in
+    preflight, because a profile that denies the CLI its own session file breaks
+    nothing a negative check can see: every turn still completes, and the loss only
+    surfaces later as a resume with no memory of the conversation. That shipped
+    once, and the other two probes were green throughout."""
+
+    async def jail_denies_the_session_write(argv, workspace, timeout=20):
+        if "echo" in argv[0]:
+            return 0, "cotf"
+        if "printf ok >" in argv[-1]:
+            return 1, "Operation not permitted"
+        return 1, "BLOCKED:Network is unreachable"
+
+    monkeypatch.setattr(sandbox, "_run_jailed", jail_denies_the_session_write)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="silently lose"):
+        await sandbox.preflight()
+
+
+async def test_preflight_does_not_trust_the_exit_code_alone(linux, monkeypatch):
+    """A zero exit with no file is the shape a mount that silently went missing
+    has: the shell succeeds against a tmpfs the jail then discards. So the probe
+    checks the host side, which is where the CLI's real session file has to land."""
+
+    async def lies_about_success(argv, workspace, timeout=20):
+        if "echo" in argv[0]:
+            return 0, "cotf"
+        if "printf ok >" in argv[-1]:
+            return 0, ""
+        return 1, "BLOCKED:Network is unreachable"
+
+    monkeypatch.setattr(sandbox, "_run_jailed", lies_about_success)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="cannot write"):
+        await sandbox.preflight()
+
+
+def test_the_shared_codex_rollout_tree_is_always_masked_on_linux(tmp_path, monkeypatch):
+    """The gap this closes: Linux binds ~/.codex read-write, so an unmasked shared
+    tree could be created by the jailed turn itself and written into -- working but
+    unisolated, where macOS refuses. Masking needs the path to exist, so it is
+    created rather than skipped."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "never-run-codex"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    codex_sessions, _ = sandbox._codex_session_paths(workspace)
+    assert not codex_sessions.exists()
+    directories, _ = sandbox._session_mount_sources(workspace)
+    assert codex_sessions in directories, "the shared tree is not created, so unmasked"
+    for source in directories:
+        source.mkdir(parents=True, exist_ok=True)
+    assert codex_sessions in sandbox._linux_grants(workspace)["opaque"]
+
+
+def test_the_mount_sources_exist_before_the_grants_are_computed(tmp_path, monkeypatch):
+    """Ordering, and it is the policy rather than a detail.
+
+    `_linux_grants` decides whether to mask a session store by whether it exists.
+    Creating the sources after that call left the shared codex tree unmasked and
+    then created it, and because Linux binds ~/.codex read-write a jailed turn could
+    write a rollout straight into it. Measured on a fresh host: rc 0, the file
+    landed, and every test in this file still passed.
+    """
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "never-run-codex"))
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/bwrap")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    codex_sessions, _ = sandbox._codex_session_paths(workspace)
+    assert not codex_sessions.exists(), "precondition: the shared tree is absent"
+    captured: dict = {}
+
+    def capture(argv, **kwargs):
+        captured.update(kwargs)
+        return ["bwrap", *argv]
+
+    monkeypatch.setattr(sandbox.sandbox_linux, "jail_argv", capture)
+    monkeypatch.setattr(
+        sandbox.sandbox_linux, "prepare_placeholders", lambda _root: object()
+    )
+    monkeypatch.setattr(
+        sandbox.sandbox_linux, "ensure_write_deny_targets", lambda *a, **k: None
+    )
+    sandbox.wrap(["/bin/echo"], workspace)
+    assert codex_sessions in captured["opaque"], (
+        "the shared rollout tree was not masked, so a jailed turn could write it"
+    )
+
+
+def test_a_mount_source_that_cannot_be_created_is_reported_not_swallowed(
+    tmp_path, monkeypatch, caplog
+):
+    """A source that cannot be created is either a mount the turn then lacks or a
+    mask that then does not apply, and the second is a boundary going missing. It
+    must not raise either: the spawn still has to happen, and bwrap reports the
+    real consequence better than a guess here would."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def refuse(self, *args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        sandbox._ensure_session_mount_sources(workspace)
+    messages = "\n".join(r.getMessage() for r in caplog.records)
+    assert "could not create mount source" in messages
+
+
+def test_a_mount_source_file_that_cannot_be_created_is_reported(
+    tmp_path, monkeypatch, caplog
+):
+    """Same for the file half of the list, which is created with touch."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def refuse(self, *args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "touch", refuse)
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        sandbox._ensure_session_mount_sources(workspace)
+    messages = "\n".join(r.getMessage() for r in caplog.records)
+    assert "could not create mount source" in messages
+    assert "policy-limits.json" in messages
+
+
+async def test_the_session_preflight_reports_a_probe_that_could_not_run(
+    linux, monkeypatch
+):
+    """A probe that never ran is not evidence of anything, so it must not read as a
+    pass. Distinguished from the session write being denied, which is a different
+    and much more specific failure."""
+
+    async def healthy_until_the_session_probe(argv, workspace, timeout=20):
+        if "echo" in argv[0]:
+            return 0, "cotf"
+        if "printf ok >" in argv[-1]:
+            raise OSError("no exec")
+        return 1, "BLOCKED:Network is unreachable"
+
+    monkeypatch.setattr(sandbox, "_run_jailed", healthy_until_the_session_probe)
+    with pytest.raises(sandbox.SandboxBoundaryError, match="session preflight could"):
+        await sandbox.preflight()
