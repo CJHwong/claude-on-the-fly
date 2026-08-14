@@ -195,7 +195,7 @@ def _find_codex_rollout(thread_id: str) -> Path | None:
     if not thread_id:
         return None
     matches = sorted(
-        _iter_rollouts(f"**/rollout-*-{thread_id}.jsonl"),
+        _iter_rollouts(f"**/{codex_state.rollout_glob(thread_id)}"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

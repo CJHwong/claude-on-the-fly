@@ -32,6 +32,7 @@ upgrade path, so none of that was covered by it.
 | `_CODEX_HOME` collapsed onto `~/.codex` with `scope_sessions` off, so the write allow nullified the deny above it and `config.toml`, `AGENTS.md`, `hooks.json` became agent-writable | `sandbox._macos_wrap` | Live jailed write into a real `~/.codex`, refused after the fix and succeeding with the one line reverted, under both profiles |
 | An unrecognised `sandbox.mode` resolved to `off`, and both startup gates return early unless the mode is `jail`, so a typo produced the posture the operator was avoiding | `sandbox.mode` | All six mode values probed |
 | The cross-thread read denies and the `state/` write deny sat above allows that could re-open them | `seatbelt/*.sb` | One `extra_paths` entry of `$HOME` re-opened both stores; tests now assert rule position, not just behaviour |
+| Thread ids were spliced into glob patterns unescaped, so `*` matched every rollout in the tree: `adopt_rollout` copied another thread's into this workspace's `CODEX_HOME`, and `_find_codex_rollout` returned an unrelated conversation for the next prompt's handoff context | `codex_state.rollout_glob`, `codex_state._valid_thread_id` | Both sites now share one `glob.escape`d pattern, and the id charset is checked on the read side and the write side. 10 adversarial cases (`*`, `?`, `[a-c]*`, `../elsewhere`, whitespace) fail without the change. Charset derived from 14 real mappings on a deployed data dir, all 36 characters of lowercase hex and hyphen. Never reachable: the id comes only from codex's `--json` control event, so this is defence in depth |
 
 ## Open
 
@@ -175,13 +176,6 @@ system prompt has the agent read it every turn. Not fixed by `scope_sessions`.
 
 **Other threads' claude transcripts are writable** when `scope_sessions` is off, not only
 readable.
-
-**Thread ids are spliced into glob patterns unescaped** in `codex_state.adopt_rollout` and
-`transcript._find_codex_rollout`. `write_thread_id` rejects only empty, over-long and
-control characters, so `*`, `?` and `[` pass. Demonstrated: a thread id of `*` copies
-another thread's rollout into the attacker workspace's `CODEX_HOME`. Not reachable today
-— the id comes only from codex's own `--json` control event — so this is defence in
-depth. Closes with `glob.escape` and a charset check.
 
 **A thread can permanently defeat its own operator guardrails.** `codex_state.ensure_home`
 re-links shared entries before every spawn, but if the agent replaces a link with a

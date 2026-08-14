@@ -98,11 +98,17 @@ class TestReadRejectsAnythingItCannotAuthenticate:
             pytest.param("x" * 513, id="over-length"),
             pytest.param("thread\x00id", id="control-character"),
             pytest.param("thread\nid", id="newline"),
+            # A mapping written by a build that predates the charset check, or
+            # planted, still has to fail here: the reader is the last gate before
+            # the id reaches a glob pattern.
+            pytest.param("*", id="glob-star"),
+            pytest.param("[a-c]*", id="glob-class"),
         ],
     )
     def test_a_record_with_an_abusive_thread_id_is_refused(self, workspace, thread_id):
-        """It ends up on a codex command line, so length and control characters
-        are bounded at the point of trust, not at the point of use."""
+        """It ends up on a codex command line and in a glob pattern, so length,
+        control characters and the charset are bounded at the point of trust,
+        not at the point of use."""
         _write_raw(workspace, "s1", {**_valid(workspace), "thread_id": thread_id})
         assert codex_state.read_thread_id(workspace, "s1") is None
 
@@ -126,6 +132,14 @@ class TestWriteRefusesWhatItCannotStandBehind:
         [
             pytest.param("x" * 513, id="over-length"),
             pytest.param("bad\x01id", id="control-character"),
+            # The id reaches a glob pattern and a filename. 14 real mappings on a
+            # deployed data dir are all 36 characters of lowercase hex and hyphen,
+            # so none of these is a thread id under any codex build.
+            pytest.param("*", id="glob-star"),
+            pytest.param("thread-?", id="glob-question"),
+            pytest.param("[a-c]*", id="glob-class"),
+            pytest.param("../elsewhere", id="path-traversal"),
+            pytest.param("two words", id="whitespace"),
         ],
     )
     def test_an_abusive_thread_id_is_refused(self, workspace, thread_id):
@@ -544,6 +558,26 @@ class TestAdoptRollout:
 
     def test_an_empty_thread_id_is_not_resumable(self, workspace):
         assert codex_state.adopt_rollout(workspace, "") is False
+
+    def test_a_wildcard_thread_id_adopts_nothing(self, tmp_path, workspace):
+        """The id is spliced into a glob, so an unescaped `*` matched every
+        rollout in the shared tree and copied the newest one into this
+        workspace's own home -- another thread's conversation, in a directory
+        this thread's agent is granted."""
+        shared = tmp_path / "shared"
+        self._rollout(shared, "someone-elses", body='{"id": 1}\n')
+
+        assert codex_state.adopt_rollout(workspace, "*", shared=shared) is False
+        assert not list(codex_state.home_dir(workspace).glob("sessions/**/*.jsonl"))
+
+    def test_a_character_class_thread_id_adopts_nothing(self, tmp_path, workspace):
+        """`[a-z]*` is the same hole in a second shape: `glob.escape` is what
+        closes the family, not a check for one metacharacter."""
+        shared = tmp_path / "shared"
+        self._rollout(shared, "abc")
+
+        assert codex_state.adopt_rollout(workspace, "[a-c]*", shared=shared) is False
+        assert not list(codex_state.home_dir(workspace).glob("sessions/**/*.jsonl"))
 
     def test_a_copy_that_fails_is_not_reported_as_adopted(
         self, tmp_path, workspace, monkeypatch
