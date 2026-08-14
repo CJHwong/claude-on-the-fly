@@ -19,6 +19,10 @@ Messaging-platform adapters (Slack, Telegram) implement the `Frontend` ABC at `s
 ### Optional overrides worth knowing
 
 - `notify_queued` / `notify_start` / `notify_complete` (default no-op) — for frontends that want cheaper signals than text replies (e.g. emoji reactions).
+- `route_for(chat_id)` / `restore_route(chat_id, route)` — the routing context a pending turn is journaled with, and how it comes back. Default is an empty dict and a no-op, which is right for a frontend whose chat id is already an address (Telegram). Slack must override both: `_session_key` is `sha256(channel:thread_ts)`, so the chat id cannot address the thread again and a replayed turn would run with nowhere to post. Telegram overrides them for its `/new` token, because `_load_sessions` runs inside `start()` — after pending turns are replayed — so without it a replay resumes the journaled session in the base session's workspace. Whatever `route_for` returns must be JSON-serializable and must not hold a credential: it goes to disk.
+- `notify_resumed(chat_id, count)` — no-op by default, and meant to stay that way. A resumed turn is announced by the same things that announce a fresh one: the reaction it gets while it runs and the reply it posts. Only a frontend with no such affordance at all should say anything here.
+- `notify_nudge(chat_id, text)` — offers a turn back, reached only for one that hit the replay limit. Default posts the prompt with `agent.strip_sender_markers` applied, because the markers are prompt grammar and quoting them back shows the person scaffolding they never wrote. Override if the platform has a tappable affordance.
+- `notify_interrupted(chat_id, running=, queued=)` — called once per affected chat while the daemon shuts down, *before* `Orchestrator.shutdown` cancels anything. Slack overrides it to mark the affected messages `:arrows_counterclockwise:` and post nothing: every pending turn resumes, so prose here is the daemon narrating its own lifecycle, once per stop, and `r` in the dashboard is a stop plus a start. A frontend with no state to show falls back to `protocol.interrupted_notice(...)`. The whole pass is bounded by `orchestrator.SHUTDOWN_NOTICE_BUDGET_S` and sits inside `supervisor.SAFE_GRACE_S`, so a platform whose API has gone away costs the exit a few seconds rather than the SIGKILL window.
 - `send_progress(chat_id, text)` (default no-op) — one mid-turn narration message while a turn runs, gated on `interim.progress`; only Slack implements it, and the implementation contract is on `Frontend.send_progress` in `protocol.py`. The coalescing and rate limiting live in `src/claude_on_the_fly/interim.py`, not in the adapter and not in `orchestrator.py` — how often a person wants to be interrupted is the same question on every platform.
 - `timeout_for(chat_id)` — per-message subprocess timeout override; `None` uses the agent default.
 - `describe()` — frontend-specific settings to print in the startup preview. Redact secrets before returning.
@@ -73,3 +77,62 @@ agent answers, the answer goes back to the asker. If your new thing polls, or
 produces work whose reply belongs somewhere other than the caller, it is a
 producer: emit `Job`s and let the worker run them. Ask before making it a
 `Frontend`.
+
+## Recovery after a stop
+
+`turns.py` is the durable half. A turn is journaled when it is *accepted*, so the
+record survives SIGKILL, a `--force` past the supervisor's grace, and a panic --
+a shutdown-time write would cover only a clean SIGTERM.
+
+Two phases, and the difference is what a frontend's messages must promise:
+
+| Phase | Meaning | Replayed as |
+|---|---|---|
+| `QUEUED` | Never handed to an agent | The prompt, verbatim |
+| `DISPATCHED` | An agent was started | The prompt, prefixed with `orchestrator.RESUME_TEMPLATE` |
+
+Both resume, silently. The phase decides only what the resumed turn is *told*: a
+dispatched one may already have written files, posted messages, or pushed commits,
+so its prompt carries a system note saying so and asking it to check the current
+state before repeating anything that writes, sends, or publishes. Holding the turn
+back instead was the earlier design and it was wrong in practice -- somebody who
+asked for work wants it done, not handed back.
+
+The one exception is a turn that has been replayed to its limit
+(`turns.MAX_REPLAYS`): running it again is the likeliest reason the daemon keeps
+going down, so that one is offered back through `notify_nudge`.
+
+There is deliberately no third "started but has not acted yet" phase -- both
+backends build their tool-event relay only when interim progress is on, so it
+would need new hooks in both and would change nothing now that both phases
+resume.
+
+**Both ends of the pause are meant to be wordless.** The stop marks the message
+`INTERRUPTED_EMOJI` and the resume moves it to `RUNNING_EMOJI`. Three states, three
+glyphs: reusing the queue's `QUEUED_EMOJI` for a restart would make "waiting its
+turn" and "interrupted" the same thing on screen. `notify_start` clears both waiting
+marks, because a turn can have been queued and then interrupted, in either order.
+Nothing is posted at either end.
+
+On Slack the journaled
+route carries `message_ts`, the message that *asked*, alongside the thread that
+receives the reply; `restore_route` puts it back into `_pending_msg` so
+`notify_start` swaps the hourglass for eyes on the original message and
+`notify_complete` clears it when the reply lands. A frontend adding recovery
+support should carry whatever its own progress indicator needs in the same way.
+
+`resume_pending` runs between `_start_sandbox` and `frontend.start`: a replayed
+turn spawns a jailed agent that needs the broker, the proxy and the shims, and
+queueing before the listener starts is what stops a live message from overtaking
+work that was already waiting. The journal is emptied before anything is replayed,
+and each replay carries a counter, so a turn that kills the daemon parks instead
+of being replayed at every start.
+
+A turn stopped on purpose (`$stop`, `abort`) has its record dropped, or the stop
+would come back after the next restart.
+
+The agent can neither read nor write this file. Both sandbox profiles deny
+`state/` in both directions, `tests/test_sandbox_parity.py` carries the contract,
+and `sandbox._probe_write` proves the write deny at startup. That is not merely
+privacy: a journal entry is replayed as a user message, so a writable journal is
+a prompt the agent could schedule for itself past any approval gate.

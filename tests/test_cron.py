@@ -511,6 +511,48 @@ class TestStop:
 
         assert not cron._command_tasks
 
+    async def test_stop_names_the_entries_it_cancelled(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Without the names the daemon log shows a clean exit, and the operator
+        has to open every entry's log to find which run died."""
+        cron = daemon(tmp_path, cfg(tmp_path))
+        cron._spawn_command(
+            CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60)
+        )
+        await asyncio.sleep(0.05)
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            await cron.stop()
+
+        assert "slow" in caplog.text
+
+    async def test_stop_is_quiet_when_no_command_was_running(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        cron = daemon(tmp_path, cfg(tmp_path))
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            await cron.stop()
+
+        assert caplog.text == ""
+
+    async def test_the_heartbeat_names_the_running_commands(
+        self, tmp_path: Path
+    ) -> None:
+        """The supervisor reads this to say what a stop will cancel, before it
+        signals anything."""
+        cron = daemon(tmp_path, cfg(tmp_path))
+        assert cron.heartbeat_extra() == {"running_commands": []}
+
+        cron._spawn_command(
+            CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60)
+        )
+        await asyncio.sleep(0.05)
+
+        assert cron.heartbeat_extra() == {"running_commands": ["slow"]}
+        await cron.stop()
+
 
 # ---------------------------------------------------------------------------
 # Pre-rename configs

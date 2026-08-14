@@ -315,7 +315,9 @@ class TestCronRunLoop:
         writer.run = AsyncMock()
         writer.path = tmp_path / "cron.json"
         writer.path.write_text("{}")
-        monkeypatch.setattr(heartbeat_mod, "HeartbeatWriter", lambda _role: writer)
+        monkeypatch.setattr(
+            heartbeat_mod, "HeartbeatWriter", lambda _role, **_kwargs: writer
+        )
         return writer
 
     def test_the_daemon_runs_and_the_heartbeat_is_cleaned_up(

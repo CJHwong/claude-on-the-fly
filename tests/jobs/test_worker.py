@@ -182,7 +182,11 @@ async def test_run_loop_cancels_in_flight_job_on_stop(tmp_path: Path) -> None:
     await asyncio.wait_for(loop_task, timeout=1.0)
 
     assert runner.cancelled is True
-    assert notifier.calls == []  # cancelled before complete/notify
+    # One notice, not a result: whoever asked is told the restart cut it short.
+    assert len(notifier.calls) == 1
+    _origin, result = notifier.calls[0]
+    assert result.ok is False
+    assert "runs again by itself" in result.text
     assert q.claim() is None  # still in cur/, not new/
     assert q.recover_stale(None) == 1
     again = q.claim()
@@ -637,3 +641,71 @@ async def test_a_cancelled_batch_member_propagates() -> None:
         await task
     with pytest.raises(asyncio.CancelledError):
         worker._harvest({task})
+
+
+# --- interruption notice ---------------------------------------------------
+
+
+async def test_a_cancelled_job_tells_its_origin_without_marking_a_delivery() -> None:
+    """The job itself re-runs, so this is a notice and not a result: marking it
+    delivered would suppress the redelivery of a reply that never existed."""
+    job = _job()
+    q = _FakeQueue([job])
+    runner = _BlockingRunner()
+    notifier = _RecordingNotifier()
+
+    task = asyncio.create_task(run_once(q, runner, notifier))
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(notifier.calls) == 1
+    origin, result = notifier.calls[0]
+    assert origin == job.origin
+    assert result.ok is False
+    assert q.completed == []
+    assert q.delivered == []
+
+
+async def test_a_notice_that_cannot_be_posted_does_not_hide_the_cancellation(
+    caplog,
+) -> None:
+    """Shutdown must proceed: the notice is a courtesy, the cancel is the job."""
+    q = _FakeQueue([_job()])
+    runner = _BlockingRunner()
+
+    class _BrokenNotifier:
+        async def notify(self, origin: dict, result: Result) -> None:
+            raise RuntimeError("channel_not_found")
+
+    task = asyncio.create_task(run_once(q, runner, _BrokenNotifier()))
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+    task.cancel()
+    with (
+        caplog.at_level("ERROR", logger="claude_on_the_fly.jobs.worker"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await task
+
+    assert "interrupted" in caplog.text
+
+
+async def test_a_notice_that_hangs_cannot_delay_the_exit_past_its_budget(
+    monkeypatch,
+) -> None:
+    """The supervisor SIGKILLs after its grace; an unreachable API must cost a
+    bounded wait, not the whole window."""
+    monkeypatch.setattr(worker, "NOTICE_BUDGET_S", 0.01)
+    q = _FakeQueue([_job()])
+    runner = _BlockingRunner()
+
+    class _HangingNotifier:
+        async def notify(self, origin: dict, result: Result) -> None:
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(run_once(q, runner, _HangingNotifier()))
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)

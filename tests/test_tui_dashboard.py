@@ -78,6 +78,10 @@ async def _open(app: _Host, pilot) -> DashboardScreen:
     return screen
 
 
+def _raise_oserror(*_args, **_kwargs):
+    raise OSError("read-only file system")
+
+
 def _result(name, status, detail="", hint=""):
     return CheckResult(name=name, status=status, detail=detail, fix_hint=hint)
 
@@ -2338,3 +2342,180 @@ class TestWatchJobs:
         }
         # The display label is the short id, the same one the table shows.
         assert screen._chat_workspaces == {"jobs:t1-abc": "abc"}
+
+
+class TestUpgradeAction:
+    """[U] is the destructive one: it stops every daemon at once. So the modal
+    has to come first, and only a confirmed run may touch anything."""
+
+    def _plan(self):
+        from claude_on_the_fly.upgrade import Plan
+
+        return Plan(command="git pull && uv sync", source="test")
+
+    async def test_it_asks_before_it_stops_anything(self, isolated, monkeypatch):
+        from claude_on_the_fly.tui.screens.upgrade import UpgradeScreen
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            monkeypatch.setattr(dash.upgrade, "resolve", self._plan)
+            monkeypatch.setattr(supervisor, "all_pending_work", lambda: [])
+            stopped: list[int] = []
+            monkeypatch.setattr(
+                supervisor, "stop_all", lambda: (stopped.append(1), [])[1]
+            )
+
+            await screen.action_upgrade()
+            await pilot.pause()
+
+            assert isinstance(app.screen, UpgradeScreen)
+            assert stopped == []
+
+    async def test_an_unknown_install_says_so_and_stops_nothing(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+
+            def _refuse():
+                raise dash.upgrade.UnknownInstall("set upgrade.command")
+
+            monkeypatch.setattr(dash.upgrade, "resolve", _refuse)
+            await screen.action_upgrade()
+            await pilot.pause()
+
+        assert any("set upgrade.command" in msg for msg, _s in notices)
+
+    async def test_upgrading_while_busy_is_ignored(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            calls: list[int] = []
+            monkeypatch.setattr(
+                dash.upgrade, "resolve", lambda: (calls.append(1), self._plan())[1]
+            )
+            screen._set_busy("busy")
+            await screen.action_upgrade()
+            await pilot.pause()
+        assert calls == []
+
+    async def test_declining_the_modal_runs_nothing(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            ran: list[int] = []
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_captured",
+                lambda _plan: (ran.append(1), (0, ""))[1],
+            )
+            screen._on_upgrade_confirmed(self._plan(), False)
+            await pilot.pause()
+        assert ran == []
+
+    async def test_confirming_the_modal_starts_the_upgrade(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            ran: list[str] = []
+
+            async def _fake_upgrade(plan):
+                ran.append(plan.command)
+
+            monkeypatch.setattr(screen, "_upgrade", _fake_upgrade)
+            screen._on_upgrade_confirmed(self._plan(), True)
+            await pilot.pause()
+
+        assert ran == ["git pull && uv sync"]
+
+    async def test_a_successful_upgrade_resumes_then_hands_over(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            order: list[str] = []
+            monkeypatch.setattr(
+                supervisor,
+                "stop_all",
+                lambda: (order.append("stop"), [("slack", 1)])[1],
+            )
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_captured",
+                lambda _plan: (order.append("run"), (0, "Updated 1 file"))[1],
+            )
+            monkeypatch.setattr(
+                supervisor, "resume", lambda: (order.append("resume"), [])[1]
+            )
+
+            await screen._upgrade(self._plan())
+            await pilot.pause()
+
+            assert order == ["stop", "run", "resume"]
+            assert app.relaunch_on_exit is True
+        log = isolated / dash.logs.log_name("upgrade")
+        assert "Updated 1 file" in log.read_text()
+
+    async def test_a_failed_upgrade_restarts_the_daemons_and_does_not_hand_over(
+        self, isolated, monkeypatch
+    ):
+        """Old code running beats nothing running, and there is no new code to
+        show, so the TUI stays where it is."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            monkeypatch.setattr(supervisor, "stop_all", lambda: [])
+            monkeypatch.setattr(
+                dash.upgrade, "run_captured", lambda _plan: (2, "fatal: no upstream")
+            )
+            resumed: list[int] = []
+            monkeypatch.setattr(
+                supervisor, "resume", lambda: (resumed.append(1), [])[1]
+            )
+
+            await screen._upgrade(self._plan())
+            await pilot.pause()
+
+        assert resumed == [1]
+        # Never set, so the host app never grew the attribute at all.
+        assert getattr(app, "relaunch_on_exit", False) is False
+        assert any("exit 2" in msg and severity == "error" for msg, severity in notices)
+
+    async def test_a_daemon_that_will_not_come_back_is_named(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            monkeypatch.setattr(supervisor, "stop_all", lambda: [])
+            monkeypatch.setattr(dash.upgrade, "run_captured", lambda _plan: (0, ""))
+            monkeypatch.setattr(
+                supervisor,
+                "resume",
+                lambda: [("slack", None, RuntimeError("no token"))],
+            )
+
+            await screen._upgrade(self._plan())
+            await pilot.pause()
+
+        assert any("no token" in msg for msg, _s in notices)
+
+    async def test_an_unwritable_log_does_not_lose_the_upgrade(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            monkeypatch.setattr(dash, "LOG_DIR", isolated / "nope" / "deeper")
+            monkeypatch.setattr(Path, "mkdir", _raise_oserror)
+
+            screen._write_upgrade_log(self._plan(), "output")
+
+        assert any("could not write" in msg for msg, _s in notices)

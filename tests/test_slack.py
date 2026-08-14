@@ -543,11 +543,17 @@ class TestNotifyStart:
 
         await frontend.notify_start(session_id)
 
-        frontend._app.client.reactions_remove.assert_awaited_once_with(
-            channel="C1", timestamp="10.0", name="hourglass_flowing_sand"
-        )
+        # Both waiting marks come off the oldest message: it may have been queued
+        # behind other work, interrupted by a restart, or both.
+        assert [
+            (c.kwargs["timestamp"], c.kwargs["name"])
+            for c in frontend._app.client.reactions_remove.await_args_list
+        ] == [
+            ("10.0", slack_mod.QUEUED_EMOJI),
+            ("10.0", slack_mod.INTERRUPTED_EMOJI),
+        ]
         frontend._app.client.reactions_add.assert_awaited_once_with(
-            channel="C1", timestamp="10.0", name="eyes"
+            channel="C1", timestamp="10.0", name=slack_mod.RUNNING_EMOJI
         )
         assert list(frontend._pending_msg[session_id]) == [("C1", "20.0")]
         assert frontend._in_flight[session_id] == ("C1", "10.0")
@@ -4898,3 +4904,236 @@ class TestSenderIdentityFallsBackToTheChat:
     def test_an_unknown_session_reports_the_chat_id(self):
         frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
         assert frontend.sender_identity(42) == "42"
+
+
+# ---------------------------------------------------------------------------
+# Pending-turn routing: what a replay after a restart needs
+# ---------------------------------------------------------------------------
+
+
+class TestRouteForAndRestore:
+    def test_the_thread_pair_is_what_gets_journaled(self, frontend):
+        """`_session_key` is a one-way hash of (channel, thread_ts), so the chat id
+        alone cannot address the thread again after a restart."""
+        chat_id = _session_key("C1", "111.222")
+        frontend._remember_session(chat_id, "C1", "111.222")
+
+        assert frontend.route_for(chat_id) == {
+            "channel": "C1",
+            "thread_ts": "111.222",
+        }
+
+    def test_the_message_that_asked_is_journaled_too(self, frontend):
+        """The thread is where the reply goes; this is where the reactions go.
+        Without it a resumed turn runs with no hourglass and no eyes, and the
+        person cannot tell it came back."""
+        chat_id = _session_key("C1", "111.222")
+        frontend._remember_session(chat_id, "C1", "111.222")
+        frontend._pending_msg.setdefault(chat_id, deque()).append(("C1", "333.444"))
+
+        assert frontend.route_for(chat_id)["message_ts"] == "333.444"
+
+    def test_the_newest_pending_message_is_the_one_journaled(self, frontend):
+        """`route_for` runs during enqueue, after the frontend appended this
+        turn's message, so the last entry is this turn's."""
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+        pending = frontend._pending_msg.setdefault(chat_id, deque())
+        pending.append(("C1", "1.0"))
+        pending.append(("C1", "2.0"))
+
+        assert frontend.route_for(chat_id)["message_ts"] == "2.0"
+
+    def test_restoring_makes_the_reaction_lifecycle_work_again(self, frontend):
+        """`notify_start` pops from `_pending_msg` to swap hourglass for eyes. This
+        is what makes a silent resume visible in the one place it should be."""
+        chat_id = _session_key("C1", "111.222")
+
+        frontend.restore_route(
+            chat_id,
+            {"channel": "C1", "thread_ts": "111.222", "message_ts": "333.444"},
+        )
+
+        assert list(frontend._pending_msg[chat_id]) == [("C1", "333.444")]
+
+    def test_replayed_messages_queue_in_the_order_they_are_restored(self, frontend):
+        """notify_start pops from the left, so oldest first has to stay oldest."""
+        chat_id = 4242
+        for ts in ("1.0", "2.0"):
+            frontend.restore_route(chat_id, {"channel": "C1", "message_ts": ts})
+
+        assert [ts for _channel, ts in frontend._pending_msg[chat_id]] == ["1.0", "2.0"]
+
+    def test_a_route_without_a_message_restores_the_thread_alone(self, frontend):
+        """A turn journaled before this field existed, or one with no message
+        behind it (a slash command). The reply still has to reach the thread."""
+        chat_id = 4242
+
+        frontend.restore_route(chat_id, {"channel": "C1", "thread_ts": "1.0"})
+
+        assert frontend._sessions[chat_id] == ("C1", "1.0")
+        assert chat_id not in frontend._pending_msg
+
+    def test_a_channel_level_session_journals_a_null_thread(self, frontend):
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+
+        assert frontend.route_for(chat_id) == {"channel": "C1", "thread_ts": None}
+
+    def test_an_unknown_session_journals_nothing(self, frontend):
+        assert frontend.route_for(_session_key("C-nope", None)) == {}
+
+    def test_a_session_with_no_pending_message_journals_only_the_thread(self, frontend):
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+
+        assert "message_ts" not in frontend.route_for(chat_id)
+
+    def test_restoring_makes_the_thread_reachable_again(self, frontend):
+        """The same move the suggestion-tap path makes: `_sessions` is empty after
+        a restart, so a replayed turn would run and have nowhere to post."""
+        chat_id = _session_key("C1", "111.222")
+
+        frontend.restore_route(chat_id, {"channel": "C1", "thread_ts": "111.222"})
+
+        assert frontend._sessions[chat_id] == ("C1", "111.222")
+
+    def test_a_journaled_route_round_trips(self, frontend):
+        chat_id = _session_key("C7", "9.9")
+        frontend._remember_session(chat_id, "C7", "9.9")
+        route = frontend.route_for(chat_id)
+        frontend._sessions.clear()  # what a restart leaves behind
+
+        frontend.restore_route(chat_id, route)
+
+        assert frontend._sessions[chat_id] == ("C7", "9.9")
+
+    @pytest.mark.parametrize("route", [{}, {"channel": ""}, {"channel": 42}])
+    def test_a_route_without_a_channel_is_refused_not_half_registered(
+        self, frontend, route, caplog
+    ):
+        """A half-session is worse than none: `send` would fail on it later,
+        somewhere far from here."""
+        chat_id = 12345
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            frontend.restore_route(chat_id, route)
+
+        assert chat_id not in frontend._sessions
+        assert "cannot restore" in caplog.text
+
+    def test_a_junk_thread_ts_degrades_to_the_channel_root(self, frontend):
+        chat_id = 999
+        frontend.restore_route(chat_id, {"channel": "C1", "thread_ts": 12.5})
+
+        assert frontend._sessions[chat_id] == ("C1", None)
+
+
+class TestResumedReactions:
+    async def test_a_leftover_eyes_reaction_is_not_a_warning(self, frontend, caplog):
+        """A force-killed daemon leaves its :eyes: on the message, so the resume
+        legitimately tries to add them again. Warning about that would make the
+        recovery path noisy about working correctly."""
+        frontend._app.client.reactions_add = AsyncMock(
+            side_effect=Exception("already_reacted")
+        )
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._react("C1", "1.0", "eyes")
+
+        assert caplog.text == ""
+
+    async def test_a_real_reaction_failure_is_still_a_warning(self, frontend, caplog):
+        frontend._app.client.reactions_add = AsyncMock(
+            side_effect=Exception("channel_not_found")
+        )
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._react("C1", "1.0", "eyes")
+
+        assert "failed to add" in caplog.text
+
+
+class TestInterruptedIsAReactionNotAMessage:
+    """A stop costs nobody an answer now, so prose about it is the daemon
+    narrating its own lifecycle -- once per stop, and `r` is two stops."""
+
+    async def test_the_running_message_is_marked_as_interrupted(self, frontend):
+        chat_id = 4242
+        frontend._in_flight[chat_id] = ("C1", "1.0")
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend.send = AsyncMock()
+
+        await frontend.notify_interrupted(chat_id, running=True, queued=0)
+
+        frontend.send.assert_not_awaited()
+        assert (
+            frontend._app.client.reactions_remove.await_args.kwargs["name"]
+            == slack_mod.RUNNING_EMOJI
+        )
+        assert (
+            frontend._app.client.reactions_add.await_args.kwargs["name"]
+            == slack_mod.INTERRUPTED_EMOJI
+        )
+
+    async def test_interrupted_does_not_reuse_the_queue_mark(self, frontend):
+        """Two states sharing a glyph is how a restart becomes indistinguishable
+        from a message waiting its turn."""
+        assert slack_mod.INTERRUPTED_EMOJI != slack_mod.QUEUED_EMOJI
+
+    async def test_queued_messages_are_marked_too(self, frontend):
+        chat_id = 4242
+        frontend._in_flight[chat_id] = ("C1", "1.0")
+        frontend._pending_msg[chat_id] = deque([("C1", "2.0"), ("C1", "3.0")])
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+
+        await frontend.notify_interrupted(chat_id, running=True, queued=2)
+
+        marked = [
+            call.kwargs["timestamp"]
+            for call in frontend._app.client.reactions_add.await_args_list
+        ]
+        assert marked == ["1.0", "2.0", "3.0"]
+
+    async def test_a_turn_with_no_message_behind_it_falls_back_to_words(self, frontend):
+        """A slash command or a picker run has nothing to react to."""
+        frontend.send = AsyncMock()
+
+        await frontend.notify_interrupted(4242, running=True, queued=0)
+
+        body = frontend.send.await_args.args[1].body
+        assert "Restarting" in body
+
+    async def test_the_interrupted_mark_becomes_eyes_when_the_turn_resumes(
+        self, frontend
+    ):
+        """The pair of them is the whole signal: interrupted goes back to waiting,
+        and the resume moves it to running with no message either way."""
+        chat_id = 4242
+        frontend._in_flight[chat_id] = ("C1", "1.0")
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._set_status = AsyncMock()
+
+        await frontend.notify_interrupted(chat_id, running=True, queued=0)
+        # What the journal replays through: the route comes back, then the turn.
+        frontend.restore_route(chat_id, {"channel": "C1", "message_ts": "1.0"})
+        await frontend.notify_start(chat_id)
+
+        removed = [
+            call.kwargs["name"]
+            for call in frontend._app.client.reactions_remove.await_args_list
+        ]
+        added = [
+            call.kwargs["name"]
+            for call in frontend._app.client.reactions_add.await_args_list
+        ]
+        # The resume clears both waiting marks: a turn can have been queued behind
+        # other work, interrupted by a restart, or both.
+        assert removed == [
+            slack_mod.RUNNING_EMOJI,
+            slack_mod.QUEUED_EMOJI,
+            slack_mod.INTERRUPTED_EMOJI,
+        ]
+        assert added == [slack_mod.INTERRUPTED_EMOJI, slack_mod.RUNNING_EMOJI]

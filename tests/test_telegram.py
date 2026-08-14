@@ -1947,3 +1947,42 @@ class TestDownloadCleanup:
 def test_telegram_does_not_implement_send_progress():
     """Interim progress is Slack-only; Telegram behaves exactly as before."""
     assert TelegramFrontend.send_progress is Frontend.send_progress
+
+
+# ---------------------------------------------------------------------------
+# Pending-turn routing
+# ---------------------------------------------------------------------------
+
+
+class TestRouteForAndRestore:
+    def test_a_chat_with_no_pinned_session_journals_nothing(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        """A Telegram chat id is the address, so nothing has to be carried to
+        reach the conversation again."""
+        assert frontend.route_for(1) == {}
+
+    def test_a_pinned_new_token_is_journaled(self, frontend: TelegramFrontend) -> None:
+        """It decides the workspace folder, and `_load_sessions` only runs once
+        `start` does -- which is after pending turns are replayed."""
+        frontend._session_tokens[1] = "20260606-123412"
+
+        assert frontend.route_for(1) == {"session_token": "20260606-123412"}
+
+    def test_restoring_puts_the_token_back_before_the_replay(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend.restore_route(1, {"session_token": "20260606-123412"})
+
+        assert frontend._session_tokens[1] == "20260606-123412"
+        # The workspace the replayed turn will use matches the one it was in.
+        assert frontend.workspace_name(1) == "telegram/1-20260606-123412"
+
+    @pytest.mark.parametrize("route", [{}, {"session_token": ""}, {"session_token": 7}])
+    def test_a_route_without_a_usable_token_leaves_the_base_session(
+        self, frontend: TelegramFrontend, route
+    ) -> None:
+        frontend.restore_route(1, route)
+
+        assert 1 not in frontend._session_tokens
+        assert frontend.workspace_name(1) == "telegram/1"

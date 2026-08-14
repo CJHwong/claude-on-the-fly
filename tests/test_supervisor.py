@@ -876,3 +876,155 @@ class TestSweepingDetachedAgentGroups:
         with caplog.at_level("ERROR"):
             supervisor._sweep_agent_groups("slack")
         assert "could not sweep detached agent groups for slack" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# pending_work — what a stop is about to interrupt
+# ---------------------------------------------------------------------------
+
+
+def _write_extra(state_dir: Path, frontend: str, extra: dict) -> None:
+    _write_heartbeat(state_dir, frontend, os.getpid())
+    path = state_dir / f"{frontend}.json"
+    payload = json.loads(path.read_text())
+    payload["extra"] = extra
+    path.write_text(json.dumps(payload))
+
+
+class TestPendingWork:
+    def test_a_stopped_daemon_has_nothing_pending(self, isolated_state):
+        assert supervisor.pending_work("slack") is None
+
+    def test_an_idle_chat_daemon_has_nothing_pending(self, isolated_state):
+        _write_extra(isolated_state / "state", "slack", {"running_jobs": []})
+
+        assert supervisor.pending_work("slack") is None
+
+    def test_a_chat_daemons_turns_are_reported_as_unrecoverable(self, isolated_state):
+        """Nothing replays a chat turn, so this is the number that has to reach
+        the operator before they agree to a stop."""
+        _write_extra(
+            isolated_state / "state",
+            "slack",
+            {"running_jobs": [{"identifier": "slack/1"}], "queued_turns": 2},
+        )
+
+        pending = supervisor.pending_work("slack")
+
+        assert pending is not None
+        assert (pending.running, pending.queued) == (1, 2)
+        assert pending.recoverable is False
+        assert pending.at_risk == 3
+        assert "lost, needs resending" in pending.describe()
+
+    def test_a_heartbeat_without_extras_reads_as_idle(self, isolated_state):
+        """An older daemon publishes no queued count. Absent is zero, not a crash."""
+        _write_heartbeat(isolated_state / "state", "slack", os.getpid())
+
+        assert supervisor.pending_work("slack") is None
+
+    def test_an_unparseable_heartbeat_reads_as_idle(self, isolated_state):
+        """The pid still resolves from the PID file, so the daemon is alive and
+        only its extras are unreadable. Degrade the report, not the stop."""
+        state = isolated_state / "state"
+        (state / "slack.pid").write_text(str(os.getpid()))
+        (state / "slack.json").write_text("{not json")
+
+        assert supervisor.pending_work("slack") is None
+
+    def test_a_non_mapping_extra_reads_as_idle(self, isolated_state):
+        state = isolated_state / "state"
+        _write_extra(state, "slack", {})
+        payload = json.loads((state / "slack.json").read_text())
+        payload["extra"] = "nope"
+        (state / "slack.json").write_text(json.dumps(payload))
+
+        assert supervisor.pending_work("slack") is None
+
+    def test_a_junk_queued_count_reads_as_zero(self, isolated_state):
+        _write_extra(
+            isolated_state / "state",
+            "slack",
+            {"running_jobs": [{"identifier": "slack/1"}], "queued_turns": "many"},
+        )
+
+        pending = supervisor.pending_work("slack")
+
+        assert pending is not None
+        assert (pending.running, pending.queued) == (1, 0)
+
+    def test_crons_running_commands_are_reported_as_recoverable(self, isolated_state):
+        """A cancelled command re-fires on its own schedule, so this postpones
+        work rather than losing it."""
+        _write_extra(
+            isolated_state / "state", "cron", {"running_commands": ["daily-digest"]}
+        )
+
+        pending = supervisor.pending_work("cron")
+
+        assert pending is not None
+        assert (pending.running, pending.at_risk) == (1, 0)
+        assert "resumes after the restart" in pending.describe()
+
+    def test_the_job_queues_depth_comes_from_the_maildir(
+        self, isolated_state, monkeypatch
+    ):
+        from claude_on_the_fly.jobs.file_queue import QueueDepth
+
+        _write_extra(isolated_state / "state", "jobs", {})
+        monkeypatch.setattr(
+            "claude_on_the_fly.tui.state.jobs_queue_depth",
+            lambda: QueueDepth(new=4, running=1, done=0, failed=0),
+        )
+
+        pending = supervisor.pending_work("jobs")
+
+        assert pending is not None
+        assert (pending.running, pending.queued) == (1, 4)
+        assert pending.recoverable is True
+
+    def test_an_empty_job_queue_has_nothing_pending(self, isolated_state, monkeypatch):
+        from claude_on_the_fly.jobs.file_queue import QueueDepth
+
+        _write_extra(isolated_state / "state", "jobs", {})
+        monkeypatch.setattr(
+            "claude_on_the_fly.tui.state.jobs_queue_depth",
+            lambda: QueueDepth(new=0, running=0, done=9, failed=1),
+        )
+
+        assert supervisor.pending_work("jobs") is None
+
+    def test_an_unreadable_queue_says_so_instead_of_reporting_zero(
+        self, isolated_state, monkeypatch
+    ):
+        """A broker-backed queue lives where this cannot look, and "nothing
+        pending" is exactly the lie the report exists to prevent."""
+        _write_extra(isolated_state / "state", "jobs", {})
+        monkeypatch.setattr(
+            "claude_on_the_fly.tui.state.jobs_queue_depth", lambda: None
+        )
+
+        pending = supervisor.pending_work("jobs")
+
+        assert pending is not None
+        assert pending.known is False
+        assert "unknown" in pending.describe()
+
+    def test_all_pending_work_covers_every_running_daemon(self, isolated_state):
+        state = isolated_state / "state"
+        _write_extra(state, "slack", {"running_jobs": [{"identifier": "slack/1"}]})
+        _write_extra(state, "cron", {"running_commands": ["nightly"]})
+
+        names = [item.frontend for item in supervisor.all_pending_work()]
+
+        assert names == ["slack", "cron"]
+
+
+class TestStopGrace:
+    def test_the_default_grace_leaves_room_for_the_notices(self):
+        """The notices are posted inside the grace window: a 5s stop (what
+        --force still uses) would SIGKILL the daemon mid-sentence."""
+        from claude_on_the_fly import orchestrator
+
+        assert supervisor.SAFE_GRACE_S > orchestrator.SHUTDOWN_NOTICE_BUDGET_S
+        assert supervisor.FORCE_GRACE_S < supervisor.SAFE_GRACE_S

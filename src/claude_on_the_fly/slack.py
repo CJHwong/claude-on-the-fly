@@ -395,6 +395,18 @@ DEFAULT_SESSION_CAP = 1000
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
+
+# One reaction per state of a message, and three distinct states. Named rather
+# than written inline at six call sites, because the failure mode is two states
+# sharing a glyph: an interrupted turn wearing the queue's hourglass cannot be
+# told from one that is merely waiting its turn.
+#
+# `arrows_counterclockwise` for interrupted, because the cause is a restart and
+# the recovery is automatic, which is exactly what it says.
+QUEUED_EMOJI = "hourglass_flowing_sand"
+RUNNING_EMOJI = "eyes"
+INTERRUPTED_EMOJI = "arrows_counterclockwise"
+
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
@@ -1102,6 +1114,59 @@ class SlackFrontend(Frontend):
         self._sessions[session_id] = (channel, thread_ts)
         self._sessions.move_to_end(session_id)
         self._evict_stale_sessions()
+
+    def route_for(self, chat_id: int) -> dict:
+        """What a pending turn has to be journaled with to be picked back up.
+
+        Two things, and they are different. The thread (`channel`, `thread_ts`) is
+        where the *reply* goes: `_session_key` is a one-way hash of that pair, so
+        the chat id alone cannot address it again. `message_ts` is the message that
+        *asked*, which is where the reactions go -- without it a resumed turn runs
+        with no hourglass and no eyes, and the person cannot tell it came back.
+
+        Empty when the session is unknown, which makes the turn unroutable and is
+        why `restore_route` treats it as such.
+        """
+        entry = self._sessions.get(chat_id)
+        if entry is None:
+            return {}
+        channel, thread_ts = entry
+        route: dict = {"channel": channel, "thread_ts": thread_ts}
+        pending = self._pending_msg.get(chat_id)
+        if pending:
+            # The newest entry is this turn's: the frontend appends it before
+            # dispatching, so `route_for` runs after that append.
+            route["message_ts"] = pending[-1][1]
+        return route
+
+    def restore_route(self, chat_id: int, route: dict) -> None:
+        """Re-register a journaled turn so a replay behaves like a fresh message.
+
+        The same move `_handle_suggestion_tap` makes for a button pressed after a
+        restart: these tables are in memory and empty now, so what they held has
+        to come back from whatever carried it. A route without a channel is dropped
+        rather than registered as a half-session that `send` would fail on.
+
+        Restoring `_pending_msg` is what makes the resume visible in the only place
+        it should be. `notify_start` pops from it to swap the hourglass for eyes,
+        and `notify_complete` clears them when the reply lands, so a resumed turn
+        gets the same reaction lifecycle as any other and needs no announcement.
+        """
+        channel = route.get("channel")
+        if not isinstance(channel, str) or not channel:
+            logger.warning(
+                "slack: pending turn for chat_id=%s has no channel, cannot restore",
+                chat_id,
+            )
+            return
+        thread_ts = route.get("thread_ts")
+        self._remember_session(
+            chat_id, channel, thread_ts if isinstance(thread_ts, str) else None
+        )
+        message_ts = route.get("message_ts")
+        if isinstance(message_ts, str) and message_ts:
+            # Appended in replay order, because notify_start pops from the left.
+            self._pending_msg.setdefault(chat_id, deque()).append((channel, message_ts))
 
     def _forget_session(self, session_id: int) -> None:
         """Drop every per-session dict entry for one thread. All of this state
@@ -2467,7 +2532,37 @@ class SlackFrontend(Frontend):
             logger.debug("notify_queued: no pending msg for chat_id=%s", chat_id)
             return
         channel, ts = pending[-1]
-        await self._react(channel, ts, "hourglass_flowing_sand")
+        await self._react(channel, ts, QUEUED_EMOJI)
+
+    async def notify_interrupted(
+        self, chat_id: int, *, running: bool, queued: int
+    ) -> None:
+        """Mark the affected messages as interrupted, and say nothing.
+
+        A stop no longer costs anybody an answer: every pending turn is journaled
+        and resumes on the next start. So prose here would be the daemon narrating
+        its own lifecycle, and it would do it once per stop -- twice if you press
+        `r`, which is a stop and a start.
+
+        The reaction says it in the vocabulary this thread already speaks, with its
+        own glyph: `QUEUED_EMOJI` already means "waiting behind other work", so
+        reusing it here would make a restart indistinguishable from a queue. The
+        resume clears this one and moves the message to `RUNNING_EMOJI` by itself.
+
+        A turn with no message behind it (a slash command, the picker) has nothing
+        to react to, and falls back to the base class's line.
+        """
+        targets: list[tuple[str, str]] = []
+        in_flight = self._in_flight.get(chat_id)
+        if in_flight is not None:
+            targets.append(in_flight)
+        targets.extend(self._pending_msg.get(chat_id) or ())
+        if not targets:
+            await super().notify_interrupted(chat_id, running=running, queued=queued)
+            return
+        for channel, ts in targets:
+            await self._unreact(channel, ts, RUNNING_EMOJI)
+            await self._react(channel, ts, INTERRUPTED_EMOJI)
 
     async def notify_start(self, chat_id: int) -> None:
         """Start the live status, then (for message-driven turns) flip the
@@ -2493,8 +2588,11 @@ class SlackFrontend(Frontend):
         suppress_reply = suppressed_queue.popleft() if suppressed_queue else False
         if suppressed_queue is not None and not suppressed_queue:
             self._pending_reply_suppressed.pop(chat_id, None)
-        await self._unreact(channel, ts, "hourglass_flowing_sand")
-        await self._react(channel, ts, "eyes")
+        # Both waiting marks, because a turn reaching here may have been queued
+        # behind other work, interrupted by a restart, or both in either order.
+        await self._unreact(channel, ts, QUEUED_EMOJI)
+        await self._unreact(channel, ts, INTERRUPTED_EMOJI)
+        await self._react(channel, ts, RUNNING_EMOJI)
         self._in_flight[chat_id] = (channel, ts)
         self._in_flight_reply_suppressed[chat_id] = suppress_reply
 
@@ -2509,7 +2607,7 @@ class SlackFrontend(Frontend):
             logger.debug("notify_complete: no in-flight msg for chat_id=%s", chat_id)
             return
         channel, ts = in_flight
-        await self._unreact(channel, ts, "eyes")
+        await self._unreact(channel, ts, RUNNING_EMOJI)
 
     # --- Helpers ---
 
@@ -2519,6 +2617,12 @@ class SlackFrontend(Frontend):
                 channel=channel, timestamp=timestamp, name=emoji
             )
         except Exception as exc:
+            # `already_reacted` is the normal case for a resumed turn: the eyes a
+            # force-killed daemon left behind are still on the message. Logged at
+            # debug so the recovery path is not noisy about working correctly.
+            if "already_reacted" in str(exc):
+                logger.debug("react: :%s: already on %s", emoji, timestamp)
+                return
             logger.warning("react: failed to add :%s: to %s: %s", emoji, timestamp, exc)
 
     async def _unreact(self, channel: str, timestamp: str, emoji: str) -> None:

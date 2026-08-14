@@ -399,3 +399,14 @@ logs:
 
   # LOG_LEVEL stays an environment variable: logging is configured before this file
   # can be parsed, so a complaint about the file needs somewhere to go.
+
+upgrade:
+  # The command `claude-tui upgrade` (and the dashboard's [U]) runs to fetch new
+  # code, after it has drained the daemons and before it brings them back. Run
+  # through a shell, from the checkout root when there is one.
+  #
+  # Leave it out and the command is derived from how this copy was installed: a
+  # git checkout gets `git pull --ff-only && uv sync`, a `uv tool install` gets
+  # `uv tool upgrade <tool>`. Set it when neither applies, or when your
+  # deployment updates some other way (a container image, a pinned tag).
+  # command: git fetch --tags && git checkout v1.4.0 && uv sync

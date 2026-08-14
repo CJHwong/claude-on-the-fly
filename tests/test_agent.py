@@ -4011,3 +4011,38 @@ class TestAttachmentHandoffRefusesWhatItCannotVouchFor:
         with pytest.raises(ValueError, match="exceeds 4 bytes"):
             agent_mod.install_download(source, tmp_path / "dest")
         assert source.exists()
+
+
+class TestStripSenderMarkers:
+    """The markers are prompt grammar for the model. Quoting a message back to
+    the person who wrote it has to show what they typed."""
+
+    def test_a_marked_message_comes_back_as_the_person_typed_it(self):
+        marked = f"{agent_mod.sender_marker('U0EXAMPLE1', 'sender')} Wait ten seconds."
+
+        assert agent_mod.strip_sender_markers(marked) == "Wait ten seconds."
+
+    def test_several_markers_are_all_removed(self):
+        """A multi-sender ingest prepends one per segment."""
+        marked = (
+            f"{agent_mod.sender_marker('U1', 'a')} first\n"
+            f"{agent_mod.sender_marker('U2', 'b')} second"
+        )
+
+        assert agent_mod.strip_sender_markers(marked) == "first\nsecond"
+
+    def test_a_display_name_containing_a_bracket_does_not_truncate_the_message(self):
+        """The display half is json.dumps output, so only the closing quote ends
+        it. A naive match on `]` would cut the message short here."""
+        marked = f"{agent_mod.sender_marker('U1', 'sen]der')} the real message"
+
+        assert agent_mod.strip_sender_markers(marked) == "the real message"
+
+    def test_text_that_looks_like_a_marker_but_is_not_survives(self):
+        """Somebody typing brackets must not lose their words."""
+        typed = "[from-id: not a real marker] still my text"
+
+        assert agent_mod.strip_sender_markers(typed) == typed
+
+    def test_an_unmarked_message_is_returned_unchanged(self):
+        assert agent_mod.strip_sender_markers("plain text") == "plain text"

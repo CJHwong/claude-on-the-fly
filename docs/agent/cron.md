@@ -101,3 +101,15 @@ unseen — then fires each named entry through `_fire`, so a run-now respects
 the same gates as a scheduled fire (outstanding-job skip, `max_concurrent`,
 key backoff). An unknown entry is logged and ignored; a `.draining` leftover
 from a crashed drain is processed by the next one.
+
+## Shutdown
+
+`stop()` sets the stop flag and cancels every task in `_command_tasks`. Nothing is
+lost that a notice could recover: an enqueued job is already durable, and a cancelled
+command fires again on its own schedule. So the daemon names the entries it cut, at
+WARNING, rather than telling anybody. Command tasks are named after their entry
+(`_spawn_command`) purely so that log line and `heartbeat_extra`'s `running_commands`
+can identify them; the task object carries no other route back to the entry.
+
+`heartbeat_extra` publishes `running_commands` for one reader:
+`supervisor.pending_work`, which says what a stop will cancel *before* it signals.

@@ -10,6 +10,47 @@ from claude_on_the_fly.agent import Response
 from claude_on_the_fly.approvals import ApprovalRequest
 
 
+def interrupted_notice(*, running: bool, queued: int) -> str:
+    """The text a chat gets when a daemon stop interrupts its unfinished work.
+
+    A module function so every frontend and the tests word it identically, and
+    so a frontend that overrides `notify_interrupted` for a richer format can
+    still reuse the sentence.
+
+    The fallback, not the normal path. A frontend that can show state without
+    talking should do that instead (Slack puts the message back to an hourglass),
+    because a stop costs nobody an answer now and prose about it is the daemon
+    narrating its own lifecycle.
+
+    So it is written as a person would say it in passing, not as a status report:
+    short, no restatement of what the reader can see, and no instruction, since
+    there is nothing for them to do.
+    """
+    total = queued + (1 if running else 0)
+    if total > 1:
+        return "Restarting. I'll get back to these in a moment."
+    return "Restarting. I'll get back to this in a moment."
+
+
+def nudge_notice(text: str) -> str:
+    """The text offering back a turn the daemon has stopped retrying.
+
+    Only reached when a replay is the wrong answer: a turn that has already been
+    replayed to its limit, most likely because running it is what keeps taking
+    the daemon down. Everything else resumes on its own.
+
+    The prompt is quoted with its sender markers stripped: they are prompt
+    grammar for the model, and quoting them back at the person who typed the
+    message shows them scaffolding they never wrote.
+    """
+    from claude_on_the_fly.agent import strip_sender_markers
+
+    return (
+        "I keep failing on this one, so I have stopped retrying it:\n\n"
+        f"{strip_sender_markers(text)}\n\nSend it again if you want me to try once more."
+    )
+
+
 class Frontend(ABC):
     """Interface for messaging platforms (Telegram, Slack, etc.)."""
 
@@ -37,6 +78,69 @@ class Frontend(ABC):
         emoji reactions) should override.
         """
         await self.send(chat_id, Response(body=f"Queued ({position} pending)."))
+
+    async def notify_interrupted(
+        self, chat_id: int, *, running: bool, queued: int
+    ) -> None:
+        """Tell a chat that a daemon stop interrupted its unfinished work.
+
+        Called once per affected chat while the daemon shuts down, before the
+        in-flight turn is cancelled. `running` says a turn was mid-answer;
+        `queued` counts the turns waiting behind it. Both are journaled
+        (`turns.py`) and both come back on the next start, so this explains the
+        pause rather than asking for anything.
+
+        Default sends a text response. A frontend with a cheaper signal may
+        override, but it must still say something: without it the sender watches
+        a turn go quiet with no idea why.
+        """
+        await self.send(
+            chat_id, Response(body=interrupted_notice(running=running, queued=queued))
+        )
+
+    def route_for(self, chat_id: int) -> dict:
+        """Routing context to journal with a pending turn, for after a restart.
+
+        A chat id is not always enough to reach the conversation again. Slack's
+        is `sha256(channel:thread_ts)`, one way, so a reply has nowhere to go
+        unless the pair travels with the turn. Telegram's chat id *is* the
+        address, hence the empty default.
+
+        Whatever is returned must be JSON-serializable and must not contain a
+        credential: it lands in a file on disk. Nothing but the frontend that
+        produced it ever reads it.
+        """
+        return {}
+
+    def restore_route(self, chat_id: int, route: dict) -> None:
+        """Re-register a route read back from the journal, before a replay.
+
+        The frontend's own session tables are in memory and empty after a
+        restart, so a replayed turn would otherwise run and then have nowhere to
+        post. Slack already does exactly this when a suggestion button is tapped
+        after a restart; this is the same move from the journal instead of a tap.
+        """
+
+    async def notify_resumed(self, chat_id: int, count: int) -> None:
+        """Signal that pending turns are being picked back up. No-op by default.
+
+        Deliberately silent. A resumed turn is announced by the same thing that
+        announces a fresh one -- the reaction it gets while it runs and the reply
+        it posts when it finishes -- so a message here would be the daemon
+        talking about itself instead of doing the work. A frontend with no such
+        affordance at all may override this to say something.
+        """
+
+    async def notify_nudge(self, chat_id: int, text: str) -> None:
+        """Offer back a turn the daemon has stopped retrying.
+
+        Rare by design: everything else resumes silently, and this is reached
+        only for a turn that hit the replay limit. Default posts the prompt as
+        text for the person to resend. A frontend with a tappable affordance
+        should override and offer it as one, since a button carries the text back
+        verbatim with no copy and paste.
+        """
+        await self.send(chat_id, Response(body=nudge_notice(text)))
 
     async def notify_start(self, chat_id: int) -> None:
         """Signal that processing has started for the next pending message.

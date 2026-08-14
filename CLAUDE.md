@@ -28,6 +28,8 @@ src/claude_on_the_fly/
   settings.py          # config.yaml (all settings, re-read on save); .env is secrets only
   envfile.py           # Reads DATA_DIR/.env the way a spawned daemon receives it (file wins)
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
+  turns.py             # Durable record of unanswered chat turns (restart recovery)
+  upgrade.py           # Resolves how this install updates, and runs it
   protocol.py          # Frontend protocol (add new interfaces here)
   cron.py              # Cron producer daemon — runs shell, enqueues Jobs
   slack.py             # telegram.py
@@ -41,6 +43,10 @@ src/claude_on_the_fly/
 
 Work reaches an agent one of two ways: a chat frontend through `orchestrator.py`,
 or `cron.py` -> the job queue -> `jobs/`. Nothing else calls `agent.run`.
+
+Both paths survive a stop. Chat turns are journaled to `state/<platform>.turns.json`
+before they run (`turns.py`) and resumed or offered back on the next start; jobs
+recover through the maildir. See `docs/agent/frontend.md` for the recovery contract.
 
 ## Verification
 

@@ -697,12 +697,40 @@ class CronDaemon:
                     state.next_fire = next_fire(state.entry.cron, now)
                     await self._fire(state.entry)
 
+    def _running_command_names(self) -> list[str]:
+        """Entry names of the commands running right now."""
+        return sorted(task.get_name() for task in self._command_tasks)
+
+    def heartbeat_extra(self) -> dict:
+        """The commands running right now, by entry name.
+
+        Published so the supervisor can say what a stop will cancel *before* it
+        signals. Nothing else can see it: a command task lives in this process.
+        """
+        return {"running_commands": self._running_command_names()}
+
     async def stop(self) -> None:
+        """Stop polling and cancel any command still running.
+
+        Nothing is lost that a notice could recover: a queued job is already
+        durable, and a cancelled command re-fires on its own schedule. So this
+        names the entries it cut in the daemon log instead. The entry's own log
+        gets its `*** cancelled during shutdown ***` marker from
+        `_run_side_effect`; without this, the daemon log showed a clean exit and
+        the operator had to open every entry to find out which run died.
+        """
         self._stop.set()
-        for task in list(self._command_tasks):
+        pending = list(self._command_tasks)
+        if pending:
+            logger.warning(
+                "cron: shutdown cancelled %d running command(s): %s",
+                len(pending),
+                ", ".join(self._running_command_names()),
+            )
+        for task in pending:
             task.cancel()
-        if self._command_tasks:
-            await asyncio.gather(*self._command_tasks, return_exceptions=True)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _sleep_to_next_minute(self) -> None:
         """Wait until the next minute boundary, waking early for a run-now
@@ -904,7 +932,9 @@ class CronDaemon:
     # --- side-effect commands ---
 
     def _spawn_command(self, entry: CronEntry) -> None:
-        task = asyncio.create_task(self._run_side_effect(entry))
+        # Named so `stop` can say which entry it cancelled; the task object
+        # itself carries no other route back to the entry.
+        task = asyncio.create_task(self._run_side_effect(entry), name=entry.name)
         self._command_tasks.add(task)
         task.add_done_callback(self._command_tasks.discard)
 
@@ -1046,7 +1076,7 @@ def main() -> int:
                 loop.add_signal_handler(
                     sig, lambda: asyncio.ensure_future(daemon.stop())
                 )
-        heartbeat = HeartbeatWriter("cron")
+        heartbeat = HeartbeatWriter("cron", extra_provider=daemon.heartbeat_extra)
         beat = asyncio.create_task(heartbeat.run())
         try:
             await daemon.run()

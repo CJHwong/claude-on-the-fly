@@ -103,6 +103,24 @@ class TelegramFrontend(Frontend):
             raise TypeError(f"Expected Orchestrator, got {type(orchestrator)}")
         self._orchestrator = orchestrator
 
+    def route_for(self, chat_id: int) -> dict:
+        """What a pending turn needs journaled beyond its chat id.
+
+        A Telegram chat id is the address, so nothing is needed to reach the
+        conversation. The pinned `/new` token is another matter: it decides the
+        workspace folder, and `_load_sessions` only runs once `start` does, which
+        is after pending turns are replayed. Without it here, a replayed turn
+        would resume the journaled session in the base session's workspace.
+        """
+        token = self._session_tokens.get(chat_id)
+        return {"session_token": token} if token else {}
+
+    def restore_route(self, chat_id: int, route: dict) -> None:
+        """Put a journaled `/new` token back before its turn is replayed."""
+        token = route.get("session_token")
+        if isinstance(token, str) and token:
+            self._session_tokens[chat_id] = token
+
     def workspace_name(self, chat_id: int) -> str:
         token = self._session_tokens.get(chat_id)
         # User-controlled usernames and first names are display data, never

@@ -41,7 +41,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ENV_FILE = DATA_DIR / ".env"
 LOG_DIR = DATA_DIR / "logs"
-DEFAULT_GRACE_S = 5.0
+FORCE_GRACE_S = 5.0
+# The grace a stop gives when it wants the daemon's interruption notices to
+# land. A chat frontend spends up to `orchestrator.SHUTDOWN_NOTICE_BUDGET_S`
+# posting them and the job worker the same again for its own, so 5s (which
+# predates the notices and is what --force still uses) would SIGKILL the daemon
+# mid-sentence.
+SAFE_GRACE_S = 20.0
 DEFAULT_SPAWN_TIMEOUT_S = 20.0
 KILL_POLL_INTERVAL_S = 0.1
 HEARTBEAT_POLL_INTERVAL_S = 0.1
@@ -273,6 +279,116 @@ def _tail_file(path: Path, n_lines: int = 25) -> str:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class PendingWork:
+    """What stopping one daemon costs, as an outside reader can see it.
+
+    `recoverable` is the whole point of showing this: a job re-runs and a cron
+    command re-fires, but a chat turn is gone and the only recovery is the
+    person sending it again. An operator deciding whether to upgrade now needs
+    those two told apart, not a single total.
+    """
+
+    frontend: str
+    running: int
+    queued: int
+    recoverable: bool
+    # False when the counts could not be read at all — a broker-backed job queue
+    # this process cannot see. Reported rather than dropped: "I cannot tell" is
+    # what the operator must weigh, and zeros would read as "nothing to lose".
+    known: bool = True
+
+    @property
+    def at_risk(self) -> int:
+        """Units of work a stop destroys for good. Recoverable work is zero."""
+        return 0 if self.recoverable else self.running + self.queued
+
+    def describe(self) -> str:
+        if not self.known:
+            return f"{self.frontend}: pending work unknown (queue not readable here)"
+        parts = []
+        if self.running:
+            parts.append(f"{self.running} running")
+        if self.queued:
+            parts.append(f"{self.queued} queued")
+        fate = (
+            "resumes after the restart" if self.recoverable else "lost, needs resending"
+        )
+        return f"{self.frontend}: {', '.join(parts)} ({fate})"
+
+
+def _heartbeat_extra(frontend: str) -> dict:
+    """The daemon's self-reported extras, or {} if unreadable.
+
+    Queued chat turns exist only in the daemon's memory, so the heartbeat is the
+    one place anything outside the process can learn about them.
+    """
+    path = _heartbeat_file(frontend)
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    extra = payload.get("extra")
+    return extra if isinstance(extra, dict) else {}
+
+
+def _count_list(extra: dict, key: str) -> int:
+    value = extra.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
+def pending_work(frontend: str) -> PendingWork | None:
+    """What `frontend` would lose or postpone if stopped now. None if nothing.
+
+    Reads the heartbeat and the job maildir — never the daemon — so it answers
+    before a signal is sent and answers for a daemon the caller does not own.
+    """
+    if not is_running(frontend):
+        return None
+    extra = _heartbeat_extra(frontend)
+    if frontend in checks.CHAT_FRONTENDS:
+        running = _count_list(extra, "running_jobs")
+        queued = extra.get("queued_turns")
+        return _pending_or_none(
+            frontend,
+            running,
+            queued if isinstance(queued, int) else 0,
+            recoverable=False,
+        )
+    if frontend == "cron":
+        # A cancelled command re-fires on its own schedule, and a job it already
+        # enqueued is durable. So cron is only ever postponed, never lost.
+        return _pending_or_none(
+            frontend, _count_list(extra, "running_commands"), 0, recoverable=True
+        )
+    # Imported per call, not bound at module level: `state` owns the queue-kind
+    # check, and a module-level binding here would freeze whichever function
+    # existed at import time — including past a test's or an operator tool's
+    # redirection of it.
+    from claude_on_the_fly.tui.state import jobs_queue_depth
+
+    depth = jobs_queue_depth()
+    if depth is None:
+        # A broker-backed queue lives where this cannot look. Saying "nothing
+        # pending" would be the lie the caller is stopping to avoid.
+        return PendingWork(frontend, running=0, queued=0, recoverable=True, known=False)
+    return _pending_or_none(frontend, depth.running, depth.new, recoverable=True)
+
+
+def _pending_or_none(
+    frontend: str, running: int, queued: int, *, recoverable: bool
+) -> PendingWork | None:
+    if not running and not queued:
+        return None
+    return PendingWork(frontend, running, queued, recoverable)
+
+
+def all_pending_work() -> list[PendingWork]:
+    """Pending work across every running daemon, in supervisable order."""
+    found = (pending_work(name) for name in checks.SUPERVISABLE_FRONTENDS)
+    return [item for item in found if item is not None]
+
+
 def is_running(frontend: str) -> bool:
     pid = _resolve_pid(frontend)
     return pid is not None and _process_exists(pid)
@@ -374,7 +490,7 @@ def spawn(
     return proc.pid
 
 
-def stop(frontend: str, *, grace_s: float = DEFAULT_GRACE_S) -> int:
+def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
     """Signal a daemon to exit. SIGTERM, wait up to grace_s, then SIGKILL.
 
     Returns the pid that was signalled. Cleans up the PID file on success.
@@ -419,7 +535,7 @@ def restart(
     *,
     env_file: Path | None = DEFAULT_ENV_FILE,
     env: Mapping[str, str] | None = None,
-    grace_s: float = DEFAULT_GRACE_S,
+    grace_s: float = SAFE_GRACE_S,
     popen_factory=subprocess.Popen,
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
@@ -472,7 +588,7 @@ def read_last_running() -> list[str]:
     ]
 
 
-def stop_all(*, grace_s: float = DEFAULT_GRACE_S) -> list[tuple[str, int]]:
+def stop_all(*, grace_s: float = SAFE_GRACE_S) -> list[tuple[str, int]]:
     """Stop every currently-running daemon. Returns (frontend, pid) per stop.
 
     Sequential (one at a time) so a single misbehaving daemon does not block

@@ -117,6 +117,24 @@ def sender_marker(sender_id: object, display_name: object = "") -> str:
     return f"[from-id: {identity}] [display: {display}]"
 
 
+# One rendered `sender_marker`, for stripping it back out. The display half is
+# always `json.dumps` output, so it is a quoted string with escaped quotes and
+# nothing else can end it -- which is what makes this safe to match non-greedily.
+_SENDER_MARKER_RE = re.compile(
+    r'\[from-id: [A-Za-z0-9_.:@-]*\] \[display: "(?:[^"\\]|\\.)*"\]\s*'
+)
+
+
+def strip_sender_markers(text: str) -> str:
+    """`text` without the sender markers, for showing it to a person.
+
+    The markers are prompt grammar for the model. Quoting a message back to the
+    human who wrote it (a resume nudge) has to show what they typed, not the
+    scaffolding wrapped around it.
+    """
+    return _SENDER_MARKER_RE.sub("", text).strip()
+
+
 def collect_outbox(workspace: Path) -> list[Path]:
     """Files the agent left in workspace/outbox to attach to the reply.
 

@@ -285,18 +285,28 @@ def _queue_kind() -> str:
     return kind
 
 
-def _jobs_queue_view() -> JobsQueueView | None:
-    """Observe the background-job maildir, or None when there is nothing to
-    observe.
+def jobs_queue_depth() -> QueueDepth | None:
+    """The job maildir's stage counts, or None when it cannot be read.
 
     The kind check mirrors `jobs/registry.make_queue`: only the `file` adapter
     keeps its state in a directory we can read. Any other kind (a broker) lives
     somewhere this reader cannot see, and reporting zeros for it would be a
-    lie — so the caller gets None and renders "queue unavailable".
+    lie — so the caller gets None and says the queue is unavailable.
+
+    Public because the supervisor asks the same question before it stops a
+    daemon, and one kind check is what keeps the two answers from diverging.
     """
     if _queue_kind() != "file":
         return None
-    depth = read_queue_depth(DEFAULT_JOBS_DIR)
+    return read_queue_depth(DEFAULT_JOBS_DIR)
+
+
+def _jobs_queue_view() -> JobsQueueView | None:
+    """Observe the background-job maildir, or None when there is nothing to
+    observe."""
+    depth = jobs_queue_depth()
+    if depth is None:
+        return None
     rows = read_queue_rows(DEFAULT_JOBS_DIR, DEFAULT_ROW_LIMIT)
     # Only a full page can have been truncated. Subtracting from depth alone
     # would report the job that finished between the two reads as hidden.

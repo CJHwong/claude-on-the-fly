@@ -164,3 +164,14 @@ A timeout carried by a cron job overrides the worker default for that job.
 |---|---|---|---|
 | `keep_days` | integer / `30` | Retention; `0` disables pruning, invalid uses default | Next prune/startup |
 | `host_tag` | string / short hostname | Host component in log filenames | Startup and daily rollover |
+
+## `upgrade`
+
+| Key | Type / default | Effect | Lifecycle |
+|---|---|---|---|
+| `command` | string / derived from the install | Shell command `claude-tui upgrade` runs to fetch new code | Immediate |
+
+Leave `command` unset and the command follows how the copy was installed: a git checkout
+runs `git pull --ff-only && uv sync` from the repository root, and a `uv tool install`
+runs `uv tool upgrade <tool>`. Any other shape refuses to guess and asks for this key.
+See [Upgrade safely](../how-to/upgrade-safely.md).

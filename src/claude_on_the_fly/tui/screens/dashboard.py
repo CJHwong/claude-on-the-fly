@@ -38,7 +38,7 @@ import shlex
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from rich.text import Text
 from textual import events
@@ -56,7 +56,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from claude_on_the_fly import checks, logs
+from claude_on_the_fly import checks, logs, upgrade
 from claude_on_the_fly.agent import (
     DATA_DIR,
     get_backend,
@@ -73,6 +73,10 @@ from claude_on_the_fly.tui import (
 from claude_on_the_fly.tui.screens.config_picker import ConfigPickerScreen
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
 from claude_on_the_fly.tui.screens.help import HelpScreen
+from claude_on_the_fly.tui.screens.upgrade import UpgradeScreen
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
+    from claude_on_the_fly.tui.tui_app import ClaudeTuiApp
 
 LOG_DIR = DATA_DIR / "logs"
 CRON_CONFIG = DATA_DIR / "cron.yaml"
@@ -198,6 +202,7 @@ class DashboardScreen(Screen):
         Binding("c", "copy_log", "Copy tail", show=False),
         Binding("R", "refresh_now", "Refresh", show=False),
         Binding("K", "stop_all", "Stop all", show=False),
+        Binding("U", "upgrade", "Upgrade", show=False),
         Binding("1", "show_tab('tab-chat')", "chat tab", show=False),
         Binding("2", "show_tab('tab-cron')", "cron tab", show=False),
         Binding("3", "show_tab('tab-jobs')", "jobs tab", show=False),
@@ -696,6 +701,68 @@ class DashboardScreen(Screen):
         finally:
             self._clear_busy()
             self._refresh()
+
+    async def action_upgrade(self) -> None:
+        """Confirm, then stop every daemon, fetch new code, and come back on it."""
+        if self._busy_msg:
+            return
+        try:
+            plan = upgrade.resolve()
+        except upgrade.UnknownInstall as exc:
+            self._notify(str(exc), "error")
+            return
+        pending = supervisor.all_pending_work()
+        self.app.push_screen(
+            UpgradeScreen(plan, pending),
+            lambda confirmed: self._on_upgrade_confirmed(plan, confirmed),
+        )
+
+    def _on_upgrade_confirmed(self, plan: upgrade.Plan, confirmed: bool | None) -> None:
+        if confirmed:
+            self.run_worker(self._upgrade(plan), exclusive=True)
+
+    async def _upgrade(self, plan: upgrade.Plan) -> None:
+        """Stop everything, run the command, start everything, hand over.
+
+        The daemons come back whether or not the command succeeded — the failure
+        case is old code running again, not a machine with nothing on it. Only a
+        success relaunches the TUI, because only then is there new code to show.
+        """
+        self._set_busy("upgrading")
+        try:
+            stopped = await asyncio.to_thread(supervisor.stop_all)
+            self._notify(f"stopped {len(stopped)} daemon(s), upgrading", "information")
+            code, output = await asyncio.to_thread(upgrade.run_captured, plan)
+            log_path = self._write_upgrade_log(plan, output)
+            results = await asyncio.to_thread(supervisor.resume)
+            for name, _, exc in results:
+                if exc is not None:
+                    self._notify(f"{name}: {exc}", "error")
+        finally:
+            self._clear_busy()
+            self._refresh()
+        if code != 0:
+            self._notify(f"upgrade failed (exit {code}), see {log_path}", "error")
+            return
+        self._notify(f"upgraded, see {log_path} — relaunching", "information")
+        cast("ClaudeTuiApp", self.app).relaunch_on_exit = True
+        self.app.exit()
+
+    def _write_upgrade_log(self, plan: upgrade.Plan, output: str) -> Path:
+        """Park the command's output where the operator can read it.
+
+        Captured rather than streamed, because git and uv writing to this
+        terminal would land on top of the dashboard. Same `<role>-<host>-<date>`
+        naming as every other log here, so retention prunes it like the rest.
+        """
+        path = logs.log_file("upgrade", directory=LOG_DIR)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"=== {plan.command} ({plan.source}) ===\n{output}\n")
+        except OSError as exc:
+            self._notify(f"could not write {path}: {exc}", "warning")
+        return path
 
     async def action_run_now(self) -> None:
         """Fire the highlighted cron entry now, via the daemon's trigger file.

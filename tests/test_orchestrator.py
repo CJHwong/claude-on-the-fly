@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,10 +13,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+import claude_on_the_fly.agent as agent_mod
 from claude_on_the_fly import interim as interim_mod
 from claude_on_the_fly import orchestrator as orchestrator_mod
 from claude_on_the_fly import permissions as permissions_mod
 from claude_on_the_fly import settings
+from claude_on_the_fly import turns as turns_mod
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import (
@@ -25,7 +28,8 @@ from claude_on_the_fly.orchestrator import (
     _extract_suggestions,
     _parse_suggestion_block,
 )
-from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.protocol import Frontend, interrupted_notice
+from claude_on_the_fly.turns import PendingTurn
 
 # ---------------------------------------------------------------------------
 # Fake frontend
@@ -79,6 +83,17 @@ class StubFrontend(Frontend):
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def journal_in_tmp(tmp_path, monkeypatch):
+    """Keep every test's pending-turn journal to itself.
+
+    The suite shares one redirected home for the whole session, so without this
+    each Orchestrator writes its journal to the same file and a turn recorded by
+    one test is resumed by the next.
+    """
+    monkeypatch.setattr(orchestrator_mod, "DATA_DIR", tmp_path)
 
 
 @pytest.fixture
@@ -684,6 +699,11 @@ class TestRun:
         assert mock_loop.add_signal_handler.call_count == 2
 
 
+async def _hang(fut: asyncio.Future) -> None:
+    """A turn that never finishes on its own, so a stop has something to cancel."""
+    await fut
+
+
 class TestShutdown:
     async def test_cancels_all_running_tasks(self, orch: Orchestrator) -> None:
         blocker1 = asyncio.get_event_loop().create_future()
@@ -701,6 +721,120 @@ class TestShutdown:
 
         assert task1.cancelled()
         assert task2.cancelled()
+
+    async def test_a_chat_mid_answer_is_told_before_its_turn_is_cancelled(
+        self, orch: Orchestrator, frontend: StubFrontend
+    ) -> None:
+        """The failure this exists for: the daemon dies, the turn is cancelled,
+        and the person who asked gets silence forever."""
+        blocker = asyncio.get_event_loop().create_future()
+        orch._running[5] = asyncio.create_task(_hang(blocker))
+
+        await orch.shutdown()
+
+        assert [chat_id for chat_id, _ in frontend.sent] == [5]
+        assert "Restarting" in frontend.sent[0][1].body
+
+    async def test_queued_turns_are_counted_in_the_notice(
+        self, orch: Orchestrator, frontend: StubFrontend
+    ) -> None:
+        blocker = asyncio.get_event_loop().create_future()
+        orch._running[5] = asyncio.create_task(_hang(blocker))
+        orch._queues[5] = asyncio.Queue()
+        orch._queues[5].put_nowait(Turn("second"))
+        orch._queues[5].put_nowait(Turn("third"))
+
+        await orch.shutdown()
+
+        # Three in total (one running, two queued), so the plural form.
+        assert "back to these" in frontend.sent[0][1].body
+
+    async def test_a_chat_with_only_queued_turns_is_told_too(
+        self, orch: Orchestrator, frontend: StubFrontend
+    ) -> None:
+        """A drain task can finish between the queue filling and the stop."""
+        orch._queues[8] = asyncio.Queue()
+        orch._queues[8].put_nowait(Turn("waiting"))
+
+        await orch.shutdown()
+
+        assert "back to this" in frontend.sent[0][1].body
+
+    async def test_an_idle_daemon_says_nothing(
+        self, orch: Orchestrator, frontend: StubFrontend
+    ) -> None:
+        """A restart that costs nobody an answer must not wake anybody up."""
+        orch._queues[8] = asyncio.Queue()
+
+        await orch.shutdown()
+
+        assert frontend.sent == []
+
+    async def test_one_chat_failing_does_not_cost_the_others_their_notice(
+        self, orch: Orchestrator, frontend: StubFrontend
+    ) -> None:
+        blocker = asyncio.get_event_loop().create_future()
+        orch._running[1] = asyncio.create_task(_hang(blocker))
+        orch._running[2] = asyncio.create_task(_hang(blocker))
+
+        async def fail_for_chat_one(chat_id: int, **_kw) -> None:
+            if chat_id == 1:
+                raise RuntimeError("channel_not_found")
+            frontend.sent.append((chat_id, Response(body="notice")))
+
+        frontend.notify_interrupted = fail_for_chat_one  # type: ignore[method-assign]
+
+        await orch.shutdown()
+
+        assert [chat_id for chat_id, _ in frontend.sent] == [2]
+        assert orch._running[1].cancelled()
+
+    async def test_a_frontend_that_hangs_cannot_hold_the_shutdown_open(
+        self, orch: Orchestrator, frontend: StubFrontend, monkeypatch, caplog
+    ) -> None:
+        """The supervisor SIGKILLs after its grace, so an unreachable API must
+        cost the exit a bounded wait rather than the whole window."""
+        blocker = asyncio.get_event_loop().create_future()
+        task = asyncio.create_task(_hang(blocker))
+        orch._running[1] = task
+        monkeypatch.setattr(orchestrator_mod, "SHUTDOWN_NOTICE_BUDGET_S", 0.01)
+
+        async def never_returns(*_a, **_kw) -> None:
+            await asyncio.Event().wait()
+
+        frontend.notify_interrupted = never_returns  # type: ignore[method-assign]
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.orchestrator"):
+            await orch.shutdown()
+
+        assert "unfinished" in caplog.text
+        assert task.cancelled()
+
+    async def test_the_heartbeat_publishes_the_queued_depth(
+        self, orch: Orchestrator
+    ) -> None:
+        """Queued turns live in this process's memory, so the supervisor can only
+        warn about them if the heartbeat carries the count."""
+        orch._queues[1] = asyncio.Queue()
+        orch._queues[1].put_nowait(Turn("a"))
+        orch._queues[2] = asyncio.Queue()
+        orch._queues[2].put_nowait(Turn("b"))
+
+        assert orch.heartbeat_extra()["queued_turns"] == 2
+
+    async def test_interrupted_chats_reports_running_and_queued_per_chat(
+        self, orch: Orchestrator
+    ) -> None:
+        done: asyncio.Future = asyncio.get_event_loop().create_future()
+        done.set_result(None)
+        finished = asyncio.ensure_future(_hang(done))
+        await finished
+        orch._running[3] = finished
+        orch._queues[4] = asyncio.Queue()
+        orch._queues[4].put_nowait(Turn("a"))
+
+        # A finished drain task is not interrupted work; an unstarted queue is.
+        assert orch.interrupted_chats() == {4: (False, 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +965,7 @@ class TestEventEmission:
             gate.set()
             await task
 
-        assert orch.heartbeat_extra() == {"running_jobs": []}
+        assert orch.heartbeat_extra() == {"running_jobs": [], "queued_turns": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -1116,7 +1250,7 @@ class TestAbort:
             mock_agent.run = slow_run
             await orch.on_message(1, "go")
             await asyncio.wait_for(started.wait(), timeout=2)
-            orch._queues[1].put_nowait("queued-behind")
+            orch._queues[1].put_nowait(Turn("queued-behind"))
             assert orch.is_busy(1)
 
             stopped = await orch.abort(1)
@@ -1751,6 +1885,61 @@ class TestRunTeardown:
         command_broker.stop.assert_awaited_once()
         credential_broker.stop.assert_awaited_once()
 
+    async def test_the_interruption_notices_go_out_before_the_frontend_stops(
+        self, monkeypatch
+    ) -> None:
+        """The notice posts through the frontend's own client. Cancelling its
+        listener first can tear that client down, so the notice has to be sent
+        while the frontend is still fully up."""
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(None, None, None)),
+        )
+        order: list[str] = []
+
+        stub = MagicMock()
+        stub.describe = lambda: {}
+        stub.set_orchestrator = MagicMock()
+
+        async def _stop() -> None:
+            order.append("frontend.stop")
+
+        async def _notify(_chat_id, **_kw) -> None:
+            order.append("notice")
+
+        async def never_returns(_on_message):
+            await asyncio.sleep(3600)
+
+        stub.stop = _stop
+        stub.notify_interrupted = _notify
+        stub.start = never_returns
+
+        captured: list[Orchestrator] = []
+        real_orchestrator = orchestrator_mod.Orchestrator
+
+        def _capture(*args, **kwargs):
+            orch = real_orchestrator(*args, **kwargs)
+            orch._queues[1] = asyncio.Queue()
+            orch._queues[1].put_nowait(Turn("waiting"))
+            captured.append(orch)
+            return orch
+
+        monkeypatch.setattr(orchestrator_mod, "Orchestrator", _capture)
+        original_wait = asyncio.Event.wait
+
+        async def stop_immediately(self):
+            self.set()
+            return await original_wait(self)
+
+        monkeypatch.setattr(asyncio.Event, "wait", stop_immediately)
+        await orchestrator_mod.run(stub, "test")
+
+        assert order == ["notice", "frontend.stop"]
+        # shutdown() asks again; the person is not told twice.
+        await captured[0].shutdown()
+        assert order.count("notice") == 1
+
     async def test_shutdown_also_revokes_the_approval_services(
         self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
@@ -1973,6 +2162,66 @@ class TestFrontendApprovalDefault:
         await Frontend.notify_queued(frontend, 1, 3)
         assert frontend.sent[0][0] == 1
         assert "Queued (3 pending)" in frontend.sent[0][1].body
+
+    async def test_the_default_interruption_notice_is_a_plain_message(self) -> None:
+        """The fallback for a frontend with no state to show. Slack overrides it
+        with a reaction instead."""
+        frontend = StubFrontend()
+        await Frontend.notify_interrupted(frontend, 4, running=True, queued=1)
+
+        chat_id, response = frontend.sent[0]
+        assert chat_id == 4
+        assert "Restarting" in response.body
+
+    def test_the_fallback_notice_reads_like_a_person_in_passing(self) -> None:
+        """The fallback, for a turn with no reaction to put a state on. Everything
+        comes back, so it asks for nothing and reports nothing the reader can see."""
+        one = interrupted_notice(running=True, queued=0)
+        several = interrupted_notice(running=False, queued=3)
+
+        assert one == "Restarting. I'll get back to this in a moment."
+        assert several == "Restarting. I'll get back to these in a moment."
+
+    def test_one_pending_turn_is_not_pluralised(self) -> None:
+        assert "back to this" in interrupted_notice(running=False, queued=1)
+
+    async def test_the_default_resume_says_nothing(self) -> None:
+        """Invisible by default: the turn's own reaction and reply are the signal,
+        so a message here would be the daemon narrating itself."""
+        frontend = StubFrontend()
+
+        await Frontend.notify_resumed(frontend, 3, 2)
+
+        assert frontend.sent == []
+
+    async def test_the_default_nudge_carries_the_prompt_back(self) -> None:
+        """Reached only for a turn the daemon stopped retrying, so the person has
+        to be able to send it again themselves."""
+        frontend = StubFrontend()
+        await Frontend.notify_nudge(frontend, 3, "audit the release posts")
+
+        _chat_id, response = frontend.sent[0]
+        assert "audit the release posts" in response.body
+        assert "Send it again" in response.body
+        assert "keep failing" in response.body
+
+    async def test_the_nudge_shows_what_the_person_typed(self) -> None:
+        """Not the prompt scaffolding wrapped around it."""
+        marked = f"{agent_mod.sender_marker('U1', 'hoss')} Wait ten seconds."
+        frontend = StubFrontend()
+
+        await Frontend.notify_nudge(frontend, 3, marked)
+
+        body = frontend.sent[0][1].body
+        assert "Wait ten seconds." in body
+        assert "from-id" not in body
+
+    def test_the_default_route_hooks_are_inert(self) -> None:
+        """A frontend whose chat id is already an address needs neither."""
+        frontend = StubFrontend()
+
+        assert Frontend.route_for(frontend, 1) == {}
+        assert Frontend.restore_route(frontend, 1, {"channel": "C1"}) is None
 
 
 # --- per-session approval services ---
@@ -2337,3 +2586,409 @@ class TestSuggestionsParsing:
         )
         assert body == "answer"
         assert labels == ["x?"]
+
+
+# ---------------------------------------------------------------------------
+# Pending-turn journal: recording, and resuming after a stop
+# ---------------------------------------------------------------------------
+
+
+class RoutingFrontend(StubFrontend):
+    """A frontend whose chat id is not enough to reach the conversation, like
+    Slack's. Records what it was asked to restore."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.routes: dict[int, dict] = {}
+        self.restored: list[tuple[int, dict]] = []
+        self.resumed: list[tuple[int, int]] = []
+        self.nudged: list[tuple[int, str]] = []
+
+    def route_for(self, chat_id: int) -> dict:
+        return self.routes.get(chat_id, {})
+
+    def restore_route(self, chat_id: int, route: dict) -> None:
+        self.restored.append((chat_id, route))
+
+    async def notify_resumed(self, chat_id: int, count: int) -> None:
+        self.resumed.append((chat_id, count))
+
+    async def notify_nudge(self, chat_id: int, text: str) -> None:
+        self.nudged.append((chat_id, text))
+
+
+@pytest.fixture
+def routing_frontend() -> RoutingFrontend:
+    return RoutingFrontend()
+
+
+@pytest.fixture
+def journaled(routing_frontend, event_log):
+    """An orchestrator over a routing frontend. `journal_in_tmp` already points
+    DATA_DIR, and so the journal, at this test's tmp_path."""
+    return Orchestrator(routing_frontend, "test", event_log=event_log)
+
+
+async def _settle(orch: Orchestrator) -> None:
+    """Wait out the drain tasks an enqueue started.
+
+    A test that leaves one pending pays for it in pytest's unraisable-exception
+    sweep, and asserting on the journal before the drain has finished is a race
+    rather than a check.
+    """
+    for _ in range(200):
+        tasks = [task for task in orch._running.values() if not task.done()]
+        if not tasks:
+            return
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class TestJournalingOnTheWayIn:
+    async def test_an_accepted_message_is_recorded_before_it_can_run(
+        self, journaled, routing_frontend
+    ) -> None:
+        """Written when the turn is accepted, not at shutdown. A record made at
+        shutdown covers a clean SIGTERM and nothing else."""
+        routing_frontend.routes[4] = {"channel": "C1", "thread_ts": "1.0"}
+        with patch.object(journaled, "_drain", AsyncMock()):
+            await journaled.on_message(4, "please do it")
+
+        replay, nudge = journaled._journal.take()
+        assert nudge == []
+        assert [(t.chat_id, t.text) for t in replay] == [(4, "please do it")]
+        assert replay[0].route == {"channel": "C1", "thread_ts": "1.0"}
+
+    async def test_the_session_token_rides_along(
+        self, journaled, routing_frontend
+    ) -> None:
+        """Without it a replay resumes a different conversation than the person
+        was in, and a different workspace."""
+        journaled.set_session_token(4, "tok-9")
+        with patch.object(journaled, "_drain", AsyncMock()):
+            await journaled.on_message(4, "hi")
+
+        replay, _ = journaled._journal.take()
+        assert replay[0].session == "tok-9"
+
+    async def test_a_compaction_is_not_journaled(self, journaled) -> None:
+        """Daemon maintenance with no text: replaying it would answer nobody and
+        offering it back would show an empty prompt."""
+        with patch.object(journaled, "_drain", AsyncMock()):
+            await journaled.on_compact(4)
+
+        assert journaled._journal.take() == ([], [])
+
+    async def test_a_finished_turn_leaves_no_record(self, journaled, tmp_path) -> None:
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="done"))
+            await journaled.on_message(4, "hi")
+            await _settle(journaled)
+
+        assert journaled._journal.take() == ([], [])
+
+    async def test_a_failed_turn_leaves_no_record(self, journaled, tmp_path) -> None:
+        """The person saw an error, so nothing is owed. Replaying it would repeat
+        whatever the failure already did."""
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+            await journaled.on_message(4, "hi")
+            await _settle(journaled)
+
+        assert journaled._journal.take() == ([], [])
+
+    async def test_a_cancelled_turn_comes_back_marked_as_already_started(
+        self, journaled, tmp_path
+    ) -> None:
+        """Exactly the case recovery exists for. It resumes, and the phase is what
+        tells the resumed turn that some of the work may already have happened."""
+        gate = asyncio.Event()
+
+        async def hang(*_a, **_kw) -> Response:
+            await gate.wait()
+            return Response(body="never")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=hang)
+            await journaled.on_message(4, "long one")
+            for _ in range(50):
+                if journaled._in_flight:
+                    break
+                await asyncio.sleep(0.01)
+            await journaled.shutdown()
+
+        replay, nudge = journaled._journal.take()
+        assert nudge == []
+        assert [(t.text, t.phase) for t in replay] == [
+            ("long one", turns_mod.DISPATCHED)
+        ]
+
+    async def test_stopping_a_turn_on_purpose_drops_its_record(
+        self, journaled, tmp_path
+    ) -> None:
+        """`$stop` is not pending work. Without this it would come back to haunt
+        the person after a restart."""
+        gate = asyncio.Event()
+
+        async def hang(*_a, **_kw) -> Response:
+            await gate.wait()
+            return Response(body="never")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=hang)
+            await journaled.on_message(4, "long one")
+            for _ in range(50):
+                if journaled._in_flight:
+                    break
+                await asyncio.sleep(0.01)
+            assert await journaled.abort(4) is True
+
+        assert journaled._journal.take() == ([], [])
+
+    async def test_aborting_drops_the_records_of_queued_turns_too(
+        self, journaled, tmp_path
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def hang(*_a, **_kw) -> Response:
+            await gate.wait()
+            return Response(body="never")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=hang)
+            await journaled.on_message(4, "running")
+            for _ in range(50):
+                if journaled._in_flight:
+                    break
+                await asyncio.sleep(0.01)
+            await journaled.on_message(4, "queued behind it")
+            await journaled.abort(4)
+
+        assert journaled._journal.take() == ([], [])
+
+
+class TestResumingPendingTurns:
+    async def test_nothing_pending_does_nothing(self, journaled) -> None:
+        assert await journaled.resume_pending() == (0, 0)
+
+    async def test_a_queued_turn_is_replayed_and_announced(
+        self, journaled, routing_frontend, tmp_path
+    ) -> None:
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4,
+                text="unanswered",
+                route={"channel": "C1"},
+                turn_id="t-1",
+                recorded_at=time.time(),
+            )
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answered"))
+            replayed, nudged = await journaled.resume_pending()
+            await _settle(journaled)
+
+        assert (replayed, nudged) == (1, 0)
+        # The route is restored before the turn runs, or the reply has nowhere to
+        # go and no reaction can land on the message that asked.
+        assert routing_frontend.restored == [(4, {"channel": "C1"})]
+        assert [body.body for _chat, body in routing_frontend.sent] == ["answered"]
+
+    async def test_the_journaled_session_is_restored_before_the_replay(
+        self, journaled, tmp_path
+    ) -> None:
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4,
+                text="x",
+                session="tok-9",
+                turn_id="t-1",
+                recorded_at=time.time(),
+            )
+        )
+        with patch.object(journaled, "_enqueue", AsyncMock()):
+            await journaled.resume_pending()
+
+        assert journaled._session_counters[4] == "tok-9"
+
+    async def test_a_turn_that_had_started_resumes_with_a_warning_to_the_agent(
+        self, journaled, routing_frontend
+    ) -> None:
+        """It comes back, because somebody asked for the work. The note is what
+        keeps it from silently repeating a push or a message it already sent."""
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4,
+                text="half-done work",
+                phase=turns_mod.DISPATCHED,
+                turn_id="t-1",
+                recorded_at=time.time(),
+            )
+        )
+        with patch.object(journaled, "_enqueue", AsyncMock()) as enqueue:
+            replayed, nudged = await journaled.resume_pending()
+
+        assert (replayed, nudged) == (1, 0)
+        assert routing_frontend.nudged == []
+        prompt = enqueue.await_args.args[1].text
+        assert prompt.endswith("half-done work")
+        assert "cotf-resume" in prompt
+        assert "before repeating anything that writes" in prompt
+
+    async def test_a_never_started_turn_resumes_verbatim(self, journaled) -> None:
+        """No note: nothing ran, so there is nothing to be careful about."""
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4, text="just asked", turn_id="t-1", recorded_at=time.time()
+            )
+        )
+        with patch.object(journaled, "_enqueue", AsyncMock()) as enqueue:
+            await journaled.resume_pending()
+
+        assert enqueue.await_args.args[1].text == "just asked"
+
+    async def test_a_resume_says_nothing_in_the_chat(
+        self, journaled, routing_frontend
+    ) -> None:
+        """Invisible on purpose: the turn's own reaction and its reply are what
+        tell the person it came back."""
+        journaled._journal.record(
+            PendingTurn(chat_id=4, text="x", turn_id="t-1", recorded_at=time.time())
+        )
+        with patch.object(journaled, "_enqueue", AsyncMock()):
+            await journaled.resume_pending()
+
+        assert routing_frontend.sent == []
+
+    async def test_a_turn_at_the_replay_limit_is_offered_back(
+        self, journaled, routing_frontend
+    ) -> None:
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4,
+                text="the one that keeps breaking",
+                turn_id="t-1",
+                recorded_at=time.time(),
+                replays=turns_mod.MAX_REPLAYS,
+            )
+        )
+        with patch.object(journaled, "_enqueue", AsyncMock()) as enqueue:
+            replayed, nudged = await journaled.resume_pending()
+
+        assert (replayed, nudged) == (0, 1)
+        enqueue.assert_not_called()
+        assert routing_frontend.nudged == [(4, "the one that keeps breaking")]
+
+    async def test_several_chats_are_resumed_independently(
+        self, journaled, routing_frontend
+    ) -> None:
+        for chat_id, turn_id in ((1, "t-1"), (2, "t-2"), (1, "t-3")):
+            journaled._journal.record(
+                PendingTurn(
+                    chat_id=chat_id,
+                    text=f"msg-{turn_id}",
+                    route={"message_ts": turn_id},
+                    turn_id=turn_id,
+                    recorded_at=time.time(),
+                )
+            )
+        with patch.object(journaled, "_enqueue", AsyncMock()) as enqueue:
+            replayed, _ = await journaled.resume_pending()
+
+        assert replayed == 3
+        assert sorted(routing_frontend.resumed) == [(1, 2), (2, 1)]
+        assert enqueue.await_count == 3
+        # Every entry's route, not just the first per chat: a route carries the
+        # message that asked, and each turn has its own.
+        assert routing_frontend.restored == [
+            (1, {"message_ts": "t-1"}),
+            (1, {"message_ts": "t-3"}),
+            (2, {"message_ts": "t-2"}),
+        ]
+
+    async def test_the_replay_counter_is_carried_forward_so_a_poison_turn_parks(
+        self, journaled, routing_frontend
+    ) -> None:
+        """Re-recording a replayed turn must not reset its count, or a turn that
+        kills the daemon is replayed at every start for ever."""
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4, text="x", turn_id="t-1", recorded_at=time.time(), replays=1
+            )
+        )
+        with patch.object(journaled, "_drain", AsyncMock()):
+            await journaled.resume_pending()
+
+        # Re-recorded at the cap rather than back at zero, so the next start
+        # parks it instead of replaying it a third time.
+        replay, nudge = journaled._journal.take()
+        assert replay == []
+        assert [t.replays for t in nudge] == [turns_mod.MAX_REPLAYS]
+
+    async def test_a_frontend_that_cannot_announce_still_replays(
+        self, journaled, routing_frontend, caplog
+    ) -> None:
+        """The work matters more than the announcement of it."""
+        journaled._journal.record(
+            PendingTurn(chat_id=4, text="x", turn_id="t-1", recorded_at=time.time())
+        )
+
+        async def boom(*_a, **_kw) -> None:
+            raise RuntimeError("channel_not_found")
+
+        routing_frontend.notify_resumed = boom  # type: ignore[method-assign]
+        with (
+            patch.object(journaled, "_enqueue", AsyncMock()) as enqueue,
+            caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"),
+        ):
+            await journaled.resume_pending()
+
+        enqueue.assert_awaited_once()
+        assert "could not tell" in caplog.text
+
+    async def test_a_frontend_that_cannot_nudge_is_logged(
+        self, journaled, routing_frontend, caplog
+    ) -> None:
+        """A parked turn, since that is the only thing nudged now."""
+        journaled._journal.record(
+            PendingTurn(
+                chat_id=4,
+                text="x",
+                turn_id="t-1",
+                recorded_at=time.time(),
+                replays=turns_mod.MAX_REPLAYS,
+            )
+        )
+
+        async def boom(*_a, **_kw) -> None:
+            raise RuntimeError("channel_not_found")
+
+        routing_frontend.notify_nudge = boom  # type: ignore[method-assign]
+        with (
+            # Patched even though nothing should be replayed here: an unpatched
+            # replay spawns a real agent CLI, which is a hang rather than a
+            # failure, and that is a bad way to learn the routing changed.
+            patch.object(journaled, "_enqueue", AsyncMock()),
+            caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"),
+        ):
+            replayed, nudged = await journaled.resume_pending()
+
+        assert (replayed, nudged) == (0, 1)
+        assert "could not offer" in caplog.text

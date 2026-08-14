@@ -371,6 +371,7 @@ class TestDashboardLayout:
             "c",
             "R",
             "K",
+            "U",
             "1",
             "2",
             "3",
@@ -973,3 +974,33 @@ def test_run_app_starts_the_application(monkeypatch):
     )
     tui_app_mod.run_app()
     assert started == ["ran"]
+
+
+def test_run_app_hands_the_terminal_to_the_new_code_after_an_upgrade(monkeypatch):
+    """A process keeps the code it loaded. Without the exec, an operator who
+    upgraded from the dashboard would still be looking at the old build."""
+    from claude_on_the_fly.tui import tui_app as tui_app_mod
+
+    def _run(self) -> None:
+        self.relaunch_on_exit = True
+
+    monkeypatch.setattr(tui_app_mod.ClaudeTuiApp, "run", _run)
+    execs: list[tuple[str, list[str]]] = []
+
+    tui_app_mod.run_app(exec_relaunch=lambda path, argv: execs.append((path, argv)))
+
+    assert len(execs) == 1
+    path, argv = execs[0]
+    assert argv[1:3] == ["-m", "claude_on_the_fly.tui.app"]
+    assert path == argv[0]
+
+
+def test_run_app_does_not_exec_on_an_ordinary_quit(monkeypatch):
+    from claude_on_the_fly.tui import tui_app as tui_app_mod
+
+    monkeypatch.setattr(tui_app_mod.ClaudeTuiApp, "run", lambda self: None)
+    execs: list[tuple] = []
+
+    tui_app_mod.run_app(exec_relaunch=lambda *a: execs.append(a))
+
+    assert execs == []

@@ -6,10 +6,12 @@ default.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from textual.app import App
 
+from claude_on_the_fly import upgrade
 from claude_on_the_fly.events import (
     EVENT_WORKER_DONE,
     EVENT_WORKER_FAILED,
@@ -121,6 +123,12 @@ class ClaudeTuiApp(App):
     # between two 2s polls don't age the baseline out of the window.
     _EVENT_TAIL = 50
 
+    # Set by the upgrade action. A process keeps the code it loaded, so showing
+    # the new version means handing this terminal to a new process — done after
+    # `run()` returns, where Textual has already restored the terminal, rather
+    # than exec'ing out from under a live screen.
+    relaunch_on_exit = False
+
     def on_mount(self) -> None:
         self.push_screen("dashboard")
         # Watch the shared event log app-wide (not per-screen), so a finished
@@ -156,5 +164,9 @@ class ClaudeTuiApp(App):
         self.bell()  # no-op when headless (tests); BEL to the terminal otherwise
 
 
-def run_app() -> None:
-    ClaudeTuiApp().run()
+def run_app(*, exec_relaunch=os.execv) -> None:
+    app = ClaudeTuiApp()
+    app.run()
+    if app.relaunch_on_exit:
+        argv = upgrade.relaunch_argv()
+        exec_relaunch(argv[0], argv)

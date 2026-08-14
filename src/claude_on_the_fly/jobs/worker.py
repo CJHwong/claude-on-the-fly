@@ -5,11 +5,12 @@ the queue and idles between polls. Both depend only on the `JobQueue`,
 `AgentRunner`, and `Notifier` ports — swapping any adapter needs no change here,
 and this module imports nothing but its ports plus `asyncio`/`logging`.
 
-Shutdown cancels the in-flight job: the supervisor SIGKILLs after a
-5s grace, so a multi-minute run must be cancelled — not finished — for
+Shutdown cancels the in-flight job: the supervisor SIGKILLs once its grace
+expires, so a multi-minute run must be cancelled — not finished — for
 `agent._exec`'s `finally` to reap the process tree in time. A cancelled job was
 never completed, so it stays in `cur/` and re-runs on the next start
-(at-least-once; jobs must be safe to re-run).
+(at-least-once; jobs must be safe to re-run). Its origin is told, because
+"re-runs on the next start" is invisible from the thread that asked.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import logging
 
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
+    Job,
     JobQueue,
     Notifier,
     OutcomeRecorder,
@@ -26,6 +28,10 @@ from claude_on_the_fly.jobs.core import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How long an interrupted job's notice may take. Sized under the supervisor's
+# safe grace so the message lands before the SIGKILL that ends the window.
+NOTICE_BUDGET_S = 8.0
 
 
 async def _deliver(
@@ -54,6 +60,29 @@ async def _deliver(
         return False
     queue.mark_delivered(job_id)
     return True
+
+
+async def _notify_interrupted(notifier: Notifier, job: Job) -> None:
+    """Tell a cancelled job's origin that a restart cut its run short.
+
+    Deliberately not a delivery: nothing is marked, because there is no result —
+    the job goes back to `new/` and runs again. Shielded and time-boxed, so the
+    notice survives the cancellation that triggered it without being able to hold
+    the shutdown open past the supervisor's grace.
+    """
+    result = Result(
+        ok=False,
+        text=(
+            "Stopped for a restart before this finished. "
+            "It runs again by itself once I am back."
+        ),
+    )
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(notifier.notify(job.origin, result)), NOTICE_BUDGET_S
+        )
+    except Exception:
+        logger.exception("jobs: could not tell %s's origin it was interrupted", job.id)
 
 
 async def redeliver_pending(queue: JobQueue, notifier: Notifier) -> int:
@@ -87,7 +116,14 @@ async def run_once(
     if job is None:
         return False
     logger.info("jobs: running %s", job.id)
-    result = await runner.run(job)
+    try:
+        result = await runner.run(job)
+    except asyncio.CancelledError:
+        # A stop cancels the run. The job survives in cur/ and re-runs at the
+        # next start, but whoever asked for it sees nothing until then unless we
+        # say so here.
+        await _notify_interrupted(notifier, job)
+        raise
     queue.complete(job, result)
     if recorder is not None:
         # Guarded even though the port forbids raising: this sits between a

@@ -12,7 +12,7 @@ import re
 import signal
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -26,6 +26,7 @@ from claude_on_the_fly import (
     permissions,
     sandbox,
     settings,
+    turns,
 )
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
@@ -47,6 +48,7 @@ from claude_on_the_fly.heartbeat import HeartbeatWriter
 from claude_on_the_fly.interim import InterimProgress, interim_progress_enabled
 from claude_on_the_fly.jobs.orphans import ProcessLedger
 from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.turns import PendingTurn, TurnJournal, new_turn_id
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,51 @@ MAX_SUGGESTIONS = 5
 MAX_SUGGESTION_LENGTH = 75
 
 _SUGGESTIONS_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# How long shutdown may spend telling interrupted chats their work died. Sized
+# under the supervisor's safe grace (`supervisor.SAFE_GRACE_S`) so the notices
+# finish inside the window rather than being cut off by the SIGKILL that ends it.
+SHUTDOWN_NOTICE_BUDGET_S = 8.0
+
+# Prepended to a resumed turn whose agent had already started before the daemon
+# stopped. The turn is replayed rather than handed back, because somebody asked
+# for the work and wants it done; this is what keeps the replay from silently
+# repeating a push, a message, or a file write that already happened. Wrapped like
+# SUGGESTIONS_TEMPLATE so the machine half never reads as the user's own words,
+# and deliberately short on instructions: what "already done" looks like is the
+# agent's judgement, not something this can enumerate.
+RESUME_TEMPLATE = (
+    "<cotf-resume>\n"
+    "System note, not user text. A restart interrupted this turn while you were "
+    "working on it, and you are picking it up again. Some of it may already be "
+    "done. Check the current state before repeating anything that writes, sends, "
+    "or publishes, then carry on and answer normally.\n"
+    "</cotf-resume>"
+)
+
+
+def _session_tag(value: int | str | None) -> str | None:
+    """The session discriminator as journaled text, or None for the base session.
+
+    `_session_counters` holds an int for cron's bumps and a str for a token the
+    frontend pinned. Stringifying both keeps one field on disk; 0 and None both
+    mean "the base session", which needs nothing restored.
+    """
+    if not value:
+        return None
+    return str(value)
+
+
+def _resume_prompt(entry: PendingTurn) -> str:
+    """The text to replay for one pending turn.
+
+    A turn that never reached an agent is replayed verbatim. One that had already
+    started carries the resume note, so it can check what it already did instead
+    of doing it twice.
+    """
+    if entry.phase != turns.DISPATCHED:
+        return entry.text
+    return f"{RESUME_TEMPLATE}\n\n{entry.text}"
 
 
 def _suggestions_enabled() -> bool:
@@ -168,6 +215,11 @@ class Turn:
 
     text: str
     compact: bool = False
+    # The `turns` journal entry this turn was recorded as, so the phase can be
+    # advanced and the record dropped once the reply is posted. Empty for a turn
+    # nothing journaled (a compaction, which is daemon maintenance rather than
+    # somebody's message, and which the auto-compact gate re-queues by itself).
+    journal_id: str = ""
 
 
 class SessionEgress:
@@ -395,6 +447,22 @@ class Orchestrator:
         # Restart-required config fields already reported. Compared as a set rather
         # than a flag so a second edit is reported too, and reverting one clears it.
         self._restarts_reported: tuple[str, ...] = ()
+        # Whether the interruption notices already went out. Shutdown happens in
+        # two steps from two places (see notify_interrupted), and a person told
+        # twice that their turn died would go looking for two lost turns.
+        self._interruptions_sent = False
+
+    @property
+    def _journal(self) -> TurnJournal:
+        """Pending turns, on disk, written before a turn can run. This is what
+        makes a stop recoverable at all: everything above it is in memory.
+
+        Resolved per call rather than held from construction, for the reason
+        `supervisor._last_running_file` gives: DATA_DIR is a module constant, so a
+        path captured in `__init__` cannot see a later redirection of it. Cheap,
+        because a journal is a path and nothing else.
+        """
+        return TurnJournal(DATA_DIR / "state" / f"{self._platform}.turns.json")
 
     def session_uuid(self, chat_id: int) -> str:
         counter = self._session_counters.get(chat_id, 0)
@@ -451,13 +519,19 @@ class Orchestrator:
         if queue is not None:
             while not queue.empty():
                 try:
-                    queue.get_nowait()
+                    dropped = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                # Somebody asked for this to stop, so it is not pending work the
+                # next start should resume. Without this, `$stop` would come back
+                # to haunt them after a restart.
+                self._journal.forget(dropped.journal_id)
         task = self._running.get(chat_id)
         if task is None or task.done():
             return False
         logger.info("abort: chat_id=%s cancelling in-flight turn", chat_id)
+        running = self._in_flight.get(chat_id) or {}
+        self._journal.forget(running.get("journal_id", ""))
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         return True
@@ -478,7 +552,33 @@ class Orchestrator:
         """Queue a compaction for this chat. Runs in FIFO order like any turn."""
         await self._enqueue(chat_id, Turn("", compact=True))
 
-    async def _enqueue(self, chat_id: int, turn: Turn) -> None:
+    def _journal_turn(self, chat_id: int, turn: Turn, *, replays: int = 0) -> Turn:
+        """Record a turn as pending and return it carrying its journal id.
+
+        Before the queue, not after: a record written after the turn could run is
+        a record that does not exist for the crash it was meant to survive.
+
+        A compaction is not journaled. It is daemon maintenance with no text, so
+        replaying it would answer nobody and offering it back would show an empty
+        prompt; the auto-compact gate re-queues one when the next message arrives.
+        """
+        if turn.compact:
+            return turn
+        entry = PendingTurn(
+            chat_id=chat_id,
+            text=turn.text,
+            route=self._frontend.route_for(chat_id),
+            session=_session_tag(self._session_counters.get(chat_id)),
+            compact=turn.compact,
+            turn_id=new_turn_id(),
+            recorded_at=time.time(),
+            replays=replays,
+        )
+        self._journal.record(entry)
+        return replace(turn, journal_id=entry.turn_id)
+
+    async def _enqueue(self, chat_id: int, turn: Turn, *, replays: int = 0) -> None:
+        turn = self._journal_turn(chat_id, turn, replays=replays)
         if chat_id not in self._queues:
             self._queues[chat_id] = asyncio.Queue()
         self._queues[chat_id].put_nowait(turn)
@@ -587,6 +687,12 @@ class Orchestrator:
 
     async def _process(self, chat_id: int, turn: Turn) -> None:
         text = turn.text
+        # Before any of this turn's setup: from here on an agent may start, and a
+        # turn that started is never replayed automatically. Marking early errs
+        # toward offering it back rather than repeating side effects, which is the
+        # safe direction for the few milliseconds of difference.
+        self._journal.mark_dispatched(turn.journal_id)
+        interrupted = False
         await self._report_config_restarts(chat_id)
         workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
@@ -611,6 +717,9 @@ class Orchestrator:
             "identifier": identifier,
             "started_at_monotonic": time.monotonic(),
             "session_uuid": session,
+            # So `abort` can drop the journal entry of the turn it cancels: a
+            # stop somebody asked for is not work to resume later.
+            "journal_id": turn.journal_id,
         }
 
         # Startup notification performs frontend I/O and is therefore a
@@ -765,6 +874,9 @@ class Orchestrator:
             )
         except asyncio.CancelledError:
             logger.info("process: chat_id=%s aborted", chat_id)
+            # Keep the journal entry: this is exactly the case recovery exists
+            # for, and the record is what lets the next start offer it back.
+            interrupted = True
             raise
         except ClaudeUnavailableError as exc:
             logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
@@ -798,6 +910,10 @@ class Orchestrator:
                 error=str(exc),
             )
         finally:
+            if not interrupted:
+                # Answered, or answered with an error the person can see. Either
+                # way nothing is owed, so the record goes.
+                self._journal.forget(turn.journal_id)
             self._in_flight.pop(chat_id, None)
             if typing_task is not None:
                 typing_task.cancel()
@@ -873,9 +989,148 @@ class Orchestrator:
             }
             for chat_id, j in self._in_flight.items()
         ]
-        return {"running_jobs": running_jobs}
+        # Queued turns live only in this process's memory, so the heartbeat is
+        # the one place an outside reader can learn they exist. The supervisor
+        # needs that to say what a stop is about to cost before it signals.
+        return {
+            "running_jobs": running_jobs,
+            "queued_turns": sum(queue.qsize() for queue in self._queues.values()),
+        }
+
+    def interrupted_chats(self) -> dict[int, tuple[bool, int]]:
+        """chat_id -> (a turn is running, how many turns wait behind it).
+
+        What a stop is about to destroy. Chats with neither are left out, so an
+        empty mapping means a stop costs nobody an answer.
+        """
+        chats: dict[int, tuple[bool, int]] = {}
+        for chat_id, task in self._running.items():
+            if not task.done():
+                chats[chat_id] = (True, 0)
+        for chat_id, queue in self._queues.items():
+            queued = queue.qsize()
+            if not queued and chat_id not in chats:
+                continue
+            chats[chat_id] = (chats.get(chat_id, (False, 0))[0], queued)
+        return chats
+
+    async def resume_pending(self) -> tuple[int, int]:
+        """Act on the journal left by the last stop. Returns (replayed, nudged).
+
+        Must run after the sandbox is up, because a replayed turn spawns a jailed
+        agent that needs the broker, the egress proxy and the shims, and before
+        the frontend starts listening, so a live message cannot overtake work that
+        was already waiting.
+
+        The journal is emptied by `take` before anything here runs, so a turn that
+        kills the daemon cannot be replayed at every start.
+        """
+        replay, nudge = self._journal.take()
+        if not replay and not nudge:
+            return 0, 0
+        logger.info("resume: replaying %d, offering back %d", len(replay), len(nudge))
+        for entry in nudge:
+            await self._offer_back(entry)
+        by_chat: dict[int, list[PendingTurn]] = {}
+        for entry in replay:
+            by_chat.setdefault(entry.chat_id, []).append(entry)
+        for chat_id, entries in by_chat.items():
+            await self._replay_chat(chat_id, entries)
+        return len(replay), len(nudge)
+
+    def _restore_chat(self, entry: PendingTurn) -> None:
+        """Put back what a replay or a nudge needs before it can be delivered.
+
+        The route first: the frontend's session tables are empty after a restart,
+        so without it the turn runs and then has nowhere to post, and no reaction
+        can land on the message that asked. Then the session discriminator, or the
+        turn would resume a different conversation than the one the person was in.
+
+        Called once per entry rather than once per chat, because a route carries
+        the *message* that asked as well as the thread it lives in, and each turn
+        has its own.
+        """
+        self._frontend.restore_route(entry.chat_id, entry.route)
+        if entry.session:
+            self._session_counters[entry.chat_id] = entry.session
+
+    async def _offer_back(self, entry: PendingTurn) -> None:
+        """Hand one turn back, for the rare case a replay is the wrong answer."""
+        self._restore_chat(entry)
+        try:
+            await self._frontend.notify_nudge(entry.chat_id, entry.text)
+        except Exception:
+            logger.exception(
+                "resume: could not offer chat_id=%s its interrupted turn",
+                entry.chat_id,
+            )
+
+    async def _replay_chat(self, chat_id: int, entries: list[PendingTurn]) -> None:
+        """Re-queue one chat's pending turns, oldest first.
+
+        Silent by design: no announcement, because the turn's own reaction and its
+        reply are what tell the person it is running, exactly as they would for a
+        message sent a second ago.
+        """
+        try:
+            await self._frontend.notify_resumed(chat_id, len(entries))
+        except Exception:
+            # The work matters more than any announcement of it.
+            logger.exception(
+                "resume: could not tell chat_id=%s it was resumed", chat_id
+            )
+        for entry in entries:
+            self._restore_chat(entry)
+            await self._enqueue(
+                chat_id,
+                Turn(_resume_prompt(entry), compact=entry.compact),
+                replays=entry.replays,
+            )
+
+    async def notify_interrupted(self) -> None:
+        """Tell every chat with unfinished work that this daemon is going down.
+
+        Called while the frontend is still fully connected, and again (as a
+        no-op) from `shutdown`. Both, because the ordering matters in opposite
+        directions: the notices must go out before the frontend's own listener is
+        torn down, and they must not be forgettable by a caller that only knows
+        about `shutdown`. Idempotent, so saying it twice says it once.
+
+        Bounded by a budget: the supervisor SIGKILLs after its grace, and a
+        frontend whose API has gone away must cost the exit a few seconds rather
+        than the whole window.
+        """
+        if self._interruptions_sent:
+            return
+        self._interruptions_sent = True
+        chats = self.interrupted_chats()
+        if not chats:
+            return
+        logger.info("shutdown: notifying %d interrupted chat(s)", len(chats))
+        try:
+            await asyncio.wait_for(
+                self._post_interruptions(chats), SHUTDOWN_NOTICE_BUDGET_S
+            )
+        except TimeoutError:
+            logger.warning(
+                "shutdown: interruption notices unfinished after %.0fs, exiting anyway",
+                SHUTDOWN_NOTICE_BUDGET_S,
+            )
+
+    async def _post_interruptions(self, chats: dict[int, tuple[bool, int]]) -> None:
+        """Post one notice per chat. One frontend failure never costs the rest."""
+        for chat_id, (running, queued) in chats.items():
+            try:
+                await self._frontend.notify_interrupted(
+                    chat_id, running=running, queued=queued
+                )
+            except Exception:
+                logger.exception(
+                    "shutdown: could not notify chat_id=%s of its lost work", chat_id
+                )
 
     async def shutdown(self) -> None:
+        await self.notify_interrupted()
         for task in self._running.values():
             task.cancel()
         await asyncio.gather(*self._running.values(), return_exceptions=True)
@@ -1084,12 +1339,23 @@ async def run(frontend: Frontend, platform: str) -> None:
         heartbeat = HeartbeatWriter(platform, extra_provider=orch.heartbeat_extra)
         heartbeat_task = asyncio.create_task(heartbeat.run())
 
+        # Between the sandbox and the listener, deliberately. A replayed turn
+        # spawns a jailed agent, so it needs the broker, the proxy and the shims
+        # that _start_sandbox built; and queueing it before the frontend accepts
+        # traffic is what stops a live message from overtaking work that was
+        # already waiting when the daemon went down.
+        await orch.resume_pending()
+
         frontend_task = asyncio.create_task(frontend.start(orch.on_message))
         logger.info("Running (%s). Ctrl+C to stop.", platform)
 
         await stop.wait()
 
         logger.info("Shutting down...")
+        # First, while the frontend's own connection is still up: tell everyone
+        # whose work this stop is about to destroy. Cancelling the frontend task
+        # first can tear down the client the notice needs to post through.
+        await orch.notify_interrupted()
         heartbeat_task.cancel()
         frontend_task.cancel()
         await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)

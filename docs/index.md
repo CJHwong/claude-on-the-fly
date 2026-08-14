@@ -16,6 +16,7 @@ empty configuration and ends with a sandboxed agent whose tool calls require app
 - [Allow network access](how-to/manage-egress.md).
 - [Broker a credentialed CLI](how-to/broker-a-command.md).
 - [Configure background workers](how-to/configure-workers.md).
+- [Upgrade safely](how-to/upgrade-safely.md).
 - [Troubleshoot configuration](how-to/troubleshoot-configuration.md).
 
 ## Look something up
