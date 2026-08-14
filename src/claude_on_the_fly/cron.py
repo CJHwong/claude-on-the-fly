@@ -1062,6 +1062,14 @@ def main() -> int:
     except ValueError as exc:
         raise SystemExit(f"config error: {exc}") from exc
 
+    # No `sandbox.verify_boundary()` here, unlike the chat daemon and the job
+    # worker, and the reason is the split at the top of docs/agent/cron.md: this
+    # daemon runs shell and enqueues, and never calls `agent.run`. It crosses no
+    # jail, so the self-test could only report on a boundary this process never
+    # uses -- and being fatal on it would take the producer down for a fault that
+    # cannot reach it, while the worker that *does* cross the jail already
+    # refuses to drain what cron queued. Move this line in the moment cron
+    # spawns an agent itself.
     queue = make_queue()
     daemon = CronDaemon(
         config_path=config,

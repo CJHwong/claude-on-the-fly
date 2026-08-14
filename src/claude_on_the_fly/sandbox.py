@@ -1496,6 +1496,16 @@ ABSENT = "absent"
 READABLE = "READABLE"
 WRITABLE = "WRITABLE"
 BROKEN = "BROKEN"
+# A probe that never ran: the file is on this host, and the jail was never asked
+# whether it hides it. This used to be `None` and was dropped from the results
+# dict on the grounds that it says nothing about the boundary. True, and that is
+# exactly why it cannot be dropped: with every probe dropped the dict is empty,
+# no entry matches BROKEN or READABLE, and the run logs "0/0 probed paths
+# confirmed denied" at INFO and returns success. Each probe has its own 15s
+# ceiling and they run concurrently, so a loaded host at startup is enough to
+# reach that. Carried as its own outcome instead, so it is never counted as
+# proof and never silently absent from the tally.
+UNTESTED = "UNTESTED"
 
 # The file the write probe tries to create inside the jail. Named so a leftover
 # is obviously ours, in the one directory the probe targets.
@@ -1506,9 +1516,9 @@ class SandboxBoundaryError(RuntimeError):
     """The live jail did not enforce one of its credential-read denies."""
 
 
-async def _probe_deny(spec: str, workspace: Path) -> str | None:
-    """Attempt one expected-denied read under the live profile. Outcome, or None
-    if the probe itself never ran and so says nothing either way."""
+async def _probe_deny(spec: str, workspace: Path) -> str:
+    """Attempt one expected-denied read under the live profile. Returns the
+    outcome, UNTESTED if the probe itself never ran."""
     path = os.path.expanduser(spec)
     # Settle absent-versus-denied from OUTSIDE the jail, before probing.
     #
@@ -1537,7 +1547,7 @@ async def _probe_deny(spec: str, workspace: Path) -> str | None:
         _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
     except (OSError, TimeoutError) as exc:
         logger.warning("sandbox: deny probe for %s failed to run: %s", spec, exc)
-        return None
+        return UNTESTED
     message = err.decode("utf-8", "replace").lower()
     if "sandbox-exec:" in message or "bwrap:" in message:
         # The wrapper itself rejected the profile, so this probe says nothing
@@ -1593,7 +1603,7 @@ def _temp_tree_hint(directory: Path) -> str:
     return ""
 
 
-async def _probe_write(directory: Path, workspace: Path) -> str | None:
+async def _probe_write(directory: Path, workspace: Path) -> str:
     """Attempt to create a file in `directory` from inside the jail.
 
     The counterpart to `_probe_deny`, and the reason it exists is `state/`: the
@@ -1624,7 +1634,7 @@ async def _probe_write(directory: Path, workspace: Path) -> str | None:
         _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
     except (OSError, TimeoutError) as exc:
         logger.warning("sandbox: write probe for %s failed to run: %s", directory, exc)
-        return None
+        return UNTESTED
     message = err.decode("utf-8", "replace").lower()
     if "sandbox-exec:" in message or "bwrap:" in message:
         logger.error(
@@ -1891,6 +1901,16 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     path is *not* evidence of anything: this machine simply has no credential
     there, and folding it into "denied" would let a run where every store happens
     to be missing report a boundary it never tested. Only DENIED is proof.
+
+    UNTESTED is fatal and ABSENT is not, and the line between them is what the
+    host told us *outside* the jail. ABSENT means the file is genuinely not on
+    this machine, so there is no credential at that path to leak; combined with
+    `preflight`, which has already proven the jail starts, refuses egress and can
+    write its session store, an all-absent run is a bare host rather than an
+    unverified boundary. UNTESTED means the opposite: the file is there, it is
+    the kind of file this exists to protect, and the one question that mattered
+    went unanswered. `preflight` is already fatal on the same spawn failures, so
+    this being lenient about them was the anomaly, not the fix.
     """
     if mode() != "jail":
         return {}
@@ -1915,15 +1935,16 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
         *(_probe_deny(spec, probe_workspace) for spec in specs),
         _probe_write(STATE_DIR, probe_workspace),
     )
-    results: dict[str, str] = {
-        spec: outcome
-        for spec, outcome in zip((*specs, write_spec), outcomes, strict=True)
-        if outcome is not None
-    }
+    # Every probe lands in the dict. Nothing is filtered out on its way in: a
+    # dropped outcome is how an all-timeout run used to report success.
+    results: dict[str, str] = dict(
+        zip((*specs, write_spec), outcomes, strict=True),
+    )
     broken = [spec for spec, outcome in results.items() if outcome == BROKEN]
     leaked = [
         spec for spec, outcome in results.items() if outcome in (READABLE, WRITABLE)
     ]
+    untested = [spec for spec, outcome in results.items() if outcome == UNTESTED]
     denied = [spec for spec, outcome in results.items() if outcome == DENIED]
     if broken:
         logger.error(
@@ -1937,19 +1958,48 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
             len(leaked),
             leaked,
         )
+    elif untested:
+        logger.error(
+            "sandbox: %d path(s) are present on this host and the jail was never "
+            "asked whether it hides them: %s",
+            len(untested),
+            untested,
+        )
     else:
         logger.info(
             "sandbox: %d/%d probed paths confirmed denied under %s "
-            "(%d absent, untested)",
+            "(%d not present on this host)",
             len(denied),
             len(results),
             _fs_base_profile().name,
             len(results) - len(denied),
         )
-    if broken or leaked:
-        details = ", ".join([*broken, *leaked])
+    if broken or leaked or untested:
+        details = ", ".join([*broken, *leaked, *untested])
         raise SandboxBoundaryError(
             "sandbox boundary self-test failed; refusing to start autonomous "
             f"work ({details})"
         )
     return results
+
+
+async def verify_boundary(workspace: Path | None = None) -> None:
+    """The whole startup self-test, for every daemon that spawns a jailed agent.
+
+    One function because the order is load-bearing and easy to get wrong from a
+    call site: `preflight` proves the jail runs and holds its egress deny, and
+    `verify_denials` proves the credential reads are refused. The first is what
+    makes the second's silence meaningful, since a jail that never started would
+    otherwise report a clean sheet.
+
+    It exists as its own name because for a while `orchestrator._start_sandbox`
+    was the only caller of either, so the chat daemon refused to serve on a jail
+    that could not hold `state/` while the job worker kept draining the queue
+    across the same unverified boundary. Any future daemon that reaches
+    `agent.run` calls this, and calls it before it claims work.
+
+    Inert unless `sandbox.mode` is `jail`: both halves return early otherwise, so
+    an `off` or `env` deployment pays nothing and starts exactly as before.
+    """
+    await preflight()
+    await verify_denials(workspace)

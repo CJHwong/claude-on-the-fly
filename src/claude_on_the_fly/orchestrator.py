@@ -1271,12 +1271,10 @@ async def _start_sandbox(
     # permanently invisible. Probing the denies here is the substitute: it records,
     # per run, that the boundary was actually in force rather than inferring it
     # from an absence of errors.
-    # Order matters: preflight proves the jail runs and its egress deny holds, and
-    # verify_denials proves the credential reads are refused. The first is what
-    # makes the second's silence meaningful, since a jail that never started
-    # would otherwise report a clean sheet.
-    await sandbox.preflight()
-    await sandbox.verify_denials()
+    # Both halves, in the order that makes the second meaningful. The job worker
+    # runs the same gate from its own composition root, so the sequence lives in
+    # sandbox.verify_boundary rather than being repeated per daemon.
+    await sandbox.verify_boundary()
     return broker_instance, SessionEgress(frontend), command_broker
 
 

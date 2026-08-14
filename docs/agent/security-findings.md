@@ -35,6 +35,8 @@ upgrade path, so none of that was covered by it.
 | `sandbox.extra_paths` had no validation, so the remedy `_JAIL_GUIDANCE` tells the agent to relay was also the bypass: an entry of `$HOME` re-opened `~/.ssh` and `~/.aws` | `sandbox._extra_read_paths` | Entries resolving to the home, an ancestor of it, or a credential store in either direction are logged at ERROR and dropped, the rest still granted; a test asserts every `_DENY_PROBES` entry is out of reach |
 | The command-broker path guard missed an attached short option, a second `=`, a traversal attached to a short option, and a relative path through a planted symlink, on a broker that runs outside the jail with the operator's credential | `commands._unsafe_path_argument` | All four verified passing the old guard and refused by the new one; the guard now reads every `=` segment and the short-option tail, and resolves each candidate against the settled cwd |
 | The agent's uv cache was the operator's, and `upgrade.run` installs from it outside any jail with the TUI's full environment | `seatbelt/*.sb`, `sandbox.agent_env` | Write grant moved to `DATA_DIR/uv-cache` and published as `UV_CACHE_DIR`; a live jailed write to `~/.cache/uv` reports "Operation not permitted" under both bases, while `uv venv` and `uv pip install --offline` complete and populate the new cache |
+| The startup self-test ran in one daemon of the two that spawn jailed agents, so a jail that could not hold `state/` stopped Slack loudly while the job worker kept draining the same queue across it | `sandbox.verify_boundary`, `jobs/cli._run` | Both halves now run from the worker's composition root before it claims work, fatal with exit 2; ordering and the before-claim position are asserted in `tests/jobs/test_cli.py` and `tests/test_sandbox.py`. Cron is deliberately not gated: it runs shell and never calls `agent.run` |
+| `verify_denials` could pass having proven nothing: a probe that raised was dropped from the results, so an all-timeout run logged `0/0 probed paths confirmed denied` at INFO and returned success | `sandbox.verify_denials` | A probe that could not run is now `UNTESTED` and fatal, and every probe lands in the results dict. Reverting the `UNTESTED` return makes `test_a_probe_that_cannot_be_spawned_refuses_to_start` and `test_a_probe_that_hangs_is_abandoned_not_awaited_forever` fail. `ABSENT` stays non-fatal: the file is genuinely not on the host, and `preflight` has already proven the jail starts |
 
 ## Open
 
@@ -127,16 +129,6 @@ where an already-compromised turn's file writes become code the operator later r
 purpose.
 
 ### The self-test
-
-**`verify_denials` runs in one daemon out of three.** Only `orchestrator._start_sandbox`
-calls it. `cron.py` and `jobs/*.py` never import `sandbox` at startup, and both spawn
-jailed agents. A jail that cannot hold `state/` stops Slack loudly and lets cron keep
-firing.
-
-**`verify_denials` can pass having proven nothing.** A probe that raises is dropped from
-the results and an absent target is not a denial, so an all-timeout run logs
-`0/0 probed paths confirmed denied` at INFO and returns success. Bounded by `preflight`
-running first and gating the jail-starts claim.
 
 **`_runtime_read_paths` resolves `argv[0]` only.** In pty mode `argv[0]` is `claude-pty`,
 which execs a different binary plus tmux, and the five slots are already full. Under
