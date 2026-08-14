@@ -171,6 +171,23 @@ different stores, and the grant pointing at a directory the CLI never writes.
 `CODEX_HOME` is set on the child by the codex backend rather than published as a session
 override, because the jobs and cron daemons never open a session.
 
+## Operator read grants
+
+`sandbox.extra_paths` is the one value an operator adds that can hand a read back, and
+`_JAIL_GUIDANCE` tells the agent to ask for exactly that whenever a read is blocked. Each
+entry is realpath'd and then refused if it is the home directory, an ancestor of it, or a
+path that reaches a credential store in either direction (`sandbox._CREDENTIAL_STORES`,
+plus DATA_DIR, which COTF_DATA_DIR can point anywhere). `tests/test_sandbox.py` asserts
+every `_DENY_PROBES` entry sits behind one of those rules, so a credential added to the
+probe list cannot be left grantable here.
+
+Entries are refused individually and the rest are still granted, unlike `sandbox.mode`,
+which refuses to start. The two fail in opposite directions: a bad mode value serves
+turns with the full environment, while a dropped read grant costs the agent capability
+and nothing else. Symlinked entries are resolved rather than refused, because /tmp, /var
+and most Homebrew and mise paths are symlinks on macOS, and the resolve happens on every
+spawn, so a link repointed later is re-checked.
+
 ## Linux jail
 
 `sandbox_linux.py` builds bubblewrap argv; `sandbox.py` owns which paths, beside the

@@ -32,6 +32,7 @@ upgrade path, so none of that was covered by it.
 | `_CODEX_HOME` collapsed onto `~/.codex` with `scope_sessions` off, so the write allow nullified the deny above it and `config.toml`, `AGENTS.md`, `hooks.json` became agent-writable | `sandbox._macos_wrap` | Live jailed write into a real `~/.codex`, refused after the fix and succeeding with the one line reverted, under both profiles |
 | An unrecognised `sandbox.mode` resolved to `off`, and both startup gates return early unless the mode is `jail`, so a typo produced the posture the operator was avoiding | `sandbox.mode` | All six mode values probed |
 | The cross-thread read denies and the `state/` write deny sat above allows that could re-open them | `seatbelt/*.sb` | One `extra_paths` entry of `$HOME` re-opened both stores; tests now assert rule position, not just behaviour |
+| `sandbox.extra_paths` had no validation, so the remedy `_JAIL_GUIDANCE` tells the agent to relay was also the bypass: an entry of `$HOME` re-opened `~/.ssh` and `~/.aws` | `sandbox._extra_read_paths` | Entries resolving to the home, an ancestor of it, or a credential store in either direction are logged at ERROR and dropped, the rest still granted; a test asserts every `_DENY_PROBES` entry is out of reach |
 
 ## Open
 
@@ -46,14 +47,6 @@ jailed turn writes the cache; a later operator-initiated upgrade installs from i
 outside the jail. Severity rests on one untested assumption: whether uv re-verifies
 cached artifacts against `uv.lock` hashes on read. If it does, this is low. Closes by
 pointing `UV_CACHE_DIR` elsewhere for the agent.
-
-**`sandbox.extra_paths` has no validation at all.** `sandbox._extra_read_paths` realpaths
-each entry and caps the count, and does nothing else: no containment check, no refusal of
-`/` or `$HOME`, no symlink rejection. `_JAIL_GUIDANCE` also tells the agent to relay
-"the operator adds the path to `sandbox.extra_paths`" whenever a read is blocked, so this
-is a value operators are actively invited to widen. The deny reordering means an entry no
-longer silently re-opens the session stores, but `$HOME` still re-opens `~/.ssh` and
-`~/.aws`.
 
 **`fs: allow-reads` leaves credential stores readable.** Measured on a real home: the
 Firefox profile tree (holding `logins.json` and `key4.db`) and `~/Library/Messages/chat.db`.

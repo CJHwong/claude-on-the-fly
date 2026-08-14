@@ -489,6 +489,93 @@ def _loopback_specs() -> tuple[str, str, str, str]:
     return sandbox_macos._loopback_specs(_loopback_ports())
 
 
+# Credential stores an `sandbox.extra_paths` entry must not reach, in either
+# direction: an entry inside one is a credential grant outright, and an entry
+# that merely contains one re-opens it, because every read grant this list
+# guards is a subpath allow written after the profile's denies.
+#
+# Directory-level stores only, and deliberately not a mirror of the profile's
+# forty-odd read denies. A file-level deny like ~/.netrc or ~/.sentryclirc sits
+# directly under $HOME, so the only entry that could re-open it is $HOME itself
+# or an ancestor, which the home rule already refuses. What this list has to
+# carry is the stores that sit deep enough for a *plausible* entry to reach:
+# ~/.config, ~/Library and ~/.local/share are the ones an operator adds for real
+# reasons. `_DENY_PROBES` is the startup-probed subset of the same idea, and
+# tests/test_sandbox.py asserts every probe is covered here or by the home rule,
+# so the two cannot drift apart in silence.
+_CREDENTIAL_STORES = (
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.azure",
+    "~/.docker",
+    "~/.kube",
+    "~/.op",
+    "~/.fly",
+    "~/.heroku",
+    "~/.vercel",
+    "~/.wrangler",
+    "~/.snowflake",
+    "~/.snowsql",
+    "~/.terraform.d",
+    "~/.config/gh",
+    "~/.config/glab-cli",
+    "~/.config/gcloud",
+    "~/.config/acli",
+    "~/.config/gws",
+    "~/.config/netlify",
+    "~/.config/1Password",
+    "~/.config/containers",
+    "~/.local/share/acli",
+    "~/Library/Keychains",
+    # This daemon's own .env, logs and state, at the default location. The
+    # redirected one is appended at call time from DATA_DIR.
+    "~/.claude-on-the-fly",
+)
+
+
+def _extra_path_stores() -> list[Path]:
+    """The credential stores an entry may not reach, realpath'd for comparison.
+
+    DATA_DIR is appended rather than listed, because COTF_DATA_DIR can point it
+    anywhere and the .env under it is exactly what env curation exists to keep
+    from the agent.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    stores = [Path(store).expanduser() for store in _CREDENTIAL_STORES]
+    stores.append(Path(DATA_DIR))
+    return [Path(os.path.realpath(store)) for store in stores]
+
+
+def _extra_path_refusal(resolved: Path) -> str | None:
+    """Why this resolved `sandbox.extra_paths` entry cannot be granted, or None.
+
+    The entry is checked after realpath rather than refused for being a symlink,
+    because a symlinked entry is the normal case rather than the suspicious one:
+    /tmp, /var and most Homebrew and mise paths are symlinks on macOS, and
+    refusing them would refuse the grants the setting exists to make. Resolving
+    first also removes the way a symlink would otherwise be used against this
+    check, since `~/link-to-home` and `$HOME` resolve to the same string. The
+    resolve happens on every spawn, so a link repointed later is re-checked
+    rather than trusted from the last time.
+    """
+    home = Path(os.path.realpath(Path.home()))
+    # Covers `/` and `/Users` as well as the home itself: every one of them is an
+    # ancestor of the home, and the profile makes the home opaque precisely so
+    # that ~/.ssh and ~/.aws stay unreadable. `_JAIL_GUIDANCE` tells the agent to
+    # ask the operator for an extra_paths entry whenever a read is blocked, so
+    # "just add $HOME" is a suggestion an operator will receive verbatim.
+    if home.is_relative_to(resolved):
+        return f"it is {home} or an ancestor of it"
+    for store in _extra_path_stores():
+        if resolved.is_relative_to(store):
+            return f"it resolves inside {store}, which the profile denies"
+        if store.is_relative_to(resolved):
+            return f"it contains {store}, which the profile denies"
+    return None
+
+
 def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     """Operator read grants for deny-most, from `sandbox.extra_paths`, realpath'd.
 
@@ -496,17 +583,41 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     because SBPL has no arrays, and a mount namespace takes a list of any length.
     Carrying the limit onto a platform that does not have it would be inventing a
     restriction to look consistent.
+
+    A refused entry is dropped and the rest of the list is granted, rather than
+    the whole spawn failing the way `sandbox.mode` does. The two are not the same
+    kind of mistake: a bad mode value fails *open*, serving turns with the full
+    environment, so refusing to start is the only loud outcome. A dropped read
+    grant fails closed. It costs the agent capability -- most likely its own
+    interpreter, and then the run stops with a clear error -- and costs the
+    operator nothing they were not already being protected from. A typo in one of
+    three entries should not take the daemon down with it.
     """
     paths = [p for p in settings.get("COTF_SANDBOX_EXTRA_PATHS").split(":") if p]
-    if cap is not None and len(paths) > cap:
+    granted: list[str] = []
+    for entry in paths:
+        resolved = Path(os.path.realpath(entry))
+        refusal = _extra_path_refusal(resolved)
+        if refusal is not None:
+            logger.error(
+                "sandbox.extra_paths entry %r (resolved to %s) is refused: %s. "
+                "Granting the rest and continuing; name a narrower path in %s.",
+                entry,
+                resolved,
+                refusal,
+                settings.operator_settings(),
+            )
+            continue
+        granted.append(str(resolved))
+    if cap is not None and len(granted) > cap:
         logger.warning(
-            "sandbox.extra_paths has %d entries; granting only the first %d "
-            "(seatbelt has no arrays)",
-            len(paths),
+            "sandbox.extra_paths has %d granted entries; granting only the first "
+            "%d (seatbelt has no arrays)",
+            len(granted),
             cap,
         )
-        paths = paths[:cap]
-    return [os.path.realpath(p) for p in paths]
+        granted = granted[:cap]
+    return granted
 
 
 def _deny_most_in_force() -> bool:

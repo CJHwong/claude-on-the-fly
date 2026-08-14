@@ -285,6 +285,73 @@ def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
     assert f"_EXTRA_2={project}" in out and f"_EXTRA_3={project}" in out
 
 
+# --- operator read grants that would undo the profile ---
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("/", id="root"),
+        pytest.param("~", id="the home itself"),
+        pytest.param("~/..", id="an ancestor of the home"),
+        pytest.param("~/.ssh", id="a credential store"),
+        pytest.param("~/.aws/sso/cache", id="inside a credential store"),
+        pytest.param("~/.config", id="a directory holding several of them"),
+        pytest.param("~/Library", id="the tree holding the keychains"),
+    ],
+)
+def test_extra_paths_refuses_an_entry_that_reopens_a_denied_store(
+    monkeypatch, caplog, entry
+):
+    """Each of these becomes `(allow file-read* (subpath ...))` written after the
+    profile's denies, and SBPL is last-match-wins, so granting one hands back the
+    exact reads deny-most exists to stop. `$HOME` is the one to worry about: it is
+    what `_JAIL_GUIDANCE` invites the agent to ask the operator for whenever a read
+    is blocked, and it re-opens ~/.ssh and ~/.aws in one line."""
+    resolved = os.path.expanduser(entry)
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", f"{resolved}:/opt/grantme")
+    with caplog.at_level("ERROR"):
+        granted = sandbox._extra_read_paths()
+    # The good entry survives: one typo must not cost the operator the grants
+    # that make the agent's own interpreter reachable.
+    assert granted == [os.path.realpath("/opt/grantme")]
+    assert resolved in caplog.text
+
+
+def test_extra_paths_resolves_a_symlink_before_judging_it(
+    monkeypatch, caplog, tmp_path
+):
+    """Refusing symlinks outright would refuse the grants the setting exists to
+    make -- /tmp, /var and most Homebrew and mise paths are symlinks on macOS --
+    so the entry is resolved first and the resolved path is what gets checked."""
+    link = tmp_path / "looks-harmless"
+    link.symlink_to(Path.home())
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(link))
+    with caplog.at_level("ERROR"):
+        assert sandbox._extra_read_paths() == []
+    assert str(link) in caplog.text
+
+
+def test_every_deny_probe_is_out_of_reach_of_extra_paths():
+    """`_DENY_PROBES` is what startup proves the jail denies, and `extra_paths` is
+    the one operator value that can grant a read back. Asserted against the probe
+    list rather than restated, so a credential added to one list cannot be left
+    grantable by the other."""
+    for spec in sandbox._deny_probe_specs():
+        parent = Path(os.path.realpath(os.path.expanduser(spec))).parent
+        assert sandbox._extra_path_refusal(parent) is not None, spec
+
+
+def test_extra_paths_keeps_the_ordinary_grants(monkeypatch):
+    """The refusals must not cost the setting its actual job: pointing the jail at
+    the interpreter and toolchain the agent runs on."""
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", "/opt/homebrew:/usr/local")
+    assert sandbox._extra_read_paths() == [
+        os.path.realpath("/opt/homebrew"),
+        os.path.realpath("/usr/local"),
+    ]
+
+
 # --- Slice 3: loopback narrowing ---
 
 
