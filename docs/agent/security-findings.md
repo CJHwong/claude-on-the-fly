@@ -37,6 +37,12 @@ upgrade path, so none of that was covered by it.
 | The agent's uv cache was the operator's, and `upgrade.run` installs from it outside any jail with the TUI's full environment | `seatbelt/*.sb`, `sandbox.agent_env` | Write grant moved to `DATA_DIR/uv-cache` and published as `UV_CACHE_DIR`; a live jailed write to `~/.cache/uv` reports "Operation not permitted" under both bases, while `uv venv` and `uv pip install --offline` complete and populate the new cache |
 | The startup self-test ran in one daemon of the two that spawn jailed agents, so a jail that could not hold `state/` stopped Slack loudly while the job worker kept draining the same queue across it | `sandbox.verify_boundary`, `jobs/cli._run` | Both halves now run from the worker's composition root before it claims work, fatal with exit 2; ordering and the before-claim position are asserted in `tests/jobs/test_cli.py` and `tests/test_sandbox.py`. Cron is deliberately not gated: it runs shell and never calls `agent.run` |
 | `verify_denials` could pass having proven nothing: a probe that raised was dropped from the results, so an all-timeout run logged `0/0 probed paths confirmed denied` at INFO and returned success | `sandbox.verify_denials` | A probe that could not run is now `UNTESTED` and fatal, and every probe lands in the results dict. Reverting the `UNTESTED` return makes `test_a_probe_that_cannot_be_spawned_refuses_to_start` and `test_a_probe_that_hangs_is_abandoned_not_awaited_forever` fail. `ABSENT` stays non-fatal: the file is genuinely not on the host, and `preflight` has already proven the jail starts |
+| The TUI watch pane rendered remote text as live Rich markup, unlike every log and tail path. The label is a workspace name, which on the trusted-bot path carries a Slack `username` the poster chooses | `dashboard._refresh_watch_session` | All five sinks in that method (one header, plus the two empty-state pairs) now go through the existing `session_format._safe`; `label` itself stays raw because the workspace path is built from it. A label holding `[/bold]` and one holding `[/Users/…/thing]` both raise MarkupError without the change |
+| `never_ask` is an exact-match lookup while `_DNS_SAFE_HOST` permits a trailing dot, so `metadata.google.internal.` skipped the permanent-block tier and was downgraded into an operator prompt. Defanged downstream, so the harm was the offer existing on the one tier that exists never to be offered | `egress.canonical_host` | One canonical form for the CONNECT host and for every configured set, so the two sides of a membership test cannot disagree. The dotted form of an `egress.allow` host also stopped re-prompting, and a bare `.` is now refused as not a hostname rather than reaching the resolver. Four cases fail without the change |
+| The pending-turn journal was 0o644 (measured), holding the verbatim text of every unanswered turn | `turns.TurnJournal._write` | Created through `os.open` at 0o600 with an explicit chmod, the same shape `codex_state.write_thread_id` uses for the same class of file. The chmod is what covers a permissive umask and a temp file an older build left behind; both cases fail without it. The fixed temp name is kept on purpose, reason in the comment |
+| The replay cap and the TTL were evadable by a tampered journal: a negative `replays` needed ~10^18 restarts to reach the cap, a NaN `recorded_at` made every TTL comparison False, and `chat_id: true` passed the `int` check and became chat_id 1 | `turns.PendingTurn.from_dict`, `turns._as_float` | Clamped at the one boundary where a disk record becomes an object, so both gates in `take()` are sound without touching them. Bad entries are dropped, which is what `_read` already does with a `None`. A boolean chat id, a NaN and an Infinity `recorded_at`, and a `replays` of -10^18 all fail without the change |
+| A thread could permanently defeat its own operator guardrails: it replaced a shared-entry link inside its writable `CODEX_HOME` with a directory, `unlink()` raised `IsADirectoryError`, and the suppressed `OSError` meant `hooks.json`, `AGENTS.md` and `config.toml` never came back for that thread | `codex_state._clear_link_site` | The link site is cleared through one helper that removes a planted directory, bounded to `HOMES_DIR` and never descending a symlink; every link failure now logs. A test plants the directory and asserts the operator's `hooks.json` is back on the next `ensure_home`, and fails without the change |
+| Thread ids were spliced into glob patterns unescaped, so `*` matched every rollout in the tree: `adopt_rollout` copied another thread's into this workspace's `CODEX_HOME`, and `_find_codex_rollout` returned an unrelated conversation for the next prompt's handoff context | `codex_state.rollout_glob`, `codex_state._valid_thread_id` | Both sites now share one `glob.escape`d pattern, and the id charset is checked on the read side and the write side. 10 adversarial cases (`*`, `?`, `[a-c]*`, `../elsewhere`, whitespace) fail without the change. Charset derived from 14 real mappings on a deployed data dir, all 36 characters of lowercase hex and hyphen. Never reachable: the id comes only from codex's `--json` control event, so this is defence in depth |
 
 ## Open
 
@@ -147,18 +153,6 @@ system prompt has the agent read it every turn. Not fixed by `scope_sessions`.
 **Other threads' claude transcripts are writable** when `scope_sessions` is off, not only
 readable.
 
-**Thread ids are spliced into glob patterns unescaped** in `codex_state.adopt_rollout` and
-`transcript._find_codex_rollout`. `write_thread_id` rejects only empty, over-long and
-control characters, so `*`, `?` and `[` pass. Demonstrated: a thread id of `*` copies
-another thread's rollout into the attacker workspace's `CODEX_HOME`. Not reachable today
-— the id comes only from codex's own `--json` control event — so this is defence in
-depth. Closes with `glob.escape` and a charset check.
-
-**A thread can permanently defeat its own operator guardrails.** `codex_state.ensure_home`
-re-links shared entries before every spawn, but if the agent replaces a link with a
-*directory*, `unlink()` raises `IsADirectoryError` and `with suppress(OSError)` swallows
-it. The operator's `hooks.json` and `AGENTS.md` never come back for that thread, silently.
-
 ### Frontends and journal
 
 **Forwarded and quoted Slack messages carry no untrusted-content boundary.** The allowlist
@@ -168,16 +162,12 @@ the body of a forward being untrusted.
 **Suggestion labels are replayed with the tapper's full sender authority.** Model-generated
 text, tapped by a human, is fed back wrapped in the real sender's `[from-id:]` marker.
 
-**The TUI watch header renders remote text as live Rich markup** (`dashboard.py`), unlike
-every log and tail path, which go through `session_format._safe()`.
-
-**The replay cap and TTL are evadable by a tampered journal.** `PendingTurn.from_dict`
-accepts a negative `replays`, so the cap needs ~10^18 restarts, and a `recorded_at` of 0
-or NaN skips the TTL. `chat_id: true` also passes the `int` check. The daemon's own write
-path is correct, so this needs a corrupted or externally-written file. Closes with
-`int(replays) >= 0` and a finiteness check.
-
-**The journal is 0o644** and holds the verbatim text of every unanswered turn.
+**A `recorded_at` of 0 is still exempt from the TTL.** `take()` gates on
+`if entry.recorded_at and ...`, so a tampered entry can skip its TTL by recording no
+timestamp at all. Left as it is: 0 is the dataclass default and the documented
+"not recorded" case, `test_a_turn_with_no_timestamp_is_not_treated_as_expired` asserts it,
+and the replay cap still bounds such an entry. Closing it means deciding that a record
+without an age is a record to drop, which is a behaviour change rather than a clamp.
 
 ### Approvals
 

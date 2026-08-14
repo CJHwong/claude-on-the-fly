@@ -805,6 +805,49 @@ async def test_a_never_ask_host_is_told_it_can_never_be_approved():
     assert "do not look for another route" in decision.refusal.body
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        pytest.param("metadata.google.internal.", id="trailing-dot"),
+        pytest.param("Metadata.Google.Internal.", id="trailing-dot-mixed-case"),
+    ],
+)
+async def test_the_fully_qualified_form_is_still_never_asked(host):
+    """The never-ask lookup is an exact set match, and a trailing dot is the same
+    name to a resolver, so the dotted form used to reach the operator prompt --
+    on the one tier that exists never to be offered."""
+    gate = RecordingGate(default=True)
+    proxy = EgressProxy(ApprovalBroker(gate))
+
+    decision = await proxy._permitted(host, 80)
+
+    assert decision.because == "never-ask policy"
+    assert decision.address is None
+    assert gate.seen == []
+
+
+async def test_the_fully_qualified_form_of_an_allowed_host_still_skips_the_prompt(
+    operator_settings,
+):
+    """The same normalisation on the allow tier. Without it the dotted form is a
+    different name, so a host the operator pre-approved is asked about again."""
+    operator_settings.write_text("egress:\n  allow:\n    - example.com\n")
+    gate = RecordingGate(default=True)
+    proxy = EgressProxy(ApprovalBroker(gate))
+
+    decision = await proxy._permitted("example.com.", 443)
+
+    assert decision.because == "pre-approved host"
+    assert gate.seen == []
+
+
+async def test_a_bare_root_host_is_not_a_hostname():
+    """`.` canonicalises to the empty string, which is nobody's name."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))
+
+    assert (await proxy._permitted(".", 443)).because == "host is not DNS-safe"
+
+
 async def test_a_malformed_host_is_told_it_is_a_request_problem():
     """Distinct action: fix the URL, not report a policy block to the user."""
     proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)))

@@ -8,10 +8,12 @@ an atomic 0600 write.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 from contextlib import suppress
@@ -24,6 +26,18 @@ logger = logging.getLogger(__name__)
 MAPPINGS_DIR = DATA_DIR / "codex-sessions"
 HOMES_DIR = DATA_DIR / "codex-homes"
 _MAX_THREAD_ID = 512
+
+# A thread id is spliced into a glob pattern and into a filename, so the charset
+# is part of both. Measured against 14 real mappings under a deployed data dir:
+# every one is 36 characters of lowercase hex and hyphen, which is a UUID. This
+# pattern is a deliberate superset of that -- underscore and dot and mixed case
+# cost nothing and survive codex changing the format -- while still excluding
+# every glob metacharacter (`*`, `?`, `[`), the path separators, and whitespace.
+#
+# Nothing reachable today produces a bad one: the id arrives only in codex's own
+# `--json` control event `thread.started`, never from model freeform text. This
+# is defence in depth, not a live exploit.
+_THREAD_ID_SAFE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
 # Everything under a shared ~/.codex that the per-workspace home has to expose so
 # codex starts and behaves the way the operator configured it. Linked rather than
@@ -57,6 +71,40 @@ _SHARED_ENTRIES = (
 # turn ran against the shared ~/.codex directly. Losing them was a regression this
 # restores.
 _SHARED_MERGED = ("skills",)
+
+
+def _valid_thread_id(clean: str) -> bool:
+    """Whether a stripped thread id is one this daemon will act on.
+
+    Both the read side and the write side ask, so a mapping written by an older
+    build cannot get past the reader either. The length cap and the charset are
+    one question: a value that fails the charset is not a thread id, whatever it
+    would do downstream.
+    """
+    return (
+        bool(clean)
+        and len(clean) <= _MAX_THREAD_ID
+        and bool(_THREAD_ID_SAFE.match(clean))
+    )
+
+
+def rollout_glob(thread_id: str) -> str:
+    """The filename pattern that finds one thread's rollout.
+
+    One helper because both callers splice the same id into the same shape, and
+    both prefix their own search root: this module's is `sessions/**/`, and
+    `transcript._iter_rollouts` already starts inside each `sessions/`.
+
+    `glob.escape` because the id is interpolated into a pattern, not compared:
+    an id of `*` matches every rollout in the tree, and both callers act on what
+    the pattern returns. `adopt_rollout` would copy another thread's rollout into
+    this workspace's own CODEX_HOME, and `transcript._find_codex_rollout`
+    searches every thread's home plus the shared tree and picks by mtime, so an
+    unrelated conversation could be prepended to the next prompt as handoff
+    context. Reproduced in a scratch tree before the escape went in, and the
+    regression tests replay both shapes through the real callers.
+    """
+    return f"rollout-*-{glob.escape(thread_id)}.jsonl"
 
 
 def _home_key(workspace: Path) -> str:
@@ -128,23 +176,61 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
         if link.is_symlink():
             if link.readlink() == target:
                 continue
-            with suppress(OSError):
-                link.unlink()
+            if not _clear_link_site(link):
+                continue
         elif link.exists():
-            # A real file where the link belongs is removed, not left alone. This
-            # home is writable by the jailed turn, so a real AGENTS.md or
-            # config.toml here would be an execution-control file the agent can
+            # A real file or directory where the link belongs is removed, not left
+            # alone. This home is writable by the jailed turn, so a real AGENTS.md
+            # or config.toml here would be an execution-control file the agent can
             # write -- standing orders it leaves itself for the next run, which is
             # the thing the shared ~/.codex deny list exists to prevent. Replacing
             # it with the link puts the name back on a path the profile denies
             # writes to.
-            with suppress(OSError):
-                link.unlink()
-        with suppress(OSError):
+            if not _clear_link_site(link):
+                continue
+        try:
             link.symlink_to(target)
+        except OSError as exc:
+            # Logged rather than suppressed. This is the operator's config, their
+            # AGENTS.md and their hooks.json arriving in the thread, and a turn
+            # that runs without them looks normal from the outside.
+            logger.warning("codex: cannot link %s -> %s: %s", link, target, exc)
     for name in _SHARED_MERGED:
         _merge_shared_dir(home / name, source_root / name)
     return home
+
+
+def _clear_link_site(link: Path) -> bool:
+    """Empty the place a shared entry has to be linked into. False if it stays.
+
+    `Path.unlink()` raises `IsADirectoryError` on a directory, and the old
+    `with suppress(OSError)` around the unlink and the symlink_to that followed
+    swallowed it with nothing logged. Confirmed by a run: a turn that deleted a
+    shared-entry link inside its own writable CODEX_HOME and made a directory in
+    its place kept that directory through every later `ensure_home()`, so the
+    operator's `config.toml`, `AGENTS.md` and `hooks.json` stopped applying to
+    that thread for ever. A thread that can permanently drop its own operator
+    guardrails is worth one destructive step to take back.
+
+    Two bounds on that step, since it is the only recursive removal in this
+    module's hot path. The site must sit under HOMES_DIR, which the daemon owns:
+    the operator's shared `~/.codex` is only ever a link *target* here, and with
+    the session boundary off `ensure_home` returns before any of this. And a
+    symlink is unlinked, never descended -- `rmtree` refuses one anyway -- so a
+    link the turn planted cannot carry the removal out of the home.
+    """
+    if not link.is_relative_to(HOMES_DIR):
+        logger.warning("codex: refusing to clear %s, outside %s", link, HOMES_DIR)
+        return False
+    try:
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)
+        else:
+            link.unlink()
+    except OSError as exc:
+        logger.warning("codex: cannot clear %s for the shared link: %s", link, exc)
+        return False
+    return True
 
 
 def _safe_iterdir(path: Path) -> list[Path]:
@@ -205,12 +291,18 @@ def _merge_shared_dir(local: Path, shared: Path) -> None:
         if link.is_symlink():
             if link.readlink() == entry:
                 continue
-            with suppress(OSError):
-                link.unlink()
+            if not _clear_link_site(link):
+                continue
         elif link.exists():
+            # Unlike `ensure_home`, a real entry here is codex's own and stays:
+            # it may hold state the agent created on purpose, and `skills/` is a
+            # directory codex writes into rather than an execution-control file
+            # the operator owns.
             continue
-        with suppress(OSError):
+        try:
             link.symlink_to(entry)
+        except OSError as exc:
+            logger.warning("codex: cannot link %s -> %s: %s", link, entry, exc)
 
 
 def _mapping_key(workspace: Path, session_uuid: str) -> str:
@@ -263,7 +355,7 @@ def adopt_rollout(workspace: Path, thread_id: str, shared: Path | None = None) -
 
     if not thread_id:
         return False
-    pattern = f"sessions/**/rollout-*-{thread_id}.jsonl"
+    pattern = f"sessions/**/{rollout_glob(thread_id)}"
     home = home_dir(workspace)
     if any(home.glob(pattern)):
         return True
@@ -311,9 +403,7 @@ def read_thread_id(workspace: Path, session_uuid: str) -> str | None:
     if recorded_workspace != workspace.resolve(strict=False):
         return None
     thread_id = record.get("thread_id")
-    if not isinstance(thread_id, str) or not thread_id.strip():
-        return None
-    if len(thread_id) > _MAX_THREAD_ID or any(ord(c) < 32 for c in thread_id):
+    if not isinstance(thread_id, str) or not _valid_thread_id(thread_id.strip()):
         return None
     return thread_id.strip()
 
@@ -323,7 +413,7 @@ def write_thread_id(workspace: Path, session_uuid: str, thread_id: object) -> Pa
     if not isinstance(thread_id, str) or not thread_id.strip():
         raise ValueError("Codex returned an empty thread id")
     clean = thread_id.strip()
-    if len(clean) > _MAX_THREAD_ID or any(ord(c) < 32 for c in clean):
+    if not _valid_thread_id(clean):
         raise ValueError("Codex returned an invalid thread id")
     MAPPINGS_DIR.mkdir(parents=True, exist_ok=True)
     MAPPINGS_DIR.chmod(stat.S_IRWXU)

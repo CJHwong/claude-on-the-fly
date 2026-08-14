@@ -49,8 +49,25 @@ logger = logging.getLogger(__name__)
 _DNS_SAFE_HOST = re.compile(r"\A[A-Za-z0-9.\-]+\Z")
 
 
+def canonical_host(host: str) -> str:
+    """A hostname in the one form every policy lookup uses.
+
+    Lowercased, and the root's trailing dot dropped. `metadata.google.internal.`
+    and `metadata.google.internal` are the same name to a resolver, but every
+    lookup here is an exact set membership test, so the dotted form skipped the
+    never-ask tier and was downgraded into an operator prompt instead. Nothing
+    reached the metadata service either way -- `_resolve_public` refuses the
+    169.254/16 answer, and link-local is excluded from `private_allow` -- so what
+    leaked was the offer itself, on the one tier that exists never to be offered.
+
+    Applied to the CONNECT host and to every configured set, because a
+    normalisation on one side of a comparison is the bug in a new place.
+    """
+    return host.strip().lower().rstrip(".")
+
+
 def parse_hosts(section: object, key: str, *, source: str) -> frozenset[str]:
-    """One host list out of an `egress:` section, lowercased. Raises ValueError.
+    """One host list out of an `egress:` section, canonical. Raises ValueError.
 
     Hosts are validated here rather than at CONNECT time so a typo is a startup
     error naming the file, not a silently dead entry that turns into an approval
@@ -66,7 +83,7 @@ def parse_hosts(section: object, key: str, *, source: str) -> frozenset[str]:
         raise ValueError(f"{source}: egress.{key} must be a list")
     hosts = set()
     for item in value:
-        host = str(item).strip().lower()
+        host = canonical_host(str(item))
         if not is_dns_safe_host(host):
             raise ValueError(f"{source}: egress.{key} entry {item!r} is not a hostname")
         hosts.add(host)
@@ -319,9 +336,11 @@ class EgressProxy:
         # Pre-approved hosts skip the operator entirely: `egress.allow` from the
         # settings file (the model APIs, plus whatever the operator added) unioned
         # with anything the caller front-loaded.
-        self._front_loaded_allowed = frozenset(host.lower() for host in allowed_hosts)
+        self._front_loaded_allowed = frozenset(
+            canonical_host(host) for host in allowed_hosts
+        )
         self._front_loaded_private = frozenset(
-            host.lower() for host in (*private_allowed_hosts, *allowed_hosts)
+            canonical_host(host) for host in (*private_allowed_hosts, *allowed_hosts)
         )
         self._allowed = self._front_loaded_allowed | default_allowed_hosts()
         # None rather than a frozenset default so the settings file is read per
@@ -329,7 +348,7 @@ class EgressProxy:
         # take effect on the next session rather than on the next daemon restart.
         self._uses_default_never_ask = never_ask is None
         self._front_loaded_never_ask = frozenset(
-            host.lower() for host in (never_ask or ())
+            canonical_host(host) for host in (never_ask or ())
         )
         self._never_ask = (
             default_never_ask() if never_ask is None else self._front_loaded_never_ask
@@ -533,8 +552,11 @@ class EgressProxy:
         allowlist decisions on the next CONNECT.
         """
         self._refresh_policy()
-        lowered = host.lower()
-        if not is_dns_safe_host(host):
+        # Canonical before any lookup: an exact match against a set is the shape
+        # of every decision below, so `metadata.google.internal.` must not be a
+        # different name from `metadata.google.internal`.
+        lowered = canonical_host(host)
+        if not is_dns_safe_host(lowered):
             logger.warning("%s: refuse %r (host is not DNS-safe)", self._tag, host)
             return _Decision(None, "host is not DNS-safe", _MALFORMED_HOST)
         if lowered in self._never_ask:

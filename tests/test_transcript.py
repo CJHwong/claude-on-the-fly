@@ -1383,6 +1383,20 @@ class TestCodexSessionsDirsResolution:
         rollout.write_text('{"type":"session_meta"}\n')
         assert transcript._find_codex_rollout("legacy-1") == rollout
 
+    def test_a_wildcard_thread_id_finds_nothing(self, tmp_path, monkeypatch):
+        """This search is the worse of the two glob sites: it covers every
+        per-thread home plus the shared tree and picks by mtime, so an unescaped
+        `*` would return an unrelated conversation to be prepended to the next
+        prompt as handoff context."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "shared"))
+        homes = tmp_path / "codex-homes"
+        monkeypatch.setattr("claude_on_the_fly.codex_state.HOMES_DIR", homes)
+        day = homes / "abc" / "sessions" / "2026" / "08" / "13"
+        day.mkdir(parents=True)
+        (day / "rollout-2026-08-13T00-00-00-someone-elses.jsonl").write_text("{}\n")
+
+        assert transcript._find_codex_rollout("*") is None
+
     def test_an_absent_homes_dir_is_not_an_error(self, tmp_path, monkeypatch):
         """A deployment that has never run codex has no homes directory at all."""
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / "shared"))
