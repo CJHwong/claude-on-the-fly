@@ -1125,6 +1125,13 @@ class DashboardScreen(Screen):
         # carry their full workspace path from the worker's heartbeat.
         label = self._chat_workspaces.get(key, identifier)
         workspace = self._job_workspaces.get(key) or (DATA_DIR / "workspaces" / label)
+        # The header and the pane render Rich markup, and on the trusted-bot path
+        # this name carries a Slack `username` the poster chooses. Every log and
+        # tail path in the TUI already goes through the same helper: a body
+        # containing `[/path]` reads as a closing tag and raises MarkupError,
+        # which takes the whole TUI down. `label` itself stays raw, because the
+        # workspace path above is built from it.
+        shown = session_format._safe(label)
 
         session_uuid = self._job_sessions.get(key)
         if not session_uuid:
@@ -1132,8 +1139,8 @@ class DashboardScreen(Screen):
                 self._watch_path = None
                 self._watch_mtime = None
                 pane.clear()
-                pane.write(f"[dim]no session uuid for {label} yet[/dim]")
-                header.update(f"[bold]watch: {label}[/bold] [dim](pending)[/dim]")
+                pane.write(f"[dim]no session uuid for {shown} yet[/dim]")
+                header.update(f"[bold]watch: {shown}[/bold] [dim](pending)[/dim]")
             return
 
         # Resolve across backends: the daemon may have run this job under a
@@ -1146,11 +1153,11 @@ class DashboardScreen(Screen):
                 self._watch_mtime = None
                 pane.clear()
                 pane.write(
-                    f"[dim]no session log yet for {label} — "
+                    f"[dim]no session log yet for {shown} — "
                     f"agent hasn't run a turn[/dim]"
                 )
                 header.update(
-                    f"[bold]watch: {label}[/bold] [dim](no session yet)[/dim]"
+                    f"[bold]watch: {shown}[/bold] [dim](no session yet)[/dim]"
                 )
             return
 
@@ -1165,7 +1172,7 @@ class DashboardScreen(Screen):
 
         self._watch_path = path
         self._watch_mtime = mtime
-        header.update(f"[bold]watch: {label}[/bold] [dim]{path.name}[/dim]")
+        header.update(f"[bold]watch: {shown}[/bold] [dim]{path.name}[/dim]")
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
         render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)

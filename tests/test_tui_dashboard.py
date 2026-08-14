@@ -14,6 +14,7 @@ import shlex
 from pathlib import Path
 
 import pytest
+from rich.markup import render as render_markup
 from textual.app import App
 from textual.widgets import DataTable, RichLog, Static, TabbedContent
 
@@ -2519,3 +2520,56 @@ class TestUpgradeAction:
             screen._write_upgrade_log(self._plan(), "output")
 
         assert any("could not write" in msg for msg, _s in notices)
+
+
+class TestTheWatchPaneRendersRemoteTextAsData:
+    """The label is a workspace name, and on the trusted-bot path that carries a
+    Slack `username` the poster chooses. Both widgets have markup enabled, so an
+    unescaped `[/something]` is a closing tag: it either eats the rest of the
+    line or raises MarkupError and takes the TUI down with it. Every log and tail
+    path already goes through `session_format._safe`; this one did not.
+    """
+
+    class _Recorder:
+        """Stands in for the header Static and the watch RichLog."""
+
+        def __init__(self) -> None:
+            self.written: list[str] = []
+
+        def update(self, value) -> None:
+            self.written.append(str(value))
+
+        def clear(self) -> None:
+            self.written.clear()
+
+        def write(self, value) -> None:
+            self.written.append(str(value))
+
+    def _drive(self, screen: DashboardScreen, label: str) -> str:
+        screen._chat_workspaces = {"telegram:7": label}
+        screen._job_sessions = {}
+        screen._job_workspaces = {}
+        header, pane = self._Recorder(), self._Recorder()
+        screen._refresh_watch_session("telegram", "7", header, pane, True)
+        return "\n".join(header.written + pane.written)
+
+    async def test_markup_in_a_workspace_name_stays_literal(self, isolated):
+        label = "telegram/[/bold]evil[blink]"
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            rendered = self._drive(screen, label)
+
+        # Parsed the way the widget parses it: the name has to survive whole.
+        assert label in render_markup(rendered).plain
+
+    async def test_a_bracketed_path_does_not_raise(self, isolated):
+        """The shape that already took the TUI down once, from a PostCompact
+        notice: `[/Users/…/thing]` is not a tag Rich knows."""
+        label = "telegram/[/Users/somebody/thing]"
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            rendered = self._drive(screen, label)
+
+        assert label in render_markup(rendered).plain
