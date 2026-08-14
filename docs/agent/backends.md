@@ -34,6 +34,12 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
   daemon-owned `~/.claude-on-the-fly/codex-sessions/` store after the first turn, then
   `resume <thread_id>` on follow-ups. The store is outside the agent-writable workspace,
   reads reject symlinks, and new records are atomic owner-only (`0600`) files.
+  A mapping is only a thread id, so `codex_state.adopt_rollout` checks the rollout is in
+  the `CODEX_HOME` this spawn will use, copying it out of the shared tree when
+  `sandbox.scope_sessions` has moved the home under it. When there is no rollout left to
+  adopt the mapping is dead: it is cleared and the turn starts a new thread with the
+  system prompt and the handoff, because `resume` on a missing rollout fails the turn
+  outright (`thread/resume failed: no rollout found for thread id`).
 
 ### Tool / skill counts (footer display)
 

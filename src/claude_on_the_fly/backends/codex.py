@@ -507,6 +507,24 @@ class CodexBackend:
         # codex exec won't expand a /custom-prompt itself, so do it here.
         prompt = _expand_codex_prompt(prompt)
         existing_thread = codex_state.read_thread_id(workspace, session_uuid)
+        # A mapping is only a thread id, and the rollout it names has to be in the
+        # home this spawn will use. Turning the session boundary on moves that home,
+        # so a mapping written before the change points at a rollout codex cannot
+        # see: `resume` then fails the whole turn with "no rollout found for thread
+        # id". Adopting the rollout keeps the conversation; when there is none left
+        # to adopt, the mapping is dead and the thread starts again with the system
+        # prompt and the handoff, which is a forgetful turn instead of a failed one.
+        if existing_thread and not codex_state.adopt_rollout(
+            workspace, existing_thread
+        ):
+            logger.warning(
+                "codex: thread=%s is not resumable here, starting a new one, "
+                "session=%s",
+                existing_thread,
+                session_uuid,
+            )
+            codex_state.clear_thread_id(workspace, session_uuid)
+            existing_thread = None
 
         # First codex turn for this session: forward any prior claude history,
         # and prepend the system prompt (codex has no --system-prompt flag, so

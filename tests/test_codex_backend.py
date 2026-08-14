@@ -24,8 +24,24 @@ def _ndjson(*messages: dict) -> bytes:
     return b"\n".join(json.dumps(m).encode() for m in messages)
 
 
+def _write_rollout(thread_id: str, home: Path) -> Path:
+    """The rollout file codex would have written for `thread_id` under `home`."""
+    path = (
+        home / "sessions/2026/08/14" / f"rollout-2026-08-14T00-00-00-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n")
+    return path
+
+
 def _write_mapping(workspace: Path, session_uuid: str, thread_id: str) -> Path:
-    """Create a daemon-owned mapping for backend tests."""
+    """Create a daemon-owned mapping, plus the rollout that makes it resumable.
+
+    The backend asks whether `resume` has a rollout to land on before it passes
+    one, so a mapping on its own is the dead-mapping case rather than the ordinary
+    one these tests are about.
+    """
+    _write_rollout(thread_id, codex_mod.codex_state.home_dir(workspace))
     return codex_mod.codex_state.write_thread_id(workspace, session_uuid, thread_id)
 
 
@@ -540,6 +556,63 @@ class TestCodexBackendRun:
         assert cmd[idx + 1] == "existing-thread"
         # Mapping unchanged (we do not overwrite on resume).
         assert json.loads(mapping.read_text())["thread_id"] == "existing-thread"
+
+    async def test_a_thread_with_no_rollout_left_starts_again(self, tmp_path: Path):
+        """codex answers `resume` on a rollout it cannot find with "no rollout found
+        for thread id", which fails the whole turn. A mapping naming a thread nothing
+        can resume is dead, so it goes and the turn starts a new one -- forgetful
+        rather than broken. The system prompt comes back with it, because the new
+        thread has no persisted history holding it."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        codex_mod.codex_state.write_thread_id(workspace, "sess-dead", "vanished-thread")
+
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(thread_id="a-fresh-thread"),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess-dead", "follow-up", "telegram")
+
+        cmd = mock.call_args[0][1]
+        assert "resume" not in cmd
+        assert "You are Claude" in cmd[-1] or "---" in cmd[-1]
+        # The dead mapping is replaced by the thread codex actually started, so a
+        # later turn resumes something that exists.
+        assert (
+            codex_mod.codex_state.read_thread_id(workspace, "sess-dead")
+            == "a-fresh-thread"
+        )
+
+    async def test_a_rollout_left_in_the_shared_tree_is_adopted(
+        self, tmp_path: Path, scoped_sessions
+    ):
+        """The upgrade path for the session boundary. The thread was started while
+        every rollout went to the shared tree; scoping moves the home codex reads,
+        so the rollout is copied across and the conversation survives the flip."""
+        from claude_on_the_fly import envfile
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        origin = _write_rollout("older-thread", envfile.codex_home())
+        codex_mod.codex_state.write_thread_id(workspace, "sess-flip", "older-thread")
+        home = codex_mod.codex_state.home_dir(workspace)
+        assert not any(home.glob("sessions/**/*.jsonl"))
+
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess-flip", "follow-up", "telegram")
+
+        cmd = mock.call_args[0][1]
+        assert cmd[cmd.index("resume") + 1] == "older-thread"
+        adopted = home / "sessions/2026/08/14" / origin.name
+        assert adopted.read_text() == "{}\n"
+        # The original stays: the daemon reads it for token and model lookups, and
+        # an operator who turns the boundary back off needs it there.
+        assert origin.is_file()
 
     async def test_no_launcher_omits_ollama_prefix(self, tmp_path: Path):
         workspace = tmp_path / "ws"

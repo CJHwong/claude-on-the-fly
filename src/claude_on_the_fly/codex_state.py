@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import stat
@@ -17,6 +18,8 @@ from contextlib import suppress
 from pathlib import Path
 
 from claude_on_the_fly.agent import DATA_DIR
+
+logger = logging.getLogger(__name__)
 
 MAPPINGS_DIR = DATA_DIR / "codex-sessions"
 HOMES_DIR = DATA_DIR / "codex-homes"
@@ -236,6 +239,59 @@ def _read_record(path: Path) -> dict | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def adopt_rollout(workspace: Path, thread_id: str, shared: Path | None = None) -> bool:
+    """Whether `codex resume <thread_id>` can find its rollout in this home.
+
+    A mapping only records a thread id. Whether the thread is still resumable is a
+    question about a file, and `CODEX_HOME` decides which directory codex looks in,
+    so turning the session boundary on moves the answer. Asking before the spawn is
+    what turns "the turn fails with `no rollout found for thread id`" into "this
+    thread starts fresh", which is the difference between a broken chat and a
+    forgetful one.
+
+    The rollout is copied out of the shared tree rather than linked to it. Seatbelt
+    matches the resolved path and the shared tree is read-denied under the boundary,
+    so a link would resolve onto a denied path and codex would report the rollout
+    missing anyway. Its relative date directory is preserved, since that is the
+    layout codex writes and reads. The original stays where it is: the daemon reads
+    it for the token and model lookups, and an operator who turns the boundary back
+    off has to find it there.
+    """
+    from claude_on_the_fly import envfile
+
+    if not thread_id:
+        return False
+    pattern = f"sessions/**/rollout-*-{thread_id}.jsonl"
+    home = home_dir(workspace)
+    if any(home.glob(pattern)):
+        return True
+    source_root = envfile.codex_home() if shared is None else shared
+    found = sorted(source_root.glob(pattern))
+    if not found:
+        logger.warning("codex: no rollout anywhere for thread=%s", thread_id)
+        return False
+    origin = found[-1]
+    destination = home / origin.relative_to(source_root)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(origin, temporary)
+        os.replace(temporary, destination)
+    except OSError as exc:
+        with suppress(OSError):
+            temporary.unlink()
+        logger.warning("codex: cannot adopt rollout %s: %s", origin, exc)
+        return False
+    logger.info("codex: adopted rollout %s into %s", origin.name, destination.parent)
+    return True
+
+
+def clear_thread_id(workspace: Path, session_uuid: str) -> None:
+    """Forget one mapping, so the next turn starts a thread codex can resume."""
+    with suppress(OSError):
+        mapping_path(workspace, session_uuid).unlink()
 
 
 def read_thread_id(workspace: Path, session_uuid: str) -> str | None:

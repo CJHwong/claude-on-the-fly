@@ -250,7 +250,8 @@ sandbox:
   # jail mode only. Give each chat thread its own agent session store, so a turn
   # reads and writes only its own transcripts instead of every thread's. Off by
   # default: with it off, every backend keeps one shared store, which is where a
-  # thread started before this setting existed left its transcript.
+  # thread started before this setting existed left its transcript. Turning it on
+  # carries each codex thread's rollout into its new home on the next turn.
   # scope_sessions: true
 
 agent:

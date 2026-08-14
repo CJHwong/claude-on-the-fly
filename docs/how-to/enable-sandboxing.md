@@ -39,10 +39,10 @@ sandbox:
 package managers. The directory holding the agent binary is granted automatically.
 
 To also stop a turn reading other threads' transcripts, add `scope_sessions: true`.
-Warning: it moves the session stores, so a conversation already running loses its
-memory. codex reports this as `no rollout found for thread id` and the turn fails.
-Turn it on when the deployment is quiet, and expect the first turn of each existing
-chat thread to start fresh.
+It moves the session stores, so the first turn of each existing chat thread has to
+find its history in the new place. A codex thread carries its rollout across and keeps
+its memory. A claude thread keeps its session where it already is, and a rollout that
+no longer exists anywhere starts the thread again rather than failing the turn.
 
 On Linux, install bubblewrap first (`apt install bubblewrap`, or your distribution's
 equivalent), and note two differences the daemon logs at startup:

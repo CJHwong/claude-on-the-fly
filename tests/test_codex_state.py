@@ -490,3 +490,86 @@ class TestSharedSkillsReachThePerThreadHome:
         assert (
             home / "skills" / "browser" / "codex.txt"
         ).read_text() == "codex made this\n"
+
+
+class TestAdoptRollout:
+    """A mapping records a thread id; whether it is resumable is about a file.
+
+    codex reads rollouts from `$CODEX_HOME`, so turning the session boundary on
+    moves the directory it looks in. Asking before the spawn is what turns a failed
+    turn into a fresh thread.
+
+    `codex_sessions_dir` redirects both stores into tmp_path: the suite's fake HOME
+    is shared across tests, so a rollout one test adopts would answer another's
+    question.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _own_stores(self, codex_sessions_dir):
+        """Per-test rollout trees, shared and per-thread alike."""
+
+    def _rollout(self, home, thread_id, body="{}\n"):
+        path = (
+            home
+            / "sessions/2026/08/14"
+            / f"rollout-2026-08-14T00-00-00-{thread_id}.jsonl"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        return path
+
+    def test_a_rollout_already_in_this_home_is_left_alone(self, tmp_path, workspace):
+        home = codex_state.home_dir(workspace)
+        path = self._rollout(home, "here")
+        assert codex_state.adopt_rollout(workspace, "here") is True
+        assert path.read_text() == "{}\n"
+
+    def test_a_rollout_in_the_shared_tree_is_copied_in(self, tmp_path, workspace):
+        """Copied, not linked: seatbelt matches the resolved path and the shared tree
+        is read-denied under the boundary, so a link would resolve onto a denied path
+        and codex would report the rollout missing anyway."""
+        shared = tmp_path / "shared"
+        origin = self._rollout(shared, "older", body='{"id": 1}\n')
+        assert codex_state.adopt_rollout(workspace, "older", shared=shared) is True
+        adopted = codex_state.home_dir(workspace) / "sessions/2026/08/14" / origin.name
+        assert adopted.read_text() == '{"id": 1}\n'
+        assert not adopted.is_symlink()
+        assert origin.is_file()
+
+    def test_nothing_to_adopt_is_reported(self, tmp_path, workspace):
+        assert (
+            codex_state.adopt_rollout(workspace, "gone", shared=tmp_path / "shared")
+            is False
+        )
+
+    def test_an_empty_thread_id_is_not_resumable(self, workspace):
+        assert codex_state.adopt_rollout(workspace, "") is False
+
+    def test_a_copy_that_fails_is_not_reported_as_adopted(
+        self, tmp_path, workspace, monkeypatch
+    ):
+        """Half a rollout is worse than none: codex would resume from a truncated
+        file. The temp name is removed and the caller starts a new thread."""
+        shared = tmp_path / "shared"
+        self._rollout(shared, "older")
+
+        def explode(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(codex_state.shutil, "copyfile", explode)
+        assert codex_state.adopt_rollout(workspace, "older", shared=shared) is False
+        home = codex_state.home_dir(workspace)
+        # No rollout and no half-written temp file, only the empty date directory.
+        assert not list(home.glob("sessions/**/*.jsonl"))
+        assert not list(home.glob("sessions/**/.*"))
+
+
+class TestClearThreadId:
+    def test_it_forgets_one_mapping(self, workspace):
+        path = codex_state.write_thread_id(workspace, "sess", "thread")
+        codex_state.clear_thread_id(workspace, "sess")
+        assert not path.exists()
+        assert codex_state.read_thread_id(workspace, "sess") is None
+
+    def test_a_mapping_that_is_not_there_is_not_an_error(self, workspace):
+        codex_state.clear_thread_id(workspace, "never-written")
