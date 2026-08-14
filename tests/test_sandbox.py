@@ -22,9 +22,10 @@ def test_mode_defaults_off(monkeypatch):
     assert sandbox.enabled() is False
 
 
-def test_unknown_mode_is_off(monkeypatch):
+def test_unknown_mode_refuses(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX", "banana")
-    assert sandbox.mode() == "off"
+    with pytest.raises(sandbox.SandboxModeError):
+        sandbox.mode()
 
 
 @pytest.mark.parametrize("value", ["env", "jail"])
@@ -1331,17 +1332,30 @@ def test_guidance_names_memory_as_writable(monkeypatch):
     assert "Writing:" in guidance
 
 
-def test_an_unrecognised_sandbox_mode_says_so_instead_of_silently_disabling(
-    monkeypatch, caplog
+def test_an_unrecognised_sandbox_mode_refuses_instead_of_silently_disabling(
+    monkeypatch,
 ):
-    """It still resolves to off, because refusing to start would turn a typo into an
-    outage. But a misspelled `jial` used to read as "no sandbox at all" with nothing
-    anywhere to say so, which is the most expensive way to be wrong about this."""
+    """A misspelled `jial` used to resolve to off with one ERROR as the only trace.
+
+    Off is the one value that guarantees neither startup gate runs: `preflight` and
+    `verify_denials` both return early unless the mode is `jail`. So a typo produced
+    exactly the posture the operator was trying to avoid, and the daemon then served
+    every turn with the full environment. An outage is the cheaper failure.
+    """
     monkeypatch.setenv("COTF_SANDBOX", "jial")
-    with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
-        assert sandbox.mode() == "off"
-    assert "not one of" in caplog.text
-    assert "NO sandbox" in caplog.text
+    with pytest.raises(sandbox.SandboxModeError) as excinfo:
+        sandbox.mode()
+    assert "jial" in str(excinfo.value)
+    assert "not one of" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_emptied_sandbox_mode_is_off_not_an_error(monkeypatch, value):
+    """A commented-out or blanked key reads as off, like an absent one. Only a value
+    somebody meant to be something is an error, or emptying the key to turn the
+    sandbox off would refuse to start."""
+    monkeypatch.setenv("COTF_SANDBOX", value)
+    assert sandbox.mode() == "off"
 
 
 def test_an_unset_sandbox_mode_is_silent(monkeypatch, caplog):
@@ -2735,3 +2749,147 @@ def test_a_data_dir_outside_the_temp_tree_gets_no_hint(monkeypatch, tmp_path):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
 
     assert sandbox._temp_tree_hint(Path("/srv/cotf/state")) == ""
+
+
+# --- the shared codex tree keeps its instruction files when scoping is off ---
+
+
+def _rule_index(profile: Path, *needles: str) -> int:
+    """Line number of the rule containing every needle, ignoring comments.
+
+    -1 when absent, so a caller comparing positions fails rather than passing on a
+    rule that was renamed out from under it.
+    """
+    for number, line in enumerate(profile.read_text().splitlines()):
+        if line.strip().startswith(";;"):
+            continue
+        if all(needle in line for needle in needles):
+            return number
+    return -1
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_shared_codex_tree_stays_write_denied_without_scoped_sessions(
+    monkeypatch, tmp_path, original_home, fs_base
+):
+    """Scoping off must not hand over `~/.codex`.
+
+    `_CODEX_HOME` used to be the resolved home, which with the boundary off *is*
+    `~/.codex`. The profile writes `(allow file-write* (subpath _CODEX_HOME))`
+    after `(deny file-write* (subpath _HOME/.codex))`, and SBPL is last-match-wins,
+    so the allow nullified the deny for the whole tree: `config.toml`, `AGENTS.md`,
+    `hooks.json`, `rules`, `agents`, `prompts`, `skills`. Those decide what codex is
+    told and what it runs, in every later run and outside any jail.
+
+    Against the real home on purpose. Both profiles grant writes to `/private/tmp`
+    and `/private/var/folders` for scratch space, and pytest's tmp_path lives under
+    the second one, so a synthetic home there would report success for a reason that
+    says nothing about this deny. The probe is a file of its own with a unique name,
+    never one of the operator's real files, and it is removed either way.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    codex = original_home / ".codex"
+    if not codex.is_dir():
+        pytest.skip("no real ~/.codex on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("COTF_SANDBOX_SCOPE_SESSIONS", raising=False)
+    workspace = tmp_path / "thread-one"
+    workspace.mkdir()
+    probe = codex / f"cotf-write-probe-{os.getpid()}"
+    try:
+        done = _run_jailed(["/bin/sh", "-c", f"echo x > {probe}"], workspace)
+        assert done.returncode != 0, (
+            "the shared codex tree is writable with scope_sessions off; "
+            "AGENTS.md and config.toml are agent-writable"
+        )
+        assert not probe.exists()
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _jail_params(monkeypatch, workspace: Path) -> dict:
+    """The keyword params `_macos_wrap` hands the seatbelt argv builder."""
+    captured: dict = {}
+
+    def fake(argv, **kwargs):
+        captured.update(kwargs)
+        return list(argv)
+
+    monkeypatch.setattr(sandbox.sandbox_macos, "jail_argv", fake)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    workspace.mkdir(parents=True, exist_ok=True)
+    sandbox.wrap(["/bin/true"], workspace)
+    return captured
+
+
+def test_the_codex_write_grant_is_the_sessions_tree_when_unscoped(
+    monkeypatch, tmp_path
+):
+    """The grant narrows to `sessions/`, which is all a rollout written before the
+    boundary needs, and is exactly what the profile granted before the boundary
+    existed. The read side still re-grants the whole tree, so resuming works."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_SCOPE_SESSIONS", raising=False)
+    params = _jail_params(monkeypatch, tmp_path / "ws")
+    assert params["codex_home"].name == "sessions"
+    assert params["codex_home"] == params["codex_sessions"]
+
+
+def test_the_codex_write_grant_is_the_per_thread_home_when_scoped(
+    monkeypatch, tmp_path, scoped_sessions
+):
+    """Scoped, the home is a per-thread directory under the data dir and granting
+    its subpath is the point: it is not inside the denied tree at all."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    params = _jail_params(monkeypatch, tmp_path / "ws")
+    assert params["codex_home"] != params["codex_sessions"]
+    assert "codex-homes" in str(params["codex_home"])
+
+
+# --- ordering: a deny only holds if nothing later re-grants it ---
+
+
+def test_the_cross_thread_session_denies_come_after_the_operator_allows():
+    """`sandbox.extra_paths` is operator-supplied, capped at 3, and `_RUNTIME_*` is
+    derived from the backend's own install location. Both are subpath allows, so an
+    entry naming an ancestor of the session stores re-opens them.
+
+    Measured with the pairs in their old position above those allows: one
+    `extra_paths` entry of `$HOME` made another thread's codex rollout and another
+    thread's claude session readable again, while the profile still loaded and the
+    log still said jailed. `extra_paths` is also the remedy the agent is told to
+    relay when a read is blocked, so it is a thing operators are invited to add.
+    """
+    profile = sandbox._DENY_MOST_PROFILE
+    last_allow = max(
+        _rule_index(profile, f'(allow file-read* (subpath (param "_{name}")))')
+        for name in ("EXTRA_1", "EXTRA_2", "EXTRA_3", "RUNTIME_1", "RUNTIME_5")
+    )
+    assert last_allow > 0
+    for deny in (
+        '(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))',
+        '(deny file-read* (subpath (param "_CODEX_SESSIONS")))',
+        '(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") '
+        '"/history.jsonl")))',
+    ):
+        index = _rule_index(profile, deny)
+        assert index > last_allow, f"an operator or runtime allow can re-open {deny}"
+
+
+def test_the_daemon_state_write_deny_comes_after_the_project_write_allow():
+    """`_PROJECT_DIR` is granted writes and is built from a name a frontend supplies,
+    part of which a Slack message sender chooses. `agent.workspace_path` reduces that
+    name so it can no longer name an ancestor of the data dir; this ordering is what
+    makes the deny hold even if it ever could again. The journal under state/ replays
+    its entries as user messages, so a writable journal is a prompt the agent can
+    schedule for itself past any approval the operator set."""
+    profile = sandbox._BASE_PROFILE
+    allow = _rule_index(profile, '(allow file-write* (subpath (param "_PROJECT_DIR")))')
+    assert allow > 0
+    for suffix in ('"/.claude-on-the-fly/state"', '(param "_DATA_DIR") "/state"'):
+        index = _rule_index(profile, "(deny file-write*", suffix)
+        assert index > allow, f"the _PROJECT_DIR write allow re-opens state/ ({suffix})"

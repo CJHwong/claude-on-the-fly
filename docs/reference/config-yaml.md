@@ -7,7 +7,7 @@ Lifecycle terms are defined in [Configuration files and lifecycle](settings.md).
 
 | Key | Type / default | Values and effect | Lifecycle |
 |---|---|---|---|
-| `mode` | string / `off` | `off`, `env`, `jail`; invalid values log and resolve to `off` | Restart required |
+| `mode` | string / `off` | `off`, `env`, `jail`; an unrecognised value refuses to start, an absent or empty one means `off` | Restart required |
 | `fs` | string / allow reads | `deny-most` narrows home-directory reads; jail only | Next turn |
 | `extra_paths` | list / empty | Up to three read grants for `deny-most` | Next turn |
 | `broker_only_loopback` | boolean / false | Limit jail loopback to published broker/proxy ports | Next turn |

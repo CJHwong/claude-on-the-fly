@@ -69,11 +69,33 @@ runtime paths measured as necessary.
 
 `sandbox.scope_sessions` gates the whole boundary and is off by default
 (`sandbox.scoped_sessions()`). Off, the granted path resolves back onto the store it
-sits in: `_CLAUDE_PROJECT` becomes `_CLAUDE_PROJECTS` and `_CODEX_HOME` becomes the
-shared codex home. SBPL is last-match-wins and the grant is written after the deny, so
-each deny is nullified by its own re-grant and no profile line has to change. On Linux
-the two masks are dropped instead, because a tmpfs and a read-write bind over the same
-path would leave argv order deciding the policy.
+sits in: `_CLAUDE_PROJECT` becomes `_CLAUDE_PROJECTS`, and `_CODEX_HOME` becomes the
+shared `sessions` tree. SBPL is last-match-wins and the grant is written after the deny,
+so each deny is nullified by its own re-grant and no profile line has to change. On
+Linux the two masks are dropped instead, because a tmpfs and a read-write bind over the
+same path would leave argv order deciding the policy.
+
+`_CODEX_HOME` stops at `sessions/` in that state rather than resolving to `~/.codex`
+itself. It used to resolve to the home, and because the profile writes
+`(allow file-write* (subpath _CODEX_HOME))` after `(deny file-write* (subpath
+_HOME/.codex))`, the allow then nullified that deny for the whole tree: `config.toml`,
+`AGENTS.md`, `hooks.json`, `rules`, `agents`, `prompts`, `skills`. Those decide what
+codex is told and what it runs, in every later run and outside any jail, so a jailed
+turn could plant standing instructions for the operator's own sessions. Confirmed by a
+real jailed write against a real `~/.codex`, under both filesystem profiles. Linux never
+had it: `_linux_grants` lists `_codex_protected` under `write_denied` whatever the
+setting says.
+
+The two cross-thread read denies sit at the **end** of the read section in
+`fs-deny-most.sb`, after the `_EXTRA_*` and `_RUNTIME_*` allows, for the same reason the
+`_DATA_DIR` denies are last. Both of those are subpath allows naming operator- or
+install-derived paths, so an entry naming an ancestor re-opens the stores. Measured with
+the pairs above those allows: one `sandbox.extra_paths` entry of `$HOME` made another
+thread's codex rollout and another thread's claude session readable again, with the
+profile still loading and the log still saying jailed. `extra_paths` is also the remedy
+the agent is told to relay when a read is blocked, so it is a value operators are
+actively invited to add. `tests/test_sandbox.py` asserts the positions, not just the
+behaviour: a behaviour test passed throughout the window the codex grant was wrong.
 
 Four profile parameters carry the session boundary, resolved per run from the workspace
 and realpath'd like every other one:
@@ -84,7 +106,7 @@ and realpath'd like every other one:
 | `_CLAUDE_PROJECTS` | `<config dir>/projects` | read denied |
 | `_CLAUDE_PROJECT` | `…/projects/<workspace hash>` | read and write granted |
 | `_CODEX_SESSIONS` | `<shared codex home>/sessions` | read denied |
-| `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>` | read and write granted |
+| `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>`, or the shared `sessions` tree when `scope_sessions` is off | read and write granted |
 
 Every claude rule is written against `_CLAUDE_CONFIG` rather than `$HOME/.claude`,
 because `CLAUDE_CONFIG_DIR` can move the tree outside `$HOME` where a `_HOME`-derived
@@ -101,7 +123,16 @@ same way. Three buckets decide what goes in it:
 |---|---|---|
 | Instruction-bearing | `settings.json`, `hooks.json`, `CLAUDE.md`, `commands/`, `skills/`, `agents/`, `plugins/` root | write denied; read on later invocations, so a write outlives the session |
 | Conversation-bearing | `projects/<hash>/` (session JSONL **and** the per-project memory dir), `history.jsonl` | per-thread only, or denied outright |
-| Runtime scratch | `shell-snapshots/`, `session-env/`, `sessions/`, `plugins/cache/`, `policy-limits.json` | granted machine-wide; none decides what the agent executes or is told |
+| Runtime scratch | `shell-snapshots/`, `session-env/`, `sessions/`, `plugins/cache/`, `policy-limits.json` | granted machine-wide |
+
+Two entries in that last bucket do not honestly belong in it. `shell-snapshots/` holds
+shell the CLI sources on a later Bash tool call, and `plugins/cache/` holds the code a
+plugin manifest points at, so a write to either can execute on a later run. The grant on
+the first is already unsupported by measurement: a jailed turn that provably ran a Bash
+tool wrote no snapshot. Both are left in place here rather than changed alongside the
+denies above, because dropping them is a behaviour change on the one path still without
+a real run behind it, and this note is the record that they are open questions rather
+than a bucket the table has cleared.
 
 `_CLAUDE_RUNTIME_WRITE_FILES` is split from `_CLAUDE_RUNTIME_WRITE_DIRS` because the
 Linux wrap creates each mount source, and `mkdir` on a file target leaves a

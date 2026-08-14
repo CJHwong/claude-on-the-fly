@@ -282,13 +282,26 @@ credential is stored". You do not need one; credentials are injected by the \
 broker."""
 
 
+class SandboxModeError(RuntimeError):
+    """`sandbox.mode` holds a value this build does not implement."""
+
+
 def mode() -> str:
     """Resolved `sandbox.mode`: 'off', 'env', or 'jail' (default 'off').
 
-    An unrecognised value still resolves to 'off', because refusing to start would
-    turn a typo into an outage. But it no longer does so in silence: a misspelled
-    `jial` used to read as "no sandbox at all" with nothing anywhere to say so,
-    which is the most expensive possible way to be wrong about this setting.
+    An unrecognised value raises. This reverses an earlier choice to resolve it
+    to 'off' and log an ERROR, on the grounds that refusing to start would turn a
+    typo into an outage. That trade is the wrong way round for this setting. Both
+    startup gates -- `preflight()` and `verify_denials()` -- return early unless
+    the mode is 'jail', so 'off' is the one value that guarantees neither of them
+    runs. A misspelled `jial` therefore produced the exact posture the operator
+    was trying to avoid, with one log line as the only trace, and the daemon then
+    served every turn with the full environment: API keys, tokens, keychain.
+
+    An outage is loud, immediate, and gets fixed. Silently running unsandboxed is
+    none of those. An absent key still means 'off', so choosing no sandbox
+    deliberately is unaffected -- only a value that was meant to be something
+    fails.
     """
     # The broker, proxy, and command service are built once. Keep the spawn
     # boundary on that same startup mode until the reported restart happens.
@@ -296,14 +309,15 @@ def mode() -> str:
     value = raw.lower()
     if value in _MODES:
         return value
-    if raw:
-        logger.error(
-            "sandbox.mode=%r is not one of %s; running with NO sandbox. Fix the "
-            "value in config.yaml, or drop the key to choose that deliberately.",
-            raw,
-            list(_MODES),
-        )
-    return "off"
+    # A commented-out or emptied key reads as "off", the same as an absent one.
+    # Only a value somebody meant to be something is an error.
+    if not raw:
+        return "off"
+    raise SandboxModeError(
+        f"sandbox.mode={raw!r} is not one of {list(_MODES)}. Fix the value in "
+        f"{settings.operator_settings()}, or drop the key to run with no sandbox "
+        f"deliberately. Refusing to start rather than serving turns unsandboxed."
+    )
 
 
 def enabled() -> bool:
@@ -741,9 +755,11 @@ def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
     turns of every other thread. 1088 of them were readable on the host this was
     measured on.
 
-    Without `scoped_sessions` the home is the shared one, whose subpath grant
-    covers the `sessions` deny under it, so the tree is readable and writable
-    again -- which is what keeps a rollout written before the setting resumable.
+    Without `scoped_sessions` the home is the shared one, so the `sessions` deny
+    under it is re-granted and a rollout written before the setting stays
+    resumable. Only `sessions/` is: the caller narrows the write grant to this
+    function's first element in that state, because granting the home itself
+    would take the whole of `~/.codex` with it. See `_macos_wrap`.
     """
     from claude_on_the_fly import codex_state, envfile
 
@@ -1233,6 +1249,21 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     base = _fs_base_profile()
     claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
+    # The write grant, which is not always the home. Scoped, the home is a
+    # per-thread directory under DATA_DIR and granting its subpath is the point.
+    # Unscoped, the home *is* the operator's `~/.codex`, and the profile writes
+    # this grant after `(deny file-write* (subpath _HOME/.codex))`. SBPL is
+    # last-match-wins, so passing the home there would nullify that deny for the
+    # whole tree -- `config.toml`, `AGENTS.md`, `hooks.json`, `rules`, `agents`,
+    # `prompts`, `skills` -- and those decide what codex is told and what it
+    # runs, in every later run and outside any jail. The collapse stops at
+    # `sessions/`: the one subtree a rollout written before the boundary needs,
+    # and exactly what the profile granted before the boundary existed.
+    #
+    # Linux needs no equivalent. `_linux_grants` puts `_codex_protected` under
+    # `write_denied` whatever the setting says, so the shared tree keeps its
+    # instruction files read-only there either way.
+    codex_write = codex_home if scoped_sessions() else codex_sessions
     return sandbox_macos.jail_argv(
         argv,
         **sandbox_macos.realpaths(workspace, DATA_DIR),
@@ -1240,7 +1271,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         claude_projects=claude_projects,
         claude_project=claude_project,
         codex_sessions=codex_sessions,
-        codex_home=codex_home,
+        codex_home=codex_write,
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
