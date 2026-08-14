@@ -112,6 +112,7 @@ FIELDS: dict[str, Field] = {
     "sandbox.fs": Field("COTF_SANDBOX_FS"),
     "sandbox.extra_paths": Field("COTF_SANDBOX_EXTRA_PATHS", sep=":"),
     "sandbox.broker_only_loopback": Field("COTF_SANDBOX_BROKER_ONLY_LOOPBACK"),
+    "sandbox.scope_sessions": Field("COTF_SANDBOX_SCOPE_SESSIONS"),
     "agent.backend": Field("AGENT_BACKEND"),
     "agent.claude.mode": Field("CLAUDE_MODE"),
     "agent.claude.model": Field("CLAUDE_MODEL"),

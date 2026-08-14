@@ -247,6 +247,12 @@ sandbox:
   # Narrow egress to the broker's loopback port and the egress proxy's, nothing else.
   # broker_only_loopback: true
 
+  # jail mode only. Give each chat thread its own agent session store, so a turn
+  # reads and writes only its own transcripts instead of every thread's. Off by
+  # default: with it off, every backend keeps one shared store, which is where a
+  # thread started before this setting existed left its transcript.
+  # scope_sessions: true
+
 agent:
   # backend: claude (default) | codex
   # Per-backend mode: native | ollama; claude also has pty, the only mode that

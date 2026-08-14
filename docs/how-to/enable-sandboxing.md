@@ -38,6 +38,12 @@ sandbox:
 `deny-most` hides most of `$HOME`. Add the directories containing interpreters and
 package managers. The directory holding the agent binary is granted automatically.
 
+To also stop a turn reading other threads' transcripts, add `scope_sessions: true`.
+Warning: it moves the session stores, so a conversation already running loses its
+memory. codex reports this as `no rollout found for thread id` and the turn fails.
+Turn it on when the deployment is quiet, and expect the first turn of each existing
+chat thread to start fresh.
+
 On Linux, install bubblewrap first (`apt install bubblewrap`, or your distribution's
 equivalent), and note two differences the daemon logs at startup:
 

@@ -11,6 +11,7 @@ Lifecycle terms are defined in [Configuration files and lifecycle](settings.md).
 | `fs` | string / allow reads | `deny-most` narrows home-directory reads; jail only | Next turn |
 | `extra_paths` | list / empty | Up to three read grants for `deny-most` | Next turn |
 | `broker_only_loopback` | boolean / false | Limit jail loopback to published broker/proxy ports | Next turn |
+| `scope_sessions` | boolean / false | Give each chat thread its own agent session store; jail only | Next turn |
 
 In `jail` mode, the agent may read the global Claude configuration needed to start but
 cannot persist turn-created global `~/.claude` settings, hooks, or plugins. The

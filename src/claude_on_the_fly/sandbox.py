@@ -668,6 +668,28 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     return list(seen.values())
 
 
+def scoped_sessions() -> bool:
+    """Whether one chat thread gets a session store of its own. Opt-in, default off.
+
+    On, a jailed turn reads and writes only the running thread's transcripts: the
+    claude grant narrows to `projects/<workspace hash>` and codex gets a
+    `CODEX_HOME` per workspace (`codex_state.home_dir`).
+
+    Off is what every deployment did before the setting existed, and what it keeps
+    doing after an upgrade. One shared store per backend, so a codex thread started
+    without the setting stays resumable and a claude `--continue` still finds its
+    session. Both profiles express the boundary as a deny on the store followed by
+    a grant on the running thread's path inside it, and SBPL is last-match-wins, so
+    off resolves the granted path back onto the store itself and the deny is
+    nullified by its own re-grant. The Linux jail drops the two masks instead.
+
+    Read per call, like every other setting: an operator's edit takes effect on the
+    next turn, and turning it on mid-conversation is what `codex_state.adopt_rollout`
+    exists to survive.
+    """
+    return settings.get("COTF_SANDBOX_SCOPE_SESSIONS").lower() in _TRUTHY
+
+
 def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
     """(the config dir, the session store to deny, this thread's dir to grant).
 
@@ -689,14 +711,20 @@ def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
     home behind a symlink would otherwise leave the grant matching nothing.
     Neither path has to exist yet -- realpath resolves the existing prefix, and
     the grant covers the directory itself, so the CLI may create it.
+
+    Without `scoped_sessions` the third path is the store, so the pair collapses
+    to "deny the store, grant the store" and the whole tree stays readable and
+    writable, as it was before the boundary existed.
     """
     from claude_on_the_fly import envfile, transcript
 
-    return (
-        Path(os.path.realpath(envfile.claude_config_dir())),
-        Path(os.path.realpath(transcript.claude_projects_dir())),
-        Path(os.path.realpath(transcript.claude_session_dir(workspace))),
+    projects = Path(os.path.realpath(transcript.claude_projects_dir()))
+    thread = (
+        Path(os.path.realpath(transcript.claude_session_dir(workspace)))
+        if scoped_sessions()
+        else projects
     )
+    return (Path(os.path.realpath(envfile.claude_config_dir())), projects, thread)
 
 
 def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
@@ -712,6 +740,10 @@ def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
     per-workspace homes existed, and a jailed turn could otherwise read the raw
     turns of every other thread. 1088 of them were readable on the host this was
     measured on.
+
+    Without `scoped_sessions` the home is the shared one, whose subpath grant
+    covers the `sessions` deny under it, so the tree is readable and writable
+    again -- which is what keeps a rollout written before the setting resumable.
     """
     from claude_on_the_fly import codex_state, envfile
 
@@ -972,7 +1004,14 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         "opaque": [
             home,
             data_dir,
-            *(path for path in (claude_projects, codex_sessions) if path.is_dir()),
+            # Both masks belong to the session boundary, so both go when it is off:
+            # the read-write binds below would otherwise have to fight a tmpfs over
+            # the same path, and which one won would depend on argv order.
+            *(
+                path
+                for path in (claude_projects, codex_sessions)
+                if scoped_sessions() and path.is_dir()
+            ),
         ],
         "read_only": [
             # What the per-thread codex home links to. Read-only because it is the

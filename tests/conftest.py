@@ -161,6 +161,18 @@ def operator_settings(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def scoped_sessions(monkeypatch):
+    """Turn the per-thread session boundary on for one test.
+
+    It is opt-in and off by default, so every test that asserts a store is scoped
+    has to ask for it. Set through the environment variable rather than a patched
+    function, so the test exercises the same resolver an operator's `config.yaml`
+    goes through.
+    """
+    monkeypatch.setenv("COTF_SANDBOX_SCOPE_SESSIONS", "1")
+
+
+@pytest.fixture
 def clear_backend_env(monkeypatch):
     """Strip backend-selection env vars so tests start from a clean slate."""
     for var in (

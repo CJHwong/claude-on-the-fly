@@ -74,7 +74,16 @@ def home_dir(workspace: Path) -> Path:
 
     Daemon-owned under DATA_DIR, beside the mappings and outside the
     agent-writable workspace, for the reason this module exists.
+
+    Without `sandbox.scoped_sessions` this is the operator's shared home, which is
+    where codex kept every rollout before per-thread homes existed. One place
+    decides it, so the profile parameter and the `CODEX_HOME` the backend sets on
+    the child cannot disagree about where the rollouts are.
     """
+    from claude_on_the_fly import envfile, sandbox
+
+    if not sandbox.scoped_sessions():
+        return envfile.codex_home()
     return HOMES_DIR / _home_key(workspace)
 
 
@@ -86,15 +95,23 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
     Absent shared entries are skipped rather than stubbed, because codex treats a
     missing config as "use the defaults" and a dangling link as an error.
     """
-    from claude_on_the_fly import envfile
+    from claude_on_the_fly import envfile, sandbox
 
     home = home_dir(workspace)
     # sessions/ is created here rather than left to codex because the jail makes
     # $HOME opaque, and a recursive mkdir that cannot stat an ancestor walks up and
     # tries to create it instead: measured as `mkdir: /Users/hoss: Operation not
     # permitted` on a path whose leaf was granted. Creating the chain now leaves
-    # codex writing files inside a directory that already exists.
+    # codex writing files inside a directory that already exists. True of the shared
+    # home too: the boundary decides which home a turn gets, not whether the
+    # directory codex is about to write into is there.
     (home / "sessions").mkdir(parents=True, exist_ok=True)
+    if not sandbox.scoped_sessions():
+        # `home` is the operator's own shared tree here, so there is nothing to link:
+        # every entry is already in place, and linking one onto itself would replace
+        # the operator's config with a link to itself. `shared` is only ever a link
+        # source, so it does not change that.
+        return home
     # Resolved through envfile, not `Path.home() / ".codex"`. A deployment that sets
     # CODEX_HOME keeps its config and credential there, and the hardcoded default
     # pointed at a directory that may hold neither -- every link then skipped as an
@@ -330,7 +347,13 @@ def remove_workspace(workspace: Path) -> None:
     """
     canonical_workspace = workspace.resolve(strict=False)
     # Links first, so removing the tree cannot follow one into the shared ~/.codex.
-    home = home_dir(workspace)
+    #
+    # Addressed under HOMES_DIR rather than through `home_dir`, which answers with
+    # the shared home when the session boundary is off. Retiring one workspace would
+    # then delete the operator's whole ~/.codex. This name is derived from the
+    # workspace either way, so a home left behind by an earlier scoped run is still
+    # the one that goes.
+    home = HOMES_DIR / _home_key(workspace)
     for link in [
         *(home / name for name in _SHARED_ENTRIES),
         *(entry for name in _SHARED_MERGED for entry in _safe_iterdir(home / name)),

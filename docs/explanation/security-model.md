@@ -52,9 +52,16 @@ the real authorization boundary.
 
 ## One thread cannot read another's conversation
 
-Under `jail`, a turn reaches only its own thread's transcripts. This matters more than
-the credential denies beside it: a token is a single secret, while a transcript is the
-message text itself, including what other people wrote in other threads.
+Under `jail` with `sandbox.scope_sessions` on, a turn reaches only its own thread's
+transcripts. This matters more than the credential denies beside it: a token is a single
+secret, while a transcript is the message text itself, including what other people wrote
+in other threads.
+
+The setting is off by default, because scoping the stores moves them. A codex thread
+started while it was off left its rollout in the shared tree, and `codex resume` cannot
+find it from a per-thread `CODEX_HOME`, so turning this on can cost a running
+conversation its memory. Turn it on deliberately, on a deployment where more than one
+person's messages reach the same host.
 
 Each chat thread already gets its own workspace, so the workspace is the boundary the
 jail scopes to. The two backends need different mechanisms because they store sessions

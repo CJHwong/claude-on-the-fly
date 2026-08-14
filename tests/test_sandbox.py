@@ -1215,7 +1215,7 @@ def test_the_codex_directory_is_deny_default_not_a_denylist(profile):
 
 @pytest.mark.parametrize("target", _CODEX_MUST_NOT_WRITE)
 def test_codex_execution_control_paths_are_unwritable_in_the_jail(
-    monkeypatch, tmp_path, original_home, target
+    monkeypatch, tmp_path, original_home, target, scoped_sessions
 ):
     """Live counterpart, against the real home so the deny is why the write fails
     rather than the path being absent.
@@ -1702,7 +1702,7 @@ def _session_dirs(home: Path, workspace: Path) -> tuple[Path, Path]:
 
 @pytest.mark.parametrize("fs_base", ["", "deny-most"])
 def test_the_running_threads_claude_session_dir_is_writable_under_the_jail(
-    monkeypatch, tmp_path, original_home, fs_base
+    monkeypatch, tmp_path, original_home, fs_base, scoped_sessions
 ):
     """The claude CLI is the jailed process, and it writes its own session JSONL to
     `<config dir>/projects/<workspace hash>/`. The blanket deny on ~/.claude covered
@@ -1742,7 +1742,7 @@ def test_the_running_threads_claude_session_dir_is_writable_under_the_jail(
 
 @pytest.mark.parametrize("fs_base", ["", "deny-most"])
 def test_another_threads_claude_session_file_is_unreadable_under_the_jail(
-    monkeypatch, tmp_path, original_home, fs_base
+    monkeypatch, tmp_path, original_home, fs_base, scoped_sessions
 ):
     """Every workspace is one chat thread, so the session store held every other
     thread's verbatim turns and both profiles let a jailed turn read all of them.
@@ -1820,7 +1820,9 @@ def test_both_profiles_receive_the_session_grant_params(tmp_path):
         assert f"_CLAUDE_PROJECT={tmp_path / 'projects' / 'thread'}" in argv
 
 
-def test_the_session_grant_follows_a_redirected_config_dir(monkeypatch, tmp_path):
+def test_the_session_grant_follows_a_redirected_config_dir(
+    monkeypatch, tmp_path, scoped_sessions
+):
     """CLAUDE_CONFIG_DIR moves the store, so the grant must move with it. Derived
     from transcript, which owns the hash scheme the CLI computes, so the path the
     jail grants and the path the daemon later reads cannot drift apart."""
@@ -1834,6 +1836,85 @@ def test_the_session_grant_follows_a_redirected_config_dir(monkeypatch, tmp_path
     assert thread.name == str(workspace.resolve()).replace("/", "-").replace(
         ".", "-"
     ).replace("_", "-")
+
+
+class TestTheSessionBoundaryIsOptIn:
+    """Off by default, and off has to mean the pre-boundary policy exactly.
+
+    Scoping a store moves it. A codex thread started while it was off left its
+    rollout in the shared tree, and `codex resume` against a per-thread CODEX_HOME
+    answers "no rollout found for thread id", which fails the turn outright.
+    """
+
+    def test_it_is_off_without_the_setting(self):
+        assert sandbox.scoped_sessions() is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+    def test_the_operator_can_turn_it_on(self, monkeypatch, value):
+        monkeypatch.setenv("COTF_SANDBOX_SCOPE_SESSIONS", value)
+        assert sandbox.scoped_sessions() is True
+
+    def test_off_grants_the_claude_store_the_deny_covers(self, tmp_path):
+        """Both profiles deny the store and grant the thread's path inside it, in
+        that order, and SBPL is last-match-wins. Granting the store back is what
+        nullifies the deny without touching a profile line."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _, projects, thread = sandbox._claude_session_paths(workspace)
+        assert thread == projects
+
+    def test_off_puts_codex_rollouts_back_in_the_shared_home(self, tmp_path):
+        from claude_on_the_fly import codex_state, envfile
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sessions, home = sandbox._codex_session_paths(workspace)
+        assert home == Path(os.path.realpath(envfile.codex_home()))
+        assert sessions == Path(os.path.realpath(envfile.codex_home() / "sessions"))
+        # And the backend points the child at the same one, or the grant and the
+        # rollout would part company.
+        assert codex_state.ensure_home(workspace) == envfile.codex_home()
+
+    def test_off_leaves_the_shared_home_as_the_operator_wrote_it(self, tmp_path):
+        """No links, because every entry is already there. Linking one onto itself
+        would replace the operator's config with a link to itself."""
+        from claude_on_the_fly import codex_state, envfile
+
+        shared = envfile.codex_home()
+        (shared / "sessions").mkdir(parents=True, exist_ok=True)
+        shared.joinpath("config.toml").write_text("model = 'x'\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        codex_state.ensure_home(workspace, shared=tmp_path / "somewhere-else")
+        assert not (shared / "config.toml").is_symlink()
+        assert (shared / "config.toml").read_text() == "model = 'x'\n"
+
+    def test_off_drops_both_linux_masks(self, tmp_path, monkeypatch):
+        """A tmpfs and a read-write bind over one path would leave argv order
+        deciding the policy, so the mask goes rather than being fought."""
+        monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _, projects, _ = sandbox._claude_session_paths(workspace)
+        sessions, _ = sandbox._codex_session_paths(workspace)
+        projects.mkdir(parents=True, exist_ok=True)
+        sessions.mkdir(parents=True, exist_ok=True)
+        grants = sandbox._linux_grants(workspace)
+        assert projects not in grants["opaque"]
+        assert sessions not in grants["opaque"]
+
+    def test_retiring_a_workspace_never_reaches_the_shared_home(self, tmp_path):
+        """`home_dir` answers with the shared home when the boundary is off, so a
+        retirement addressed through it would delete the operator's whole ~/.codex."""
+        from claude_on_the_fly import codex_state, envfile
+
+        shared = envfile.codex_home()
+        shared.mkdir(parents=True, exist_ok=True)
+        shared.joinpath("auth.json").write_text("{}\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        codex_state.remove_workspace(workspace)
+        assert (shared / "auth.json").is_file()
 
 
 def test_the_spawned_agent_is_told_which_config_dir_the_daemon_resolved(
@@ -1850,7 +1931,9 @@ def test_the_spawned_agent_is_told_which_config_dir_the_daemon_resolved(
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "elsewhere")
 
 
-def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(tmp_path):
+def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(
+    tmp_path, scoped_sessions
+):
     """The bubblewrap mirror of the seatbelt pair. projects/ is opaque rather than
     read-only, because the read-only ~/.claude mount would otherwise expose every
     other thread's turns. The running thread's directory is granted back deeper, the
@@ -1910,7 +1993,7 @@ def test_the_shared_codex_rollout_tree_is_no_longer_writable(profile):
     assert '(allow file-write* (subpath (param "_CODEX_HOME")))' in text
 
 
-def test_each_workspace_gets_its_own_codex_home(tmp_path):
+def test_each_workspace_gets_its_own_codex_home(tmp_path, scoped_sessions):
     """The isolation boundary. codex names a rollout at startup from the date and
     thread id, so there is nothing per-workspace to grant inside one shared tree."""
     from claude_on_the_fly import codex_state
@@ -1923,7 +2006,9 @@ def test_each_workspace_gets_its_own_codex_home(tmp_path):
     assert codex_state.home_dir(first) == codex_state.home_dir(first)
 
 
-def test_the_codex_home_links_the_operators_config_and_credential(tmp_path):
+def test_the_codex_home_links_the_operators_config_and_credential(
+    tmp_path, scoped_sessions
+):
     """codex must still read the operator's configuration and its own credential.
     Links rather than copies, so an operator's edit applies on the next turn, and a
     write through the link resolves onto a path the profile already governs."""
@@ -1946,7 +2031,9 @@ def test_the_codex_home_links_the_operators_config_and_credential(tmp_path):
     assert not (home / "hooks.json").exists()
 
 
-def test_ensure_home_is_idempotent_and_relinks_a_moved_target(tmp_path):
+def test_ensure_home_is_idempotent_and_relinks_a_moved_target(
+    tmp_path, scoped_sessions
+):
     """It runs before every spawn, so a second call must not fail, and an operator
     who repoints a shared entry gets the new target without a restart."""
     from claude_on_the_fly import codex_state
@@ -1966,7 +2053,9 @@ def test_ensure_home_is_idempotent_and_relinks_a_moved_target(tmp_path):
     assert (relinked / "config.toml").readlink() == moved / "config.toml"
 
 
-def test_removing_a_workspace_takes_its_codex_home_without_following_links(tmp_path):
+def test_removing_a_workspace_takes_its_codex_home_without_following_links(
+    tmp_path, scoped_sessions
+):
     """The home holds that thread's rollouts and its name encodes a path that will
     never exist again, so nothing else could reclaim it. The links are unlinked
     first, or the tree walk would delete the operator's shared config."""
@@ -1984,7 +2073,9 @@ def test_removing_a_workspace_takes_its_codex_home_without_following_links(tmp_p
     assert (shared / "config.toml").read_text() == "keep me\n"
 
 
-def test_linux_grants_hide_other_threads_rollouts_and_keep_this_ones(tmp_path):
+def test_linux_grants_hide_other_threads_rollouts_and_keep_this_ones(
+    tmp_path, scoped_sessions
+):
     """The bubblewrap mirror. The shared tree is masked with an empty tmpfs; the
     thread's own home is a read-write mount, and it has to exist because a mount
     source that is absent takes the whole turn with it."""
@@ -2000,7 +2091,9 @@ def test_linux_grants_hide_other_threads_rollouts_and_keep_this_ones(tmp_path):
     assert codex_home in grants["read_write"]
 
 
-def test_an_absent_session_store_is_not_named_as_a_mount(tmp_path, monkeypatch):
+def test_an_absent_session_store_is_not_named_as_a_mount(
+    tmp_path, monkeypatch, scoped_sessions
+):
     """bwrap creates its mount points inside a `--ro-bind / /` root, so naming a
     path that does not exist on the host fails the whole spawn with "Can't mkdir
     parents ... Read-only file system" rather than being skipped.
@@ -2183,7 +2276,7 @@ def test_linux_grants_mirror_the_claude_runtime_writes_and_mask_history(tmp_path
 
 
 async def test_preflight_refuses_when_the_agent_cannot_persist_its_session(
-    linux, monkeypatch
+    linux, monkeypatch, scoped_sessions
 ):
     """The failure this probe exists for. It is the only positive check in
     preflight, because a profile that denies the CLI its own session file breaks
@@ -2203,7 +2296,9 @@ async def test_preflight_refuses_when_the_agent_cannot_persist_its_session(
         await sandbox.preflight()
 
 
-async def test_preflight_does_not_trust_the_exit_code_alone(linux, monkeypatch):
+async def test_preflight_does_not_trust_the_exit_code_alone(
+    linux, monkeypatch, scoped_sessions
+):
     """A zero exit with no file is the shape a mount that silently went missing
     has: the shell succeeds against a tmpfs the jail then discards. So the probe
     checks the host side, which is where the CLI's real session file has to land."""
@@ -2220,7 +2315,9 @@ async def test_preflight_does_not_trust_the_exit_code_alone(linux, monkeypatch):
         await sandbox.preflight()
 
 
-def test_the_shared_codex_rollout_tree_is_always_masked_on_linux(tmp_path, monkeypatch):
+def test_the_shared_codex_rollout_tree_is_always_masked_on_linux(
+    tmp_path, monkeypatch, scoped_sessions
+):
     """The gap this closes: Linux binds ~/.codex read-write, so an unmasked shared
     tree could be created by the jailed turn itself and written into -- working but
     unisolated, where macOS refuses. Masking needs the path to exist, so it is
@@ -2237,7 +2334,9 @@ def test_the_shared_codex_rollout_tree_is_always_masked_on_linux(tmp_path, monke
     assert codex_sessions in sandbox._linux_grants(workspace)["opaque"]
 
 
-def test_the_mount_sources_exist_before_the_grants_are_computed(tmp_path, monkeypatch):
+def test_the_mount_sources_exist_before_the_grants_are_computed(
+    tmp_path, monkeypatch, scoped_sessions
+):
     """Ordering, and it is the policy rather than a detail.
 
     `_linux_grants` decides whether to mask a session store by whether it exists.
@@ -2312,7 +2411,7 @@ def test_a_mount_source_file_that_cannot_be_created_is_reported(
 
 
 async def test_the_session_preflight_reports_a_probe_that_could_not_run(
-    linux, monkeypatch
+    linux, monkeypatch, scoped_sessions
 ):
     """A probe that never ran is not evidence of anything, so it must not read as a
     pass. Distinguished from the session write being denied, which is a different

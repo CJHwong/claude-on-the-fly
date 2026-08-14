@@ -67,6 +67,14 @@ runtime paths measured as necessary.
 
 ## Per-thread session grants
 
+`sandbox.scope_sessions` gates the whole boundary and is off by default
+(`sandbox.scoped_sessions()`). Off, the granted path resolves back onto the store it
+sits in: `_CLAUDE_PROJECT` becomes `_CLAUDE_PROJECTS` and `_CODEX_HOME` becomes the
+shared codex home. SBPL is last-match-wins and the grant is written after the deny, so
+each deny is nullified by its own re-grant and no profile line has to change. On Linux
+the two masks are dropped instead, because a tmpfs and a read-write bind over the same
+path would leave argv order deciding the policy.
+
 Four profile parameters carry the session boundary, resolved per run from the workspace
 and realpath'd like every other one:
 

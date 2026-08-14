@@ -314,6 +314,10 @@ class TestCodexHomeShieldsExecutionControlNames:
     what codex executes or is told must resolve onto the shared paths the profile
     denies writes to."""
 
+    @pytest.fixture(autouse=True)
+    def _boundary_on(self, scoped_sessions):
+        """Every test here is about the per-thread home, which is opt-in."""
+
     def test_a_real_file_left_by_the_agent_is_replaced_by_the_link(self, tmp_path):
         """Without this, a turn could write its own AGENTS.md into its home and leave
         itself standing orders for the next run -- exactly what the shared ~/.codex
@@ -344,7 +348,9 @@ class TestCodexHomeShieldsExecutionControlNames:
         assert not (home / "config.toml").is_symlink()
 
 
-def test_the_home_links_follow_a_redirected_codex_home(tmp_path, monkeypatch):
+def test_the_home_links_follow_a_redirected_codex_home(
+    tmp_path, monkeypatch, scoped_sessions
+):
     """A deployment that sets CODEX_HOME keeps its config and credential there.
 
     Hardcoding `Path.home() / ".codex"` pointed the links at a directory that may
@@ -374,6 +380,10 @@ class TestSharedSkillsReachThePerThreadHome:
     a write-denied shared path, and it cannot simply be left empty either -- the
     operator's skills were reachable before per-thread homes existed.
     """
+
+    @pytest.fixture(autouse=True)
+    def _boundary_on(self, scoped_sessions):
+        """Every test here is about the per-thread home, which is opt-in."""
 
     def test_shared_skills_are_linked_entry_by_entry(self, tmp_path):
         shared = tmp_path / "shared-codex"
