@@ -65,6 +65,73 @@ Codex requires the hook trust bypass because inline hooks have no persisted trus
 Seatbelt therefore denies writes to Codex execution-control paths and re-grants only the
 runtime paths measured as necessary.
 
+## Per-thread session grants
+
+Four profile parameters carry the session boundary, resolved per run from the workspace
+and realpath'd like every other one:
+
+| Parameter | Value | Rule |
+|---|---|---|
+| `_CLAUDE_CONFIG` | `envfile.claude_config_dir()` | write denied, then re-granted below |
+| `_CLAUDE_PROJECTS` | `<config dir>/projects` | read denied |
+| `_CLAUDE_PROJECT` | `…/projects/<workspace hash>` | read and write granted |
+| `_CODEX_SESSIONS` | `<shared codex home>/sessions` | read denied |
+| `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>` | read and write granted |
+
+Every claude rule is written against `_CLAUDE_CONFIG` rather than `$HOME/.claude`,
+because `CLAUDE_CONFIG_DIR` can move the tree outside `$HOME` where a `_HOME`-derived
+rule matches nothing while the profile still loads.
+
+## What a claude turn may write
+
+`_CLAUDE_RUNTIME_WRITES` in `sandbox.py` is the re-grant list, and it is a
+measurement: two real turns, one making a Bash tool call and one resuming with
+`--continue`, diffing the config tree either side. The codex list above was built the
+same way. Three buckets decide what goes in it:
+
+| Bucket | Examples | Policy |
+|---|---|---|
+| Instruction-bearing | `settings.json`, `hooks.json`, `CLAUDE.md`, `commands/`, `skills/`, `agents/`, `plugins/` root | write denied; read on later invocations, so a write outlives the session |
+| Conversation-bearing | `projects/<hash>/` (session JSONL **and** the per-project memory dir), `history.jsonl` | per-thread only, or denied outright |
+| Runtime scratch | `shell-snapshots/`, `session-env/`, `sessions/`, `plugins/cache/`, `policy-limits.json` | granted machine-wide; none decides what the agent executes or is told |
+
+`_CLAUDE_RUNTIME_WRITE_FILES` is split from `_CLAUDE_RUNTIME_WRITE_DIRS` because the
+Linux wrap creates each mount source, and `mkdir` on a file target leaves a
+*directory* called `policy-limits.json` that the CLI then cannot write. Same
+distinction, and same reason, as `_CODEX_PROTECTED_DIRS`.
+
+Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside the
+per-thread grant, so it is isolated by the same rule as the transcript and needs no
+grant of its own. Before the per-thread grant existed it was denied along with the
+session file, so memory was silently off under `jail` too.
+
+Both bases reference all four, unlike `_EXTRA_*`, so `jail_argv` always passes them. A
+profile referencing an unpassed `-D` is refused outright, which is the failure worth
+having: the alternative is a jail that loads with the session grant silently absent.
+
+Three ordering constraints, all found by a live probe rather than by reading:
+
+- On Linux, `_ensure_session_mount_sources` runs **before** `_linux_grants`. The grants
+  decide whether to mask a session store by whether it exists, so creating the sources
+  afterwards left the shared codex tree unmasked and then created it. Since Linux binds
+  `~/.codex` read-write, a jailed turn could write a rollout straight into it: measured
+  at rc 0 with the file landing on the host, while the whole suite stayed green.
+
+- The codex pair must come *after* the `~/.codex` read allow. SBPL is last-match-wins, so
+  placed before it the allow won and a jailed turn still read another thread's rollout
+  while the profile looked correct.
+- `codex_state.ensure_home` creates `sessions/` before the spawn. A recursive mkdir that
+  cannot stat an ancestor walks up and tries to create it, which under an opaque `$HOME`
+  fails at `/Users/<name>` on a path whose leaf was granted.
+
+The claude grant is derived from `envfile.claude_config_dir()`, and `agent_env` states
+`CLAUDE_CONFIG_DIR` on the child for the same reason: it is not a passthrough key, so a
+deployment setting it in `DATA_DIR/.env` would leave the daemon and the CLI resolving
+different stores, and the grant pointing at a directory the CLI never writes.
+
+`CODEX_HOME` is set on the child by the codex backend rather than published as a session
+override, because the jobs and cron daemons never open a session.
+
 ## Linux jail
 
 `sandbox_linux.py` builds bubblewrap argv; `sandbox.py` owns which paths, beside the

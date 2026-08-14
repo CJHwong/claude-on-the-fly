@@ -324,15 +324,23 @@ async def _run_codex_exec(
     workspace: Path, cmd: list[str], timeout: float | None
 ) -> dict:
     """Run codex, collect stdout, parse JSONL. Raises RuntimeError on failure."""
+    # Before the wrap: the jail grants this path by name, and on Linux it is a
+    # mount source, which has to exist. Set on the child rather than through a
+    # session override so every spawn path gets it -- the jobs and cron daemons
+    # never open a session, and a codex turn there would otherwise write its
+    # rollout into the shared tree that the jail no longer grants.
+    codex_home = codex_state.ensure_home(workspace)
     cmd = sandbox.wrap(cmd, workspace)
     logger.debug("codex exec: cwd=%s cmd=%s", workspace, " ".join(cmd[:8]) + "...")
+    env = sandbox.agent_env()
+    env = {**(os.environ if env is None else env), "CODEX_HOME": str(codex_home)}
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
         start_new_session=True,
-        env=sandbox.agent_env(),
+        env=env,
     )
     agent.track_agent_process(proc, cmd)
     try:

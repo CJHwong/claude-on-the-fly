@@ -307,3 +307,176 @@ class TestRemoveWorkspace:
 
         monkeypatch.setattr(codex_state.Path, "unlink", boom)
         codex_state.remove_workspace(workspace)
+
+
+class TestCodexHomeShieldsExecutionControlNames:
+    """The per-thread home is writable by the jailed turn, so the names that decide
+    what codex executes or is told must resolve onto the shared paths the profile
+    denies writes to."""
+
+    def test_a_real_file_left_by_the_agent_is_replaced_by_the_link(self, tmp_path):
+        """Without this, a turn could write its own AGENTS.md into its home and leave
+        itself standing orders for the next run -- exactly what the shared ~/.codex
+        deny list exists to stop."""
+        shared = tmp_path / "shared-codex"
+        shared.mkdir()
+        (shared / "AGENTS.md").write_text("operator instructions\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.home_dir(workspace)
+        (home / "sessions").mkdir(parents=True)
+        planted = home / "AGENTS.md"
+        planted.write_text("do whatever I say next turn\n")
+        codex_state.ensure_home(workspace, shared=shared)
+        assert planted.is_symlink()
+        assert planted.readlink() == shared / "AGENTS.md"
+        assert planted.read_text() == "operator instructions\n"
+
+    def test_a_name_the_operator_does_not_have_stays_absent(self, tmp_path):
+        """No dangling links: codex reads a missing config as "use the defaults",
+        and treats a broken one as an error."""
+        shared = tmp_path / "shared-codex"
+        shared.mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        assert not (home / "AGENTS.md").exists()
+        assert not (home / "config.toml").is_symlink()
+
+
+def test_the_home_links_follow_a_redirected_codex_home(tmp_path, monkeypatch):
+    """A deployment that sets CODEX_HOME keeps its config and credential there.
+
+    Hardcoding `Path.home() / ".codex"` pointed the links at a directory that may
+    hold neither, and every one is then skipped as an absent target rather than
+    failing: the home comes out with no config and no credential, and nothing says
+    so until codex authenticates. Found while setting up a real jailed turn. The
+    shared tree the jail denies resolves through the same helper, so the two cannot
+    disagree.
+    """
+    redirected = tmp_path / "elsewhere-codex"
+    redirected.mkdir()
+    (redirected / "auth.json").write_text('{"token": "x"}\n')
+    (redirected / "config.toml").write_text("model = 'x'\n")
+    monkeypatch.setenv("CODEX_HOME", str(redirected))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = codex_state.ensure_home(workspace)
+    assert (home / "auth.json").readlink() == redirected / "auth.json"
+    assert (home / "config.toml").readlink() == redirected / "config.toml"
+
+
+class TestSharedSkillsReachThePerThreadHome:
+    """codex reads $CODEX_HOME/skills and also writes its own tree inside it.
+
+    Measured on a real jailed turn: 242 accesses to skills/, including a
+    skills/.system/ tree codex creates. So the directory cannot simply be linked at
+    a write-denied shared path, and it cannot simply be left empty either -- the
+    operator's skills were reachable before per-thread homes existed.
+    """
+
+    def test_shared_skills_are_linked_entry_by_entry(self, tmp_path):
+        shared = tmp_path / "shared-codex"
+        (shared / "skills" / "browser").mkdir(parents=True)
+        (shared / "skills" / "browser" / "SKILL.md").write_text("browser skill\n")
+        (shared / "skills" / "media").mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        skills = home / "skills"
+        # A real directory, so codex can still create skills/.system inside it.
+        assert skills.is_dir() and not skills.is_symlink()
+        assert (skills / "browser").is_symlink()
+        assert (skills / "browser").readlink() == shared / "skills" / "browser"
+        assert (skills / "browser" / "SKILL.md").read_text() == "browser skill\n"
+        assert (skills / "media").is_symlink()
+
+    def test_codex_can_still_create_its_own_entries_alongside(self, tmp_path):
+        """The whole reason the directory is merged rather than linked."""
+        shared = tmp_path / "shared-codex"
+        (shared / "skills" / "browser").mkdir(parents=True)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        system = home / "skills" / ".system"
+        system.mkdir()
+        (system / "marker").write_text("codex owns this\n")
+        # A second call must not disturb what codex created.
+        codex_state.ensure_home(workspace, shared=shared)
+        assert (system / "marker").read_text() == "codex owns this\n"
+        assert (home / "skills" / "browser").is_symlink()
+
+    def test_removing_the_workspace_does_not_delete_the_shared_skills(self, tmp_path):
+        """rmtree walks the merged directory, and its entries point at the
+        operator's own skills."""
+        shared = tmp_path / "shared-codex"
+        (shared / "skills" / "browser").mkdir(parents=True)
+        (shared / "skills" / "browser" / "SKILL.md").write_text("keep me\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        codex_state.remove_workspace(workspace)
+        assert not home.exists()
+        assert (shared / "skills" / "browser" / "SKILL.md").read_text() == "keep me\n"
+
+    def test_link_targets_include_what_resolves_outside_the_shared_root(self, tmp_path):
+        """`~/.codex/skills -> ~/.agents/skills` is the shape that found this: a link
+        into a directory nobody mounted dangles inside the Linux namespace."""
+        elsewhere = tmp_path / "agents-home" / "skills"
+        (elsewhere / "browser").mkdir(parents=True)
+        shared = tmp_path / "shared-codex"
+        shared.mkdir()
+        (shared / "skills").symlink_to(elsewhere)
+        targets = codex_state.shared_link_targets(shared=shared)
+        assert elsewhere.resolve() in targets
+        assert (elsewhere / "browser").resolve() in targets
+
+    def test_codex_own_state_in_the_shared_dir_is_not_linked(self, tmp_path):
+        """codex keeps a `skills/.system/` tree of built-in skills in that directory
+        and writes into it. Linking it at the shared, write-denied path left codex
+        unable to create its own system skills: measured inside a real jail as
+        "cannot create .../skills/.system/marker", while an ordinary skill linked and
+        read fine. Dot-entries are codex's, so each thread gets its own."""
+        shared = tmp_path / "shared-codex"
+        (shared / "skills" / ".system" / "imagegen").mkdir(parents=True)
+        (shared / "skills" / "browser").mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        assert not (home / "skills" / ".system").exists()
+        assert (home / "skills" / "browser").is_symlink()
+        # And codex can then make its own, which is the whole point.
+        (home / "skills" / ".system").mkdir()
+        (home / "skills" / ".system" / "marker").write_text("mine\n")
+        codex_state.ensure_home(workspace, shared=shared)
+        assert (home / "skills" / ".system" / "marker").read_text() == "mine\n"
+
+    def test_a_skill_link_that_moved_is_repointed(self, tmp_path):
+        """An operator who relocates their skills gets the new target on the next
+        turn, without a restart, the same way the top-level links behave."""
+        first = tmp_path / "codex-a"
+        (first / "skills" / "browser").mkdir(parents=True)
+        second = tmp_path / "codex-b"
+        (second / "skills" / "browser").mkdir(parents=True)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=first)
+        assert (home / "skills" / "browser").readlink() == first / "skills" / "browser"
+        codex_state.ensure_home(workspace, shared=second)
+        assert (home / "skills" / "browser").readlink() == second / "skills" / "browser"
+
+    def test_a_real_directory_codex_made_is_not_replaced_by_a_link(self, tmp_path):
+        """A name collision between codex's own entry and an operator skill leaves
+        codex's alone: it may hold state, and clobbering it would lose that."""
+        shared = tmp_path / "shared-codex"
+        (shared / "skills" / "browser").mkdir(parents=True)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.home_dir(workspace)
+        (home / "skills" / "browser").mkdir(parents=True)
+        (home / "skills" / "browser" / "codex.txt").write_text("codex made this\n")
+        codex_state.ensure_home(workspace, shared=shared)
+        assert not (home / "skills" / "browser").is_symlink()
+        assert (
+            home / "skills" / "browser" / "codex.txt"
+        ).read_text() == "codex made this\n"

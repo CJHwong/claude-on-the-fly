@@ -50,6 +50,55 @@ An approved HTTPS host remains a covert channel because the CONNECT proxy does n
 intercept TLS. A brokered CLI runs outside the jail, so its provider-side token scope is
 the real authorization boundary.
 
+## One thread cannot read another's conversation
+
+Under `jail`, a turn reaches only its own thread's transcripts. This matters more than
+the credential denies beside it: a token is a single secret, while a transcript is the
+message text itself, including what other people wrote in other threads.
+
+Each chat thread already gets its own workspace, so the workspace is the boundary the
+jail scopes to. The two backends need different mechanisms because they store sessions
+differently.
+
+| | Claude | Codex |
+|---|---|---|
+| Where sessions live | `<config dir>/projects/<workspace hash>/` | `$CODEX_HOME/sessions/<date>/rollout-*.jsonl` |
+| Keyed by the workspace | Yes, so the path is known before the run | No, the name is chosen at startup |
+| How the jail scopes it | Denies `projects/`, grants this thread's directory | Gives each workspace its own `CODEX_HOME` |
+
+The agent CLI is itself the jailed process, so it must keep write access to the session
+file it is currently writing. A blanket deny over the whole store looks safer and is not:
+it stops the CLI persisting the session, the turn still completes, and nothing surfaces
+until a later resume comes back with no memory of the conversation.
+
+Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside that same
+per-thread directory, so it is covered by the same grant and isolated by the same rule.
+That is also why a blanket deny cost more than resume: the agent's memory was off too,
+just as quietly. This is separate from cotf's own memory under `DATA_DIR/memory`, which
+has its own grant.
+
+Beyond its session directory, a turn writes runtime scratch: shell snapshots for the
+Bash tool, per-session env, plugin cache, rate-limit state. Those are granted from a
+measured list, on the principle that separates them from `settings.json`, hooks,
+commands, skills, agents and the plugins root. Nothing in the granted set decides what
+the agent executes or is told, so nothing in it survives into the next invocation as
+instructions. `docs/agent/broker.md` records the list and how it was measured.
+
+`history.jsonl` is denied for reading, not merely unwritable. It holds every prompt
+typed in every project on the host, so it crosses threads the same way `projects/` does,
+and no measured turn writes it.
+
+A codex home holds links back to the operator's `config.toml`, `AGENTS.md`, hooks, rules,
+plugins, prompts and `auth.json`. Writes through those links resolve onto the shared paths
+the profile already governs, so the execution and instruction surface stays read-only
+while token refresh keeps working.
+
+Deleting a thread's workspace removes both stores, because each is named after a path
+that will never exist again.
+
+The daemon is not jailed and reads every thread's store, which is what cross-backend
+handoff needs. The isolation is enforced at the jail, not by narrowing the daemon.
+
 ## Authentication boundaries
 
 The credential broker can protect a backend only when it can inject an API key header

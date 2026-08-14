@@ -20,8 +20,8 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _EXTRA_1.._EXTRA_3 and _RUNTIME_1.._RUNTIME_4 (unused slots resolve to
-;; _PROJECT_DIR, a harmless no-op).
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3 and _RUNTIME_1.._RUNTIME_5
+;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
 (version 1)
 (deny default)
@@ -51,8 +51,37 @@
 (allow file-read* (subpath (param "_PROJECT_DIR")))
 (allow file-read* (subpath (string-append (param "_HOME") "/.claude")))
 (allow file-read* (literal (string-append (param "_HOME") "/.claude.json")))
+;; claude keeps one directory of session JSONL per workspace, and a workspace is
+;; one chat thread. The grant above reaches all of them, so a jailed turn could
+;; read the verbatim turns of every other thread on the host. Deny the tree and
+;; re-grant only the running thread's directory, which is what the CLI needs to
+;; write and resume its own session. Both params are resolved per run from the
+;; workspace, so _CLAUDE_PROJECT is always a child of _CLAUDE_PROJECTS and wins
+;; by depth. Parameterised rather than built from _HOME because CLAUDE_CONFIG_DIR
+;; can move the tree anywhere, including outside $HOME where the deny above it
+;; would not reach.
+(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))
+(allow file-read* (subpath (param "_CLAUDE_PROJECT")))
+;; Every prompt typed in every project on this host, so it crosses threads the same
+;; way projects/ does. Denied by name, like the credentials further down, because it
+;; is one file rather than a tree. No measured turn writes it, so nothing is lost.
+(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
 ;; codex config, the same grant ~/.claude gets for the other backend.
 (allow file-read* (subpath (string-append (param "_HOME") "/.codex")))
+;; The same boundary for the other backend, and codex was the wider hole: the
+;; ~/.codex grant above reached every rollout in one flat date tree, 1088 of them
+;; on the host this was measured on. codex picks the rollout name at startup, so
+;; there is no per-workspace path to re-grant inside the shared tree; the workspace
+;; gets its own CODEX_HOME instead and this thread's rollouts are the only ones in
+;; it. _CODEX_HOME lives under the data dir, which this profile makes opaque, so it
+;; needs its own grant to be reachable at all.
+;;
+;; Ordering is the whole rule here: SBPL is last-match-wins, so these must come
+;; *after* the ~/.codex allow directly above. Measured with this pair placed before
+;; it, the allow won and a jailed turn still read 91855 bytes of another thread's
+;; rollout while the profile looked correct.
+(deny file-read* (subpath (param "_CODEX_SESSIONS")))
+(allow file-read* (subpath (param "_CODEX_HOME")))
 ;; Command-broker shims. Generated under DATA_DIR, which deny-most makes
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".
@@ -72,12 +101,18 @@
 ;; interpreter with "execvp() ... Operation not permitted" (rc 71), which is how
 ;; the startup egress probe came to block the daemon entirely.
 ;;
-;; Four slots because SBPL has no arrays, same trade as _EXTRA_*. Unused slots
-;; repeat _PROJECT_DIR, which is already allowed.
+;; Five slots because SBPL has no arrays, same trade as _EXTRA_*. Unused slots
+;; repeat _PROJECT_DIR, which is already allowed. Five rather than four because a
+;; launcher and the code it runs need not share a directory: `claude` installs as
+;; a symlink in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>, and
+;; granting only the resolved parent left execvp unable to read the symlink it has
+;; to resolve first (rc 71, "No such file or directory", which reads like a missing
+;; binary rather than a denial).
 (allow file-read* (subpath (param "_RUNTIME_1")))
 (allow file-read* (subpath (param "_RUNTIME_2")))
 (allow file-read* (subpath (param "_RUNTIME_3")))
 (allow file-read* (subpath (param "_RUNTIME_4")))
+(allow file-read* (subpath (param "_RUNTIME_5")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
 ;; at _PROJECT_DIR, already allowed above, so they add nothing.
 (allow file-read* (subpath (param "_EXTRA_1")))
@@ -97,7 +132,28 @@
 ;; sandboxed turn must not persist instructions there. The deny is explicit even
 ;; though deny-most already denies HOME, keeping the policy invariant visible.
 (deny file-write* (subpath (string-append (param "_HOME") "/.claude")))
+;; The same deny against the resolved config directory, because CLAUDE_CONFIG_DIR
+;; can move it outside $HOME where the rule above reaches nothing. Every claude
+;; re-grant below is written against this param for the same reason.
+(deny file-write* (subpath (param "_CLAUDE_CONFIG")))
 (allow file-write* (literal (string-append (param "_HOME") "/.claude.json")))
+(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/.claude.json")))
+;; The denies above cover projects/, where the claude CLI writes the session JSONL
+;; that makes resume work, and its per-project memory directory. The CLI is the
+;; jailed process, so it was denied both. Turns still completed, which is why this
+;; went unnoticed: the failure is silent and only a resume or a lost memory shows
+;; it. Re-granted for the running thread alone, so a turn still cannot reach
+;; another thread's conversation or memory.
+(allow file-write* (subpath (param "_CLAUDE_PROJECT")))
+;; Runtime scratch a real turn was measured writing. See _CLAUDE_RUNTIME_WRITES in
+;; sandbox.py for how the list was taken and why each entry is not
+;; instruction-bearing. settings.json, hooks, commands, skills, agents and the
+;; plugins/ root are absent on purpose and stay denied by the rules above.
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/shell-snapshots")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/session-env")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/sessions")))
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/plugins/cache")))
+(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/policy-limits.json")))
 ;; codex needs this to start at all; see the note in fs-allow-reads.sb.
 ;; codex needs to write under ~/.codex or it will not start, but the directory also
 ;; holds everything that decides what codex *executes* and what it is *told*. So this
@@ -117,7 +173,11 @@
 ;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
 ;;                     manifest at the plugins/ root stays denied
 (deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/sessions")))
+;; Rollouts go to this thread's own CODEX_HOME now, so the shared tree no longer
+;; needs to be writable. Everything codex writes that is not a rollout -- the
+;; sqlite state, the caches, the shell snapshot it sources, the writer lock --
+;; lands inside _CODEX_HOME, which the grant below covers wholesale.
+(allow file-write* (subpath (param "_CODEX_HOME")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))

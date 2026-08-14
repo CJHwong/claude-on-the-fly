@@ -19,6 +19,7 @@ in _BASE_URL. The real keys never enter this process's child env.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -352,6 +353,16 @@ def agent_env() -> dict[str, str] | None:
         return {**os.environ, **overrides}
     env = {key: value for key, value in os.environ.items() if _is_passthrough(key)}
     dropped = len(os.environ) - len(env)
+    # The jail grants the claude session directory by name, derived from the
+    # config dir the *daemon* resolves. CLAUDE_CONFIG_DIR is not a passthrough
+    # key, so a deployment that sets it in DATA_DIR/.env had the daemon pointing
+    # one way and the spawned CLI defaulting to ~/.claude -- which would leave the
+    # grant on a directory the CLI never writes, and the session unpersisted with
+    # nothing in the log. Stated explicitly so the two cannot disagree. Resolving
+    # to claude's own default when unset is what the CLI would have done anyway.
+    from claude_on_the_fly import envfile
+
+    env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
@@ -618,7 +629,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
     )
 
 
-_RUNTIME_SLOTS = 4
+_RUNTIME_SLOTS = 5
 
 
 def _runtime_read_paths(argv: list[str]) -> list[Path]:
@@ -636,14 +647,78 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     paths: list[Path] = []
     binary = shutil.which(argv[0]) if argv else None
     if binary:
-        # The parent, not the file: an npm-installed CLI is a shim beside the
-        # package tree it loads. Read-only, and it holds executables not secrets.
+        # Two directories, because a launcher and the code it runs need not share
+        # one. `claude` installs as a symlink in ~/.local/bin pointing into
+        # ~/.local/share/claude/versions/<v>, and granting only the resolved
+        # parent left execvp unable to read the symlink it has to resolve first:
+        # measured as rc 71, "execvp() of 'claude' failed: No such file or
+        # directory", which reads like a missing binary rather than a denial.
+        # The npm layout this was first measured against had them in one place,
+        # so one grant covered both by accident.
+        #
+        # The parent in each case, not the file: an npm-installed CLI is a shim
+        # beside the package tree it loads. Read-only, and they hold executables
+        # rather than secrets.
+        paths.append(Path(binary).parent)
         paths.append(Path(os.path.realpath(binary)).parent)
     paths += [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
     seen: dict[str, Path] = {}
     for path in paths:
         seen.setdefault(str(path), path)
     return list(seen.values())
+
+
+def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
+    """(the config dir, the session store to deny, this thread's dir to grant).
+
+    The config dir comes first because every other claude rule in both profiles is
+    written against it rather than against `$HOME/.claude`: CLAUDE_CONFIG_DIR can
+    move the whole tree outside `$HOME`, where a `_HOME`-derived rule matches
+    nothing while the profile still loads.
+
+    claude writes its session JSONL to `<config dir>/projects/<workspace hash>/`,
+    and one workspace is one chat thread. Two paths rather than one because the
+    policy is a pair: deny the store, re-grant the running thread. Granting
+    without the deny leaves every other thread readable; denying without the
+    grant stops the CLI persisting the session it is currently writing, and the
+    turn still completes, so nothing surfaces until a resume comes back empty.
+
+    Resolved through `transcript`, which owns the hash scheme the CLI uses, so
+    the grant and the daemon's own reader cannot drift apart. Realpath'd like
+    every other profile parameter: seatbelt matches the resolved path, and a
+    home behind a symlink would otherwise leave the grant matching nothing.
+    Neither path has to exist yet -- realpath resolves the existing prefix, and
+    the grant covers the directory itself, so the CLI may create it.
+    """
+    from claude_on_the_fly import envfile, transcript
+
+    return (
+        Path(os.path.realpath(envfile.claude_config_dir())),
+        Path(os.path.realpath(transcript.claude_projects_dir())),
+        Path(os.path.realpath(transcript.claude_session_dir(workspace))),
+    )
+
+
+def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
+    """(the shared rollout tree to deny, this thread's codex home to grant).
+
+    codex names a rollout by date and thread id in one flat tree and picks the
+    name at startup, so there is no per-workspace path to grant the way claude's
+    `projects/<hash>` can be. The workspace gets its own `CODEX_HOME` instead
+    (`codex_state.home_dir`), which is what makes the location predictable before
+    the run, and the backend points the child at it.
+
+    The shared tree still has to be denied: it holds every rollout written before
+    per-workspace homes existed, and a jailed turn could otherwise read the raw
+    turns of every other thread. 1088 of them were readable on the host this was
+    measured on.
+    """
+    from claude_on_the_fly import codex_state, envfile
+
+    return (
+        Path(os.path.realpath(envfile.codex_home() / "sessions")),
+        Path(os.path.realpath(codex_state.home_dir(workspace))),
+    )
 
 
 def _platform() -> str:
@@ -655,6 +730,57 @@ def _platform() -> str:
     exactly the code you least want untested.
     """
     return sys.platform
+
+
+# What a real claude turn writes under its config directory, besides its own
+# session directory. Measured the way the codex list below was: two turns against
+# the real CLI, one making a Bash tool call and one resuming with `--continue`,
+# diffing the config tree either side. A grant missing from here is a capability
+# the agent silently loses under the jail; a grant here it does not need is attack
+# surface, so the list is the measurement and not a guess.
+#
+# None of these decides what the agent executes or is told, which is the line that
+# keeps them separable from settings.json, hooks, commands, skills, agents and the
+# plugins/ root. Those stay denied: they are read on later invocations, so a write
+# there outlives the session.
+#
+# Deliberately NOT here:
+#   projects/         conversation-bearing, granted per thread instead
+#   history.jsonl     cross-project prompt history, and a read leak of its own
+#   todos/, statsig/  no real turn was observed writing them
+_CLAUDE_RUNTIME_WRITE_DIRS = (
+    # Observed being written by a real turn against the operator's own config
+    # directory, and kept for that reason -- but a jailed `claude -p` turn that
+    # actually executed a Bash tool call wrote none, on a fresh config directory
+    # or an existing one, so this grant is not what makes tool use work. The path
+    # production uses is claude-pty, an interactive shell, which is where a shell
+    # snapshot plausibly is written and which is not yet measured under the jail.
+    # Kept rather than dropped because removing it would trade attack surface for
+    # the risk of breaking the one path that has not been tested.
+    "shell-snapshots",
+    "session-env",
+    # Distinct from projects/, despite the name.
+    "sessions",
+    # cache/ only, so a manifest at the plugins/ root stays denied.
+    "plugins/cache",
+)
+
+# Split from the directories rather than derived from the name, the same
+# distinction _CODEX_PROTECTED_DIRS makes and for the same reason: creating a
+# mount source with mkdir when the target is a file leaves a *directory* called
+# policy-limits.json, and the CLI then cannot write its own state.
+_CLAUDE_RUNTIME_WRITE_FILES = ("policy-limits.json",)
+
+_CLAUDE_RUNTIME_WRITES = (
+    *_CLAUDE_RUNTIME_WRITE_DIRS,
+    *_CLAUDE_RUNTIME_WRITE_FILES,
+)
+
+# Files under the claude config directory a turn must not read, named one by one
+# the way the credential denies are. history.jsonl is every prompt typed in every
+# project on the host, so it crosses threads exactly like projects/ does, and no
+# measured turn writes it.
+_CLAUDE_READ_DENIED = ("history.jsonl",)
 
 
 # ~/.codex is writable on Linux, with the dangerous entries mounted read-only back
@@ -726,8 +852,67 @@ def _project_write_denies(project: Path, names: tuple[str, ...]) -> list[Path]:
     return [project / name for name in names]
 
 
+def _session_mount_sources(workspace: Path) -> tuple[list[Path], list[Path]]:
+    """(directories, files) bubblewrap binds read-write, which must exist first.
+
+    Named separately from the grants so the Linux wrap can create them without
+    `_linux_grants` acquiring a side effect: `_readable_paths` calls it purely to
+    build the agent's guidance note, and that must not touch the filesystem.
+    """
+    claude_config, _, claude_project = _claude_session_paths(workspace)
+    codex_sessions, codex_home = _codex_session_paths(workspace)
+    directories = [
+        claude_project,
+        codex_home,
+        # Where codex actually writes rollouts. `codex_state.ensure_home` creates it
+        # too, but only when the codex backend is the one spawning; the jail must not
+        # depend on which backend ran first, and the preflight probe writes here.
+        codex_home / "sessions",
+        # Not writable, and created for exactly that reason: the shared rollout
+        # tree is masked with a tmpfs, and a mask can only be mounted over a path
+        # that exists. Absent, it was left unmasked, and because Linux binds
+        # ~/.codex read-write a jailed turn could then create the tree itself and
+        # write into it -- working but unisolated, where macOS refuses outright.
+        # Measured on a host that had never run codex.
+        codex_sessions,
+        *(claude_config / name for name in _CLAUDE_RUNTIME_WRITE_DIRS),
+    ]
+    files = [claude_config / name for name in _CLAUDE_RUNTIME_WRITE_FILES]
+    return directories, files
+
+
+def _ensure_session_mount_sources(workspace: Path) -> None:
+    """Materialise every per-thread mount source, before the grants are computed.
+
+    Two reasons a source has to exist, and they pull in opposite directions, which
+    is why this cannot be skipped when a path is absent:
+
+      - A read-write bind needs something to bind, or bwrap fails the whole spawn
+        with "Can't mkdir parents ... Read-only file system".
+      - A mask needs something to mount over. An absent one is silently left
+        unmasked, and for the shared codex tree that is a real hole, because Linux
+        binds ~/.codex read-write.
+    """
+    directories, files = _session_mount_sources(workspace)
+    for source in directories:
+        try:
+            source.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Never silent: a source that cannot be created is either a mount the
+            # turn then lacks, or a mask that then does not apply, and the second
+            # one is a boundary quietly going missing.
+            logger.warning("sandbox: could not create mount source %s: %s", source, exc)
+    for source in files:
+        try:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.touch(exist_ok=True)
+        except OSError as exc:
+            logger.warning("sandbox: could not create mount source %s: %s", source, exc)
+
+
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
+    from claude_on_the_fly import codex_state
     from claude_on_the_fly.agent import DATA_DIR, MEMORY_DIR
 
     home = Path(os.path.realpath(Path.home()))
@@ -735,9 +920,22 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     project = Path(os.path.realpath(workspace))
     tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
     codex = home / ".codex"
+    claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
+    codex_sessions, codex_home = _codex_session_paths(workspace)
     read_write = [
         project,
         Path(os.path.realpath(MEMORY_DIR)),
+        # The running thread's claude session directory. Deeper than the opaque
+        # projects/ tmpfs below, so depth ordering restores exactly this one --
+        # the same trade the plugins/cache entry makes further down. Without it
+        # the CLI cannot write the session file resume reads, and the turn still
+        # succeeds, so the loss is silent.
+        claude_project,
+        # The measured runtime scratch. Deeper than the read-only ~/.claude mount,
+        # so depth ordering restores exactly these. They are created on the host
+        # before the wrap for the same reason the session dirs are: bwrap cannot
+        # make a mount point under a read-only root.
+        *(claude_config / name for name in _CLAUDE_RUNTIME_WRITES),
         tmpdir,
         home / ".claude.json",
         home / ".cache/uv",
@@ -749,13 +947,39 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         codex,
         codex / "plugins/cache",
         codex / "plugins/.remote-plugin-install-staging",
+        # This thread's codex home, where its rollouts and sqlite state go. Under
+        # the data dir, which is opaque, so without this the directory the backend
+        # just pointed the child at would not exist inside the namespace.
+        codex_home,
     ]
     return {
         # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
         # $HOME gets the same treatment. memory/ and shims/ are granted back below
         # at greater depth, so the sibling .env and logs/ stay hidden either way.
-        "opaque": [home, data_dir],
+        # projects/ is opaque rather than merely read-only: the read-only mount of
+        # ~/.claude below would otherwise expose every other thread's verbatim
+        # turns, which is worse in kind than the credentials this profile denies.
+        # An empty tmpfs also keeps the directory listable, so a CLI that stats it
+        # sees a plausible store rather than a missing one.
+        #
+        # Each is masked only if it is actually there. bwrap creates its mount
+        # points inside a `--ro-bind / /` root, so naming an absent one fails the
+        # whole spawn with "Can't mkdir parents ... Read-only file system" rather
+        # than being ignored. A tree that does not exist holds no other thread's
+        # transcripts either, so there is nothing to hide. The read-write sources
+        # above are different: those are created on the host before the wrap,
+        # because the turn needs them whether or not anything made them yet.
+        "opaque": [
+            home,
+            data_dir,
+            *(path for path in (claude_projects, codex_sessions) if path.is_dir()),
+        ],
         "read_only": [
+            # What the per-thread codex home links to. Read-only because it is the
+            # operator's config, prompts and skills, and unmounted it would dangle
+            # inside the namespace: a link into ~/.agents resolves nowhere here, and
+            # codex then reports a missing file rather than a hidden one.
+            *codex_state.shared_link_targets(),
             home / ".claude",
             codex,
             data_dir / "shims",
@@ -770,7 +994,18 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             *_project_write_denies(project, _PROJECT_WRITE_DENY_DIRS),
             *(codex / name for name in _CODEX_PROTECTED_DIRS),
         ],
-        "masked": _linux_masked(data_dir),
+        # history.jsonl joins the ssh-agent socket and the stray .env files: a file
+        # a coarser grant exposes, named individually. ~/.claude is a read-only
+        # mount here rather than a global read allow, so hiding one file inside it
+        # needs a mount over that file, which is what masked does.
+        "masked": [
+            *_linux_masked(data_dir),
+            *(
+                path
+                for name in _CLAUDE_READ_DENIED
+                if (path := claude_config / name).exists()
+            ),
+        ],
     }
 
 
@@ -853,6 +1088,12 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # next to the package tree it loads. Read-only, and it holds executables
     # rather than secrets.
     grants["read_only"] += _runtime_read_paths(argv)
+    # Same reason `ensure_write_deny_targets` materialises its targets: a mount
+    # source has to exist on the host, because bwrap cannot create one inside the
+    # read-only root. Both are this turn's own session directories, so creating
+    # them is what the turn was going to do anyway; a claude turn gets an empty
+    # codex home and vice versa, which costs one directory and keeps the wrap
+    # independent of which backend is running.
     placeholders = sandbox_linux.prepare_placeholders(DATA_DIR / "jail")
     sandbox_linux.ensure_write_deny_targets(
         grants["write_denied"], placeholders, grants["write_denied_dirs"]
@@ -920,6 +1161,19 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     """
     if mode() != "jail":
         return argv
+    # Before either platform branch, and before `_linux_grants` in particular, which
+    # decides whether to mask a session store by whether it exists: creating these
+    # afterwards left the shared codex tree unmasked and then created it, and since
+    # Linux binds ~/.codex read-write a jailed turn could write a rollout straight
+    # into it. Measured at rc 0 with the file landing on the host.
+    #
+    # Both platforms, not only the one that needs mount sources. A jailed process
+    # creating its own directory chain hits the same wall the probes kept finding: a
+    # recursive mkdir that cannot stat an ancestor walks up and tries to create it,
+    # which under an opaque $HOME fails at the home directory itself. Creating the
+    # chain here means the CLI only ever writes files into a directory that is
+    # already there.
+    _ensure_session_mount_sources(workspace)
     if _platform().startswith("linux"):
         return _linux_wrap(argv, workspace)
     if not shutil.which("sandbox-exec"):
@@ -938,9 +1192,16 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     from claude_on_the_fly.agent import DATA_DIR
 
     base = _fs_base_profile()
+    claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
+    codex_sessions, codex_home = _codex_session_paths(workspace)
     return sandbox_macos.jail_argv(
         argv,
         **sandbox_macos.realpaths(workspace, DATA_DIR),
+        claude_config=claude_config,
+        claude_projects=claude_projects,
+        claude_project=claude_project,
+        codex_sessions=codex_sessions,
+        codex_home=codex_home,
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
@@ -1155,7 +1416,7 @@ async def preflight() -> None:
     credential files it spawns nothing at all -- and a jail that never starts
     would go unnoticed precisely because there was nothing to notice.
 
-    Two checks, both cheap and both startup-fatal:
+    Three checks, all cheap and all startup-fatal:
 
       1. The jail runs a trivial command. Catches a missing mechanism, a profile
          that will not parse, and on Linux the case this cannot be reasoned about
@@ -1165,10 +1426,21 @@ async def preflight() -> None:
          claim of the whole design -- that the egress proxy cannot be bypassed --
          and until now nothing checked it on either platform. A jail whose network
          rules silently did not apply looks exactly like one whose did.
+      3. A jailed process can write the session directory the agent CLI persists
+         to. The only positive check of the three, and it exists because the
+         failure it catches is invisible: the CLI *is* the jailed process, so a
+         profile that denies its session file still completes every turn and only
+         shows up as a resume that has forgotten the conversation, or a memory
+         that silently stopped being kept. That shipped once. The other two
+         checks would not have caught it, because nothing was denied that the
+         jail was asked to deny.
     """
     if mode() != "jail":
         return
     _log_inert_settings()
+    # First, and before anything is spawned: this is a layout problem, so paying
+    # for two jail probes to discover it afterwards is waste.
+    _preflight_protected_symlinks()
     workspace = _probe_workspace()
     try:
         code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
@@ -1201,7 +1473,98 @@ async def preflight() -> None:
         raise SandboxBoundaryError(
             f"sandbox egress preflight was inconclusive: {output.strip()[:400]}"
         )
-    logger.info("sandbox: preflight ok, jail starts and external egress is refused")
+    await _preflight_session_write(workspace)
+    logger.info(
+        "sandbox: preflight ok, jail starts, external egress is refused, and the "
+        "agent can persist its session"
+    )
+
+
+def _preflight_protected_symlinks() -> None:
+    """Report execution-control paths that are symlinks, before a turn hits them.
+
+    These are the entries the jail protects because they decide what the agent
+    executes or is told: config, hooks, standing instructions, rules, plugins,
+    agents. A symlink there breaks each platform differently, and neither failure
+    announces itself as "your instruction files are not protected":
+
+      - Linux cannot mount over it. bwrap reports "Can't create file at <path>:
+        No such file or directory" and the turn dies, which reads like a missing
+        file rather than a layout it refuses. Measured with a `~/.codex/AGENTS.md`
+        symlinked to `~/.claude/CLAUDE.md`, which is an ordinary way to keep one
+        set of instructions for both backends.
+      - macOS resolves the path before matching, so a deny written against the
+        link covers the link and not the file behind it. The profile loads, the
+        log says jailed, and the target stays writable.
+
+    Fatal only on Linux, where the turn would fail anyway. On macOS this is a real
+    weakening but an established layout, so it warns rather than refusing to serve
+    a deployment that has been working.
+    """
+    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    linked = [path for path in _codex_protected(codex) if path.is_symlink()]
+    if not linked:
+        return
+    names = ", ".join(str(path) for path in linked)
+    if _platform().startswith("linux"):
+        raise SandboxBoundaryError(
+            "sandbox preflight failed: these execution-control paths are symlinks, "
+            f"and a mount namespace cannot mount read-only over one: {names}. "
+            "Replace each with a real file or directory, or move the content and "
+            "drop the link, then restart."
+        )
+    logger.warning(
+        "sandbox: %d execution-control path(s) are symlinks: %s. Seatbelt matches "
+        "the resolved path, so each write deny protects the link and not the file "
+        "behind it, and a jailed turn could rewrite instructions the next run "
+        "reads. Replace them with real files to close that.",
+        len(linked),
+        names,
+    )
+
+
+_SESSION_PROBE_NAME = ".cotf-preflight"
+
+
+async def _preflight_session_write(workspace: Path) -> None:
+    """Prove a jailed process can write the store the agent CLI persists to.
+
+    Probes the same path `wrap` grants for this workspace, so it exercises the real
+    grant rather than a stand-in. The probe workspace is the daemon's own, so the
+    directory this creates is not a live thread's.
+
+    Both backends are checked because the two stores are granted by different
+    mechanisms -- claude by a path derived from the workspace, codex by a per-thread
+    home the backend also has to publish -- and either can be broken alone.
+    """
+    _, _, claude_project = _claude_session_paths(workspace)
+    _, codex_home = _codex_session_paths(workspace)
+    for label, directory in (
+        ("claude session", claude_project),
+        ("codex home", codex_home / "sessions"),
+    ):
+        target = directory / _SESSION_PROBE_NAME
+        try:
+            # No mkdir: `wrap` created the chain on the host, and a recursive mkdir
+            # from inside would walk up into the opaque $HOME and fail there
+            # instead, reporting a denial that says nothing about this grant.
+            code, output = await _run_jailed(
+                ["/bin/sh", "-c", f"printf ok > {target}"], workspace
+            )
+        except (OSError, TimeoutError) as exc:
+            raise SandboxBoundaryError(
+                f"sandbox session preflight could not run: {exc}"
+            ) from exc
+        wrote = target.is_file()
+        with contextlib.suppress(OSError):
+            target.unlink()
+        if code != 0 or not wrote:
+            raise SandboxBoundaryError(
+                f"sandbox preflight failed: a jailed process cannot write its "
+                f"{label} directory ({directory}), so the agent would complete "
+                "turns and silently lose its conversation and memory. "
+                f"(rc={code}): {output.strip()[:400]}"
+            )
 
 
 async def verify_denials(workspace: Path | None = None) -> dict[str, str]:

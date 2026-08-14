@@ -45,9 +45,11 @@ _DEFAULT_LOOPBACK = "localhost:*"
 # `ask` -- the approval service the backends ask about tool calls. A fifth
 # service would need a fifth slot here and in both profiles.
 _LOOPBACK_SLOTS = 4
-# Runtime read slots in fs-deny-most.sb: agent binary dir, sys.prefix,
-# sys.base_prefix, package dir.
-_RUNTIME_SLOTS = 4
+# Runtime read slots in fs-deny-most.sb: the launcher's directory, the resolved
+# binary's directory, sys.prefix, sys.base_prefix, package dir. Five because a
+# launcher and the code it runs need not share a directory: `claude` is a symlink
+# in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>.
+_RUNTIME_SLOTS = 5
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -101,6 +103,11 @@ def jail_argv(
     data_dir: Path | str,
     project: Path | str,
     tmpdir: Path | str,
+    claude_config: Path | str,
+    claude_projects: Path | str,
+    claude_project: Path | str,
+    codex_sessions: Path | str,
+    codex_home: Path | str,
     base: Path,
     loopback: tuple[str, str, str, str],
     extra_paths: list[str],
@@ -136,6 +143,20 @@ def jail_argv(
         f"_PROJECT_DIR={project}",
         "-D",
         f"_TMPDIR={tmpdir}",
+        # Both profiles reference these, unlike _EXTRA_* below, so they are always
+        # passed. A missing -D makes sandbox-exec refuse the profile outright,
+        # which is the failure mode worth having: the alternative is a jail that
+        # loads with the session grant silently absent.
+        "-D",
+        f"_CLAUDE_CONFIG={claude_config}",
+        "-D",
+        f"_CLAUDE_PROJECTS={claude_projects}",
+        "-D",
+        f"_CLAUDE_PROJECT={claude_project}",
+        "-D",
+        f"_CODEX_SESSIONS={codex_sessions}",
+        "-D",
+        f"_CODEX_HOME={codex_home}",
         "-D",
         f"_BASE={base}",
         "-D",
