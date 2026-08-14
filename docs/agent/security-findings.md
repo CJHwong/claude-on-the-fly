@@ -33,6 +33,7 @@ upgrade path, so none of that was covered by it.
 | An unrecognised `sandbox.mode` resolved to `off`, and both startup gates return early unless the mode is `jail`, so a typo produced the posture the operator was avoiding | `sandbox.mode` | All six mode values probed |
 | The cross-thread read denies and the `state/` write deny sat above allows that could re-open them | `seatbelt/*.sb` | One `extra_paths` entry of `$HOME` re-opened both stores; tests now assert rule position, not just behaviour |
 | `sandbox.extra_paths` had no validation, so the remedy `_JAIL_GUIDANCE` tells the agent to relay was also the bypass: an entry of `$HOME` re-opened `~/.ssh` and `~/.aws` | `sandbox._extra_read_paths` | Entries resolving to the home, an ancestor of it, or a credential store in either direction are logged at ERROR and dropped, the rest still granted; a test asserts every `_DENY_PROBES` entry is out of reach |
+| The command-broker path guard missed an attached short option, a second `=`, a traversal attached to a short option, and a relative path through a planted symlink, on a broker that runs outside the jail with the operator's credential | `commands._unsafe_path_argument` | All four verified passing the old guard and refused by the new one; the guard now reads every `=` segment and the short-option tail, and resolves each candidate against the settled cwd |
 
 ## Open
 
@@ -68,14 +69,6 @@ grant, so turning `scope_sessions` on — the recommended hardening — hands th
 symlink's target. On Linux `_ensure_session_mount_sources` also `mkdir`s through it as the
 unjailed daemon. `_preflight_protected_symlinks` checks only the six `_codex_protected`
 entries.
-
-**The command-broker path guard has three bypasses.** `commands._unsafe_path_argument`
-misses an attached short option (`-o/etc/passwd`), a second `=` (`--opt=a=/etc/passwd`),
-and a relative path through a symlink planted in the workspace. Not exploitable with the
-bundled allowlist: neither `gh` nor `acli` has a file-taking flag in its allowed
-subcommands, verified against `--help`. It matters because the guard is generic and
-`docs/how-to/broker-a-command.md` invites operators to add tools, and the broker runs
-outside the jail with the real credential.
 
 ### Egress
 

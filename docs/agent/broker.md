@@ -50,6 +50,22 @@ The broker does not parse arbitrary CLI semantics after an allowed prefix. Gener
 subcommands remain unavailable unless explicitly listed, and provider-side credential
 scope is still required because argv inspection cannot safely model every future flag.
 
+`_unsafe_path_argument` reads an option token three ways, because an option carries its
+value three ways: every `=` segment after the first, not just the first split, and
+everything after the short option letter when there is no separator at all. Reading only
+the first split let `-o/etc/passwd`, `-D/Users/someone`, `--opt=a=/etc/passwd` and `-C..`
+through, all four verified against the guard. It runs *after* the cwd is settled and
+resolves each candidate against it, which is the only reading that catches
+`link/etc/passwd` where `link` is a symlink the turn planted in its own workspace.
+Resolving rather than refusing symlink components is forced: the workspace itself is
+reached through `/var` -> `/private/var` on macOS, so every argument in it has one. Tool entries merge by name; removed
+packaged refusals are warned. An operator override without `allow` therefore disables
+that tool until its safe subcommands are listed.
+
+The broker does not parse arbitrary CLI semantics after an allowed prefix. Generic API
+subcommands remain unavailable unless explicitly listed, and provider-side credential
+scope is still required because argv inspection cannot safely model every future flag.
+
 ## Tool approvals
 
 `permissions.py` owns config parsing, request classification, per-session HTTP service,
