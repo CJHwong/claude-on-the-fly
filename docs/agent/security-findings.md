@@ -32,6 +32,8 @@ upgrade path, so none of that was covered by it.
 | `_CODEX_HOME` collapsed onto `~/.codex` with `scope_sessions` off, so the write allow nullified the deny above it and `config.toml`, `AGENTS.md`, `hooks.json` became agent-writable | `sandbox._macos_wrap` | Live jailed write into a real `~/.codex`, refused after the fix and succeeding with the one line reverted, under both profiles |
 | An unrecognised `sandbox.mode` resolved to `off`, and both startup gates return early unless the mode is `jail`, so a typo produced the posture the operator was avoiding | `sandbox.mode` | All six mode values probed |
 | The cross-thread read denies and the `state/` write deny sat above allows that could re-open them | `seatbelt/*.sb` | One `extra_paths` entry of `$HOME` re-opened both stores; tests now assert rule position, not just behaviour |
+| The startup self-test ran in one daemon of the two that spawn jailed agents, so a jail that could not hold `state/` stopped Slack loudly while the job worker kept draining the same queue across it | `sandbox.verify_boundary`, `jobs/cli._run` | Both halves now run from the worker's composition root before it claims work, fatal with exit 2; ordering and the before-claim position are asserted in `tests/jobs/test_cli.py` and `tests/test_sandbox.py`. Cron is deliberately not gated: it runs shell and never calls `agent.run` |
+| `verify_denials` could pass having proven nothing: a probe that raised was dropped from the results, so an all-timeout run logged `0/0 probed paths confirmed denied` at INFO and returned success | `sandbox.verify_denials` | A probe that could not run is now `UNTESTED` and fatal, and every probe lands in the results dict. Reverting the `UNTESTED` return makes `test_a_probe_that_cannot_be_spawned_refuses_to_start` and `test_a_probe_that_hangs_is_abandoned_not_awaited_forever` fail. `ABSENT` stays non-fatal: the file is genuinely not on the host, and `preflight` has already proven the jail starts |
 
 ## Open
 
@@ -148,16 +150,6 @@ where an already-compromised turn's file writes become code the operator later r
 purpose.
 
 ### The self-test
-
-**`verify_denials` runs in one daemon out of three.** Only `orchestrator._start_sandbox`
-calls it. `cron.py` and `jobs/*.py` never import `sandbox` at startup, and both spawn
-jailed agents. A jail that cannot hold `state/` stops Slack loudly and lets cron keep
-firing.
-
-**`verify_denials` can pass having proven nothing.** A probe that raises is dropped from
-the results and an absent target is not a denial, so an all-timeout run logs
-`0/0 probed paths confirmed denied` at INFO and returns success. Bounded by `preflight`
-running first and gating the jail-starts claim.
 
 **`_runtime_read_paths` resolves `argv[0]` only.** In pty mode `argv[0]` is `claude-pty`,
 which execs a different binary plus tmux, and the five slots are already full. Under

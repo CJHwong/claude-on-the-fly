@@ -210,7 +210,58 @@ relay bridges exists. A port mapper would fail open, which is why one is not use
 - `sandbox.preflight` proves the jail starts and refuses external egress before the
   daemon serves. `verify_denials` alone cannot: it settles absent-versus-denied outside
   the jail, so on a machine with none of the probed credentials it spawns nothing.
+- Every daemon that reaches `agent.run` runs both, through `sandbox.verify_boundary`,
+  before it accepts or claims work.
+- A run that proved nothing fails. A probe that could not run is `UNTESTED`, not a
+  dropped result.
 - A missing or unusable mechanism is fatal on both platforms.
+
+## The startup self-test
+
+`sandbox.verify_boundary` is `preflight` then `verify_denials`, in that order, and it
+exists as one name because the order is load-bearing and the call sites are now plural.
+`verify_denials` settles absent-versus-denied outside the jail, so on a host holding none
+of the probed credentials it spawns nothing at all, and a jail that never started would
+report a clean sheet. `preflight` is what makes that silence mean something.
+
+Two daemons call it, and one deliberately does not:
+
+| Daemon | Calls it | Failure | Why |
+|---|---|---|---|
+| chat (`orchestrator._start_sandbox`) | yes | refuse to serve | Spawns a jailed agent per turn |
+| jobs worker (`jobs/cli._run`) | yes | refuse to start, exit 2 | Spawns a jailed agent per job, unattended |
+| cron producer (`cron.main`) | no | n/a | Runs shell and enqueues; never calls `agent.run` |
+
+The worker's refusal is fatal rather than advisory, and being unattended is the argument
+for that rather than against it: it runs `bypassPermissions` turns against whatever a
+producer queued, so an unproven credential boundary is worth more there than in the chat
+daemon. The queue is durable, so a refusal costs a restart and the jobs wait; the
+opposite choice is silent and cannot be undone once the reads have happened.
+
+Cron is left out on the split stated at the top of [cron.md](cron.md): it runs shell and
+never spawns an agent, so the self-test could only report on a boundary that process
+never crosses, and a fatal result there would stop the producer for a fault that cannot
+reach it. The worker that *does* cross the jail already refuses to drain what cron
+queued, so nothing runs unverified either way.
+
+### Five outcomes, and only one of them is proof
+
+`DENIED` is proof. `READABLE` / `WRITABLE` and `BROKEN` are failures. The other two are
+the interesting pair:
+
+- `ABSENT` — the file is genuinely not on this host, checked from outside the jail.
+  There is no credential at that path to leak, so this is honest non-evidence and it is
+  not fatal. `preflight` bounds it: the jail has already been shown to start, to refuse
+  egress, and to write its session store.
+- `UNTESTED` — the file *is* there and the probe never ran. Fatal.
+
+`UNTESTED` used to be `None` and was filtered out of the results dict on the grounds that
+it says nothing about the boundary. True, and that is exactly why it could not be
+dropped: with every probe dropped the dict was empty, no entry matched `BROKEN` or
+`READABLE`, and the function logged `0/0 probed paths confirmed denied` at INFO and
+returned success. Each probe carries its own 15s ceiling and they run concurrently, so a
+loaded host at startup was enough to reach that. `preflight` is already fatal on the same
+spawn failures, so leniency here was the anomaly. Every probe now lands in the dict.
 
 Tests for these invariants live in `test_sandbox.py`, `test_sandbox_linux.py`,
 `test_netns_relay.py`, `test_approvals.py`, `test_permissions.py`, `test_cotf_approve.py`,

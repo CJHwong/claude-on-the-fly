@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
-from claude_on_the_fly import agent, checks, settings
+from claude_on_the_fly import agent, checks, sandbox, settings
 from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
 from claude_on_the_fly.jobs.agent_runner import (
     OrchestratorAgentRunner,
@@ -198,6 +198,22 @@ async def _run(token: str) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
+    # Before anything claims a job, and after the signal handlers so the probes
+    # are interruptible. This worker spawns jailed agents through `agent.run`
+    # exactly as a chat turn does, and until this call existed only the chat
+    # daemon proved the boundary: a jail that could not hold its denies stopped
+    # Slack loudly while the worker kept draining the same queue across an
+    # unverified boundary.
+    #
+    # Fatal, not advisory, and the fact that nobody is watching is the argument
+    # *for* that rather than against it. The worker runs bypassPermissions turns
+    # against whatever a producer queued, unattended, so an unproven credential
+    # boundary here is worth more to an attacker than the same fault in the chat
+    # daemon. A refusal is loud in the supervisor and costs nothing permanent --
+    # the queue is durable, the jobs wait, and the next start replays them. The
+    # opposite choice is silent and irreversible: the reads have happened.
+    await sandbox.verify_boundary()
+
     queue, runner, notifier, recorder = build_components(token)
 
     # Reap what a previous worker orphaned, before anything claims work:
@@ -287,8 +303,15 @@ def _cmd_run() -> int:
     loop_warning = _notifier_loop_warning(token_var, token)
     if loop_warning:
         logger.warning("%s", loop_warning)
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_run(token))
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(_run(token))
+    except sandbox.SandboxBoundaryError as exc:
+        # An exit code and one line, not a traceback: this is an operator-facing
+        # refusal with a remedy in its message, and it exits the same way as the
+        # other two refusals above so the supervisor treats all three alike.
+        sys.stderr.write(f"claude-jobs: {exc}\n")
+        return 2
     return 0
 
 
