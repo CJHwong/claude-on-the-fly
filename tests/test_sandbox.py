@@ -2363,3 +2363,56 @@ def test_the_runtime_slot_count_covers_every_path_the_wrapper_supplies(tmp_path)
         f"{len(granted)} runtime paths but only {sandbox_macos._RUNTIME_SLOTS} slots; "
         "the extras are dropped and the backend cannot start"
     )
+
+
+def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
+    monkeypatch, tmp_path
+):
+    """A mount namespace cannot mount read-only over a symlink: bwrap reports
+    "Can't create file at <path>: No such file or directory" and the turn dies,
+    which reads like a missing file rather than a layout it refuses. Measured with
+    ~/.codex/AGENTS.md symlinked to ~/.claude/CLAUDE.md, which is an ordinary way
+    to keep one set of instructions for both backends."""
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    target = home / "shared-instructions.md"
+    target.write_text("be helpful\n")
+    (home / ".codex" / "AGENTS.md").symlink_to(target)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    with pytest.raises(sandbox.SandboxBoundaryError, match="cannot mount read-only"):
+        sandbox._preflight_protected_symlinks()
+
+
+def test_a_symlinked_execution_control_path_warns_on_macos(
+    monkeypatch, tmp_path, caplog
+):
+    """Seatbelt matches the resolved path, so a deny written against the link covers
+    the link and not the file behind it: the profile loads, the log says jailed, and
+    the target stays writable. Warned rather than refused, because this is an
+    established layout and refusing would stop a deployment that has been working.
+    """
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    target = home / "shared-instructions.md"
+    target.write_text("be helpful\n")
+    (home / ".codex" / "AGENTS.md").symlink_to(target)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        sandbox._preflight_protected_symlinks()
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "AGENTS.md" in message and "are symlinks" in message
+    assert "protects the link and not the file behind it" in message
+
+
+def test_no_warning_when_the_protected_paths_are_real(monkeypatch, tmp_path, caplog):
+    """The common case must stay silent, or the warning becomes noise nobody reads."""
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "AGENTS.md").write_text("be helpful\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        sandbox._preflight_protected_symlinks()
+    assert "symlink" not in "\n".join(r.getMessage() for r in caplog.records)

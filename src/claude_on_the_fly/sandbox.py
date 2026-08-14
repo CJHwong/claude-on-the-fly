@@ -1432,6 +1432,9 @@ async def preflight() -> None:
     if mode() != "jail":
         return
     _log_inert_settings()
+    # First, and before anything is spawned: this is a layout problem, so paying
+    # for two jail probes to discover it afterwards is waste.
+    _preflight_protected_symlinks()
     workspace = _probe_workspace()
     try:
         code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
@@ -1468,6 +1471,49 @@ async def preflight() -> None:
     logger.info(
         "sandbox: preflight ok, jail starts, external egress is refused, and the "
         "agent can persist its session"
+    )
+
+
+def _preflight_protected_symlinks() -> None:
+    """Report execution-control paths that are symlinks, before a turn hits them.
+
+    These are the entries the jail protects because they decide what the agent
+    executes or is told: config, hooks, standing instructions, rules, plugins,
+    agents. A symlink there breaks each platform differently, and neither failure
+    announces itself as "your instruction files are not protected":
+
+      - Linux cannot mount over it. bwrap reports "Can't create file at <path>:
+        No such file or directory" and the turn dies, which reads like a missing
+        file rather than a layout it refuses. Measured with a `~/.codex/AGENTS.md`
+        symlinked to `~/.claude/CLAUDE.md`, which is an ordinary way to keep one
+        set of instructions for both backends.
+      - macOS resolves the path before matching, so a deny written against the
+        link covers the link and not the file behind it. The profile loads, the
+        log says jailed, and the target stays writable.
+
+    Fatal only on Linux, where the turn would fail anyway. On macOS this is a real
+    weakening but an established layout, so it warns rather than refusing to serve
+    a deployment that has been working.
+    """
+    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    linked = [path for path in _codex_protected(codex) if path.is_symlink()]
+    if not linked:
+        return
+    names = ", ".join(str(path) for path in linked)
+    if _platform().startswith("linux"):
+        raise SandboxBoundaryError(
+            "sandbox preflight failed: these execution-control paths are symlinks, "
+            f"and a mount namespace cannot mount read-only over one: {names}. "
+            "Replace each with a real file or directory, or move the content and "
+            "drop the link, then restart."
+        )
+    logger.warning(
+        "sandbox: %d execution-control path(s) are symlinks: %s. Seatbelt matches "
+        "the resolved path, so each write deny protects the link and not the file "
+        "behind it, and a jailed turn could rewrite instructions the next run "
+        "reads. Replace them with real files to close that.",
+        len(linked),
+        names,
     )
 
 
