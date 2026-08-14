@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -314,10 +315,23 @@ class TurnJournal:
             # served: this journal is a safety net, not a gate on the message path.
             logger.exception("turns: cannot serialize the journal for %s", self._path)
             return
+        # A fixed temp name, kept on purpose. One daemon owns one frontend's
+        # journal, so there is no second writer to collide with, and a fixed name
+        # is reclaimed by the next write after a SIGKILL -- a pid-suffixed one
+        # would leave a file behind for every kill, in a directory nothing sweeps.
         tmp = self._path.with_suffix(".json.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(payload, encoding="utf-8")
+            # 0600, not `write_text`'s 0o644 (measured). This file holds the
+            # verbatim text of every unanswered turn, so it gets the same
+            # treatment as the other daemon-owned record of a conversation
+            # (`codex_state.write_thread_id`). The mode argument covers the
+            # create; the chmod covers a permissive umask and a temp file left
+            # by an older build.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            with os.fdopen(os.open(tmp, flags, 0o600), "wb") as handle:
+                handle.write(payload.encode("utf-8"))
+            os.chmod(tmp, 0o600)
             tmp.replace(self._path)
         except OSError:
             # The turn matters more than the record of it. Logged rather than

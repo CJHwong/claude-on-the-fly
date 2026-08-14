@@ -8,6 +8,7 @@ running it.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,28 @@ class TestRecording:
         replay, _ = journal.take(now=1000.0)
 
         assert len(replay) == 1
+
+    def test_the_journal_is_owner_only(self, journal):
+        """It holds the verbatim text of every unanswered turn. Measured at 0o644
+        before this, because `write_text` inherits the umask."""
+        journal.record(_turn())
+
+        assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
+
+    def test_a_journal_left_world_readable_by_an_older_build_is_tightened(
+        self, journal
+    ):
+        """The temp name is fixed, so a file an older build left behind is the
+        one the next write opens. O_CREAT's mode does not apply to a file that
+        already exists, which is what the explicit chmod is for."""
+        journal.path.parent.mkdir(parents=True)
+        stale = journal.path.with_suffix(".json.tmp")
+        stale.write_text("[]")
+        stale.chmod(0o644)
+
+        journal.record(_turn())
+
+        assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
 
     def test_an_unwritable_journal_does_not_raise(self, tmp_path, caplog):
         """A journal that cannot be written must not take down the turn it was
