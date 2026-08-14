@@ -36,6 +36,7 @@ from claude_on_the_fly.agent import (
     persona_for,
     read_attachment,
     sender_marker,
+    workspace_path,
 )
 from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.protocol import Frontend
@@ -718,7 +719,7 @@ class TelegramFrontend(Frontend):
     async def _save_file(self, chat_id: int, file_id: str, file_name: str) -> Path:
         if not self._app:
             raise RuntimeError("App not started")
-        workspace = DATA_DIR / "workspaces" / self.workspace_name(chat_id)
+        workspace = workspace_path(self.workspace_name(chat_id), DATA_DIR)
         workspace.mkdir(parents=True, exist_ok=True)
         safe_name = Path(file_name).name
         dest = workspace / safe_name

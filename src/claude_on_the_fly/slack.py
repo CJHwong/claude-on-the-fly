@@ -34,6 +34,7 @@ from claude_on_the_fly.agent import (
     persona_for,
     read_attachment,
     sender_marker,
+    workspace_path,
     write_attachment,
 )
 from claude_on_the_fly.approvals import ApprovalRequest
@@ -2726,7 +2727,7 @@ class SlackFrontend(Frontend):
         return []
 
     def _workspace_path(self, session_id: int) -> Path:
-        return DATA_DIR / "workspaces" / self.workspace_name(session_id)
+        return workspace_path(self.workspace_name(session_id), DATA_DIR)
 
     async def _save_files(self, session_id: int, files: list[dict]) -> list[str]:
         """Download Slack files to workspace. Returns '[File saved: name]' lines."""

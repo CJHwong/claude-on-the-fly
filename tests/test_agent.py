@@ -4046,3 +4046,81 @@ class TestStripSenderMarkers:
 
     def test_an_unmarked_message_is_returned_unchanged(self):
         assert agent_mod.strip_sender_markers("plain text") == "plain text"
+
+
+class TestWorkspacePath:
+    """A workspace name is untrusted, and the path built from it is a grant.
+
+    It becomes `_PROJECT_DIR`, which both jails grant writes to, and the directory
+    above it holds `cron.yaml`, whose entries the cron producer runs through a shell
+    with the daemon's full environment and no jail. So a traversal here is not a
+    tidiness problem, it is host code execution outside the sandbox.
+    """
+
+    def test_a_realistic_name_is_unchanged(self, tmp_path):
+        """The character set Slack and Telegram already restrict their identifiers
+        to survives the reduction, so an existing conversation keeps its workspace
+        rather than silently starting a new one."""
+        for name in ("telegram/123", "telegram/123-1699999999", "slack/dm-hoss-1-2"):
+            assert agent_mod.workspace_path(name, tmp_path) == (
+                tmp_path / "workspaces" / name
+            )
+
+    def test_an_underscore_survives(self, tmp_path):
+        """Slack channel names allow underscores, and `safe_segment` maps an unsafe
+        run to a single `_`, so `my_channel` is stable rather than renamed."""
+        got = agent_mod.workspace_path("slack/my_channel-1", tmp_path)
+        assert got == tmp_path / "workspaces" / "slack" / "my_channel-1"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "slack/dm-../../../evil-1-2",
+            "../../evil",
+            "slack/..",
+            "slack/../../../../../../etc",
+            "/etc/passwd",
+            "slack\\..\\..\\evil",
+        ],
+    )
+    def test_a_traversing_name_cannot_leave_the_tree(self, name, tmp_path):
+        """On Slack the sender half of the name is `event["username"]` for a trusted
+        bot, an arbitrary per-message string Slack does not constrain. One `..` in it
+        used to land the workspace on the data dir itself."""
+        root = (tmp_path / "workspaces").resolve()
+        got = agent_mod.workspace_path(name, tmp_path).resolve()
+        assert got.is_relative_to(root), got
+        assert ".." not in got.parts
+
+    def test_a_traversing_telegram_session_token_cannot_escape(self, tmp_path):
+        """The second way into this sink, and it is not a chat message.
+
+        `telegram.restore_route` puts a journaled `session_token` back before its turn
+        replays, checking only that it is a non-empty string, and `workspace_name`
+        interpolates it into the folder name. The journal lives under `state/`, which
+        the jail denies both ways, so the writer is the daemon or a corrupted file
+        rather than the agent -- this is the defense-in-depth half.
+        """
+        token = "../../../../../../../etc"
+        got = agent_mod.workspace_path(f"telegram/123-{token}", tmp_path)
+        root = (tmp_path / "workspaces").resolve()
+        assert got.resolve().is_relative_to(root), got
+        assert ".." not in got.parts
+
+    def test_a_name_that_reduces_to_nothing_is_refused(self, tmp_path):
+        """`/` alone leaves no component. Refusing beats returning the workspaces
+        root, which every conversation would then share."""
+        with pytest.raises(ValueError, match="empty after reduction"):
+            agent_mod.workspace_path("/", tmp_path)
+
+    def test_a_symlink_standing_where_the_workspace_goes_is_refused(self, tmp_path):
+        """The reduction makes the traversal unreachable, so this is the assertion
+        that the arithmetic held. It fires on a symlink already planted at the
+        workspace path, which `resolve()` follows out of the tree."""
+        root = tmp_path / "workspaces" / "slack"
+        root.mkdir(parents=True)
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        (root / "hijacked").symlink_to(outside)
+        with pytest.raises(ValueError, match="escapes the tree"):
+            agent_mod.workspace_path("slack/hijacked", tmp_path)

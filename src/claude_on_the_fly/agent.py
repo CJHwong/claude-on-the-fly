@@ -50,6 +50,54 @@ def data_dir_from(env: Mapping[str, str]) -> Path:
 
 
 DATA_DIR = data_dir_from(os.environ)
+
+
+def workspace_path(name: str, data_dir: Path) -> Path:
+    """`data_dir/workspaces/<name>`, with every component of `name` reduced.
+
+    A frontend names a workspace after the conversation, and part of that name
+    is a display string somebody else chose: on Slack a trusted bot's per-message
+    `username` reaches it verbatim, and Slack does not constrain that field. So
+    the value is untrusted even though the frontend supplying it is not.
+
+    The path matters more than a name usually does. It becomes `_PROJECT_DIR`,
+    which both jails grant writes to, and the directory above it holds
+    `cron.yaml`, whose entries the cron producer runs through a shell with the
+    daemon's full environment and no jail. A single `..` would therefore turn a
+    workspace name into host code execution outside the sandbox, which is why
+    this is not left to the frontends to remember.
+
+    `keys.safe_segment` reduces each component to `[A-Za-z0-9-]`, so `..` cannot
+    survive it and neither can a separator the frontend did not intend. The
+    containment check afterwards is not redundant with that: it asserts this
+    function's own arithmetic held, and it refuses rather than returning a path
+    outside the tree. A symlink already standing where the workspace goes fails
+    it too, since `resolve()` follows one and the target is then outside.
+
+    Names that reach here today are unchanged by the reduction -- Slack and
+    Telegram both restrict their own identifiers to this character set, and the
+    timestamp suffix is dashed -- so an existing conversation keeps its
+    workspace.
+
+    `data_dir` is a parameter rather than this module's `DATA_DIR` because each
+    caller already holds the one its own module imported, and a frontend under
+    test redirects that. A hidden read of the global here would quietly ignore the
+    redirection and write into the operator's real data directory.
+    """
+    from claude_on_the_fly.jobs.keys import safe_segment
+
+    root = data_dir / "workspaces"
+    parts = [safe_segment(part) for part in re.split(r"[\\/]+", name) if part]
+    if not parts:
+        raise ValueError(f"workspace name is empty after reduction: {name!r}")
+    candidate = root.joinpath(*parts)
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"workspace name escapes the tree: {name!r}") from exc
+    return candidate
+
+
 MEMORY_DIR = DATA_DIR / "memory"
 MEMORY_ROOT = str(MEMORY_DIR)
 KNOWLEDGE_DIR = str(MEMORY_DIR / "knowledge")

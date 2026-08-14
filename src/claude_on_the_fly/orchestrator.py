@@ -36,6 +36,7 @@ from claude_on_the_fly.agent import (
     Response,
     current_backend_key,
     strip_suggestions_blocks,
+    workspace_path,
 )
 from claude_on_the_fly.approvals import ApprovalBroker
 from claude_on_the_fly.events import (
@@ -694,7 +695,7 @@ class Orchestrator:
         self._journal.mark_dispatched(turn.journal_id)
         interrupted = False
         await self._report_config_restarts(chat_id)
-        workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
+        workspace = workspace_path(self._frontend.workspace_name(chat_id), DATA_DIR)
         workspace.mkdir(parents=True, exist_ok=True)
         if self._platform in agent.ATTACHMENT_PLATFORMS:
             (workspace / agent.OUTBOX_DIRNAME).mkdir(exist_ok=True)
