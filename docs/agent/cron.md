@@ -91,7 +91,7 @@ Two different limits, both spelled `timeout` in different places:
 
 ## Run-now trigger
 
-The TUI's Run-now button (`n` on the cron tab) is a file, not a signal: the
+The TUI's run-now key (`n` on the cron tab) is a file, not a signal: the
 operator writes `state/cron.trigger` (`request_run_now`) and the daemon polls
 it in `_sleep_to_next_minute` at 1s granularity, so a request lands within a
 second instead of waiting out the minute. `_drain_triggers` renames the file

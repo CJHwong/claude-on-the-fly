@@ -358,8 +358,9 @@ class TestDashboardLayout:
 
         visible = {b.key for b in DashboardScreen.BINDINGS if b.show}
         hidden = {b.key for b in DashboardScreen.BINDINGS if not b.show}
-        # Slim footer: lifecycle (k/r), help, quit.
-        assert visible == {"k", "r", "question_mark", "q"}
+        # Footer: lifecycle (k/r), the three tab-scoped actions (filtered per
+        # tab by check_action), help, quit.
+        assert visible == {"k", "r", "n", "S", "t", "question_mark", "q"}
         # Everything else stays bound but lives in the `?` help modal.
         assert hidden == {
             "l",
@@ -370,15 +371,33 @@ class TestDashboardLayout:
             "c",
             "R",
             "K",
-            "n",
-            "t",
-            "s",
             "1",
             "2",
             "3",
             "left",
             "right",
         }
+
+    @pytest.mark.asyncio
+    async def test_the_footer_offers_only_the_active_tab_s_actions(self):
+        from textual.widgets import Footer
+
+        app = ClaudeTuiApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            def footer_keys() -> set[str]:
+                footer = app.screen.query_one(Footer)
+                return {key.key_display for key in footer.query("FooterKey")}
+
+            for key, tab in (("2", "tab-cron"), ("3", "tab-jobs"), ("1", "tab-chat")):
+                await pilot.press(key)
+                await pilot.pause()
+                keys = footer_keys()
+                assert {"k", "r", "?", "q"} <= keys, (tab, keys)
+                # Run-now and sort belong to cron, takeover to chat.
+                assert ({"n", "S"} <= keys) is (tab == "tab-cron"), (tab, keys)
+                assert ("t" in keys) is (tab == "tab-chat"), (tab, keys)
 
     @pytest.mark.asyncio
     async def test_help_modal_lists_keys_hidden_from_footer(self):
