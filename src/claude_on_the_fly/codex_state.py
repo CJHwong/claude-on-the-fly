@@ -43,6 +43,18 @@ _SHARED_ENTRIES = (
     "auth.json",
 )
 
+# Shared directories the agent must see the *contents* of, but which codex also
+# writes into. Linking the directory itself would do one of those at the cost of
+# the other: measured on a real jailed turn, codex touched `skills/` 242 times and
+# created a `skills/.system/` tree of its own, so a link to a write-denied shared
+# directory would stop it. Linking each entry instead leaves a real directory codex
+# owns, holding read-only links to the operator's own skills.
+#
+# The operator's skills were reachable before per-thread homes existed, because the
+# turn ran against the shared ~/.codex directly. Losing them was a regression this
+# restores.
+_SHARED_MERGED = ("skills",)
+
 
 def _home_key(workspace: Path) -> str:
     return hashlib.sha256(
@@ -110,7 +122,75 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
                 link.unlink()
         with suppress(OSError):
             link.symlink_to(target)
+    for name in _SHARED_MERGED:
+        _merge_shared_dir(home / name, source_root / name)
     return home
+
+
+def _safe_iterdir(path: Path) -> list[Path]:
+    try:
+        return sorted(path.iterdir())
+    except OSError:
+        return []
+
+
+def shared_link_targets(shared: Path | None = None) -> list[Path]:
+    """Resolved paths the per-thread home links to, for the Linux jail to mount.
+
+    Seatbelt needs none of this: it matches the resolved path, and everything here
+    already sits under a granted subtree. A mount namespace has no such luck -- a
+    link into a directory nobody mounted dangles inside the jail, and codex reports
+    a missing file rather than a hidden one. `~/.codex/skills -> ~/.agents/skills`
+    is the shape that found this: outside every mount the profile lists.
+    """
+    from claude_on_the_fly import envfile
+
+    root = envfile.codex_home() if shared is None else shared
+    resolved: dict[str, Path] = {}
+    for name in (*_SHARED_ENTRIES, *_SHARED_MERGED):
+        entry = root / name
+        if not entry.exists():
+            continue
+        real = Path(os.path.realpath(entry))
+        resolved.setdefault(str(real), real)
+        # Each child too: a merged directory links its entries individually, and
+        # those can resolve somewhere else again.
+        for child in _safe_iterdir(entry):
+            child_real = Path(os.path.realpath(child))
+            resolved.setdefault(str(child_real), child_real)
+    return list(resolved.values())
+
+
+def _merge_shared_dir(local: Path, shared: Path) -> None:
+    """Make `local` a real directory holding links to each entry in `shared`.
+
+    A real directory so codex can still create its own state inside it, and links
+    so the operator's entries stay on the shared, write-denied paths. Entries codex
+    created itself are left alone: the operator's set and codex's own set live side
+    by side, and only a name collision has to be decided, which the shared entry
+    wins for the same reason it wins in `ensure_home`.
+    """
+    local.mkdir(parents=True, exist_ok=True)
+    for entry in _safe_iterdir(shared):
+        # Dot-entries are codex's own state, not operator skills: it keeps a
+        # `skills/.system/` tree of built-in skills and writes into it. Linking that
+        # at the shared, write-denied path left codex unable to create its own
+        # system skills -- measured as "cannot create .../skills/.system/marker"
+        # inside a real jail, while an ordinary skill linked and read fine. Each
+        # thread gets its own, which is also the right blast radius for something
+        # the agent can write.
+        if entry.name.startswith("."):
+            continue
+        link = local / entry.name
+        if link.is_symlink():
+            if link.readlink() == entry:
+                continue
+            with suppress(OSError):
+                link.unlink()
+        elif link.exists():
+            continue
+        with suppress(OSError):
+            link.symlink_to(entry)
 
 
 def _mapping_key(workspace: Path, session_uuid: str) -> str:
@@ -251,8 +331,10 @@ def remove_workspace(workspace: Path) -> None:
     canonical_workspace = workspace.resolve(strict=False)
     # Links first, so removing the tree cannot follow one into the shared ~/.codex.
     home = home_dir(workspace)
-    for name in _SHARED_ENTRIES:
-        link = home / name
+    for link in [
+        *(home / name for name in _SHARED_ENTRIES),
+        *(entry for name in _SHARED_MERGED for entry in _safe_iterdir(home / name)),
+    ]:
         if link.is_symlink():
             with suppress(OSError):
                 link.unlink()

@@ -912,6 +912,7 @@ def _ensure_session_mount_sources(workspace: Path) -> None:
 
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
+    from claude_on_the_fly import codex_state
     from claude_on_the_fly.agent import DATA_DIR, MEMORY_DIR
 
     home = Path(os.path.realpath(Path.home()))
@@ -974,6 +975,11 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             *(path for path in (claude_projects, codex_sessions) if path.is_dir()),
         ],
         "read_only": [
+            # What the per-thread codex home links to. Read-only because it is the
+            # operator's config, prompts and skills, and unmounted it would dangle
+            # inside the namespace: a link into ~/.agents resolves nowhere here, and
+            # codex then reports a missing file rather than a hidden one.
+            *codex_state.shared_link_targets(),
             home / ".claude",
             codex,
             data_dir / "shims",
