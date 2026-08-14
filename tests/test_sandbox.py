@@ -663,7 +663,9 @@ async def test_verify_denials_reports_each_probe(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         results = await sandbox.verify_denials(tmp_path)
     assert results, "expected at least one probe"
@@ -672,6 +674,29 @@ async def test_verify_denials_reports_each_probe(
     assert sandbox.DENIED in results.values(), f"nothing actually denied: {results}"
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "confirmed denied" in logged
+
+
+async def test_verify_boundary_proves_the_jail_runs_before_reading_its_silence(
+    monkeypatch, tmp_path
+):
+    """Order is the reason this is one function rather than two calls per daemon.
+    `verify_denials` settles absent-versus-denied outside the jail, so on a host
+    with none of the probed credentials it spawns nothing at all -- and a jail
+    that never started would report a clean sheet. `preflight` is what makes that
+    silence mean something, so it has to come first at every call site."""
+    order: list[str] = []
+
+    async def fake_preflight():
+        order.append("preflight")
+
+    async def fake_verify(workspace=None):
+        order.append("verify_denials")
+        return {}
+
+    monkeypatch.setattr(sandbox, "preflight", fake_preflight)
+    monkeypatch.setattr(sandbox, "verify_denials", fake_verify)
+    await sandbox.verify_boundary(tmp_path)
+    assert order == ["preflight", "verify_denials"]
 
 
 async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplog):
@@ -687,14 +712,19 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         results = await sandbox.verify_denials(tmp_path)
     assert set(results.values()) == {sandbox.ABSENT}, results
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "deny untested" in logged
     assert f"0/{len(results)} probed" in logged
-    assert len(results) == len(sandbox._DENY_PROBES)
+    # The deny probes plus the stubbed `state/` write probe. Every probe lands in
+    # the dict, including the ones that prove nothing -- an outcome that is
+    # missing is the shape of the bug this used to have.
+    assert len(results) == len(sandbox._DENY_PROBES) + 1
 
 
 @pytest.fixture
@@ -905,11 +935,17 @@ class TestInertWhenOff:
 # --- probe outcomes that a real machine will not produce on demand ---
 
 
-async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
+async def test_a_probe_that_cannot_be_spawned_refuses_to_start(
     monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
-    """Not an outcome: a probe that never ran is evidence about the probe, not
-    about the boundary, so it must not land in the results dict at all."""
+    """A probe that never ran is evidence about the probe, not about the
+    boundary. That was once the argument for dropping it from the results dict,
+    and dropping it is what let the whole run pass on no evidence: with every
+    probe dropped the dict is empty, nothing matches BROKEN or READABLE, and the
+    function logged "0/0 probed paths confirmed denied" at INFO and returned
+    success. The path is on this host (`probe_paths_exist`), so what went
+    untested is a real credential file. It is carried as UNTESTED and it is
+    fatal."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
 
     async def cannot_spawn(*_args, **_kwargs):
@@ -920,16 +956,28 @@ async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        assert await sandbox.verify_denials(tmp_path) == {}
-    assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
+    with (
+        caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
+        pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
+    ):
+        await sandbox.verify_denials(tmp_path)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "failed to run" in logged
+    assert "never asked whether it hides them" in logged
+    # The line that used to be emitted here, and the reason this passed.
+    assert "confirmed denied" not in logged
 
 
 async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
     monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
-    """These run on the daemon's startup path, before it serves anything."""
+    """These run on the daemon's startup path, before it serves anything. The
+    timeout is the whole point of the ceiling, and an expired probe is UNTESTED:
+    a loaded host is the plausible way every probe expires at once, which is the
+    way this used to report success on no evidence at all."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
 
     class HangingProbe:
@@ -948,9 +996,14 @@ async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        assert await sandbox.verify_denials(tmp_path) == {}
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
+    with (
+        caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"),
+        pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
+    ):
+        await sandbox.verify_denials(tmp_path)
     assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
 
 
@@ -984,7 +1037,9 @@ async def test_a_readable_credential_path_is_an_error_not_a_pass(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     with (
         caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
         pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
@@ -1026,10 +1081,12 @@ async def test_probes_run_concurrently_not_one_after_another(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     results = await sandbox.verify_denials(tmp_path)
     assert peak == len(sandbox._DENY_PROBES), f"peak concurrency was {peak}"
-    assert set(results.values()) == {sandbox.DENIED}
+    assert set(results.values()) == {sandbox.DENIED, sandbox.ABSENT}
 
 
 # --- shim PATH routing ---
@@ -2671,7 +2728,7 @@ async def test_a_broken_profile_is_not_reported_as_a_denied_write(
     assert "the profile is broken" in caplog.text
 
 
-async def test_a_write_probe_that_cannot_spawn_says_nothing_either_way(
+async def test_a_write_probe_that_cannot_spawn_is_untested_not_dropped(
     monkeypatch, tmp_path, caplog
 ):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -2684,7 +2741,7 @@ async def test_a_write_probe_that_cannot_spawn_says_nothing_either_way(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", cannot_spawn)
 
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        assert await sandbox._probe_write(state, tmp_path) is None
+        assert await sandbox._probe_write(state, tmp_path) == sandbox.UNTESTED
 
     assert "failed to run" in caplog.text
 
