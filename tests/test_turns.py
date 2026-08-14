@@ -226,6 +226,56 @@ class TestCorruptRecords:
 
         assert journal.take(now=1000.0) == ([], [])
 
+    def test_a_boolean_chat_id_is_dropped(self, journal):
+        """`bool` subclasses `int`, so this arrived as chat_id=True, which
+        compares equal to 1: somebody's turn replayed into whichever
+        conversation that frontend numbers 1."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            json.dumps([{"chat_id": True, "text": "x", "turn_id": "t"}])
+        )
+
+        assert journal.take(now=1000.0) == ([], [])
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_a_recorded_at_that_is_not_a_number_is_dropped(self, journal, literal):
+        """The TTL gate is `moment - recorded_at > ttl_s`, and every comparison
+        against NaN is False, so the entry survived every TTL for ever. Written
+        as a raw literal because that is what a tampered file holds -- json.loads
+        accepts these by default."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            '[{"chat_id": 1, "text": "x", "turn_id": "t", "recorded_at": '
+            + literal
+            + "}]"
+        )
+
+        assert journal.take(now=1e12) == ([], [])
+
+    def test_a_negative_replay_counter_cannot_outrun_the_cap(self, journal):
+        """`take()` parks at `replays >= MAX_REPLAYS`. A counter of -10^18 needs
+        that many restarts to reach 2, so the turn most likely to be killing the
+        daemon is replayed at every start instead of being handed back."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            json.dumps(
+                [
+                    {
+                        "chat_id": 1,
+                        "text": "x",
+                        "turn_id": "t",
+                        "recorded_at": 1000.0,
+                        "replays": -(10**18),
+                    }
+                ]
+            )
+        )
+
+        replay, nudge = journal.take(now=1000.0)
+
+        assert nudge == []
+        assert [t.replays for t in replay] == [1]
+
     def test_an_unknown_phase_resumes_as_if_work_had_started(self, journal):
         """A record we cannot classify gets the careful treatment: replayed, but
         with the note that some of it may already have happened."""

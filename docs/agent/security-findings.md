@@ -32,6 +32,7 @@ upgrade path, so none of that was covered by it.
 | `_CODEX_HOME` collapsed onto `~/.codex` with `scope_sessions` off, so the write allow nullified the deny above it and `config.toml`, `AGENTS.md`, `hooks.json` became agent-writable | `sandbox._macos_wrap` | Live jailed write into a real `~/.codex`, refused after the fix and succeeding with the one line reverted, under both profiles |
 | An unrecognised `sandbox.mode` resolved to `off`, and both startup gates return early unless the mode is `jail`, so a typo produced the posture the operator was avoiding | `sandbox.mode` | All six mode values probed |
 | The cross-thread read denies and the `state/` write deny sat above allows that could re-open them | `seatbelt/*.sb` | One `extra_paths` entry of `$HOME` re-opened both stores; tests now assert rule position, not just behaviour |
+| The replay cap and the TTL were evadable by a tampered journal: a negative `replays` needed ~10^18 restarts to reach the cap, a NaN `recorded_at` made every TTL comparison False, and `chat_id: true` passed the `int` check and became chat_id 1 | `turns.PendingTurn.from_dict`, `turns._as_float` | Clamped at the one boundary where a disk record becomes an object, so both gates in `take()` are sound without touching them. Bad entries are dropped, which is what `_read` already does with a `None`. A boolean chat id, a NaN and an Infinity `recorded_at`, and a `replays` of -10^18 all fail without the change |
 | A thread could permanently defeat its own operator guardrails: it replaced a shared-entry link inside its writable `CODEX_HOME` with a directory, `unlink()` raised `IsADirectoryError`, and the suppressed `OSError` meant `hooks.json`, `AGENTS.md` and `config.toml` never came back for that thread | `codex_state._clear_link_site` | The link site is cleared through one helper that removes a planted directory, bounded to `HOMES_DIR` and never descending a symlink; every link failure now logs. A test plants the directory and asserts the operator's `hooks.json` is back on the next `ensure_home`, and fails without the change |
 | Thread ids were spliced into glob patterns unescaped, so `*` matched every rollout in the tree: `adopt_rollout` copied another thread's into this workspace's `CODEX_HOME`, and `_find_codex_rollout` returned an unrelated conversation for the next prompt's handoff context | `codex_state.rollout_glob`, `codex_state._valid_thread_id` | Both sites now share one `glob.escape`d pattern, and the id charset is checked on the read side and the write side. 10 adversarial cases (`*`, `?`, `[a-c]*`, `../elsewhere`, whitespace) fail without the change. Charset derived from 14 real mappings on a deployed data dir, all 36 characters of lowercase hex and hyphen. Never reachable: the id comes only from codex's `--json` control event, so this is defence in depth |
 
@@ -190,13 +191,12 @@ text, tapped by a human, is fed back wrapped in the real sender's `[from-id:]` m
 **The TUI watch header renders remote text as live Rich markup** (`dashboard.py`), unlike
 every log and tail path, which go through `session_format._safe()`.
 
-**The replay cap and TTL are evadable by a tampered journal.** `PendingTurn.from_dict`
-accepts a negative `replays`, so the cap needs ~10^18 restarts, and a `recorded_at` of 0
-or NaN skips the TTL. `chat_id: true` also passes the `int` check. The daemon's own write
-path is correct, so this needs a corrupted or externally-written file. Closes with
-`int(replays) >= 0` and a finiteness check.
-
-**The journal is 0o644** and holds the verbatim text of every unanswered turn.
+**A `recorded_at` of 0 is still exempt from the TTL.** `take()` gates on
+`if entry.recorded_at and ...`, so a tampered entry can skip its TTL by recording no
+timestamp at all. Left as it is: 0 is the dataclass default and the documented
+"not recorded" case, `test_a_turn_with_no_timestamp_is_not_treated_as_expired` asserts it,
+and the replay cap still bounds such an entry. Closing it means deciding that a record
+without an age is a record to drop, which is a behaviour change rather than a clamp.
 
 ### Approvals
 

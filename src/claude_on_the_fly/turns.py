@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -105,6 +106,17 @@ class PendingTurn:
         A half-written or hand-edited entry is dropped rather than degraded: the
         text is what gets replayed as somebody's message, so a partial record is
         not something to guess at.
+
+        This is also the only place a disk record becomes an object, which is
+        why the two gates in `take()` are made sound here rather than there. A
+        negative `replays` and a non-finite `recorded_at` both walk straight past
+        a comparison, so the values are clamped where they are read.
+
+        `text` is deliberately not length-capped. The daemon's own write path is
+        the message a person sent, and a cap here would silently drop a long
+        paste; nothing about it bounds memory either, since `_read` has already
+        read the whole file. Anyone who can plant a 5 MB entry can plant a
+        thousand small ones.
         """
         try:
             chat_id = data["chat_id"]
@@ -112,9 +124,17 @@ class PendingTurn:
             turn_id = data["turn_id"]
         except (KeyError, TypeError):
             return None
-        if not isinstance(chat_id, int) or not isinstance(text, str):
+        # `bool` subclasses `int`, so `chat_id: true` passed the int check and
+        # became chat_id=True, which compares equal to 1: a stranger's reply
+        # aimed at whichever conversation that frontend numbers 1.
+        if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+            return None
+        if not isinstance(text, str):
             return None
         if not isinstance(turn_id, str) or not turn_id:
+            return None
+        recorded_at = _as_float(data.get("recorded_at"))
+        if recorded_at is None:
             return None
         route = data.get("route")
         session = data.get("session")
@@ -131,13 +151,35 @@ class PendingTurn:
             # this" note rather than as a clean first attempt.
             phase=phase if phase in (QUEUED, DISPATCHED) else DISPATCHED,
             turn_id=turn_id,
-            recorded_at=_as_float(data.get("recorded_at")),
-            replays=replays if isinstance(replays, int) else 0,
+            recorded_at=recorded_at,
+            # Clamped, not trusted. `take()` parks a turn at `replays >=
+            # MAX_REPLAYS`, so a counter of -1 needs about 10^18 restarts to get
+            # there: the turn that keeps killing the daemon is replayed at every
+            # start instead of being handed back. bool is excluded for the reason
+            # chat_id is.
+            replays=max(0, replays)
+            if isinstance(replays, int) and not isinstance(replays, bool)
+            else 0,
         )
 
 
-def _as_float(value: Any) -> float:
-    return float(value) if isinstance(value, int | float) else 0.0
+def _as_float(value: Any) -> float | None:
+    """A recorded timestamp; 0.0 if there is none, None if it is not a number.
+
+    The TTL gate is `moment - entry.recorded_at > ttl_s`. Every comparison
+    against NaN is False, so a NaN outlives its TTL for ever, and an infinity
+    does the same in one direction. Neither is a timestamp, so the entry is
+    dropped rather than repaired -- guessing at the age of a message somebody is
+    about to be answered for is the thing this class refuses to do.
+
+    A missing or non-numeric value stays 0.0, which reads as "not recorded" and
+    is exempt from the TTL. That is the existing degrade-to-defaults contract for
+    every other scalar here, and the daemon's own writer always sets the field.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0.0
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def new_turn_id() -> str:
