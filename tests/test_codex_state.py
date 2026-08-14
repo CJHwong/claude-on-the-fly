@@ -342,3 +342,25 @@ class TestCodexHomeShieldsExecutionControlNames:
         home = codex_state.ensure_home(workspace, shared=shared)
         assert not (home / "AGENTS.md").exists()
         assert not (home / "config.toml").is_symlink()
+
+
+def test_the_home_links_follow_a_redirected_codex_home(tmp_path, monkeypatch):
+    """A deployment that sets CODEX_HOME keeps its config and credential there.
+
+    Hardcoding `Path.home() / ".codex"` pointed the links at a directory that may
+    hold neither, and every one is then skipped as an absent target rather than
+    failing: the home comes out with no config and no credential, and nothing says
+    so until codex authenticates. Found while setting up a real jailed turn. The
+    shared tree the jail denies resolves through the same helper, so the two cannot
+    disagree.
+    """
+    redirected = tmp_path / "elsewhere-codex"
+    redirected.mkdir()
+    (redirected / "auth.json").write_text('{"token": "x"}\n')
+    (redirected / "config.toml").write_text("model = 'x'\n")
+    monkeypatch.setenv("CODEX_HOME", str(redirected))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = codex_state.ensure_home(workspace)
+    assert (home / "auth.json").readlink() == redirected / "auth.json"
+    assert (home / "config.toml").readlink() == redirected / "config.toml"

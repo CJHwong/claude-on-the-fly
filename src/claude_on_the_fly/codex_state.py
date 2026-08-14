@@ -74,6 +74,8 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
     Absent shared entries are skipped rather than stubbed, because codex treats a
     missing config as "use the defaults" and a dangling link as an error.
     """
+    from claude_on_the_fly import envfile
+
     home = home_dir(workspace)
     # sessions/ is created here rather than left to codex because the jail makes
     # $HOME opaque, and a recursive mkdir that cannot stat an ancestor walks up and
@@ -81,7 +83,12 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
     # permitted` on a path whose leaf was granted. Creating the chain now leaves
     # codex writing files inside a directory that already exists.
     (home / "sessions").mkdir(parents=True, exist_ok=True)
-    source_root = Path.home() / ".codex" if shared is None else shared
+    # Resolved through envfile, not `Path.home() / ".codex"`. A deployment that sets
+    # CODEX_HOME keeps its config and credential there, and the hardcoded default
+    # pointed at a directory that may hold neither -- every link then skipped as an
+    # absent target, leaving a home with no config and no credential at all. The
+    # shared tree the jail denies resolves the same way, so the two cannot disagree.
+    source_root = envfile.codex_home() if shared is None else shared
     for name in _SHARED_ENTRIES:
         link, target = home / name, source_root / name
         if not target.exists():
