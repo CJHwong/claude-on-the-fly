@@ -204,6 +204,28 @@ and nothing else. Symlinked entries are resolved rather than refused, because /t
 and most Homebrew and mise paths are symlinks on macOS, and the resolve happens on every
 spawn, so a link repointed later is re-checked.
 
+## The uv cache
+
+Both profiles used to grant the agent writes to `~/.cache/uv`, which is the cache
+`upgrade.run` installs this daemon's own dependencies from: it shells `uv sync` with no
+`env=`, outside any jail and with the TUI's full environment. A jailed turn seeding a
+wheel there is code the operator later runs on purpose, and a cache entry waits rather
+than racing anything.
+
+`sandbox.uv_cache_dir()` is `DATA_DIR/uv-cache`, exported as `UV_CACHE_DIR` by
+`agent_env` because HOME is a passthrough key and uv would otherwise resolve the
+operator's cache. `_ensure_session_mount_sources` creates it before the wrap on both
+platforms: on Linux `--bind-try` skips an absent source, and on macOS the jailed process
+cannot create a directory under a data dir it may not write. The *read* grant on
+`~/.cache/uv` is kept, because a downloaded wheel is not a secret and a warm cache is
+still worth having.
+
+Measured under both bases: a jailed write to `$HOME/.cache/uv` reports "Operation not
+permitted" and one to the agent's own cache succeeds, and under `deny-most` a jailed
+`uv venv` plus `uv pip install --offline --no-index` both complete, populating
+`uv-cache/` with `archive-v0`, `wheels-v6` and `interpreter-v4`. The read grant alone
+does not break uv: it writes only where `UV_CACHE_DIR` points.
+
 ## Linux jail
 
 `sandbox_linux.py` builds bubblewrap argv; `sandbox.py` owns which paths, beside the

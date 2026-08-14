@@ -34,20 +34,13 @@ upgrade path, so none of that was covered by it.
 | The cross-thread read denies and the `state/` write deny sat above allows that could re-open them | `seatbelt/*.sb` | One `extra_paths` entry of `$HOME` re-opened both stores; tests now assert rule position, not just behaviour |
 | `sandbox.extra_paths` had no validation, so the remedy `_JAIL_GUIDANCE` tells the agent to relay was also the bypass: an entry of `$HOME` re-opened `~/.ssh` and `~/.aws` | `sandbox._extra_read_paths` | Entries resolving to the home, an ancestor of it, or a credential store in either direction are logged at ERROR and dropped, the rest still granted; a test asserts every `_DENY_PROBES` entry is out of reach |
 | The command-broker path guard missed an attached short option, a second `=`, a traversal attached to a short option, and a relative path through a planted symlink, on a broker that runs outside the jail with the operator's credential | `commands._unsafe_path_argument` | All four verified passing the old guard and refused by the new one; the guard now reads every `=` segment and the short-option tail, and resolves each candidate against the settled cwd |
+| The agent's uv cache was the operator's, and `upgrade.run` installs from it outside any jail with the TUI's full environment | `seatbelt/*.sb`, `sandbox.agent_env` | Write grant moved to `DATA_DIR/uv-cache` and published as `UV_CACHE_DIR`; a live jailed write to `~/.cache/uv` reports "Operation not permitted" under both bases, while `uv venv` and `uv pip install --offline` complete and populate the new cache |
 
 ## Open
 
 Ordered by severity against the threat model above.
 
 ### Credential reach
-
-**The agent's uv cache is the operator's.** Both profiles grant `~/.cache/uv`
-(`fs-allow-reads.sb`, `fs-deny-most.sb`), `HOME` passes through unchanged, and
-`upgrade.run` shells `uv sync` with no `env=`, inheriting the TUI's full environment. A
-jailed turn writes the cache; a later operator-initiated upgrade installs from it,
-outside the jail. Severity rests on one untested assumption: whether uv re-verifies
-cached artifacts against `uv.lock` hashes on read. If it does, this is low. Closes by
-pointing `UV_CACHE_DIR` elsewhere for the agent.
 
 **`fs: allow-reads` leaves credential stores readable.** Measured on a real home: the
 Firefox profile tree (holding `logins.json` and `key4.db`) and `~/Library/Messages/chat.db`.

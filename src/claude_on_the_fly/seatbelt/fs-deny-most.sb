@@ -75,6 +75,12 @@
 ;; rest of $HOME unless it is granted back. Scoped to memory/ so the sibling .env
 ;; and logs/ stay unreadable.
 (allow file-read* (subpath (string-append (param "_DATA_DIR") "/memory")))
+;; The agent's own uv cache. Written by it, so it has to be readable back, and it
+;; lives under the data dir this profile makes opaque. See the write grant below
+;; for why it is not the operator's cache.
+(allow file-read* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
+;; The operator's cache, read-only. uv is pointed elsewhere for writes, and a
+;; downloaded wheel is not a secret, so reading a warm cache costs nothing.
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-read* (subpath (param "_TMPDIR")))
 ;; The runtime this jail has to be able to run: the agent binary's directory and
@@ -215,7 +221,12 @@
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
+;; The agent's own uv cache, not the operator's: `upgrade.run` runs `uv sync`
+;; outside any jail with the TUI's full environment, so a wheel a jailed turn
+;; seeded in ~/.cache/uv is code the operator later runs on purpose. See
+;; sandbox.uv_cache_dir, which agent_env exports as UV_CACHE_DIR. The read allow
+;; on ~/.cache/uv above is kept: reading a warm cache leaks nothing.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
 (allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))

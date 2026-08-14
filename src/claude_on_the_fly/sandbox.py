@@ -382,6 +382,11 @@ def agent_env() -> dict[str, str] | None:
     from claude_on_the_fly import envfile
 
     env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
+    # Stated for the reason the profiles no longer grant writes to ~/.cache/uv:
+    # see uv_cache_dir(). HOME is a passthrough key, so without this the child
+    # resolves the operator's cache and the write deny costs capability instead of
+    # buying isolation.
+    env["UV_CACHE_DIR"] = str(uv_cache_dir())
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
@@ -396,6 +401,27 @@ def agent_env() -> dict[str, str] | None:
         dropped,
     )
     return env
+
+
+def uv_cache_dir() -> Path:
+    """The agent's own uv cache, separate from the operator's.
+
+    Both profiles used to grant the agent writes to `~/.cache/uv`, and that is the
+    same cache `upgrade.run` installs this daemon's own dependencies from: it
+    shells `uv sync` with no `env=`, so it inherits the TUI's full environment
+    outside any jail. A jailed turn seeding a wheel there is code the operator
+    later runs on purpose, with ANTHROPIC_API_KEY and SLACK_TOKEN in reach. The
+    turn does not even need to win a race, because a cache entry waits.
+
+    Under DATA_DIR, beside memory/ and shims/, because that is the one tree both
+    profiles already grant the agent writes into while keeping the daemon's .env,
+    logs/ and state/ denied. The operator's cache stays *readable* under
+    deny-most, so a warm cache still helps anything that consults it; only the
+    write is gone.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    return DATA_DIR / "uv-cache"
 
 
 def shim_dir() -> Path:
@@ -658,6 +684,7 @@ def _readable_paths(workspace: Path | str) -> list[str]:
         f"{home}/.claude.json",
         f"{home}/.codex",
         f"{home}/.cache/uv",
+        str(uv_cache_dir()),
         str(shim_dir()),
         *_extra_read_paths(),
     ]
@@ -1058,6 +1085,13 @@ def _ensure_session_mount_sources(workspace: Path) -> None:
         binds ~/.codex read-write.
     """
     directories, files = _session_mount_sources(workspace)
+    # The agent's uv cache is daemon-wide rather than per-thread, so it is not one
+    # of the session sources, but it needs creating here for both of the reasons
+    # above: on Linux `--bind-try` skips an absent source, leaving the grant
+    # silently missing under a data dir that is an opaque tmpfs remounted
+    # read-only; on macOS the jailed process would have to create the directory
+    # itself under a parent it cannot write.
+    directories = [*directories, Path(os.path.realpath(uv_cache_dir()))]
     for source in directories:
         try:
             source.mkdir(parents=True, exist_ok=True)
@@ -1102,7 +1136,10 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         *(claude_config / name for name in _CLAUDE_RUNTIME_WRITES),
         tmpdir,
         home / ".claude.json",
-        home / ".cache/uv",
+        # The agent's own uv cache, not the operator's, which is bound read-only
+        # below. See uv_cache_dir(). Deeper than the opaque data dir, so depth
+        # ordering restores exactly this one.
+        Path(os.path.realpath(uv_cache_dir())),
         home / ".ollama",
         home / ".Trash",
         # Writable so codex can create new state files it names itself; the
@@ -1154,6 +1191,9 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             home / ".claude",
             codex,
             data_dir / "shims",
+            # Read-only, where it used to be read-write: a warm cache still
+            # speeds a `uv run` up, and uv writes to UV_CACHE_DIR instead.
+            home / ".cache/uv",
             *(Path(p) for p in _extra_read_paths(cap=None)),
         ],
         "read_write": read_write,

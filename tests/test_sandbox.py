@@ -352,6 +352,66 @@ def test_extra_paths_keeps_the_ordinary_grants(monkeypatch):
     ]
 
 
+# --- the agent's uv cache is not the operator's ---
+
+
+def test_the_agent_is_pointed_at_its_own_uv_cache(monkeypatch):
+    """`upgrade.run` shells `uv sync` with no env=, outside any jail and with the
+    TUI's full environment. A jailed turn that could seed ~/.cache/uv would be
+    writing code the operator later installs from. HOME is a passthrough key, so
+    the child resolves the operator's cache unless UV_CACHE_DIR says otherwise."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["UV_CACHE_DIR"] == str(agent.DATA_DIR / "uv-cache")
+    assert env["UV_CACHE_DIR"] != f"{Path.home()}/.cache/uv"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_neither_profile_lets_a_turn_write_the_operators_uv_cache(profile):
+    """Structural rather than a live probe, for the reason the memory-grant test
+    gives: the suite's HOME is a tmpdir inside _TMPDIR, which both profiles grant
+    wholesale, so a live write to ~/.cache/uv would be allowed for the wrong
+    reason and would prove nothing about this rule."""
+    text = profile.read_text()
+    assert (
+        '(allow file-write* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))'
+        in text
+    )
+    assert (
+        '(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))'
+        not in text
+    )
+
+
+def test_deny_most_still_reads_the_operators_uv_cache():
+    """The read is kept deliberately: a downloaded wheel is not a secret, and a
+    warm cache is the difference between a fast `uv run` and a cold one."""
+    text = sandbox._DENY_MOST_PROFILE.read_text()
+    assert (
+        '(allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))'
+        in text
+    )
+
+
+def test_the_uv_cache_exists_before_the_wrap(monkeypatch, tmp_path):
+    """On Linux `--bind-try` skips an absent source, so the grant would be silently
+    missing under a data dir that is an opaque tmpfs; on macOS the jailed process
+    would have to create the directory under a parent it cannot write."""
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path / "data")
+    assert not sandbox.uv_cache_dir().exists()
+    sandbox._ensure_session_mount_sources(tmp_path / "ws")
+    assert sandbox.uv_cache_dir().is_dir()
+
+
+def test_linux_binds_the_operators_uv_cache_read_only(tmp_path):
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    operator_cache = Path(os.path.realpath(Path.home())) / ".cache/uv"
+    assert operator_cache in grants["read_only"]
+    assert operator_cache not in grants["read_write"]
+    assert Path(os.path.realpath(sandbox.uv_cache_dir())) in grants["read_write"]
+
+
 # --- Slice 3: loopback narrowing ---
 
 
@@ -1164,10 +1224,11 @@ def test_memory_grant_is_scoped_to_memory_not_the_whole_data_dir(profile):
     grants = re.findall(
         r'\(allow file-(?:read|write)\*.*?\(param "_DATA_DIR"\) "([^"]*)"', text
     )
+    scoped = ("/memory", "/shims", "/uv-cache")
     assert grants, "expected at least one data-dir grant"
     for suffix in grants:
-        assert suffix.startswith("/memory") or suffix.startswith("/shims"), (
-            f"data-dir grant {suffix!r} is wider than memory/ and shims/"
+        assert suffix.startswith(scoped), (
+            f"data-dir grant {suffix!r} is wider than {', '.join(scoped)}"
         )
 
 

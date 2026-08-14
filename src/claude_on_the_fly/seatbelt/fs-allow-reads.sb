@@ -324,8 +324,14 @@
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
-;; uv: Needed for caching packages and metadata
-(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
+;; uv: needed for caching packages and metadata, but NOT the operator's cache.
+;; `upgrade.run` installs this daemon's own dependencies with `uv sync`, outside
+;; any jail and with the TUI's full environment, so a wheel a jailed turn seeded
+;; in ~/.cache/uv is code the operator later runs on purpose. The agent gets its
+;; own cache under the data dir instead (sandbox.uv_cache_dir, exported as
+;; UV_CACHE_DIR by sandbox.agent_env). Reads of the operator's cache stay allowed
+;; by the global read allow above, so a warm cache still helps.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
 ;; Ollama: Needed to sync aliases, save configurations, and manage models/temporary files
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
