@@ -1307,7 +1307,12 @@ def _probe_workspace() -> Path:
 DENIED = "denied"
 ABSENT = "absent"
 READABLE = "READABLE"
+WRITABLE = "WRITABLE"
 BROKEN = "BROKEN"
+
+# The file the write probe tries to create inside the jail. Named so a leftover
+# is obviously ours, in the one directory the probe targets.
+_WRITE_PROBE_NAME = ".cotf-write-probe"
 
 
 class SandboxBoundaryError(RuntimeError):
@@ -1378,6 +1383,80 @@ async def _probe_deny(spec: str, workspace: Path) -> str | None:
         if message.strip()
         else f"rc={probe.returncode}",
     )
+    return DENIED
+
+
+def _temp_tree_hint(directory: Path) -> str:
+    """Name the likeliest cause of a writable data dir, or return nothing.
+
+    Both profiles grant writes to the temp trees outright, because a toolchain
+    needs scratch space. A data dir placed inside one therefore inherits that
+    grant, and the deny on `state/` cannot take it back -- last match wins. The
+    refusal is correct either way, but "your data dir is in /tmp" is a fix and a
+    bare path is a puzzle.
+    """
+    candidates = [os.environ.get("TMPDIR"), "/tmp", "/private/tmp", "/var/folders"]
+    resolved = str(Path(os.path.realpath(directory)))
+    for base in candidates:
+        if base and resolved.startswith(str(Path(os.path.realpath(base)))):
+            return (
+                f" -- it sits under {base}, which the jail grants writes to for "
+                "scratch space. Point the data dir somewhere outside the temp tree."
+            )
+    return ""
+
+
+async def _probe_write(directory: Path, workspace: Path) -> str | None:
+    """Attempt to create a file in `directory` from inside the jail.
+
+    The counterpart to `_probe_deny`, and the reason it exists is `state/`: the
+    pending-turn journal there is replayed as user messages at the next start, so
+    a jailed turn that could write one would be scheduling a prompt for itself
+    past whatever approval the operator set. That deny was held by the *absence*
+    of an allow rule, which is one refactor away from being held by nothing.
+
+    Judged by effect, not by errno. A write that "succeeded" inside a Linux
+    namespace onto a tmpfs leaves nothing on the host, which is the outcome that
+    matters and is what this checks; a message- or returncode-based verdict would
+    have to model each platform's mechanism to say the same thing.
+    """
+    target = directory / _WRITE_PROBE_NAME
+    with contextlib.suppress(OSError):
+        target.unlink()
+    if not directory.is_dir():
+        logger.info("sandbox: write probe %s not present, deny untested", directory)
+        return ABSENT
+    argv = wrap(["/bin/sh", "-c", f"echo probe >> '{target}'"], workspace)
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            *argv,
+            env=agent_env() or {},
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
+    except (OSError, TimeoutError) as exc:
+        logger.warning("sandbox: write probe for %s failed to run: %s", directory, exc)
+        return None
+    message = err.decode("utf-8", "replace").lower()
+    if "sandbox-exec:" in message or "bwrap:" in message:
+        logger.error(
+            "sandbox: write probe %s could not run, the profile is broken: %s",
+            directory,
+            message.strip().splitlines()[0] if message.strip() else "?",
+        )
+        return BROKEN
+    if target.exists():
+        with contextlib.suppress(OSError):
+            target.unlink()
+        logger.error(
+            "sandbox: PROBE FAIL %s is WRITABLE inside the jail; a turn could "
+            "queue its own work for the next start%s",
+            directory,
+            _temp_tree_hint(directory),
+        )
+        return WRITABLE
+    logger.info("sandbox: write probe %s denied by the profile", directory)
     return DENIED
 
 
@@ -1638,16 +1717,26 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     # defaulting to cwd would leave those in whichever directory the daemon
     # happened to start in, usually somebody's checkout.
     probe_workspace = workspace or _probe_workspace()
+    # The write probe rides along with the reads: one more subprocess on a path
+    # that already spawns several concurrently. `state/` is the only directory
+    # probed for writes, because it is the only one whose contents decide what
+    # runs on a later turn (`turns.py`).
+    from claude_on_the_fly.heartbeat import STATE_DIR
+
+    write_spec = f"{STATE_DIR} (write)"
     outcomes = await asyncio.gather(
-        *(_probe_deny(spec, probe_workspace) for spec in specs)
+        *(_probe_deny(spec, probe_workspace) for spec in specs),
+        _probe_write(STATE_DIR, probe_workspace),
     )
     results: dict[str, str] = {
         spec: outcome
-        for spec, outcome in zip(specs, outcomes, strict=True)
+        for spec, outcome in zip((*specs, write_spec), outcomes, strict=True)
         if outcome is not None
     }
     broken = [spec for spec, outcome in results.items() if outcome == BROKEN]
-    leaked = [spec for spec, outcome in results.items() if outcome == READABLE]
+    leaked = [
+        spec for spec, outcome in results.items() if outcome in (READABLE, WRITABLE)
+    ]
     denied = [spec for spec, outcome in results.items() if outcome == DENIED]
     if broken:
         logger.error(
@@ -1657,13 +1746,13 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
         )
     elif leaked:
         logger.error(
-            "sandbox: %d credential path(s) READABLE inside the jail: %s",
+            "sandbox: %d path(s) reachable inside the jail that must not be: %s",
             len(leaked),
             leaked,
         )
     else:
         logger.info(
-            "sandbox: %d/%d probed credential paths confirmed denied under %s "
+            "sandbox: %d/%d probed paths confirmed denied under %s "
             "(%d absent, untested)",
             len(denied),
             len(results),

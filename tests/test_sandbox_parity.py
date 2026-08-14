@@ -95,6 +95,18 @@ CONTRACT = (
     Case("daemon .env", "{data}/.env", read=DENY),
     Case("daemon .env one level down", "{data}/memory/.env", read=DENY),
     Case("daemon conversation logs", "{data}/logs/chat.log", read=DENY),
+    # --- the daemons' own bookkeeping ---
+    # The journal is the sharp one, and the write side is sharper than the read
+    # side: its entries are replayed as user messages at the next start, so a
+    # jailed turn that could write one would be scheduling a prompt for itself
+    # past whatever approval the operator set. The session map and the event log
+    # describe every *other* conversation the daemon serves, which is the same
+    # boundary `sandbox.scope_sessions` draws between sessions.
+    Case(
+        "pending-turn journal", "{data}/state/slack.turns.json", read=DENY, write=DENY
+    ),
+    Case("session map", "{data}/state/telegram-sessions.json", read=DENY, write=DENY),
+    Case("daemon event log", "{data}/state/events.jsonl", read=DENY, write=DENY),
     # --- config that decides what runs on a LATER turn ---
     # Each of these outlives the session, so a jailed turn writing one is how an
     # injected agent leaves itself standing orders.
@@ -164,6 +176,7 @@ def world(monkeypatch):
         project / ".vscode",
         memory,
         data / "logs",
+        data / "state",
     ):
         directory.mkdir(parents=True, exist_ok=True)
     seed = {
@@ -179,6 +192,11 @@ def world(monkeypatch):
         data / ".env": "TELEGRAM_BOT_TOKEN=PARITY\n",
         data / "memory/.env": "TELEGRAM_BOT_TOKEN=PARITY\n",
         data / "logs/chat.log": "PARITY transcript\n",
+        # Seeded for the same reason as everything else here: a read that fails
+        # because nothing is there proves nothing about the boundary.
+        data / "state/slack.turns.json": "[]\n",
+        data / "state/telegram-sessions.json": "{}\n",
+        data / "state/events.jsonl": "{}\n",
         memory / "recall.md": "remembered\n",
         project / "note.txt": "work\n",
         project / ".mcp.json": "{}\n",
@@ -237,6 +255,35 @@ def test_contract_holds_on_this_platform(case, world):
         if got != case.write:
             failures.append(f"write expected {case.write}, got {got}")
     assert not failures, f"{case.what} ({path}): " + "; ".join(failures)
+
+
+# The daemons' bookkeeping, as the paths the state cases above use.
+_STATE_FILES = (
+    "state/slack.turns.json",
+    "state/telegram-sessions.json",
+    "state/events.jsonl",
+)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="allow-reads is a macOS-only shape"
+)
+@pytest.mark.parametrize("name", _STATE_FILES)
+def test_the_state_dir_is_denied_under_allow_reads_too(name, world, monkeypatch):
+    """The contract above runs under deny-most, where the whole data dir is
+    opaque and this holds for free. `allow-reads` is the default and the opposite
+    shape -- read everything, deny a list -- so the rule that covers `state/`
+    there is the one that can be missing, and was.
+
+    Write is asserted alongside read because the write is the dangerous half: a
+    journal entry is replayed as a user message at the next start.
+    """
+    monkeypatch.setenv("COTF_SANDBOX_FS", "allow-reads")
+    path = str(world["data"] / name)
+    project = world["project"]
+
+    assert not _can_read(path, project), f"{name} is readable under allow-reads"
+    assert not _can_write(path, project), f"{name} is writable under allow-reads"
 
 
 def test_the_agents_own_loopback_still_works(world):

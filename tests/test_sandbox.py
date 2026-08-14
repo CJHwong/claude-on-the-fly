@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -657,6 +658,11 @@ async def test_verify_denials_reports_each_probe(
         pytest.skip("macOS only")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
+    # The write probe is isolated here on purpose. This suite's home lives under
+    # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
+    # would report WRITABLE for a reason that says nothing about the read denies
+    # this test is about. It has its own tests below, including a live one.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         results = await sandbox.verify_denials(tmp_path)
     assert results, "expected at least one probe"
@@ -676,12 +682,18 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     if not shutil.which("sandbox-exec"):
         pytest.skip("macOS only")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
+    # The write probe is isolated here on purpose. This suite's home lives under
+    # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
+    # would report WRITABLE for a reason that says nothing about the read denies
+    # this test is about. It has its own tests below, including a live one.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         results = await sandbox.verify_denials(tmp_path)
     assert set(results.values()) == {sandbox.ABSENT}, results
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "deny untested" in logged
-    assert f"0/{len(sandbox._DENY_PROBES)} probed" in logged
+    assert f"0/{len(results)} probed" in logged
+    assert len(results) == len(sandbox._DENY_PROBES)
 
 
 @pytest.fixture
@@ -903,6 +915,11 @@ async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
         raise OSError("too many open files")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", cannot_spawn)
+    # The write probe is isolated here on purpose. This suite's home lives under
+    # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
+    # would report WRITABLE for a reason that says nothing about the read denies
+    # this test is about. It has its own tests below, including a live one.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
         assert await sandbox.verify_denials(tmp_path) == {}
     assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
@@ -926,6 +943,11 @@ async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_hanging)
     monkeypatch.setattr(asyncio, "wait_for", _immediate_timeout)
+    # The write probe is isolated here on purpose. This suite's home lives under
+    # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
+    # would report WRITABLE for a reason that says nothing about the read denies
+    # this test is about. It has its own tests below, including a live one.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
         assert await sandbox.verify_denials(tmp_path) == {}
     assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
@@ -957,6 +979,11 @@ async def test_a_readable_credential_path_is_an_error_not_a_pass(
         return ReadableProbe()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_readable)
+    # The write probe is isolated here on purpose. This suite's home lives under
+    # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
+    # would report WRITABLE for a reason that says nothing about the read denies
+    # this test is about. It has its own tests below, including a live one.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
     with (
         caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
         pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
@@ -964,7 +991,7 @@ async def test_a_readable_credential_path_is_an_error_not_a_pass(
         await sandbox.verify_denials(tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "PROBE FAIL" in logged
-    assert "credential path(s) READABLE inside the jail" in logged
+    assert "reachable inside the jail that must not be" in logged
     # A leak must never be reported alongside a reassuring count.
     assert "confirmed denied" not in logged
 
@@ -994,6 +1021,11 @@ async def test_probes_run_concurrently_not_one_after_another(
         return SlowProbe()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_slow)
+    # The write probe is isolated here on purpose. This suite's home lives under
+    # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
+    # would report WRITABLE for a reason that says nothing about the read denies
+    # this test is about. It has its own tests below, including a live one.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
     results = await sandbox.verify_denials(tmp_path)
     assert peak == len(sandbox._DENY_PROBES), f"peak concurrency was {peak}"
     assert set(results.values()) == {sandbox.DENIED}
@@ -2515,3 +2547,191 @@ def test_no_warning_when_the_protected_paths_are_real(monkeypatch, tmp_path, cap
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
         sandbox._preflight_protected_symlinks()
     assert "symlink" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# --- the write probe: state/ must not be writable from inside the jail ---
+
+
+async def test_the_write_probe_reports_a_real_write_as_writable(monkeypatch, tmp_path):
+    """Judged by effect: the probe file exists on the host afterwards.
+
+    Faked rather than run for real, because a correctly configured machine cannot
+    produce this outcome on demand -- which is exactly why the outcome needs a
+    test of its own.
+    """
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    state = tmp_path / "state"
+    state.mkdir()
+
+    class WritingProbe:
+        returncode = 0
+
+        async def communicate(self):
+            (state / sandbox._WRITE_PROBE_NAME).write_text("probe\n")
+            return b"", b""
+
+    async def spawn(*_args, **_kwargs):
+        return WritingProbe()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    assert await sandbox._probe_write(state, tmp_path) == sandbox.WRITABLE
+    # Cleaned up, so a WRITABLE verdict does not leave its own evidence behind.
+    assert not (state / sandbox._WRITE_PROBE_NAME).exists()
+
+
+async def test_the_write_probe_reports_a_refused_write_as_denied(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    state = tmp_path / "state"
+    state.mkdir()
+
+    class RefusedProbe:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"sh: cannot create: Operation not permitted"
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *_a, **_kw: _resolved(RefusedProbe())
+    )
+
+    assert await sandbox._probe_write(state, tmp_path) == sandbox.DENIED
+
+
+async def test_a_write_that_lands_nowhere_on_the_host_counts_as_denied(
+    monkeypatch, tmp_path
+):
+    """A Linux namespace can let the write "succeed" onto a tmpfs that vanishes.
+    The host is what matters, so an rc of 0 with no file is still denied."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    state = tmp_path / "state"
+    state.mkdir()
+
+    class LyingProbe:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *_a, **_kw: _resolved(LyingProbe())
+    )
+
+    assert await sandbox._probe_write(state, tmp_path) == sandbox.DENIED
+
+
+async def test_the_write_probe_says_nothing_when_the_directory_is_absent(
+    monkeypatch, tmp_path, caplog
+):
+    """Absent is not evidence: a first-run daemon has no state dir yet, and
+    calling that "denied" would report a boundary nothing tested."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        outcome = await sandbox._probe_write(tmp_path / "nope", tmp_path)
+
+    assert outcome == sandbox.ABSENT
+    assert "deny untested" in caplog.text
+
+
+async def test_a_broken_profile_is_not_reported_as_a_denied_write(
+    monkeypatch, tmp_path, caplog
+):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    state = tmp_path / "state"
+    state.mkdir()
+
+    class BrokenProfile:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"sandbox-exec: error parsing profile"
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *_a, **_kw: _resolved(BrokenProfile())
+    )
+
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
+        assert await sandbox._probe_write(state, tmp_path) == sandbox.BROKEN
+
+    assert "the profile is broken" in caplog.text
+
+
+async def test_a_write_probe_that_cannot_spawn_says_nothing_either_way(
+    monkeypatch, tmp_path, caplog
+):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    state = tmp_path / "state"
+    state.mkdir()
+
+    async def cannot_spawn(*_args, **_kwargs):
+        raise OSError("too many open files")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", cannot_spawn)
+
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+        assert await sandbox._probe_write(state, tmp_path) is None
+
+    assert "failed to run" in caplog.text
+
+
+async def test_a_writable_state_dir_refuses_to_start(monkeypatch, tmp_path):
+    """The sharpest case in this file: a journal entry is replayed as a user
+    message, so a writable `state/` is a prompt the agent could schedule for
+    itself. It must stop the daemon, not warn."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_DENY_PROBES", ())
+    monkeypatch.setattr(sandbox, "_deny_probe_specs", lambda: ())
+    monkeypatch.setattr(
+        sandbox, "_probe_write", AsyncMock(return_value=sandbox.WRITABLE)
+    )
+
+    with pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"):
+        await sandbox.verify_denials(tmp_path)
+
+
+async def _resolved(value):
+    return value
+
+
+async def test_a_data_dir_inside_the_temp_tree_is_named_as_the_cause(
+    monkeypatch, tmp_path, caplog
+):
+    """Found by the suite failing on itself. Both profiles grant writes to the
+    temp trees for scratch space, so a data dir placed inside one inherits that
+    grant and the `state/` deny cannot take it back. Refusing is right; refusing
+    with a bare path is a puzzle."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    state = tmp_path / "data" / "state"
+    state.mkdir(parents=True)
+
+    class WritingProbe:
+        returncode = 0
+
+        async def communicate(self):
+            (state / sandbox._WRITE_PROBE_NAME).write_text("probe\n")
+            return b"", b""
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", lambda *_a, **_kw: _resolved(WritingProbe())
+    )
+
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
+        assert await sandbox._probe_write(state, tmp_path) == sandbox.WRITABLE
+
+    assert "grants writes to for scratch space" in caplog.text
+    assert "outside the temp tree" in caplog.text
+
+
+def test_a_data_dir_outside_the_temp_tree_gets_no_hint(monkeypatch, tmp_path):
+    """The hint must not fire for the ordinary case, or it becomes noise that
+    points at the wrong thing.
+
+    A literal path rather than a fixture directory: `tmp_path` is itself inside
+    the temp tree this checks for, which is what makes the suite's own home hit
+    the grant in the first place.
+    """
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    assert sandbox._temp_tree_hint(Path("/srv/cotf/state")) == ""
