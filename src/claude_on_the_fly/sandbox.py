@@ -749,9 +749,14 @@ def _platform() -> str:
 #   history.jsonl     cross-project prompt history, and a read leak of its own
 #   todos/, statsig/  no real turn was observed writing them
 _CLAUDE_RUNTIME_WRITE_DIRS = (
-    # The Bash tool writes a shell script and then sources it. Same
-    # execution-adjacent trade the codex shell_snapshots grant records, and it
-    # cannot be closed without taking the tool with it.
+    # Observed being written by a real turn against the operator's own config
+    # directory, and kept for that reason -- but a jailed `claude -p` turn that
+    # actually executed a Bash tool call wrote none, on a fresh config directory
+    # or an existing one, so this grant is not what makes tool use work. The path
+    # production uses is claude-pty, an interactive shell, which is where a shell
+    # snapshot plausibly is written and which is not yet measured under the jail.
+    # Kept rather than dropped because removing it would trade attack surface for
+    # the risk of breaking the one path that has not been tested.
     "shell-snapshots",
     "session-env",
     # Distinct from projects/, despite the name.
