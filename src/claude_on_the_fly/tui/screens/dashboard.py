@@ -26,7 +26,8 @@ Selection model: the active tab decides which daemon the supervisor keys
 unlike focus. On the chat tab ←/→ pick the frontend (header-owned, always
 visible so a stopped one can still be started), and the highlighted row points
 the watch pane at that job's session. Refresh runs at 1Hz, rebuilding tables
-from a fresh state.snapshot() while preserving each table's cursor by row key.
+from a fresh state.snapshot() while preserving each table's cursor by row key
+and its scroll offset (see _restore_cursor).
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
-    Button,
     DataTable,
     Footer,
     Header,
@@ -137,9 +137,17 @@ class DashboardScreen(Screen):
         height: auto;
         padding: 0 0 0 1;
     }
-    #cron-entries, #chat-strip, #jobs-queue {
+    #chat-strip, #jobs-queue {
         height: auto;
         max-height: 100%;
+    }
+    /* The cron table is the panel's flexible child: it takes the space the
+       header and the prompt-detail block below it don't need, and scrolls
+       inside that. `height: auto` let a long entry list grow past the panel
+       and push the detail block off the bottom of the screen. */
+    #cron-entries {
+        height: 1fr;
+        min-height: 3;
     }
     #cron-detail-header, #cron-detail {
         display: none;
@@ -148,15 +156,12 @@ class DashboardScreen(Screen):
         height: auto;
         padding: 0 0 0 1;
     }
+    /* Half the panel at most: on a short terminal a fixed 8 rows would leave
+       the flexible table nothing and spill out of the panel again. */
     #cron-detail {
         height: auto;
-        max-height: 8;
+        max-height: 50%;
         border: solid grey;
-    }
-    #cron-run-now {
-        height: auto;
-        width: auto;
-        margin: 0 0 0 1;
     }
     #action-cue {
         height: auto;
@@ -164,19 +169,25 @@ class DashboardScreen(Screen):
     }
     """
 
-    # The footer carries only the keys reached for constantly: daemon lifecycle
-    # (acting on the active tab / focused chat row — see the action cue), help,
-    # and quit. Everything else — the views (logs / history), config, and the
-    # utility tail (resume, doctor, copy-tail, refresh, stop-all) — stays bound
-    # but `show=False`, surfaced on demand in the `?` help modal. The tab-switch
-    # keys [1]–[4] ride on the tab titles themselves, so they're hidden too.
-    # Keeping one BINDINGS list as the single source means the modal can't drift.
+    # The footer carries the keys reached for constantly: daemon lifecycle
+    # (acting on the active tab / focused chat row — see the action cue), the
+    # active tab's own actions, help, and quit. The tab-scoped ones are shown
+    # but filtered by `check_action`, so the footer only offers what the tab in
+    # front of you can actually do. Everything else — the views (logs /
+    # history), config, and the utility tail (resume, doctor, copy-tail,
+    # refresh, stop-all) — stays bound but `show=False`, surfaced on demand in
+    # the `?` help modal. The tab-switch keys [1]–[3] ride on the tab titles
+    # themselves, so they're hidden too. Keeping one BINDINGS list as the single
+    # source means the modal can't drift.
     # `c` copies the highlighted log tail via OSC 52 (iTerm2/kitty/WezTerm/
     # Alacritty); hold Option (macOS) or Shift while click-dragging for the
     # terminal's own partial-selection copy.
     BINDINGS: ClassVar = [
         Binding("k", "stop", "Stop"),
         Binding("r", "restart", "Restart"),
+        Binding("n", "run_now", "Run now"),
+        Binding("S", "cycle_cron_sort", "Sort"),
+        Binding("t", "copy_takeover", "Takeover"),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("q", "app.quit", "Quit"),
         Binding("l", "app.push_screen('logs')", "Logs", show=False),
@@ -187,9 +198,6 @@ class DashboardScreen(Screen):
         Binding("c", "copy_log", "Copy tail", show=False),
         Binding("R", "refresh_now", "Refresh", show=False),
         Binding("K", "stop_all", "Stop all", show=False),
-        Binding("n", "run_now", "Run now", show=False),
-        Binding("t", "copy_takeover", "Copy takeover", show=False),
-        Binding("s", "cycle_cron_sort", "Sort cron", show=False),
         Binding("1", "show_tab('tab-chat')", "chat tab", show=False),
         Binding("2", "show_tab('tab-cron')", "cron tab", show=False),
         Binding("3", "show_tab('tab-jobs')", "jobs tab", show=False),
@@ -216,8 +224,8 @@ class DashboardScreen(Screen):
         "Refresh": "refresh now",
         "Stop all": "stop every running daemon",
         "Run now": "fire the highlighted cron entry now (cron tab)",
-        "Copy takeover": "copy the highlighted chat job's resume command (chat tab)",
-        "Sort cron": "toggle the cron table between next-fire and name order",
+        "Takeover": "copy the highlighted chat job's resume command (chat tab)",
+        "Sort": "toggle the cron table between next-fire and name order (cron tab)",
         "chat tab": "switch to the chat tab",
         "cron tab": "switch to the cron tab",
         "jobs tab": "switch to the background-jobs tab",
@@ -318,9 +326,6 @@ class DashboardScreen(Screen):
                         highlight=False,
                         markup=False,
                     )
-                    # Mouse path for run-now; `n` is the keyboard path. Both
-                    # gate on the cron daemon being alive (see action_run_now).
-                    yield Button("Run now", id="cron-run-now")
                 # `jobs-queue`, NOT `cron-entries` — the latter is already the
                 # cron tab's cron table above.
                 with (
@@ -393,7 +398,6 @@ class DashboardScreen(Screen):
         self.query_one("#log-pane", RichLog).can_focus = False
         self.query_one("#watch-pane", RichLog).can_focus = False
         self.query_one("#cron-detail", RichLog).can_focus = False
-        self.query_one("#cron-run-now", Button).can_focus = False
         self._refresh()
         self.set_interval(1.0, self._refresh)
         self.set_interval(1.0, self._refresh_log)
@@ -488,6 +492,31 @@ class DashboardScreen(Screen):
             self.query_one(f"#{table_id}", DataTable).focus()
         self._refresh_log(force_reload=True)
         self._update_action_cue()
+        # The footer offers the active tab's actions, so it has to be rebuilt
+        # whenever the tab changes (see check_action).
+        self.refresh_bindings()
+
+    # Action → the tab that owns it. An action absent from this map is global.
+    _TAB_ACTIONS: ClassVar[dict[str, str]] = {
+        "run_now": "tab-cron",
+        "cycle_cron_sort": "tab-cron",
+        "copy_takeover": "tab-chat",
+    }
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide a tab-scoped key when its tab isn't in front.
+
+        The footer reads this, so `n` / `S` only appear on the cron tab and `t`
+        only on the chat tab. Returning False (not None) hides the key rather
+        than graying it out — a key you cannot use is noise, not information.
+        """
+        owner = self._TAB_ACTIONS.get(action)
+        if owner is None:
+            return True
+        try:
+            return self.query_one("#daemon-tabs", TabbedContent).active == owner
+        except Exception:
+            return False  # pre-mount: no tab is in front yet
 
     def _selected_job(self) -> str | None:
         """Highlighted job name in the scheduled jobs DataTable, or None."""
@@ -508,20 +537,29 @@ class DashboardScreen(Screen):
 
     @staticmethod
     def _restore_cursor(
-        table: DataTable, keys: list[str], previously: str | None
+        table: DataTable,
+        keys: list[str],
+        previously: str | None,
+        scroll_y: int = 0,
     ) -> None:
-        if previously is None:
-            return
-        for i, key in enumerate(keys):
-            if key == previously:
-                # Already there? Don't move — move_cursor emits RowHighlighted
-                # even for a no-op, and the 1Hz refresh would otherwise fire a
-                # spurious highlight (and a log rewrite) every tick.
-                if table.cursor_row == i:
-                    return
-                with contextlib.suppress(Exception):
-                    table.move_cursor(row=i)
-                return
+        """Put the cursor back on the row it was on, and the viewport back where
+        it was.
+
+        `DataTable.clear()` drops both. Restoring the cursor alone scrolls the
+        table back down to it, so a scrolled table snaps to the top and back
+        inside every 1Hz tick — which the operator sees as a flashing table.
+        `scroll_y` is the offset read before the rebuild; the scroll is clamped,
+        so a rebuild that dropped rows lands at the new bottom, not past it.
+        """
+        index = keys.index(previously) if previously in keys else None
+        # Already there? Don't move — move_cursor emits RowHighlighted even for
+        # a no-op, and the 1Hz refresh would otherwise fire a spurious highlight
+        # (and a log rewrite) every tick.
+        if index is not None and table.cursor_row != index:
+            with contextlib.suppress(Exception):
+                table.move_cursor(row=index)
+        if scroll_y:
+            table.scroll_to(y=scroll_y, animate=False)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         # Repoint the log pane when the cursor moves. No force_reload: a real
@@ -683,10 +721,6 @@ class DashboardScreen(Screen):
             self._notify(f"run-now failed: {exc}", "error")
             return
         self._notify(f"run-now requested for {job}", "information")
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "cron-run-now":
-            await self.action_run_now()
 
     def action_cycle_cron_sort(self) -> None:
         """Toggle the cron table between next-fire and name order."""
@@ -1217,6 +1251,7 @@ class DashboardScreen(Screen):
 
         table = self.query_one("#cron-entries", DataTable)
         previously = self._selected_job()
+        scroll_y = table.scroll_offset.y
         self._cron_details = {job.name: job.detail for job in jobs}
         table.clear()
         keys: list[str] = []
@@ -1248,7 +1283,13 @@ class DashboardScreen(Screen):
                 Text("no jobs (g)", style="dim"), "", "", "", "", key="__empty__"
             )
         else:
-            self._restore_cursor(table, keys, previously)
+            self._restore_cursor(table, keys, previously, scroll_y)
+        # The table is `height: 1fr`, so it fills the panel and scrolls once the
+        # list outgrows it — that is what keeps the detail block below it on
+        # screen. Capping it at the rows it actually has (+1 for the column
+        # header) stops a two-entry list painting half a screen of empty zebra
+        # stripes, the one thing `height: auto` was doing well.
+        table.styles.max_height = table.row_count + 1
         self._resize_prompt_column(table)
         self._refresh_cron_detail()
 
@@ -1364,6 +1405,7 @@ class DashboardScreen(Screen):
 
         table = self.query_one("#jobs-queue", DataTable)
         previously = self._datatable_cursor_key("#jobs-queue")
+        scroll_y = table.scroll_offset.y
         table.clear()
         keys: list[str] = []
         for row in view.rows if view else []:
@@ -1407,7 +1449,7 @@ class DashboardScreen(Screen):
                     key="__more__",
                 )
                 keys.append("__more__")
-            self._restore_cursor(table, keys, previously)
+            self._restore_cursor(table, keys, previously, scroll_y)
 
     @staticmethod
     def _chat_frontends(
@@ -1451,6 +1493,7 @@ class DashboardScreen(Screen):
 
         table = self.query_one("#chat-strip", DataTable)
         previously = self._datatable_cursor_key("#chat-strip")
+        scroll_y = table.scroll_offset.y
         table.clear()
         keys: list[str] = []
         for job in running:
@@ -1477,7 +1520,7 @@ class DashboardScreen(Screen):
             )
             table.add_row(Text(msg, style="dim"), "", key="__empty__")
         else:
-            self._restore_cursor(table, keys, previously)
+            self._restore_cursor(table, keys, previously, scroll_y)
 
     def _refresh_stale_banner(self, snap: state.Snapshot) -> None:
         stale = [f.name for f in snap.frontends if f.stale]

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App
-from textual.widgets import Button, DataTable, RichLog, Static, TabbedContent
+from textual.widgets import DataTable, RichLog, Static, TabbedContent
 
 import claude_on_the_fly.tui.screens.dashboard as dash
 from claude_on_the_fly.checks import CheckResult
@@ -1529,17 +1529,97 @@ class TestCronTable:
             header = str(app.screen.query_one("#cron-header", Static).content)
         assert "sort: name" in header
 
-    async def test_s_toggles_the_sort_mode(self, isolated):
+    async def test_shift_s_toggles_the_sort_mode(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
             assert screen._cron_sort == "next"
-            await pilot.press("s")
+            await pilot.press("S")
             await pilot.pause()
             assert screen._cron_sort == "name"
+            await pilot.press("S")
+            await pilot.pause()
+            assert screen._cron_sort == "next"
+
+    async def test_lowercase_s_does_not_sort(self, isolated):
+        """`S`, not `s` — the lowercase key is free for the DataTable."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
             await pilot.press("s")
             await pilot.pause()
             assert screen._cron_sort == "next"
+
+    async def test_the_cron_table_leaves_room_for_the_detail_block(self, isolated):
+        """A long entry list must not push the prompt preview off the panel.
+
+        The table is the panel's flexible child, so it scrolls instead of
+        growing; the detail block below it stays on screen.
+        """
+        app = _Host()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            jobs = [
+                self._job(name=f"entry-{i:02d}", detail=f"do the thing {i} " * 6)
+                for i in range(30)
+            ]
+            screen._refresh_cron(self._snap(jobs), self._status("running"))
+            await pilot.pause()
+            panel = app.screen.query_one("#cron-panel")
+            table = app.screen.query_one("#cron-entries", DataTable)
+            detail = app.screen.query_one("#cron-detail", RichLog)
+            assert detail.display
+            assert detail.region.height > 0
+            assert detail.region.bottom <= panel.region.bottom
+            assert table.region.bottom <= detail.region.y
+
+    async def test_a_scrolled_table_stays_put_across_a_refresh(self, isolated):
+        """`clear()` drops the scroll offset and the cursor restore scrolls
+        back to it, so a scrolled table snapped to the top and back on every
+        1Hz tick — a flash the operator sees once a second."""
+        app = _Host()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            jobs = [self._job(name=f"entry-{i:02d}") for i in range(30)]
+            snap, status = self._snap(jobs), self._status("running")
+            screen._refresh_cron(snap, status)
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            table.move_cursor(row=25)
+            await pilot.pause()
+            scrolled = table.scroll_offset.y
+            assert scrolled > 0
+            screen._refresh_cron(snap, status)
+            # Read before the next pause: the flash was the intermediate frame.
+            assert table.scroll_offset.y == scrolled
+            await pilot.pause()
+            assert table.scroll_offset.y == scrolled
+            assert table.cursor_row == 25
+
+    async def test_a_short_entry_list_keeps_the_table_at_its_content_height(
+        self, isolated
+    ):
+        """The flexible table is capped at the rows it has, so two entries
+        don't paint a half-screen of empty zebra stripes."""
+        app = _Host()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            jobs = [self._job(name=f"entry-{i}", detail="short") for i in range(2)]
+            screen._refresh_cron(self._snap(jobs), self._status("running"))
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            # 2 rows + the column header.
+            assert table.region.height == 3
 
     async def test_name_sort_orders_the_table(self, isolated):
         """The snapshot arrives sorted by next fire; the name order is a
@@ -2056,9 +2136,9 @@ class TestChatTakeover:
 
 
 class TestRunNow:
-    """`n` / the Run-now button fire the highlighted cron entry via the
-    daemon's trigger file. The trigger lands under the redirected DATA_DIR, so
-    the tests assert on the file itself rather than on a mocked writer."""
+    """`n` fires the highlighted cron entry via the daemon's trigger file. The
+    trigger lands under the redirected DATA_DIR, so the tests assert on the file
+    itself rather than on a mocked writer."""
 
     def _wire_cron(self, screen: DashboardScreen, monkeypatch, *, job="nightly"):
         screen.action_show_tab("tab-cron")
@@ -2081,21 +2161,30 @@ class TestRunNow:
         assert (isolated / "state" / "cron.trigger").is_file()
         assert any("run-now requested for nightly" in msg for msg, _sev in notices)
 
-    async def test_the_button_fires_the_same_action(self, isolated, monkeypatch):
+    def test_a_tab_scoped_key_is_hidden_before_the_tabs_mount(self):
+        """The Footer asks for bindings early; no tab is in front yet, so a
+        tab-scoped key stays off it rather than crashing the paint."""
+        screen = DashboardScreen()
+        assert screen.check_action("run_now", ()) is False
+        assert screen.check_action("stop", ()) is True
+
+    async def test_run_now_is_inert_off_the_cron_tab(self, isolated, monkeypatch):
+        """`n` belongs to the cron tab: check_action hides it elsewhere, and a
+        hidden binding does not fire."""
         from claude_on_the_fly import agent
 
         monkeypatch.setattr(agent, "DATA_DIR", isolated)
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            self._wire_cron(screen, monkeypatch)
+            monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
             monkeypatch.setattr(supervisor, "is_running", lambda _n: True)
-            notices = _capture(screen)
-            button = app.screen.query_one("#cron-run-now", Button)
-            button.press()
+            screen.action_show_tab("tab-chat")
             await pilot.pause()
-        assert (isolated / "state" / "cron.trigger").is_file()
-        assert any("run-now requested for nightly" in msg for msg, _sev in notices)
+            assert screen.check_action("run_now", ()) is False
+            await pilot.press("n")
+            await pilot.pause()
+        assert not (isolated / "state" / "cron.trigger").exists()
 
     async def test_run_now_refuses_when_the_daemon_is_stopped(
         self, isolated, monkeypatch
