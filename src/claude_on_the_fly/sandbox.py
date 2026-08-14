@@ -629,7 +629,7 @@ def agent_guidance(workspace: Path | None = None) -> str:
     )
 
 
-_RUNTIME_SLOTS = 4
+_RUNTIME_SLOTS = 5
 
 
 def _runtime_read_paths(argv: list[str]) -> list[Path]:
@@ -647,8 +647,19 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     paths: list[Path] = []
     binary = shutil.which(argv[0]) if argv else None
     if binary:
-        # The parent, not the file: an npm-installed CLI is a shim beside the
-        # package tree it loads. Read-only, and it holds executables not secrets.
+        # Two directories, because a launcher and the code it runs need not share
+        # one. `claude` installs as a symlink in ~/.local/bin pointing into
+        # ~/.local/share/claude/versions/<v>, and granting only the resolved
+        # parent left execvp unable to read the symlink it has to resolve first:
+        # measured as rc 71, "execvp() of 'claude' failed: No such file or
+        # directory", which reads like a missing binary rather than a denial.
+        # The npm layout this was first measured against had them in one place,
+        # so one grant covered both by accident.
+        #
+        # The parent in each case, not the file: an npm-installed CLI is a shim
+        # beside the package tree it loads. Read-only, and they hold executables
+        # rather than secrets.
+        paths.append(Path(binary).parent)
         paths.append(Path(os.path.realpath(binary)).parent)
     paths += [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
     seen: dict[str, Path] = {}

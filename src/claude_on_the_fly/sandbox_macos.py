@@ -45,9 +45,11 @@ _DEFAULT_LOOPBACK = "localhost:*"
 # `ask` -- the approval service the backends ask about tool calls. A fifth
 # service would need a fifth slot here and in both profiles.
 _LOOPBACK_SLOTS = 4
-# Runtime read slots in fs-deny-most.sb: agent binary dir, sys.prefix,
-# sys.base_prefix, package dir.
-_RUNTIME_SLOTS = 4
+# Runtime read slots in fs-deny-most.sb: the launcher's directory, the resolved
+# binary's directory, sys.prefix, sys.base_prefix, package dir. Five because a
+# launcher and the code it runs need not share a directory: `claude` is a symlink
+# in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>.
+_RUNTIME_SLOTS = 5
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 

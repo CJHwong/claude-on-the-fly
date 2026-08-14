@@ -2328,3 +2328,38 @@ async def test_the_session_preflight_reports_a_probe_that_could_not_run(
     monkeypatch.setattr(sandbox, "_run_jailed", healthy_until_the_session_probe)
     with pytest.raises(sandbox.SandboxBoundaryError, match="session preflight could"):
         await sandbox.preflight()
+
+
+def test_the_runtime_grants_cover_a_launcher_symlinked_elsewhere(tmp_path, monkeypatch):
+    """`claude` installs as a symlink in ~/.local/bin pointing into
+    ~/.local/share/claude/versions/<v>. Granting only the resolved parent left
+    execvp unable to read the symlink it has to resolve first, and the jail failed
+    with rc 71 "execvp() of 'claude' failed: No such file or directory" -- which
+    reads like a missing binary rather than a denial, and is why the deny-most
+    profile could not start the claude backend at all.
+
+    The npm layout this was first measured against keeps both in one directory, so
+    a single grant covered them by accident.
+    """
+    launcher_dir = tmp_path / "bin"
+    target_dir = tmp_path / "share" / "versions"
+    launcher_dir.mkdir(parents=True)
+    target_dir.mkdir(parents=True)
+    real = target_dir / "2.1.232"
+    real.write_text("#!/bin/sh\n")
+    launcher = launcher_dir / "agent-cli"
+    launcher.symlink_to(real)
+    monkeypatch.setattr(shutil, "which", lambda _name: str(launcher))
+    granted = sandbox._runtime_read_paths(["agent-cli"])
+    assert launcher_dir in granted, "the launcher's own directory is not granted"
+    assert target_dir in granted, "the resolved binary's directory is not granted"
+
+
+def test_the_runtime_slot_count_covers_every_path_the_wrapper_supplies(tmp_path):
+    """A path past the slot cap is truncated, silently, and the backend then fails
+    to exec. The cap and the list have to move together."""
+    granted = sandbox._runtime_read_paths(["python3"])
+    assert len(granted) <= sandbox_macos._RUNTIME_SLOTS, (
+        f"{len(granted)} runtime paths but only {sandbox_macos._RUNTIME_SLOTS} slots; "
+        "the extras are dropped and the backend cannot start"
+    )

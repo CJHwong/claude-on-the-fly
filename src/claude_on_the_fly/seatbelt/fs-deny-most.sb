@@ -20,7 +20,7 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3 and _RUNTIME_1.._RUNTIME_4
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3 and _RUNTIME_1.._RUNTIME_5
 ;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
 (version 1)
@@ -66,11 +66,6 @@
 ;; way projects/ does. Denied by name, like the credentials further down, because it
 ;; is one file rather than a tree. No measured turn writes it, so nothing is lost.
 (deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
-;; The same boundary for the other backend, and codex was the wider hole: the
-;; ~/.codex grant above reached every rollout in one flat date tree, 1088 of them
-;; on the host this was measured on. codex picks the rollout name at startup, so
-;; there is no per-workspace path to re-grant; the workspace gets its own
-;; CODEX_HOME instead and this thread's rollouts are the only ones inside it.
 ;; codex config, the same grant ~/.claude gets for the other backend.
 (allow file-read* (subpath (string-append (param "_HOME") "/.codex")))
 ;; The same boundary for the other backend, and codex was the wider hole: the
@@ -106,12 +101,18 @@
 ;; interpreter with "execvp() ... Operation not permitted" (rc 71), which is how
 ;; the startup egress probe came to block the daemon entirely.
 ;;
-;; Four slots because SBPL has no arrays, same trade as _EXTRA_*. Unused slots
-;; repeat _PROJECT_DIR, which is already allowed.
+;; Five slots because SBPL has no arrays, same trade as _EXTRA_*. Unused slots
+;; repeat _PROJECT_DIR, which is already allowed. Five rather than four because a
+;; launcher and the code it runs need not share a directory: `claude` installs as
+;; a symlink in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>, and
+;; granting only the resolved parent left execvp unable to read the symlink it has
+;; to resolve first (rc 71, "No such file or directory", which reads like a missing
+;; binary rather than a denial).
 (allow file-read* (subpath (param "_RUNTIME_1")))
 (allow file-read* (subpath (param "_RUNTIME_2")))
 (allow file-read* (subpath (param "_RUNTIME_3")))
 (allow file-read* (subpath (param "_RUNTIME_4")))
+(allow file-read* (subpath (param "_RUNTIME_5")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
 ;; at _PROJECT_DIR, already allowed above, so they add nothing.
 (allow file-read* (subpath (param "_EXTRA_1")))
