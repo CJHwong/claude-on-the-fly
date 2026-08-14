@@ -176,23 +176,61 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
         if link.is_symlink():
             if link.readlink() == target:
                 continue
-            with suppress(OSError):
-                link.unlink()
+            if not _clear_link_site(link):
+                continue
         elif link.exists():
-            # A real file where the link belongs is removed, not left alone. This
-            # home is writable by the jailed turn, so a real AGENTS.md or
-            # config.toml here would be an execution-control file the agent can
+            # A real file or directory where the link belongs is removed, not left
+            # alone. This home is writable by the jailed turn, so a real AGENTS.md
+            # or config.toml here would be an execution-control file the agent can
             # write -- standing orders it leaves itself for the next run, which is
             # the thing the shared ~/.codex deny list exists to prevent. Replacing
             # it with the link puts the name back on a path the profile denies
             # writes to.
-            with suppress(OSError):
-                link.unlink()
-        with suppress(OSError):
+            if not _clear_link_site(link):
+                continue
+        try:
             link.symlink_to(target)
+        except OSError as exc:
+            # Logged rather than suppressed. This is the operator's config, their
+            # AGENTS.md and their hooks.json arriving in the thread, and a turn
+            # that runs without them looks normal from the outside.
+            logger.warning("codex: cannot link %s -> %s: %s", link, target, exc)
     for name in _SHARED_MERGED:
         _merge_shared_dir(home / name, source_root / name)
     return home
+
+
+def _clear_link_site(link: Path) -> bool:
+    """Empty the place a shared entry has to be linked into. False if it stays.
+
+    `Path.unlink()` raises `IsADirectoryError` on a directory, and the old
+    `with suppress(OSError)` around the unlink and the symlink_to that followed
+    swallowed it with nothing logged. Confirmed by a run: a turn that deleted a
+    shared-entry link inside its own writable CODEX_HOME and made a directory in
+    its place kept that directory through every later `ensure_home()`, so the
+    operator's `config.toml`, `AGENTS.md` and `hooks.json` stopped applying to
+    that thread for ever. A thread that can permanently drop its own operator
+    guardrails is worth one destructive step to take back.
+
+    Two bounds on that step, since it is the only recursive removal in this
+    module's hot path. The site must sit under HOMES_DIR, which the daemon owns:
+    the operator's shared `~/.codex` is only ever a link *target* here, and with
+    the session boundary off `ensure_home` returns before any of this. And a
+    symlink is unlinked, never descended -- `rmtree` refuses one anyway -- so a
+    link the turn planted cannot carry the removal out of the home.
+    """
+    if not link.is_relative_to(HOMES_DIR):
+        logger.warning("codex: refusing to clear %s, outside %s", link, HOMES_DIR)
+        return False
+    try:
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)
+        else:
+            link.unlink()
+    except OSError as exc:
+        logger.warning("codex: cannot clear %s for the shared link: %s", link, exc)
+        return False
+    return True
 
 
 def _safe_iterdir(path: Path) -> list[Path]:
@@ -253,12 +291,18 @@ def _merge_shared_dir(local: Path, shared: Path) -> None:
         if link.is_symlink():
             if link.readlink() == entry:
                 continue
-            with suppress(OSError):
-                link.unlink()
+            if not _clear_link_site(link):
+                continue
         elif link.exists():
+            # Unlike `ensure_home`, a real entry here is codex's own and stays:
+            # it may hold state the agent created on purpose, and `skills/` is a
+            # directory codex writes into rather than an execution-control file
+            # the operator owns.
             continue
-        with suppress(OSError):
+        try:
             link.symlink_to(entry)
+        except OSError as exc:
+            logger.warning("codex: cannot link %s -> %s: %s", link, entry, exc)
 
 
 def _mapping_key(workspace: Path, session_uuid: str) -> str:

@@ -350,6 +350,43 @@ class TestCodexHomeShieldsExecutionControlNames:
         assert planted.readlink() == shared / "AGENTS.md"
         assert planted.read_text() == "operator instructions\n"
 
+    def test_a_directory_the_agent_planted_gives_the_shared_entry_back(self, tmp_path):
+        """The guardrail-defeat this closes: the turn deletes the hooks.json link
+        inside its own writable home and makes a directory there. `unlink()`
+        raises IsADirectoryError on that, and the suppressed OSError meant every
+        later spawn left the directory alone, so the operator's hooks never
+        applied to that thread again."""
+        shared = tmp_path / "shared-codex"
+        shared.mkdir()
+        (shared / "hooks.json").write_text('{"hooks": []}\n')
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        (home / "hooks.json").unlink()
+        (home / "hooks.json").mkdir()
+        (home / "hooks.json" / "squatter").write_text("agent made this\n")
+
+        codex_state.ensure_home(workspace, shared=shared)
+
+        assert (home / "hooks.json").readlink() == shared / "hooks.json"
+        assert (home / "hooks.json").read_text() == '{"hooks": []}\n'
+
+    def test_a_link_site_outside_the_per_thread_homes_is_left_alone(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The bound on the one destructive step. Nothing reaches this today --
+        the boundary-off path returns before any linking -- so it is asserted
+        rather than left to reasoning."""
+        outsider = tmp_path / "not-a-home" / "config.toml"
+        outsider.parent.mkdir(parents=True)
+        outsider.mkdir()
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.codex_state"):
+            assert codex_state._clear_link_site(outsider) is False
+
+        assert outsider.is_dir()
+        assert "refusing to clear" in caplog.text
+
     def test_a_name_the_operator_does_not_have_stays_absent(self, tmp_path):
         """No dangling links: codex reads a missing config as "use the defaults",
         and treats a broken one as an error."""
@@ -384,6 +421,85 @@ def test_the_home_links_follow_a_redirected_codex_home(
     home = codex_state.ensure_home(workspace)
     assert (home / "auth.json").readlink() == redirected / "auth.json"
     assert (home / "config.toml").readlink() == redirected / "config.toml"
+
+
+class TestALinkageFailureIsVisibleRatherThanSilent:
+    """The linking is best-effort by design: a turn still has to run. What it
+    must not be is quiet, which is how a thread kept the directory it planted
+    over the operator's hooks.json for ever."""
+
+    @pytest.fixture(autouse=True)
+    def _boundary_on(self, scoped_sessions):
+        """The per-thread home is opt-in, and only it links anything."""
+
+    def _shared(self, tmp_path):
+        shared = tmp_path / "shared-codex"
+        (shared / "skills" / "browser").mkdir(parents=True)
+        (shared / "config.toml").write_text("model = 'x'\n")
+        return shared
+
+    def test_a_directory_that_cannot_be_removed_is_reported(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        shared = self._shared(tmp_path)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=shared)
+        (home / "config.toml").unlink()
+        (home / "config.toml").mkdir()
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(codex_state.shutil, "rmtree", refuse)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.codex_state"):
+            codex_state.ensure_home(workspace, shared=shared)
+
+        assert (home / "config.toml").is_dir()
+        assert "cannot clear" in caplog.text
+
+    def test_a_stale_link_that_cannot_be_unlinked_is_reported(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Both link sites: the shared entries and the merged skills."""
+        shared = self._shared(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "skills" / "browser").mkdir(parents=True)
+        (elsewhere / "config.toml").write_text("someone else's\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        home = codex_state.ensure_home(workspace, shared=elsewhere)
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(codex_state.Path, "unlink", refuse)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.codex_state"):
+            codex_state.ensure_home(workspace, shared=shared)
+
+        assert (home / "config.toml").readlink() == elsewhere / "config.toml"
+        assert (home / "skills" / "browser").readlink() == (
+            elsewhere / "skills" / "browser"
+        )
+        assert "cannot clear" in caplog.text
+
+    def test_a_link_that_cannot_be_created_is_reported(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        shared = self._shared(tmp_path)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(codex_state.Path, "symlink_to", refuse)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.codex_state"):
+            home = codex_state.ensure_home(workspace, shared=shared)
+
+        assert not (home / "config.toml").exists()
+        assert "cannot link" in caplog.text
+        assert "skills/browser" in caplog.text.replace(str(home), "")
 
 
 class TestSharedSkillsReachThePerThreadHome:
