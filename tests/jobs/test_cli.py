@@ -433,11 +433,28 @@ class TestRunLoopWiring:
         assert order == ["verify_boundary", "build", "sweep", "run_loop"]
 
 
-def test_an_unproven_jail_refuses_to_start_the_worker(monkeypatch, capsys) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        cli.sandbox.SandboxBoundaryError(
+            "sandbox boundary self-test failed; refusing to start autonomous work"
+        ),
+        cli.sandbox.SandboxModeError(
+            "sandbox.mode='jial' is not one of ['off', 'env', 'jail']. "
+            "Refusing to start rather than serving turns unsandboxed."
+        ),
+    ],
+    ids=["boundary", "mode"],
+)
+def test_an_unproven_jail_refuses_to_start_the_worker(
+    monkeypatch, capsys, error
+) -> None:
     """Fatal rather than advisory, and unattended is the argument for it: the
     worker runs bypassPermissions turns against whatever a producer queued. The
     queue is durable, so a refusal costs a restart; the opposite choice cannot be
-    undone once the reads have happened."""
+    undone once the reads have happened. Both startup refusals exit the same way:
+    a typo'd `sandbox.mode` raises SandboxModeError from `verify_boundary` ->
+    `preflight`, and it must not die with a traceback and exit 1."""
     monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
     monkeypatch.setattr(cli, "_setup_logging", lambda: None)
     monkeypatch.setattr(cli, "check_backend", lambda: None)
@@ -446,14 +463,12 @@ def test_an_unproven_jail_refuses_to_start_the_worker(monkeypatch, capsys) -> No
     )
 
     async def refuse(_token):
-        raise cli.sandbox.SandboxBoundaryError(
-            "sandbox boundary self-test failed; refusing to start autonomous work"
-        )
+        raise error
 
     monkeypatch.setattr(cli, "_run", refuse)
 
     assert cli._cmd_run() == 2
-    assert "refusing to start autonomous work" in capsys.readouterr().err
+    assert "refusing to start" in capsys.readouterr().err.lower()
 
 
 def test_normalize_argv_treats_a_bare_flag_as_run_options() -> None:

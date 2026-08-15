@@ -306,10 +306,13 @@ def _cmd_run() -> int:
     try:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run(token))
-    except sandbox.SandboxBoundaryError as exc:
+    except (sandbox.SandboxBoundaryError, sandbox.SandboxModeError) as exc:
         # An exit code and one line, not a traceback: this is an operator-facing
         # refusal with a remedy in its message, and it exits the same way as the
         # other two refusals above so the supervisor treats all three alike.
+        # SandboxModeError is the other startup refusal: a typo'd `sandbox.mode`
+        # raises it from `verify_boundary` -> `preflight`, and without this
+        # catch the worker died with a traceback and exit 1 instead.
         sys.stderr.write(f"claude-jobs: {exc}\n")
         return 2
     return 0
