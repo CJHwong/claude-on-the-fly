@@ -2944,15 +2944,53 @@ class TestResolvePtyBinary:
 
 
 # ---------------------------------------------------------------------------
-# Response pty-derived footer formatting
+# Response context and pty-derived footer formatting
 # ---------------------------------------------------------------------------
 
 
-class TestResponsePtyFooter:
+class TestResponseContextFooter:
     def test_appends_context_window_pct(self):
-        r = Response(body="x", cost=0.01, model="haiku", context_window_pct=42)
+        r = Response(
+            body="x",
+            cost=0.01,
+            model="haiku",
+            context_window_pct=42,
+            context_tokens=900_000,
+            context_window_size=1_000_000,
+        )
         stats = r.format_stats()
         assert "ctx 42%" in stats
+
+    def test_derives_context_window_pct_from_native_fields(self):
+        r = Response(
+            body="x",
+            cost=0.01,
+            duration=1.2,
+            tokens_in=10,
+            tokens_out=2,
+            model="gpt-5.6-sol",
+            context_tokens=650_000,
+            context_window_size=1_000_000,
+        )
+        assert r.format_stats() == ("$0.0100 | 1.2s | ↑10 ↓2 | ctx 65% | gpt-5.6-sol")
+
+    @pytest.mark.parametrize(
+        ("context_tokens", "context_window_size"),
+        [(None, 1_000_000), (100, None), (100, 0)],
+    )
+    def test_omits_context_window_pct_without_complete_native_fields(
+        self,
+        context_tokens,
+        context_window_size,
+    ):
+        r = Response(
+            body="x",
+            cost=0.01,
+            model="gpt-5.6-sol",
+            context_tokens=context_tokens,
+            context_window_size=context_window_size,
+        )
+        assert "ctx" not in r.format_stats()
 
     def test_skips_5h_below_threshold(self):
         r = Response(
