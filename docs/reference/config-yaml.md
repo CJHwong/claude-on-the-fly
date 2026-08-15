@@ -7,9 +7,9 @@ Lifecycle terms are defined in [Configuration files and lifecycle](settings.md).
 
 | Key | Type / default | Values and effect | Lifecycle |
 |---|---|---|---|
-| `mode` | string / `off` | `off`, `env`, `jail`; invalid values log and resolve to `off` | Restart required |
+| `mode` | string / `off` | `off`, `env`, `jail`; an unrecognised value refuses to start, an absent or empty one means `off` | Restart required |
 | `fs` | string / allow reads | `deny-most` narrows home-directory reads; jail only | Next turn |
-| `extra_paths` | list / empty | Up to three read grants for `deny-most` | Next turn |
+| `extra_paths` | list / empty | Up to three read grants for `deny-most`; an entry that resolves to the home directory, an ancestor of it, or a credential store or file the profile denies is logged at ERROR and dropped | Next turn |
 | `broker_only_loopback` | boolean / false | Limit jail loopback to published broker/proxy ports | Next turn |
 | `scope_sessions` | boolean / false | Give each chat thread its own agent session store; jail only | Next turn |
 

@@ -200,10 +200,11 @@
 ;; daemon serves, which is the boundary `sandbox.scope_sessions` exists to hold.
 ;; Denied in both directions and probed at startup (`sandbox._DENY_PROBES`),
 ;; because a rule nobody tests is a rule that can be narrowed in silence.
+;; The write half of this pair is at the end of the write section, not here: it
+;; has to come after `_PROJECT_DIR`, which is granted writes and is a path built
+;; from a name a frontend supplies.
 (deny file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/state")))
 (deny file-read* (subpath (string-append (param "_DATA_DIR") "/state")))
-(deny file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/state")))
-(deny file-write* (subpath (string-append (param "_DATA_DIR") "/state")))
 (deny file-read* (literal (string-append (param "_HOME") "/.zhistory")))
 (deny file-read* (subpath (string-append (param "_HOME") "/.zsh")))
 
@@ -323,8 +324,14 @@
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
-;; uv: Needed for caching packages and metadata
-(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
+;; uv: needed for caching packages and metadata, but NOT the operator's cache.
+;; `upgrade.run` installs this daemon's own dependencies with `uv sync`, outside
+;; any jail and with the TUI's full environment, so a wheel a jailed turn seeded
+;; in ~/.cache/uv is code the operator later runs on purpose. The agent gets its
+;; own cache under the data dir instead (sandbox.uv_cache_dir, exported as
+;; UV_CACHE_DIR by sandbox.agent_env). Reads of the operator's cache stay allowed
+;; by the global read allow above, so a warm cache still helps.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
 ;; Ollama: Needed to sync aliases, save configurations, and manage models/temporary files
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
@@ -366,3 +373,17 @@
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.vscode")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.idea")))
+
+;; ---------------------------------------------------------------------------
+;; The daemons' own state — last, so nothing above can re-grant it
+;; ---------------------------------------------------------------------------
+;; The read half of this is in the read section, with the reasoning. The write
+;; half is here because `_PROJECT_DIR` is granted writes a few rules above, and
+;; that path is built from a name a frontend supplies -- on Slack, partly from a
+;; string a message sender chooses. `agent.workspace_path` reduces that name so it
+;; can no longer name an ancestor of this directory, and this placement is what
+;; makes the deny hold even if it ever could. The journal under state/ replays its
+;; entries as user messages at the next start, so a writable journal is a prompt
+;; the agent schedules for itself past any approval the operator set.
+(deny file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/state")))
+(deny file-write* (subpath (string-append (param "_DATA_DIR") "/state")))

@@ -38,6 +38,13 @@ sandbox:
 `deny-most` hides most of `$HOME`. Add the directories containing interpreters and
 package managers. The directory holding the agent binary is granted automatically.
 
+Name each directory, never `$HOME` itself. A grant is written after the profile's
+denies and wins over them, so `$HOME` gives the agent back `~/.ssh` and `~/.aws` in one
+line. The daemon refuses such an entry: the home directory, any ancestor of it, and any
+path that reaches a credential store are logged at ERROR and dropped, and the remaining
+entries are still granted. If the agent then reports a blocked read, grant the narrowest
+directory that unblocks it.
+
 To also stop a turn reading other threads' transcripts, add `scope_sessions: true`.
 It moves the session stores, so the first turn of each existing chat thread has to
 find its history in the new place. A codex thread carries its rollout across and keeps

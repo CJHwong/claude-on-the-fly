@@ -222,6 +222,11 @@ Attempt an operation you believe is in scope rather than declining in advance. \
 If policy blocks it you get a clear error and can report that; declining without \
 trying tells the user nothing about what is actually possible.
 
+Your working material is this conversation's workspace and its own transcript. \
+Other conversations on this host belong to other people and other tasks, and \
+their stored sessions are not part of what you were asked to do. If something \
+you need genuinely lives in another conversation, ask for it.
+
 Common blocked scenarios and the remedy to relay to the user:
 - Reading a file outside the allowed set (e.g. `cat ~/.aws/credentials`) \
 {block_read}. Remedy: the operator adds the path to `sandbox.extra_paths`.
@@ -282,13 +287,26 @@ credential is stored". You do not need one; credentials are injected by the \
 broker."""
 
 
+class SandboxModeError(RuntimeError):
+    """`sandbox.mode` holds a value this build does not implement."""
+
+
 def mode() -> str:
     """Resolved `sandbox.mode`: 'off', 'env', or 'jail' (default 'off').
 
-    An unrecognised value still resolves to 'off', because refusing to start would
-    turn a typo into an outage. But it no longer does so in silence: a misspelled
-    `jial` used to read as "no sandbox at all" with nothing anywhere to say so,
-    which is the most expensive possible way to be wrong about this setting.
+    An unrecognised value raises. This reverses an earlier choice to resolve it
+    to 'off' and log an ERROR, on the grounds that refusing to start would turn a
+    typo into an outage. That trade is the wrong way round for this setting. Both
+    startup gates -- `preflight()` and `verify_denials()` -- return early unless
+    the mode is 'jail', so 'off' is the one value that guarantees neither of them
+    runs. A misspelled `jial` therefore produced the exact posture the operator
+    was trying to avoid, with one log line as the only trace, and the daemon then
+    served every turn with the full environment: API keys, tokens, keychain.
+
+    An outage is loud, immediate, and gets fixed. Silently running unsandboxed is
+    none of those. An absent key still means 'off', so choosing no sandbox
+    deliberately is unaffected -- only a value that was meant to be something
+    fails.
     """
     # The broker, proxy, and command service are built once. Keep the spawn
     # boundary on that same startup mode until the reported restart happens.
@@ -296,14 +314,15 @@ def mode() -> str:
     value = raw.lower()
     if value in _MODES:
         return value
-    if raw:
-        logger.error(
-            "sandbox.mode=%r is not one of %s; running with NO sandbox. Fix the "
-            "value in config.yaml, or drop the key to choose that deliberately.",
-            raw,
-            list(_MODES),
-        )
-    return "off"
+    # A commented-out or emptied key reads as "off", the same as an absent one.
+    # Only a value somebody meant to be something is an error.
+    if not raw:
+        return "off"
+    raise SandboxModeError(
+        f"sandbox.mode={raw!r} is not one of {list(_MODES)}. Fix the value in "
+        f"{settings.operator_settings()}, or drop the key to run with no sandbox "
+        f"deliberately. Refusing to start rather than serving turns unsandboxed."
+    )
 
 
 def enabled() -> bool:
@@ -363,6 +382,11 @@ def agent_env() -> dict[str, str] | None:
     from claude_on_the_fly import envfile
 
     env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
+    # Stated for the reason the profiles no longer grant writes to ~/.cache/uv:
+    # see uv_cache_dir(). HOME is a passthrough key, so without this the child
+    # resolves the operator's cache and the write deny costs capability instead of
+    # buying isolation.
+    env["UV_CACHE_DIR"] = str(uv_cache_dir())
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
@@ -377,6 +401,27 @@ def agent_env() -> dict[str, str] | None:
         dropped,
     )
     return env
+
+
+def uv_cache_dir() -> Path:
+    """The agent's own uv cache, separate from the operator's.
+
+    Both profiles used to grant the agent writes to `~/.cache/uv`, and that is the
+    same cache `upgrade.run` installs this daemon's own dependencies from: it
+    shells `uv sync` with no `env=`, so it inherits the TUI's full environment
+    outside any jail. A jailed turn seeding a wheel there is code the operator
+    later runs on purpose, with ANTHROPIC_API_KEY and SLACK_TOKEN in reach. The
+    turn does not even need to win a race, because a cache entry waits.
+
+    Under DATA_DIR, beside memory/ and shims/, because that is the one tree both
+    profiles already grant the agent writes into while keeping the daemon's .env,
+    logs/ and state/ denied. The operator's cache stays *readable* under
+    deny-most, so a warm cache still helps anything that consults it; only the
+    write is gone.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    return DATA_DIR / "uv-cache"
 
 
 def shim_dir() -> Path:
@@ -470,6 +515,137 @@ def _loopback_specs() -> tuple[str, str, str, str]:
     return sandbox_macos._loopback_specs(_loopback_ports())
 
 
+# Credential stores an `sandbox.extra_paths` entry must not reach, in either
+# direction: an entry inside one is a credential grant outright, and an entry
+# that merely contains one re-opens it, because every read grant this list
+# guards is a subpath allow written after the profile's denies.
+#
+# Directory-level stores only, and deliberately not a mirror of the profile's
+# forty-odd read denies. What this list has to carry is the stores that sit
+# deep enough for a *plausible* entry to reach: ~/.config, ~/Library and
+# ~/.local/share are the ones an operator adds for real reasons. `_DENY_PROBES`
+# is the startup-probed subset of the same idea, and tests/test_sandbox.py
+# asserts every probe is covered here or by the home rule, so the two cannot
+# drift apart in silence.
+#
+# The file-level denies are a separate list (`_CREDENTIAL_FILES`), because an
+# entry can name a file as easily as a directory: `~/.netrc` is neither the
+# home nor an ancestor of it, so the home rule alone does not stop an entry
+# that re-opens exactly one denied file. The two lists together mirror the
+# profile's read denies, and the test that walks `_DENY_PROBES` covers both.
+_CREDENTIAL_STORES = (
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.azure",
+    "~/.docker",
+    "~/.kube",
+    "~/.op",
+    "~/.fly",
+    "~/.heroku",
+    "~/.vercel",
+    "~/.wrangler",
+    "~/.snowflake",
+    "~/.snowsql",
+    "~/.terraform.d",
+    "~/.config/gh",
+    "~/.config/glab-cli",
+    "~/.config/gcloud",
+    "~/.config/acli",
+    "~/.config/gws",
+    "~/.config/netlify",
+    "~/.config/1Password",
+    "~/.config/containers",
+    "~/.local/share/acli",
+    "~/Library/Keychains",
+    # This daemon's own .env, logs and state, at the default location. The
+    # redirected one is appended at call time from DATA_DIR.
+    "~/.claude-on-the-fly",
+)
+
+# The profile's file-level credential denies, mirrored from fs-allow-reads.sb.
+# An entry can name a file as easily as a directory, so each of these is
+# checked the same way the stores are: an entry that is the file, or a
+# directory that contains it, re-opens it.
+_CREDENTIAL_FILES = (
+    "~/.sentryclirc",
+    "~/.pypirc",
+    "~/.npmrc",
+    "~/.cargo/credentials.toml",
+    "~/.netrc",
+    "~/.gem/credentials",
+    "~/.config/pip/pip.conf",
+    "~/.m2/settings.xml",
+    "~/.gradle/gradle.properties",
+    "~/.oci/config",
+    "~/.git-credentials",
+    "~/.config/hub",
+    "~/.config/containers/auth.json",
+    "~/.terraform.d/credentials.tfrc.json",
+    "~/.vault-token",
+    "~/.databrickscfg",
+    "~/.pgpass",
+    "~/.my.cnf",
+    "~/.config/rclone/rclone.conf",
+    "~/.s3cfg",
+    "~/.boto",
+)
+
+
+def _extra_path_stores() -> list[Path]:
+    """The credential stores an entry may not reach, realpath'd for comparison.
+
+    DATA_DIR is appended rather than listed, because COTF_DATA_DIR can point it
+    anywhere and the .env under it is exactly what env curation exists to keep
+    from the agent.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    stores = [Path(store).expanduser() for store in _CREDENTIAL_STORES]
+    stores.append(Path(DATA_DIR))
+    return [Path(os.path.realpath(store)) for store in stores]
+
+
+def _extra_path_files() -> list[Path]:
+    """The file-level credential paths an entry may not reach, realpath'd."""
+    return [
+        Path(os.path.realpath(Path(file).expanduser())) for file in _CREDENTIAL_FILES
+    ]
+
+
+def _extra_path_refusal(resolved: Path) -> str | None:
+    """Why this resolved `sandbox.extra_paths` entry cannot be granted, or None.
+
+    The entry is checked after realpath rather than refused for being a symlink,
+    because a symlinked entry is the normal case rather than the suspicious one:
+    /tmp, /var and most Homebrew and mise paths are symlinks on macOS, and
+    refusing them would refuse the grants the setting exists to make. Resolving
+    first also removes the way a symlink would otherwise be used against this
+    check, since `~/link-to-home` and `$HOME` resolve to the same string. The
+    resolve happens on every spawn, so a link repointed later is re-checked
+    rather than trusted from the last time.
+    """
+    home = Path(os.path.realpath(Path.home()))
+    # Covers `/` and `/Users` as well as the home itself: every one of them is an
+    # ancestor of the home, and the profile makes the home opaque precisely so
+    # that ~/.ssh and ~/.aws stay unreadable. `_JAIL_GUIDANCE` tells the agent to
+    # ask the operator for an extra_paths entry whenever a read is blocked, so
+    # "just add $HOME" is a suggestion an operator will receive verbatim.
+    if home.is_relative_to(resolved):
+        return f"it is {home} or an ancestor of it"
+    for store in _extra_path_stores():
+        if resolved.is_relative_to(store):
+            return f"it resolves inside {store}, which the profile denies"
+        if store.is_relative_to(resolved):
+            return f"it contains {store}, which the profile denies"
+    for file in _extra_path_files():
+        if resolved.is_relative_to(file):
+            return f"it resolves inside {file}, which the profile denies"
+        if file.is_relative_to(resolved):
+            return f"it contains {file}, which the profile denies"
+    return None
+
+
 def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     """Operator read grants for deny-most, from `sandbox.extra_paths`, realpath'd.
 
@@ -477,17 +653,41 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     because SBPL has no arrays, and a mount namespace takes a list of any length.
     Carrying the limit onto a platform that does not have it would be inventing a
     restriction to look consistent.
+
+    A refused entry is dropped and the rest of the list is granted, rather than
+    the whole spawn failing the way `sandbox.mode` does. The two are not the same
+    kind of mistake: a bad mode value fails *open*, serving turns with the full
+    environment, so refusing to start is the only loud outcome. A dropped read
+    grant fails closed. It costs the agent capability -- most likely its own
+    interpreter, and then the run stops with a clear error -- and costs the
+    operator nothing they were not already being protected from. A typo in one of
+    three entries should not take the daemon down with it.
     """
     paths = [p for p in settings.get("COTF_SANDBOX_EXTRA_PATHS").split(":") if p]
-    if cap is not None and len(paths) > cap:
+    granted: list[str] = []
+    for entry in paths:
+        resolved = Path(os.path.realpath(entry))
+        refusal = _extra_path_refusal(resolved)
+        if refusal is not None:
+            logger.error(
+                "sandbox.extra_paths entry %r (resolved to %s) is refused: %s. "
+                "Granting the rest and continuing; name a narrower path in %s.",
+                entry,
+                resolved,
+                refusal,
+                settings.operator_settings(),
+            )
+            continue
+        granted.append(str(resolved))
+    if cap is not None and len(granted) > cap:
         logger.warning(
-            "sandbox.extra_paths has %d entries; granting only the first %d "
-            "(seatbelt has no arrays)",
-            len(paths),
+            "sandbox.extra_paths has %d granted entries; granting only the first "
+            "%d (seatbelt has no arrays)",
+            len(granted),
             cap,
         )
-        paths = paths[:cap]
-    return [os.path.realpath(p) for p in paths]
+        granted = granted[:cap]
+    return granted
 
 
 def _deny_most_in_force() -> bool:
@@ -528,6 +728,7 @@ def _readable_paths(workspace: Path | str) -> list[str]:
         f"{home}/.claude.json",
         f"{home}/.codex",
         f"{home}/.cache/uv",
+        str(uv_cache_dir()),
         str(shim_dir()),
         *_extra_read_paths(),
     ]
@@ -741,9 +942,11 @@ def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
     turns of every other thread. 1088 of them were readable on the host this was
     measured on.
 
-    Without `scoped_sessions` the home is the shared one, whose subpath grant
-    covers the `sessions` deny under it, so the tree is readable and writable
-    again -- which is what keeps a rollout written before the setting resumable.
+    Without `scoped_sessions` the home is the shared one, so the `sessions` deny
+    under it is re-granted and a rollout written before the setting stays
+    resumable. Only `sessions/` is: the caller narrows the write grant to this
+    function's first element in that state, because granting the home itself
+    would take the whole of `~/.codex` with it. See `_macos_wrap`.
     """
     from claude_on_the_fly import codex_state, envfile
 
@@ -838,12 +1041,22 @@ _CODEX_PROTECTED = (
     "rules",
     "plugins",
     "agents",
+    # Prompts are what codex is told, the same standing-instruction class as
+    # AGENTS.md, and codex never writes into them. `skills` is deliberately not
+    # here: codex writes its own tree inside it (measured: 242 touches and a
+    # `skills/.system/` tree per turn), so a read-only mount there breaks codex
+    # the way the sweep did before it was narrowed to named entries.
+    "prompts",
+    # The backend's own OAuth token. The agent must read it to authenticate, so
+    # it stays readable; only the write is denied, which keeps a turn from
+    # swapping the operator's credential for one it controls.
+    "auth.json",
 )
 
 # Which of the entries above are directories. Named rather than derived: the
 # extension-less ones are a mix of both kinds, so a stand-in created for an
 # absent target has to be told which it is.
-_CODEX_PROTECTED_DIRS = ("rules", "plugins", "agents")
+_CODEX_PROTECTED_DIRS = ("rules", "plugins", "agents", "prompts")
 
 
 # Written inside an area the agent may otherwise write, so each needs an explicit
@@ -926,6 +1139,13 @@ def _ensure_session_mount_sources(workspace: Path) -> None:
         binds ~/.codex read-write.
     """
     directories, files = _session_mount_sources(workspace)
+    # The agent's uv cache is daemon-wide rather than per-thread, so it is not one
+    # of the session sources, but it needs creating here for both of the reasons
+    # above: on Linux `--bind-try` skips an absent source, leaving the grant
+    # silently missing under a data dir that is an opaque tmpfs remounted
+    # read-only; on macOS the jailed process would have to create the directory
+    # itself under a parent it cannot write.
+    directories = [*directories, Path(os.path.realpath(uv_cache_dir()))]
     for source in directories:
         try:
             source.mkdir(parents=True, exist_ok=True)
@@ -970,7 +1190,10 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         *(claude_config / name for name in _CLAUDE_RUNTIME_WRITES),
         tmpdir,
         home / ".claude.json",
-        home / ".cache/uv",
+        # The agent's own uv cache, not the operator's, which is bound read-only
+        # below. See uv_cache_dir(). Deeper than the opaque data dir, so depth
+        # ordering restores exactly this one.
+        Path(os.path.realpath(uv_cache_dir())),
         home / ".ollama",
         home / ".Trash",
         # Writable so codex can create new state files it names itself; the
@@ -1022,6 +1245,9 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             home / ".claude",
             codex,
             data_dir / "shims",
+            # Read-only, where it used to be read-write: a warm cache still
+            # speeds a `uv run` up, and uv writes to UV_CACHE_DIR instead.
+            home / ".cache/uv",
             *(Path(p) for p in _extra_read_paths(cap=None)),
         ],
         "read_write": read_write,
@@ -1233,6 +1459,21 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     base = _fs_base_profile()
     claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
+    # The write grant, which is not always the home. Scoped, the home is a
+    # per-thread directory under DATA_DIR and granting its subpath is the point.
+    # Unscoped, the home *is* the operator's `~/.codex`, and the profile writes
+    # this grant after `(deny file-write* (subpath _HOME/.codex))`. SBPL is
+    # last-match-wins, so passing the home there would nullify that deny for the
+    # whole tree -- `config.toml`, `AGENTS.md`, `hooks.json`, `rules`, `agents`,
+    # `prompts`, `skills` -- and those decide what codex is told and what it
+    # runs, in every later run and outside any jail. The collapse stops at
+    # `sessions/`: the one subtree a rollout written before the boundary needs,
+    # and exactly what the profile granted before the boundary existed.
+    #
+    # Linux needs no equivalent. `_linux_grants` puts `_codex_protected` under
+    # `write_denied` whatever the setting says, so the shared tree keeps its
+    # instruction files read-only there either way.
+    codex_write = codex_home if scoped_sessions() else codex_sessions
     return sandbox_macos.jail_argv(
         argv,
         **sandbox_macos.realpaths(workspace, DATA_DIR),
@@ -1240,7 +1481,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         claude_projects=claude_projects,
         claude_project=claude_project,
         codex_sessions=codex_sessions,
-        codex_home=codex_home,
+        codex_home=codex_write,
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
@@ -1309,6 +1550,16 @@ ABSENT = "absent"
 READABLE = "READABLE"
 WRITABLE = "WRITABLE"
 BROKEN = "BROKEN"
+# A probe that never ran: the file is on this host, and the jail was never asked
+# whether it hides it. This used to be `None` and was dropped from the results
+# dict on the grounds that it says nothing about the boundary. True, and that is
+# exactly why it cannot be dropped: with every probe dropped the dict is empty,
+# no entry matches BROKEN or READABLE, and the run logs "0/0 probed paths
+# confirmed denied" at INFO and returns success. Each probe has its own 15s
+# ceiling and they run concurrently, so a loaded host at startup is enough to
+# reach that. Carried as its own outcome instead, so it is never counted as
+# proof and never silently absent from the tally.
+UNTESTED = "UNTESTED"
 
 # The file the write probe tries to create inside the jail. Named so a leftover
 # is obviously ours, in the one directory the probe targets.
@@ -1319,9 +1570,9 @@ class SandboxBoundaryError(RuntimeError):
     """The live jail did not enforce one of its credential-read denies."""
 
 
-async def _probe_deny(spec: str, workspace: Path) -> str | None:
-    """Attempt one expected-denied read under the live profile. Outcome, or None
-    if the probe itself never ran and so says nothing either way."""
+async def _probe_deny(spec: str, workspace: Path) -> str:
+    """Attempt one expected-denied read under the live profile. Returns the
+    outcome, UNTESTED if the probe itself never ran."""
     path = os.path.expanduser(spec)
     # Settle absent-versus-denied from OUTSIDE the jail, before probing.
     #
@@ -1350,7 +1601,7 @@ async def _probe_deny(spec: str, workspace: Path) -> str | None:
         _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
     except (OSError, TimeoutError) as exc:
         logger.warning("sandbox: deny probe for %s failed to run: %s", spec, exc)
-        return None
+        return UNTESTED
     message = err.decode("utf-8", "replace").lower()
     if "sandbox-exec:" in message or "bwrap:" in message:
         # The wrapper itself rejected the profile, so this probe says nothing
@@ -1406,7 +1657,7 @@ def _temp_tree_hint(directory: Path) -> str:
     return ""
 
 
-async def _probe_write(directory: Path, workspace: Path) -> str | None:
+async def _probe_write(directory: Path, workspace: Path) -> str:
     """Attempt to create a file in `directory` from inside the jail.
 
     The counterpart to `_probe_deny`, and the reason it exists is `state/`: the
@@ -1437,7 +1688,7 @@ async def _probe_write(directory: Path, workspace: Path) -> str | None:
         _out, err = await asyncio.wait_for(probe.communicate(), timeout=15)
     except (OSError, TimeoutError) as exc:
         logger.warning("sandbox: write probe for %s failed to run: %s", directory, exc)
-        return None
+        return UNTESTED
     message = err.decode("utf-8", "replace").lower()
     if "sandbox-exec:" in message or "bwrap:" in message:
         logger.error(
@@ -1704,6 +1955,16 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
     path is *not* evidence of anything: this machine simply has no credential
     there, and folding it into "denied" would let a run where every store happens
     to be missing report a boundary it never tested. Only DENIED is proof.
+
+    UNTESTED is fatal and ABSENT is not, and the line between them is what the
+    host told us *outside* the jail. ABSENT means the file is genuinely not on
+    this machine, so there is no credential at that path to leak; combined with
+    `preflight`, which has already proven the jail starts, refuses egress and can
+    write its session store, an all-absent run is a bare host rather than an
+    unverified boundary. UNTESTED means the opposite: the file is there, it is
+    the kind of file this exists to protect, and the one question that mattered
+    went unanswered. `preflight` is already fatal on the same spawn failures, so
+    this being lenient about them was the anomaly, not the fix.
     """
     if mode() != "jail":
         return {}
@@ -1728,15 +1989,16 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
         *(_probe_deny(spec, probe_workspace) for spec in specs),
         _probe_write(STATE_DIR, probe_workspace),
     )
-    results: dict[str, str] = {
-        spec: outcome
-        for spec, outcome in zip((*specs, write_spec), outcomes, strict=True)
-        if outcome is not None
-    }
+    # Every probe lands in the dict. Nothing is filtered out on its way in: a
+    # dropped outcome is how an all-timeout run used to report success.
+    results: dict[str, str] = dict(
+        zip((*specs, write_spec), outcomes, strict=True),
+    )
     broken = [spec for spec, outcome in results.items() if outcome == BROKEN]
     leaked = [
         spec for spec, outcome in results.items() if outcome in (READABLE, WRITABLE)
     ]
+    untested = [spec for spec, outcome in results.items() if outcome == UNTESTED]
     denied = [spec for spec, outcome in results.items() if outcome == DENIED]
     if broken:
         logger.error(
@@ -1750,19 +2012,48 @@ async def verify_denials(workspace: Path | None = None) -> dict[str, str]:
             len(leaked),
             leaked,
         )
+    elif untested:
+        logger.error(
+            "sandbox: %d path(s) are present on this host and the jail was never "
+            "asked whether it hides them: %s",
+            len(untested),
+            untested,
+        )
     else:
         logger.info(
             "sandbox: %d/%d probed paths confirmed denied under %s "
-            "(%d absent, untested)",
+            "(%d not present on this host)",
             len(denied),
             len(results),
             _fs_base_profile().name,
             len(results) - len(denied),
         )
-    if broken or leaked:
-        details = ", ".join([*broken, *leaked])
+    if broken or leaked or untested:
+        details = ", ".join([*broken, *leaked, *untested])
         raise SandboxBoundaryError(
             "sandbox boundary self-test failed; refusing to start autonomous "
             f"work ({details})"
         )
     return results
+
+
+async def verify_boundary(workspace: Path | None = None) -> None:
+    """The whole startup self-test, for every daemon that spawns a jailed agent.
+
+    One function because the order is load-bearing and easy to get wrong from a
+    call site: `preflight` proves the jail runs and holds its egress deny, and
+    `verify_denials` proves the credential reads are refused. The first is what
+    makes the second's silence meaningful, since a jail that never started would
+    otherwise report a clean sheet.
+
+    It exists as its own name because for a while `orchestrator._start_sandbox`
+    was the only caller of either, so the chat daemon refused to serve on a jail
+    that could not hold `state/` while the job worker kept draining the queue
+    across the same unverified boundary. Any future daemon that reaches
+    `agent.run` calls this, and calls it before it claims work.
+
+    Inert unless `sandbox.mode` is `jail`: both halves return early otherwise, so
+    an `off` or `env` deployment pays nothing and starts exactly as before.
+    """
+    await preflight()
+    await verify_denials(workspace)

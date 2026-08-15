@@ -36,6 +36,7 @@ from claude_on_the_fly.agent import (
     Response,
     current_backend_key,
     strip_suggestions_blocks,
+    workspace_path,
 )
 from claude_on_the_fly.approvals import ApprovalBroker
 from claude_on_the_fly.events import (
@@ -694,7 +695,7 @@ class Orchestrator:
         self._journal.mark_dispatched(turn.journal_id)
         interrupted = False
         await self._report_config_restarts(chat_id)
-        workspace = DATA_DIR / "workspaces" / self._frontend.workspace_name(chat_id)
+        workspace = workspace_path(self._frontend.workspace_name(chat_id), DATA_DIR)
         workspace.mkdir(parents=True, exist_ok=True)
         if self._platform in agent.ATTACHMENT_PLATFORMS:
             (workspace / agent.OUTBOX_DIRNAME).mkdir(exist_ok=True)
@@ -1270,12 +1271,10 @@ async def _start_sandbox(
     # permanently invisible. Probing the denies here is the substitute: it records,
     # per run, that the boundary was actually in force rather than inferring it
     # from an absence of errors.
-    # Order matters: preflight proves the jail runs and its egress deny holds, and
-    # verify_denials proves the credential reads are refused. The first is what
-    # makes the second's silence meaningful, since a jail that never started
-    # would otherwise report a clean sheet.
-    await sandbox.preflight()
-    await sandbox.verify_denials()
+    # Both halves, in the order that makes the second meaningful. The job worker
+    # runs the same gate from its own composition root, so the sequence lives in
+    # sandbox.verify_boundary rather than being repeated per daemon.
+    await sandbox.verify_boundary()
     return broker_instance, SessionEgress(frontend), command_broker
 
 

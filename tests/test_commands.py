@@ -316,6 +316,89 @@ async def test_path_arguments_cannot_escape_the_workspace(tmp_path, argv):
         await broker.stop()
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["/etc/passwd"], id="absolute"),
+        pytest.param(["~/.ssh/id_rsa"], id="home-relative"),
+        pytest.param(["--file=/etc/passwd"], id="long option value"),
+        pytest.param(["../x"], id="traversal"),
+        pytest.param(["a/../../etc"], id="traversal mid-path"),
+        pytest.param(["C:\\Windows"], id="windows absolute"),
+        # The four shapes that used to pass. Each was verified against the guard
+        # before the fix: refused=False, with the argument reaching the CLI.
+        pytest.param(["-o/etc/passwd"], id="attached short option"),
+        pytest.param(["-D/Users/someone"], id="attached short option, no slash first"),
+        pytest.param(["--opt=a=/etc/passwd"], id="a second = inside the value"),
+        pytest.param(["-C.."], id="traversal attached to a short option"),
+    ],
+)
+def test_path_arguments_that_reach_outside_the_workspace_are_refused(tmp_path, argv):
+    """The broker runs outside the jail with the operator's real credential, so
+    this guard is what keeps a vetted CLI from being a file-read primitive. It is
+    generic on purpose -- docs/how-to/broker-a-command.md invites operators to add
+    tools -- so it has to hold for flags no bundled tool happens to have."""
+    assert commands._unsafe_path_argument(argv, str(tmp_path)) == argv[0]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["pr", "view", "123"], id="subcommand and a number"),
+        pytest.param(["--limit", "5"], id="a flag and its value"),
+        pytest.param(["pr", "list", "--repo", "owner/repo"], id="a repo argument"),
+        pytest.param(["api", "repos/o/r/issues"], id="an api path"),
+        pytest.param(["-abc"], id="a cluster of boolean short flags"),
+        pytest.param(["notes.md"], id="a file in the workspace"),
+    ],
+)
+def test_ordinary_relative_arguments_still_run(tmp_path, argv):
+    assert commands._unsafe_path_argument(argv, str(tmp_path)) is None
+
+
+def test_a_relative_path_through_a_planted_symlink_is_refused(tmp_path):
+    """The agent's workspace is writable, so `ln -s / link` is a move it can make
+    on its own. `link/etc/passwd` is lexically a clean relative path; only
+    resolving it against the directory the CLI runs in shows where it lands."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "link").symlink_to("/")
+    assert commands._unsafe_path_argument(["link/etc/passwd"], str(workspace)) == (
+        "link/etc/passwd"
+    )
+    # Without the cwd there is nothing to resolve against, which is why the check
+    # is made where the broker has already settled the workspace.
+    assert commands._unsafe_path_argument(["link/etc/passwd"]) is None
+
+
+def test_a_symlink_loop_argument_is_not_refused(tmp_path):
+    """A path that cannot be resolved cannot be opened by the CLI either, so
+    treating the failure as an escape would refuse a command over an argument that
+    was never going to read anything."""
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    assert commands._unsafe_path_argument(["a"], str(tmp_path)) is None
+
+
+async def test_a_planted_symlink_is_refused_over_the_wire(tmp_path):
+    """The guard runs before process creation, and after the cwd is settled: a
+    relative argument means nothing without the directory it resolves from."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "link").symlink_to("/")
+    broker, _port = await start(tmp_path, (ShimmedTool(name="echo", allow=((),)),))
+    try:
+        result = await post(
+            broker,
+            {"tool": "echo", "argv": ["link/etc/passwd"], "cwd": str(workspace)},
+            workspace=workspace,
+        )
+        assert result["rc"] == 126
+        assert result["refused"] is True
+    finally:
+        await broker.stop()
+
+
 async def test_subprocess_env_is_narrow(tmp_path, monkeypatch):
     """The broker runs unjailed, so the subprocess must not inherit every secret
     the daemon happens to hold."""

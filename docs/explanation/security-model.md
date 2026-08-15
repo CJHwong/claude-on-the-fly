@@ -14,6 +14,37 @@ Approval prompts are the softest control: an attacker can shape the request and 
 can approve it. Metadata endpoints and credential readback are therefore refused rather
 than offered for approval.
 
+## What is enforced, and what is only asked for
+
+Not everything this project cares about is defended by a mechanism, and the difference
+decides what you should put in front of the agent.
+
+**Enforced.** Your real credentials stay out of the agent's reach, and outbound traffic
+is gated by destination host. These are the two the sandbox exists for. Keys live in the
+keychain behind the credential broker, credentialed CLIs run outside the jail and return
+only their output, and HTTPS leaves through a CONNECT proxy that checks the host. When
+one of these cannot be established, startup fails rather than continuing.
+
+**Asked for, not enforced.** One conversation staying out of another's transcripts. With
+`sandbox.scope_sessions` on the jail does enforce it, but the setting is off by default,
+and the agent is instructed rather than prevented in that state. An instruction does not
+survive prompt injection, which is the same threat that justifies the sandbox, so treat
+this as a norm a cooperative agent keeps and not as a boundary.
+
+That is a deliberate position rather than an oversight. This is a shared assistant: the
+people who can reach it are expected to be able to reach what it has done. If you need
+one person's conversations to be unreadable by another person who can also message the
+bot, that is a different design, and the honest answer today is to run separate daemons
+with separate data directories.
+
+**Out of scope.** The agent runs model-generated code by design, so anything it can do
+with the capability it has been granted is not a containment failure. Scope the
+provider-side tokens accordingly.
+
+The practical consequence: anything pasted into a conversation should be treated as
+readable by anyone who can message the bot, unless you have turned
+`sandbox.scope_sessions` on.
+
 ## Sandbox modes
 
 `off` inherits the daemon environment. `env` removes credentials and routes supported
@@ -50,12 +81,15 @@ An approved HTTPS host remains a covert channel because the CONNECT proxy does n
 intercept TLS. A brokered CLI runs outside the jail, so its provider-side token scope is
 the real authorization boundary.
 
-## One thread cannot read another's conversation
+## Scoping a thread to its own conversation
 
 Under `jail` with `sandbox.scope_sessions` on, a turn reaches only its own thread's
-transcripts. This matters more than the credential denies beside it: a token is a single
-secret, while a transcript is the message text itself, including what other people wrote
-in other threads.
+transcripts. A token is a single secret; a transcript is the message text itself,
+including what other people wrote in other threads.
+
+Off, which is the default, the agent is asked to stay in its own thread rather than
+stopped from leaving it. See "What is enforced, and what is only asked for" above before
+relying on either state.
 
 The setting is off by default, because scoping the stores moves them. A codex thread
 started while it was off left its rollout in the shared tree, where `codex resume` cannot

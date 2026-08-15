@@ -392,6 +392,84 @@ class TestRunLoopWiring:
             await cli._run("xoxb-token")
         assert removed == [ledger.on_process]
 
+    async def test_the_jail_is_proven_before_anything_claims_work(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The worker spawns jailed agents through `agent.run`, and for a while
+        only the chat daemon proved that jail holds. A boundary that could not
+        hold `state/` therefore stopped Slack loudly and left this worker
+        draining the same queue across it."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        order: list[str] = []
+        ledger = MagicMock()
+        ledger.sweep.side_effect = lambda: (order.append("sweep"), 0)[1]
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda _t: (
+                order.append("build"),
+                (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+            )[1],
+        )
+
+        async def verify(*_args, **_kwargs):
+            order.append("verify_boundary")
+
+        monkeypatch.setattr(cli.sandbox, "verify_boundary", verify)
+
+        async def fake_run_loop(*_args, **_kwargs):
+            order.append("run_loop")
+
+        monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
+
+        await cli._run("xoxb-token")
+
+        assert order == ["verify_boundary", "build", "sweep", "run_loop"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        cli.sandbox.SandboxBoundaryError(
+            "sandbox boundary self-test failed; refusing to start autonomous work"
+        ),
+        cli.sandbox.SandboxModeError(
+            "sandbox.mode='jial' is not one of ['off', 'env', 'jail']. "
+            "Refusing to start rather than serving turns unsandboxed."
+        ),
+    ],
+    ids=["boundary", "mode"],
+)
+def test_an_unproven_jail_refuses_to_start_the_worker(
+    monkeypatch, capsys, error
+) -> None:
+    """Fatal rather than advisory, and unattended is the argument for it: the
+    worker runs bypassPermissions turns against whatever a producer queued. The
+    queue is durable, so a refusal costs a restart; the opposite choice cannot be
+    undone once the reads have happened. Both startup refusals exit the same way:
+    a typo'd `sandbox.mode` raises SandboxModeError from `verify_boundary` ->
+    `preflight`, and it must not die with a traceback and exit 1."""
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(
+        cli.checks, "resolve_jobs_token", lambda env: ("JOBS_SLACK_TOKEN", "xoxb-t")
+    )
+
+    async def refuse(_token):
+        raise error
+
+    monkeypatch.setattr(cli, "_run", refuse)
+
+    assert cli._cmd_run() == 2
+    assert "refusing to start" in capsys.readouterr().err.lower()
+
 
 def test_normalize_argv_treats_a_bare_flag_as_run_options() -> None:
     """`claude-jobs --verbose` is somebody running the worker, not a typo'd

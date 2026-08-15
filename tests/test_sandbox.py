@@ -22,9 +22,10 @@ def test_mode_defaults_off(monkeypatch):
     assert sandbox.enabled() is False
 
 
-def test_unknown_mode_is_off(monkeypatch):
+def test_unknown_mode_refuses(monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX", "banana")
-    assert sandbox.mode() == "off"
+    with pytest.raises(sandbox.SandboxModeError):
+        sandbox.mode()
 
 
 @pytest.mark.parametrize("value", ["env", "jail"])
@@ -282,6 +283,164 @@ def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
     # No grants => all three slots resolve to the (already-allowed) project dir.
     assert out.count(f"_EXTRA_1={project}") == 1
     assert f"_EXTRA_2={project}" in out and f"_EXTRA_3={project}" in out
+
+
+# --- operator read grants that would undo the profile ---
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("/", id="root"),
+        pytest.param("~", id="the home itself"),
+        pytest.param("~/..", id="an ancestor of the home"),
+        pytest.param("~/.ssh", id="a credential store"),
+        pytest.param("~/.aws/sso/cache", id="inside a credential store"),
+        pytest.param("~/.config", id="a directory holding several of them"),
+        pytest.param("~/Library", id="the tree holding the keychains"),
+    ],
+)
+def test_extra_paths_refuses_an_entry_that_reopens_a_denied_store(
+    monkeypatch, caplog, entry
+):
+    """Each of these becomes `(allow file-read* (subpath ...))` written after the
+    profile's denies, and SBPL is last-match-wins, so granting one hands back the
+    exact reads deny-most exists to stop. `$HOME` is the one to worry about: it is
+    what `_JAIL_GUIDANCE` invites the agent to ask the operator for whenever a read
+    is blocked, and it re-opens ~/.ssh and ~/.aws in one line."""
+    resolved = os.path.expanduser(entry)
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", f"{resolved}:/opt/grantme")
+    with caplog.at_level("ERROR"):
+        granted = sandbox._extra_read_paths()
+    # The good entry survives: one typo must not cost the operator the grants
+    # that make the agent's own interpreter reachable.
+    assert granted == [os.path.realpath("/opt/grantme")]
+    assert resolved in caplog.text
+
+
+def test_extra_paths_resolves_a_symlink_before_judging_it(
+    monkeypatch, caplog, tmp_path
+):
+    """Refusing symlinks outright would refuse the grants the setting exists to
+    make -- /tmp, /var and most Homebrew and mise paths are symlinks on macOS --
+    so the entry is resolved first and the resolved path is what gets checked."""
+    link = tmp_path / "looks-harmless"
+    link.symlink_to(Path.home())
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(link))
+    with caplog.at_level("ERROR"):
+        assert sandbox._extra_read_paths() == []
+    assert str(link) in caplog.text
+
+
+def test_every_deny_probe_is_out_of_reach_of_extra_paths():
+    """`_DENY_PROBES` is what startup proves the jail denies, and `extra_paths` is
+    the one operator value that can grant a read back. Asserted against the probe
+    list rather than restated, so a credential added to one list cannot be left
+    grantable by the other."""
+    for spec in sandbox._deny_probe_specs():
+        parent = Path(os.path.realpath(os.path.expanduser(spec))).parent
+        assert sandbox._extra_path_refusal(parent) is not None, spec
+
+
+def test_every_file_level_credential_is_out_of_reach_of_extra_paths():
+    """`_CREDENTIAL_FILES` mirrors the profile's file-level read denies, and an
+    entry can name a file as easily as a directory: `~/.netrc` is neither the
+    home nor an ancestor of it, so the home rule alone does not stop an entry
+    that re-opens exactly one denied file. Asserted against the list rather
+    than restated, so a credential added to one cannot be left grantable by
+    the other."""
+    for spec in sandbox._CREDENTIAL_FILES:
+        resolved = Path(os.path.realpath(Path(spec).expanduser()))
+        assert sandbox._extra_path_refusal(resolved) is not None, spec
+        # A directory that merely contains the file is refused too, the same
+        # bidirectional check the stores get.
+        assert sandbox._extra_path_refusal(resolved.parent) is not None, spec
+
+
+def test_extra_paths_keeps_the_ordinary_grants(monkeypatch):
+    """The refusals must not cost the setting its actual job: pointing the jail at
+    the interpreter and toolchain the agent runs on."""
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", "/opt/homebrew:/usr/local")
+    assert sandbox._extra_read_paths() == [
+        os.path.realpath("/opt/homebrew"),
+        os.path.realpath("/usr/local"),
+    ]
+
+
+# --- the agent's uv cache is not the operator's ---
+
+
+def test_the_agent_is_pointed_at_its_own_uv_cache(monkeypatch):
+    """`upgrade.run` shells `uv sync` with no env=, outside any jail and with the
+    TUI's full environment. A jailed turn that could seed ~/.cache/uv would be
+    writing code the operator later installs from. HOME is a passthrough key, so
+    the child resolves the operator's cache unless UV_CACHE_DIR says otherwise."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["UV_CACHE_DIR"] == str(agent.DATA_DIR / "uv-cache")
+    assert env["UV_CACHE_DIR"] != f"{Path.home()}/.cache/uv"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_neither_profile_lets_a_turn_write_the_operators_uv_cache(profile):
+    """Structural rather than a live probe, for the reason the memory-grant test
+    gives: the suite's HOME is a tmpdir inside _TMPDIR, which both profiles grant
+    wholesale, so a live write to ~/.cache/uv would be allowed for the wrong
+    reason and would prove nothing about this rule."""
+    text = profile.read_text()
+    assert (
+        '(allow file-write* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))'
+        in text
+    )
+    assert (
+        '(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))'
+        not in text
+    )
+
+
+def test_deny_most_still_reads_the_operators_uv_cache():
+    """The read is kept deliberately: a downloaded wheel is not a secret, and a
+    warm cache is the difference between a fast `uv run` and a cold one."""
+    text = sandbox._DENY_MOST_PROFILE.read_text()
+    assert (
+        '(allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))'
+        in text
+    )
+
+
+def test_the_uv_cache_exists_before_the_wrap(monkeypatch, tmp_path):
+    """On Linux `--bind-try` skips an absent source, so the grant would be silently
+    missing under a data dir that is an opaque tmpfs; on macOS the jailed process
+    would have to create the directory under a parent it cannot write."""
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path / "data")
+    assert not sandbox.uv_cache_dir().exists()
+    sandbox._ensure_session_mount_sources(tmp_path / "ws")
+    assert sandbox.uv_cache_dir().is_dir()
+
+
+def test_linux_binds_the_operators_uv_cache_read_only(tmp_path):
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    operator_cache = Path(os.path.realpath(Path.home())) / ".cache/uv"
+    assert operator_cache in grants["read_only"]
+    assert operator_cache not in grants["read_write"]
+    assert Path(os.path.realpath(sandbox.uv_cache_dir())) in grants["read_write"]
+
+
+def test_linux_write_denies_cover_codex_prompts_and_auth(tmp_path):
+    """Linux binds the whole `~/.codex` read-write, so the write denies are the
+    only thing between a turn and the entries that decide what codex is told
+    and what it authenticates as. Prompts are standing instructions codex
+    reads on every run, and auth.json is the backend's own OAuth token: both
+    must be read-only. `skills` is deliberately absent -- codex writes its own
+    tree inside it (measured: 242 touches and a `skills/.system/` tree per
+    turn), so a read-only mount there breaks codex."""
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    assert codex / "prompts" in grants["write_denied"]
+    assert codex / "auth.json" in grants["write_denied"]
+    assert codex / "prompts" in grants["write_denied_dirs"]
+    assert codex / "skills" not in grants["write_denied"]
 
 
 # --- Slice 3: loopback narrowing ---
@@ -662,7 +821,9 @@ async def test_verify_denials_reports_each_probe(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         results = await sandbox.verify_denials(tmp_path)
     assert results, "expected at least one probe"
@@ -671,6 +832,29 @@ async def test_verify_denials_reports_each_probe(
     assert sandbox.DENIED in results.values(), f"nothing actually denied: {results}"
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "confirmed denied" in logged
+
+
+async def test_verify_boundary_proves_the_jail_runs_before_reading_its_silence(
+    monkeypatch, tmp_path
+):
+    """Order is the reason this is one function rather than two calls per daemon.
+    `verify_denials` settles absent-versus-denied outside the jail, so on a host
+    with none of the probed credentials it spawns nothing at all -- and a jail
+    that never started would report a clean sheet. `preflight` is what makes that
+    silence mean something, so it has to come first at every call site."""
+    order: list[str] = []
+
+    async def fake_preflight():
+        order.append("preflight")
+
+    async def fake_verify(workspace=None):
+        order.append("verify_denials")
+        return {}
+
+    monkeypatch.setattr(sandbox, "preflight", fake_preflight)
+    monkeypatch.setattr(sandbox, "verify_denials", fake_verify)
+    await sandbox.verify_boundary(tmp_path)
+    assert order == ["preflight", "verify_denials"]
 
 
 async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplog):
@@ -686,14 +870,19 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
         results = await sandbox.verify_denials(tmp_path)
     assert set(results.values()) == {sandbox.ABSENT}, results
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "deny untested" in logged
     assert f"0/{len(results)} probed" in logged
-    assert len(results) == len(sandbox._DENY_PROBES)
+    # The deny probes plus the stubbed `state/` write probe. Every probe lands in
+    # the dict, including the ones that prove nothing -- an outcome that is
+    # missing is the shape of the bug this used to have.
+    assert len(results) == len(sandbox._DENY_PROBES) + 1
 
 
 @pytest.fixture
@@ -904,11 +1093,17 @@ class TestInertWhenOff:
 # --- probe outcomes that a real machine will not produce on demand ---
 
 
-async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
+async def test_a_probe_that_cannot_be_spawned_refuses_to_start(
     monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
-    """Not an outcome: a probe that never ran is evidence about the probe, not
-    about the boundary, so it must not land in the results dict at all."""
+    """A probe that never ran is evidence about the probe, not about the
+    boundary. That was once the argument for dropping it from the results dict,
+    and dropping it is what let the whole run pass on no evidence: with every
+    probe dropped the dict is empty, nothing matches BROKEN or READABLE, and the
+    function logged "0/0 probed paths confirmed denied" at INFO and returned
+    success. The path is on this host (`probe_paths_exist`), so what went
+    untested is a real credential file. It is carried as UNTESTED and it is
+    fatal."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
 
     async def cannot_spawn(*_args, **_kwargs):
@@ -919,16 +1114,28 @@ async def test_a_probe_that_cannot_be_spawned_says_nothing_either_way(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        assert await sandbox.verify_denials(tmp_path) == {}
-    assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
+    with (
+        caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
+        pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
+    ):
+        await sandbox.verify_denials(tmp_path)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "failed to run" in logged
+    assert "never asked whether it hides them" in logged
+    # The line that used to be emitted here, and the reason this passed.
+    assert "confirmed denied" not in logged
 
 
 async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
     monkeypatch, tmp_path, caplog, probe_paths_exist
 ):
-    """These run on the daemon's startup path, before it serves anything."""
+    """These run on the daemon's startup path, before it serves anything. The
+    timeout is the whole point of the ceiling, and an expired probe is UNTESTED:
+    a loaded host is the plausible way every probe expires at once, which is the
+    way this used to report success on no evidence at all."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
 
     class HangingProbe:
@@ -947,9 +1154,14 @@ async def test_a_probe_that_hangs_is_abandoned_not_awaited_forever(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        assert await sandbox.verify_denials(tmp_path) == {}
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
+    with (
+        caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"),
+        pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
+    ):
+        await sandbox.verify_denials(tmp_path)
     assert "failed to run" in "\n".join(r.getMessage() for r in caplog.records)
 
 
@@ -983,7 +1195,9 @@ async def test_a_readable_credential_path_is_an_error_not_a_pass(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     with (
         caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"),
         pytest.raises(sandbox.SandboxBoundaryError, match="refusing to start"),
@@ -1025,10 +1239,12 @@ async def test_probes_run_concurrently_not_one_after_another(
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
     # would report WRITABLE for a reason that says nothing about the read denies
     # this test is about. It has its own tests below, including a live one.
-    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=None))
+    # Stubbed ABSENT rather than None: every probe lands in the results dict now,
+    # and ABSENT is the outcome that neither proves nor disproves the boundary.
+    monkeypatch.setattr(sandbox, "_probe_write", AsyncMock(return_value=sandbox.ABSENT))
     results = await sandbox.verify_denials(tmp_path)
     assert peak == len(sandbox._DENY_PROBES), f"peak concurrency was {peak}"
-    assert set(results.values()) == {sandbox.DENIED}
+    assert set(results.values()) == {sandbox.DENIED, sandbox.ABSENT}
 
 
 # --- shim PATH routing ---
@@ -1096,10 +1312,11 @@ def test_memory_grant_is_scoped_to_memory_not_the_whole_data_dir(profile):
     grants = re.findall(
         r'\(allow file-(?:read|write)\*.*?\(param "_DATA_DIR"\) "([^"]*)"', text
     )
+    scoped = ("/memory", "/shims", "/uv-cache")
     assert grants, "expected at least one data-dir grant"
     for suffix in grants:
-        assert suffix.startswith("/memory") or suffix.startswith("/shims"), (
-            f"data-dir grant {suffix!r} is wider than memory/ and shims/"
+        assert suffix.startswith(scoped), (
+            f"data-dir grant {suffix!r} is wider than {', '.join(scoped)}"
         )
 
 
@@ -1331,17 +1548,30 @@ def test_guidance_names_memory_as_writable(monkeypatch):
     assert "Writing:" in guidance
 
 
-def test_an_unrecognised_sandbox_mode_says_so_instead_of_silently_disabling(
-    monkeypatch, caplog
+def test_an_unrecognised_sandbox_mode_refuses_instead_of_silently_disabling(
+    monkeypatch,
 ):
-    """It still resolves to off, because refusing to start would turn a typo into an
-    outage. But a misspelled `jial` used to read as "no sandbox at all" with nothing
-    anywhere to say so, which is the most expensive way to be wrong about this."""
+    """A misspelled `jial` used to resolve to off with one ERROR as the only trace.
+
+    Off is the one value that guarantees neither startup gate runs: `preflight` and
+    `verify_denials` both return early unless the mode is `jail`. So a typo produced
+    exactly the posture the operator was trying to avoid, and the daemon then served
+    every turn with the full environment. An outage is the cheaper failure.
+    """
     monkeypatch.setenv("COTF_SANDBOX", "jial")
-    with caplog.at_level("ERROR", logger="claude_on_the_fly.sandbox"):
-        assert sandbox.mode() == "off"
-    assert "not one of" in caplog.text
-    assert "NO sandbox" in caplog.text
+    with pytest.raises(sandbox.SandboxModeError) as excinfo:
+        sandbox.mode()
+    assert "jial" in str(excinfo.value)
+    assert "not one of" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_emptied_sandbox_mode_is_off_not_an_error(monkeypatch, value):
+    """A commented-out or blanked key reads as off, like an absent one. Only a value
+    somebody meant to be something is an error, or emptying the key to turn the
+    sandbox off would refuse to start."""
+    monkeypatch.setenv("COTF_SANDBOX", value)
+    assert sandbox.mode() == "off"
 
 
 def test_an_unset_sandbox_mode_is_silent(monkeypatch, caplog):
@@ -1456,9 +1686,14 @@ async def test_session_relay_is_inert_off_linux(monkeypatch):
     await relay.close()  # always safe, whatever the platform
 
 
-async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog):
+async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog, monkeypatch):
     """A jail the agent cannot reach any host service from is working, not broken
     -- but it is never what a deployment wants, so it must not pass silently."""
+    # The ambient environment is not the deployment: a shell that routes the
+    # model API through a local server (ANTHROPIC_BASE_URL, HTTPS_PROXY, ...)
+    # would leak a port into `_loopback_ports` and start the relay, and the
+    # socket path then exceeds sun_path's 104 bytes under the deep test home.
+    _clear_loopback_env(monkeypatch)
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
         relay = await sandbox.open_session_relay({}, "chat")
     await relay.close()
@@ -1470,8 +1705,12 @@ async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog):
 async def test_session_relay_bridges_the_ports_from_the_overrides(linux, monkeypatch):
     """Ports come from the overrides about to be published, not os.environ: a
     per-session egress proxy lives only in the ContextVar."""
-    # sun_path caps out near 104 bytes and the fake home used by these tests is
-    # already most of that, so point the relay at a short directory.
+    # The ambient environment is not the deployment: a shell that routes the
+    # model API through a local server would leak a port into `_loopback_ports`
+    # and the assertion below would see it. sun_path caps out near 104 bytes
+    # and the fake home used by these tests is already most of that, so point
+    # the relay at a short directory too.
+    _clear_loopback_env(monkeypatch)
     with tempfile.TemporaryDirectory(dir="/tmp") as short:
         monkeypatch.setattr(agent, "DATA_DIR", Path(short))
         relay = await sandbox.open_session_relay(
@@ -2657,7 +2896,7 @@ async def test_a_broken_profile_is_not_reported_as_a_denied_write(
     assert "the profile is broken" in caplog.text
 
 
-async def test_a_write_probe_that_cannot_spawn_says_nothing_either_way(
+async def test_a_write_probe_that_cannot_spawn_is_untested_not_dropped(
     monkeypatch, tmp_path, caplog
 ):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -2670,7 +2909,7 @@ async def test_a_write_probe_that_cannot_spawn_says_nothing_either_way(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", cannot_spawn)
 
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        assert await sandbox._probe_write(state, tmp_path) is None
+        assert await sandbox._probe_write(state, tmp_path) == sandbox.UNTESTED
 
     assert "failed to run" in caplog.text
 
@@ -2735,3 +2974,147 @@ def test_a_data_dir_outside_the_temp_tree_gets_no_hint(monkeypatch, tmp_path):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
 
     assert sandbox._temp_tree_hint(Path("/srv/cotf/state")) == ""
+
+
+# --- the shared codex tree keeps its instruction files when scoping is off ---
+
+
+def _rule_index(profile: Path, *needles: str) -> int:
+    """Line number of the rule containing every needle, ignoring comments.
+
+    -1 when absent, so a caller comparing positions fails rather than passing on a
+    rule that was renamed out from under it.
+    """
+    for number, line in enumerate(profile.read_text().splitlines()):
+        if line.strip().startswith(";;"):
+            continue
+        if all(needle in line for needle in needles):
+            return number
+    return -1
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_shared_codex_tree_stays_write_denied_without_scoped_sessions(
+    monkeypatch, tmp_path, original_home, fs_base
+):
+    """Scoping off must not hand over `~/.codex`.
+
+    `_CODEX_HOME` used to be the resolved home, which with the boundary off *is*
+    `~/.codex`. The profile writes `(allow file-write* (subpath _CODEX_HOME))`
+    after `(deny file-write* (subpath _HOME/.codex))`, and SBPL is last-match-wins,
+    so the allow nullified the deny for the whole tree: `config.toml`, `AGENTS.md`,
+    `hooks.json`, `rules`, `agents`, `prompts`, `skills`. Those decide what codex is
+    told and what it runs, in every later run and outside any jail.
+
+    Against the real home on purpose. Both profiles grant writes to `/private/tmp`
+    and `/private/var/folders` for scratch space, and pytest's tmp_path lives under
+    the second one, so a synthetic home there would report success for a reason that
+    says nothing about this deny. The probe is a file of its own with a unique name,
+    never one of the operator's real files, and it is removed either way.
+    """
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    codex = original_home / ".codex"
+    if not codex.is_dir():
+        pytest.skip("no real ~/.codex on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("COTF_SANDBOX_SCOPE_SESSIONS", raising=False)
+    workspace = tmp_path / "thread-one"
+    workspace.mkdir()
+    probe = codex / f"cotf-write-probe-{os.getpid()}"
+    try:
+        done = _run_jailed(["/bin/sh", "-c", f"echo x > {probe}"], workspace)
+        assert done.returncode != 0, (
+            "the shared codex tree is writable with scope_sessions off; "
+            "AGENTS.md and config.toml are agent-writable"
+        )
+        assert not probe.exists()
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _jail_params(monkeypatch, workspace: Path) -> dict:
+    """The keyword params `_macos_wrap` hands the seatbelt argv builder."""
+    captured: dict = {}
+
+    def fake(argv, **kwargs):
+        captured.update(kwargs)
+        return list(argv)
+
+    monkeypatch.setattr(sandbox.sandbox_macos, "jail_argv", fake)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    workspace.mkdir(parents=True, exist_ok=True)
+    sandbox.wrap(["/bin/true"], workspace)
+    return captured
+
+
+def test_the_codex_write_grant_is_the_sessions_tree_when_unscoped(
+    monkeypatch, tmp_path
+):
+    """The grant narrows to `sessions/`, which is all a rollout written before the
+    boundary needs, and is exactly what the profile granted before the boundary
+    existed. The read side still re-grants the whole tree, so resuming works."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("COTF_SANDBOX_SCOPE_SESSIONS", raising=False)
+    params = _jail_params(monkeypatch, tmp_path / "ws")
+    assert params["codex_home"].name == "sessions"
+    assert params["codex_home"] == params["codex_sessions"]
+
+
+def test_the_codex_write_grant_is_the_per_thread_home_when_scoped(
+    monkeypatch, tmp_path, scoped_sessions
+):
+    """Scoped, the home is a per-thread directory under the data dir and granting
+    its subpath is the point: it is not inside the denied tree at all."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    params = _jail_params(monkeypatch, tmp_path / "ws")
+    assert params["codex_home"] != params["codex_sessions"]
+    assert "codex-homes" in str(params["codex_home"])
+
+
+# --- ordering: a deny only holds if nothing later re-grants it ---
+
+
+def test_the_cross_thread_session_denies_come_after_the_operator_allows():
+    """`sandbox.extra_paths` is operator-supplied, capped at 3, and `_RUNTIME_*` is
+    derived from the backend's own install location. Both are subpath allows, so an
+    entry naming an ancestor of the session stores re-opens them.
+
+    Measured with the pairs in their old position above those allows: one
+    `extra_paths` entry of `$HOME` made another thread's codex rollout and another
+    thread's claude session readable again, while the profile still loaded and the
+    log still said jailed. `extra_paths` is also the remedy the agent is told to
+    relay when a read is blocked, so it is a thing operators are invited to add.
+    """
+    profile = sandbox._DENY_MOST_PROFILE
+    last_allow = max(
+        _rule_index(profile, f'(allow file-read* (subpath (param "_{name}")))')
+        for name in ("EXTRA_1", "EXTRA_2", "EXTRA_3", "RUNTIME_1", "RUNTIME_5")
+    )
+    assert last_allow > 0
+    for deny in (
+        '(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))',
+        '(deny file-read* (subpath (param "_CODEX_SESSIONS")))',
+        '(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") '
+        '"/history.jsonl")))',
+    ):
+        index = _rule_index(profile, deny)
+        assert index > last_allow, f"an operator or runtime allow can re-open {deny}"
+
+
+def test_the_daemon_state_write_deny_comes_after_the_project_write_allow():
+    """`_PROJECT_DIR` is granted writes and is built from a name a frontend supplies,
+    part of which a Slack message sender chooses. `agent.workspace_path` reduces that
+    name so it can no longer name an ancestor of the data dir; this ordering is what
+    makes the deny hold even if it ever could again. The journal under state/ replays
+    its entries as user messages, so a writable journal is a prompt the agent can
+    schedule for itself past any approval the operator set."""
+    profile = sandbox._BASE_PROFILE
+    allow = _rule_index(profile, '(allow file-write* (subpath (param "_PROJECT_DIR")))')
+    assert allow > 0
+    for suffix in ('"/.claude-on-the-fly/state"', '(param "_DATA_DIR") "/state"'):
+        index = _rule_index(profile, "(deny file-write*", suffix)
+        assert index > allow, f"the _PROJECT_DIR write allow re-opens state/ ({suffix})"

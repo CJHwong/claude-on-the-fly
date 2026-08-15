@@ -50,6 +50,16 @@ The broker does not parse arbitrary CLI semantics after an allowed prefix. Gener
 subcommands remain unavailable unless explicitly listed, and provider-side credential
 scope is still required because argv inspection cannot safely model every future flag.
 
+`_unsafe_path_argument` reads an option token three ways, because an option carries its
+value three ways: every `=` segment after the first, not just the first split, and
+everything after the short option letter when there is no separator at all. Reading only
+the first split let `-o/etc/passwd`, `-D/Users/someone`, `--opt=a=/etc/passwd` and `-C..`
+through, all four verified against the guard. It runs *after* the cwd is settled and
+resolves each candidate against it, which is the only reading that catches
+`link/etc/passwd` where `link` is a symlink the turn planted in its own workspace.
+Resolving rather than refusing symlink components is forced: the workspace itself is
+reached through `/var` -> `/private/var` on macOS, so every argument in it has one.
+
 ## Tool approvals
 
 `permissions.py` owns config parsing, request classification, per-session HTTP service,
@@ -69,11 +79,33 @@ runtime paths measured as necessary.
 
 `sandbox.scope_sessions` gates the whole boundary and is off by default
 (`sandbox.scoped_sessions()`). Off, the granted path resolves back onto the store it
-sits in: `_CLAUDE_PROJECT` becomes `_CLAUDE_PROJECTS` and `_CODEX_HOME` becomes the
-shared codex home. SBPL is last-match-wins and the grant is written after the deny, so
-each deny is nullified by its own re-grant and no profile line has to change. On Linux
-the two masks are dropped instead, because a tmpfs and a read-write bind over the same
-path would leave argv order deciding the policy.
+sits in: `_CLAUDE_PROJECT` becomes `_CLAUDE_PROJECTS`, and `_CODEX_HOME` becomes the
+shared `sessions` tree. SBPL is last-match-wins and the grant is written after the deny,
+so each deny is nullified by its own re-grant and no profile line has to change. On
+Linux the two masks are dropped instead, because a tmpfs and a read-write bind over the
+same path would leave argv order deciding the policy.
+
+`_CODEX_HOME` stops at `sessions/` in that state rather than resolving to `~/.codex`
+itself. It used to resolve to the home, and because the profile writes
+`(allow file-write* (subpath _CODEX_HOME))` after `(deny file-write* (subpath
+_HOME/.codex))`, the allow then nullified that deny for the whole tree: `config.toml`,
+`AGENTS.md`, `hooks.json`, `rules`, `agents`, `prompts`, `skills`. Those decide what
+codex is told and what it runs, in every later run and outside any jail, so a jailed
+turn could plant standing instructions for the operator's own sessions. Confirmed by a
+real jailed write against a real `~/.codex`, under both filesystem profiles. Linux never
+had it: `_linux_grants` lists `_codex_protected` under `write_denied` whatever the
+setting says.
+
+The two cross-thread read denies sit at the **end** of the read section in
+`fs-deny-most.sb`, after the `_EXTRA_*` and `_RUNTIME_*` allows, for the same reason the
+`_DATA_DIR` denies are last. Both of those are subpath allows naming operator- or
+install-derived paths, so an entry naming an ancestor re-opens the stores. Measured with
+the pairs above those allows: one `sandbox.extra_paths` entry of `$HOME` made another
+thread's codex rollout and another thread's claude session readable again, with the
+profile still loading and the log still saying jailed. `extra_paths` is also the remedy
+the agent is told to relay when a read is blocked, so it is a value operators are
+actively invited to add. `tests/test_sandbox.py` asserts the positions, not just the
+behaviour: a behaviour test passed throughout the window the codex grant was wrong.
 
 Four profile parameters carry the session boundary, resolved per run from the workspace
 and realpath'd like every other one:
@@ -84,7 +116,7 @@ and realpath'd like every other one:
 | `_CLAUDE_PROJECTS` | `<config dir>/projects` | read denied |
 | `_CLAUDE_PROJECT` | `…/projects/<workspace hash>` | read and write granted |
 | `_CODEX_SESSIONS` | `<shared codex home>/sessions` | read denied |
-| `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>` | read and write granted |
+| `_CODEX_HOME` | `DATA_DIR/codex-homes/<workspace key>`, or the shared `sessions` tree when `scope_sessions` is off | read and write granted |
 
 Every claude rule is written against `_CLAUDE_CONFIG` rather than `$HOME/.claude`,
 because `CLAUDE_CONFIG_DIR` can move the tree outside `$HOME` where a `_HOME`-derived
@@ -101,7 +133,16 @@ same way. Three buckets decide what goes in it:
 |---|---|---|
 | Instruction-bearing | `settings.json`, `hooks.json`, `CLAUDE.md`, `commands/`, `skills/`, `agents/`, `plugins/` root | write denied; read on later invocations, so a write outlives the session |
 | Conversation-bearing | `projects/<hash>/` (session JSONL **and** the per-project memory dir), `history.jsonl` | per-thread only, or denied outright |
-| Runtime scratch | `shell-snapshots/`, `session-env/`, `sessions/`, `plugins/cache/`, `policy-limits.json` | granted machine-wide; none decides what the agent executes or is told |
+| Runtime scratch | `shell-snapshots/`, `session-env/`, `sessions/`, `plugins/cache/`, `policy-limits.json` | granted machine-wide |
+
+Two entries in that last bucket do not honestly belong in it. `shell-snapshots/` holds
+shell the CLI sources on a later Bash tool call, and `plugins/cache/` holds the code a
+plugin manifest points at, so a write to either can execute on a later run. The grant on
+the first is already unsupported by measurement: a jailed turn that provably ran a Bash
+tool wrote no snapshot. Both are left in place here rather than changed alongside the
+denies above, because dropping them is a behaviour change on the one path still without
+a real run behind it, and this note is the record that they are open questions rather
+than a bucket the table has cleared.
 
 `_CLAUDE_RUNTIME_WRITE_FILES` is split from `_CLAUDE_RUNTIME_WRITE_DIRS` because the
 Linux wrap creates each mount source, and `mkdir` on a file target leaves a
@@ -139,6 +180,49 @@ different stores, and the grant pointing at a directory the CLI never writes.
 
 `CODEX_HOME` is set on the child by the codex backend rather than published as a session
 override, because the jobs and cron daemons never open a session.
+
+## Operator read grants
+
+`sandbox.extra_paths` is the one value an operator adds that can hand a read back, and
+`_JAIL_GUIDANCE` tells the agent to ask for exactly that whenever a read is blocked. Each
+entry is realpath'd and then refused if it is the home directory, an ancestor of it, or a
+path that reaches a credential store or a file-level credential deny in either direction
+(`sandbox._CREDENTIAL_STORES` and `sandbox._CREDENTIAL_FILES`, plus DATA_DIR, which
+COTF_DATA_DIR can point anywhere). An entry can name a file as easily as a directory:
+`~/.netrc` is neither the home nor an ancestor of it, so the file list exists because the
+home rule alone would not stop an entry that re-opens exactly one denied file.
+`tests/test_sandbox.py` asserts every `_DENY_PROBES` entry and every `_CREDENTIAL_FILES`
+entry sits behind one of those rules, so a credential added to either list cannot be left
+grantable here.
+
+Entries are refused individually and the rest are still granted, unlike `sandbox.mode`,
+which refuses to start. The two fail in opposite directions: a bad mode value serves
+turns with the full environment, while a dropped read grant costs the agent capability
+and nothing else. Symlinked entries are resolved rather than refused, because /tmp, /var
+and most Homebrew and mise paths are symlinks on macOS, and the resolve happens on every
+spawn, so a link repointed later is re-checked.
+
+## The uv cache
+
+Both profiles used to grant the agent writes to `~/.cache/uv`, which is the cache
+`upgrade.run` installs this daemon's own dependencies from: it shells `uv sync` with no
+`env=`, outside any jail and with the TUI's full environment. A jailed turn seeding a
+wheel there is code the operator later runs on purpose, and a cache entry waits rather
+than racing anything.
+
+`sandbox.uv_cache_dir()` is `DATA_DIR/uv-cache`, exported as `UV_CACHE_DIR` by
+`agent_env` because HOME is a passthrough key and uv would otherwise resolve the
+operator's cache. `_ensure_session_mount_sources` creates it before the wrap on both
+platforms: on Linux `--bind-try` skips an absent source, and on macOS the jailed process
+cannot create a directory under a data dir it may not write. The *read* grant on
+`~/.cache/uv` is kept, because a downloaded wheel is not a secret and a warm cache is
+still worth having.
+
+Measured under both bases: a jailed write to `$HOME/.cache/uv` reports "Operation not
+permitted" and one to the agent's own cache succeeds, and under `deny-most` a jailed
+`uv venv` plus `uv pip install --offline --no-index` both complete, populating
+`uv-cache/` with `archive-v0`, `wheels-v6` and `interpreter-v4`. The read grant alone
+does not break uv: it writes only where `UV_CACHE_DIR` points.
 
 ## Linux jail
 
@@ -179,7 +263,58 @@ relay bridges exists. A port mapper would fail open, which is why one is not use
 - `sandbox.preflight` proves the jail starts and refuses external egress before the
   daemon serves. `verify_denials` alone cannot: it settles absent-versus-denied outside
   the jail, so on a machine with none of the probed credentials it spawns nothing.
+- Every daemon that reaches `agent.run` runs both, through `sandbox.verify_boundary`,
+  before it accepts or claims work.
+- A run that proved nothing fails. A probe that could not run is `UNTESTED`, not a
+  dropped result.
 - A missing or unusable mechanism is fatal on both platforms.
+
+## The startup self-test
+
+`sandbox.verify_boundary` is `preflight` then `verify_denials`, in that order, and it
+exists as one name because the order is load-bearing and the call sites are now plural.
+`verify_denials` settles absent-versus-denied outside the jail, so on a host holding none
+of the probed credentials it spawns nothing at all, and a jail that never started would
+report a clean sheet. `preflight` is what makes that silence mean something.
+
+Two daemons call it, and one deliberately does not:
+
+| Daemon | Calls it | Failure | Why |
+|---|---|---|---|
+| chat (`orchestrator._start_sandbox`) | yes | refuse to serve | Spawns a jailed agent per turn |
+| jobs worker (`jobs/cli._run`) | yes | refuse to start, exit 2 | Spawns a jailed agent per job, unattended |
+| cron producer (`cron.main`) | no | n/a | Runs shell and enqueues; never calls `agent.run` |
+
+The worker's refusal is fatal rather than advisory, and being unattended is the argument
+for that rather than against it: it runs `bypassPermissions` turns against whatever a
+producer queued, so an unproven credential boundary is worth more there than in the chat
+daemon. The queue is durable, so a refusal costs a restart and the jobs wait; the
+opposite choice is silent and cannot be undone once the reads have happened.
+
+Cron is left out on the split stated at the top of [cron.md](cron.md): it runs shell and
+never spawns an agent, so the self-test could only report on a boundary that process
+never crosses, and a fatal result there would stop the producer for a fault that cannot
+reach it. The worker that *does* cross the jail already refuses to drain what cron
+queued, so nothing runs unverified either way.
+
+### Five outcomes, and only one of them is proof
+
+`DENIED` is proof. `READABLE` / `WRITABLE` and `BROKEN` are failures. The other two are
+the interesting pair:
+
+- `ABSENT` — the file is genuinely not on this host, checked from outside the jail.
+  There is no credential at that path to leak, so this is honest non-evidence and it is
+  not fatal. `preflight` bounds it: the jail has already been shown to start, to refuse
+  egress, and to write its session store.
+- `UNTESTED` — the file *is* there and the probe never ran. Fatal.
+
+`UNTESTED` used to be `None` and was filtered out of the results dict on the grounds that
+it says nothing about the boundary. True, and that is exactly why it could not be
+dropped: with every probe dropped the dict was empty, no entry matched `BROKEN` or
+`READABLE`, and the function logged `0/0 probed paths confirmed denied` at INFO and
+returned success. Each probe carries its own 15s ceiling and they run concurrently, so a
+loaded host at startup was enough to reach that. `preflight` is already fatal on the same
+spawn failures, so leniency here was the anomaly. Every probe now lands in the dict.
 
 Tests for these invariants live in `test_sandbox.py`, `test_sandbox_linux.py`,
 `test_netns_relay.py`, `test_approvals.py`, `test_permissions.py`, `test_cotf_approve.py`,

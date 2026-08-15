@@ -8,6 +8,7 @@ running it.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,28 @@ class TestRecording:
         replay, _ = journal.take(now=1000.0)
 
         assert len(replay) == 1
+
+    def test_the_journal_is_owner_only(self, journal):
+        """It holds the verbatim text of every unanswered turn. Measured at 0o644
+        before this, because `write_text` inherits the umask."""
+        journal.record(_turn())
+
+        assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
+
+    def test_a_journal_left_world_readable_by_an_older_build_is_tightened(
+        self, journal
+    ):
+        """The temp name is fixed, so a file an older build left behind is the
+        one the next write opens. O_CREAT's mode does not apply to a file that
+        already exists, which is what the explicit chmod is for."""
+        journal.path.parent.mkdir(parents=True)
+        stale = journal.path.with_suffix(".json.tmp")
+        stale.write_text("[]")
+        stale.chmod(0o644)
+
+        journal.record(_turn())
+
+        assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
 
     def test_an_unwritable_journal_does_not_raise(self, tmp_path, caplog):
         """A journal that cannot be written must not take down the turn it was
@@ -225,6 +248,71 @@ class TestCorruptRecords:
         journal.path.write_text(json.dumps([entry]))
 
         assert journal.take(now=1000.0) == ([], [])
+
+    def test_a_boolean_chat_id_is_dropped(self, journal):
+        """`bool` subclasses `int`, so this arrived as chat_id=True, which
+        compares equal to 1: somebody's turn replayed into whichever
+        conversation that frontend numbers 1."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            json.dumps([{"chat_id": True, "text": "x", "turn_id": "t"}])
+        )
+
+        assert journal.take(now=1000.0) == ([], [])
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_a_recorded_at_that_is_not_a_number_is_dropped(self, journal, literal):
+        """The TTL gate is `moment - recorded_at > ttl_s`, and every comparison
+        against NaN is False, so the entry survived every TTL for ever. Written
+        as a raw literal because that is what a tampered file holds -- json.loads
+        accepts these by default."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            '[{"chat_id": 1, "text": "x", "turn_id": "t", "recorded_at": '
+            + literal
+            + "}]"
+        )
+
+        assert journal.take(now=1e12) == ([], [])
+
+    def test_a_recorded_at_too_large_for_a_float_is_dropped(self, journal):
+        """`float()` raises OverflowError on an int past ~1.8e308, and a raw
+        integer literal of that size is valid JSON. The NaN/Infinity clamp
+        missed this shape: the exception propagated through `take()` and
+        crashed the daemon at startup. Written as a raw literal because that
+        is what a tampered file holds."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            '[{"chat_id": 1, "text": "x", "turn_id": "t", "recorded_at": '
+            + "9" * 400
+            + "}]"
+        )
+
+        assert journal.take(now=1000.0) == ([], [])
+
+    def test_a_negative_replay_counter_cannot_outrun_the_cap(self, journal):
+        """`take()` parks at `replays >= MAX_REPLAYS`. A counter of -10^18 needs
+        that many restarts to reach 2, so the turn most likely to be killing the
+        daemon is replayed at every start instead of being handed back."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            json.dumps(
+                [
+                    {
+                        "chat_id": 1,
+                        "text": "x",
+                        "turn_id": "t",
+                        "recorded_at": 1000.0,
+                        "replays": -(10**18),
+                    }
+                ]
+            )
+        )
+
+        replay, nudge = journal.take(now=1000.0)
+
+        assert nudge == []
+        assert [t.replays for t in replay] == [1]
 
     def test_an_unknown_phase_resumes_as_if_work_had_started(self, journal):
         """A record we cannot classify gets the careful treatment: replayed, but

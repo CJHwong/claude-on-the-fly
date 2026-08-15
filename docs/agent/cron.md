@@ -9,6 +9,13 @@ needs an agent becomes a job. That split is the design, not an implementation
 detail: the daemon decides *what* to work on, the worker decides *how long* and
 *how many at once*.
 
+That split is why `cron.main` does **not** call `sandbox.verify_boundary()`, unlike
+the chat daemon and the job worker. This process crosses no jail, so the self-test
+could only report on a boundary it never uses, and a fatal result would stop the
+producer for a fault that cannot reach it. The worker already refuses to drain what
+cron queued when the boundary is unproven, so nothing runs unverified either way.
+Move the call in the moment cron spawns an agent itself.
+
 ## Why there is no reconcile pass
 
 The daemon this replaced held a worker open per ticket across turns, which forced

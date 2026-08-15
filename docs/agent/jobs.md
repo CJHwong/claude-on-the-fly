@@ -90,6 +90,14 @@ Three ways a jobs setup fails quietly, each caught before a daemon starts rather
 
 `warn` is non-blocking by construction — `checks.is_blocking` is what every caller counting problems should use, so a `doctor` run reports the advice and still exits 0.
 
+## The sandbox self-test is part of startup
+
+`_run` calls `sandbox.verify_boundary()` before `build_components`, so the jail is proven before anything claims a job. Inert unless `sandbox.mode` is `jail`.
+
+It is here because this worker spawns jailed agents through `agent.run` exactly as a chat turn does, and for a while only `orchestrator._start_sandbox` ran the self-test: a jail that could not hold `state/` stopped Slack loudly and left this worker draining the same queue across an unverified boundary.
+
+A failure is **fatal** — `_cmd_run` returns 2 with one line on stderr, the same shape as the already-running and no-token refusals, so the supervisor treats all three alike. Nobody watching is the argument *for* that: the worker runs `bypassPermissions` turns against whatever a producer queued. The queue is durable and the jobs wait, so a refusal costs a restart; a start on an unverified boundary cannot be undone once the reads have happened. See [broker.md](broker.md) for the outcomes and for why the cron producer is not gated.
+
 ## Orphaned agent processes
 
 `agent._exec` spawns the CLI with `start_new_session=True` so one `killpg` reaps the CLI *and* every tool subprocess it forked. The cost: the child is unreachable from the parent's group, and `supervisor.stop()` signals the worker pid alone before SIGKILLing it after a five-second grace. A worker that misses that window would leave a full agent CLI running with no parent and no record of its pid.

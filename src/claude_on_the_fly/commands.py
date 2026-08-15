@@ -413,16 +413,53 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     return any(tokens[: len(prefix)] == prefix for prefix in tool.allow)
 
 
-def _unsafe_path_argument(argv: list[str]) -> str | None:
-    """Return the first absolute/traversing argument, or ``None``.
+def _path_candidates(item: str) -> list[str]:
+    """The substrings of one argv token that could be a path.
+
+    An option carries its value three ways, and reading only the first left two
+    bypasses. `--file=/etc/passwd` splits once, which is what the guard used to
+    do; `--opt=a=/etc/passwd` puts an `=` inside the value, so the single split
+    handed the check `a=/etc/passwd`, which is relative and passed; and a short
+    option attaches its value with no separator at all, so `-o/etc/passwd` and
+    `-D/Users/someone` were never looked inside.
+
+    Everything after the short option letter is the value, because there is no
+    way to tell `-C..` (option C, value `..`) from a cluster of boolean flags
+    without a per-flag arity model the broker deliberately does not have. Reading
+    the tail of a boolean cluster as a path over-refuses at worst: `-abc` is
+    checked as the relative path `bc`, which is inside the workspace and allowed.
+    """
+    if not item.startswith("-"):
+        return [item]
+    candidates = item.split("=")[1:]
+    if not item.startswith("--"):
+        candidates.append(item[2:])
+    return candidates
+
+
+def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None:
+    """Return the first absolute/traversing/escaping argument, or ``None``.
 
     The broker is not a file-transfer channel. Relative paths are still allowed
     for a vetted command and are resolved by the CLI from the session workspace;
     host-absolute and escaping paths are refused before process creation. The
     Windows check matters when a cross-platform config is exercised on macOS.
+
+    With ``cwd``, each candidate is also resolved against it and required to stay
+    inside. That is the only reading that catches a relative path through a
+    symlink, and the agent can plant one: its workspace is writable, so `ln -s /
+    link` makes `link/etc/passwd` a lexically clean relative path that the CLI
+    then opens as `/etc/passwd`. Resolving is the right half of the choice
+    because the guard cannot refuse symlink components instead: the workspace
+    itself is reached through `/var` -> `/private/var` on macOS, so every
+    argument in it has one. Containment is checked against the resolved cwd for
+    the same reason. `cwd` is what `_workspace_cwd` already vetted as being
+    inside the session workspace, so containment here inherits that boundary
+    rather than restating it.
     """
+    root = Path(cwd).resolve(strict=False) if cwd else None
     for item in argv:
-        for candidate in (item, item.split("=", 1)[1] if "=" in item else ""):
+        for candidate in _path_candidates(item):
             if not candidate or candidate == ".":
                 continue
             if candidate == ".." or candidate.startswith(("/", "~/", "~\\")):
@@ -432,7 +469,22 @@ def _unsafe_path_argument(argv: list[str]) -> str | None:
                 or ".." in Path(candidate).parts
             ):
                 return item
+            if root is not None and not _contained(root, candidate):
+                return item
     return None
+
+
+def _contained(root: Path, candidate: str) -> bool:
+    """Whether ``candidate``, resolved from ``root``, stays under it.
+
+    A candidate that cannot be resolved at all is treated as contained: it is not
+    a path the CLI can open either, and refusing on an OSError would turn an
+    unreadable intermediate directory into a refused command.
+    """
+    try:
+        return (root / candidate).resolve(strict=False).is_relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return True
 
 
 def _workspace_cwd(body: dict, workspace: Path | None) -> str | None:
@@ -742,7 +794,26 @@ class CommandBroker:
             )
             return CommandResult(stderr=_REFUSAL_TEXT + "\n", rc=1, refused=True)
 
-        unsafe_path = _unsafe_path_argument(argv)
+        # The cwd is settled before the argv check rather than after, because a
+        # relative argument means nothing without the directory the CLI resolves
+        # it from: that is what turns a symlink the agent planted in its own
+        # workspace back into the absolute path it points at.
+        cwd = _workspace_cwd(body, workspace)
+        if cwd is None:
+            logger.warning(
+                "commands: REFUSE %s (cwd is outside its session workspace)",
+                tool.name,
+            )
+            return CommandResult(
+                stderr=(
+                    "[sandbox] the command broker only runs inside this session's "
+                    "workspace.\n"
+                ),
+                rc=126,
+                refused=True,
+            )
+
+        unsafe_path = _unsafe_path_argument(argv, cwd)
         if unsafe_path is not None:
             logger.warning(
                 "commands: REFUSE %s %s (absolute or escaping path argument)",
@@ -762,20 +833,6 @@ class CommandBroker:
         if binary is None:  # pragma: no cover - filtered at construction
             return CommandResult(stderr=f"[sandbox] {tool.name} not found\n", rc=127)
 
-        cwd = _workspace_cwd(body, workspace)
-        if cwd is None:
-            logger.warning(
-                "commands: REFUSE %s (cwd is outside its session workspace)",
-                tool.name,
-            )
-            return CommandResult(
-                stderr=(
-                    "[sandbox] the command broker only runs inside this session's "
-                    "workspace.\n"
-                ),
-                rc=126,
-                refused=True,
-            )
         # The full argv is the audit record, and it is deliberately at WARNING:
         # every brokered command runs with a real credential, so it should be
         # visible without turning debug logging on.

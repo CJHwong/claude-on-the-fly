@@ -60,28 +60,12 @@
 ;; by depth. Parameterised rather than built from _HOME because CLAUDE_CONFIG_DIR
 ;; can move the tree anywhere, including outside $HOME where the deny above it
 ;; would not reach.
-(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))
-(allow file-read* (subpath (param "_CLAUDE_PROJECT")))
-;; Every prompt typed in every project on this host, so it crosses threads the same
-;; way projects/ does. Denied by name, like the credentials further down, because it
-;; is one file rather than a tree. No measured turn writes it, so nothing is lost.
-(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
+;; read the verbatim turns of every other thread on the host. The pair that does
+;; it is at the END of this section, not here: see "Cross-thread session stores"
+;; below. It has to come after the operator and runtime allows, because either one
+;; can name an ancestor of these trees.
 ;; codex config, the same grant ~/.claude gets for the other backend.
 (allow file-read* (subpath (string-append (param "_HOME") "/.codex")))
-;; The same boundary for the other backend, and codex was the wider hole: the
-;; ~/.codex grant above reached every rollout in one flat date tree, 1088 of them
-;; on the host this was measured on. codex picks the rollout name at startup, so
-;; there is no per-workspace path to re-grant inside the shared tree; the workspace
-;; gets its own CODEX_HOME instead and this thread's rollouts are the only ones in
-;; it. _CODEX_HOME lives under the data dir, which this profile makes opaque, so it
-;; needs its own grant to be reachable at all.
-;;
-;; Ordering is the whole rule here: SBPL is last-match-wins, so these must come
-;; *after* the ~/.codex allow directly above. Measured with this pair placed before
-;; it, the allow won and a jailed turn still read 91855 bytes of another thread's
-;; rollout while the profile looked correct.
-(deny file-read* (subpath (param "_CODEX_SESSIONS")))
-(allow file-read* (subpath (param "_CODEX_HOME")))
 ;; Command-broker shims. Generated under DATA_DIR, which deny-most makes
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".
@@ -91,6 +75,12 @@
 ;; rest of $HOME unless it is granted back. Scoped to memory/ so the sibling .env
 ;; and logs/ stay unreadable.
 (allow file-read* (subpath (string-append (param "_DATA_DIR") "/memory")))
+;; The agent's own uv cache. Written by it, so it has to be readable back, and it
+;; lives under the data dir this profile makes opaque. See the write grant below
+;; for why it is not the operator's cache.
+(allow file-read* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
+;; The operator's cache, read-only. uv is pointed elsewhere for writes, and a
+;; downloaded wheel is not a secret, so reading a warm cache costs nothing.
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
 (allow file-read* (subpath (param "_TMPDIR")))
 ;; The runtime this jail has to be able to run: the agent binary's directory and
@@ -118,6 +108,35 @@
 (allow file-read* (subpath (param "_EXTRA_1")))
 (allow file-read* (subpath (param "_EXTRA_2")))
 (allow file-read* (subpath (param "_EXTRA_3")))
+;; -- Cross-thread session stores --
+;; Placed here, after every allow above, for the reason the _DATA_DIR denies below
+;; are placed last: SBPL is last-match-wins, and an operator grant or a runtime
+;; grant can name an ancestor of these trees. Measured with these two pairs in the
+;; read section above the _EXTRA_* allows: one `sandbox.extra_paths` entry of $HOME
+;; made another thread's codex rollout and another thread's claude session both
+;; readable again, while the profile still loaded and the log still said jailed.
+;; `sandbox.extra_paths` is also the remedy the agent is told to relay when a read
+;; is blocked, so that entry is a thing an operator is actively invited to add.
+;;
+;; Each pair is deny-the-tree then re-grant-this-thread, and the order inside a
+;; pair is load-bearing too. _CLAUDE_PROJECT is always a child of
+;; _CLAUDE_PROJECTS, so it wins by depth as well as by position.
+(deny file-read* (subpath (param "_CLAUDE_PROJECTS")))
+(allow file-read* (subpath (param "_CLAUDE_PROJECT")))
+;; Every prompt typed in every project on this host, so it crosses threads the same
+;; way projects/ does. Denied by name, like the credentials further down, because it
+;; is one file rather than a tree. No measured turn writes it, so nothing is lost.
+(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
+;; codex was the wider hole: the ~/.codex allow above reached every rollout in one
+;; flat date tree, 1088 of them on the host this was measured on. codex picks the
+;; rollout name at startup, so there is no per-workspace path to re-grant inside
+;; the shared tree; the workspace gets its own CODEX_HOME instead and this thread's
+;; rollouts are the only ones in it. _CODEX_HOME lives under the data dir, which
+;; this profile makes opaque, so it needs its own grant to be reachable at all.
+;; Measured with this pair placed before the ~/.codex allow, that allow won and a
+;; jailed turn still read 91855 bytes of another thread's rollout.
+(deny file-read* (subpath (param "_CODEX_SESSIONS")))
+(allow file-read* (subpath (param "_CODEX_HOME")))
 ;; The daemon's own .env and logs stay denied even outside _HOME: deny-most only
 ;; makes $HOME opaque, and COTF_DATA_DIR can point the data dir anywhere -- at a
 ;; redirected directory outside $HOME every rule above would leave the tokens
@@ -202,7 +221,12 @@
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.cache/uv")))
+;; The agent's own uv cache, not the operator's: `upgrade.run` runs `uv sync`
+;; outside any jail with the TUI's full environment, so a wheel a jailed turn
+;; seeded in ~/.cache/uv is code the operator later runs on purpose. See
+;; sandbox.uv_cache_dir, which agent_env exports as UV_CACHE_DIR. The read allow
+;; on ~/.cache/uv above is kept: reading a warm cache leaks nothing.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
 (allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
