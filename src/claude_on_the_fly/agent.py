@@ -52,6 +52,21 @@ def data_dir_from(env: Mapping[str, str]) -> Path:
 DATA_DIR = data_dir_from(os.environ)
 
 
+# Everything outside this set collapses to one `_`, the same shape
+# `jobs.keys.safe_segment` uses, with the dot kept: Slack usernames contain dots
+# and a workspace that moves loses the thread's files and its session history.
+_WORKSPACE_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+# `.` and `..` are the only names the filesystem reads as navigation, so they are
+# the only dot forms that have to go. `..foo` is an ordinary filename.
+_WORKSPACE_DOTS_ONLY = re.compile(r"\A\.+\Z")
+
+
+def _workspace_segment(part: str) -> str:
+    """One path component of a workspace name, reduced so it cannot navigate."""
+    cleaned = _WORKSPACE_UNSAFE.sub("_", part)
+    return "_" if _WORKSPACE_DOTS_ONLY.match(cleaned) else cleaned
+
+
 def workspace_path(name: str, data_dir: Path) -> Path:
     """`data_dir/workspaces/<name>`, with every component of `name` reduced.
 
@@ -67,27 +82,31 @@ def workspace_path(name: str, data_dir: Path) -> Path:
     workspace name into host code execution outside the sandbox, which is why
     this is not left to the frontends to remember.
 
-    `keys.safe_segment` reduces each component to `[A-Za-z0-9-]`, so `..` cannot
-    survive it and neither can a separator the frontend did not intend. The
-    containment check afterwards is not redundant with that: it asserts this
-    function's own arithmetic held, and it refuses rather than returning a path
-    outside the tree. A symlink already standing where the workspace goes fails
-    it too, since `resolve()` follows one and the target is then outside.
+    Each component is reduced to `[A-Za-z0-9._-]`, and a component made only of
+    dots becomes `_`. That second rule is the whole traversal defence: `.` and
+    `..` are the only names the filesystem reads as navigation, and every other
+    use of a dot is an ordinary character in an ordinary filename. The containment
+    check afterwards is not redundant with it: it asserts this function's own
+    arithmetic held, and it refuses rather than returning a path outside the tree.
+    A symlink already standing where the workspace goes fails it too, since
+    `resolve()` follows one and the target is then outside.
 
-    Names that reach here today are unchanged by the reduction -- Slack and
-    Telegram both restrict their own identifiers to this character set, and the
-    timestamp suffix is dashed -- so an existing conversation keeps its
-    workspace.
+    The dot is kept rather than reduced with everything else because Slack
+    usernames contain them. Measured against a real deployment: of 167 workspaces
+    on disk, `keys.safe_segment` would have moved 8, all of the shape
+    `dm-first.last-<ts>`. A moved workspace is not cosmetic. The directory holds
+    the thread's files, its outbox and its persona link, and claude derives its
+    session hash from the working directory, so the conversation would have lost
+    its history as well. `keys.safe_segment` is left alone: job keys have no such
+    names and want the tighter set.
 
     `data_dir` is a parameter rather than this module's `DATA_DIR` because each
     caller already holds the one its own module imported, and a frontend under
     test redirects that. A hidden read of the global here would quietly ignore the
     redirection and write into the operator's real data directory.
     """
-    from claude_on_the_fly.jobs.keys import safe_segment
-
     root = data_dir / "workspaces"
-    parts = [safe_segment(part) for part in re.split(r"[\\/]+", name) if part]
+    parts = [_workspace_segment(part) for part in re.split(r"[\\/]+", name) if part]
     if not parts:
         raise ValueError(f"workspace name is empty after reduction: {name!r}")
     candidate = root.joinpath(*parts)

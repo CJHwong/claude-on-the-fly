@@ -4066,6 +4066,39 @@ class TestWorkspacePath:
                 tmp_path / "workspaces" / name
             )
 
+    def test_a_dotted_slack_username_keeps_its_workspace(self, tmp_path):
+        """Slack usernames contain dots, and a workspace that moves takes the
+        thread's files, its outbox and its persona link with it -- and its history,
+        since claude derives the session hash from the working directory.
+
+        Measured against a real deployment before this was allowed for: of 167
+        workspaces on disk, reducing the dot would have moved 8, every one of them
+        `dm-first.last-<ts>`. This runs regardless of `sandbox.mode`, so it would
+        have hit a deployment with no sandbox at all.
+        """
+        for name in (
+            "slack/dm-andy.wl.huang-1776150903",
+            "slack/dm-sean.fang-1774327153",
+            "slack/general.announcements-1",
+        ):
+            assert (
+                agent_mod.workspace_path(name, tmp_path)
+                == tmp_path / "workspaces" / name
+            )
+
+    @pytest.mark.parametrize("part", [".", "..", "...", "...."])
+    def test_a_component_that_is_only_dots_cannot_navigate(self, part, tmp_path):
+        """Keeping the dot is safe because `.` and `..` are the only names the
+        filesystem reads as navigation, and both are dots-only."""
+        got = agent_mod.workspace_path(f"slack/{part}/x", tmp_path)
+        assert got == tmp_path / "workspaces" / "slack" / "_" / "x"
+
+    def test_a_dot_inside_a_name_is_not_navigation(self, tmp_path):
+        """`..foo` is an ordinary filename, so it survives intact rather than being
+        collapsed along with the two names that are not."""
+        got = agent_mod.workspace_path("slack/..foo", tmp_path)
+        assert got == tmp_path / "workspaces" / "slack" / "..foo"
+
     def test_an_underscore_survives(self, tmp_path):
         """Slack channel names allow underscores, and `safe_segment` maps an unsafe
         run to a single `_`, so `my_channel` is stable rather than renamed."""
