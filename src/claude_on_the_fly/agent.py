@@ -547,16 +547,15 @@ class Response:
     suggestions: list[str] = field(default_factory=list)
     # Set only on a compaction turn, so callers can tell one from a reply.
     compaction: Compaction | None = None
-    # Optional statusline-derived fields, only populated in CLAUDE_MODE=pty.
+    # Optional statusline-derived fields, populated in CLAUDE_MODE=pty.
     rate_limits_5h_pct: int | None = None
     rate_limits_5h_resets_at: int | None = None
     rate_limits_7d_pct: int | None = None
     rate_limits_7d_resets_at: int | None = None
     context_window_pct: int | None = None
-    # Prompt size and the model's window, in tokens. The percentage above is
-    # derived from these two and loses the scale: 7% is 70k on a 200k model and
-    # 70k on a 1M model, and only one of those is worth compacting. The
-    # auto-compact gate needs the absolute numbers, so carry them.
+    # Prompt size and the model's window, in tokens. Native backends populate
+    # these instead of context_window_pct; the auto-compact gate also needs the
+    # absolute numbers, so carry them.
     context_tokens: int | None = None
     context_window_size: int | None = None
     exceeds_200k: bool = False
@@ -578,8 +577,15 @@ class Response:
             parts.append(f"{self.duration:.1f}s")
         if self.tokens_in or self.tokens_out:
             parts.append(f"↑{self.tokens_in} ↓{self.tokens_out}")
-        if self.context_window_pct is not None:
-            parts.append(f"ctx {self.context_window_pct}%")
+        context_window_pct = self.context_window_pct
+        if (
+            context_window_pct is None
+            and self.context_tokens is not None
+            and self.context_window_size
+        ):
+            context_window_pct = self.context_tokens * 100 // self.context_window_size
+        if context_window_pct is not None:
+            parts.append(f"ctx {context_window_pct}%")
         # Only surface the 5h budget when it's actually loud; the 7d window
         # rarely matters in chat. resets_at is a Unix timestamp from pty.
         if (
