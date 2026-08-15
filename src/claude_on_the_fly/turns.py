@@ -176,10 +176,19 @@ def _as_float(value: Any) -> float | None:
     A missing or non-numeric value stays 0.0, which reads as "not recorded" and
     is exempt from the TTL. That is the existing degrade-to-defaults contract for
     every other scalar here, and the daemon's own writer always sets the field.
+
+    A raw integer literal past ~1.8e308 is valid JSON and passes the isinstance
+    check above, and `float()` raises OverflowError on it. The NaN/Infinity
+    clamp missed that shape: the exception propagated through `take()` and
+    crashed the daemon at startup. Not a timestamp either, so it is dropped the
+    way a NaN is.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return 0.0
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     return number if math.isfinite(number) else None
 
 

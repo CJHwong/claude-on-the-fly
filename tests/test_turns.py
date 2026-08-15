@@ -275,6 +275,21 @@ class TestCorruptRecords:
 
         assert journal.take(now=1e12) == ([], [])
 
+    def test_a_recorded_at_too_large_for_a_float_is_dropped(self, journal):
+        """`float()` raises OverflowError on an int past ~1.8e308, and a raw
+        integer literal of that size is valid JSON. The NaN/Infinity clamp
+        missed this shape: the exception propagated through `take()` and
+        crashed the daemon at startup. Written as a raw literal because that
+        is what a tampered file holds."""
+        journal.path.parent.mkdir(parents=True)
+        journal.path.write_text(
+            '[{"chat_id": 1, "text": "x", "turn_id": "t", "recorded_at": '
+            + "9" * 400
+            + "}]"
+        )
+
+        assert journal.take(now=1000.0) == ([], [])
+
     def test_a_negative_replay_counter_cannot_outrun_the_cap(self, journal):
         """`take()` parks at `replays >= MAX_REPLAYS`. A counter of -10^18 needs
         that many restarts to reach 2, so the turn most likely to be killing the
