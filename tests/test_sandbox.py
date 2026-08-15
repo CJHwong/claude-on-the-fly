@@ -342,6 +342,21 @@ def test_every_deny_probe_is_out_of_reach_of_extra_paths():
         assert sandbox._extra_path_refusal(parent) is not None, spec
 
 
+def test_every_file_level_credential_is_out_of_reach_of_extra_paths():
+    """`_CREDENTIAL_FILES` mirrors the profile's file-level read denies, and an
+    entry can name a file as easily as a directory: `~/.netrc` is neither the
+    home nor an ancestor of it, so the home rule alone does not stop an entry
+    that re-opens exactly one denied file. Asserted against the list rather
+    than restated, so a credential added to one cannot be left grantable by
+    the other."""
+    for spec in sandbox._CREDENTIAL_FILES:
+        resolved = Path(os.path.realpath(Path(spec).expanduser()))
+        assert sandbox._extra_path_refusal(resolved) is not None, spec
+        # A directory that merely contains the file is refused too, the same
+        # bidirectional check the stores get.
+        assert sandbox._extra_path_refusal(resolved.parent) is not None, spec
+
+
 def test_extra_paths_keeps_the_ordinary_grants(monkeypatch):
     """The refusals must not cost the setting its actual job: pointing the jail at
     the interpreter and toolchain the agent runs on."""
@@ -410,6 +425,22 @@ def test_linux_binds_the_operators_uv_cache_read_only(tmp_path):
     assert operator_cache in grants["read_only"]
     assert operator_cache not in grants["read_write"]
     assert Path(os.path.realpath(sandbox.uv_cache_dir())) in grants["read_write"]
+
+
+def test_linux_write_denies_cover_codex_prompts_and_auth(tmp_path):
+    """Linux binds the whole `~/.codex` read-write, so the write denies are the
+    only thing between a turn and the entries that decide what codex is told
+    and what it authenticates as. Prompts are standing instructions codex
+    reads on every run, and auth.json is the backend's own OAuth token: both
+    must be read-only. `skills` is deliberately absent -- codex writes its own
+    tree inside it (measured: 242 touches and a `skills/.system/` tree per
+    turn), so a read-only mount there breaks codex."""
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    assert codex / "prompts" in grants["write_denied"]
+    assert codex / "auth.json" in grants["write_denied"]
+    assert codex / "prompts" in grants["write_denied_dirs"]
+    assert codex / "skills" not in grants["write_denied"]
 
 
 # --- Slice 3: loopback narrowing ---
@@ -1655,9 +1686,14 @@ async def test_session_relay_is_inert_off_linux(monkeypatch):
     await relay.close()  # always safe, whatever the platform
 
 
-async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog):
+async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog, monkeypatch):
     """A jail the agent cannot reach any host service from is working, not broken
     -- but it is never what a deployment wants, so it must not pass silently."""
+    # The ambient environment is not the deployment: a shell that routes the
+    # model API through a local server (ANTHROPIC_BASE_URL, HTTPS_PROXY, ...)
+    # would leak a port into `_loopback_ports` and start the relay, and the
+    # socket path then exceeds sun_path's 104 bytes under the deep test home.
+    _clear_loopback_env(monkeypatch)
     with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
         relay = await sandbox.open_session_relay({}, "chat")
     await relay.close()
@@ -1669,8 +1705,12 @@ async def test_session_relay_warns_when_nothing_is_brokered(linux, caplog):
 async def test_session_relay_bridges_the_ports_from_the_overrides(linux, monkeypatch):
     """Ports come from the overrides about to be published, not os.environ: a
     per-session egress proxy lives only in the ContextVar."""
-    # sun_path caps out near 104 bytes and the fake home used by these tests is
-    # already most of that, so point the relay at a short directory.
+    # The ambient environment is not the deployment: a shell that routes the
+    # model API through a local server would leak a port into `_loopback_ports`
+    # and the assertion below would see it. sun_path caps out near 104 bytes
+    # and the fake home used by these tests is already most of that, so point
+    # the relay at a short directory too.
+    _clear_loopback_env(monkeypatch)
     with tempfile.TemporaryDirectory(dir="/tmp") as short:
         monkeypatch.setattr(agent, "DATA_DIR", Path(short))
         relay = await sandbox.open_session_relay(

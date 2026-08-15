@@ -521,14 +521,18 @@ def _loopback_specs() -> tuple[str, str, str, str]:
 # guards is a subpath allow written after the profile's denies.
 #
 # Directory-level stores only, and deliberately not a mirror of the profile's
-# forty-odd read denies. A file-level deny like ~/.netrc or ~/.sentryclirc sits
-# directly under $HOME, so the only entry that could re-open it is $HOME itself
-# or an ancestor, which the home rule already refuses. What this list has to
-# carry is the stores that sit deep enough for a *plausible* entry to reach:
-# ~/.config, ~/Library and ~/.local/share are the ones an operator adds for real
-# reasons. `_DENY_PROBES` is the startup-probed subset of the same idea, and
-# tests/test_sandbox.py asserts every probe is covered here or by the home rule,
-# so the two cannot drift apart in silence.
+# forty-odd read denies. What this list has to carry is the stores that sit
+# deep enough for a *plausible* entry to reach: ~/.config, ~/Library and
+# ~/.local/share are the ones an operator adds for real reasons. `_DENY_PROBES`
+# is the startup-probed subset of the same idea, and tests/test_sandbox.py
+# asserts every probe is covered here or by the home rule, so the two cannot
+# drift apart in silence.
+#
+# The file-level denies are a separate list (`_CREDENTIAL_FILES`), because an
+# entry can name a file as easily as a directory: `~/.netrc` is neither the
+# home nor an ancestor of it, so the home rule alone does not stop an entry
+# that re-opens exactly one denied file. The two lists together mirror the
+# profile's read denies, and the test that walks `_DENY_PROBES` covers both.
 _CREDENTIAL_STORES = (
     "~/.ssh",
     "~/.gnupg",
@@ -559,6 +563,34 @@ _CREDENTIAL_STORES = (
     "~/.claude-on-the-fly",
 )
 
+# The profile's file-level credential denies, mirrored from fs-allow-reads.sb.
+# An entry can name a file as easily as a directory, so each of these is
+# checked the same way the stores are: an entry that is the file, or a
+# directory that contains it, re-opens it.
+_CREDENTIAL_FILES = (
+    "~/.sentryclirc",
+    "~/.pypirc",
+    "~/.npmrc",
+    "~/.cargo/credentials.toml",
+    "~/.netrc",
+    "~/.gem/credentials",
+    "~/.config/pip/pip.conf",
+    "~/.m2/settings.xml",
+    "~/.gradle/gradle.properties",
+    "~/.oci/config",
+    "~/.git-credentials",
+    "~/.config/hub",
+    "~/.config/containers/auth.json",
+    "~/.terraform.d/credentials.tfrc.json",
+    "~/.vault-token",
+    "~/.databrickscfg",
+    "~/.pgpass",
+    "~/.my.cnf",
+    "~/.config/rclone/rclone.conf",
+    "~/.s3cfg",
+    "~/.boto",
+)
+
 
 def _extra_path_stores() -> list[Path]:
     """The credential stores an entry may not reach, realpath'd for comparison.
@@ -572,6 +604,13 @@ def _extra_path_stores() -> list[Path]:
     stores = [Path(store).expanduser() for store in _CREDENTIAL_STORES]
     stores.append(Path(DATA_DIR))
     return [Path(os.path.realpath(store)) for store in stores]
+
+
+def _extra_path_files() -> list[Path]:
+    """The file-level credential paths an entry may not reach, realpath'd."""
+    return [
+        Path(os.path.realpath(Path(file).expanduser())) for file in _CREDENTIAL_FILES
+    ]
 
 
 def _extra_path_refusal(resolved: Path) -> str | None:
@@ -599,6 +638,11 @@ def _extra_path_refusal(resolved: Path) -> str | None:
             return f"it resolves inside {store}, which the profile denies"
         if store.is_relative_to(resolved):
             return f"it contains {store}, which the profile denies"
+    for file in _extra_path_files():
+        if resolved.is_relative_to(file):
+            return f"it resolves inside {file}, which the profile denies"
+        if file.is_relative_to(resolved):
+            return f"it contains {file}, which the profile denies"
     return None
 
 
@@ -997,12 +1041,22 @@ _CODEX_PROTECTED = (
     "rules",
     "plugins",
     "agents",
+    # Prompts are what codex is told, the same standing-instruction class as
+    # AGENTS.md, and codex never writes into them. `skills` is deliberately not
+    # here: codex writes its own tree inside it (measured: 242 touches and a
+    # `skills/.system/` tree per turn), so a read-only mount there breaks codex
+    # the way the sweep did before it was narrowed to named entries.
+    "prompts",
+    # The backend's own OAuth token. The agent must read it to authenticate, so
+    # it stays readable; only the write is denied, which keeps a turn from
+    # swapping the operator's credential for one it controls.
+    "auth.json",
 )
 
 # Which of the entries above are directories. Named rather than derived: the
 # extension-less ones are a mix of both kinds, so a stand-in created for an
 # absent target has to be told which it is.
-_CODEX_PROTECTED_DIRS = ("rules", "plugins", "agents")
+_CODEX_PROTECTED_DIRS = ("rules", "plugins", "agents", "prompts")
 
 
 # Written inside an area the agent may otherwise write, so each needs an explicit
