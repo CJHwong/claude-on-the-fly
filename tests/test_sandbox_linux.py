@@ -7,11 +7,12 @@ one branch nobody tests.
 
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly import sandbox_linux
+from claude_on_the_fly import sandbox, sandbox_linux
 
 
 @pytest.fixture
@@ -152,6 +153,75 @@ def test_mount_order_does_not_depend_on_caller_list_order(tmp_path, places):
         placeholders=places,
     )
     assert forward == reversed_
+
+
+@pytest.mark.parametrize("scoped", ["", "true"])
+def test_mount_order_is_depth_then_rank_for_every_pair(tmp_path, monkeypatch, scoped):
+    """The ordering property that makes the whole mount table correct, asserted
+    over the real policy through the real pure function rather than a hand-drawn
+    table. Mount order is the policy -- later mounts win -- so a parent must
+    always be mounted before its children, and at equal depth the rank
+    (opaque < read-only < read-write < write-denied < masked) breaks the tie.
+    This is the invariant that keeps `extra_paths: $HOME` from re-exposing the
+    data dir, and the codex-grant and state-deny regressions on the macOS side
+    were the same bug class in SBPL ordering."""
+    if scoped:
+        monkeypatch.setenv("COTF_SANDBOX_SCOPE_SESSIONS", scoped)
+    workspace = tmp_path / "ws"
+    grants = sandbox._linux_grants(workspace)
+    placeholders = sandbox_linux.prepare_placeholders(tmp_path / "jail")
+    argv = sandbox_linux.jail_argv(
+        ["true"],
+        opaque=grants["opaque"],
+        read_only=grants["read_only"],
+        read_write=grants["read_write"],
+        write_denied=grants["write_denied"],
+        masked=grants["masked"],
+        sockets={},
+        placeholders=placeholders,
+        write_denied_dirs=grants["write_denied_dirs"],
+    )
+    # The full tuple, not just (depth, rank): jail_argv sorts on (depth, rank,
+    # args), and the args list is what breaks a tie between two mounts of the
+    # same path depth and the same kind.
+    mounts = sorted(
+        sandbox_linux._mounts(
+            grants["opaque"],
+            grants["read_only"],
+            grants["read_write"],
+            grants["write_denied"],
+            grants["masked"],
+            placeholders=placeholders,
+            deny_dirs=frozenset(str(Path(p)) for p in grants["write_denied_dirs"]),
+        )
+    )
+    # The property, over every pair: the deeper path lands later, and at equal
+    # depth the rank breaks the tie.
+    for (depth, rank, _), (next_depth, next_rank, _) in pairwise(mounts):
+        assert (depth, rank) <= (next_depth, next_rank), (
+            f"mount at depth {depth} rank {rank} sorts after depth {next_depth} "
+            f"rank {next_rank}"
+        )
+    # The argv emits exactly this table, in this order: the fixed prefix, then
+    # the sorted mounts, then the remount pass. A mismatch here means the jail
+    # runs a table the property above did not check.
+    prefix = argv[:11]
+    assert prefix == [
+        "bwrap",
+        "--ro-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/run",
+        "--die-with-parent",
+    ]
+    emitted = argv[11 : 11 + sum(len(args) for _, _, args in mounts)]
+    assert emitted == [arg for _, _, args in mounts for arg in args]
+    assert argv[11 + len(emitted)] == "--remount-ro"
 
 
 # --- the fixed prefix and the trailing remount ---
