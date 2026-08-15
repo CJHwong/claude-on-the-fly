@@ -22,7 +22,7 @@ from claude_on_the_fly.cron import (
     parse_items,
     request_run_now,
 )
-from claude_on_the_fly.jobs.core import Job
+from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.key_state import KeyStateStore, fingerprint
 
 
@@ -64,11 +64,30 @@ class FakeQueue:
         return 0
 
 
-def daemon(tmp_path: Path, config: Path, queue: FakeQueue | None = None) -> CronDaemon:
+class _RecordingAlertSink:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, Result]] = []
+
+    async def alert(self, origin: dict, result: Result) -> None:
+        self.calls.append((origin, result))
+
+
+class _RaisingAlertSink:
+    async def alert(self, origin: dict, result: Result) -> None:
+        raise RuntimeError("alert down")
+
+
+def daemon(
+    tmp_path: Path,
+    config: Path,
+    queue: FakeQueue | None = None,
+    alert_sink=None,
+) -> CronDaemon:
     return CronDaemon(
         config_path=config,
         queue=queue or FakeQueue(),
         key_state=KeyStateStore(tmp_path / "state"),
+        alert_sink=alert_sink,
     )
 
 
@@ -421,6 +440,27 @@ class TestFire:
         assert queue.jobs == []
         assert "producer exited 3" in caplog.text
 
+    async def test_a_failing_producer_alerts(self, tmp_path: Path) -> None:
+        sink = _RecordingAlertSink()
+        cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
+
+        await cron._fire(_producer_entry(command="exit 3"))
+
+        assert sink.calls == [
+            (
+                {"kind": "cron", "entry": "jira"},
+                Result(ok=False, text="producer exited 3"),
+            )
+        ]
+
+    async def test_a_successful_producer_does_not_alert(self, tmp_path: Path) -> None:
+        sink = _RecordingAlertSink()
+        cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
+
+        await cron._fire(_producer_entry(command="true"))
+
+        assert sink.calls == []
+
     async def test_a_broken_entry_does_not_stop_the_daemon(
         self, tmp_path: Path, caplog
     ) -> None:
@@ -452,6 +492,39 @@ class TestFire:
 
         assert queue.jobs == []
         assert any("exit=0" in block for _, block in written)
+
+    async def test_a_failing_side_effect_alerts(self, tmp_path: Path) -> None:
+        sink = _RecordingAlertSink()
+        cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
+        entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 1", timeout=30)
+
+        await cron._run_side_effect(entry)
+
+        assert sink.calls == [
+            (
+                {"kind": "cron", "entry": "prune"},
+                Result(ok=False, text="command exited 1"),
+            )
+        ]
+
+    async def test_a_successful_side_effect_does_not_alert(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
+        entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 0", timeout=30)
+
+        await cron._run_side_effect(entry)
+
+        assert sink.calls == []
+
+    async def test_a_failed_alert_does_not_take_the_daemon_down(
+        self, tmp_path: Path
+    ) -> None:
+        cron = daemon(tmp_path, cfg(tmp_path), alert_sink=_RaisingAlertSink())
+        entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 1", timeout=30)
+
+        await cron._run_side_effect(entry)  # must not raise
 
 
 class TestReload:

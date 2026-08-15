@@ -428,6 +428,44 @@ class TestCheckJobs:
         assert note.status == "ok"
         assert "$job" in note.detail
 
+    def test_alert_targets_ok_when_none_configured(self):
+        results = check_jobs({"SLACK_TOKEN": "xoxb-123"})
+        row = next(r for r in results if r.name == "alert targets")
+        assert row.status == "ok"
+        assert "none configured" in row.detail
+
+    def test_alert_targets_ok_with_tokens(self):
+        env = {
+            "SLACK_TOKEN": "xoxb-123",
+            "SLACK_ALERT_TARGET": "C42",
+            "TELEGRAM_BOT_TOKEN": "bot-t",
+            "TELEGRAM_ALERT_TARGET": "123",
+        }
+        row = next(r for r in check_jobs(env) if r.name == "alert targets")
+        assert row.status == "ok"
+        assert "configured" in row.detail
+
+    def test_alert_target_without_a_token_warns(self):
+        """The cron producer is the daemon that would silently skip alerts, so
+        the missing token is named. Warned, never blocked."""
+        env = {
+            "SLACK_TOKEN": "xoxb-123",
+            "SLACK_ALERT_TARGET": "C42",
+            "TELEGRAM_ALERT_TARGET": "123",
+        }
+        row = next(r for r in check_jobs(env) if r.name == "alert targets")
+        assert row.status == "warn"
+        assert "TELEGRAM_ALERT_TARGET" in row.detail
+        assert all_ok(check_jobs(env))
+
+        row = next(
+            r
+            for r in check_jobs({"SLACK_ALERT_TARGET": "C42"})
+            if r.name == "alert targets"
+        )
+        assert row.status == "warn"
+        assert "SLACK_ALERT_TARGET" in row.detail
+
     def test_producer_note_does_not_contradict_the_slack_group(self):
         # Both groups render on one doctor screen, so the two rows of this name
         # must agree on severity as well as wording — a "producer on" beside

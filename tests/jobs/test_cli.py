@@ -265,7 +265,7 @@ class TestRunLoopWiring:
         monkeypatch.setattr(
             cli,
             "build_components",
-            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+            lambda *_a: (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
         )
         order: list[str] = []
         ledger.sweep.side_effect = lambda: (order.append("sweep"), 2)[1]
@@ -301,7 +301,7 @@ class TestRunLoopWiring:
         monkeypatch.setattr(
             cli,
             "build_components",
-            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+            lambda *_a: (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
         )
         order: list[str] = []
         seen: dict[str, object] = {}
@@ -342,7 +342,7 @@ class TestRunLoopWiring:
         monkeypatch.setattr(
             cli,
             "build_components",
-            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+            lambda *_a: (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
         )
         monkeypatch.setattr(cli, "sweep_run_workspaces", lambda *_a, **_k: [])
 
@@ -372,7 +372,7 @@ class TestRunLoopWiring:
         monkeypatch.setattr(
             cli,
             "build_components",
-            lambda _t: (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+            lambda *_a: (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
         )
 
         async def boom(*_args, **_kwargs):
@@ -408,9 +408,9 @@ class TestRunLoopWiring:
         monkeypatch.setattr(
             cli,
             "build_components",
-            lambda _t: (
+            lambda *_a: (
                 order.append("build"),
-                (MagicMock(), MagicMock(), MagicMock(), MagicMock()),
+                (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
             )[1],
         )
 

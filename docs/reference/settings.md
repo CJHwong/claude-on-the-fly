@@ -43,6 +43,8 @@ falls back for that section without discarding unrelated sections.
 | `permissions.mode` | Chat daemon | Approval service and backend artifacts are constructed once |
 | `slack.slash_command` | Slack daemon | Registered with Slack at startup |
 | `slack.job_command` | Slack daemon | Trigger and producer queue are constructed together |
+| `slack.alert_target` | Jobs and cron daemons | Alert sinks are constructed at startup |
+| `telegram.alert_target` | Jobs and cron daemons | Alert sinks are constructed at startup |
 | `jobs.queue_kind` | Slack and jobs daemons | Producer and worker must use the same adapter |
 | `jobs.concurrency` | Jobs daemon | Worker pool size is fixed for the run |
 | `jobs.poll_interval_s` | Jobs daemon | Worker loop receives it at startup |

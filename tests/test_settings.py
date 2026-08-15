@@ -528,6 +528,15 @@ def test_worker_construction_settings_are_restart_required():
     } <= set(settings.RESTART_REQUIRED)
 
 
+def test_alert_target_settings_are_restart_required():
+    """The alert sinks are constructed once, at startup, in both the worker and
+    the cron producer — an edit cannot reach a live daemon."""
+    assert {
+        "slack.alert_target",
+        "telegram.alert_target",
+    } <= set(settings.RESTART_REQUIRED)
+
+
 def test_check_reload_ignores_a_field_that_is_re_read(operator_settings):
     """ttl_seconds and the allowlist land on their own. Reporting them would train
     the operator to ignore the notice."""

@@ -107,6 +107,7 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `stats` | string / `summary` | `off`, `summary`, `detailed`; invalid uses summary | Immediate |
 | `slash_command` | string / unset | Bot-token Slack command | Restart required |
 | `job_command` | string / `$job` | Prefix for background work; empty disables | Restart Slack |
+| `alert_target` | string / unset | Slack channel or DM id for cron/job failure alerts; unset disables alerts | Restart jobs and cron |
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
 | `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
 | `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands unread instead of being read on arrival by a sender who is about to leave; `0` posts it immediately | Immediate |
@@ -131,6 +132,7 @@ human Slack ID or your DMs are ignored.
 |---|---|---|---|
 | `allowed_user_id` | integer / required | Sole authorized user and fallback approval DM | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, or `detailed` | Immediate |
+| `alert_target` | integer / unset | Telegram chat id for cron/job failure alerts; unset disables alerts | Restart jobs and cron |
 | `personas` | mapping / empty | Per-chat instructions file, keyed by chat id or `default` | Immediate |
 
 Changing `allowed_user_id` immediately revokes the previous ID for messages and approval

@@ -135,6 +135,99 @@ async def test_run_once_failure_still_completes_and_notifies() -> None:
     assert notifier.calls == [(job.origin, Result(ok=False, text="boom"))]
 
 
+# --- alerts ----------------------------------------------------------------
+
+
+class _RecordingAlertSink:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, Result]] = []
+
+    async def alert(self, origin: dict, result: Result) -> None:
+        self.calls.append((origin, result))
+
+
+class _RaisingAlertSink:
+    async def alert(self, origin: dict, result: Result) -> None:
+        raise RuntimeError("alert down")
+
+
+async def test_run_once_alerts_a_failed_job_after_delivery() -> None:
+    job = _job()
+    q = _FakeQueue([job])
+    runner = _CountingRunner(result=Result(ok=False, text="boom"))
+    notifier = _RecordingNotifier()
+    sink = _RecordingAlertSink()
+
+    did = await run_once(q, runner, notifier, alert_sink=sink)
+
+    assert did is True
+    assert notifier.calls == [(job.origin, Result(ok=False, text="boom"))]
+    assert sink.calls == [(job.origin, Result(ok=False, text="boom"))]
+
+
+async def test_run_once_does_not_alert_a_success() -> None:
+    job = _job()
+    q = _FakeQueue([job])
+    sink = _RecordingAlertSink()
+
+    await run_once(q, _CountingRunner(), _RecordingNotifier(), alert_sink=sink)
+
+    assert sink.calls == []
+
+
+async def test_run_once_without_a_sink_does_not_alert() -> None:
+    job = _job()
+    q = _FakeQueue([job])
+
+    did = await run_once(
+        q, _CountingRunner(result=Result(ok=False, text="boom")), _RecordingNotifier()
+    )
+
+    assert did is True
+
+
+async def test_a_failed_alert_does_not_cost_the_job() -> None:
+    """The alert is a heads-up, not a delivery: a dead alert channel must not
+    fail the job or lose the reply."""
+    job = _job()
+    q = _FakeQueue([job])
+    notifier = _RecordingNotifier()
+
+    did = await run_once(
+        q,
+        _CountingRunner(result=Result(ok=False, text="boom")),
+        notifier,
+        alert_sink=_RaisingAlertSink(),
+    )
+
+    assert did is True
+    assert q.completed == [(job, Result(ok=False, text="boom"))]
+    assert notifier.calls == [(job.origin, Result(ok=False, text="boom"))]
+
+
+async def test_a_cancelled_job_does_not_alert() -> None:
+    """The interrupted notice is not a failure — the job re-runs — so the alert
+    sink must not hear about it."""
+    job = _job()
+    q = _FakeQueue([job])
+    sink = _RecordingAlertSink()
+
+    class _HangingRunner:
+        async def run(self, job: Job) -> Result:
+            await asyncio.sleep(3600)
+            return Result(ok=True, text="never")
+
+    task = asyncio.create_task(
+        run_once(q, _HangingRunner(), _RecordingNotifier(), alert_sink=sink)
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert sink.calls == []
+
+
 # --- run_loop --------------------------------------------------------------
 
 

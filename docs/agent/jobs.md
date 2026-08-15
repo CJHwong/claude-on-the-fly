@@ -13,13 +13,15 @@ reconfigure an already-running worker.
 
 ## Layers
 
-`jobs/core.py` is the clean core — stdlib only, no chat/DB/network/LLM/filesystem client. It holds `Job`, `Result`, and the three ports the worker depends on:
+`jobs/core.py` is the clean core — stdlib only, no chat/DB/network/LLM/filesystem client. It holds `Job`, `Result`, and the five ports the worker depends on:
 
 | Port | Adapter shipped | Where |
 |---|---|---|
 | `JobQueue` | `FileInboxQueue` (maildir) | `jobs/file_queue.py` |
 | `AgentRunner` | `OrchestratorAgentRunner` | `jobs/agent_runner.py` |
 | `Notifier` | `SlackThreadNotifier` | `jobs/slack_notifier.py` |
+| `OutcomeRecorder` | `KeyStateOutcomeRecorder` | `jobs/key_state.py` |
+| `AlertSink` | `build_alert_sink` factory | `jobs/alerts.py` |
 
 `jobs/worker.py` imports nothing but those ports plus `asyncio`/`logging`, so an adapter can be swapped with no change to the loop. `jobs/cli.py` is the composition root: it names `OrchestratorAgentRunner` and `SlackThreadNotifier` directly, and takes the queue from `registry.make_queue()` — `jobs/registry.py` is where `FileInboxQueue` is named.
 
@@ -56,6 +58,8 @@ Two properties everything else rests on:
 That is why `Notifier.notify` **raises** on a failed post rather than swallowing it: returning normally is what marks a result delivered, so an adapter that hides a failure turns a retryable miss into a reply nobody ever receives.
 
 **Outcomes are reported back to the producer.** `OutcomeRecorder` is the fourth port: the worker calls it once per completed job, after the result is durable and before delivery. Only a *producer* needs it — `cron.py` records attempts when it enqueues, and without the matching outcome its backoff reads a `failures` count nothing increments. It shipped broken exactly that way once, with unit tests green because they called the store directly, so the composition test now asserts the daemon's own wiring leaves a failure on record. Implementations must not raise, and the worker guards the call anyway: it sits between a durable result and its delivery, so a bookkeeping bug must not cost the reply.
+
+**Failures are alerted to a monitoring surface.** `AlertSink` is the fifth port: the worker calls it once per completed job, after delivery, only when `result.ok` is False. A cron-origin failure has no live thread — the entry's log is the only record, and nobody is watching it — so the sink posts a compact heads-up to a configured channel or chat. The sink decides whether the origin is alertable; the core never reads `origin`. The factory `build_alert_sink` (`jobs/alerts.py`) reads `slack.alert_target` and `telegram.alert_target` and returns None when neither is set, so alerts are opt-in and an install that never configured one behaves exactly as it did before. The sinks are wrapped in three layers: `CronOriginAlertSink` alerts only cron-origin failures (a Slack-origin job's failure already replies in its thread, where the requester is watching); `MultiAlertSink` fans out to every configured platform, each guarded, and raises only when every sink failed — which is what keeps the cooldown from silencing the next attempt; `CooldownAlertSink` allows one alert per entry per `ALERT_COOLDOWN_S` (30 min), in-memory, because a failing entry fires on its own schedule and would otherwise spam the channel at every fire. The cron producer alerts through the same factory for its own failures — a side-effect command or a producer exiting non-zero — see [cron.md](cron.md). Two paths deliberately never alert: a cancelled job's interrupted notice is not a failure (the job re-runs), and a redelivered result does not re-alert (the alert fired at completion; a worker that crashed between completing and delivering loses it, which the entry's log already records).
 
 A cancelled job's origin is **told**, from `worker.run_once`'s `except CancelledError`. It is a notice, not a delivery: nothing is marked, because there is no result to redeliver — the job itself re-runs. The notice is shielded and bounded by `NOTICE_BUDGET_S`, so the cancellation it reports cannot be delayed past the supervisor's grace, and a notifier that raises is logged rather than allowed to swallow the cancel. "It re-runs at the next start" is invisible from the thread that asked, which is the whole reason this exists.
 

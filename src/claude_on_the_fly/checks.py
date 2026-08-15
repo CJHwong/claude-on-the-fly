@@ -506,7 +506,33 @@ def check_jobs(env: Mapping[str, str]) -> list[CheckResult]:
         _check_jobs_token(env),
         _check_queue_kind(env),
         _slack_job_producer_note(env),
+        _check_alert_targets(env),
     ]
+
+
+def _check_alert_targets(env: Mapping[str, str]) -> CheckResult:
+    """Warn when an alert target is set but its token is missing.
+
+    The worker refuses to start without a Slack token, so its alerts are
+    covered; the cron producer is the one that would silently skip alerts.
+    Advisory: an install that never configured alerts is legitimate.
+    """
+    channel = env.get("SLACK_ALERT_TARGET", "").strip()
+    chat = env.get("TELEGRAM_ALERT_TARGET", "").strip()
+    if not channel and not chat:
+        return CheckResult(name="alert targets", status="ok", detail="none configured")
+    missing = []
+    if channel and not resolve_jobs_token(env)[1]:
+        missing.append("SLACK_ALERT_TARGET needs JOBS_SLACK_TOKEN or SLACK_TOKEN")
+    if chat and not env.get("TELEGRAM_BOT_TOKEN", "").strip():
+        missing.append("TELEGRAM_ALERT_TARGET needs TELEGRAM_BOT_TOKEN")
+    if not missing:
+        return CheckResult(name="alert targets", status="ok", detail="configured")
+    return CheckResult(
+        name="alert targets",
+        status="warn",
+        detail="; ".join(missing),
+    )
 
 
 def _check_queue_kind(env: Mapping[str, str]) -> CheckResult:

@@ -67,7 +67,9 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
         lambda: "claude:native:sonnet",
     )
 
-    queue, runner, notifier, recorder = cli.build_components(token="xoxb-test")
+    queue, runner, notifier, recorder, alert_sink = cli.build_components(
+        token="xoxb-test", env={}
+    )
 
     job = Job(
         id="100-a",
@@ -76,7 +78,7 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
     )
     queue.enqueue(job)
 
-    did = await run_once(queue, runner, notifier, recorder)
+    did = await run_once(queue, runner, notifier, recorder, alert_sink)
     assert did is True
 
     # (a) The notifier posted the reply into the origin channel/thread.
@@ -91,6 +93,54 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
     assert not list((jobs_root / "cur").glob("*.json"))
     assert (jobs_root / "done" / "100-a.json").exists()
     assert (jobs_root / "done" / "100-a.result.json").exists()
+
+
+async def test_real_composition_alerts_a_failed_cron_job(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The daemon's own wiring must include the alert sink: a failed cron job
+    posts a heads-up to the configured alert channel."""
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+    fake_client = _FakeSlackClient()
+    monkeypatch.setattr(
+        "slack_sdk.web.async_client.AsyncWebClient",
+        lambda **kwargs: fake_client,
+    )
+
+    async def _fails(**kwargs: Any) -> Response:
+        raise RuntimeError("agent exploded")
+
+    monkeypatch.setattr(agent, "run", _fails)
+    monkeypatch.setattr(
+        "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+        lambda: "claude:native:sonnet",
+    )
+
+    queue, runner, notifier, recorder, alert_sink = cli.build_components(
+        token="xoxb-test",
+        env={"SLACK_ALERT_TARGET": "C99", "SLACK_TOKEN": "xoxb-test"},
+    )
+    assert alert_sink is not None
+    queue.enqueue(
+        Job(
+            id="100-a",
+            prompt="p",
+            origin={"kind": "cron", "entry": "jira"},
+            key="jira/ACE-1",
+            session_key="jira/ACE-1",
+            platform="cron",
+        )
+    )
+
+    assert await run_once(queue, runner, notifier, recorder, alert_sink) is True
+
+    # The failure reply went to the entry's log (no channel in origin); the
+    # alert went to the configured channel.
+    assert len(fake_client.calls) == 1
+    call = fake_client.calls[0]
+    assert call["channel"] == "C99"
+    assert call["text"] == ":x: cron entry jira failed"
 
 
 async def test_real_composition_records_a_keyed_outcome(
@@ -118,7 +168,9 @@ async def test_real_composition_records_a_keyed_outcome(
         lambda: "claude:native:sonnet",
     )
 
-    queue, runner, notifier, recorder = cli.build_components(token="xoxb-test")
+    queue, runner, notifier, recorder, alert_sink = cli.build_components(
+        token="xoxb-test", env={}
+    )
     queue.enqueue(
         Job(
             id="100-a",
@@ -130,7 +182,7 @@ async def test_real_composition_records_a_keyed_outcome(
         )
     )
 
-    assert await run_once(queue, runner, notifier, recorder) is True
+    assert await run_once(queue, runner, notifier, recorder, alert_sink) is True
 
     from claude_on_the_fly.jobs.key_state import KeyStateStore
 

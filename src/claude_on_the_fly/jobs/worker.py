@@ -20,6 +20,7 @@ import logging
 
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
+    AlertSink,
     Job,
     JobQueue,
     Notifier,
@@ -109,6 +110,7 @@ async def run_once(
     runner: AgentRunner,
     notifier: Notifier,
     recorder: OutcomeRecorder | None = None,
+    alert_sink: AlertSink | None = None,
 ) -> bool:
     """Claim, run, complete, and notify one job. Returns True if a job was
     handled, False if the queue was empty."""
@@ -135,6 +137,14 @@ async def run_once(
         except Exception:
             logger.exception("jobs: could not record the outcome of %s", job.id)
     await _deliver(queue, notifier, job.id, job.origin, result)
+    if not result.ok and alert_sink is not None:
+        # A heads-up, not a delivery: the reply is already out, and a failed
+        # alert must not cost the job's completion. Logged rather than
+        # swallowed, or a dead alert channel would go quiet without a trace.
+        try:
+            await alert_sink.alert(job.origin, result)
+        except Exception:
+            logger.exception("jobs: could not alert the failure of %s", job.id)
     logger.info("jobs: completed %s (ok=%s)", job.id, result.ok)
     return True
 
@@ -147,6 +157,7 @@ async def run_loop(
     poll_interval_s: float,
     concurrency: int = 1,
     recorder: OutcomeRecorder | None = None,
+    alert_sink: AlertSink | None = None,
 ) -> None:
     """Drain the queue until `stop_event` is set, up to `concurrency` jobs at once.
 
@@ -181,7 +192,9 @@ async def run_loop(
         while not stop_event.is_set():
             while len(running) < concurrency:
                 running.add(
-                    asyncio.create_task(run_once(queue, runner, notifier, recorder))
+                    asyncio.create_task(
+                        run_once(queue, runner, notifier, recorder, alert_sink)
+                    )
                 )
 
             await asyncio.wait(

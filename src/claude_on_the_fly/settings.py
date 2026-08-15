@@ -139,12 +139,14 @@ FIELDS: dict[str, Field] = {
     "slack.stats": Field("SLACK_STATS_MODE"),
     "slack.slash_command": Field("SLACK_SLASH_COMMAND"),
     "slack.job_command": Field("SLACK_JOB_COMMAND"),
+    "slack.alert_target": Field("SLACK_ALERT_TARGET"),
     "slack.session_cap": Field("SLACK_SESSION_CAP"),
     "slack.reply_soft_limit": Field("SLACK_REPLY_SOFT_LIMIT"),
     "slack.reply_limit_notice_seconds": Field("SLACK_REPLY_LIMIT_NOTICE_SECONDS"),
     "slack.mention_notice_seconds": Field("SLACK_MENTION_NOTICE_SECONDS"),
     "telegram.allowed_user_id": Field("TELEGRAM_ALLOWED_USER_ID"),
     "telegram.stats": Field("TELEGRAM_STATS_MODE"),
+    "telegram.alert_target": Field("TELEGRAM_ALERT_TARGET"),
     "jobs.queue_kind": Field("JOBS_QUEUE_KIND"),
     "jobs.concurrency": Field("JOBS_CONCURRENCY"),
     "jobs.poll_interval_s": Field("JOBS_POLL_INTERVAL_S"),
@@ -183,6 +185,10 @@ RESTART_REQUIRED = (
     "jobs.timeout",
     # Read once, when the startup sweep runs. An edit lands at the next restart.
     "jobs.workspace_keep_days",
+    # The alert sinks are constructed once, at startup, in both the worker and
+    # the cron producer.
+    "slack.alert_target",
+    "telegram.alert_target",
 )
 
 

@@ -108,6 +108,14 @@ A key whose job fails backs off exponentially (10s, 20s, 40s… capped at 5min)
 instead of retrying every poll. A success clears the streak, and an item that
 *changes* skips the wait — new information should not sit behind a backoff.
 
+Failures also alert to a monitoring surface when one is configured: set
+`slack.alert_target` (a Slack channel or DM id) or `telegram.alert_target` (a
+Telegram chat id) in `config.yaml`, and a failed agent run, a side-effect
+command that exits non-zero, or a producer that exits non-zero posts a compact
+heads-up there — at most one per entry per 30 minutes. Unset, failures stay
+in the entry's log as they always did. Both settings need a restart of
+`claude-jobs` and `claude-cron`.
+
 ## Checking your config
 
 ```bash

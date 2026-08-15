@@ -47,7 +47,7 @@ from liquid.exceptions import LiquidError, LiquidSyntaxError
 
 from claude_on_the_fly import logs
 from claude_on_the_fly.agent import DATA_DIR
-from claude_on_the_fly.jobs.core import Job, JobQueue
+from claude_on_the_fly.jobs.core import AlertSink, Job, JobQueue, Result
 from claude_on_the_fly.jobs.key_state import (
     DEFAULT_MAX_FIRES,
     KeyStateStore,
@@ -625,10 +625,17 @@ def request_run_now(entry_name: str) -> None:
 class CronDaemon:
     """Fires due entries and enqueues the work they produce."""
 
-    def __init__(self, config_path: Path, queue: JobQueue, key_state: KeyStateStore):
+    def __init__(
+        self,
+        config_path: Path,
+        queue: JobQueue,
+        key_state: KeyStateStore,
+        alert_sink: AlertSink | None = None,
+    ):
         self._config_path = config_path
         self._queue = queue
         self._key_state = key_state
+        self._alert_sink = alert_sink
         self._state: dict[str, EntryState] = {}
         self._mtime = 0.0
         self._stop = asyncio.Event()
@@ -842,6 +849,7 @@ class CronDaemon:
                 rc,
                 f": {stdout.strip()[:400]}" if stdout.strip() else "",
             )
+            await self._alert_failure(entry, f"producer exited {rc}")
             return
         items = parse_items(stdout, entry.name)
         if not items:
@@ -966,6 +974,24 @@ class CronDaemon:
         append_log(
             entry.name, f"=== done exit={rc} duration={elapsed:.1f}s{note} ===\n"
         )
+        if rc != 0:
+            await self._alert_failure(entry, f"command exited {rc}{note}")
+
+    async def _alert_failure(self, entry: CronEntry, text: str) -> None:
+        """Tell the alert channel(s) that this entry's run failed.
+
+        Guarded: an alert is a heads-up, not a delivery, and a dead alert
+        channel must not take the daemon down. The entry's log already has
+        the full story either way.
+        """
+        if self._alert_sink is None:
+            return
+        try:
+            await self._alert_sink.alert(
+                {"kind": "cron", "entry": entry.name}, Result(ok=False, text=text)
+            )
+        except Exception:
+            logger.exception("cron %s: could not alert its failure", entry.name)
 
     async def _run_command(
         self, command: str, *, timeout: float, capture: bool
@@ -1070,11 +1096,15 @@ def main() -> int:
     # cannot reach it, while the worker that *does* cross the jail already
     # refuses to drain what cron queued. Move this line in the moment cron
     # spawns an agent itself.
+    from claude_on_the_fly import settings
+    from claude_on_the_fly.jobs.alerts import build_alert_sink
+
     queue = make_queue()
     daemon = CronDaemon(
         config_path=config,
         queue=queue,
         key_state=KeyStateStore(DATA_DIR / "jobs"),
+        alert_sink=build_alert_sink(settings.environment()),
     )
 
     async def _run() -> None:

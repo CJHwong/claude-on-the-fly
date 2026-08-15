@@ -87,6 +87,16 @@ Producer stdout is capped (`MAX_PRODUCER_BYTES`) so a command that accidentally
 streams a log file cannot exhaust memory, and its stderr is logged rather than
 swallowed.
 
+## Failures alert to the configured channel
+
+A side-effect command or a producer that exits non-zero is logged, and — when
+`slack.alert_target` or `telegram.alert_target` is set — also posted to that
+monitoring surface through the same `build_alert_sink` factory the worker
+uses, so one platform sender is written once and shared. The alert is a
+heads-up, not a delivery: it is guarded, and the entry's log has the full
+story either way. Agent-run job failures alert from the worker instead; see
+[jobs.md](jobs.md).
+
 ## Timeouts
 
 Two different limits, both spelled `timeout` in different places:

@@ -22,6 +22,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Mapping
 from typing import cast
 from uuid import uuid4
 
@@ -33,8 +34,10 @@ from claude_on_the_fly.jobs.agent_runner import (
     OrchestratorAgentRunner,
     sweep_run_workspaces,
 )
+from claude_on_the_fly.jobs.alerts import build_alert_sink
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
+    AlertSink,
     Job,
     JobQueue,
     Notifier,
@@ -138,9 +141,9 @@ def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
 
 
 def build_components(
-    token: str,
-) -> tuple[JobQueue, AgentRunner, Notifier, OutcomeRecorder]:
-    """Wire the worker's three adapters from config — the single construction
+    token: str, env: Mapping[str, str]
+) -> tuple[JobQueue, AgentRunner, Notifier, OutcomeRecorder, AlertSink | None]:
+    """Wire the worker's adapters from config — the single construction
     point the daemon uses.
 
     Extracted from `_run` so a composition test can drive the SAME wiring the
@@ -148,7 +151,8 @@ def build_components(
     what would catch a mis-constructed notifier or a token that never reaches
     the client. Returns the ports, not the concretes, so this stays the one
     place that names the runner and the notifier; the queue concrete is named
-    in `registry.py`, behind `make_queue()`.
+    in `registry.py`, behind `make_queue()`. `env` is the resolved settings
+    mapping the alert sink reads its targets from.
     """
     from slack_sdk.web.async_client import AsyncWebClient
 
@@ -167,7 +171,10 @@ def build_components(
     # Closes the producer's feedback loop: cron records attempts when it
     # enqueues, this records how they turned out, and its backoff reads both.
     recorder = KeyStateOutcomeRecorder(KeyStateStore(agent.DATA_DIR / "jobs"))
-    return queue, runner, notifier, recorder
+    # Failure alerts: None when no target is configured, so an install that
+    # never set one behaves exactly as it did before.
+    alert_sink = build_alert_sink(env)
+    return queue, runner, notifier, recorder, alert_sink
 
 
 def _running_jobs(runner: OrchestratorAgentRunner) -> dict:
@@ -214,7 +221,9 @@ async def _run(token: str) -> None:
     # opposite choice is silent and irreversible: the reads have happened.
     await sandbox.verify_boundary()
 
-    queue, runner, notifier, recorder = build_components(token)
+    queue, runner, notifier, recorder, alert_sink = build_components(
+        token, settings.environment()
+    )
 
     # Reap what a previous worker orphaned, before anything claims work:
     # run_loop's first act is recover_stale, and re-running a job whose earlier
@@ -264,6 +273,7 @@ async def _run(token: str) -> None:
             _poll_interval_s(),
             concurrency=concurrency,
             recorder=recorder,
+            alert_sink=alert_sink,
         )
     finally:
         agent.remove_process_listener(ledger.on_process)

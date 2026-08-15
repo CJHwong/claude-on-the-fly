@@ -227,3 +227,17 @@ class Notifier(Protocol):
     """
 
     async def notify(self, origin: dict[str, Any], result: Result) -> None: ...
+
+
+@runtime_checkable
+class AlertSink(Protocol):
+    """Delivery port for failure alerts — posts a failed job's outcome to a
+    monitoring surface (a channel, a chat), not to its origin.
+
+    Called only on `not result.ok`, after the result is durable and delivered.
+    The sink decides whether this origin is alertable; the core never reads
+    origin. Implementations must not raise: an alert that fails must not cost
+    the reply it follows, and the worker guards the call anyway.
+    """
+
+    async def alert(self, origin: dict[str, Any], result: Result) -> None: ...

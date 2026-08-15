@@ -314,8 +314,7 @@ slack:
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
   # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
 
-  # Reply footer: off | summary | detailed
-  # stats: summary
+  # Reply footer and stats: off | summary | detailed
 
   # Slash command to register. Must match the app manifest; needs a restart.
   # slash_command: /cotf
@@ -323,19 +322,19 @@ slack:
   # Background-job trigger. Absent means $job; set it empty ("") to turn jobs off.
   # Trigger and queue are constructed at Slack startup, so changing it needs a restart.
   # job_command: "$job"
+  # Failure-alert target: a Slack channel or DM id. Unset = no alerts. Needs a restart.
+  # alert_target: C0123456789
 
-  # Threads retained before LRU eviction, replies per thread before the $continue gate,
-  # seconds that gate notice is held so it lands after the sender left (0 posts it now),
-  # and seconds an untagged channel message waits for a "tag me" notice (0 = never).
+  # Threads retained before LRU eviction, replies per thread before the $continue gate;
+  # seconds a gate notice is held (0 posts now), seconds a "tag me" notice waits (0 = never).
   # session_cap: 1000
   # reply_soft_limit: 10
   # reply_limit_notice_seconds: 0
   # mention_notice_seconds: 0
 
-  # Per-chat persona: a file, relative to the data root, that REPLACES the
-  # data-root CLAUDE.md for one chat. Key it by channel id (survives renames; the
-  # C... in any Slack link), channel name, a U... sender id, or `dm`. `default`
-  # catches every chat the others do not name. Read per message.
+  # Per-chat persona: a file, relative to the data root, that REPLACES the data-root
+  # CLAUDE.md for one chat. Key by channel id (survives renames; the C... in any Slack
+  # link), channel name, a U... sender id, `dm`, or `default`. Read per message.
   # Key order and failure handling: docs/reference/persona.md
   # personas:
   #   C07ABCDEF: personas/oncall.md    # #ops-alerts
@@ -346,6 +345,12 @@ telegram:
   # One bot, one operator. There is no list.
   # allowed_user_id: 123456789
   # stats: summary
+
+  # Failure-alert target for cron/job failures: a Telegram chat id (a DM chat
+  # id equals the user id). Unset means no alerts. The worker and the cron
+  # producer build their alert sinks at startup, so changing it needs a
+  # restart.
+  # alert_target: 123456789
 
   # Per-chat persona, keyed by chat id, plus `default`. docs/reference/persona.md
   # personas:
