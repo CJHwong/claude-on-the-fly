@@ -20,6 +20,7 @@ rule or function name is the durable part.
 | 2026-08-01 | Whole repo, external scanner | `2c03555` | 32, all remediated in `28b7ece`..`744d3b6` |
 | 2026-08-14 | Sandbox, brokers, frontends, state | `9f96b3f` | 39 after dedupe |
 | 2026-08-14 | `upgrade.py`, `turns.py`, new surface | `8390b33` | 6 |
+| 2026-08-15 | PR #29 tree, `/code-review` run plus verification | `0c7cd4c` + working tree | 3 fixed, 2 open |
 
 The August 1 scan predated the Linux jail, `netns_relay`, the session boundary, and the
 upgrade path, so none of that was covered by it.
@@ -43,6 +44,9 @@ upgrade path, so none of that was covered by it.
 | The replay cap and the TTL were evadable by a tampered journal: a negative `replays` needed ~10^18 restarts to reach the cap, a NaN `recorded_at` made every TTL comparison False, and `chat_id: true` passed the `int` check and became chat_id 1 | `turns.PendingTurn.from_dict`, `turns._as_float` | Clamped at the one boundary where a disk record becomes an object, so both gates in `take()` are sound without touching them. Bad entries are dropped, which is what `_read` already does with a `None`. A boolean chat id, a NaN and an Infinity `recorded_at`, and a `replays` of -10^18 all fail without the change |
 | A thread could permanently defeat its own operator guardrails: it replaced a shared-entry link inside its writable `CODEX_HOME` with a directory, `unlink()` raised `IsADirectoryError`, and the suppressed `OSError` meant `hooks.json`, `AGENTS.md` and `config.toml` never came back for that thread | `codex_state._clear_link_site` | The link site is cleared through one helper that removes a planted directory, bounded to `HOMES_DIR` and never descending a symlink; every link failure now logs. A test plants the directory and asserts the operator's `hooks.json` is back on the next `ensure_home`, and fails without the change |
 | Thread ids were spliced into glob patterns unescaped, so `*` matched every rollout in the tree: `adopt_rollout` copied another thread's into this workspace's `CODEX_HOME`, and `_find_codex_rollout` returned an unrelated conversation for the next prompt's handoff context | `codex_state.rollout_glob`, `codex_state._valid_thread_id` | Both sites now share one `glob.escape`d pattern, and the id charset is checked on the read side and the write side. 10 adversarial cases (`*`, `?`, `[a-c]*`, `../elsewhere`, whitespace) fail without the change. Charset derived from 14 real mappings on a deployed data dir, all 36 characters of lowercase hex and hyphen. Never reachable: the id comes only from codex's `--json` control event, so this is defence in depth |
+| The NaN/Infinity clamp on `recorded_at` missed the huge-integer shape: a raw integer literal past ~1.8e308 is valid JSON, passes the `isinstance(int)` check, and `float()` raises `OverflowError` on it, which propagated through `take()` and crashed the daemon at startup | `turns._as_float` | Reproduced live with a 400-digit `recorded_at` (`CRASH: OverflowError int too large to convert to float`), then caught: `OverflowError` returns `None` and the entry is dropped the way a NaN is. `from_dict` is now total, so the journal read path cannot raise. `test_a_recorded_at_too_large_for_a_float_is_dropped` fails without the change |
+| `sandbox.extra_paths` could re-open a *file*-level credential deny: the docstring claimed the home rule covered them, but an entry naming `~/.netrc` itself is neither the home nor an ancestor nor inside a listed store, so it was granted and re-opened exactly one denied file | `sandbox._CREDENTIAL_FILES`, `sandbox._extra_path_refusal` | 21 file-level paths mirrored 1:1 from the profile's literal denies, checked bidirectionally like the stores. `~/.netrc`, `~/.cargo`, `~/.config/hub` refused while `/opt/homebrew`, `/usr/local`, `/tmp` still granted. `test_every_file_level_credential_is_out_of_reach_of_extra_paths` walks the list and fails without the change |
+| The Linux jail left `~/.codex/prompts` and `~/.codex/auth.json` writable: `_CODEX_PROTECTED` omitted them, so a turn could plant standing instructions codex reads on every run, or swap the operator's OAuth token | `sandbox._CODEX_PROTECTED` | `prompts` and `auth.json` added to the write-deny list, `prompts` to the dirs. `skills` deliberately not added: codex writes its own tree inside it (measured: 242 touches and a `skills/.system/` tree per turn), so a read-only mount there breaks codex. `test_linux_write_denies_cover_codex_prompts_and_auth` fails without the change |
 
 ## Open
 
@@ -168,6 +172,20 @@ timestamp at all. Left as it is: 0 is the dataclass default and the documented
 "not recorded" case, `test_a_turn_with_no_timestamp_is_not_treated_as_expired` asserts it,
 and the replay cap still bounds such an entry. Closing it means deciding that a record
 without an age is a record to drop, which is a behaviour change rather than a clamp.
+
+**A planted symlink at a conversation's own workspace path makes the next turn
+crash.** `workspace_path` raises `ValueError` when `resolve()` follows the link out of
+the tree (its own regression test asserts this), and `orchestrator._process` has no
+catch: the turn was already `mark_dispatched`, so the message is lost and the chat's
+drain task dies. Self-DoS only -- the agent can only break its own workspace -- and
+catching it would change the intended fail-loud behaviour, so it is left open pending
+a decision on what a compromised workspace should do to a turn.
+
+**The TUI watch pane builds its path from the raw workspace name.** The display is
+sanitized (`session_format._safe`), but `DATA_DIR / "workspaces" / label` uses the raw
+label, so a name containing `..` makes the pane resolve a session log from outside the
+tree and render it on the operator's screen. Display-only, on the operator's own
+machine, and the label is daemon-internal state; left open.
 
 ### Approvals
 

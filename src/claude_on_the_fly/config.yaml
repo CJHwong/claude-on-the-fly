@@ -242,7 +242,7 @@ sandbox:
   # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3.
   # Name a directory, not $HOME: a grant is written after the profile's denies and
   # wins over them. An entry that is the home, an ancestor of it, or a path reaching
-  # a credential store is logged at ERROR and dropped.
+  # a credential store or file the profile denies is logged at ERROR and dropped.
   # fs: deny-most
   # extra_paths:
   #   - /opt/homebrew

@@ -58,13 +58,7 @@ through, all four verified against the guard. It runs *after* the cwd is settled
 resolves each candidate against it, which is the only reading that catches
 `link/etc/passwd` where `link` is a symlink the turn planted in its own workspace.
 Resolving rather than refusing symlink components is forced: the workspace itself is
-reached through `/var` -> `/private/var` on macOS, so every argument in it has one. Tool entries merge by name; removed
-packaged refusals are warned. An operator override without `allow` therefore disables
-that tool until its safe subcommands are listed.
-
-The broker does not parse arbitrary CLI semantics after an allowed prefix. Generic API
-subcommands remain unavailable unless explicitly listed, and provider-side credential
-scope is still required because argv inspection cannot safely model every future flag.
+reached through `/var` -> `/private/var` on macOS, so every argument in it has one.
 
 ## Tool approvals
 
@@ -192,10 +186,14 @@ override, because the jobs and cron daemons never open a session.
 `sandbox.extra_paths` is the one value an operator adds that can hand a read back, and
 `_JAIL_GUIDANCE` tells the agent to ask for exactly that whenever a read is blocked. Each
 entry is realpath'd and then refused if it is the home directory, an ancestor of it, or a
-path that reaches a credential store in either direction (`sandbox._CREDENTIAL_STORES`,
-plus DATA_DIR, which COTF_DATA_DIR can point anywhere). `tests/test_sandbox.py` asserts
-every `_DENY_PROBES` entry sits behind one of those rules, so a credential added to the
-probe list cannot be left grantable here.
+path that reaches a credential store or a file-level credential deny in either direction
+(`sandbox._CREDENTIAL_STORES` and `sandbox._CREDENTIAL_FILES`, plus DATA_DIR, which
+COTF_DATA_DIR can point anywhere). An entry can name a file as easily as a directory:
+`~/.netrc` is neither the home nor an ancestor of it, so the file list exists because the
+home rule alone would not stop an entry that re-opens exactly one denied file.
+`tests/test_sandbox.py` asserts every `_DENY_PROBES` entry and every `_CREDENTIAL_FILES`
+entry sits behind one of those rules, so a credential added to either list cannot be left
+grantable here.
 
 Entries are refused individually and the rest are still granted, unlike `sandbox.mode`,
 which refuses to start. The two fail in opposite directions: a bad mode value serves
