@@ -149,6 +149,22 @@ async def test_cooldown_suppresses_repeats_within_the_window() -> None:
     assert len(inner.calls) == 1
 
 
+async def test_cooldown_first_alert_fires_on_a_young_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh sink must alert even when the machine has been up less than
+    the window. `now - 0.0 < window` would swallow the FIRST alert on a
+    young host (a fresh CI VM) because a never-alerted entry must not
+    compare as an ancient timestamp."""
+    monkeypatch.setattr("claude_on_the_fly.jobs.alerts.time.monotonic", lambda: 120.0)
+    inner = _RecordingSink()
+    sink = CooldownAlertSink(inner, window_s=1800.0)
+
+    await sink.alert(_origin(), _result("boom"))
+
+    assert len(inner.calls) == 1
+
+
 async def test_cooldown_is_per_entry() -> None:
     inner = _RecordingSink()
     sink = CooldownAlertSink(inner, window_s=60.0)
