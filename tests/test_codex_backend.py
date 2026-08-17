@@ -454,6 +454,7 @@ class TestRunCodexExec:
 def _success_result(
     thread_id: str | None = "thread-1",
     body: str = "hello",
+    last_assistant_text: str = "",
     input_tokens: int = 100,
     cached: int = 20,
     cache_write: int = 0,
@@ -464,6 +465,7 @@ def _success_result(
     return {
         "thread_id": thread_id,
         "body": body,
+        "last_assistant_text": last_assistant_text,
         "usage": {
             "input_tokens": input_tokens,
             "cached_input_tokens": cached,
@@ -1147,6 +1149,38 @@ class TestCodexBackendNudgeRetry:
         assert mock.await_count == 1
         # Handed on verbatim; the orchestrator owns the placeholder.
         assert resp.body == '<suggestions>["x?"]</suggestions>'
+
+    async def test_a_block_only_body_falls_back_to_the_last_real_text(
+        self,
+        tmp_path: Path,
+    ):
+        """A turn that ends with only a <suggestions> block did say something
+        earlier: the block is the protocol token, not a reply. The last real
+        text replaces it so the user sees the answer instead of the
+        orchestrator's placeholder — still without a second billed turn."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        only_block = _success_result(
+            thread_id="t1",
+            body='<suggestions>["x?"]</suggestions>',
+            last_assistant_text="the real summary",
+        )
+
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            side_effect=[only_block],
+        ) as mock:
+            resp = await CodexBackend().run(
+                workspace,
+                "sess-x",
+                "hi",
+                "telegram",
+                nudge_prompt="nudge with template",
+            )
+
+        assert mock.await_count == 1
+        assert resp.body == "the real summary"
 
     async def test_retry_accumulates_tokens_and_tools(self, tmp_path: Path):
         workspace = tmp_path / "ws"

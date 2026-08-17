@@ -74,10 +74,12 @@ SUGGESTIONS_TEMPLATE = (
     "<cotf-suggest>\n"
     "System instruction, not user text. Answer the user first, then end with a "
     "JSON array of 3 short follow-up options in "
-    '<suggestions>["one", "two"]</suggestions>, nothing after. A tapped option '
-    "is sent back verbatim as the user's next message, so each option must be a "
-    'step you can execute with no further input ("Audit the release posts") or '
-    'a question you can answer by doing work ("What is it doing now?"). Offer '
+    '<suggestions>["one", "two"]</suggestions>, nothing after. The block is '
+    "the END of your reply, never the whole reply: always write the answer "
+    "text before it, even if the answer is brief. A tapped option is sent "
+    "back verbatim as the user's next message, so each option must be a step "
+    'you can execute with no further input ("Audit the release posts") or a '
+    'question you can answer by doing work ("What is it doing now?"). Offer '
     "options only at a real decision fork; otherwise emit "
     "<suggestions>[]</suggestions>.\n"
     "</cotf-suggest>"

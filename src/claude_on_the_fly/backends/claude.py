@@ -25,6 +25,7 @@ from claude_on_the_fly.agent import (
     OllamaLauncher,
     Response,
     build_system_prompt,
+    strip_suggestions_blocks,
 )
 from claude_on_the_fly.transcript import (
     _workspace_to_claude_hash,
@@ -388,6 +389,16 @@ class ClaudeBackend:
         cli_output = await executor(workspace, argv, timeout=timeout)
 
         body = (cli_output.get("result") or "").strip()
+        if body and not strip_suggestions_blocks(body).strip():
+            # The turn ended with only a <suggestions> block: the protocol
+            # token the prompt asked for, not a reply. The agent did say
+            # something earlier in the turn, so use the last real text it
+            # produced instead of the orchestrator's placeholder. This is
+            # still NOT the empty case below — the block is evidence the
+            # turn ran to completion, so it is still not nudged.
+            last_text = (cli_output.get("last_assistant_text") or "").strip()
+            if last_text:
+                body = last_text
         if not body and (cli_output.get("compact") or {}).get("result"):
             # A compaction reports `subtype: "success"` with an empty `result`,
             # which is byte-identical to a turn that died producing nothing. The

@@ -683,6 +683,7 @@ def _fold(
     skill_counts: dict[str, int],
     compact: dict | None = None,
     last_usage: dict | None = None,
+    last_text: dict | None = None,
 ) -> dict | None:
     """Apply one parsed stream-json message to running tallies.
 
@@ -696,6 +697,13 @@ def _fold(
     call in the turn, which overstates how full the context is the moment the
     turn ends (see `_native_context_fields`); the last assistant message is
     the reading that reflects the context a compaction would actually see.
+
+    When last_text is given, it is replaced with each assistant message's
+    text — but only when that text is real content, not a lone
+    `<suggestions>` block. The final message of a turn is often just the
+    block the prompt asked for, and a backend that needs the last thing the
+    agent actually said (a block-only reply is a completed turn that chose
+    not to restate its answer) can read it back off the result line.
     """
     msg_type = msg.get("type")
     if msg_type == "assistant":
@@ -703,6 +711,14 @@ def _fold(
             usage = msg.get("message", {}).get("usage") or {}
             last_usage.clear()
             last_usage.update(usage)
+        if last_text is not None:
+            text = "".join(
+                block.get("text") or ""
+                for block in msg.get("message", {}).get("content", [])
+                if block.get("type") == "text"
+            ).strip()
+            if text and strip_suggestions_blocks(text).strip():
+                last_text["text"] = text
         for block in msg.get("message", {}).get("content", []):
             if block.get("type") != "tool_use":
                 continue
@@ -745,6 +761,7 @@ def parse_stream(stdout: bytes) -> dict:
     skill_counts: dict[str, int] = {}
     compact: dict = {}
     last_usage: dict = {}
+    last_text: dict = {}
     result: dict = {}
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -755,13 +772,14 @@ def parse_stream(stdout: bytes) -> dict:
         except json.JSONDecodeError:
             logger.warning("parse_stream: skipping malformed line: %s", line[:120])
             continue
-        r = _fold(msg, tool_counts, skill_counts, compact, last_usage)
+        r = _fold(msg, tool_counts, skill_counts, compact, last_usage, last_text)
         if r is not None:
             result = r
     if result:
         result["tool_counts"] = tool_counts
         result["skill_counts"] = skill_counts
         result["compact"] = compact
+        result["last_assistant_text"] = last_text.get("text", "")
     return result
 
 
@@ -928,6 +946,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     skill_counts: dict[str, int] = {}
     compact: dict = {}
     last_usage: dict = {}
+    last_text: dict = {}
     result: dict = {}
     line_count = 0
     stdout_bytes = 0
@@ -950,7 +969,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
             except json.JSONDecodeError:
                 logger.warning("exec: skipping malformed line: %s", line[:120])
                 continue
-            r = _fold(msg, tool_counts, skill_counts, compact, last_usage)
+            r = _fold(msg, tool_counts, skill_counts, compact, last_usage, last_text)
             if relay is not None:
                 try:
                     relay.feed(msg)
@@ -987,6 +1006,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
         result["tool_counts"] = tool_counts
         result["skill_counts"] = skill_counts
         result["compact"] = compact
+        result["last_assistant_text"] = last_text.get("text", "")
 
     if proc.returncode != 0:
         err_stderr = stderr_bytes.decode().strip()
@@ -1199,6 +1219,12 @@ def _merge_cli_output(first: dict, second: dict) -> dict:
     # already keeps the retry's reading, which resumes the session and so is
     # more current than anything the first run produced. Summing the two would
     # over-read the context exactly like the top-level `usage` does.
+    # `last_assistant_text` follows the same rule, but a retry that produced no
+    # real text must not erase the first run's — the fallback is better than
+    # nothing, and the retry's own body is what the merged result posts anyway.
+    merged["last_assistant_text"] = second.get("last_assistant_text") or first.get(
+        "last_assistant_text"
+    )
     return merged
 
 

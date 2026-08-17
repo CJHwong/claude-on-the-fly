@@ -28,6 +28,7 @@ from claude_on_the_fly.agent import (
     OllamaLauncher,
     Response,
     build_system_prompt,
+    strip_suggestions_blocks,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,6 +280,7 @@ def parse_codex_stream(stdout: bytes) -> dict:
     """
     thread_id: str | None = None
     body = ""
+    last_assistant_text = ""
     usage: dict = {}
     error: str | None = None
     completed = False
@@ -302,6 +304,12 @@ def parse_codex_stream(stdout: bytes) -> dict:
                 text = item.get("text") or ""
                 if text:
                     body = text
+                    # The last agent_message is the reply, but a lone
+                    # <suggestions> block is the protocol token, not content.
+                    # Keep the last real text so a block-only reply can fall
+                    # back to what the agent actually said.
+                    if strip_suggestions_blocks(text).strip():
+                        last_assistant_text = text
             elif item_type and item_type not in _NON_TOOL_ITEMS:
                 tool_counts[item_type] = tool_counts.get(item_type, 0) + 1
         elif kind == "turn.completed":
@@ -313,6 +321,7 @@ def parse_codex_stream(stdout: bytes) -> dict:
     return {
         "thread_id": thread_id,
         "body": body,
+        "last_assistant_text": last_assistant_text,
         "usage": usage,
         "error": error,
         "completed": completed,
@@ -580,6 +589,16 @@ class CodexBackend:
             )
 
         body = (result.get("body") or "").strip()
+        if body and not strip_suggestions_blocks(body).strip():
+            # The turn ended with only a <suggestions> block: the protocol
+            # token the prompt asked for, not a reply. The agent did say
+            # something earlier in the turn, so use the last real text it
+            # produced instead of the orchestrator's placeholder. This is
+            # still NOT the empty case below — the block is evidence the
+            # turn ran to completion, so it is still not nudged.
+            last_text = (result.get("last_assistant_text") or "").strip()
+            if last_text:
+                body = last_text
         if not body:
             # Nothing at all came back: a plausible dead turn, worth one retry.
             #
