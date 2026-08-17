@@ -2,6 +2,10 @@ default_stages:
 - commit
 - push
 fail_fast: false
+# `prek install` (or `pre-commit install`) installs only the pre-commit hook type
+# by default, which would leave the commit-msg guard below installed-but-never-run
+# — a guard that cannot fire looks identical to a guard that passes.
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -24,6 +28,47 @@ repos:
     hooks:
     -   id: gitleaks
         entry: gitleaks detect --verbose --redact
+# Conventional Commits at the commit-msg stage, via commitlint itself rather
+# than a re-implementation of it. Shared upstream hook plus a config file, so
+# another repo adopts this by copying these five lines and .commitlintrc.yaml
+# — a bespoke checker would have to be copied as code, and copies drift.
+#
+# config-conventional is what "commitlint" means to everyone else: it also
+# enforces subject-case, subject-full-stop and header-max-length, which the
+# lighter Python re-implementations leave out. Its defaultIgnores already
+# exempt the subjects git generates — merge, revert, fixup! and squash! —
+# so no exemption list is maintained here.
+#
+# Pinned to a commit, not the v9.26.0 tag: a tag is mutable and this hook runs
+# on every `git commit` on a contributor's machine, with their ambient
+# credentials, rather than on a disposable runner. Same trust boundary the
+# SHA-pinned actions in .github/workflows/ sit behind.
+-   repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
+    rev: 25d0a52aa8bc0fc242613346792dc8d726c13347  # v9.26.0
+    hooks:
+    -   id: commitlint
+        stages: [commit-msg]
+        # The node language uses the developer's own node when one is on PATH,
+        # so an unpinned hook builds against whatever that happens to be.
+        # @commitlint/cli@21 declares engines node >= 22.12.0, and CI runs the
+        # same version pinned in .github/workflows/commit-checks.yml.
+        language_version: '22.20.0'
+        # Both packages pinned. additional_dependencies floats otherwise, and
+        # the upstream hook's own package.json declares `@commitlint/cli` as a
+        # caret range, so an unpinned CLI resolves to whatever 21.x was newest
+        # when a given contributor first built the hook environment.
+        #
+        # The CLI pin here does take effect, which is worth stating because it
+        # is not obvious: pinning @commitlint/cli@21.1.0 while the hook's nested
+        # copy sat at 21.2.2 produced `commitlint --version` 21.1.0, because the
+        # entry point on PATH symlinks to the top-level copy this list installs.
+        # Pinning both is what makes "cannot pass locally and fail in CI" true.
+        #
+        # Bump these by hand, together with the versions in
+        # .github/workflows/commit-checks.yml, which must match exactly.
+        additional_dependencies:
+        -   '@commitlint/cli@21.2.2'
+        -   '@commitlint/config-conventional@21.2.2'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.0
     hooks:

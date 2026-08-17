@@ -30,3 +30,7 @@ src/claude_on_the_fly/_version.py
 # Scratch git worktrees. Scoped to worktrees/ rather than all of .claude/ so
 # project-level agent config stays committable if it ever lands there.
 .claude/worktrees/
+
+# Installed by the commit-message checks in CI. This is not a Node project; the
+# directory is CI tooling only, and is never committed.
+node_modules/

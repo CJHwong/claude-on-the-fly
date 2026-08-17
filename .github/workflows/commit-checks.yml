@@ -1,0 +1,150 @@
+# Checks the commit history a pull request proposes to merge, and the subject
+# that actually lands.
+#
+# A standalone workflow rather than a job on ci.yml: this one needs the
+# `edited` trigger so a retitle re-runs the title check, and ci.yml's lint and
+# test jobs are expensive enough that re-running them on every retitle is not
+# worth it.
+name: commit checks
+
+on:
+  pull_request:
+    # `edited` is on top of the default set so that retitling a pull request
+    # re-runs the title check below. Without it a contributor can fix a rejected
+    # title and the failing run stays failing until the next push.
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-checks:
+    name: commit history is mergeable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # Every check below reads a commit range, so the base commit has to be
+          # in the checkout. The default depth of 1 has neither end of the range.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Exact patch, matching the commitlint hook's language_version in
+          # .pre-commit-config.yaml. A floating '22' would let the runner's node
+          # drift away from the one a contributor's hook is built against.
+          node-version: '22.20.0'
+
+      # Installed from pinned direct packages rather than a committed
+      # package-lock.json. A lockfile would fix the transitive tree too, but it
+      # needs a package.json beside it, and this is a Python project — a Node
+      # manifest at its root is read by tooling that infers a project's language
+      # from one, and nothing here ships or is imported. The two packages that
+      # decide a verdict are the parser and the ruleset, and both are pinned.
+      #
+      # --ignore-scripts: with no lockfile the transitive tree resolves fresh on
+      # every run, on a shared runner. commitlint needs no install script to run.
+      - name: Install commitlint
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts --no-audit --no-fund \
+            @commitlint/cli@21.2.2 @commitlint/config-conventional@21.2.2
+
+      # Three checks in one job so a contributor fixing commit history sees
+      # every problem in one pass rather than one per push. They are separate
+      # steps, not one command: the fixes differ (reword vs retitle vs
+      # autosquash) and merging them into a single pass/fail would hide which
+      # one failed. Subjects are linted first because a reword is the cheaper
+      # fix and often removes the reason to look further.
+      #
+      # The commitlint hook in .pre-commit-config.yaml covers the same subjects
+      # locally, but only where someone ran `prek install`. This job is
+      # what makes the rule hold for everyone.
+      #
+      # ./node_modules/.bin/commitlint, not npx: npx falls back to fetching a
+      # package when the local one is missing, which would turn a broken install
+      # step into a silent unpinned download. `commitlint` is also a separately
+      # owned npm name, distinct from `@commitlint/cli`.
+      - name: Subjects are Conventional Commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # commitlint's own --from/--to is the documented way to lint a range,
+          # and it reads the same .commitlintrc.yaml as the hook, so the two
+          # cannot drift. The hook's --commit-msg-filename cannot be reused: it
+          # invokes commitlint with --edit, which reads .git/COMMIT_EDITMSG and
+          # ignores the file handed to it, so a per-commit loop would silently
+          # lint the wrong message.
+          #
+          # base.sha is the base branch tip, not necessarily an ancestor of the
+          # head: if the base moved after the branch was cut, the raw range picks
+          # up unrelated commits and lints history this pull request never
+          # touched.
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          ./node_modules/.bin/commitlint --from "$MERGE_BASE" --to "$HEAD_SHA" --verbose
+
+      # The step above lints the commits a pull request proposes, which is not
+      # necessarily what lands. Squash merging with
+      # squash_merge_commit_title=COMMIT_OR_PR_TITLE writes the pull request
+      # title as the subject on the default branch whenever the branch carries
+      # more than one commit. Leaving that unchecked lets a green run put
+      # `Fix stuff` on the default branch. Linting it unconditionally also
+      # covers the merge method being changed later without anyone remembering
+      # this file.
+      #
+      # The title reaches commitlint through the environment and stdin, never
+      # interpolated into the script body, so a title carrying shell syntax is
+      # data rather than code.
+      - name: Pull request title is a Conventional Commit
+        if: '!cancelled()'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PR_TITLE" | ./node_modules/.bin/commitlint --verbose
+
+      # Runs even when a check above failed, so one push reports all three.
+      - name: No unfolded fixup commits
+        if: '!cancelled()'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # `fixup!` / `squash!` / `amend!` are a deliberate transient state:
+          # a review round creates them and `rebase --autosquash` folds them in.
+          # commitlint lets them through via config-conventional's
+          # defaultIgnores, and so does the local hook, so nothing catches the
+          # case where the autosquash never ran.
+          #
+          # Subjects only: a body may quote `fixup!` while explaining an
+          # autosquash, and that is not a fixup commit.
+          #
+          # Same merge-base as the subject check, for the same reason, and it is
+          # also the ref the autosquash hint below has to name to be runnable.
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          # Two statements, not one pipeline: `|| true` would swallow a git
+          # failure too (an unknown SHA after a base force-push), and the step
+          # would then report "no unfolded fixup commits" and pass. Let `set -e`
+          # catch git; absorb only grep's no-match exit.
+          commits=$(git log --format='%h %s' "$MERGE_BASE..$HEAD_SHA")
+          unfolded=$(printf '%s\n' "$commits" \
+            | grep -E '^[0-9a-f]+ (fixup|squash|amend)! ' || true)
+          if [ -n "$unfolded" ]; then
+            echo "Unfolded fixup commits on this branch:"
+            echo "$unfolded"
+            echo
+            echo "Fold them in with: git rebase -i --autosquash $MERGE_BASE"
+            exit 1
+          fi
+          echo "No unfolded fixup commits."

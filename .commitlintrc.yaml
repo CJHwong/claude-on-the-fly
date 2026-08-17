@@ -1,0 +1,11 @@
+# Conventional Commits, judged by commitlint's own reference ruleset.
+#
+# YAML rather than .js so a repo with no Node toolchain of its own can copy this
+# file unchanged. The rules live upstream: a local override list here is a second
+# place for the ruleset to live, and the two drift the moment one of them is
+# edited.
+#
+# Read by both the commit-msg hook in .pre-commit-config.yaml and the CI job in
+# .github/workflows/commit-checks.yml, so a commit cannot pass locally and fail
+# in CI.
+extends: ['@commitlint/config-conventional']
