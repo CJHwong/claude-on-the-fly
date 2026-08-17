@@ -117,7 +117,12 @@ class CooldownAlertSink:
     async def alert(self, origin: Mapping[str, Any], result: Result) -> None:
         entry = str(origin.get("entry") or "")
         now = time.monotonic()
-        if now - self._last_alerted_at.get(entry, 0.0) < self._window_s:
+        last = self._last_alerted_at.get(entry)
+        # `last is None` means "never alerted", which must NOT compare as an
+        # ancient timestamp: on a machine younger than the window (a fresh CI
+        # VM, a recently rebooted host), `now - 0.0 < window` is true and the
+        # FIRST alert would be swallowed as a "repeat".
+        if last is not None and now - last < self._window_s:
             return
         await self._inner.alert(origin, result)
         self._last_alerted_at[entry] = now

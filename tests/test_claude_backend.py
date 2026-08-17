@@ -292,6 +292,46 @@ class TestRunPassesThroughABlockOnlyReply:
         # Handed on verbatim; the orchestrator owns the placeholder.
         assert response.body == '<suggestions>["x?"]</suggestions>'
 
+    async def test_a_block_only_body_falls_back_to_the_last_real_text(
+        self, tmp_path, monkeypatch
+    ):
+        """A turn that ends with only a <suggestions> block did say something
+        earlier: the block is the protocol token, not a reply. The last real
+        text replaces it so the user sees the answer instead of the
+        orchestrator's placeholder — still without a second billed turn."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        session = (
+            tmp_path
+            / "projects"
+            / claude_mod._workspace_to_claude_hash(tmp_path)
+            / "sid.jsonl"
+        )
+        session.parent.mkdir(parents=True)
+        session.write_text('{"type":"user"}\n', encoding="utf-8")
+
+        backend = claude_mod.ClaudeBackend()
+        first = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": '<suggestions>["x?"]</suggestions>',
+            "last_assistant_text": "the real summary",
+            "tool_counts": {},
+            "skill_counts": {},
+        }
+        with patch.object(
+            claude_mod.agent,
+            "_exec",
+            new_callable=AsyncMock,
+            side_effect=[first],
+        ) as native_exec:
+            response = await backend.run(
+                tmp_path, "sid", "hi", "slack", nudge_prompt="nudge with template"
+            )
+
+        assert native_exec.await_count == 1
+        assert response.body == "the real summary"
+
 
 class TestNativeContextFields:
     """The auto-compact gate's reading in native mode. pty gets it from the

@@ -1109,6 +1109,29 @@ class TestParseStream:
         out = parse_stream(stream)
         assert out["tool_counts"] == {"Read": 3, "Bash": 1}
 
+    def test_last_assistant_text_tracks_the_last_real_text(self):
+        """A turn that ends with only a <suggestions> block did say something
+        earlier; the last real text is what a block-only reply falls back to."""
+        stream = _ndjson(
+            _assistant_line({"type": "text", "text": "the real summary"}),
+            _assistant_line(
+                {"type": "text", "text": '<suggestions>["x?"]</suggestions>'}
+            ),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_text"] == "the real summary"
+
+    def test_a_suggestions_only_message_does_not_count_as_text(self):
+        stream = _ndjson(
+            _assistant_line(
+                {"type": "text", "text": '<suggestions>["x?"]</suggestions>'}
+            ),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_text"] == ""
+
     def test_skill_tool_populates_skill_counts(self):
         stream = _ndjson(
             _assistant_line(
