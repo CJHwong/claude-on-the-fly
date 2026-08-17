@@ -388,6 +388,14 @@ class TestProcess:
         assert sent.body == "Here is the answer"
         assert sent.suggestions == ["ask a?", "ask b?"]
 
+    def test_template_carries_the_worked_example(self) -> None:
+        """The worked example is the lever that makes flash-tier models emit
+        the block (measured: 5/5 emission vs 3/5 without it). Pin it so a
+        future edit cannot drop it silently."""
+        assert "Example of a complete reply:" in SUGGESTIONS_TEMPLATE
+        assert '<suggestions>["Tell me more about its history"' in SUGGESTIONS_TEMPLATE
+        assert "The block is mandatory in every reply" in SUGGESTIONS_TEMPLATE
+
     async def test_malformed_block_yields_no_suggestions(
         self,
         orch: Orchestrator,
