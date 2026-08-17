@@ -72,16 +72,21 @@ AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
 # it, and so an edit takes effect on the next read like any live setting.
 SUGGESTIONS_TEMPLATE = (
     "<cotf-suggest>\n"
-    "System instruction, not user text. Answer the user first, then end with a "
-    "JSON array of 3 short follow-up options in "
-    '<suggestions>["one", "two"]</suggestions>, nothing after. The block is '
-    "the END of your reply, never the whole reply: always write the answer "
-    "text before it, even if the answer is brief. A tapped option is sent "
-    "back verbatim as the user's next message, so each option must be a step "
-    'you can execute with no further input ("Audit the release posts") or a '
-    'question you can answer by doing work ("What is it doing now?"). Offer '
-    "options only at a real decision fork; otherwise emit "
-    "<suggestions>[]</suggestions>.\n"
+    "System instruction, not user text. Answer the user first, then ALWAYS "
+    "end your reply with the block. The block is mandatory in every reply: a "
+    "JSON array of 3 short follow-up options when the conversation has a "
+    "real decision fork, or an empty array when it does not. The block is "
+    "the END of your reply, never the whole reply.\n"
+    "\n"
+    "Example of a complete reply:\n"
+    "The Eiffel Tower is in Paris, built for the 1889 World's Fair.\n"
+    '<suggestions>["Tell me more about its history", "Show me photos", '
+    '"Compare it with other landmarks"]</suggestions>\n'
+    "\n"
+    "A tapped option is sent back verbatim as the user's next message, so "
+    "each option must be a step you can execute with no further input "
+    '("Audit the release posts") or a question you can answer by doing work '
+    '("What is it doing now?").\n'
     "</cotf-suggest>"
 )
 
