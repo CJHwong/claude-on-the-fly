@@ -14,7 +14,7 @@ from claude_on_the_fly.jobs.slack_notifier import (
     SlackThreadNotifier,
     _blocks,
 )
-from claude_on_the_fly.slack_mrkdwn import SLACK_BLOCK_LIMIT, split_blocks, to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import SLACK_MARKDOWN_LIMIT, split_blocks
 
 
 def _client() -> AsyncMock:
@@ -34,7 +34,7 @@ async def test_posts_result_into_origin_thread() -> None:
     assert kwargs["channel"] == "C123"
     assert kwargs["thread_ts"] == "1699.5"
     assert kwargs["text"] == "the answer"
-    assert kwargs["blocks"][0]["type"] == "section"
+    assert kwargs["blocks"][0] == {"type": "markdown", "text": "the answer"}
 
 
 async def test_reads_only_channel_and_thread_ts_never_sender_id() -> None:
@@ -64,7 +64,7 @@ async def test_failure_result_is_marked() -> None:
     # The notification line marks the failure; the detail rides in the blocks,
     # which are what Slack actually renders.
     assert "Job failed" in kwargs["text"]
-    assert "stack trace" in kwargs["blocks"][0]["text"]["text"]
+    assert "stack trace" in kwargs["blocks"][0]["text"]
 
 
 async def test_no_channel_skips_post() -> None:
@@ -77,12 +77,12 @@ async def test_no_channel_skips_post() -> None:
 async def test_long_body_splits_into_multiple_blocks() -> None:
     client = _client()
     notifier = SlackThreadNotifier(client)
-    body = "\n".join(["x" * 500 for _ in range(20)])  # ~10k chars
+    body = "\n".join(["x" * 5000 for _ in range(5)])  # ~25k chars
     await notifier.notify({"channel": "C1"}, Result(ok=True, text=body))
     blocks = client.chat_postMessage.call_args.kwargs["blocks"]
     assert len(blocks) > 1
     for block in blocks:
-        assert len(block["text"]["text"]) <= SLACK_BLOCK_LIMIT
+        assert len(block["text"]) <= SLACK_MARKDOWN_LIMIT
 
 
 async def test_post_failure_propagates() -> None:
@@ -99,26 +99,26 @@ async def test_post_failure_propagates() -> None:
 
 def test_single_over_limit_line_reassembles_with_zero_loss() -> None:
     # One unbroken line (no newlines) well over the limit — the JSON-blob case.
-    # The old splitter truncated it to line[:SLACK_BLOCK_LIMIT] and dropped the
+    # The old splitter truncated it to line[:LIMIT] and dropped the
     # tail; every character must now survive across the produced chunks.
-    line = "J" * (SLACK_BLOCK_LIMIT * 2 + 137)
+    line = "J" * (SLACK_MARKDOWN_LIMIT * 2 + 137)
     chunks = split_blocks(line)
-    assert len(chunks) == 3  # 3000 + 3000 + 137
-    assert all(len(c) <= SLACK_BLOCK_LIMIT for c in chunks)
+    assert len(chunks) == 3  # 12000 + 12000 + 137
+    assert all(len(c) <= SLACK_MARKDOWN_LIMIT for c in chunks)
     assert "".join(chunks) == line  # nothing dropped
 
 
 async def test_over_limit_line_delivered_without_content_loss() -> None:
     client = _client()
     notifier = SlackThreadNotifier(client)
-    body = "K" * (SLACK_BLOCK_LIMIT * 3 + 50)
+    body = "K" * (SLACK_MARKDOWN_LIMIT * 3 + 50)
     await notifier.notify({"channel": "C1"}, Result(ok=True, text=body))
     blocks = client.chat_postMessage.call_args.kwargs["blocks"]
     assert len(blocks) > 1
     for block in blocks:
-        assert len(block["text"]["text"]) <= SLACK_BLOCK_LIMIT
-    reassembled = "".join(block["text"]["text"] for block in blocks)
-    assert reassembled == to_mrkdwn(body)
+        assert len(block["text"]) <= SLACK_MARKDOWN_LIMIT
+    reassembled = "".join(block["text"] for block in blocks)
+    assert reassembled == body
 
 
 async def test_result_over_block_budget_splits_into_multiple_messages() -> None:
@@ -127,7 +127,7 @@ async def test_result_over_block_budget_splits_into_multiple_messages() -> None:
     # Many separate over-limit lines → far more than SLACK_MAX_BLOCKS blocks, which
     # a single chat_postMessage would reject with `invalid_blocks`.
     body = "\n".join(
-        "z" * (SLACK_BLOCK_LIMIT + 10) for _ in range(SLACK_MAX_BLOCKS + 5)
+        "z" * (SLACK_MARKDOWN_LIMIT + 10) for _ in range(SLACK_MAX_BLOCKS + 5)
     )
     await notifier.notify({"channel": "C1"}, Result(ok=True, text=body))
 
@@ -137,14 +137,12 @@ async def test_result_over_block_budget_splits_into_multiple_messages() -> None:
         assert len(call.kwargs["blocks"]) <= SLACK_MAX_BLOCKS
     # Posted to the same origin, and no content lost across the messages.
     assert all(call.kwargs["channel"] == "C1" for call in calls)
-    posted = "".join(
-        block["text"]["text"] for call in calls for block in call.kwargs["blocks"]
-    )
-    assert posted == to_mrkdwn(body)
+    posted = "".join(block["text"] for call in calls for block in call.kwargs["blocks"])
+    assert posted == body
 
 
 def test_blocks_helper_never_empty() -> None:
-    assert _blocks("") == [{"type": "section", "text": {"type": "mrkdwn", "text": ""}}]
+    assert _blocks("") == [{"type": "markdown", "text": ""}]
 
 
 async def test_fallback_text_stays_within_slacks_cap() -> None:

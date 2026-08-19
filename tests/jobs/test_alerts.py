@@ -97,9 +97,7 @@ async def test_slack_sink_posts_one_compact_message() -> None:
     call = client.calls[0]
     assert call["channel"] == "C42"
     assert call["text"] == ":x: cron entry jira failed"
-    assert call["blocks"][0]["text"]["text"].startswith(
-        ":x: cron entry jira failed\nboom"
-    )
+    assert call["blocks"][0]["text"].startswith(":x: cron entry jira failed\nboom")
 
 
 # --- Telegram --------------------------------------------------------------

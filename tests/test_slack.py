@@ -22,11 +22,52 @@ from claude_on_the_fly.slack import (
     DEFAULT_REPLY_SOFT_LIMIT,
     JOB_LIST_LIMIT,
     SlackFrontend,
+    _build_response_blocks,
     _render_job_list,
     _session_key,
     _split_blocks,
 )
-from claude_on_the_fly.slack_mrkdwn import SLACK_BLOCK_LIMIT
+from claude_on_the_fly.slack_mrkdwn import SLACK_MARKDOWN_LIMIT
+
+# ---------------------------------------------------------------------------
+# _build_response_blocks
+# ---------------------------------------------------------------------------
+
+
+class TestBuildResponseBlocks:
+    """The body ships as Markdown for Slack to parse, not as pre-cooked mrkdwn.
+
+    Slack's `markdown` block gives back a real `rich_text_list` that indents and
+    a real `table`. Converting first would flatten both, which is what the old
+    `section` path did.
+    """
+
+    def test_body_is_a_markdown_block(self):
+        blocks = _build_response_blocks("hello", Response(body="hello"))
+        assert blocks[0] == {"type": "markdown", "text": "hello"}
+
+    def test_nested_list_reaches_slack_unconverted(self):
+        body = "- top\n  - child"
+        blocks = _build_response_blocks(body, Response(body=body))
+        assert blocks[0]["text"] == body
+
+    def test_table_is_not_flattened_into_a_code_fence(self):
+        body = "| a | b |\n| --- | --- |\n| 1 | 2 |"
+        blocks = _build_response_blocks(body, Response(body=body))
+        assert blocks[0]["text"] == body
+        assert "```" not in blocks[0]["text"]
+
+    def test_bold_keeps_its_markdown_spelling(self):
+        blocks = _build_response_blocks("**bold**", Response(body="**bold**"))
+        assert blocks[0]["text"] == "**bold**"
+
+    def test_a_long_body_is_laid_across_several_markdown_blocks(self):
+        body = "x" * (SLACK_MARKDOWN_LIMIT + 10)
+        blocks = _build_response_blocks(body, Response(body=body))
+        bodies = [b for b in blocks if b["type"] == "markdown"]
+        assert len(bodies) == 2
+        assert "".join(b["text"] for b in bodies) == body
+
 
 # ---------------------------------------------------------------------------
 # _split_blocks
@@ -39,7 +80,7 @@ class TestSplitBlocks:
         assert _split_blocks(text) == ["hello world"]
 
     def test_multiple_chunks_split_on_line_boundaries(self):
-        line = "x" * 2000
+        line = "x" * (SLACK_MARKDOWN_LIMIT - 1000)
         text = f"{line}\n{line}"
         result = _split_blocks(text)
         assert len(result) == 2
@@ -52,17 +93,17 @@ class TestSplitBlocks:
     def test_very_long_single_line_is_sliced_not_truncated(self):
         """A line over the limit used to be cut to line[:LIMIT] with the tail
         dropped — no error, no log, and nothing in the output saying so."""
-        text = "a" * (SLACK_BLOCK_LIMIT + 500)
+        text = "a" * (SLACK_MARKDOWN_LIMIT + 500)
         result = _split_blocks(text)
         assert len(result) == 2
-        assert all(len(chunk) <= SLACK_BLOCK_LIMIT for chunk in result)
+        assert all(len(chunk) <= SLACK_MARKDOWN_LIMIT for chunk in result)
         assert "".join(result) == text
 
     def test_empty_text_returns_list_with_empty_string(self):
         assert _split_blocks("") == [""]
 
     def test_exact_limit_not_split(self):
-        text = "a" * SLACK_BLOCK_LIMIT
+        text = "a" * SLACK_MARKDOWN_LIMIT
         assert _split_blocks(text) == [text]
 
     def test_multiline_accumulation(self):
@@ -74,11 +115,11 @@ class TestSplitBlocks:
 
     def test_long_line_after_chunk_flushes_previous(self):
         short = "hello"
-        long_line = "b" * (SLACK_BLOCK_LIMIT + 100)
+        long_line = "b" * (SLACK_MARKDOWN_LIMIT + 100)
         text = f"{short}\n{long_line}"
         result = _split_blocks(text)
         assert result[0] == short
-        assert all(len(chunk) <= SLACK_BLOCK_LIMIT for chunk in result)
+        assert all(len(chunk) <= SLACK_MARKDOWN_LIMIT for chunk in result)
         assert "".join(result) == text
 
 
@@ -609,7 +650,7 @@ class TestSend:
         assert call_kwargs["channel"] == "C1"
         assert call_kwargs["thread_ts"] == "t1"
         blocks = call_kwargs["blocks"]
-        assert any(b["type"] == "section" for b in blocks)
+        assert any(b["type"] == "markdown" for b in blocks)
         assert any(b["type"] == "context" for b in blocks)
 
     async def test_suppressed_bot_reply_omits_slack_post(self, frontend):
@@ -905,7 +946,7 @@ class TestSendProgress:
         rendered = frontend._app.client.chat_postMessage.call_args.kwargs["blocks"][0][
             "elements"
         ][0]["text"]
-        assert len(rendered) < SLACK_BLOCK_LIMIT
+        assert len(rendered) < slack_mod._BLOCK_TEXT_LIMIT + 100
         assert "more characters" in rendered
         assert "xxxxxxxxxx" in rendered
 

@@ -13,6 +13,12 @@ The content of a code fence or an inline code span passes through untouched, so
 asterisks/pipes inside one survive; the spacing *around* an inline span is still
 adjusted, because Slack needs a boundary there. Raw inline HTML (e.g. Slack
 ``<@U123>`` mentions) is preserved.
+
+Reply bodies do NOT come through here. They ship as a ``markdown`` block, which
+Slack parses server-side into real lists and tables -- everything the degrading
+above gives up. This conversion is for the surfaces that have no markdown block:
+a ``context`` element takes ``mrkdwn`` and nothing else, which is where the
+mid-turn progress line lands.
 """
 
 from __future__ import annotations
@@ -241,11 +247,12 @@ def _render_link(
     return f"<{href}|{label}>" if label and label != href else f"<{href}>"
 
 
-# Slack rejects a section block whose text exceeds this, so a long reply has to
-# be laid across several blocks. Lives here beside `to_mrkdwn` because every
-# caller that splits has already converted: chunking is the last step of
-# rendering mrkdwn for Slack, not a concern of any one frontend.
-SLACK_BLOCK_LIMIT = 3000
+# Slack rejects a markdown block whose text exceeds this, so a long reply has to
+# be laid across several blocks. Measured against a live workspace: 12000 passes
+# and 12001 fails, and the count is characters rather than bytes -- 12000 CJK
+# characters (36000 bytes) go through. That is four times what a `section` holds,
+# which is why a reply now rarely needs splitting at all.
+SLACK_MARKDOWN_LIMIT = 12000
 
 
 def split_blocks(text: str) -> list[str]:
@@ -262,7 +269,7 @@ def split_blocks(text: str) -> list[str]:
     chunk = ""
     for index, line in enumerate(text.split("\n")):
         segment = f"\n{line}" if index else line  # restore the split newline
-        if len(chunk) + len(segment) <= SLACK_BLOCK_LIMIT:
+        if len(chunk) + len(segment) <= SLACK_MARKDOWN_LIMIT:
             chunk += segment
             continue
         # Overflow: flush the running chunk, then lay `segment` down, slicing it
@@ -270,9 +277,9 @@ def split_blocks(text: str) -> list[str]:
         if chunk:
             chunks.append(chunk)
             chunk = ""
-        while len(segment) > SLACK_BLOCK_LIMIT:
-            chunks.append(segment[:SLACK_BLOCK_LIMIT])
-            segment = segment[SLACK_BLOCK_LIMIT:]
+        while len(segment) > SLACK_MARKDOWN_LIMIT:
+            chunks.append(segment[:SLACK_MARKDOWN_LIMIT])
+            segment = segment[SLACK_MARKDOWN_LIMIT:]
         chunk = segment
     if chunk:
         chunks.append(chunk)
