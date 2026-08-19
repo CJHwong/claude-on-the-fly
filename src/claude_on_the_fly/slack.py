@@ -503,10 +503,17 @@ def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> st
 
 
 def _build_response_blocks(body: str, response: Response) -> list[dict]:
-    """Render a Response as Slack block-kit: section chunks + stats/tools context."""
+    """Render a Response as Slack block-kit: markdown chunks + stats/tools context.
+
+    The body goes out as the agent wrote it, in a `markdown` block. Slack parses
+    it server-side, so a list becomes a real `rich_text_list` that indents, and a
+    table becomes a real `table` block. Converting to mrkdwn first would throw
+    both away: the legacy parser has no list and no table, so a nested list
+    flattens to literal dashes and a table lands in a code fence.
+    """
     blocks: list[dict] = []
-    for chunk in _split_blocks(to_mrkdwn(body)):
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+    for chunk in _split_blocks(body):
+        blocks.append({"type": "markdown", "text": chunk})
     stats, tools = footer_parts(response, "slack")
     if stats:
         blocks.append(

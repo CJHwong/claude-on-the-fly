@@ -3,14 +3,16 @@
 Runs in the worker process, separate from the Slack frontend, so it builds its
 OWN `AsyncWebClient` (token resolved in `cli.py`; identity is deployer-config,
 never hardcoded). It reads only the routing keys the producer put in `origin`
-(`channel`, `thread_ts`) — never `sender_id` — and converts the agent's Markdown
-to Slack mrkdwn with the shared `to_mrkdwn`.
+(`channel`, `thread_ts`) — never `sender_id`.
 
-Block splitting comes from `slack_mrkdwn.split_blocks`, shared with the chat
-frontend so the same reply cannot render differently depending on which one
-produced it. A post failure raises: returning normally is what marks a result
-delivered, so swallowing one would turn a retryable miss into a reply nobody
-ever receives. The worker decides what to do about it.
+The body ships as a `markdown` block, so Slack parses the agent's Markdown
+server-side into native lists and tables. Block splitting comes from
+`slack_mrkdwn.split_blocks`, shared with the chat frontend so the same reply
+cannot render differently depending on which one produced it.
+
+A post failure raises: returning normally is what marks a result delivered, so
+swallowing one would turn a retryable miss into a reply nobody ever receives.
+The worker decides what to do about it.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import logging
 from typing import Any, Protocol
 
 from claude_on_the_fly.jobs.core import Result
-from claude_on_the_fly.slack_mrkdwn import split_blocks, to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import split_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +50,9 @@ class _PostsMessages(Protocol):
     async def chat_postMessage(self, *, channel: str, **kwargs: Any) -> Any: ...
 
 
-def _blocks(mrkdwn_text: str) -> list[dict]:
+def _blocks(markdown_text: str) -> list[dict]:
     return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
-        for chunk in split_blocks(mrkdwn_text)
+        {"type": "markdown", "text": chunk} for chunk in split_blocks(markdown_text)
     ]
 
 
@@ -76,7 +77,7 @@ class SlackThreadNotifier:
             return
         thread_ts = origin.get("thread_ts")
         body = result.text if result.ok else f":warning: Job failed\n{result.text}"
-        blocks = _blocks(to_mrkdwn(body))
+        blocks = _blocks(body)
         # Post in batches of at most SLACK_MAX_BLOCKS so a large result is
         # delivered across several messages instead of tripping Slack's
         # per-message block cap, which `chat_postMessage` rejects outright with

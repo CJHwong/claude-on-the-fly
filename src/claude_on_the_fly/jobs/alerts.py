@@ -28,7 +28,6 @@ from claude_on_the_fly.jobs.slack_notifier import (
     _fallback_text,
     _PostsMessages,
 )
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +70,7 @@ class SlackAlertSink:
         await self._client.chat_postMessage(
             channel=self._channel,
             text=_fallback_text(body),
-            blocks=_blocks(to_mrkdwn(body)),
+            blocks=_blocks(body),
         )
 
 
