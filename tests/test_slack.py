@@ -1406,7 +1406,13 @@ class TestDownloadFile:
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.content_type = content_type
-        mock_resp.content.read = AsyncMock(return_value=content)
+
+        # Hand the body back in several chunks, the way a real socket does.
+        async def _iter_chunked(size):
+            for start in range(0, len(content), 4):
+                yield content[start : start + 4]
+
+        mock_resp.content.iter_chunked = _iter_chunked
 
         mock_get_ctx = MagicMock()
         mock_get_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
@@ -1467,8 +1473,8 @@ class TestDownloadFile:
             )
 
     async def test_a_download_over_the_cap_is_refused(self, tmp_path, monkeypatch):
-        """The read asks for one byte past the cap so the overflow is visible
-        without buffering the whole body."""
+        """The loop stops at the first chunk that crosses the cap, so an
+        oversized body never lands in memory whole."""
         monkeypatch.setattr("claude_on_the_fly.slack.MAX_ATTACHMENT_BYTES", 8)
         dest = tmp_path / "big.bin"
         mock_ctx, _ = self._mock_aiohttp(b"x" * 9)
@@ -1484,6 +1490,38 @@ class TestDownloadFile:
             )
 
         assert not dest.exists()
+
+    async def test_keeps_every_byte_of_a_multi_chunk_body(self, tmp_path):
+        """A real socket delivers a large body in pieces. Mocks cannot show
+        that, so serve one over loopback and compare the bytes."""
+        from aiohttp import web
+
+        payload = bytes(range(256)) * 8192  # 2 MiB, far past one socket buffer
+
+        async def handler(request):
+            resp = web.StreamResponse(headers={"Content-Type": "application/zip"})
+            await resp.prepare(request)
+            for start in range(0, len(payload), 64 * 1024):
+                await resp.write(payload[start : start + 64 * 1024])
+            await resp.write_eof()
+            return resp
+
+        app = web.Application()
+        app.router.add_get("/f.zip", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        dest = tmp_path / "f.zip"
+        try:
+            await SlackFrontend._download_file(
+                f"http://127.0.0.1:{port}/f.zip", dest, "xoxp-tok"
+            )
+        finally:
+            await runner.cleanup()
+
+        assert dest.read_bytes() == payload
 
     async def test_replaces_symlink_without_writing_through_it(self, tmp_path):
         target = tmp_path / "outside.txt"
