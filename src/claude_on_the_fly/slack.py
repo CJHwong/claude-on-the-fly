@@ -408,6 +408,8 @@ QUEUED_EMOJI = "hourglass_flowing_sand"
 RUNNING_EMOJI = "eyes"
 INTERRUPTED_EMOJI = "arrows_counterclockwise"
 
+_DOWNLOAD_CHUNK = 64 * 1024
+
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
@@ -2770,13 +2772,21 @@ class SlackFrontend(Frontend):
                 raise RuntimeError(
                     f"got HTML instead of file data (likely auth issue): {url}"
                 )
-            data = await resp.content.read(MAX_ATTACHMENT_BYTES + 1)
+            # aiohttp's read(n) returns whatever is buffered, not n bytes, so a
+            # single call truncates any body larger than one chunk. Drain the
+            # stream and bound the total instead.
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.content.iter_chunked(_DOWNLOAD_CHUNK):
+                total += len(chunk)
+                if total > MAX_ATTACHMENT_BYTES:
+                    raise ValueError(
+                        f"download exceeds {MAX_ATTACHMENT_BYTES} bytes: {dest.name}"
+                    )
+                chunks.append(chunk)
+            data = b"".join(chunks)
             if not data:
                 raise RuntimeError(f"empty response body: {url}")
-            if len(data) > MAX_ATTACHMENT_BYTES:
-                raise ValueError(
-                    f"download exceeds {MAX_ATTACHMENT_BYTES} bytes: {dest.name}"
-                )
             write_attachment(dest, data)
             logger.debug(
                 "downloaded %s: %d bytes, content-type=%s",
