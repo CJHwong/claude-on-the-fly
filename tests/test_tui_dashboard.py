@@ -1174,7 +1174,7 @@ class TestJobsQueueTable:
             )
             await pilot.pause()
             table = app.screen.query_one("#jobs-queue", DataTable)
-            assert "[/]" in str(table.get_row_at(0)[2])
+            assert "[/]" in str(table.get_row_at(0)[3])
 
     async def test_a_job_with_no_enqueue_time_shows_no_age(self, isolated):
         app = _Host()
@@ -1185,7 +1185,81 @@ class TestJobsQueueTable:
             )
             await pilot.pause()
             table = app.screen.query_one("#jobs-queue", DataTable)
-            assert str(table.get_row_at(0)[3]) == "-"
+            assert str(table.get_row_at(0)[4]) == "-"
+
+    async def test_a_cron_job_is_named_by_its_entry(self, isolated):
+        """The entry is what an operator matches against cron.yaml and against
+        the entry's own log; the bare word "cron" would say nothing."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [self._row(origin={"kind": "cron", "entry": "jira-poll"})]
+                    )
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert str(table.get_row_at(0)[1]) == "jira-poll"
+
+    async def test_a_chat_job_is_named_by_its_producer(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view([self._row(origin={"kind": "slack", "channel": "C1"})])
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert str(table.get_row_at(0)[1]) == "slack"
+
+    async def test_an_origin_without_a_kind_claims_no_producer(self, isolated):
+        """A record written before the field existed, or one that could not be
+        read at all."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(self._snap(self._view([self._row(origin={})])), None)
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert str(table.get_row_at(0)[1]) == "-"
+
+    async def test_a_cron_origin_missing_its_entry_still_names_the_producer(
+        self, isolated
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(self._view([self._row(origin={"kind": "cron"})])), None
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            assert str(table.get_row_at(0)[1]) == "cron"
+
+    async def test_the_prompt_column_takes_the_leftover_width(self, isolated):
+        """Five columns no longer fit an 80-column terminal at fixed widths, so
+        the prompt takes what the other four leave and the table fits."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            screen._refresh_jobs(
+                self._snap(self._view([self._row(prompt="x" * 200)])), None
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            total = sum(c.get_render_width(table) for c in table.columns.values())
+            # Inside the run_test block: the widget's size resets to 0 when the
+            # app shuts down, so the assertion must not outlive it.
+            assert total == table.size.width
 
     async def test_an_empty_queue_keeps_a_focusable_row(self, isolated):
         """So the table stays reachable by Tab and the lifecycle keys still work."""
@@ -1221,7 +1295,7 @@ class TestJobsQueueTable:
 
 
 class TestCronTable:
-    def _snap(self, jobs, error=None):
+    def _snap(self, jobs, error=None, queue=None):
         from datetime import UTC, datetime
 
         from claude_on_the_fly.tui.state import Snapshot
@@ -1231,7 +1305,28 @@ class TestCronTable:
             frontends=[],
             jobs=jobs,
             schedule_error=error,
-            jobs_queue=None,
+            jobs_queue=queue,
+        )
+
+    def _queue(self, *entries):
+        """A queue view holding one in-flight cron job per name given."""
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly.jobs.file_queue import QueueDepth, QueueRow
+        from claude_on_the_fly.tui.state import JobsQueueView
+
+        rows = [
+            QueueRow(
+                id=f"{i}-aaaaaaaa",
+                prompt="p",
+                origin={"kind": "cron", "entry": name},
+                enqueued_at=datetime.now(UTC),
+                in_flight=True,
+            )
+            for i, name in enumerate(entries)
+        ]
+        return JobsQueueView(
+            depth=QueueDepth(new=0, running=len(rows), done=0, failed=0), rows=rows
         )
 
     def _job(self, name="nightly", detail=""):
@@ -1257,6 +1352,135 @@ class TestCronTable:
         from claude_on_the_fly.tui.state import FrontendStatus
 
         return FrontendStatus(name="cron", state=state_str)
+
+    async def test_an_entry_whose_work_is_in_flight_says_running(self, isolated):
+        """The entry an operator is watching is the one whose countdown matters
+        least: its work is already running."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("nightly")], queue=self._queue("nightly")),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert str(table.get_row_at(0)[3]) == "running"
+
+    async def test_a_producer_entry_counts_its_in_flight_items(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap(
+                    [self._job("jira")], queue=self._queue("jira", "jira", "other")
+                ),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert str(table.get_row_at(0)[3]) == "running (2)"
+
+    async def test_an_idle_entry_keeps_its_countdown(self, isolated):
+        """Another entry's job running must not blank out this one's next fire."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("nightly")], queue=self._queue("something-else")),
+                self._status("running"),
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert "in 1.0h" in str(table.get_row_at(0)[3])
+
+    async def test_a_queued_job_is_not_yet_running(self, isolated):
+        """Only a claimed job is running; a queued one leaves the countdown,
+        which is still the honest answer to when this entry next fires."""
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly.jobs.file_queue import QueueDepth, QueueRow
+        from claude_on_the_fly.tui.state import JobsQueueView
+
+        view = JobsQueueView(
+            depth=QueueDepth(new=1, running=0, done=0, failed=0),
+            rows=[
+                QueueRow(
+                    id="1-aaaaaaaa",
+                    prompt="p",
+                    origin={"kind": "cron", "entry": "nightly"},
+                    enqueued_at=datetime.now(UTC),
+                    in_flight=False,
+                )
+            ],
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("nightly")], queue=view), self._status("running")
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert "in 1.0h" in str(table.get_row_at(0)[3])
+
+    async def test_a_chat_job_never_marks_a_cron_entry_running(self, isolated):
+        """A Slack job's origin carries no entry, and an entry name that happens
+        to match a channel must not be read as one."""
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly.jobs.file_queue import QueueDepth, QueueRow
+        from claude_on_the_fly.tui.state import JobsQueueView
+
+        view = JobsQueueView(
+            depth=QueueDepth(new=0, running=1, done=0, failed=0),
+            rows=[
+                QueueRow(
+                    id="1-aaaaaaaa",
+                    prompt="p",
+                    origin={"kind": "slack", "entry": "nightly"},
+                    enqueued_at=datetime.now(UTC),
+                    in_flight=True,
+                )
+            ],
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("nightly")], queue=view), self._status("running")
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert "in 1.0h" in str(table.get_row_at(0)[3])
+
+    async def test_a_cron_origin_without_an_entry_marks_nothing(self, isolated):
+        from datetime import UTC, datetime
+
+        from claude_on_the_fly.jobs.file_queue import QueueDepth, QueueRow
+        from claude_on_the_fly.tui.state import JobsQueueView
+
+        view = JobsQueueView(
+            depth=QueueDepth(new=0, running=1, done=0, failed=0),
+            rows=[
+                QueueRow(
+                    id="1-aaaaaaaa",
+                    prompt="p",
+                    origin={"kind": "cron"},
+                    enqueued_at=datetime.now(UTC),
+                    in_flight=True,
+                )
+            ],
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_cron(
+                self._snap([self._job("nightly")], queue=view), self._status("running")
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert "in 1.0h" in str(table.get_row_at(0)[3])
 
     async def test_a_running_scheduler_shows_the_next_fire(self, isolated):
         app = _Host()
@@ -1351,21 +1575,22 @@ class TestCronTable:
             screen = await _open(app, pilot)
             table = app.screen.query_one("#cron-entries", DataTable)
             monkeypatch.setattr(DataTable, "size", property(lambda self: Size(0, 0)))
-            screen._resize_prompt_column(table)
+            screen._resize_flex_column(table, dash.PROMPT_COLUMN, auto_label="name")
             prompt = self._prompt_col(table)
-        assert prompt.width == 20
+        assert prompt.width == 14
 
     async def test_resize_without_the_prompt_column_is_a_no_op(self, isolated):
-        """Defensive: a table that never had the column (e.g. the jobs queue)
-        is left untouched."""
+        """Defensive: a table that never had the column (the chat strip) is left
+        untouched — including its missing `name` column, which the cron table's
+        auto-sizing measures."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            screen.action_show_tab("tab-jobs")
+            screen.action_show_tab("tab-chat")
             await pilot.pause()
-            table = app.screen.query_one("#jobs-queue", DataTable)
+            table = app.screen.query_one("#chat-strip", DataTable)
             before = {c.label.plain: c.width for c in table.columns.values()}
-            screen._resize_prompt_column(table)
+            screen._resize_flex_column(table, dash.PROMPT_COLUMN, auto_label="name")
             after = {c.label.plain: c.width for c in table.columns.values()}
         assert before == after
 

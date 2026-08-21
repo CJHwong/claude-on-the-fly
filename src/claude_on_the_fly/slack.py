@@ -1974,6 +1974,10 @@ class SlackFrontend(Frontend):
                 id=f"{time.time_ns()}-{uuid4().hex[:8]}",
                 prompt=task,
                 origin={
+                    # `kind` names the producer for any reader listing the
+                    # queue (the TUI's source column); the rest is routing the
+                    # notifier reads back on completion.
+                    "kind": "slack",
                     "channel": channel,
                     "thread_ts": thread_ts,
                     "sender_id": sender_id,

@@ -2811,11 +2811,14 @@ class TestJobCommand:
             }
         )
 
-        # Exactly one job, with the task and the origin (carrying sender_id).
+        # Exactly one job, with the task and the origin: the producer's kind
+        # (what a queue listing names the row by) plus the routing the notifier
+        # reads back.
         assert len(queue.jobs) == 1
         job = queue.jobs[0]
         assert job.prompt == "summarize the incident"
         assert job.origin == {
+            "kind": "slack",
             "channel": "C1",
             "thread_ts": "123.45",
             "sender_id": "U_ALLOWED",
