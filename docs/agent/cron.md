@@ -106,6 +106,10 @@ Two different limits, both spelled `timeout` in different places:
 - a side-effect command, and the agent run each item becomes, get the entry's own
   `timeout`, which rides to the worker on `Job.timeout`
 
+## What the cron tab shows as "running"
+
+An entry's own work is done the moment it enqueues, so the cron daemon cannot say whether the work it produced is running — the jobs worker owns that. The cron table answers it from the queue instead: `_running_by_entry` counts the in-flight rows whose `origin` names that entry, and the row's next-fire cell reads `running`, or `running (N)` for a producer entry with several items in flight. Only a claimed job counts; a queued one leaves the countdown, which is still the honest answer to when the entry next fires. The count depends on the producer stamping `{"kind": "cron", "entry": <name>}` on the origin (`_enqueue`) — drop that and the table goes quiet rather than wrong.
+
 ## Run-now trigger
 
 The TUI's run-now key (`n` on the cron tab) is a file, not a signal: the

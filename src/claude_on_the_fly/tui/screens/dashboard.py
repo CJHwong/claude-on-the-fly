@@ -80,10 +80,13 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
 
 LOG_DIR = DATA_DIR / "logs"
 CRON_CONFIG = DATA_DIR / "cron.yaml"
-# The cron table's flexible column: sized to the leftover width on every
-# refresh (see _resize_prompt_column) so the name column can auto-size to its
-# content and the prompt/command text still gets the rest of the row.
-PROMPT_COLUMN = "prompt / command"
+# Both tables' flexible column: sized to the leftover width on every refresh
+# (see _resize_flex_column), so the cron table's name column can auto-size to
+# its content and the text still gets the rest of the row. The cron table
+# labelled this "prompt / command" until the fifth column arrived: that header
+# no longer fits the width the column is left at an 80-column terminal, and the
+# `kind` column already says which of the two a row holds.
+PROMPT_COLUMN = "prompt"
 TAIL_LINES = 200
 # When showing an agent job watch, tail this many raw JSONL events; each
 # formats to 1–4 visible lines so the rendered pane stays manageable.
@@ -125,6 +128,42 @@ def _prompt_preview(prompt: str | None, limit: int = 80) -> str:
         return "(unreadable)"
     flat = " ".join(prompt.split())
     return flat[:limit]
+
+
+def _running_by_entry(view: state.JobsQueueView | None) -> dict[str, int]:
+    """How many of each cron entry's jobs the worker has in flight.
+
+    Read off the queue rather than the cron daemon: the producer's job ends at
+    the enqueue, so the entry that fired is idle while the work it produced
+    runs. `origin` is what ties the two together (see `_job_source`).
+
+    The row list is capped, so an entry can in principle be missed. `cur/` is
+    listed before `new/`, so in-flight rows survive the cap first — a miss needs
+    more concurrent jobs than the cap itself.
+    """
+    counts: dict[str, int] = {}
+    for row in view.rows if view else []:
+        if not row.in_flight or row.origin.get("kind") != "cron":
+            continue
+        entry = str(row.origin.get("entry") or "")
+        if entry:
+            counts[entry] = counts.get(entry, 0) + 1
+    return counts
+
+
+def _job_source(origin: dict) -> str:
+    """Who produced this job, as one cell.
+
+    A cron job is named by its entry, which is the string an operator matches
+    against cron.yaml and against the `cron-<entry>-…` log; the bare word
+    "cron" would only repeat what the tab already says. Every other producer
+    is named by its kind. An origin with no kind predates the field, so it says
+    so rather than claiming a producer it cannot know.
+    """
+    kind = str(origin.get("kind") or "")
+    if kind == "cron":
+        return str(origin.get("entry") or "cron")
+    return kind or "-"
 
 
 class DashboardScreen(Screen):
@@ -376,21 +415,32 @@ class DashboardScreen(Screen):
         jobs.add_column("kind", width=8)
         jobs.add_column("next fire", width=24)
         # Flexible: resized to the leftover width on every refresh and on
-        # resize (see _resize_prompt_column); the mount-time width only
-        # matters for the pre-layout paint.
-        jobs.add_column(PROMPT_COLUMN, width=20)
+        # resize (see _resize_flex_column). The mount-time width is the fit for
+        # an 80-column terminal against a name column no wider than its own
+        # header, because a hidden pane has no size to fit against until it is
+        # first painted — every later fit corrects it from the real width.
+        jobs.add_column(PROMPT_COLUMN, width=14)
         # The background-job queue: what the worker is running now and what is
         # waiting. The id cell shows only the random tail (the time half of the
         # id is already the `enqueued` column); the row key keeps the full id.
         # `job` is sized for the widest placeholder rather than the widest id:
         # "queue unavailable" is 17 cells against an id tail's 8, and a fixed
-        # column clips rather than wraps. `prompt` hands back exactly those 7,
-        # so the four columns still render in 75 cells — inside the 76 the
-        # panel is given at an 80-column terminal.
+        # column clips rather than wraps. `source` names the producer — the
+        # cron entry that fired this job, or the chat frontend that asked —
+        # which is the only thing tying a queue row back to a schedule.
+        # `prompt` is the flexible column: the other four take 48 cells and 8
+        # of padding, so it gets whatever the terminal leaves over (see
+        # _resize_flex_column) rather than a fifth fixed width that no longer
+        # fits in the 76 the panel is given at an 80-column terminal. Its
+        # mount-time width is that 80-column fit exactly, not a placeholder:
+        # the first paint happens before any refresh has a size to fit against,
+        # and a wider start would overflow the row until the next 1Hz tick.
+        # Every later fit can only widen it.
         queue = self.query_one("#jobs-queue", DataTable)
         queue.add_column("job", width=17)
+        queue.add_column("source", width=14)
         queue.add_column("state", width=8)
-        queue.add_column("prompt", width=33)
+        queue.add_column(PROMPT_COLUMN, width=18)
         queue.add_column("enqueued", width=9)
         # The chat strip shows the selected frontend's currently-running jobs:
         # what's running and for how long. The header says which frontend.
@@ -412,16 +462,36 @@ class DashboardScreen(Screen):
         self.query_one("#chat-strip", DataTable).focus()
         self._update_action_cue()
 
+    # Table id → (flexible column, the auto-sized column to measure). Both
+    # tables give one column the width the others leave over.
+    _FLEX_COLUMNS: ClassVar[dict[str, tuple[str, str | None]]] = {
+        "cron-entries": (PROMPT_COLUMN, "name"),
+        "jobs-queue": (PROMPT_COLUMN, None),
+    }
+
+    def _refit_flex_columns(self) -> None:
+        """Re-fit every flexible column to its table's current width.
+
+        Guarded per table: a table on an unopened tab still has no size, and
+        that must not stop the other one being fitted.
+        """
+        for table_id, (label, auto_label) in self._FLEX_COLUMNS.items():
+            with contextlib.suppress(Exception):
+                self._resize_flex_column(
+                    self.query_one(f"#{table_id}", DataTable),
+                    label,
+                    auto_label=auto_label,
+                )
+
     def on_resize(self, event: events.Resize) -> None:
-        """Re-fit the cron table's prompt column to the new width.
+        """Re-fit both flexible prompt columns to the new width.
 
         The first _refresh runs before layout (table size 0), so without this
         the first paint would show the mount-time placeholder width; a
         terminal resize would otherwise leave the column stale until the next
         1Hz tick.
         """
-        with contextlib.suppress(Exception):
-            self._resize_prompt_column(self.query_one("#cron-entries", DataTable))
+        self._refit_flex_columns()
 
     # ------------------------------------------------------------------
     # Selection / focus
@@ -1329,12 +1399,24 @@ class DashboardScreen(Screen):
         self._cron_details = {job.name: job.detail for job in jobs}
         table.clear()
         keys: list[str] = []
+        running = _running_by_entry(snap.jobs_queue)
         for job in jobs:
-            next_str = (
-                render._fmt_next_fire(job.next_fire, snap.timestamp)
-                if sched_running
-                else "-"
-            )
+            # An entry whose work is in flight says so in place of its
+            # countdown: that entry is the one an operator is watching, and the
+            # next fire is the answer to a question they are not asking yet.
+            # The count only appears above one, because a producer entry is the
+            # only kind that can have several items running at once.
+            in_flight = running.get(job.name, 0)
+            if in_flight == 1:
+                next_str = "running"
+            elif in_flight > 1:
+                next_str = f"running ({in_flight})"
+            else:
+                next_str = (
+                    render._fmt_next_fire(job.next_fire, snap.timestamp)
+                    if sched_running
+                    else "-"
+                )
             # Text(), not str: the detail is operator-written and can carry
             # markup-looking brackets ("[pytest]"), which a bare str cell would
             # feed to Rich's markup parser — same reason the jobs queue wraps
@@ -1364,7 +1446,7 @@ class DashboardScreen(Screen):
         # header) stops a two-entry list painting half a screen of empty zebra
         # stripes, the one thing `height: auto` was doing well.
         table.styles.max_height = table.row_count + 1
-        self._resize_prompt_column(table)
+        self._resize_flex_column(table, PROMPT_COLUMN, auto_label="name")
         self._refresh_cron_detail()
 
     def _refresh_cron_detail(self) -> None:
@@ -1402,40 +1484,44 @@ class DashboardScreen(Screen):
             header.display = True
             pane.display = True
 
-    def _resize_prompt_column(self, table: DataTable) -> None:
-        """Size the prompt/command column to the table's leftover width.
+    def _resize_flex_column(
+        self, table: DataTable, label: str, *, auto_label: str | None = None
+    ) -> None:
+        """Size the `label` column to the table's leftover width.
 
-        The name column auto-sizes to its content (so names show in full) and
-        the other three are fixed, so the prompt column takes whatever is
-        left and DataTable clips the overflow. The name column's width is
-        measured from the rows rather than read off the column: DataTable
-        measures cells on idle, after this synchronous pass, so the column's
-        own width is one tick stale. No-op before the first layout, when the
-        table's size is still 0.
+        Every other column is fixed, so the flexible one takes whatever is left
+        and DataTable clips the overflow. `auto_label` names a column that
+        auto-sizes to its content instead (the cron table's name column, so
+        names show in full); its width is measured from the rows rather than
+        read off the column, because DataTable measures cells on idle — after
+        this synchronous pass — so the column's own width is one tick stale.
+        No-op before the first layout, when the table's size is still 0.
         """
         if table.size.width <= 0:
             return
-        prompt = next(
-            (c for c in table.columns.values() if c.label.plain == PROMPT_COLUMN),
+        flex = next(
+            (c for c in table.columns.values() if c.label.plain == label),
             None,
         )
-        if prompt is None:
+        if flex is None:
             return
-        name_col = next(c for c in table.columns.values() if c.label.plain == "name")
-        widest_name = max(
-            (len(str(table.get_row(key)[0])) for key in table.rows),
-            default=0,
+        auto_col = next(
+            (c for c in table.columns.values() if c.label.plain == auto_label), None
         )
-        name_render = (
-            max(len(name_col.label.plain), widest_name) + 2 * table.cell_padding
-        )
-        others = name_render + sum(
+        others = 0
+        if auto_col is not None:
+            widest = max(
+                (len(str(table.get_row(key)[0])) for key in table.rows),
+                default=0,
+            )
+            others += max(len(auto_col.label.plain), widest) + 2 * table.cell_padding
+        others += sum(
             c.get_render_width(table)
             for c in table.columns.values()
-            if c is not prompt and c is not name_col
+            if c is not flex and c is not auto_col
         )
-        prompt.width = max(10, table.size.width - others - 2 * table.cell_padding)
-        prompt.auto_width = False
+        flex.width = max(10, table.size.width - others - 2 * table.cell_padding)
+        flex.auto_width = False
 
     def _refresh_jobs(
         self, snap: state.Snapshot, jobs: state.FrontendStatus | None
@@ -1497,6 +1583,7 @@ class DashboardScreen(Screen):
             # _refresh_watch_cron wraps log lines.
             table.add_row(
                 Text(_short_job_id(row.id)),
+                Text(_job_source(row.origin)),
                 "running" if row.in_flight else "queued",
                 Text(_prompt_preview(row.prompt)),
                 render.fmt_age(age_s),
@@ -1506,7 +1593,7 @@ class DashboardScreen(Screen):
             # Keep one row so the table reads as "here, but empty" and stays
             # focusable for Tab / the lifecycle keys — same as the other tabs.
             msg = "queue unavailable" if view is None else "queue empty"
-            table.add_row(Text(msg, style="dim"), "", "", "", key="__empty__")
+            table.add_row(Text(msg, style="dim"), "", "", "", "", key="__empty__")
         else:
             if view is not None and view.hidden:
                 # The cap is a display limit, so say what it cut rather than
@@ -1520,10 +1607,12 @@ class DashboardScreen(Screen):
                     "",
                     "",
                     "",
+                    "",
                     key="__more__",
                 )
                 keys.append("__more__")
             self._restore_cursor(table, keys, previously, scroll_y)
+        self._resize_flex_column(table, PROMPT_COLUMN)
 
     @staticmethod
     def _chat_frontends(

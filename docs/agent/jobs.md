@@ -114,6 +114,8 @@ The sweep refuses to signal a group whose current command no longer matches what
 
 `[4]` on the dashboard (`tui/screens/dashboard.py`). Header liveness comes from the `jobs` heartbeat; the queue counts and rows come from the directory, so a backlog is visible with the worker stopped — the state an operator most needs to see. `k`/`r` stop/restart the worker when that tab is active, resolved through `_active_daemon()`; `jobs` is already in `supervisor._FRONTEND_MODULE` and `checks.SUPERVISABLE_FRONTENDS`, so `K`/`u` cover it too.
 
+The `source` column names the producer, read off `origin`: a cron job shows the entry that fired it, so a queue row can be matched against `cron.yaml` and against that entry's own log, and every other producer shows its `origin["kind"]`. An origin with no kind predates the field and shows `-`. Adding a producer therefore means stamping `kind` on the origin it enqueues, or its jobs list as anonymous. `prompt` is the flexible column, sized to the width the other four leave over, because five fixed widths no longer fit an 80-column terminal.
+
 A queue deeper than the row cap gets a trailing `… N more` row, so the cap never truncates in silence. `N` is counted only when the page came back full — a shorter page means a job finished between the depth read and the row read, not a hidden row.
 
 The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#cron-entries` is a different widget** — the cron tab's cron table — and must not be reused.

@@ -629,16 +629,16 @@ class TestJobsTab:
             assert table.row_count == 2
             first = table.get_row_at(0)
             assert str(first[0]) == "aaaaaaaa"  # short id; row key holds the full one
-            assert str(first[1]) == "running"
-            assert str(first[2]) == "the running one"
+            assert str(first[2]) == "running"
+            assert str(first[3]) == "the running one"
             second = table.get_row_at(1)
-            assert str(second[1]) == "queued"
+            assert str(second[2]) == "queued"
             # A newline would break the cell; the preview collapses whitespace.
             # The brackets must survive verbatim — markup would swallow them.
             # (This assertion reads the stored value, so on its own it can't
             # prove markup-safety; reaching it at all is the real check —
             # add_row measures each cell, so an unwrapped str raises there.)
-            assert str(second[2]) == "fix [/] and the [b] route"
+            assert str(second[3]) == "fix [/] and the [b] route"
 
     @pytest.mark.asyncio
     async def test_capped_queue_shows_what_it_left_out(self, tmp_path, monkeypatch):
@@ -756,9 +756,9 @@ class TestJobsTab:
             # by value rather than by row position — an index into a row that
             # turned out to be a placeholder would measure an empty cell and
             # prove nothing.
-            states = {str(table.get_row_at(i)[1]) for i in range(DEFAULT_ROW_LIMIT)}
+            states = {str(table.get_row_at(i)[2]) for i in range(DEFAULT_ROW_LIMIT)}
             assert states == {"running", "queued"}
-            assert max(cell_len(s) for s in states) <= table.ordered_columns[1].width
+            assert max(cell_len(s) for s in states) <= table.ordered_columns[2].width
 
             # A broker-backed queue can't be read from here, and says so in the
             # longest string this table can print.
@@ -853,6 +853,91 @@ class TestJobsTab:
             await pilot.press("k")
             await pilot.pause()
             assert stopped == ["jobs"]
+
+
+class TestCronTab:
+    """The cron table's own width contract. The jobs table has the same one
+    (TestJobsTab), and the two share `_resize_flex_column`."""
+
+    @staticmethod
+    def _isolate(tmp_path, monkeypatch, entries):
+        monkeypatch.setattr("claude_on_the_fly.tui.state.STATE_DIR", tmp_path / "state")
+        monkeypatch.setattr(
+            "claude_on_the_fly.tui.state.DEFAULT_JOBS_DIR", tmp_path / "jobs"
+        )
+        config = tmp_path / "cron.yaml"
+        config.write_text(
+            "jobs:\n"
+            + "".join(
+                f'  - name: {name}\n    cron: "*/5 * * * *"\n    prompt: {"x" * 120}\n'
+                for name in entries
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("claude_on_the_fly.tui.state.DEFAULT_SCHEDULE_YAML", config)
+        return config
+
+    @pytest.mark.asyncio
+    async def test_the_row_fits_the_panel_once_the_table_has_a_width(
+        self, tmp_path, monkeypatch
+    ):
+        """The prompt column is flexible, so a long prompt must cost the table
+        its own width rather than the row's. Measured after a refresh that had a
+        real width to fit against: a pane that has never been painted has no
+        width, and the mount-time column widths are what cover that frame.
+
+        The name column auto-sizes without bound, so this holds while the
+        leftover clears the flexible column's floor of 10 — an entry name long
+        enough to eat that floor overflows the panel and scrolls, which is the
+        column's contract, not a bug in the fit."""
+        from textual.widgets import DataTable
+
+        self._isolate(tmp_path, monkeypatch, ["nightly"])
+        app = ClaudeTuiApp()
+        # Pinned: the budget below is a claim about an 80-column terminal.
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            screen = _dashboard(app)
+            table = app.screen.query_one("#cron-entries", DataTable)
+            assert table.size.width  # the pane has been painted
+            screen._refresh()
+            await pilot.pause()
+
+            assert table.row_count == 1
+            assert (
+                sum(column.get_render_width(table) for column in table.ordered_columns)
+                <= table.container_size.width
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_mount_time_widths_fit_an_80_column_terminal(
+        self, tmp_path, monkeypatch
+    ):
+        """The frame before any fit: the fixed columns plus the flexible one's
+        mount-time width have to fit the 76 the panel is given at 80 columns,
+        against a name column no wider than its own header. A longer entry name
+        widens that column, and the row overflows by the difference until the
+        next refresh fits it — which is why the mount-time width is the fit and
+        not a placeholder."""
+        from textual.widgets import DataTable
+
+        self._isolate(tmp_path, monkeypatch, [])
+        app = ClaudeTuiApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            table = app.screen.query_one("#cron-entries", DataTable)
+            budget = table.container_size.width
+            # Two cells of padding per column, and the name column at its own
+            # header width — the narrowest it can render.
+            total = sum(
+                max(column.width, len(column.label.plain)) + 2
+                for column in table.ordered_columns
+            )
+            assert total <= budget, f"{total} > {budget}"
 
 
 class TestLogScrollPreservation:
