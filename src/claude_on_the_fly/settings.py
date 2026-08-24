@@ -121,6 +121,7 @@ FIELDS: dict[str, Field] = {
     "agent.codex.model": Field("CODEX_MODEL"),
     "agent.ollama.model": Field("OLLAMA_MODEL"),
     "agent.ollama.effort": Field("OLLAMA_EFFORT"),
+    "agent.ollama.context_window": Field("OLLAMA_CONTEXT_WINDOW"),
     "agent.skills_cache_ttl_seconds": Field("SKILLS_CACHE_TTL_SECONDS"),
     "agent.pricing_ttl_seconds": Field("COTF_PRICING_TTL_SECONDS"),
     "agent.auto_compact_pct": Field("COTF_AUTO_COMPACT_PCT"),

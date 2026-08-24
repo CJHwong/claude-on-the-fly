@@ -4218,3 +4218,32 @@ class TestWorkspacePath:
         (root / "hijacked").symlink_to(outside)
         with pytest.raises(ValueError, match="escapes the tree"):
             agent_mod.workspace_path("slack/hijacked", tmp_path)
+
+
+class TestOllamaContextWindowSetting:
+    """Unset or unusable leaves ollama reporting nothing, which is how the
+    feature behaved before the setting existed."""
+
+    def _resolve(self, monkeypatch, raw):
+        from claude_on_the_fly import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod.settings, "get", lambda *a, **k: raw)
+        return agent_mod._ollama_context_window()
+
+    def test_unset_is_none(self, monkeypatch):
+        assert self._resolve(monkeypatch, "") is None
+
+    def test_blank_is_none(self, monkeypatch):
+        assert self._resolve(monkeypatch, "   ") is None
+
+    def test_junk_is_none(self, monkeypatch):
+        assert self._resolve(monkeypatch, "wide") is None
+
+    def test_zero_is_none(self, monkeypatch):
+        assert self._resolve(monkeypatch, "0") is None
+
+    def test_negative_is_none(self, monkeypatch):
+        assert self._resolve(monkeypatch, "-1") is None
+
+    def test_positive_is_used(self, monkeypatch):
+        assert self._resolve(monkeypatch, "200000") == 200000
