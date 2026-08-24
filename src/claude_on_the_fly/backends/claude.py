@@ -81,7 +81,9 @@ def _last_compact_boundary(path: Path | None) -> dict:
     return found
 
 
-def _native_context_fields(cli_output: dict) -> dict:
+def _native_context_fields(
+    cli_output: dict, window_override: int | None = None
+) -> dict:
     """Prompt size and model window from a `claude -p` result envelope.
 
     The pty statusline hands these over ready-made; native has to add them up,
@@ -104,6 +106,12 @@ def _native_context_fields(cli_output: dict) -> dict:
     overstate how full the context is, and for a feature that spends money to
     act, over-reading is the costly direction. Empty dict when either number is
     missing, which reads downstream as "no reading" rather than as zero.
+
+    `window_override` replaces that lookup with a number the operator declared.
+    Ollama mode needs it: the CLI still prints a `contextWindow`, but it comes
+    from claude's own table and describes whichever model claude thinks it is
+    talking to, not the one ollama routed the turn to. An operator who states
+    the window is not guessing, so the reading is trustworthy again.
     """
     usage = cli_output.get("last_assistant_usage") or {}
     tokens = (
@@ -111,11 +119,14 @@ def _native_context_fields(cli_output: dict) -> dict:
         + int(usage.get("cache_read_input_tokens", 0))
         + int(usage.get("cache_creation_input_tokens", 0))
     )
-    windows = [
-        int(entry.get("contextWindow", 0))
-        for entry in (cli_output.get("modelUsage") or {}).values()
-        if isinstance(entry, dict) and entry.get("contextWindow")
-    ]
+    if window_override:
+        windows = [int(window_override)]
+    else:
+        windows = [
+            int(entry.get("contextWindow", 0))
+            for entry in (cli_output.get("modelUsage") or {}).values()
+            if isinstance(entry, dict) and entry.get("contextWindow")
+        ]
     if not tokens or not windows:
         return {}
     return {"context_tokens": tokens, "context_window_size": max(windows)}
@@ -294,11 +305,16 @@ class ClaudeBackend:
         self,
         launcher: OllamaLauncher | None = None,
         pty: bool = False,
+        ollama_context_window: int | None = None,
     ) -> None:
         if launcher is not None and pty:
             raise ValueError("ClaudeBackend: launcher and pty are mutually exclusive")
         self.launcher = launcher
         self.pty = pty
+        # Only meaningful in ollama mode, where the CLI's own `contextWindow`
+        # describes the wrong model. Unset keeps the old behaviour: no reading,
+        # so the footer omits `ctx` and the auto-compact gate stays off.
+        self.ollama_context_window = ollama_context_window
         # Resolve once at construction so per-message hot path skips the
         # `shutil.which` + `os.access` syscalls. Missing binary fails fast
         # here rather than on the first message — preflight already guarantees
@@ -470,22 +486,29 @@ class ClaudeBackend:
 
         statusline = cli_output.get("statusline") or {}
         extra = _statusline_response_fields(statusline)
-        if not self.pty and self.launcher is None:
+        if not self.pty and (self.launcher is None or self.ollama_context_window):
             # pty already has these from the statusline, and its top-level
             # `usage` is the last assistant message only (see `_extract_tokens`),
             # so deriving them there would understate a multi-turn prompt.
             #
-            # Withheld in ollama mode for the same reason the cost above is
-            # recomputed there: the claude CLI reports `contextWindow` from its
-            # own table even when ollama is serving some other vendor's model, so
-            # the figure describes a model that isn't answering (200000 observed
-            # for glm-5.2:cloud). Cost has a real substitute in the OpenRouter
-            # registry; a context window has none. Reporting nothing leaves the
-            # auto-compact gate with no reading, which switches it off in this
-            # mode rather than thresholding against a made-up denominator —
-            # over-reading is the direction that spends money. `$compact` is
-            # unaffected: it is asked for, and the CLI does the real work.
-            extra.update(_native_context_fields(cli_output))
+            # In ollama mode the CLI still reports `contextWindow`, but from
+            # claude's own table for whichever model it thinks it is talking to,
+            # not the one ollama routed the turn to (200000 observed for
+            # glm-5.2:cloud). Cost has a real substitute in the OpenRouter
+            # registry; a window has none the engine can derive — so the engine
+            # does not invent one. `agent.ollama.context_window` lets the
+            # operator state it instead, and a stated window is not a guess.
+            # Left unset, nothing is reported: the footer omits `ctx` and the
+            # auto-compact gate stays off rather than thresholding against a
+            # made-up denominator, since over-reading is the direction that
+            # spends money. `$compact` is unaffected either way: it is asked
+            # for, and the CLI does the real work.
+            extra.update(
+                _native_context_fields(
+                    cli_output,
+                    self.ollama_context_window if self.launcher is not None else None,
+                )
+            )
 
         return Response(
             body=body,

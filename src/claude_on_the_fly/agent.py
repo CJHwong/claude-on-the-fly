@@ -1479,6 +1479,34 @@ def current_backend_key() -> str:
     raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
 
 
+def _ollama_context_window() -> int | None:
+    """Resolve the operator-declared context window for ollama mode.
+
+    None for unset or unusable values, which leaves ollama reporting no reading
+    at all — the behaviour before this setting existed. A junk value disables
+    the reading rather than taking the daemon down, and is logged so a typo does
+    not look like a silently working setting.
+    """
+    raw = settings.get("OLLAMA_CONTEXT_WINDOW").strip()
+    if not raw:
+        return None
+    try:
+        window = int(raw)
+    except ValueError:
+        logger.warning(
+            "OLLAMA_CONTEXT_WINDOW=%r is not a number, ollama reports no context",
+            raw,
+        )
+        return None
+    if window <= 0:
+        logger.warning(
+            "OLLAMA_CONTEXT_WINDOW=%d is not positive, ollama reports no context",
+            window,
+        )
+        return None
+    return window
+
+
 def _build_claude_backend() -> AgentBackend:
     from claude_on_the_fly.backends.claude import ClaudeBackend
 
@@ -1489,7 +1517,10 @@ def _build_claude_backend() -> AgentBackend:
         model = settings.get("OLLAMA_MODEL").strip()
         if not model:
             raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
-        return ClaudeBackend(launcher=OllamaLauncher(model=model))
+        return ClaudeBackend(
+            launcher=OllamaLauncher(model=model),
+            ollama_context_window=_ollama_context_window(),
+        )
     if mode == "pty":
         return ClaudeBackend(pty=True)
     raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")

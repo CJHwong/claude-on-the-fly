@@ -553,10 +553,11 @@ class TestCompactTimeout:
         assert native_exec.await_args.kwargs["timeout"] == 30
 
 
-class TestOllamaWithholdsTheContextWindow:
+class TestOllamaContextWindow:
     """The claude CLI reports `contextWindow` from its own table even when ollama
     serves another vendor's model, so the figure describes a model that isn't
-    answering. Cost gets a real substitute from OpenRouter; a window has none."""
+    answering. The engine will not invent one, but it will use one the operator
+    declares through `agent.ollama.context_window`."""
 
     def _envelope(self) -> dict:
         return {
@@ -609,6 +610,40 @@ class TestOllamaWithholdsTheContextWindow:
         assert response.context_window_size is None, (
             "a made-up denominator is worse than none"
         )
+
+    async def test_declared_window_is_used(self, tmp_path, monkeypatch):
+        """A declared window beats the CLI's own figure, which describes the
+        wrong model. 321000 is deliberately not the 200000 in the envelope."""
+        backend = claude_mod.ClaudeBackend(
+            launcher=claude_mod.OllamaLauncher("glm-5.2:cloud"),
+            ollama_context_window=321_000,
+        )
+        response = await self._run(backend, tmp_path, monkeypatch)
+        assert response.context_tokens == 38_502
+        assert response.context_window_size == 321_000
+
+    async def test_declared_window_does_not_leak_into_native(
+        self, tmp_path, monkeypatch
+    ):
+        """Native derives a real window, so the override is ignored there."""
+        backend = claude_mod.ClaudeBackend(ollama_context_window=321_000)
+        response = await self._run(backend, tmp_path, monkeypatch)
+        assert response.context_window_size == 200000
+
+    def test_declared_window_reaches_the_footer(self):
+        """The footer derives `ctx N%` from the pair, so a declared window is
+        what makes the field appear in ollama mode."""
+        response = claude_mod.Response(
+            body="hi",
+            cost=0.0,
+            duration=1.0,
+            tokens_in=1,
+            tokens_out=1,
+            model="glm-5.2:cloud",
+            context_tokens=160_500,
+            context_window_size=321_000,
+        )
+        assert "ctx 50%" in response.format_stats()
 
 
 class TestBillableUsage:

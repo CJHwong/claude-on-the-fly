@@ -272,6 +272,11 @@ agent:
   # ollama:
   #   model: deepseek-v4-flash:cloud
   #   effort: high
+  #   # The window `ctx N%` and auto-compact threshold against. Ollama mode has
+  #   # no reliable one to read: claude prints its own table's figure for a model
+  #   # it is not actually talking to. State it here and both work; leave it unset
+  #   # and neither does. Match it to the CLI's own limit.
+  #   context_window: 200000
   # Effort applies to the ollama-served model, whichever backend runs under it;
   # in native (or pty) mode the CLIs inherit their own config and this setting
   # never overrides it. Both backends accept low | medium | high | xhigh;

@@ -29,14 +29,16 @@ configuration writes, not those persona links.
 | `codex.mode` | string / `native` | `native` or `ollama` | Next turn |
 | `codex.model` | string / unset | Passed to Codex native mode | Next turn |
 | `ollama.model` | string / unset | Required when either backend mode is `ollama` | Next turn |
+| `ollama.context_window` | integer / unset | Window that `ctx N%` and `auto_compact_pct` measure against in ollama mode; unset reports no reading | Next turn |
 | `auto_compact_pct` | integer / unset | `1..100`; invalid disables automatic compaction | Immediate |
 | `skills_cache_ttl_seconds` | number / `3600` | `<=0` probes on every query; invalid uses default | Immediate |
 | `pricing_ttl_seconds` | integer / `604800` | `0` always refreshes; negative never expires | Immediate |
 | `pty.auto_install` | boolean / false | Install missing claude-pty without prompting | Startup |
 | `pty.auto_refresh` | boolean / true | Re-splice incomplete pty hooks | Startup |
 
-Automatic compaction requires a reliable context-window reading. It is inert for
-Claude routed through Ollama; manual `$compact` remains available.
+Automatic compaction requires a reliable context-window reading. Native and pty
+derive one. Ollama cannot, so it is inert there until `ollama.context_window`
+supplies one; manual `$compact` remains available either way.
 
 ## `interim`
 
