@@ -69,6 +69,20 @@ slack:
   blocked_senders: [U999]
   # Senders that trigger Claude but get no reply posted back.
   silent_senders: [B07JPABE2]
+  # Optional pre-agent gate for an allowed automation bot.
+  bot_policies:
+    B07JPABE2:
+      mode: mention_or_high_value_only
+      process_if:
+        - explicitly_mentions_agent
+        - ticket_comment_or_mention
+        - support_escalation
+      drop_before_ai:
+        - discovery_booked
+        - call_or_note_activity
+        - deal_or_signature_update
+        - payment_notification
+      audit_dropped_events: true
   # Bot token only: the slash command you declared in the manifest. Must match it
   # exactly. Unset means no slash command -- open the skill picker from a message's
   # "..." menu instead. Registered at startup, so a change needs a restart.
@@ -97,6 +111,7 @@ next one without a restart.
 - In channels, only allowed senders (auto-allowed ID + `slack.allowed_senders`) can trigger Claude via @mention
 - Bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID (`B…`) is in `slack.allowed_senders`; trusted bot posts trigger Claude without an @mention. Don't list this app's own bot ID (it would loop)
 - Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
+- A `slack.bot_policies` entry can narrow an allowed bot before agent dispatch. `mention_or_high_value_only` accepts direct mentions and configured ticket/support signals, while routine and unmatched events are dropped without consuming an agent turn
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)

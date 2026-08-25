@@ -11,7 +11,8 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -412,6 +413,187 @@ _DOWNLOAD_CHUNK = 64 * 1024
 
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
+
+
+# Trusted bots normally bypass the channel @mention gate. A per-bot policy can
+# narrow that trust before any session or agent process is created, which is
+# materially different from `silent_senders`: silence suppresses the final Slack
+# reply, while this gate prevents the agent run itself.
+_BOT_POLICY_MODES = frozenset(
+    {"all", "mention_only", "mention_or_high_value_only", "drop"}
+)
+_BOT_PROCESS_CONDITIONS = frozenset(
+    {
+        "explicitly_mentions_agent",
+        "ticket_comment_or_mention",
+        "support_escalation",
+    }
+)
+_BOT_DROP_CATEGORIES = frozenset(
+    {
+        "discovery_booked",
+        "call_or_note_activity",
+        "deal_or_signature_update",
+        "payment_notification",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _BotPolicy:
+    mode: str
+    process_if: frozenset[str]
+    drop_before_ai: frozenset[str]
+    audit_dropped_events: bool
+
+
+def _string_set(value: object, *, field: str, bot_id: str) -> frozenset[str] | None:
+    """Validate one list-valued bot-policy field.
+
+    Returning None distinguishes an invalid field from a deliberately empty list.
+    Invalid policy is ignored as a whole below, preserving the pre-policy behaviour
+    instead of silently dropping work because an operator made a typo.
+    """
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        logger.error(
+            "slack: ignoring bot policy for %s: %s must be a list of names",
+            bot_id,
+            field,
+        )
+        return None
+    return frozenset(
+        item.strip() for item in value if isinstance(item, str) and item.strip()
+    )
+
+
+def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
+    """Parse a single ``slack.bot_policies.<B...>`` block.
+
+    None means no usable policy, so the existing trusted-bot behaviour remains in
+    force. That fallback is deliberately fail-visible rather than fail-drop: a
+    malformed optimization must not discard work.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        logger.error(
+            "slack: ignoring bot policy for %s: expected a mapping, got %s",
+            bot_id,
+            type(raw).__name__,
+        )
+        return None
+    mode = str(raw.get("mode", "all")).strip()
+    if mode not in _BOT_POLICY_MODES:
+        logger.error(
+            "slack: ignoring bot policy for %s: unknown mode %r (expected one of %s)",
+            bot_id,
+            mode,
+            sorted(_BOT_POLICY_MODES),
+        )
+        return None
+    process_if = _string_set(raw.get("process_if"), field="process_if", bot_id=bot_id)
+    drop_before_ai = _string_set(
+        raw.get("drop_before_ai"), field="drop_before_ai", bot_id=bot_id
+    )
+    if process_if is None or drop_before_ai is None:
+        return None
+    unknown_process = sorted(process_if - _BOT_PROCESS_CONDITIONS)
+    unknown_drop = sorted(drop_before_ai - _BOT_DROP_CATEGORIES)
+    if unknown_process or unknown_drop:
+        logger.error(
+            "slack: ignoring bot policy for %s: unknown process_if=%s drop_before_ai=%s",
+            bot_id,
+            unknown_process,
+            unknown_drop,
+        )
+        return None
+    audit = raw.get("audit_dropped_events", False)
+    if not isinstance(audit, bool):
+        logger.error(
+            "slack: ignoring bot policy for %s: audit_dropped_events must be true or false",
+            bot_id,
+        )
+        return None
+    return _BotPolicy(mode, process_if, drop_before_ai, audit)
+
+
+def _matches_ticket_comment_or_mention(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:new\s+(?:ticket\s+)?(?:comment|reply|mention)|"
+            r"(?:commented|replied|mentioned)\b.{0,80}\bticket|"
+            r"ticket\b.{0,80}\b(?:comment|reply|mention)(?:ed)?)\b",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+def _matches_support_escalation(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:support\s+escalation|escalat(?:e|ed|ion)\b.{0,80}\bsupport|"
+            r"support\b.{0,80}\bescalat(?:e|ed|ion)|"
+            r"priority\s*:?\s*urgent|severity\s*:?\s*s[12]|critical\s+support)\b",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+def _routine_bot_category(text: str, enabled: frozenset[str]) -> str | None:
+    """Return the first configured routine category matched by message content."""
+    patterns = (
+        ("discovery_booked", r"\bdiscovery\s+booked\b"),
+        (
+            "call_or_note_activity",
+            r"\b(?:(?:logged|updated)\s+(?:a\s+)?(?:call|note)|"
+            r"(?:call|note)\s+(?:was\s+)?(?:logged|updated))\b",
+        ),
+        (
+            "deal_or_signature_update",
+            r"\b(?:deal\s+(?:ready\s+to\s+sign|won|stage)|"
+            r"(?:contract|agreement)\s+(?:was\s+)?signed|signature)\b",
+        ),
+        (
+            "payment_notification",
+            r"\b(?:payment\s+received|send\s+(?:the\s+)?invoice|"
+            r"invoice\s+payment|overdue\s+invoice)\b",
+        ),
+    )
+    for category, pattern in patterns:
+        if category in enabled and re.search(pattern, text, re.IGNORECASE | re.DOTALL):
+            return category
+    return None
+
+
+def _bot_policy_decision(
+    policy: _BotPolicy, *, text: str, user_id: str
+) -> tuple[bool, str]:
+    """Whether a trusted bot event may create an agent run, plus an audit reason."""
+    if policy.mode == "all":
+        return True, "mode_all"
+    if policy.mode == "drop":
+        return False, "mode_drop"
+
+    if f"<@{user_id}>" in text:
+        return True, "explicit_mention"
+
+    if policy.mode == "mention_or_high_value_only":
+        if (
+            "ticket_comment_or_mention" in policy.process_if
+            and _matches_ticket_comment_or_mention(text)
+        ):
+            return True, "ticket_comment_or_mention"
+        if "support_escalation" in policy.process_if and _matches_support_escalation(
+            text
+        ):
+            return True, "support_escalation"
+
+    category = _routine_bot_category(text, policy.drop_before_ai)
+    return False, category or "unmatched"
 
 
 # How many queued jobs a bare-trigger listing shows before it summarises the
@@ -877,6 +1059,7 @@ class SlackFrontend(Frontend):
         blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
+        bot_policies: Mapping[str, object] | None = None,
         job_command: str | None = None,
         job_queue: JobQueue | None = None,
     ) -> None:
@@ -910,6 +1093,7 @@ class SlackFrontend(Frontend):
         self._pinned_blocked_senders = blocked_senders
         self._pinned_allowed_bot_ids = allowed_bot_ids
         self._pinned_silent_sender_ids = silent_sender_ids
+        self._pinned_bot_policies = bot_policies
         logger.debug(
             "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_senders=%s, allowed_bot_ids=%s, silent_sender_ids=%s",
             user_id,
@@ -1041,6 +1225,21 @@ class SlackFrontend(Frontend):
     @property
     def _silent_sender_ids(self) -> set[str]:
         return self._senders("SLACK_SILENT_SENDER_IDS", self._pinned_silent_sender_ids)
+
+    def _bot_policy(self, bot_id: str) -> _BotPolicy | None:
+        """Return the bot's optional policy, re-reading operator config live."""
+        policies: object
+        if self._pinned_bot_policies is not None:
+            policies = self._pinned_bot_policies
+        else:
+            policies = settings.operator("slack").get("bot_policies", {})
+        if not isinstance(policies, Mapping):
+            logger.error(
+                "slack: ignoring bot_policies: expected a mapping, got %s",
+                type(policies).__name__,
+            )
+            return None
+        return _parse_bot_policy(bot_id, policies.get(bot_id))
 
     def set_orchestrator(self, orchestrator: object) -> None:
         from claude_on_the_fly.orchestrator import Orchestrator
@@ -1793,7 +1992,6 @@ class SlackFrontend(Frontend):
             if not is_trusted_bot:
                 logger.debug("skipped: untrusted bot_message bot_id=%s", bot_id)
                 return
-            logger.info("trusted bot_message accepted: bot_id=%s", bot_id)
         elif subtype and subtype not in _ALLOWED_SUBTYPES:
             logger.debug("skipped: subtype=%s", subtype)
             return
@@ -1830,9 +2028,47 @@ class SlackFrontend(Frontend):
             fwd_refs,
         )
 
-        # Trusted bots are already authorized by bot_id and carry no user field,
-        # so the human allow/block and @mention gates don't apply to them.
-        if not is_trusted_bot:
+        if is_trusted_bot:
+            policy = self._bot_policy(bot_id)
+            if policy is not None:
+                policy_text = "\n".join(
+                    part
+                    for part in (
+                        text,
+                        extra_content,
+                        *(str(fwd.get("text", "")) for fwd in forwards),
+                    )
+                    if part
+                )
+                process, reason = _bot_policy_decision(
+                    policy, text=policy_text, user_id=self._user_id
+                )
+                if not process:
+                    self._processed_ts.append(ts)
+                    self._active_channels[channel] = ts
+                    if channel_type:
+                        self._channel_types[channel] = channel_type
+                    audit_log = (
+                        logger.info if policy.audit_dropped_events else logger.debug
+                    )
+                    audit_log(
+                        "slack bot pre-agent gate: decision=drop bot_id=%s channel=%s ts=%s reason=%s",
+                        bot_id,
+                        channel,
+                        ts,
+                        reason,
+                    )
+                    return
+                logger.info(
+                    "trusted bot_message accepted: bot_id=%s policy_reason=%s",
+                    bot_id,
+                    reason,
+                )
+            else:
+                logger.info("trusted bot_message accepted: bot_id=%s", bot_id)
+        else:
+            # Trusted bots are authorized above by bot_id and carry no user field,
+            # so only humans reach the allow/block and @mention gates below.
             # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
             if sender_id in self._blocked_senders:
                 logger.debug("skipped: sender %s in blocked_senders", sender_id)

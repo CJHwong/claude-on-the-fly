@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     SlackFrontend,
+    _bot_policy_decision,
+    _BotPolicy,
     _extract_forwards,
     _flatten_primary_content,
     _flatten_rich_elements,
+    _matches_support_escalation,
+    _matches_ticket_comment_or_mention,
+    _parse_bot_policy,
     _render_attachment,
     _render_forward,
+    _routine_bot_category,
     _session_key,
     _text_from_blocks,
     _text_from_primary_blocks,
@@ -454,6 +462,7 @@ def _make_frontend(
     allowed_bot_ids: set[str] | None = None,
     silent_sender_ids: set[str] | None = None,
     blocked_senders: set[str] | None = None,
+    bot_policies: dict[str, object] | None = None,
 ) -> SlackFrontend:
     with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
         mock_app = MagicMock()
@@ -467,6 +476,7 @@ def _make_frontend(
             allowed_bot_ids=allowed_bot_ids,
             silent_sender_ids=silent_sender_ids,
             blocked_senders=blocked_senders,
+            bot_policies=bot_policies,
         )
     fe._on_message = AsyncMock()
     # short-circuit helpers that would hit the network
@@ -870,7 +880,170 @@ def _bot_event(bot_id: str = "B07JPABE2", **overrides) -> dict:
     return event
 
 
+def _policy(
+    mode: str,
+    *,
+    process_if: frozenset[str] = frozenset(),
+    drop_before_ai: frozenset[str] = frozenset(),
+    audit_dropped_events: bool = False,
+) -> _BotPolicy:
+    return _BotPolicy(mode, process_if, drop_before_ai, audit_dropped_events)
+
+
+class TestBotPolicy:
+    def test_absent_policy_means_normal_trusted_bot_behavior(self):
+        assert _parse_bot_policy("B1", None) is None
+
+    def test_defaults_to_all_with_empty_lists(self):
+        assert _parse_bot_policy("B1", {}) == _policy("all")
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            ("drop", "expected a mapping"),
+            ({"mode": "typo"}, "unknown mode"),
+            ({"process_if": "support_escalation"}, "must be a list"),
+            ({"process_if": [1]}, "must be a list"),
+            ({"drop_before_ai": "payment_notification"}, "must be a list"),
+            ({"process_if": ["unknown"]}, "unknown process_if"),
+            ({"drop_before_ai": ["unknown"]}, "drop_before_ai=['unknown']"),
+            ({"audit_dropped_events": "yes"}, "must be true or false"),
+        ],
+    )
+    def test_invalid_policy_is_ignored_visibly(self, raw, message, caplog):
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert _parse_bot_policy("B1", raw) is None
+        assert message in caplog.text
+
+    def test_names_are_trimmed_and_audit_is_preserved(self):
+        policy = _parse_bot_policy(
+            "B1",
+            {
+                "mode": "mention_only",
+                "process_if": [" explicitly_mentions_agent ", ""],
+                "drop_before_ai": [" payment_notification "],
+                "audit_dropped_events": True,
+            },
+        )
+        assert policy == _policy(
+            "mention_only",
+            process_if=frozenset({"explicitly_mentions_agent"}),
+            drop_before_ai=frozenset({"payment_notification"}),
+            audit_dropped_events=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("policy", "text", "expected"),
+        [
+            (_policy("all"), "anything", (True, "mode_all")),
+            (_policy("drop"), "<@U1>", (False, "mode_drop")),
+            (
+                _policy("mention_only"),
+                "hello <@U1>",
+                (True, "explicit_mention"),
+            ),
+            (_policy("mention_only"), "hello", (False, "unmatched")),
+            (
+                _policy(
+                    "mention_or_high_value_only",
+                    process_if=frozenset({"ticket_comment_or_mention"}),
+                ),
+                "A user commented on the ticket",
+                (True, "ticket_comment_or_mention"),
+            ),
+            (
+                _policy(
+                    "mention_or_high_value_only",
+                    process_if=frozenset({"support_escalation"}),
+                ),
+                "Escalated by the support team",
+                (True, "support_escalation"),
+            ),
+            (
+                _policy(
+                    "mention_or_high_value_only",
+                    drop_before_ai=frozenset({"payment_notification"}),
+                ),
+                "Payment received",
+                (False, "payment_notification"),
+            ),
+        ],
+    )
+    def test_decision_order(self, policy, text, expected):
+        assert _bot_policy_decision(policy, text=text, user_id="U1") == expected
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("New ticket reply", True),
+            ("Mentioned the customer on ticket ACE-1", True),
+            ("Ticket ACE-1 was commented", True),
+            ("A ticket was opened", False),
+        ],
+    )
+    def test_ticket_signal_variants(self, text, expected):
+        assert _matches_ticket_comment_or_mention(text) is expected
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Support escalation", True),
+            ("Escalated this to support", True),
+            ("Support asked for an escalation", True),
+            ("Priority: urgent", True),
+            ("Severity: S2", True),
+            ("Critical support request", True),
+            ("Routine support reply", False),
+        ],
+    )
+    def test_support_signal_variants(self, text, expected):
+        assert _matches_support_escalation(text) is expected
+
+    @pytest.mark.parametrize(
+        ("text", "category"),
+        [
+            ("Discovery booked", "discovery_booked"),
+            ("Logged a call", "call_or_note_activity"),
+            ("A note was updated", "call_or_note_activity"),
+            ("Deal won", "deal_or_signature_update"),
+            ("Agreement was signed", "deal_or_signature_update"),
+            ("Overdue invoice", "payment_notification"),
+        ],
+    )
+    def test_routine_category_variants(self, text, category):
+        enabled = frozenset(
+            {
+                "discovery_booked",
+                "call_or_note_activity",
+                "deal_or_signature_update",
+                "payment_notification",
+            }
+        )
+        assert _routine_bot_category(text, enabled) == category
+        assert _routine_bot_category(text, frozenset()) is None
+
+
 class TestIngestEventTrustedBot:
+    @staticmethod
+    def _selective_policy(**overrides) -> dict[str, object]:
+        policy: dict[str, object] = {
+            "mode": "mention_or_high_value_only",
+            "process_if": [
+                "explicitly_mentions_agent",
+                "ticket_comment_or_mention",
+                "support_escalation",
+            ],
+            "drop_before_ai": [
+                "discovery_booked",
+                "call_or_note_activity",
+                "deal_or_signature_update",
+                "payment_notification",
+            ],
+            "audit_dropped_events": True,
+        }
+        policy.update(overrides)
+        return {"B07JPABE2": policy}
+
     async def test_trusted_bot_dispatches_with_attachment_content(self):
         fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
         await fe._ingest_event(_bot_event())
@@ -906,6 +1079,89 @@ class TestIngestEventTrustedBot:
         # sender_id is "" for a bot; a non-"*" user allowlist must not drop it.
         fe = _make_frontend(
             allowed_user_ids={"USOMEONE"}, allowed_bot_ids={"B07JPABE2"}
+        )
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_drops_routine_event_before_agent(self, caplog):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        event = _bot_event(
+            text="*Discovery booked*\nInvitee: Customer",
+            attachments=[],
+        )
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await fe._ingest_event(event)
+
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+        assert event["ts"] in fe._processed_ts
+        assert fe._sessions == {}
+        assert fe._active_channels[event["channel"]] == event["ts"]
+        assert fe._channel_types[event["channel"]] == event["channel_type"]
+        audit_row = next(row for row in caplog.messages if "decision=drop" in row)
+        assert "reason=discovery_booked" in audit_row
+        assert "Invitee" not in audit_row
+        assert "Customer" not in audit_row
+
+    async def test_policy_checks_flattened_attachment_content(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_selective_policy_direct_mention_always_processes(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="<@UBOT> Discovery booked", attachments=[])
+        )
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_processes_ticket_comment_without_mention(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="New comment on ticket 12345", attachments=[])
+        )
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_processes_support_escalation_without_mention(
+        self,
+    ):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="Support escalation — Severity: S1", attachments=[])
+        )
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_drops_unmatched_bot_event(self, caplog):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(audit_dropped_events=False),
+        )
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            await fe._ingest_event(
+                _bot_event(text="A new automation event", attachments=[])
+            )
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+        assert "reason=unmatched" in caplog.text
+
+    async def test_invalid_policy_preserves_existing_trusted_bot_behavior(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies={"B07JPABE2": {"mode": "typo"}},
         )
         await fe._ingest_event(_bot_event())
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]

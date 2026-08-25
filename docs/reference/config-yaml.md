@@ -106,6 +106,7 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `allowed_senders` | list / token identity | Humans or explicitly listed bot IDs allowed to trigger | Immediate |
 | `blocked_senders` | list / empty | Deny list; wins over allowed | Immediate |
 | `silent_senders` | list / empty | Trigger without posting a reply | Immediate |
+| `bot_policies` | mapping / empty | Per-allowed-bot pre-agent gate; see below | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, `detailed`; invalid uses summary | Immediate |
 | `slash_command` | string / unset | Bot-token Slack command | Restart required |
 | `job_command` | string / `$job` | Prefix for background work; empty disables | Restart Slack |
@@ -127,6 +128,20 @@ a bare `*` starts a YAML alias and makes the configuration invalid.
 
 `*` allows any human but never implicitly allows bots. With a bot token, list your own
 human Slack ID or your DMs are ignored.
+
+`bot_policies` is keyed by an allowed bot's `B…` id. Supported modes are `all`,
+`mention_only`, `mention_or_high_value_only`, and `drop`. Both selective modes
+accept a direct mention of the agent. The high-value mode can also accept
+`ticket_comment_or_mention` and `support_escalation` signals listed in `process_if`.
+Supported routine categories in `drop_before_ai` are `discovery_booked`,
+`call_or_note_activity`, `deal_or_signature_update`, and `payment_notification`.
+Unmatched events are dropped in either selective mode.
+
+When `audit_dropped_events` is true, the normal Slack log records only the bot id,
+channel id, event timestamp, and decision reason — not the message text. An invalid
+policy logs an error and preserves the existing trusted-bot behavior instead of
+silently discarding work. `silent_senders` remains independent: it suppresses the
+reply only after an allowed event has run.
 
 ## `telegram`
 

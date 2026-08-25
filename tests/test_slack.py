@@ -4201,6 +4201,52 @@ class TestSlashCommand:
         assert "slack.slash_command" in settings.RESTART_REQUIRED
 
 
+class TestBotPolicies:
+    def test_policy_is_read_from_operator_yaml(self, frontend, operator_settings):
+        operator_settings.write_text(
+            """slack:
+  bot_policies:
+    B1:
+      mode: mention_or_high_value_only
+      process_if: [explicitly_mentions_agent, ticket_comment_or_mention]
+      drop_before_ai: [discovery_booked, payment_notification]
+      audit_dropped_events: true
+"""
+        )
+        policy = frontend._bot_policy("B1")
+        assert policy is not None
+        assert policy.mode == "mention_or_high_value_only"
+        assert policy.audit_dropped_events is True
+        assert "ticket_comment_or_mention" in policy.process_if
+
+    def test_policy_edit_is_visible_without_restart(self, frontend, operator_settings):
+        operator_settings.write_text(
+            "slack:\n  bot_policies:\n    B1:\n      mode: mention_only\n"
+        )
+        first = frontend._bot_policy("B1")
+        assert first is not None and first.mode == "mention_only"
+
+        operator_settings.write_text(
+            "slack:\n  bot_policies:\n    B1:\n      mode: drop\n"
+        )
+        second = frontend._bot_policy("B1")
+        assert second is not None and second.mode == "drop"
+
+    def test_missing_policy_uses_normal_trusted_behavior(
+        self, frontend, operator_settings
+    ):
+        operator_settings.write_text("slack: {}\n")
+        assert frontend._bot_policy("B1") is None
+
+    def test_non_mapping_policy_table_is_ignored_visibly(
+        self, frontend, operator_settings, caplog
+    ):
+        operator_settings.write_text("slack:\n  bot_policies: []\n")
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert frontend._bot_policy("B1") is None
+        assert "expected a mapping" in caplog.text
+
+
 class TestSenderLists:
     """Access control, read per message so an edit needs no restart.
 

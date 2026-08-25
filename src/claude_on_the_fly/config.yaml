@@ -319,6 +319,23 @@ slack:
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
   # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
 
+  # Optional per-bot gate, evaluated before a session or agent process is created.
+  # Bot ids here must still appear in allowed_senders. Invalid policies log an
+  # error and preserve normal trusted-bot behavior rather than dropping work.
+  # bot_policies:
+  #   B07JPABE2:
+  #     mode: mention_or_high_value_only
+  #     process_if:
+  #       - explicitly_mentions_agent
+  #       - ticket_comment_or_mention
+  #       - support_escalation
+  #     drop_before_ai:
+  #       - discovery_booked
+  #       - call_or_note_activity
+  #       - deal_or_signature_update
+  #       - payment_notification
+  #     audit_dropped_events: true
+
   # Reply footer and stats: off | summary | detailed
 
   # Slash command to register. Must match the app manifest; needs a restart.
