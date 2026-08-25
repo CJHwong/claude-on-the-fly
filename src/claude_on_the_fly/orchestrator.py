@@ -1316,6 +1316,7 @@ async def run(frontend: Frontend, platform: str) -> None:
     # supervisor can reap it even if this process is SIGKILLed.
     process_ledger = ProcessLedger(DATA_DIR / "state" / f"{platform}.pids")
     listener_attached = False
+    heartbeat_task: asyncio.Task[None] | None = None
 
     try:
         process_ledger.sweep()
@@ -1389,5 +1390,14 @@ async def run(frontend: Frontend, platform: str) -> None:
         # sequence. Never leave a durable process listener attached to the module.
         if listener_attached:
             agent.remove_process_listener(process_ledger.on_process)
+        # Before remove_owned, always. A failure between the heartbeat task
+        # starting and the normal shutdown sequence (resume_pending raising, or
+        # a sandbox teardown error) used to leave the loop alive across the
+        # removal, and its next write recreated the file with a fresh timestamp
+        # and the pid of a process that is exiting. The TUI then read a live
+        # daemon that was already gone.
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
         heartbeat.remove_owned()
         heartbeat.release()
