@@ -322,18 +322,45 @@ slack:
   # Optional per-bot gate, evaluated before a session or agent process is created.
   # Bot ids here must still appear in allowed_senders. Invalid policies log an
   # error and preserve normal trusted-bot behavior rather than dropping work.
+  #
+  #   mode: all        every message reaches the agent (the default)
+  #         selective  `process_if` decides; everything else is dropped
+  #         drop       nothing from this bot reaches the agent
+  #
+  # `process_if` and `drop_before_ai` are your patterns, not a fixed vocabulary:
+  # which messages from YOUR bot are worth an agent turn is a question only you
+  # can answer, and a Jira bot, a PagerDuty bot and a non-English workspace have
+  # nothing in common to hardcode. Each entry is a name and a regular expression
+  # matched against the message text, case-insensitively. Order matters, and the
+  # first match wins.
+  #
+  # `explicitly_mentions_agent` is the one bare name, because "does this address
+  # the agent" is not a text match you could write yourself.
+  #
+  # Under `selective` a message matching nothing is DROPPED. `drop_before_ai`
+  # does not decide that; it only names the drop, so a known routine event is
+  # distinguishable in the log from a message no rule describes.
+  #
+  # The patterns below are a worked example from one CRM bot. They are not
+  # defaults and nothing ships them: replace them with your own.
   # bot_policies:
   #   B07JPABE2:
-  #     mode: mention_or_high_value_only
+  #     mode: selective
   #     process_if:
   #       - explicitly_mentions_agent
-  #       - ticket_comment_or_mention
-  #       - support_escalation
+  #       - name: ticket_activity
+  #         match: 'new (ticket )?(comment|reply|mention)'
+  #       - name: support_escalation
+  #         match: 'support escalation|priority: ?urgent|severity: ?s[12]'
   #     drop_before_ai:
-  #       - discovery_booked
-  #       - call_or_note_activity
-  #       - deal_or_signature_update
-  #       - payment_notification
+  #       - name: discovery_booked
+  #         match: 'discovery booked'
+  #       - name: deal_or_signature_update
+  #         match: 'deal (won|stage)|ready to sign|signature'
+  #       - name: payment_notification
+  #         match: 'payment received|overdue invoice'
+  #     # Defaults to true. A drop is logged at INFO so a pattern that does not
+  #     # match what you expected is visible as a log line, not as silence.
   #     audit_dropped_events: true
 
   # Reply footer and stats: off | summary | detailed

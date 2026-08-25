@@ -129,19 +129,34 @@ a bare `*` starts a YAML alias and makes the configuration invalid.
 `*` allows any human but never implicitly allows bots. With a bot token, list your own
 human Slack ID or your DMs are ignored.
 
-`bot_policies` is keyed by an allowed bot's `B…` id. Supported modes are `all`,
-`mention_only`, `mention_or_high_value_only`, and `drop`. Both selective modes
-accept a direct mention of the agent. The high-value mode can also accept
-`ticket_comment_or_mention` and `support_escalation` signals listed in `process_if`.
-Supported routine categories in `drop_before_ai` are `discovery_booked`,
-`call_or_note_activity`, `deal_or_signature_update`, and `payment_notification`.
-Unmatched events are dropped in either selective mode.
+`bot_policies` is keyed by an allowed bot's `B…` id. Supported modes are `all`
+(every message reaches the agent), `selective` (`process_if` decides), and `drop`
+(nothing does).
 
-When `audit_dropped_events` is true, the normal Slack log records only the bot id,
-channel id, event timestamp, and decision reason — not the message text. An invalid
-policy logs an error and preserves the existing trusted-bot behavior instead of
-silently discarding work. `silent_senders` remains independent: it suppresses the
-reply only after an allowed event has run.
+`process_if` and `drop_before_ai` are ordered lists of your own patterns, because
+which of a bot's messages deserve an agent turn is specific to that bot and that
+workspace. Each entry is a mapping with a `name` and a `match`, where `match` is a
+regular expression applied to the message text with `re.IGNORECASE` and no other
+flag. `DOTALL` is deliberately off, so `.` does not cross newlines in a message
+flattened from blocks and attachments; write `(?s)` in your own pattern if you want
+it. The first matching rule wins and its `name` becomes the audit reason.
+
+`explicitly_mentions_agent` is the one bare string allowed, and only in
+`process_if`. It is a structural test rather than a text match, so there is no
+pattern an operator could write for it.
+
+Under `selective` an event matching nothing is dropped. `drop_before_ai` does not
+decide that. It labels it: a matched rule replaces `unmatched` in the audit line so
+a known routine event is distinguishable from a message no rule describes.
+
+When `audit_dropped_events` is true (the default), the normal Slack log records only
+the bot id, channel id, event timestamp, and decision reason — not the message text.
+It defaults on because this gate discards work before the agent sees it, and a
+pattern that does not match what its author expected should be a log line rather
+than silence. An invalid policy logs an error once per configuration and preserves
+the existing trusted-bot behavior instead of silently discarding work.
+`silent_senders` remains independent: it suppresses the reply only after an allowed
+event has run.
 
 ## `telegram`
 
