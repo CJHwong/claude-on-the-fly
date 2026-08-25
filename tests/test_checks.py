@@ -15,6 +15,7 @@ from claude_on_the_fly.checks import (
     all_ok,
     check_all,
     check_backend,
+    check_backend_runtime_access,
     check_binaries,
     check_frontend,
     check_jobs,
@@ -28,6 +29,68 @@ from claude_on_the_fly.checks import (
     slack_deprecations,
 )
 from claude_on_the_fly.interim import interim_progress_enabled
+
+
+class TestBackendRuntimeAccess:
+    def test_non_codex_backend_needs_no_probe(self, tmp_path):
+        assert (
+            check_backend_runtime_access(
+                {"AGENT_BACKEND": "claude", "HOME": str(tmp_path)}
+            )
+            == []
+        )
+
+    def test_codex_write_probe_passes_and_cleans_up(self, tmp_path):
+        codex_home = tmp_path / "codex-home"
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+
+        assert [(r.name, r.status) for r in results] == [
+            ("Codex state write access", "ok")
+        ]
+        assert str(codex_home) in results[0].detail
+        assert list(codex_home.iterdir()) == []
+
+    def test_default_codex_home_uses_home(self, tmp_path):
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "CODEX", "HOME": str(tmp_path)}
+        )
+        assert results[0].status == "ok"
+        assert (tmp_path / ".codex").is_dir()
+
+    def test_codex_write_probe_reports_sandbox_denial(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        real_open = checks_mod.os.open
+
+        def deny_probe(path, flags, mode=0o777):
+            if str(path).startswith(str(codex_home)):
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(checks_mod.os, "open", deny_probe)
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+
+        assert [(r.name, r.status) for r in results] == [
+            ("Codex state write access", "invalid")
+        ]
+        assert "Operation not permitted" in results[0].detail
+        assert "outside a sandboxed agent session" in (results[0].fix_hint or "")
+
+    def test_failure_after_open_closes_and_removes_probe(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+
+        def fail_write(_fd, _data):
+            raise OSError("write failed")
+
+        monkeypatch.setattr(checks_mod.os, "write", fail_write)
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+        assert results[0].status == "invalid"
+        assert list(codex_home.iterdir()) == []
 
 
 class TestSlackResolvers:

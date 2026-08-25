@@ -213,13 +213,25 @@ def _load_env(env_file: Path | None) -> dict[str, str]:
     return envfile.merged(env_file)
 
 
-def _heartbeat_fresh(frontend: str) -> bool:
-    """True iff a fresh heartbeat file exists for this frontend."""
+def _spawn_preflight(frontend: str, resolved_env: Mapping[str, str]) -> None:
+    """Validate a prospective daemon from the process that will spawn it."""
+    effective_env = settings.environment(resolved_env)
+    results = checks.check_frontend(frontend, effective_env)
+    if frontend in {*checks.CHAT_FRONTENDS, "jobs"}:
+        results += checks.check_backend_runtime_access(effective_env)
+    if not checks.all_ok(results):
+        raise PreflightFailed(frontend=frontend, results=results)
+
+
+def _heartbeat_fresh(frontend: str, *, expected_pid: int | None = None) -> bool:
+    """True iff a fresh heartbeat exists and belongs to ``expected_pid``."""
     path = _heartbeat_file(frontend)
     if not path.is_file():
         return False
     try:
         data = json.loads(path.read_text())
+        if expected_pid is not None and data.get("pid") != expected_pid:
+            return False
         last = data.get("last_heartbeat")
         if not isinstance(last, str):
             return False
@@ -434,9 +446,7 @@ def spawn(
     # settings.environment()). The child itself gets the raw merged env and does
     # its own layering, so baking config values in here would make the daemon
     # log "legacy env var wins" warnings about values it never asked for.
-    results = checks.check_frontend(frontend, settings.environment(resolved_env))
-    if not checks.all_ok(results):
-        raise PreflightFailed(frontend=frontend, results=results)
+    _spawn_preflight(frontend, resolved_env)
 
     stdout = _stdout_file(frontend)
     log_handle = stdout.open("ab")
@@ -460,7 +470,7 @@ def spawn(
     if wait_for_heartbeat:
         deadline = time.monotonic() + spawn_timeout_s
         while time.monotonic() < deadline:
-            if _heartbeat_fresh(frontend):
+            if _heartbeat_fresh(frontend, expected_pid=proc.pid):
                 return proc.pid
             rc = proc.poll()
             if rc is not None:
@@ -540,7 +550,13 @@ def restart(
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
 ) -> int:
-    """Stop (if running) and respawn. Returns the new pid."""
+    """Preflight the replacement, then stop (if running) and respawn."""
+    if frontend not in _FRONTEND_MODULE:
+        raise ValueError(f"unknown frontend: {frontend!r}")
+    resolved_env = dict(env) if env is not None else _load_env(env_file)
+    # Validate while the current daemon is still healthy. A bad config edit or
+    # sandboxed parent should refuse the replacement without causing an outage.
+    _spawn_preflight(frontend, resolved_env)
     with contextlib.suppress(NotRunning):
         stop(frontend, grace_s=grace_s)
     # Remove stale heartbeat so spawn's wait_for_heartbeat checks a fresh write
@@ -550,7 +566,7 @@ def restart(
     return spawn(
         frontend,
         env_file=env_file,
-        env=env,
+        env=resolved_env,
         popen_factory=popen_factory,
         wait_for_heartbeat=wait_for_heartbeat,
         spawn_timeout_s=spawn_timeout_s,

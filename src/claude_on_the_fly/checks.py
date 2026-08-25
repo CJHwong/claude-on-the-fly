@@ -14,9 +14,11 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from claude_on_the_fly import envfile
 from claude_on_the_fly.interim import interim_progress_reads_as_on
@@ -725,6 +727,60 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
         results.append(interim)
 
     return results
+
+
+def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
+    """Probe host access the selected backend needs before it is spawned.
+
+    Permission bits are not sufficient when the supervisor itself is running in
+    a sandbox. A real create/write/unlink cycle verifies that the replacement
+    daemon will be able to initialize Codex state before a restart stops the
+    healthy process.
+    """
+    if env.get("AGENT_BACKEND", "claude").lower() != "codex":
+        return []
+
+    configured = env.get("CODEX_HOME", "").strip()
+    home = (
+        Path(configured).expanduser()
+        if configured
+        else Path(env.get("HOME") or Path.home()) / ".codex"
+    )
+    probe = home / f".cotf-write-probe-{os.getpid()}-{uuid4().hex}"
+    fd: int | None = None
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, b"ok\n")
+        os.close(fd)
+        fd = None
+        probe.unlink()
+    except OSError as exc:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        with suppress(OSError):
+            probe.unlink()
+        return [
+            CheckResult(
+                name="Codex state write access",
+                status="invalid",
+                detail=f"cannot write {home}: {exc}",
+                fix_hint=(
+                    "Run the start or restart command from a terminal outside "
+                    "a sandboxed agent session. Changing mode bits may not help "
+                    "when the parent process is sandboxed."
+                ),
+            )
+        ]
+
+    return [
+        CheckResult(
+            name="Codex state write access",
+            status="ok",
+            detail=f"write probe passed at {home}",
+        )
+    ]
 
 
 # Backend/mode pairs that can both compact and supply the prompt-size reading

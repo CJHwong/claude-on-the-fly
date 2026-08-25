@@ -234,6 +234,50 @@ class TestStop:
 
 
 class TestRestart:
+    def test_unknown_frontend_is_refused_before_stop(self, monkeypatch):
+        stop = MagicMock()
+        monkeypatch.setattr(supervisor, "stop", stop)
+        with pytest.raises(ValueError, match="unknown frontend"):
+            supervisor.restart("nope", env={})
+        stop.assert_not_called()
+
+    def test_failed_runtime_probe_keeps_healthy_daemon_running(
+        self, isolated_state, monkeypatch
+    ):
+        """A sandboxed operator is refused before stop(), not afterward."""
+        from claude_on_the_fly.checks import CheckResult
+
+        _write_heartbeat(supervisor.STATE_DIR, "slack", pid=1111)
+        failure = CheckResult(
+            name="Codex state write access",
+            status="invalid",
+            detail="Operation not permitted",
+        )
+        monkeypatch.setattr(
+            supervisor.checks,
+            "check_backend_runtime_access",
+            lambda _env: [failure],
+        )
+        stop = MagicMock()
+        monkeypatch.setattr(supervisor, "stop", stop)
+        popen = MagicMock()
+
+        with pytest.raises(supervisor.PreflightFailed, match="Codex state write"):
+            supervisor.restart(
+                "slack",
+                env={
+                    "SLACK_APP_TOKEN": "xapp-1",
+                    "SLACK_TOKEN": "xoxb-1",
+                    "AGENT_BACKEND": "codex",
+                },
+                popen_factory=popen,
+                wait_for_heartbeat=False,
+            )
+
+        stop.assert_not_called()
+        popen.assert_not_called()
+        assert (supervisor.STATE_DIR / "slack.json").is_file()
+
     def test_restart_stops_then_spawns(self, isolated_state, monkeypatch):
         _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1111)
 
@@ -545,6 +589,18 @@ class TestHeartbeatFreshness:
         )
         assert supervisor._heartbeat_fresh("slack") is True
 
+    def test_a_recent_heartbeat_from_another_pid_is_not_our_startup(
+        self, isolated_state
+    ):
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (isolated_state / "state" / "slack.json").write_text(
+            json.dumps({"pid": 1111, "last_heartbeat": now})
+        )
+        assert supervisor._heartbeat_fresh("slack", expected_pid=2222) is False
+        assert supervisor._heartbeat_fresh("slack", expected_pid=1111) is True
+
     def test_an_old_heartbeat_is_not_fresh(self, isolated_state):
         """A SIGKILLed daemon leaves its file behind, so age is the only thing that
         distinguishes it from a live one."""
@@ -629,10 +685,15 @@ class TestSpawnWaitsForAHeartbeat:
         proc = MagicMock(pid=4242)
         proc.poll.return_value = None
 
-        def heartbeat_now(_frontend):
+        def heartbeat_now(_frontend, *, expected_pid=None):
             (supervisor.STATE_DIR / "telegram.json").write_text(
                 json.dumps(
-                    {"last_heartbeat": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                    {
+                        "pid": expected_pid,
+                        "last_heartbeat": datetime.now(UTC).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                    }
                 )
             )
             return True
@@ -651,7 +712,7 @@ class TestSpawnWaitsForAHeartbeat:
     ):
         proc = MagicMock(pid=4242)
         proc.poll.return_value = 1
-        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: False)
         stdout = supervisor.LOG_DIR / "telegram.stdout"
         stdout.write_text("Traceback...\nImportError: no module named telegram\n")
         monkeypatch.setattr(supervisor, "_stdout_file", lambda _f: stdout)
@@ -677,7 +738,7 @@ class TestSpawnWaitsForAHeartbeat:
         holding the queue that nothing will ever manage."""
         proc = MagicMock(pid=4242)
         proc.poll.return_value = None
-        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: False)
         monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(
@@ -703,7 +764,7 @@ class TestSpawnWaitsForAHeartbeat:
         cleanup signal on top of it is not."""
         proc = MagicMock(pid=4242)
         proc.poll.return_value = None
-        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f: False)
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: False)
         monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
         monkeypatch.setattr(
             supervisor.os,
