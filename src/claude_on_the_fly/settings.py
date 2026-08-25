@@ -72,6 +72,7 @@ SECTIONS = (
     "sandbox",
     "agent",
     "interim",
+    "watchdog",
     "slack",
     "telegram",
     "jobs",
@@ -131,6 +132,9 @@ FIELDS: dict[str, Field] = {
     # progress has one: `interim.py`. It is not a backend knob (it survives a
     # backend swap) and not platform rendering (the pacing question is the same on
     # every frontend), so it belongs beside neither `agent:` nor `slack:`.
+    # Read per tick by a one-shot process, so an edit lands on the next
+    # scheduler run with nothing to restart.
+    "watchdog.stale_seconds": Field("WATCHDOG_STALE_SECONDS"),
     "interim.progress": Field("COTF_INTERIM_PROGRESS"),
     "interim.warmup_seconds": Field("COTF_INTERIM_WARMUP_SECONDS"),
     "interim.min_gap_seconds": Field("COTF_INTERIM_MIN_GAP_SECONDS"),

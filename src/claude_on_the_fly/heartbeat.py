@@ -39,6 +39,20 @@ DEFAULT_INTERVAL_S = 5.0
 DEFAULT_LIVENESS_WINDOW_S = 30.0
 
 
+def resolved_runtime_dir(executable: str) -> str | None:
+    """The real directory a Python entry point lives in, symlinks followed.
+
+    The `bin` directory rather than the binary: a virtualenv's python is often
+    a symlink to one shared system interpreter, which would make every release
+    look identical. None when the path cannot be resolved, which reads as
+    "cannot tell" to every caller rather than as a difference.
+    """
+    try:
+        return str(Path(executable).parent.resolve())
+    except (OSError, RuntimeError):
+        return None
+
+
 class InstanceAlreadyClaimed(RuntimeError):
     """A second daemon tried to own the same frontend state."""
 
@@ -148,6 +162,13 @@ class HeartbeatWriter:
         self._started_at = _utcnow_iso()
         self._version = _package_version()
         self._executable = sys.executable
+        # Resolved once, here, while this process is starting. `sys.executable`
+        # under a managed launcher is the symlink path (`.../current/.venv/bin/
+        # python`), so resolving it later answers "where does current point
+        # NOW" rather than "which release is this process running". A reader
+        # comparing two live resolutions of one symlink can never see a
+        # difference, however many releases have come and gone.
+        self._resolved_executable = resolved_runtime_dir(sys.executable)
         self._path = self._state_dir / f"{frontend}.json"
         self._lock_path = self._state_dir / f"{frontend}.instance.lock"
         self._lock_fd: int | None = None
@@ -225,6 +246,7 @@ class HeartbeatWriter:
                 "last_heartbeat": _utcnow_iso(),
                 "version": self._version,
                 "executable": self._executable,
+                "resolved_executable": self._resolved_executable,
                 "instance_id": self._instance_id,
                 "extra": extra,
             }

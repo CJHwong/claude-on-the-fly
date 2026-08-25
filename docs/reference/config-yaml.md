@@ -40,6 +40,25 @@ Automatic compaction requires a reliable context-window reading. Native and pty
 derive one. Ollama cannot, so it is inert there until `ollama.context_window`
 supplies one; manual `$compact` remains available either way.
 
+## `watchdog`
+
+| Key | Type / default | Values and effect | Lifecycle |
+|---|---|---|---|
+| `stale_seconds` | number / `90` | How long a live process may go without a heartbeat before `claude-watchdog` restarts it; non-numeric, zero, or negative warns and uses the default | Immediate |
+
+Read per run by a one-shot process, so an edit applies on the next scheduler
+tick with nothing to restart.
+
+The threshold is deliberately higher than the dashboard's 15 second staleness
+window. That one decides a colour, where being early is free; this one decides a
+restart, which costs every turn in flight, and the heartbeat coroutine can be
+briefly starved by a poll cadence or a slow tracker call.
+
+`claude-watchdog` acts only on a daemon whose process is alive and whose
+heartbeat has gone stale. It never starts a stopped daemon: nothing on disk
+separates a crash from a deliberate stop or from the middle of an upgrade. See
+[Recover a wedged daemon](../how-to/recover-a-wedged-daemon.md).
+
 ## `interim`
 
 | Key | Type / default | Values and effect | Lifecycle |

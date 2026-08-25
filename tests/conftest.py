@@ -134,6 +134,21 @@ def isolate_startup_settings(monkeypatch):
     monkeypatch.setattr(settings, "_STARTUP_VALUES", {})
 
 
+@pytest.fixture(autouse=True)
+def isolate_processed_events(tmp_path, monkeypatch):
+    """Give every test its own processed-event set.
+
+    The set is durable on purpose, so without this one test's handled ids are
+    still remembered when the next one reuses the same event timestamp, and the
+    second test silently skips the message it meant to ingest. Redirects
+    DATA_DIR on the consuming module, the convention the orchestrator tests
+    already use.
+    """
+    from claude_on_the_fly import slack
+
+    monkeypatch.setattr(slack, "DATA_DIR", tmp_path / "cotf-data")
+
+
 @pytest.fixture
 def operator_settings(tmp_path, monkeypatch):
     """Path to a per-test operator `config.yaml`, with DATA_DIR redirected to it.

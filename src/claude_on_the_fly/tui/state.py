@@ -31,7 +31,7 @@ from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
 from claude_on_the_fly.cron import CronEntry
 from claude_on_the_fly.cron import load_config as load_cron_config
 from claude_on_the_fly.cron import next_fire as cron_next_fire
-from claude_on_the_fly.heartbeat import STATE_DIR
+from claude_on_the_fly.heartbeat import STATE_DIR, resolved_runtime_dir
 from claude_on_the_fly.heartbeat import process_exists as heartbeat_process_exists
 from claude_on_the_fly.jobs.file_queue import (
     DEFAULT_ROW_LIMIT,
@@ -154,15 +154,27 @@ def _is_stale(
     daemon_executable: str | None,
     self_version: str,
     self_executable: str,
+    daemon_resolved_executable: str | None = None,
 ) -> bool:
     """A daemon is stale when it's running but its recorded version or
     executable path differs from the TUI's own. Missing fields (older
     daemons without `executable` in the heartbeat) are treated as
-    "can't tell" so we don't false-positive during a rollout."""
+    "can't tell" so we don't false-positive during a rollout.
+
+    A deployment that switches a `current` release symlink needs the resolved
+    comparison. Both processes are launched through the symlink, so both record
+    the same literal path and the string comparison below can never see a
+    release change. The daemon resolves its own directory once at startup
+    (`heartbeat.resolved_runtime_dir`); this resolves the reader's now. One
+    frozen side and one live side is what makes a flip visible, and comparing
+    two live resolutions of the same symlink is what makes it invisible.
+    """
     if state_str != "running":
         return False
     if daemon_version is not None and daemon_version != self_version:
         return True
+    if daemon_resolved_executable is not None:
+        return daemon_resolved_executable != resolved_runtime_dir(self_executable)
     return daemon_executable is not None and daemon_executable != self_executable
 
 
@@ -195,6 +207,11 @@ def _frontend_status_from_heartbeat(
     daemon_executable = (
         payload.get("executable")
         if isinstance(payload.get("executable"), str)
+        else None
+    )
+    daemon_resolved = (
+        payload.get("resolved_executable")
+        if isinstance(payload.get("resolved_executable"), str)
         else None
     )
 
@@ -234,7 +251,12 @@ def _frontend_status_from_heartbeat(
         version=daemon_version,
         executable=daemon_executable,
         stale=_is_stale(
-            state, daemon_version, daemon_executable, self_version, self_executable
+            state,
+            daemon_version,
+            daemon_executable,
+            self_version,
+            self_executable,
+            daemon_resolved,
         ),
     )
 

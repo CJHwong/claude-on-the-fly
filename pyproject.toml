@@ -24,6 +24,7 @@ claude-telegram = "claude_on_the_fly.telegram:main"
 claude-cron = "claude_on_the_fly.cron:main"
 claude-jobs = "claude_on_the_fly.jobs.cli:main"
 claude-tui = "claude_on_the_fly.tui.app:main"
+claude-watchdog = "claude_on_the_fly.watchdog:main"
 
 [dependency-groups]
 dev = [

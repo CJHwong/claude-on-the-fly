@@ -39,6 +39,7 @@ from claude_on_the_fly.agent import (
     write_attachment,
 )
 from claude_on_the_fly.approvals import ApprovalRequest
+from claude_on_the_fly.event_dedupe import ProcessedEvents
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
@@ -1134,7 +1135,7 @@ class SlackFrontend(Frontend):
         # currently running, so a slash command targets a real message or
         # command-anchor session instead of an unregistered root.
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
-        self._processed_ts: deque[str] = deque(maxlen=1000)
+        self._processed_events_cache: tuple[Path, ProcessedEvents] | None = None
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
         self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
         self._own_dm: dict[str, tuple[bool, float]] = {}
@@ -1232,6 +1233,23 @@ class SlackFrontend(Frontend):
         if pinned is not None:
             return pinned
         return {sid for sid in self._configured_senders() if sid.startswith("B")}
+
+    @property
+    def _processed_ts(self) -> ProcessedEvents:
+        """Event ids this install has acted on, surviving a restart.
+
+        Cached against its own path rather than rebuilt per call the way
+        `orchestrator._journal` is: a journal is a path and nothing else, while
+        this reads its file on construction. Re-keying on the path keeps the
+        one property `_journal` has, that a later redirection of DATA_DIR is
+        still seen, without re-reading the set on every message.
+        """
+        path = DATA_DIR / "state" / "slack.events.json"
+        cached = self._processed_events_cache
+        if cached is None or cached[0] != path:
+            cached = (path, ProcessedEvents(path))
+            self._processed_events_cache = cached
+        return cached[1]
 
     @property
     def _silent_sender_ids(self) -> set[str]:
@@ -2064,7 +2082,7 @@ class SlackFrontend(Frontend):
                     policy, text=policy_text, user_id=self._user_id
                 )
                 if not process:
-                    self._processed_ts.append(ts)
+                    self._processed_ts.add(ts)
                     self._active_channels[channel] = ts
                     if channel_type:
                         self._channel_types[channel] = channel_type
@@ -2162,7 +2180,7 @@ class SlackFrontend(Frontend):
             # This branch returns before the normal path's catch-up bookkeeping,
             # so mirror it here or a reconnect re-ingests the trigger and
             # compacts a second time.
-            self._processed_ts.append(ts)
+            self._processed_ts.add(ts)
             self._active_channels[channel] = ts
             if channel_type:
                 self._channel_types[channel] = channel_type
@@ -2215,7 +2233,7 @@ class SlackFrontend(Frontend):
             # mark the ts processed (dedup), record the channel + watermark so
             # _catchup re-fetches it after a disconnect, and cache the channel
             # type so the recovered messages gate identically to the live path.
-            self._processed_ts.append(ts)
+            self._processed_ts.add(ts)
             self._active_channels[channel] = ts
             if channel_type:
                 self._channel_types[channel] = channel_type
@@ -2314,7 +2332,7 @@ class SlackFrontend(Frontend):
             return
 
         self._session_sender_ids[session_id] = sender_id
-        self._processed_ts.append(ts)
+        self._processed_ts.add(ts)
         self._active_channels[channel] = ts
         if channel_type:
             self._channel_types[channel] = channel_type

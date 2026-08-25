@@ -299,6 +299,18 @@ agent:
   #   auto_install: false
   #   auto_refresh: true
 
+watchdog:
+  # `claude-watchdog` restarts a daemon whose process is alive but whose
+  # heartbeat has gone stale. Nothing else recovers one without a person
+  # watching the dashboard. An external scheduler runs the command; this
+  # package installs no timer.
+  #
+  # How long a live process may go silent first. The dashboard calls a daemon
+  # broken at 15s, which is right for a colour and wrong for an action: acting
+  # that early kills every turn in flight over a briefly starved coroutine. At
+  # the 5s heartbeat interval the default is 18 consecutive misses.
+  # stale_seconds: 90
+
 interim:
   # Forward the agent's mid-turn narration into the thread while a turn runs, so a
   # long turn is not silent. Off by default; native/ollama backends only (not
