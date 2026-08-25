@@ -28,6 +28,7 @@ from claude_on_the_fly.slack import (
     _split_blocks,
 )
 from claude_on_the_fly.slack_mrkdwn import SLACK_MARKDOWN_LIMIT
+from claude_on_the_fly.slack_watermarks import SlackWatermarks
 
 # ---------------------------------------------------------------------------
 # _build_response_blocks
@@ -701,6 +702,7 @@ class TestSend:
 
         await frontend.send(session_id, Response(body="hi"))
         assert "99.0" in frontend._our_sent_timestamps
+        assert "99.0" in frontend._processed_ts
 
     async def test_send_ok_false_logs_warning(self, frontend: SlackFrontend) -> None:
         session_id = _session_key("C1", "t1")
@@ -1209,6 +1211,54 @@ class TestOnHello:
             await frontend._on_hello(event={}, say=None)
         assert frontend._connected_once is True
         mock_catchup.assert_not_awaited()
+
+    async def test_initial_connection_runs_catchup_from_durable_watermark(
+        self, frontend
+    ):
+        SlackWatermarks(slack_mod.DATA_DIR / "state" / "slack.watermarks.json").record(
+            "D1", str(time.time()), "im"
+        )
+        with patch.object(frontend, "_catchup", new_callable=AsyncMock) as catchup:
+            await frontend._on_hello(event={}, say=None)
+
+        catchup.assert_awaited_once()
+        assert frontend._active_channels["D1"]
+        assert frontend._channel_types["D1"] == "im"
+
+    async def test_initial_connection_ignores_stale_durable_watermark(self, frontend):
+        SlackWatermarks(slack_mod.DATA_DIR / "state" / "slack.watermarks.json").record(
+            "D1", "100.0", "im"
+        )
+        with patch.object(frontend, "_catchup", new_callable=AsyncMock) as catchup:
+            await frontend._on_hello(event={}, say=None)
+
+        catchup.assert_not_awaited()
+        assert "D1" not in frontend._active_channels
+
+    async def test_initial_catchup_ingests_only_the_unseen_history(self, frontend):
+        previous_ts = str(time.time() - 10)
+        own_reply_ts = str(time.time() - 8)
+        missed_ts = str(time.time() - 5)
+        path = slack_mod.DATA_DIR / "state" / "slack.watermarks.json"
+        SlackWatermarks(path).record("D1", previous_ts, "im")
+        frontend._processed_ts.add(previous_ts)
+        frontend._remember_sent_timestamp(own_reply_ts)
+        frontend._app.client.conversations_history.return_value = {
+            "messages": [
+                {"ts": missed_ts, "text": "sent during restart", "user": "U_ALLOWED"},
+                {"ts": own_reply_ts, "text": "our earlier reply", "user": "U_SELF"},
+                {"ts": previous_ts, "text": "already handled", "user": "U_ALLOWED"},
+            ]
+        }
+
+        await frontend._on_hello(event={}, say=None)
+
+        frontend._on_message.assert_awaited_once()
+        assert "sent during restart" in frontend._on_message.await_args.args[1]
+        assert missed_ts in frontend._processed_ts
+        frontend._app.client.conversations_history.assert_awaited_once_with(
+            channel="D1", oldest=previous_ts, inclusive=False, limit=20
+        )
 
     async def test_reconnection_triggers_catchup(self, frontend):
         frontend._connected_once = True
@@ -4316,6 +4366,52 @@ class TestProcessedEventDurability:
         laziness from, so rebuilding per call would be a read per message."""
         first = frontend._processed_ts
         assert frontend._processed_ts is first
+
+
+class TestWatermarkDurability:
+    async def test_an_accepted_event_persists_its_restart_position(self, frontend):
+        event_ts = str(time.time())
+        await frontend._ingest_event(
+            {
+                "user": "U_ALLOWED",
+                "channel": "D1",
+                "channel_type": "im",
+                "ts": event_ts,
+                "text": "please check",
+            }
+        )
+
+        restored = SlackWatermarks(
+            slack_mod.DATA_DIR / "state" / "slack.watermarks.json"
+        ).recent()
+        assert [(row.channel, row.ts, row.channel_type) for row in restored] == [
+            ("D1", event_ts, "im")
+        ]
+
+    def test_the_store_is_reread_when_the_data_dir_moves(
+        self, frontend, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "one")
+        frontend._record_watermark("D1", str(time.time()), "im")
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "two")
+
+        assert len(frontend._watermarks) == 0
+
+    def test_a_malformed_timestamp_does_not_move_the_live_position(self, frontend):
+        frontend._active_channels["D1"] = "100.0"
+
+        frontend._record_watermark("D1", "not-a-timestamp", "im")
+
+        assert frontend._active_channels["D1"] == "100.0"
+        assert frontend._channel_types["D1"] == "im"
+
+    def test_durable_positions_are_restored_once(self, frontend):
+        SlackWatermarks(slack_mod.DATA_DIR / "state" / "slack.watermarks.json").record(
+            "D1", str(time.time()), "im"
+        )
+
+        assert frontend._restore_watermarks() == 1
+        assert frontend._restore_watermarks() == 0
 
 
 class TestSenderLists:

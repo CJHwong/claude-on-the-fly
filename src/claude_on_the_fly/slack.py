@@ -46,6 +46,7 @@ from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+from claude_on_the_fly.slack_watermarks import SlackWatermarks
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -1119,8 +1120,10 @@ class SlackFrontend(Frontend):
         # filter correctly drops our reply echoes — let it. A user token (xoxp-)
         # replies as the human, and we deliberately keep self-events so messages
         # typed from another Slack client still reach the agent; dedup of our own
-        # replies then falls to _our_sent_timestamps (which _catchup relies on
-        # regardless, since fetched history bypasses Bolt's filter).
+        # replies then falls to _our_sent_timestamps. The durable processed-event
+        # ledger mirrors those reply timestamps too, because restart catch-up
+        # begins with an empty in-memory echo guard and fetched history bypasses
+        # Bolt's filter.
         self._is_bot_token = token.startswith("xoxb-")
         self._app = AsyncApp(
             token=token, ignoring_self_events_enabled=self._is_bot_token
@@ -1136,6 +1139,8 @@ class SlackFrontend(Frontend):
         # command-anchor session instead of an unregistered root.
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
         self._processed_events_cache: tuple[Path, ProcessedEvents] | None = None
+        self._watermarks_cache: tuple[Path, SlackWatermarks] | None = None
+        self._watermarks_restored = False
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
         self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
         self._own_dm: dict[str, tuple[bool, float]] = {}
@@ -1250,6 +1255,53 @@ class SlackFrontend(Frontend):
             cached = (path, ProcessedEvents(path))
             self._processed_events_cache = cached
         return cached[1]
+
+    @property
+    def _watermarks(self) -> SlackWatermarks:
+        """Recent active conversations, surviving a daemon restart."""
+        path = DATA_DIR / "state" / "slack.watermarks.json"
+        cached = self._watermarks_cache
+        if cached is None or cached[0] != path:
+            cached = (path, SlackWatermarks(path))
+            self._watermarks_cache = cached
+        return cached[1]
+
+    def _record_watermark(
+        self, channel: str, event_ts: str, channel_type: str = ""
+    ) -> None:
+        """Advance the in-memory and durable catch-up positions together."""
+        previous = self._active_channels.get(channel)
+        try:
+            advances = previous is None or float(event_ts) >= float(previous)
+        except (TypeError, ValueError):
+            advances = False
+        if advances:
+            self._active_channels[channel] = event_ts
+        if channel_type:
+            self._channel_types[channel] = channel_type
+        self._watermarks.record(channel, event_ts, channel_type)
+
+    def _restore_watermarks(self) -> int:
+        """Merge recent persisted positions before the initial history scan."""
+        if self._watermarks_restored:
+            return 0
+        self._watermarks_restored = True
+        restored = 0
+        for entry in self._watermarks.recent():
+            previous = self._active_channels.get(entry.channel)
+            if previous is None or float(entry.ts) > float(previous):
+                self._active_channels[entry.channel] = entry.ts
+            if entry.channel_type:
+                self._channel_types[entry.channel] = entry.channel_type
+            restored += 1
+        return restored
+
+    def _remember_sent_timestamp(self, event_ts: object) -> None:
+        """Keep one COTF-authored Slack event out of live and restart catch-up."""
+        if not isinstance(event_ts, str) or not event_ts:
+            return
+        self._our_sent_timestamps.append(event_ts)
+        self._processed_ts.add(event_ts)
 
     @property
     def _silent_sender_ids(self) -> set[str]:
@@ -2011,6 +2063,14 @@ class SlackFrontend(Frontend):
     async def _on_hello(self, event, say):
         if not self._connected_once:
             self._connected_once = True
+            restored = self._restore_watermarks()
+            if restored:
+                logger.info(
+                    "Socket Mode: initial connection, running catch-up for %d recent conversation(s)",
+                    restored,
+                )
+                await self._catchup()
+                return
             logger.info("Socket Mode: initial connection")
             return
         logger.info("Socket Mode: reconnected, running catch-up")
@@ -2083,9 +2143,7 @@ class SlackFrontend(Frontend):
                 )
                 if not process:
                     self._processed_ts.add(ts)
-                    self._active_channels[channel] = ts
-                    if channel_type:
-                        self._channel_types[channel] = channel_type
+                    self._record_watermark(channel, ts, channel_type)
                     audit_log = (
                         logger.info if policy.audit_dropped_events else logger.debug
                     )
@@ -2181,9 +2239,7 @@ class SlackFrontend(Frontend):
             # so mirror it here or a reconnect re-ingests the trigger and
             # compacts a second time.
             self._processed_ts.add(ts)
-            self._active_channels[channel] = ts
-            if channel_type:
-                self._channel_types[channel] = channel_type
+            self._record_watermark(channel, ts, channel_type)
             if self._orchestrator is None:
                 await self._post_notice(
                     channel, thread_ts, "Not connected to a session yet."
@@ -2234,9 +2290,7 @@ class SlackFrontend(Frontend):
             # _catchup re-fetches it after a disconnect, and cache the channel
             # type so the recovered messages gate identically to the live path.
             self._processed_ts.add(ts)
-            self._active_channels[channel] = ts
-            if channel_type:
-                self._channel_types[channel] = channel_type
+            self._record_watermark(channel, ts, channel_type)
             if not task:
                 # A bare trigger is somebody asking what is already running,
                 # which is the one moment the answer is worth more than the
@@ -2333,9 +2387,7 @@ class SlackFrontend(Frontend):
 
         self._session_sender_ids[session_id] = sender_id
         self._processed_ts.add(ts)
-        self._active_channels[channel] = ts
-        if channel_type:
-            self._channel_types[channel] = channel_type
+        self._record_watermark(channel, ts, channel_type)
 
         cover_parts: list[str] = []
         if file_lines:
@@ -2465,7 +2517,7 @@ class SlackFrontend(Frontend):
             return []
 
         if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+            self._remember_sent_timestamp(resp["ts"])
             self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             logger.debug("send: ok ts=%s", resp["ts"])
             await self._upload_attachments(channel, thread_ts, response.attachments)
@@ -2521,7 +2573,7 @@ class SlackFrontend(Frontend):
             logger.error("upload: failed to post failure notice: %s", exc)
             return
         if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+            self._remember_sent_timestamp(resp["ts"])
 
     def _schedule_reply_limit_warning(
         self,
@@ -2679,7 +2731,7 @@ class SlackFrontend(Frontend):
             logger.error("reply-limit: failed to post warning: %s", exc)
             return
         if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+            self._remember_sent_timestamp(resp["ts"])
 
     async def _anchor_run(
         self, channel: str, thread_ts: str | None, label: str
@@ -2704,7 +2756,7 @@ class SlackFrontend(Frontend):
             return None
         if resp.get("ok"):
             ts = resp["ts"]
-            self._our_sent_timestamps.append(ts)
+            self._remember_sent_timestamp(ts)
             return ts
         return None
 
@@ -2740,7 +2792,7 @@ class SlackFrontend(Frontend):
             logger.error("post_notice: failed to post %r: %s", text, exc)
             return
         if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+            self._remember_sent_timestamp(resp["ts"])
 
     async def send_progress(self, chat_id: int, text: str) -> None:
         """Post one mid-turn progress message into the thread the turn runs in.
@@ -2793,7 +2845,7 @@ class SlackFrontend(Frontend):
             logger.error("progress: failed to post: %s", exc)
             return
         if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+            self._remember_sent_timestamp(resp["ts"])
 
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload
@@ -2804,7 +2856,7 @@ class SlackFrontend(Frontend):
                     for share in share_list:
                         ts = share.get("ts")
                         if ts:
-                            self._our_sent_timestamps.append(ts)
+                            self._remember_sent_timestamp(ts)
 
     async def send_typing(self, chat_id: int) -> None:
         """Live progress tick. The orchestrator calls this every ~4s while a
@@ -3006,7 +3058,7 @@ class SlackFrontend(Frontend):
             logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
             return []
         if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+            self._remember_sent_timestamp(resp["ts"])
             self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             await self._upload_attachments(dm_channel, None, response.attachments)
             logger.info(
