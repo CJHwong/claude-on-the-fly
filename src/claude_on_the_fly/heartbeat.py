@@ -50,6 +50,19 @@ class InstanceAlreadyClaimed(RuntimeError):
         self.holder = holder
 
 
+class InstanceLockUnavailable(RuntimeError):
+    """The state directory cannot hold the lock that makes ownership exclusive."""
+
+    def __init__(self, frontend: str, lock_path: Path, cause: OSError) -> None:
+        super().__init__(
+            f"cannot lock {lock_path} for the {frontend} daemon ({cause}); "
+            "the state directory is on a filesystem without file locking. "
+            "Point DATA_DIR at a local disk."
+        )
+        self.frontend = frontend
+        self.lock_path = lock_path
+
+
 def _package_version() -> str:
     try:
         return version("claude-on-the-fly")
@@ -159,6 +172,17 @@ class HeartbeatWriter:
                 holder = "unknown"
             os.close(fd)
             raise InstanceAlreadyClaimed(self._frontend, holder or "unknown") from None
+        except OSError as exc:
+            # A state dir on a filesystem without flock (some NFS and FUSE
+            # mounts) raises ENOLCK/EOPNOTSUPP rather than BlockingIOError.
+            # Catching only the latter leaked this fd and stopped every daemon
+            # on an install that worked before the lock existed.
+            #
+            # Refusing rather than degrading is deliberate: the whole point of
+            # the claim is that two daemons cannot both own one frontend, and a
+            # mount that cannot answer the question cannot be assumed to say no.
+            os.close(fd)
+            raise InstanceLockUnavailable(self._frontend, self._lock_path, exc) from exc
         try:
             os.ftruncate(fd, 0)
             os.write(fd, str(self._pid).encode())

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -165,6 +166,41 @@ class TestSingletonClaim:
             assert exc.value.holder == "unknown"
         finally:
             first.release()
+
+    def test_mount_without_flock_refuses_instead_of_leaking(
+        self, tmp_path, monkeypatch
+    ):
+        """ENOLCK is not contention, and it must not escape as a bare OSError.
+
+        Some NFS and FUSE mounts cannot lock at all. Catching only
+        BlockingIOError leaked the descriptor and stopped every daemon with a
+        traceback on an install that worked before the lock existed.
+        """
+        writer = HeartbeatWriter("slack", state_dir=tmp_path)
+        opened: list[int] = []
+        real_open = heartbeat.os.open
+
+        def record_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            opened.append(fd)
+            return fd
+
+        def no_locks(_fd, _op):
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        monkeypatch.setattr(heartbeat.os, "open", record_open)
+        monkeypatch.setattr(heartbeat.fcntl, "flock", no_locks)
+
+        with pytest.raises(heartbeat.InstanceLockUnavailable) as exc:
+            writer.claim()
+        assert "without file locking" in str(exc.value)
+        assert exc.value.frontend == "slack"
+
+        # The descriptor is closed, not leaked: a second close raises EBADF.
+        monkeypatch.undo()
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            os.close(opened[0])
 
     def test_failed_owner_record_releases_the_lock(self, tmp_path, monkeypatch):
         writer = HeartbeatWriter("slack", state_dir=tmp_path)

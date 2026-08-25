@@ -471,6 +471,34 @@ def test_an_unproven_jail_refuses_to_start_the_worker(
     assert "refusing to start" in capsys.readouterr().err.lower()
 
 
+def test_a_second_worker_refuses_without_a_traceback(monkeypatch, capsys) -> None:
+    """The `live_pid` guard above misses the case that matters most here.
+
+    A heartbeat old enough to read as dead while its process still runs sails
+    past that guard and loses the lock race inside `claim()`. Before this the
+    operator got a raw traceback and exit 1 for the same mistake the guard
+    already knows how to explain in one line.
+    """
+    from claude_on_the_fly.heartbeat import InstanceAlreadyClaimed
+
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(
+        cli.checks, "resolve_jobs_token", lambda env: ("JOBS_SLACK_TOKEN", "xoxb-t")
+    )
+
+    async def refuse(_token):
+        raise InstanceAlreadyClaimed("jobs", "4242")
+
+    monkeypatch.setattr(cli, "_run", refuse)
+
+    assert cli._cmd_run() == 2
+    err = capsys.readouterr().err
+    assert "claude-jobs: jobs daemon is already running" in err
+    assert "Traceback" not in err
+
+
 def test_normalize_argv_treats_a_bare_flag_as_run_options() -> None:
     """`claude-jobs --verbose` is somebody running the worker, not a typo'd
     subcommand."""

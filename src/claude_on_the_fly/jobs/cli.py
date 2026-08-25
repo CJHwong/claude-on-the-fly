@@ -29,7 +29,12 @@ from uuid import uuid4
 from dotenv import load_dotenv
 
 from claude_on_the_fly import agent, checks, sandbox, settings
-from claude_on_the_fly.heartbeat import HeartbeatWriter, live_pid
+from claude_on_the_fly.heartbeat import (
+    HeartbeatWriter,
+    InstanceAlreadyClaimed,
+    InstanceLockUnavailable,
+    live_pid,
+)
 from claude_on_the_fly.jobs.agent_runner import (
     OrchestratorAgentRunner,
     sweep_run_workspaces,
@@ -323,7 +328,12 @@ def _cmd_run() -> int:
     try:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run(token))
-    except (sandbox.SandboxBoundaryError, sandbox.SandboxModeError) as exc:
+    except (
+        sandbox.SandboxBoundaryError,
+        sandbox.SandboxModeError,
+        InstanceAlreadyClaimed,
+        InstanceLockUnavailable,
+    ) as exc:
         # An exit code and one line, not a traceback: this is an operator-facing
         # refusal with a remedy in its message, and it exits the same way as the
         # other two refusals above so the supervisor treats all three alike.

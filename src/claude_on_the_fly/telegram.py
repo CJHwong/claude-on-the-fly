@@ -784,15 +784,27 @@ class TelegramFrontend(Frontend):
 
 
 def main() -> None:
+    import sys
+
     from dotenv import load_dotenv
 
+    from claude_on_the_fly.heartbeat import (
+        InstanceAlreadyClaimed,
+        InstanceLockUnavailable,
+    )
     from claude_on_the_fly.orchestrator import run
     from claude_on_the_fly.preflight import run_telegram
 
     load_dotenv()
     token, allowed_user_id = run_telegram()
     frontend = TelegramFrontend(token=token, allowed_user_id=allowed_user_id)
-    asyncio.run(run(frontend, platform="telegram"))
+    try:
+        asyncio.run(run(frontend, platform="telegram"))
+    except (InstanceAlreadyClaimed, InstanceLockUnavailable) as exc:
+        # An operator-facing refusal with its remedy in the message, not a
+        # traceback. The supervisor already treats exit 2 as a clean refusal.
+        sys.stderr.write(f"claude-telegram: {exc}\n")
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":  # pragma: no cover

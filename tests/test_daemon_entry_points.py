@@ -368,3 +368,94 @@ class TestCronRunLoop:
         with pytest.raises(RuntimeError, match="queue vanished"):
             cron_mod.main()
         assert not writer.path.exists()
+
+
+class TestSecondInstanceIsRefusedCleanly:
+    """A duplicate daemon is an operator mistake, not a crash.
+
+    `live_pid` cannot catch every case: a heartbeat old enough to read as dead
+    while its process still runs reaches `claim()` and loses the lock race. That
+    is exactly when the operator most needs a sentence instead of a traceback.
+    """
+
+    def _claimed(self, frontend: str):
+        from claude_on_the_fly.heartbeat import InstanceAlreadyClaimed
+
+        def raise_claimed(_coro):
+            _coro.close()
+            raise InstanceAlreadyClaimed(frontend, "4242")
+
+        return raise_claimed
+
+    def test_cron_prints_one_line_and_exits_two(
+        self, tmp_path, monkeypatch, no_dotenv, no_daemon_logging, capsys
+    ):
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {"entries": [{"name": "a", "cron": "* * * * *", "prompt": "x"}]}
+            )
+        )
+        monkeypatch.setattr("sys.argv", ["claude-cron", "--config", str(path)])
+        monkeypatch.setattr(cron_mod.asyncio, "run", self._claimed("cron"))
+
+        assert cron_mod.main() == 2
+        err = capsys.readouterr().err
+        assert "claude-cron: cron daemon is already running" in err
+        assert "Traceback" not in err
+
+    def test_telegram_prints_one_line_and_exits_two(
+        self, monkeypatch, no_dotenv, capsys
+    ):
+        from claude_on_the_fly import preflight
+
+        monkeypatch.setattr(preflight, "run_telegram", lambda: ("tok-123", 4242))
+        monkeypatch.setattr(telegram_mod, "TelegramFrontend", lambda **_kw: MagicMock())
+        monkeypatch.setattr(telegram_mod.asyncio, "run", self._claimed("telegram"))
+
+        with pytest.raises(SystemExit) as exc:
+            telegram_mod.main()
+        assert exc.value.code == 2
+        assert "claude-telegram: telegram daemon is already running" in (
+            capsys.readouterr().err
+        )
+
+    def test_slack_prints_one_line_and_exits_two(self, monkeypatch, no_dotenv, capsys):
+        from claude_on_the_fly import preflight
+
+        monkeypatch.setattr("sys.argv", ["claude-slack"])
+        monkeypatch.setattr(
+            preflight, "run_slack", lambda: ("xapp-tok", "xoxb-tok", "U_SELF")
+        )
+        monkeypatch.setattr(slack_mod, "SlackFrontend", lambda **_kw: MagicMock())
+        monkeypatch.setattr(slack_mod.asyncio, "run", self._claimed("slack"))
+
+        with pytest.raises(SystemExit) as exc:
+            slack_mod.main()
+        assert exc.value.code == 2
+        assert "claude-slack: slack daemon is already running" in (
+            capsys.readouterr().err
+        )
+
+    def test_an_unlockable_state_dir_refuses_the_same_way(
+        self, tmp_path, monkeypatch, no_dotenv, no_daemon_logging, capsys
+    ):
+        from claude_on_the_fly.heartbeat import InstanceLockUnavailable
+
+        path = tmp_path / "cron.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {"entries": [{"name": "a", "cron": "* * * * *", "prompt": "x"}]}
+            )
+        )
+        monkeypatch.setattr("sys.argv", ["claude-cron", "--config", str(path)])
+
+        def raise_unlockable(_coro):
+            _coro.close()
+            raise InstanceLockUnavailable(
+                "cron", tmp_path / "cron.instance.lock", OSError("No locks available")
+            )
+
+        monkeypatch.setattr(cron_mod.asyncio, "run", raise_unlockable)
+        assert cron_mod.main() == 2
+        assert "without file locking" in capsys.readouterr().err
