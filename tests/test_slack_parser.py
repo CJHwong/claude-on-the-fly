@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.slack import (
     SlackFrontend,
+    _bot_policy_decision,
+    _BotPolicy,
+    _BotRule,
     _extract_forwards,
     _flatten_primary_content,
     _flatten_rich_elements,
+    _parse_bot_policy,
     _render_attachment,
     _render_forward,
     _session_key,
@@ -454,6 +461,7 @@ def _make_frontend(
     allowed_bot_ids: set[str] | None = None,
     silent_sender_ids: set[str] | None = None,
     blocked_senders: set[str] | None = None,
+    bot_policies: dict[str, object] | None = None,
 ) -> SlackFrontend:
     with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
         mock_app = MagicMock()
@@ -467,6 +475,7 @@ def _make_frontend(
             allowed_bot_ids=allowed_bot_ids,
             silent_sender_ids=silent_sender_ids,
             blocked_senders=blocked_senders,
+            bot_policies=bot_policies,
         )
     fe._on_message = AsyncMock()
     # short-circuit helpers that would hit the network
@@ -870,7 +879,182 @@ def _bot_event(bot_id: str = "B07JPABE2", **overrides) -> dict:
     return event
 
 
+def _rules(*pairs: tuple[str, str]) -> tuple[_BotRule, ...]:
+    return tuple(
+        _BotRule(name, re.compile(expr, re.IGNORECASE)) for name, expr in pairs
+    )
+
+
+def _policy(
+    mode: str,
+    *,
+    mentions_agent: bool = False,
+    process_if: tuple[_BotRule, ...] = (),
+    drop_before_ai: tuple[_BotRule, ...] = (),
+    audit_dropped_events: bool = True,
+) -> _BotPolicy:
+    return _BotPolicy(
+        mode, mentions_agent, process_if, drop_before_ai, audit_dropped_events
+    )
+
+
+class TestBotPolicy:
+    def test_absent_policy_means_normal_trusted_bot_behavior(self):
+        assert _parse_bot_policy("B1", None) is None
+
+    def test_defaults_to_all_with_empty_lists(self):
+        assert _parse_bot_policy("B1", {}) == _policy("all")
+
+    def test_audit_defaults_to_true(self):
+        """A gate that discards work before the agent sees it must be audible.
+
+        With it off, the first symptom of a pattern that does not match what its
+        author expected is silence.
+        """
+        assert _parse_bot_policy("B1", {}).audit_dropped_events is True
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            ("drop", "expected a mapping"),
+            ({"mode": "typo"}, "unknown mode"),
+            ({"mode": "mention_or_high_value_only"}, "unknown mode"),
+            ({"process_if": "x"}, "must be a list"),
+            ({"process_if": [1]}, "must be a mapping"),
+            ({"drop_before_ai": "x"}, "must be a list"),
+            ({"process_if": ["unknown"]}, "must be a"),
+            ({"drop_before_ai": ["explicitly_mentions_agent"]}, "must be a"),
+            ({"process_if": [{"match": "x"}]}, "non-empty"),
+            ({"process_if": [{"name": "x"}]}, "non-empty"),
+            ({"process_if": [{"name": "x", "match": "  "}]}, "non-empty"),
+            ({"process_if": [{"name": "x", "match": "a("}]}, "invalid regular"),
+            ({"audit_dropped_events": "yes"}, "must be true or false"),
+        ],
+    )
+    def test_invalid_policy_is_ignored_visibly(self, raw, message, caplog):
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert _parse_bot_policy("B1", raw) is None
+        assert message in caplog.text
+
+    def test_operator_patterns_are_compiled_in_order(self):
+        policy = _parse_bot_policy(
+            "B1",
+            {
+                "mode": "selective",
+                "process_if": [
+                    " explicitly_mentions_agent ",
+                    {"name": " urgent ", "match": "P[12]"},
+                    {"name": "ticket", "match": "new comment"},
+                ],
+                "drop_before_ai": [{"name": "routine", "match": "discovery booked"}],
+                "audit_dropped_events": False,
+            },
+        )
+        assert policy.mode == "selective"
+        assert policy.mentions_agent is True
+        assert [r.name for r in policy.process_if] == ["urgent", "ticket"]
+        assert [r.name for r in policy.drop_before_ai] == ["routine"]
+        assert policy.audit_dropped_events is False
+
+    def test_patterns_are_case_insensitive_but_not_dotall(self):
+        """`.` must not cross newlines.
+
+        A Slack message flattened from blocks and attachments puts unrelated
+        words a few characters apart across lines. With DOTALL the packaged
+        support-escalation example matched a routine deal update.
+        """
+        policy = _parse_bot_policy(
+            "B1",
+            {
+                "mode": "selective",
+                "process_if": [{"name": "esc", "match": "support.{0,80}escalation"}],
+            },
+        )
+        rule = policy.process_if[0]
+        assert rule.pattern.search("SUPPORT needs escalation")
+        assert not rule.pattern.search("Need support\n\nno escalation planned")
+
+    def test_an_operator_can_opt_into_dotall(self):
+        policy = _parse_bot_policy(
+            "B1",
+            {
+                "mode": "selective",
+                "process_if": [
+                    {"name": "esc", "match": "(?s)support.{0,80}escalation"}
+                ],
+            },
+        )
+        assert policy.process_if[0].pattern.search("support\n\nescalation")
+
+    @pytest.mark.parametrize(
+        ("policy", "text", "expected"),
+        [
+            (_policy("all"), "anything", (True, "mode_all")),
+            (_policy("drop"), "<@U1>", (False, "mode_drop")),
+            (
+                _policy("selective", mentions_agent=True),
+                "hello <@U1>",
+                (True, "explicit_mention"),
+            ),
+            (_policy("selective", mentions_agent=True), "hello", (False, "unmatched")),
+            (_policy("selective"), "anything", (False, "unmatched")),
+            (
+                _policy("selective", process_if=_rules(("ticket", "new comment"))),
+                "A NEW COMMENT arrived",
+                (True, "ticket"),
+            ),
+            (
+                _policy(
+                    "selective", drop_before_ai=_rules(("payment", "payment received"))
+                ),
+                "Payment received",
+                (False, "payment"),
+            ),
+            (
+                _policy(
+                    "selective",
+                    process_if=_rules(("first", "deal"), ("second", "deal")),
+                ),
+                "deal won",
+                (True, "first"),
+            ),
+        ],
+    )
+    def test_decision_order(self, policy, text, expected):
+        assert _bot_policy_decision(policy, text=text, user_id="U1") == expected
+
+    def test_a_mention_is_ignored_when_the_condition_is_not_listed(self):
+        """The condition is read now. It used to be accepted and never consulted,
+        so the mention check ran whether or not an operator asked for it."""
+        policy = _policy("selective", mentions_agent=False)
+        assert _bot_policy_decision(policy, text="hi <@U1>", user_id="U1") == (
+            False,
+            "unmatched",
+        )
+
+
 class TestIngestEventTrustedBot:
+    @staticmethod
+    def _selective_policy(**overrides) -> dict[str, object]:
+        policy: dict[str, object] = {
+            "mode": "selective",
+            "process_if": [
+                "explicitly_mentions_agent",
+                {
+                    "name": "ticket_comment_or_mention",
+                    "match": "new (ticket )?(comment|reply|mention)",
+                },
+                {"name": "support_escalation", "match": "support escalation"},
+            ],
+            "drop_before_ai": [
+                {"name": "discovery_booked", "match": "discovery booked"},
+                {"name": "payment_notification", "match": "payment received"},
+            ],
+            "audit_dropped_events": True,
+        }
+        policy.update(overrides)
+        return {"B07JPABE2": policy}
+
     async def test_trusted_bot_dispatches_with_attachment_content(self):
         fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
         await fe._ingest_event(_bot_event())
@@ -906,6 +1090,106 @@ class TestIngestEventTrustedBot:
         # sender_id is "" for a bot; a non-"*" user allowlist must not drop it.
         fe = _make_frontend(
             allowed_user_ids={"USOMEONE"}, allowed_bot_ids={"B07JPABE2"}
+        )
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_drops_routine_event_before_agent(self, caplog):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        event = _bot_event(
+            text="*Discovery booked*\nInvitee: Customer",
+            attachments=[],
+        )
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await fe._ingest_event(event)
+
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+        assert event["ts"] in fe._processed_ts
+        assert fe._sessions == {}
+        assert fe._active_channels[event["channel"]] == event["ts"]
+        assert fe._channel_types[event["channel"]] == event["channel_type"]
+        audit_row = next(row for row in caplog.messages if "decision=drop" in row)
+        assert "reason=discovery_booked" in audit_row
+        assert "Invitee" not in audit_row
+        assert "Customer" not in audit_row
+
+    async def test_policy_checks_flattened_attachment_content(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(_bot_event())
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_selective_policy_direct_mention_always_processes(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="<@UBOT> Discovery booked", attachments=[])
+        )
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_an_accepted_mention_reaches_the_agent_without_the_token(self):
+        """The human mention path strips it; this one did not.
+
+        A bot accepted by `explicit_mention` handed the agent a prompt still
+        carrying the raw routing token.
+        """
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="<@UBOT> please look at this", attachments=[])
+        )
+        (_channel, delivered), _kwargs = fe._on_message.await_args  # type: ignore[union-attr]
+        assert "<@UBOT>" not in delivered
+        assert "please look at this" in delivered
+
+    async def test_selective_policy_processes_ticket_comment_without_mention(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="New comment on ticket 12345", attachments=[])
+        )
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_processes_support_escalation_without_mention(
+        self,
+    ):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(),
+        )
+        await fe._ingest_event(
+            _bot_event(text="Support escalation — Severity: S1", attachments=[])
+        )
+        fe._on_message.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_selective_policy_drops_unmatched_bot_event(self, caplog):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies=self._selective_policy(audit_dropped_events=False),
+        )
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            await fe._ingest_event(
+                _bot_event(text="A new automation event", attachments=[])
+            )
+        fe._on_message.assert_not_awaited()  # type: ignore[union-attr]
+        assert "reason=unmatched" in caplog.text
+
+    async def test_invalid_policy_preserves_existing_trusted_bot_behavior(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies={"B07JPABE2": {"mode": "typo"}},
         )
         await fe._ingest_event(_bot_event())
         fe._on_message.assert_awaited_once()  # type: ignore[union-attr]

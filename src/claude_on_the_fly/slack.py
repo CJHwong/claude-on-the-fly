@@ -11,7 +11,8 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -412,6 +413,193 @@ _DOWNLOAD_CHUNK = 64 * 1024
 
 _ALLOWED_SUBTYPES = {"file_share"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
+
+
+# Trusted bots normally bypass the channel @mention gate. A per-bot policy can
+# narrow that trust before any session or agent process is created, which is
+# materially different from `silent_senders`: silence suppresses the final Slack
+# reply, while this gate prevents the agent run itself.
+_BOT_POLICY_MODES = frozenset({"all", "selective", "drop"})
+
+# The one condition that is not a text match, so the one condition an operator
+# cannot express as a pattern: whether this message addresses the agent. Every
+# other condition is the operator's own vocabulary, written in their config.
+_MENTION_CONDITION = "explicitly_mentions_agent"
+
+
+@dataclass(frozen=True)
+class _BotRule:
+    """One operator-named pattern, and the audit reason its match produces."""
+
+    name: str
+    pattern: re.Pattern[str]
+
+
+@dataclass(frozen=True)
+class _BotPolicy:
+    mode: str
+    mentions_agent: bool
+    process_if: tuple[_BotRule, ...]
+    drop_before_ai: tuple[_BotRule, ...]
+    audit_dropped_events: bool
+
+
+def _bot_rules(
+    value: object, *, field: str, bot_id: str, allow_mention: bool
+) -> tuple[bool, tuple[_BotRule, ...]] | None:
+    """Validate one list-valued bot-policy field into ordered rules.
+
+    Returning None distinguishes an invalid field from a deliberately empty
+    list. Order is preserved and first match wins, so an operator whose patterns
+    overlap decides the precedence rather than inheriting a set's iteration
+    order.
+
+    Patterns compile with IGNORECASE and nothing else. DOTALL in particular is
+    left off: a Slack message flattened from blocks and attachments puts
+    unrelated words within a few characters of each other across newlines, and a
+    `.` that crossed them matched a routine deal update as a support escalation.
+    An operator who wants it writes `(?s)` in their own pattern.
+    """
+    if value is None:
+        return False, ()
+    if not isinstance(value, list):
+        logger.error(
+            "slack: ignoring bot policy for %s: %s must be a list", bot_id, field
+        )
+        return None
+
+    mentions_agent = False
+    rules: list[_BotRule] = []
+    for item in value:
+        if isinstance(item, str):
+            if item.strip() == _MENTION_CONDITION and allow_mention:
+                mentions_agent = True
+                continue
+            logger.error(
+                "slack: ignoring bot policy for %s: %s entry %r must be a "
+                "{name, match} mapping%s",
+                bot_id,
+                field,
+                item,
+                f" or {_MENTION_CONDITION!r}" if allow_mention else "",
+            )
+            return None
+        if not isinstance(item, Mapping):
+            logger.error(
+                "slack: ignoring bot policy for %s: %s entry must be a mapping, got %s",
+                bot_id,
+                field,
+                type(item).__name__,
+            )
+            return None
+
+        name = str(item.get("name", "")).strip()
+        expression = item.get("match")
+        if not name or not isinstance(expression, str) or not expression.strip():
+            logger.error(
+                "slack: ignoring bot policy for %s: %s entry needs a non-empty "
+                "`name` and `match`",
+                bot_id,
+                field,
+            )
+            return None
+        try:
+            pattern = re.compile(expression, re.IGNORECASE)
+        except re.error as exc:
+            logger.error(
+                "slack: ignoring bot policy for %s: %s entry %r has an invalid "
+                "regular expression: %s",
+                bot_id,
+                field,
+                name,
+                exc,
+            )
+            return None
+        rules.append(_BotRule(name, pattern))
+
+    return mentions_agent, tuple(rules)
+
+
+def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
+    """Parse a single ``slack.bot_policies.<B...>`` block.
+
+    None means no usable policy, so the existing trusted-bot behaviour remains in
+    force. That fallback is deliberately fail-visible rather than fail-drop: a
+    malformed optimization must not discard work.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        logger.error(
+            "slack: ignoring bot policy for %s: expected a mapping, got %s",
+            bot_id,
+            type(raw).__name__,
+        )
+        return None
+    mode = str(raw.get("mode", "all")).strip()
+    if mode not in _BOT_POLICY_MODES:
+        logger.error(
+            "slack: ignoring bot policy for %s: unknown mode %r (expected one of %s)",
+            bot_id,
+            mode,
+            sorted(_BOT_POLICY_MODES),
+        )
+        return None
+
+    processed = _bot_rules(
+        raw.get("process_if"), field="process_if", bot_id=bot_id, allow_mention=True
+    )
+    dropped = _bot_rules(
+        raw.get("drop_before_ai"),
+        field="drop_before_ai",
+        bot_id=bot_id,
+        allow_mention=False,
+    )
+    if processed is None or dropped is None:
+        return None
+    mentions_agent, process_if = processed
+    _, drop_before_ai = dropped
+
+    # Defaults to true. This gate discards work before the agent ever sees it, so
+    # the first symptom of a pattern that does not match what the operator
+    # expected is "the agent stopped answering my bot". At DEBUG there is nothing
+    # in a normal log to explain it.
+    audit = raw.get("audit_dropped_events", True)
+    if not isinstance(audit, bool):
+        logger.error(
+            "slack: ignoring bot policy for %s: audit_dropped_events must be true or false",
+            bot_id,
+        )
+        return None
+    return _BotPolicy(mode, mentions_agent, process_if, drop_before_ai, audit)
+
+
+def _bot_policy_decision(
+    policy: _BotPolicy, *, text: str, user_id: str
+) -> tuple[bool, str]:
+    """Whether a trusted bot event may create an agent run, plus an audit reason.
+
+    Unmatched drops. `drop_before_ai` therefore does not decide the drop, it
+    names one: a matched rule replaces "unmatched" in the audit line so an
+    operator reading the log can tell a known routine event from a message no
+    rule describes.
+    """
+    if policy.mode == "all":
+        return True, "mode_all"
+    if policy.mode == "drop":
+        return False, "mode_drop"
+
+    if policy.mentions_agent and f"<@{user_id}>" in text:
+        return True, "explicit_mention"
+
+    for rule in policy.process_if:
+        if rule.pattern.search(text):
+            return True, rule.name
+
+    for rule in policy.drop_before_ai:
+        if rule.pattern.search(text):
+            return False, rule.name
+    return False, "unmatched"
 
 
 # How many queued jobs a bare-trigger listing shows before it summarises the
@@ -877,6 +1065,7 @@ class SlackFrontend(Frontend):
         blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
+        bot_policies: Mapping[str, object] | None = None,
         job_command: str | None = None,
         job_queue: JobQueue | None = None,
     ) -> None:
@@ -910,6 +1099,12 @@ class SlackFrontend(Frontend):
         self._pinned_blocked_senders = blocked_senders
         self._pinned_allowed_bot_ids = allowed_bot_ids
         self._pinned_silent_sender_ids = silent_sender_ids
+        self._pinned_bot_policies = bot_policies
+        # bot_id -> (canonical config, parsed policy). Compiling an
+        # operator's patterns on every event from a chatty bot is waste, and
+        # re-validating one is worse: a typo used to log an error once per
+        # message, forever, burying the rest of the Slack log.
+        self._bot_policy_cache: dict[str, tuple[str, _BotPolicy | None]] = {}
         logger.debug(
             "init: user_id=%s, allowed_user_ids=%s, allow_all=%s, blocked_senders=%s, allowed_bot_ids=%s, silent_sender_ids=%s",
             user_id,
@@ -1041,6 +1236,30 @@ class SlackFrontend(Frontend):
     @property
     def _silent_sender_ids(self) -> set[str]:
         return self._senders("SLACK_SILENT_SENDER_IDS", self._pinned_silent_sender_ids)
+
+    def _bot_policy(self, bot_id: str) -> _BotPolicy | None:
+        """Return the bot's optional policy, re-reading operator config live."""
+        policies: object
+        if self._pinned_bot_policies is not None:
+            policies = self._pinned_bot_policies
+        else:
+            policies = settings.operator("slack").get("bot_policies", {})
+        if not isinstance(policies, Mapping):
+            logger.error(
+                "slack: ignoring bot_policies: expected a mapping, got %s",
+                type(policies).__name__,
+            )
+            return None
+        raw = policies.get(bot_id)
+        # repr, not a hash: the block is a handful of keys, and an equal repr
+        # means an equal parse. A miss costs one re-parse, never a wrong answer.
+        canonical = repr(raw)
+        cached = self._bot_policy_cache.get(bot_id)
+        if cached is not None and cached[0] == canonical:
+            return cached[1]
+        policy = _parse_bot_policy(bot_id, raw)
+        self._bot_policy_cache[bot_id] = (canonical, policy)
+        return policy
 
     def set_orchestrator(self, orchestrator: object) -> None:
         from claude_on_the_fly.orchestrator import Orchestrator
@@ -1793,7 +2012,6 @@ class SlackFrontend(Frontend):
             if not is_trusted_bot:
                 logger.debug("skipped: untrusted bot_message bot_id=%s", bot_id)
                 return
-            logger.info("trusted bot_message accepted: bot_id=%s", bot_id)
         elif subtype and subtype not in _ALLOWED_SUBTYPES:
             logger.debug("skipped: subtype=%s", subtype)
             return
@@ -1830,9 +2048,52 @@ class SlackFrontend(Frontend):
             fwd_refs,
         )
 
-        # Trusted bots are already authorized by bot_id and carry no user field,
-        # so the human allow/block and @mention gates don't apply to them.
-        if not is_trusted_bot:
+        if is_trusted_bot:
+            policy = self._bot_policy(bot_id)
+            if policy is not None:
+                policy_text = "\n".join(
+                    part
+                    for part in (
+                        text,
+                        extra_content,
+                        *(str(fwd.get("text", "")) for fwd in forwards),
+                    )
+                    if part
+                )
+                process, reason = _bot_policy_decision(
+                    policy, text=policy_text, user_id=self._user_id
+                )
+                if not process:
+                    self._processed_ts.append(ts)
+                    self._active_channels[channel] = ts
+                    if channel_type:
+                        self._channel_types[channel] = channel_type
+                    audit_log = (
+                        logger.info if policy.audit_dropped_events else logger.debug
+                    )
+                    audit_log(
+                        "slack bot pre-agent gate: decision=drop bot_id=%s channel=%s ts=%s reason=%s",
+                        bot_id,
+                        channel,
+                        ts,
+                        reason,
+                    )
+                    return
+                # Same treatment the human mention path gives it below: the
+                # agent gets the request, not the routing token that delivered
+                # it. A bot accepted by `explicit_mention` used to hand the
+                # agent a prompt still carrying the raw `<@U...>`.
+                text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
+                logger.info(
+                    "trusted bot_message accepted: bot_id=%s policy_reason=%s",
+                    bot_id,
+                    reason,
+                )
+            else:
+                logger.info("trusted bot_message accepted: bot_id=%s", bot_id)
+        else:
+            # Trusted bots are authorized above by bot_id and carry no user field,
+            # so only humans reach the allow/block and @mention gates below.
             # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
             if sender_id in self._blocked_senders:
                 logger.debug("skipped: sender %s in blocked_senders", sender_id)

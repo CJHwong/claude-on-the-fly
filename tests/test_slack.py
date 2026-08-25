@@ -4201,6 +4201,88 @@ class TestSlashCommand:
         assert "slack.slash_command" in settings.RESTART_REQUIRED
 
 
+class TestBotPolicies:
+    def test_policy_is_read_from_operator_yaml(self, frontend, operator_settings):
+        operator_settings.write_text(
+            """slack:
+  bot_policies:
+    B1:
+      mode: selective
+      process_if:
+        - explicitly_mentions_agent
+        - name: ticket_activity
+          match: 'new comment'
+      drop_before_ai:
+        - name: routine
+          match: 'discovery booked'
+      audit_dropped_events: true
+"""
+        )
+        policy = frontend._bot_policy("B1")
+        assert policy is not None
+        assert policy.mode == "selective"
+        assert policy.audit_dropped_events is True
+        assert policy.mentions_agent is True
+        assert [rule.name for rule in policy.process_if] == ["ticket_activity"]
+        assert [rule.name for rule in policy.drop_before_ai] == ["routine"]
+
+    def test_policy_edit_is_visible_without_restart(self, frontend, operator_settings):
+        operator_settings.write_text(
+            "slack:\n  bot_policies:\n    B1:\n      mode: selective\n"
+        )
+        first = frontend._bot_policy("B1")
+        assert first is not None and first.mode == "selective"
+
+        operator_settings.write_text(
+            "slack:\n  bot_policies:\n    B1:\n      mode: drop\n"
+        )
+        second = frontend._bot_policy("B1")
+        assert second is not None and second.mode == "drop"
+
+    def test_an_unchanged_policy_is_parsed_once(self, frontend, operator_settings):
+        """A chatty bot must not recompile its patterns on every message, and a
+        typo must not log the same error once per message forever."""
+        operator_settings.write_text(
+            """slack:
+  bot_policies:
+    B1:
+      mode: selective
+      process_if:
+        - name: ticket_activity
+          match: 'new comment'
+"""
+        )
+        first = frontend._bot_policy("B1")
+        second = frontend._bot_policy("B1")
+        assert first is second
+        assert first.process_if[0].pattern is second.process_if[0].pattern
+
+    def test_a_broken_policy_logs_once_not_once_per_event(
+        self, frontend, operator_settings, caplog
+    ):
+        operator_settings.write_text(
+            "slack:\n  bot_policies:\n    B1:\n      mode: typo\n"
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            for _ in range(5):
+                assert frontend._bot_policy("B1") is None
+        assert caplog.text.count("unknown mode") == 1
+
+    def test_missing_policy_uses_normal_trusted_behavior(
+        self, frontend, operator_settings
+    ):
+        operator_settings.write_text("slack: {}\n")
+        assert frontend._bot_policy("B1") is None
+
+    def test_non_mapping_policy_table_is_ignored_visibly(
+        self, frontend, operator_settings, caplog
+    ):
+        operator_settings.write_text("slack:\n  bot_policies: []\n")
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert frontend._bot_policy("B1") is None
+        assert "expected a mapping" in caplog.text
+
+
 class TestSenderLists:
     """Access control, read per message so an edit needs no restart.
 
