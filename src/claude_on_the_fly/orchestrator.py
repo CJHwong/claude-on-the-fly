@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -1306,14 +1305,23 @@ async def run(frontend: Frontend, platform: str) -> None:
     # diagnostics was the shape that never got them.
     settings.check_operator_settings()
 
+    # Heartbeat freshness is not an atomic startup guard: two daemons can both
+    # pass it before either writes. Claim ownership before sweeping orphaned
+    # process groups or starting any shared service.
+    heartbeat = HeartbeatWriter(platform)
+    heartbeat.claim()
+
     # Agent CLIs are separate process groups. Recover groups left by a forced
     # daemon stop before accepting new work, and record every live group so the
     # supervisor can reap it even if this process is SIGKILLed.
     process_ledger = ProcessLedger(DATA_DIR / "state" / f"{platform}.pids")
-    process_ledger.sweep()
-    agent.add_process_listener(process_ledger.on_process)
+    listener_attached = False
 
     try:
+        process_ledger.sweep()
+        agent.add_process_listener(process_ledger.on_process)
+        listener_attached = True
+
         # When sandboxing is enabled, the broker holds the real API keys and the
         # agent reaches them only through loopback. start_default_broker publishes
         # base-urls into os.environ that sandbox.agent_env forwards to the agent.
@@ -1342,7 +1350,7 @@ async def run(frontend: Frontend, platform: str) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        heartbeat = HeartbeatWriter(platform, extra_provider=orch.heartbeat_extra)
+        heartbeat.set_extra_provider(orch.heartbeat_extra)
         heartbeat_task = asyncio.create_task(heartbeat.run())
 
         # Between the sandbox and the listener, deliberately. A replayed turn
@@ -1376,9 +1384,10 @@ async def run(frontend: Frontend, platform: str) -> None:
             await command_broker.stop()
         if broker_instance is not None:
             await broker_instance.stop()
-        with contextlib.suppress(FileNotFoundError):
-            heartbeat.path.unlink()
     finally:
         # Startup or frontend failures can happen before the normal shutdown
         # sequence. Never leave a durable process listener attached to the module.
-        agent.remove_process_listener(process_ledger.on_process)
+        if listener_attached:
+            agent.remove_process_listener(process_ledger.on_process)
+        heartbeat.remove_owned()
+        heartbeat.release()

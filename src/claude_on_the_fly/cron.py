@@ -1115,14 +1115,15 @@ def main() -> int:
                     sig, lambda: asyncio.ensure_future(daemon.stop())
                 )
         heartbeat = HeartbeatWriter("cron", extra_provider=daemon.heartbeat_extra)
+        heartbeat.claim()
         beat = asyncio.create_task(heartbeat.run())
         try:
             await daemon.run()
         finally:
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)
-            with contextlib.suppress(FileNotFoundError):
-                heartbeat.path.unlink()
+            heartbeat.remove_owned()
+            heartbeat.release()
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run())

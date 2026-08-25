@@ -315,6 +315,7 @@ class TestCronRunLoop:
         writer.run = AsyncMock()
         writer.path = tmp_path / "cron.json"
         writer.path.write_text("{}")
+        writer.remove_owned.side_effect = lambda: writer.path.unlink(missing_ok=True)
         monkeypatch.setattr(
             heartbeat_mod, "HeartbeatWriter", lambda _role, **_kwargs: writer
         )

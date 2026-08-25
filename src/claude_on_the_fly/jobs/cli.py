@@ -205,66 +205,71 @@ async def _run(token: str) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
-    # Before anything claims a job, and after the signal handlers so the probes
-    # are interruptible. This worker spawns jailed agents through `agent.run`
-    # exactly as a chat turn does, and until this call existed only the chat
-    # daemon proved the boundary: a jail that could not hold its denies stopped
-    # Slack loudly while the worker kept draining the same queue across an
-    # unverified boundary.
-    #
-    # Fatal, not advisory, and the fact that nobody is watching is the argument
-    # *for* that rather than against it. The worker runs bypassPermissions turns
-    # against whatever a producer queued, unattended, so an unproven credential
-    # boundary here is worth more to an attacker than the same fault in the chat
-    # daemon. A refusal is loud in the supervisor and costs nothing permanent --
-    # the queue is durable, the jobs wait, and the next start replays them. The
-    # opposite choice is silent and irreversible: the reads have happened.
-    await sandbox.verify_boundary()
-
-    queue, runner, notifier, recorder, alert_sink = build_components(
-        token, settings.environment()
-    )
-
-    # Reap what a previous worker orphaned, before anything claims work:
-    # run_loop's first act is recover_stale, and re-running a job whose earlier
-    # copy is still executing is exactly what this prevents.
-    ledger = ProcessLedger(agent.DATA_DIR / "jobs" / LEDGER_NAME)
-    killed = ledger.sweep()
-    if killed:
-        logger.warning(
-            "claude-jobs: reaped %d orphaned agent process group(s) from a "
-            "previous run",
-            killed,
-        )
-    agent.add_process_listener(ledger.on_process)
-
-    # Retention for finished one-shot workspaces. Startup is the whole cadence:
-    # the sweep is bounded by what one worker's lifetime accumulated, and a worker
-    # that never restarts is not accumulating either. Before the loop claims
-    # anything, so a long rmtree cannot compete with a running job for the disk.
-    retired = sweep_run_workspaces(agent.DATA_DIR, days=_workspace_keep_days())
-    if retired:
-        logger.info(
-            "claude-jobs: retired %d finished job workspace(s) past retention",
-            len(retired),
-        )
-
-    # The composition root knows the runner is the concrete
-    # OrchestratorAgentRunner (build_components constructs it); the port type
-    # only promises `run`, so the in_flight access needs the cast.
-    heartbeat = HeartbeatWriter(
-        "jobs",
-        extra_provider=lambda: _running_jobs(cast(OrchestratorAgentRunner, runner)),
-    )
-    heartbeat_task = asyncio.create_task(heartbeat.run())
-    concurrency = _concurrency()
-    logger.info(
-        "claude-jobs: started (poll every %.1fs, up to %d job(s) at once)",
-        _poll_interval_s(),
-        concurrency,
-    )
-
+    heartbeat = HeartbeatWriter("jobs")
+    heartbeat.claim()
+    heartbeat_task: asyncio.Task[None] | None = None
+    ledger: ProcessLedger | None = None
+    listener_attached = False
     try:
+        # Before anything claims a job, and after the signal handlers so the probes
+        # are interruptible. This worker spawns jailed agents through `agent.run`
+        # exactly as a chat turn does, and until this call existed only the chat
+        # daemon proved the boundary: a jail that could not hold its denies stopped
+        # Slack loudly while the worker kept draining the same queue across an
+        # unverified boundary.
+        #
+        # Fatal, not advisory, and the fact that nobody is watching is the argument
+        # *for* that rather than against it. The worker runs bypassPermissions turns
+        # against whatever a producer queued, unattended, so an unproven credential
+        # boundary here is worth more to an attacker than the same fault in the chat
+        # daemon. A refusal is loud in the supervisor and costs nothing permanent --
+        # the queue is durable, the jobs wait, and the next start replays them. The
+        # opposite choice is silent and irreversible: the reads have happened.
+        await sandbox.verify_boundary()
+
+        queue, runner, notifier, recorder, alert_sink = build_components(
+            token, settings.environment()
+        )
+
+        # Reap what a previous worker orphaned, before anything claims work:
+        # run_loop's first act is recover_stale, and re-running a job whose earlier
+        # copy is still executing is exactly what this prevents.
+        ledger = ProcessLedger(agent.DATA_DIR / "jobs" / LEDGER_NAME)
+        killed = ledger.sweep()
+        if killed:
+            logger.warning(
+                "claude-jobs: reaped %d orphaned agent process group(s) from a "
+                "previous run",
+                killed,
+            )
+        agent.add_process_listener(ledger.on_process)
+        listener_attached = True
+
+        # Retention for finished one-shot workspaces. Startup is the whole cadence:
+        # the sweep is bounded by what one worker's lifetime accumulated, and a worker
+        # that never restarts is not accumulating either. Before the loop claims
+        # anything, so a long rmtree cannot compete with a running job for the disk.
+        retired = sweep_run_workspaces(agent.DATA_DIR, days=_workspace_keep_days())
+        if retired:
+            logger.info(
+                "claude-jobs: retired %d finished job workspace(s) past retention",
+                len(retired),
+            )
+
+        # The composition root knows the runner is the concrete
+        # OrchestratorAgentRunner (build_components constructs it); the port type
+        # only promises `run`, so the in_flight access needs the cast.
+        heartbeat.set_extra_provider(
+            lambda: _running_jobs(cast(OrchestratorAgentRunner, runner))
+        )
+        heartbeat_task = asyncio.create_task(heartbeat.run())
+        concurrency = _concurrency()
+        logger.info(
+            "claude-jobs: started (poll every %.1fs, up to %d job(s) at once)",
+            _poll_interval_s(),
+            concurrency,
+        )
+
         await run_loop(
             queue,
             runner,
@@ -276,11 +281,13 @@ async def _run(token: str) -> None:
             alert_sink=alert_sink,
         )
     finally:
-        agent.remove_process_listener(ledger.on_process)
-        heartbeat_task.cancel()
-        await asyncio.gather(heartbeat_task, return_exceptions=True)
-        with contextlib.suppress(FileNotFoundError):
-            heartbeat.path.unlink()
+        if listener_attached and ledger is not None:
+            agent.remove_process_listener(ledger.on_process)
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        heartbeat.remove_owned()
+        heartbeat.release()
         logger.info("claude-jobs: shut down")
 
 
