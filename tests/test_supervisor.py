@@ -278,6 +278,51 @@ class TestRestart:
         popen.assert_not_called()
         assert (supervisor.STATE_DIR / "slack.json").is_file()
 
+    def test_a_restart_preflights_exactly_once(self, isolated_state, monkeypatch):
+        """The probes write to disk, so a second run is a side effect, not just
+        wasted work. restart() validates while the old daemon is still healthy;
+        spawn() is told that has already happened."""
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1111)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            supervisor,
+            "_spawn_preflight",
+            lambda frontend, _env: calls.append(frontend),
+        )
+        states = iter([True, False, False])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: next(states))
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(supervisor, "KILL_POLL_INTERVAL_S", 0.001)
+
+        supervisor.restart(
+            "telegram",
+            env={"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALLOWED_USER_ID": "1"},
+            grace_s=0.02,
+            popen_factory=MagicMock(return_value=MagicMock(pid=2222)),
+            wait_for_heartbeat=False,
+        )
+
+        assert calls == ["telegram"]
+
+    def test_a_plain_spawn_still_preflights(self, isolated_state, monkeypatch):
+        """The skip belongs to restart alone. Nothing else may inherit it."""
+        calls: list[str] = []
+        monkeypatch.setattr(
+            supervisor,
+            "_spawn_preflight",
+            lambda frontend, _env: calls.append(frontend),
+        )
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+
+        supervisor.spawn(
+            "telegram",
+            env={"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALLOWED_USER_ID": "1"},
+            popen_factory=MagicMock(return_value=MagicMock(pid=2222)),
+            wait_for_heartbeat=False,
+        )
+
+        assert calls == ["telegram"]
+
     def test_restart_stops_then_spawns(self, isolated_state, monkeypatch):
         _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1111)
 

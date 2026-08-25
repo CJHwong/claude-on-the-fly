@@ -419,12 +419,16 @@ def spawn(
     popen_factory=subprocess.Popen,
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
+    preflighted: bool = False,
 ) -> int:
     """Start a detached daemon for `frontend`. Returns its pid.
 
     Blocks until the daemon writes its first heartbeat (or `spawn_timeout_s`
     elapses, in which case the child is killed and SpawnTimeout is raised).
     Set wait_for_heartbeat=False to skip the wait — only safe for tests.
+    Set preflighted=True when the caller already ran the checks against this
+    exact env, as `restart` does: the probes write to disk, so running them
+    twice per restart is a visible side effect, not just wasted work.
 
     Raises:
         PreflightFailed: env checks failed.
@@ -446,7 +450,8 @@ def spawn(
     # settings.environment()). The child itself gets the raw merged env and does
     # its own layering, so baking config values in here would make the daemon
     # log "legacy env var wins" warnings about values it never asked for.
-    _spawn_preflight(frontend, resolved_env)
+    if not preflighted:
+        _spawn_preflight(frontend, resolved_env)
 
     stdout = _stdout_file(frontend)
     log_handle = stdout.open("ab")
@@ -556,6 +561,7 @@ def restart(
     resolved_env = dict(env) if env is not None else _load_env(env_file)
     # Validate while the current daemon is still healthy. A bad config edit or
     # sandboxed parent should refuse the replacement without causing an outage.
+    # This is the only preflight a restart runs; spawn is told it is done.
     _spawn_preflight(frontend, resolved_env)
     with contextlib.suppress(NotRunning):
         stop(frontend, grace_s=grace_s)
@@ -570,6 +576,7 @@ def restart(
         popen_factory=popen_factory,
         wait_for_heartbeat=wait_for_heartbeat,
         spawn_timeout_s=spawn_timeout_s,
+        preflighted=True,
     )
 
 

@@ -32,16 +32,27 @@ from claude_on_the_fly.interim import interim_progress_enabled
 
 
 class TestBackendRuntimeAccess:
-    def test_non_codex_backend_needs_no_probe(self, tmp_path):
-        assert (
-            check_backend_runtime_access(
-                {"AGENT_BACKEND": "claude", "HOME": str(tmp_path)}
-            )
-            == []
+    def test_claude_backend_is_probed_too(self, tmp_path):
+        """The default backend writes state under $HOME just as codex does."""
+        config_dir = tmp_path / "claude-home"
+        config_dir.mkdir()
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "claude", "CLAUDE_CONFIG_DIR": str(config_dir)}
         )
+        assert [(r.name, r.status) for r in results] == [
+            ("Claude state write access", "ok")
+        ]
+        assert list(config_dir.iterdir()) == []
+
+    def test_backend_absent_defaults_to_claude(self, tmp_path):
+        config_dir = tmp_path / "claude-home"
+        config_dir.mkdir()
+        results = check_backend_runtime_access({"CLAUDE_CONFIG_DIR": str(config_dir)})
+        assert results[0].name == "Claude state write access"
 
     def test_codex_write_probe_passes_and_cleans_up(self, tmp_path):
         codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
         results = check_backend_runtime_access(
             {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
         )
@@ -52,15 +63,26 @@ class TestBackendRuntimeAccess:
         assert str(codex_home) in results[0].detail
         assert list(codex_home.iterdir()) == []
 
-    def test_default_codex_home_uses_home(self, tmp_path):
+    def test_absent_home_is_not_created(self, tmp_path):
+        """The probe answers "could this be created" without creating it.
+
+        Creating it would report ok for a mistyped home the backend has no
+        state in, which is the misconfiguration the check stands next to.
+        """
+        codex_home = tmp_path / "typo" / "codex-home"
         results = check_backend_runtime_access(
-            {"AGENT_BACKEND": "CODEX", "HOME": str(tmp_path)}
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
         )
         assert results[0].status == "ok"
-        assert (tmp_path / ".codex").is_dir()
+        assert not codex_home.exists()
+        assert not codex_home.parent.exists()
+        # It probed the nearest directory that does exist.
+        assert str(tmp_path) in results[0].detail
+        assert list(tmp_path.iterdir()) == []
 
-    def test_codex_write_probe_reports_sandbox_denial(self, tmp_path, monkeypatch):
+    def test_unwritable_ancestor_is_refused(self, tmp_path, monkeypatch):
         codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
         real_open = checks_mod.os.open
 
         def deny_probe(path, flags, mode=0o777):
@@ -81,6 +103,7 @@ class TestBackendRuntimeAccess:
 
     def test_failure_after_open_closes_and_removes_probe(self, tmp_path, monkeypatch):
         codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
 
         def fail_write(_fd, _data):
             raise OSError("write failed")
@@ -91,6 +114,14 @@ class TestBackendRuntimeAccess:
         )
         assert results[0].status == "invalid"
         assert list(codex_home.iterdir()) == []
+
+    def test_doctor_runs_the_probe(self, tmp_path):
+        """An operator refused by this check must be able to see it in doctor."""
+        config_dir = tmp_path / "claude-home"
+        config_dir.mkdir()
+        groups = checks_mod.check_all({"CLAUDE_CONFIG_DIR": str(config_dir)})
+        names = [r.name for r in groups["backend"]]
+        assert "Claude state write access" in names
 
 
 class TestSlackResolvers:

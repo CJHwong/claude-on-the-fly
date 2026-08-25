@@ -734,22 +734,31 @@ def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
 
     Permission bits are not sufficient when the supervisor itself is running in
     a sandbox. A real create/write/unlink cycle verifies that the replacement
-    daemon will be able to initialize Codex state before a restart stops the
+    daemon will be able to initialize its own state before a restart stops the
     healthy process.
-    """
-    if env.get("AGENT_BACKEND", "claude").lower() != "codex":
-        return []
 
-    configured = env.get("CODEX_HOME", "").strip()
-    home = (
-        Path(configured).expanduser()
-        if configured
-        else Path(env.get("HOME") or Path.home()) / ".codex"
-    )
-    probe = home / f".cotf-write-probe-{os.getpid()}-{uuid4().hex}"
+    Both backends are probed. Running this for codex alone left the outage it
+    exists to prevent fully reachable on `claude`, which is the default and
+    writes its own state under the operator's home just the same.
+    """
+    if env.get("AGENT_BACKEND", "claude").lower() == "codex":
+        label, home = "Codex", envfile.codex_home(env)
+    else:
+        label, home = "Claude", envfile.claude_config_dir(env)
+
+    # Probe the nearest directory that already exists instead of creating the
+    # home. Creating it would let a mistyped CLAUDE_CONFIG_DIR or CODEX_HOME
+    # pass by bringing the wrong directory into being, and it would report `ok`
+    # for a home the backend has no state in. A first run whose home does not
+    # exist yet is still answered: what it needs to know is whether the parent
+    # will accept the directory the backend is about to create.
+    target = home
+    while not target.is_dir() and target.parent != target:
+        target = target.parent
+
+    probe = target / f".cotf-write-probe-{os.getpid()}-{uuid4().hex}"
     fd: int | None = None
     try:
-        home.mkdir(parents=True, exist_ok=True)
         fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.write(fd, b"ok\n")
         os.close(fd)
@@ -763,9 +772,9 @@ def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
             probe.unlink()
         return [
             CheckResult(
-                name="Codex state write access",
+                name=f"{label} state write access",
                 status="invalid",
-                detail=f"cannot write {home}: {exc}",
+                detail=f"cannot write {target}: {exc}",
                 fix_hint=(
                     "Run the start or restart command from a terminal outside "
                     "a sandboxed agent session. Changing mode bits may not help "
@@ -776,9 +785,9 @@ def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
 
     return [
         CheckResult(
-            name="Codex state write access",
+            name=f"{label} state write access",
             status="ok",
-            detail=f"write probe passed at {home}",
+            detail=f"write probe passed at {target}",
         )
     ]
 
@@ -1239,7 +1248,7 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
     e = os.environ if env is None else env
     return {
         **{name: check_frontend(name, e) for name in SUPERVISABLE_FRONTENDS},
-        "backend": check_backend(e),
+        "backend": check_backend(e) + check_backend_runtime_access(e),
         "binaries": check_binaries(e),
     }
 
