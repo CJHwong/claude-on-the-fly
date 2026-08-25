@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -11,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from claude_on_the_fly import heartbeat
-from claude_on_the_fly.heartbeat import HeartbeatWriter
+from claude_on_the_fly.heartbeat import HeartbeatWriter, InstanceAlreadyClaimed
 
 
 class TestWriteOnce:
@@ -33,6 +34,7 @@ class TestWriteOnce:
         assert "last_heartbeat" in payload
         assert "version" in payload
         assert "executable" in payload
+        assert "instance_id" in payload
         assert (
             payload["executable"].endswith("python")
             or "python" in payload["executable"]
@@ -69,6 +71,11 @@ class TestWriteOnce:
         second = json.loads((tmp_path / "telegram.json").read_text())["started_at"]
 
         assert first == second
+
+    def test_temporary_file_is_unique_to_the_writer_and_removed(self, tmp_path):
+        writer = HeartbeatWriter("slack", state_dir=tmp_path)
+        writer.write_once()
+        assert list(tmp_path.glob("slack.json.*.tmp")) == []
 
     def test_write_failure_does_not_raise(self, tmp_path, monkeypatch):
         # Make the tmp file path unwritable by replacing the dir with a file.
@@ -118,6 +125,118 @@ class TestRunLoop:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class TestSingletonClaim:
+    def test_second_writer_is_refused_until_first_releases(self, tmp_path):
+        first = HeartbeatWriter("slack", state_dir=tmp_path, pid=101)
+        second = HeartbeatWriter("slack", state_dir=tmp_path)
+        first.claim()
+        first.claim()
+        try:
+            with pytest.raises(InstanceAlreadyClaimed) as exc:
+                second.claim()
+            assert exc.value.frontend == "slack"
+            assert exc.value.holder == "101"
+            assert "already running" in str(exc.value)
+        finally:
+            first.release()
+
+        second.claim()
+        second.release()
+
+    def test_release_is_idempotent(self, tmp_path):
+        writer = HeartbeatWriter("slack", state_dir=tmp_path)
+        writer.claim()
+        writer.release()
+        writer.release()
+
+    def test_unreadable_owner_is_reported_as_unknown(self, tmp_path, monkeypatch):
+        first = HeartbeatWriter("slack", state_dir=tmp_path)
+        second = HeartbeatWriter("slack", state_dir=tmp_path)
+        first.claim()
+        monkeypatch.setattr(
+            heartbeat.os,
+            "read",
+            lambda _fd, _size: (_ for _ in ()).throw(OSError("unreadable")),
+        )
+        try:
+            with pytest.raises(InstanceAlreadyClaimed) as exc:
+                second.claim()
+            assert exc.value.holder == "unknown"
+        finally:
+            first.release()
+
+    def test_mount_without_flock_refuses_instead_of_leaking(
+        self, tmp_path, monkeypatch
+    ):
+        """ENOLCK is not contention, and it must not escape as a bare OSError.
+
+        Some NFS and FUSE mounts cannot lock at all. Catching only
+        BlockingIOError leaked the descriptor and stopped every daemon with a
+        traceback on an install that worked before the lock existed.
+        """
+        writer = HeartbeatWriter("slack", state_dir=tmp_path)
+        opened: list[int] = []
+        real_open = heartbeat.os.open
+
+        def record_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            opened.append(fd)
+            return fd
+
+        def no_locks(_fd, _op):
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        monkeypatch.setattr(heartbeat.os, "open", record_open)
+        monkeypatch.setattr(heartbeat.fcntl, "flock", no_locks)
+
+        with pytest.raises(heartbeat.InstanceLockUnavailable) as exc:
+            writer.claim()
+        assert "without file locking" in str(exc.value)
+        assert exc.value.frontend == "slack"
+
+        # The descriptor is closed, not leaked: a second close raises EBADF.
+        monkeypatch.undo()
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            os.close(opened[0])
+
+    def test_failed_owner_record_releases_the_lock(self, tmp_path, monkeypatch):
+        writer = HeartbeatWriter("slack", state_dir=tmp_path)
+
+        def broken_write(_fd, _data):
+            raise OSError("disk failed")
+
+        monkeypatch.setattr(heartbeat.os, "write", broken_write)
+        with pytest.raises(OSError, match="disk failed"):
+            writer.claim()
+
+        monkeypatch.undo()
+        replacement = HeartbeatWriter("slack", state_dir=tmp_path)
+        replacement.claim()
+        replacement.release()
+
+
+class TestOwnedCleanup:
+    def test_old_writer_does_not_unlink_replacement_heartbeat(self, tmp_path):
+        old = HeartbeatWriter("slack", state_dir=tmp_path, pid=101)
+        replacement = HeartbeatWriter("slack", state_dir=tmp_path, pid=202)
+        old.write_once()
+        replacement.write_once()
+
+        old.remove_owned()
+        assert json.loads((tmp_path / "slack.json").read_text())["pid"] == 202
+
+        replacement.remove_owned()
+        assert not (tmp_path / "slack.json").exists()
+
+    @pytest.mark.parametrize("content", [None, "not json"])
+    def test_missing_or_invalid_heartbeat_needs_no_cleanup(self, tmp_path, content):
+        path = tmp_path / "slack.json"
+        if content is not None:
+            path.write_text(content)
+        HeartbeatWriter("slack", state_dir=tmp_path).remove_owned()
 
 
 class TestLivePid:

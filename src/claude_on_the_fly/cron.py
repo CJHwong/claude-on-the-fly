@@ -1056,7 +1056,11 @@ def main() -> int:
 
     from dotenv import load_dotenv
 
-    from claude_on_the_fly.heartbeat import HeartbeatWriter
+    from claude_on_the_fly.heartbeat import (
+        HeartbeatWriter,
+        InstanceAlreadyClaimed,
+        InstanceLockUnavailable,
+    )
     from claude_on_the_fly.jobs.registry import make_queue
     from claude_on_the_fly.preflight import setup_daemon_logging
 
@@ -1115,17 +1119,25 @@ def main() -> int:
                     sig, lambda: asyncio.ensure_future(daemon.stop())
                 )
         heartbeat = HeartbeatWriter("cron", extra_provider=daemon.heartbeat_extra)
+        heartbeat.claim()
         beat = asyncio.create_task(heartbeat.run())
         try:
             await daemon.run()
         finally:
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)
-            with contextlib.suppress(FileNotFoundError):
-                heartbeat.path.unlink()
+            heartbeat.remove_owned()
+            heartbeat.release()
 
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_run())
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(_run())
+    except (InstanceAlreadyClaimed, InstanceLockUnavailable) as exc:
+        # One line and exit 2, the shape every other startup refusal uses. The
+        # freshness guard above cannot cover the case that matters here: a
+        # heartbeat old enough to look dead while its process is still running.
+        sys.stderr.write(f"claude-cron: {exc}\n")
+        return 2
     return 0
 
 

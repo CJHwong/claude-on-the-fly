@@ -1893,6 +1893,64 @@ class TestRunTeardown:
         command_broker.stop.assert_awaited_once()
         credential_broker.stop.assert_awaited_once()
 
+    async def test_a_startup_failure_stops_the_heartbeat_before_removing_it(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """remove_owned() is worthless while the writing loop is still alive.
+
+        A failure after the heartbeat task starts but before the normal shutdown
+        sequence used to skip the cancel. The loop's next write then recreated
+        the file with a fresh timestamp and the pid of a process on its way out,
+        so the TUI read a live daemon that was already gone.
+        """
+        monkeypatch.setattr(
+            orchestrator_mod,
+            "_start_sandbox",
+            AsyncMock(return_value=(None, None, None)),
+        )
+
+        order: list[str] = []
+        heartbeat = MagicMock()
+        heartbeat.claim = MagicMock()
+        heartbeat.set_extra_provider = MagicMock()
+        heartbeat.remove_owned = lambda: order.append("remove_owned")
+        heartbeat.release = MagicMock()
+
+        async def beat_forever():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("heartbeat_cancelled")
+                raise
+
+        heartbeat.run = beat_forever
+        monkeypatch.setattr(
+            orchestrator_mod, "HeartbeatWriter", lambda _platform: heartbeat
+        )
+
+        # The first await after the heartbeat task is created. It yields once
+        # so the heartbeat loop actually reaches its first await, which is what
+        # makes the cancel below observable rather than a no-op on a task that
+        # was never scheduled.
+        async def corrupt_journal(_self):
+            await asyncio.sleep(0)
+            raise RuntimeError("journal is corrupt")
+
+        monkeypatch.setattr(
+            orchestrator_mod.Orchestrator, "resume_pending", corrupt_journal
+        )
+
+        stub = MagicMock()
+        stub.describe = lambda: {"bot_token": "ab***yz"}
+        stub.set_orchestrator = MagicMock()
+        stub.stop = AsyncMock()
+        stub.start = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="journal is corrupt"):
+            await orchestrator_mod.run(stub, "test")
+
+        assert order == ["heartbeat_cancelled", "remove_owned"]
+
     async def test_the_interruption_notices_go_out_before_the_frontend_stops(
         self, monkeypatch
     ) -> None:

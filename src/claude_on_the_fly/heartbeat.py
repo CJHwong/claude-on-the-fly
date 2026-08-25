@@ -15,6 +15,8 @@ TUI, because a daemon needs it too — to refuse to start a second copy of itsel
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -23,6 +25,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from uuid import uuid4
 
 from claude_on_the_fly.agent import DATA_DIR
 
@@ -34,6 +37,30 @@ DEFAULT_INTERVAL_S = 5.0
 # relative to DEFAULT_INTERVAL_S so a daemon briefly starved of the event loop
 # is not declared dead.
 DEFAULT_LIVENESS_WINDOW_S = 30.0
+
+
+class InstanceAlreadyClaimed(RuntimeError):
+    """A second daemon tried to own the same frontend state."""
+
+    def __init__(self, frontend: str, holder: str = "unknown") -> None:
+        super().__init__(
+            f"{frontend} daemon is already running (instance lock held by {holder})"
+        )
+        self.frontend = frontend
+        self.holder = holder
+
+
+class InstanceLockUnavailable(RuntimeError):
+    """The state directory cannot hold the lock that makes ownership exclusive."""
+
+    def __init__(self, frontend: str, lock_path: Path, cause: OSError) -> None:
+        super().__init__(
+            f"cannot lock {lock_path} for the {frontend} daemon ({cause}); "
+            "the state directory is on a filesystem without file locking. "
+            "Point DATA_DIR at a local disk."
+        )
+        self.frontend = frontend
+        self.lock_path = lock_path
 
 
 def _package_version() -> str:
@@ -122,10 +149,64 @@ class HeartbeatWriter:
         self._version = _package_version()
         self._executable = sys.executable
         self._path = self._state_dir / f"{frontend}.json"
+        self._lock_path = self._state_dir / f"{frontend}.instance.lock"
+        self._lock_fd: int | None = None
+        self._instance_id = uuid4().hex
 
     @property
     def path(self) -> Path:
         return self._path
+
+    def claim(self) -> None:
+        """Atomically acquire process-lifetime ownership of this frontend."""
+        if self._lock_fd is not None:
+            return
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                holder = os.read(fd, 128).decode(errors="replace").strip()
+            except OSError:
+                holder = "unknown"
+            os.close(fd)
+            raise InstanceAlreadyClaimed(self._frontend, holder or "unknown") from None
+        except OSError as exc:
+            # A state dir on a filesystem without flock (some NFS and FUSE
+            # mounts) raises ENOLCK/EOPNOTSUPP rather than BlockingIOError.
+            # Catching only the latter leaked this fd and stopped every daemon
+            # on an install that worked before the lock existed.
+            #
+            # Refusing rather than degrading is deliberate: the whole point of
+            # the claim is that two daemons cannot both own one frontend, and a
+            # mount that cannot answer the question cannot be assumed to say no.
+            os.close(fd)
+            raise InstanceLockUnavailable(self._frontend, self._lock_path, exc) from exc
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, str(self._pid).encode())
+            os.fsync(fd)
+        except Exception:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            raise
+        self._lock_fd = fd
+
+    def release(self) -> None:
+        """Release a lock acquired by :meth:`claim`. Idempotent."""
+        fd = self._lock_fd
+        if fd is None:
+            return
+        self._lock_fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def set_extra_provider(self, provider: Callable[[], dict] | None) -> None:
+        """Attach data that was not available when the instance was claimed."""
+        self._extra_provider = provider
 
     def write_once(self) -> None:
         """Synchronous single write — used at startup and from the run loop.
@@ -144,14 +225,28 @@ class HeartbeatWriter:
                 "last_heartbeat": _utcnow_iso(),
                 "version": self._version,
                 "executable": self._executable,
+                "instance_id": self._instance_id,
                 "extra": extra,
             }
-            tmp = self._path.with_suffix(".json.tmp")
+            tmp = self._path.with_name(
+                f"{self._path.name}.{self._pid}.{self._instance_id}.tmp"
+            )
             tmp.write_text(json.dumps(payload))
             tmp.replace(self._path)
             logger.debug("heartbeat: wrote %s pid=%d", self._frontend, self._pid)
         except Exception as exc:
             logger.warning("heartbeat write failed for %s: %s", self._frontend, exc)
+
+    def remove_owned(self) -> None:
+        """Remove the heartbeat only if it still belongs to this writer."""
+        try:
+            payload = json.loads(self._path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if payload.get("instance_id") != self._instance_id:
+            return
+        with contextlib.suppress(FileNotFoundError):
+            self._path.unlink()
 
     async def run(self) -> None:
         """Loop until cancelled, writing the heartbeat every interval_s seconds.

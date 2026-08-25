@@ -3239,10 +3239,15 @@ class SlackFrontend(Frontend):
 
 def main() -> None:
     import argparse
+    import sys
 
     from dotenv import load_dotenv
 
     from claude_on_the_fly import slack_manifest
+    from claude_on_the_fly.heartbeat import (
+        InstanceAlreadyClaimed,
+        InstanceLockUnavailable,
+    )
     from claude_on_the_fly.orchestrator import run
     from claude_on_the_fly.preflight import run_slack
 
@@ -3281,7 +3286,13 @@ def main() -> None:
     # restart. preflight has already validated them and refused to start on a broken
     # one.
     frontend = SlackFrontend(app_token=app_token, token=token, user_id=user_id)
-    asyncio.run(run(frontend, platform="slack"))
+    try:
+        asyncio.run(run(frontend, platform="slack"))
+    except (InstanceAlreadyClaimed, InstanceLockUnavailable) as exc:
+        # An operator-facing refusal with its remedy in the message, not a
+        # traceback. The supervisor already treats exit 2 as a clean refusal.
+        sys.stderr.write(f"claude-slack: {exc}\n")
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":  # pragma: no cover

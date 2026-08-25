@@ -14,9 +14,11 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from claude_on_the_fly import envfile
 from claude_on_the_fly.interim import interim_progress_reads_as_on
@@ -727,6 +729,69 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
     return results
 
 
+def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
+    """Probe host access the selected backend needs before it is spawned.
+
+    Permission bits are not sufficient when the supervisor itself is running in
+    a sandbox. A real create/write/unlink cycle verifies that the replacement
+    daemon will be able to initialize its own state before a restart stops the
+    healthy process.
+
+    Both backends are probed. Running this for codex alone left the outage it
+    exists to prevent fully reachable on `claude`, which is the default and
+    writes its own state under the operator's home just the same.
+    """
+    if env.get("AGENT_BACKEND", "claude").lower() == "codex":
+        label, home = "Codex", envfile.codex_home(env)
+    else:
+        label, home = "Claude", envfile.claude_config_dir(env)
+
+    # Probe the nearest directory that already exists instead of creating the
+    # home. Creating it would let a mistyped CLAUDE_CONFIG_DIR or CODEX_HOME
+    # pass by bringing the wrong directory into being, and it would report `ok`
+    # for a home the backend has no state in. A first run whose home does not
+    # exist yet is still answered: what it needs to know is whether the parent
+    # will accept the directory the backend is about to create.
+    target = home
+    while not target.is_dir() and target.parent != target:
+        target = target.parent
+
+    probe = target / f".cotf-write-probe-{os.getpid()}-{uuid4().hex}"
+    fd: int | None = None
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, b"ok\n")
+        os.close(fd)
+        fd = None
+        probe.unlink()
+    except OSError as exc:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        with suppress(OSError):
+            probe.unlink()
+        return [
+            CheckResult(
+                name=f"{label} state write access",
+                status="invalid",
+                detail=f"cannot write {target}: {exc}",
+                fix_hint=(
+                    "Run the start or restart command from a terminal outside "
+                    "a sandboxed agent session. Changing mode bits may not help "
+                    "when the parent process is sandboxed."
+                ),
+            )
+        ]
+
+    return [
+        CheckResult(
+            name=f"{label} state write access",
+            status="ok",
+            detail=f"write probe passed at {target}",
+        )
+    ]
+
+
 # Backend/mode pairs that can both compact and supply the prompt-size reading
 # the auto-compact gate thresholds on. The gap is claude's ollama mode, which
 # withholds the window on purpose (see `ClaudeBackend.run`) because the claude
@@ -1183,7 +1248,7 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
     e = os.environ if env is None else env
     return {
         **{name: check_frontend(name, e) for name in SUPERVISABLE_FRONTENDS},
-        "backend": check_backend(e),
+        "backend": check_backend(e) + check_backend_runtime_access(e),
         "binaries": check_binaries(e),
     }
 

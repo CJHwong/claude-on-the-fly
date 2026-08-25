@@ -15,6 +15,7 @@ from claude_on_the_fly.checks import (
     all_ok,
     check_all,
     check_backend,
+    check_backend_runtime_access,
     check_binaries,
     check_frontend,
     check_jobs,
@@ -28,6 +29,99 @@ from claude_on_the_fly.checks import (
     slack_deprecations,
 )
 from claude_on_the_fly.interim import interim_progress_enabled
+
+
+class TestBackendRuntimeAccess:
+    def test_claude_backend_is_probed_too(self, tmp_path):
+        """The default backend writes state under $HOME just as codex does."""
+        config_dir = tmp_path / "claude-home"
+        config_dir.mkdir()
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "claude", "CLAUDE_CONFIG_DIR": str(config_dir)}
+        )
+        assert [(r.name, r.status) for r in results] == [
+            ("Claude state write access", "ok")
+        ]
+        assert list(config_dir.iterdir()) == []
+
+    def test_backend_absent_defaults_to_claude(self, tmp_path):
+        config_dir = tmp_path / "claude-home"
+        config_dir.mkdir()
+        results = check_backend_runtime_access({"CLAUDE_CONFIG_DIR": str(config_dir)})
+        assert results[0].name == "Claude state write access"
+
+    def test_codex_write_probe_passes_and_cleans_up(self, tmp_path):
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+
+        assert [(r.name, r.status) for r in results] == [
+            ("Codex state write access", "ok")
+        ]
+        assert str(codex_home) in results[0].detail
+        assert list(codex_home.iterdir()) == []
+
+    def test_absent_home_is_not_created(self, tmp_path):
+        """The probe answers "could this be created" without creating it.
+
+        Creating it would report ok for a mistyped home the backend has no
+        state in, which is the misconfiguration the check stands next to.
+        """
+        codex_home = tmp_path / "typo" / "codex-home"
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+        assert results[0].status == "ok"
+        assert not codex_home.exists()
+        assert not codex_home.parent.exists()
+        # It probed the nearest directory that does exist.
+        assert str(tmp_path) in results[0].detail
+        assert list(tmp_path.iterdir()) == []
+
+    def test_unwritable_ancestor_is_refused(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        real_open = checks_mod.os.open
+
+        def deny_probe(path, flags, mode=0o777):
+            if str(path).startswith(str(codex_home)):
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(checks_mod.os, "open", deny_probe)
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+
+        assert [(r.name, r.status) for r in results] == [
+            ("Codex state write access", "invalid")
+        ]
+        assert "Operation not permitted" in results[0].detail
+        assert "outside a sandboxed agent session" in (results[0].fix_hint or "")
+
+    def test_failure_after_open_closes_and_removes_probe(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+
+        def fail_write(_fd, _data):
+            raise OSError("write failed")
+
+        monkeypatch.setattr(checks_mod.os, "write", fail_write)
+        results = check_backend_runtime_access(
+            {"AGENT_BACKEND": "codex", "CODEX_HOME": str(codex_home)}
+        )
+        assert results[0].status == "invalid"
+        assert list(codex_home.iterdir()) == []
+
+    def test_doctor_runs_the_probe(self, tmp_path):
+        """An operator refused by this check must be able to see it in doctor."""
+        config_dir = tmp_path / "claude-home"
+        config_dir.mkdir()
+        groups = checks_mod.check_all({"CLAUDE_CONFIG_DIR": str(config_dir)})
+        names = [r.name for r in groups["backend"]]
+        assert "Claude state write access" in names
 
 
 class TestSlackResolvers:
