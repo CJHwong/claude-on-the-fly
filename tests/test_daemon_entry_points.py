@@ -207,11 +207,14 @@ class TestSlackMain:
         )
         monkeypatch.setattr(slack_mod.asyncio, "run", lambda coro: coro.close())
         slack_mod.main()
-        assert built[0] == {
+        assert {key: built[0][key] for key in ("app_token", "token", "user_id")} == {
             "app_token": "xapp-tok",
             "token": "xoxb-tok",
             "user_id": "U_SELF",
         }
+        assert built[0]["event_state"].path == (
+            slack_mod.DATA_DIR / "state" / "slack.events.json"
+        )
 
     def test_the_sender_lists_are_left_unset_so_they_read_live(
         self, monkeypatch, no_dotenv

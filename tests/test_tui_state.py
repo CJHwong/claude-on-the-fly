@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
+from claude_on_the_fly.tui import state as state_mod
 from claude_on_the_fly.tui.state import (
     Snapshot,
     snapshot,
@@ -285,6 +286,23 @@ class TestJobs:
 
 
 class TestStaleDetection:
+    def test_symlinked_and_physical_runtime_are_the_same(self, tmp_path):
+        release_bin = tmp_path / "releases" / "one" / ".venv" / "bin"
+        release_bin.mkdir(parents=True)
+        current = tmp_path / "current"
+        current.symlink_to(tmp_path / "releases" / "one")
+        assert state_mod.same_runtime_environment(
+            str(current / ".venv" / "bin" / "python"),
+            str(release_bin / "python"),
+        )
+
+    def test_runtime_comparison_falls_back_when_resolution_fails(self, monkeypatch):
+        monkeypatch.setattr(
+            Path, "resolve", lambda _self: (_ for _ in ()).throw(OSError())
+        )
+        assert state_mod.same_runtime_environment("same", "same") is True
+        assert state_mod.same_runtime_environment("left", "right") is False
+
     def test_matching_version_and_executable_not_stale(self, empty_state, alive_check):
         _write_heartbeat(
             empty_state,
@@ -325,6 +343,35 @@ class TestStaleDetection:
         )
         tg = next(f for f in snap.frontends if f.name == "telegram")
         assert tg.stale is True
+
+    def test_managed_runtime_is_comparison_target_and_marks_old_tui(
+        self, tmp_path, empty_state, alive_check, monkeypatch
+    ):
+        old = tmp_path / "releases" / "old" / ".venv" / "bin" / "python"
+        new = tmp_path / "releases" / "new" / ".venv" / "bin" / "python"
+        old.parent.mkdir(parents=True)
+        new.parent.mkdir(parents=True)
+        monkeypatch.setenv(state_mod.EXPECTED_RUNTIME_EXECUTABLE_ENV, str(new))
+        monkeypatch.setattr(state_mod.sys, "executable", str(old))
+        _write_heartbeat(
+            empty_state,
+            "telegram",
+            last_heartbeat="2026-05-19T13:00:00Z",
+            version="0.1.0",
+            executable=str(new),
+        )
+
+        snap = snapshot(
+            empty_state,
+            None,
+            now=_at("2026-05-19T13:00:05Z"),
+            process_check=alive_check,
+            self_version="0.1.0",
+        )
+
+        tg = next(f for f in snap.frontends if f.name == "telegram")
+        assert tg.stale is False
+        assert snap.controller_stale is True
 
     def test_different_version_marks_running_daemon_stale(
         self, empty_state, alive_check

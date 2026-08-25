@@ -114,6 +114,9 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
 | `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands unread instead of being read on arrival by a sender who is about to leave; `0` posts it immediately | Immediate |
 | `mention_notice_seconds` | non-negative number / `0` | Seconds an untagged channel message waits before the bot replies that it only sees messages tagging it, once per thread; `0` disables the notice and records no per-thread state for it | Immediate |
+| `foreground_timeout_s` | positive number / unset | Enables seamless long-turn handoff; ordinary work is announced as background shortly before this interactive window ends, while clearly long work is announced immediately | Immediate |
+| `background_handoff_margin_s` | positive number / `30` | Seconds reserved before the foreground boundary for the handoff notice; capped at half of the foreground window | Immediate |
+| `background_timeout_s` | positive number / `3600` | Real wall-clock deadline for the same managed execution after handoff | Immediate |
 | `personas` | mapping / empty | Per-chat instructions file, replacing the data-root `CLAUDE.md`; keys are channel id, channel name, sender id, `dm`, or `default` | Immediate |
 
 Persona values are paths relative to the data root and must resolve inside it. A value
@@ -179,3 +182,13 @@ Leave `command` unset and the command follows how the copy was installed: a git 
 runs `git pull --ff-only && uv sync` from the repository root, and a `uv tool install`
 runs `uv tool upgrade <tool>`. Any other shape refuses to guess and asks for this key.
 See [Upgrade safely](../how-to/upgrade-safely.md).
+
+## `watchdog`
+
+| Key | Type / default | Effect | Lifecycle |
+|---|---|---|---|
+| `heartbeat_stale_seconds` | positive number / `90` | Heartbeat age that makes a live daemon unhealthy | Next watchdog invocation |
+| `limit_grace_seconds` | positive number / `120` | Extra cleanup time after a managed turn's advertised execution timeout before restart | Next watchdog invocation |
+
+These values are read by the one-shot `claude-watchdog` command. cotf deliberately
+does not install a scheduler; see [Run the watchdog](../how-to/watchdog.md).

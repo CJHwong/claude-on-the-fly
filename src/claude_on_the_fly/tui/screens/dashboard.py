@@ -717,6 +717,12 @@ class DashboardScreen(Screen):
             except supervisor.SpawnTimeout as exc:
                 self._notify(f"{name}: spawn timed out — see {exc.log_path}", "error")
                 return
+            except supervisor.RestartInProgress as exc:
+                self._notify(str(exc), "warning")
+                return
+            except supervisor.ControllerOutOfDate as exc:
+                self._notify(str(exc), "error")
+                return
             except Exception as exc:
                 self._notify(f"{name}: {verb} failed: {exc}", "error")
                 return
@@ -1688,7 +1694,13 @@ class DashboardScreen(Screen):
     def _refresh_stale_banner(self, snap: state.Snapshot) -> None:
         stale = [f.name for f in snap.frontends if f.stale]
         banner = self.query_one("#stale-banner", Static)
-        if stale:
+        if snap.controller_stale:
+            banner.update(
+                "[bold red]⚠ This dashboard belongs to the previous managed "
+                "release. Quit and reopen it before starting or restarting "
+                "services.[/bold red]"
+            )
+        elif stale:
             names = ", ".join(stale)
             banner.update(
                 f"[bold yellow]⚠ {len(stale)} daemon(s) out of date "

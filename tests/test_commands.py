@@ -380,6 +380,19 @@ def test_a_symlink_loop_argument_is_not_refused(tmp_path):
     assert commands._unsafe_path_argument(["a"], str(tmp_path)) is None
 
 
+def test_an_unresolvable_argument_is_not_refused(monkeypatch, tmp_path):
+    """Resolution failure does not turn an unusable path into an escape."""
+    real_resolve = Path.resolve
+
+    def fail_for_candidate(self, *args, **kwargs):
+        if self.name == "unresolvable":
+            raise OSError("cannot resolve")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_for_candidate)
+    assert commands._unsafe_path_argument(["unresolvable"], str(tmp_path)) is None
+
+
 async def test_a_planted_symlink_is_refused_over_the_wire(tmp_path):
     """The guard runs before process creation, and after the cwd is settled: a
     relative argument means nothing without the directory it resolves from."""

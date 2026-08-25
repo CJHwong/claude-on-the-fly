@@ -26,6 +26,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 from claude_on_the_fly import checks, logs, settings
 from claude_on_the_fly.agent import (
     DATA_DIR,
+    DEFAULT_TIMEOUT,
     MAX_ATTACHMENT_BYTES,
     Response,
     cached_skills,
@@ -41,7 +42,8 @@ from claude_on_the_fly.approvals import ApprovalRequest
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
-from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.protocol import Frontend, ManagedTurnPolicy
+from claude_on_the_fly.slack_events import SlackEventState
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
 from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
@@ -110,6 +112,65 @@ INTERIM_PREFIX = "⏳"
 # increment one), so narration would land on people who never asked a question.
 _INTERIM_CHANNEL_TYPES = frozenset({"im", "mpim"})
 
+# Long-turn supervision is opt-in: an absent foreground value preserves the
+# existing timeout behavior and posts no handoff notice. Operators who set it
+# get two clocks -- an interactive handoff and a longer execution deadline.
+DEFAULT_BACKGROUND_HANDOFF_MARGIN_S = 30.0
+
+_LONG_TASK_DIRECT_RE = re.compile(
+    r"(?:\b(?:deep\s+research|root\s+cause|investigat(?:e|ion)|"
+    r"research|audit|batch|monitor|watch\s+until)\b|"
+    r"深入(?:研究|調查|分析)|研究一下|調查(?:一下|原因|根因)|根因分析|"
+    r"全面(?:盤點|分析|檢查)|批次(?:處理|檢查)|監控|持續追蹤)",
+    re.IGNORECASE,
+)
+_LONG_TASK_ACTION_RE = re.compile(
+    r"(?:\b(?:analy[sz]e|compare|review|trace|gather|summari[sz]e|report)\b|"
+    r"分析|比較|比對|回顧|追查|彙整|整理(?:一份)?|報告|盤點)",
+    re.IGNORECASE,
+)
+_LONG_TASK_SCOPE_RE = re.compile(
+    r"(?:\b(?:all|every|multiple|across|history|historical|past\s+\d+)\b|"
+    r"所有|全部|多個|跨(?:系統|平台|團隊)|歷史(?:紀錄|訊息)?|"
+    r"(?:最近|過去)\s*\d+\s*(?:天|週|周|月))",
+    re.IGNORECASE,
+)
+_LONG_TASK_SOURCES = (
+    "slack",
+    "jira",
+    "hubspot",
+    "confluence",
+    "github",
+    "codebase",
+    "repository",
+    "repo",
+    "database",
+    "log",
+    "web",
+    "程式碼",
+    "資料庫",
+    "日誌",
+)
+_QUOTED_CONTEXT_RE = re.compile(
+    r"<forwarded_message\b.*?</forwarded_message>", re.IGNORECASE | re.DOTALL
+)
+
+
+def looks_like_long_task(text: str) -> bool:
+    """Conservatively route clearly long work to the background immediately."""
+    primary = _QUOTED_CONTEXT_RE.sub(" ", text)
+    if _LONG_TASK_DIRECT_RE.search(primary):
+        return True
+    if not _LONG_TASK_ACTION_RE.search(primary):
+        return False
+    lowered = primary.casefold()
+    source_count = sum(source in lowered for source in _LONG_TASK_SOURCES)
+    return source_count >= 2 or bool(_LONG_TASK_SCOPE_RE.search(primary))
+
+
+def _uses_zh(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", text))
+
 
 # Bot-token-only slash command, opt-in: unset registers no command at all, and
 # the skill picker is reached from a message's "..." shortcut instead. When set
@@ -160,6 +221,39 @@ def _non_negative_float(name: str, fallback: float) -> float:
         logger.warning("%s=%s cannot be negative; using %s", name, value, fallback)
         return fallback
     return value
+
+
+def _optional_positive_float(name: str) -> float | None:
+    """A live duration setting whose absence disables its feature."""
+    raw = settings.get(name).strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; ignoring it", name, raw)
+        return None
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("%s=%r must be positive; ignoring it", name, raw)
+        return None
+    return value
+
+
+def foreground_timeout_s() -> float | None:
+    """Interactive window; unset disables managed background handoff."""
+    return _optional_positive_float("SLACK_FOREGROUND_TIMEOUT_S")
+
+
+def background_handoff_margin_s() -> float:
+    """Time reserved to announce a handoff before the interactive boundary."""
+    value = _optional_positive_float("SLACK_BACKGROUND_HANDOFF_MARGIN_S")
+    return value if value is not None else DEFAULT_BACKGROUND_HANDOFF_MARGIN_S
+
+
+def background_timeout_s() -> float:
+    """Real execution deadline once managed handoff is enabled."""
+    value = _optional_positive_float("SLACK_BACKGROUND_TIMEOUT_S")
+    return value if value is not None else DEFAULT_TIMEOUT
 
 
 def reply_soft_limit() -> int:
@@ -879,6 +973,7 @@ class SlackFrontend(Frontend):
         silent_sender_ids: set[str] | None = None,
         job_command: str | None = None,
         job_queue: JobQueue | None = None,
+        event_state: SlackEventState | None = None,
     ) -> None:
         self._app_token = app_token
         self._user_id = user_id
@@ -939,9 +1034,17 @@ class SlackFrontend(Frontend):
         # currently running, so a slash command targets a real message or
         # command-anchor session instead of an unregistered root.
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
-        self._processed_ts: deque[str] = deque(maxlen=1000)
-        self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
-        self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
+        self._event_state = event_state
+        restored = event_state.read() if event_state is not None else None
+        self._processed_ts: deque[str] = deque(
+            restored.processed_ts if restored is not None else (), maxlen=1000
+        )
+        self._active_channels: dict[str, str] = dict(
+            restored.active_channels if restored is not None else {}
+        )
+        self._channel_types: dict[str, str] = dict(
+            restored.channel_types if restored is not None else {}
+        )
         self._own_dm: dict[str, tuple[bool, float]] = {}
         # Membership is authorization state, not immutable channel metadata.
         # Cache definitive answers briefly, and never cache an answer produced by
@@ -1774,10 +1877,29 @@ class SlackFrontend(Frontend):
     async def _on_hello(self, event, say):
         if not self._connected_once:
             self._connected_once = True
-            logger.info("Socket Mode: initial connection")
-            return
-        logger.info("Socket Mode: reconnected, running catch-up")
+            logger.info("Socket Mode: initial connection, running catch-up")
+        else:
+            logger.info("Socket Mode: reconnected, running catch-up")
         await self._catchup()
+
+    def _remember_event(self, ts: str, channel: str, channel_type: str = "") -> None:
+        """Advance dedupe and catch-up state at a durable acceptance boundary."""
+        self._processed_ts.append(ts)
+        previous = self._active_channels.get(channel)
+        if previous is None or ts > previous:
+            self._active_channels[channel] = ts
+        if channel_type:
+            self._channel_types[channel] = channel_type
+        if self._event_state is None:
+            return
+        try:
+            self._event_state.write(
+                list(self._processed_ts), self._active_channels, self._channel_types
+            )
+        except OSError as exc:
+            # The in-memory path still works. Keep serving and make persistence
+            # loss visible in the daemon log.
+            logger.error("slack events: could not persist %s/%s: %s", channel, ts, exc)
 
     async def _ingest_event(self, event: dict) -> None:
         subtype = event.get("subtype")
@@ -1883,6 +2005,7 @@ class SlackFrontend(Frontend):
             stopped = False
             if self._orchestrator is not None:
                 stopped = await self._orchestrator.abort(session_id)
+            self._remember_event(ts, channel, channel_type)
             await self._post_notice(
                 channel,
                 thread_ts,
@@ -1901,11 +2024,8 @@ class SlackFrontend(Frontend):
             # This branch returns before the normal path's catch-up bookkeeping,
             # so mirror it here or a reconnect re-ingests the trigger and
             # compacts a second time.
-            self._processed_ts.append(ts)
-            self._active_channels[channel] = ts
-            if channel_type:
-                self._channel_types[channel] = channel_type
             if self._orchestrator is None:
+                self._remember_event(ts, channel, channel_type)
                 await self._post_notice(
                     channel, thread_ts, "Not connected to a session yet."
                 )
@@ -1927,6 +2047,7 @@ class SlackFrontend(Frontend):
             self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
             self._pending_reply_suppressed.setdefault(session_id, deque()).append(False)
             await self._orchestrator.on_compact(session_id)
+            self._remember_event(ts, channel, channel_type)
             return
 
         # The job trigger queues a background job that outlives this chat turn;
@@ -1949,16 +2070,11 @@ class SlackFrontend(Frontend):
         ):
             task = job_text[len(job_command) :].strip()
             # Unlike $stop, $job is not idempotent — a catchup re-ingest on
-            # reconnect would enqueue a second job. Mirror the normal path's
-            # catch-up bookkeeping (which this branch returns before reaching):
-            # mark the ts processed (dedup), record the channel + watermark so
-            # _catchup re-fetches it after a disconnect, and cache the channel
-            # type so the recovered messages gate identically to the live path.
-            self._processed_ts.append(ts)
-            self._active_channels[channel] = ts
-            if channel_type:
-                self._channel_types[channel] = channel_type
+            # reconnect would enqueue a second job. This branch records the
+            # event after the queue's durable enqueue succeeds; failed enqueues
+            # remain eligible for a later catch-up instead of being forgotten.
             if not task:
+                self._remember_event(ts, channel, channel_type)
                 # A bare trigger is somebody asking what is already running,
                 # which is the one moment the answer is worth more than the
                 # usage line — so show both.
@@ -1995,6 +2111,7 @@ class SlackFrontend(Frontend):
                     "Couldn't queue that job — check the worker logs.",
                 )
                 return
+            self._remember_event(ts, channel, channel_type)
             logger.info("slack %s/%s: queued job %s", channel, thread_ts, job.id)
             # Promise a reply only if something can produce one. With the
             # trigger on by default, an install that never started the worker
@@ -2053,10 +2170,6 @@ class SlackFrontend(Frontend):
             return
 
         self._session_sender_ids[session_id] = sender_id
-        self._processed_ts.append(ts)
-        self._active_channels[channel] = ts
-        if channel_type:
-            self._channel_types[channel] = channel_type
 
         cover_parts: list[str] = []
         if file_lines:
@@ -2094,6 +2207,10 @@ class SlackFrontend(Frontend):
         )
         if self._on_message:
             await self._on_message(session_id, final_text)
+            # The orchestrator journals before on_message returns. Persist Slack
+            # dedup only after that durable acceptance boundary so a crash cannot
+            # remember an event while losing its turn.
+            self._remember_event(ts, channel, channel_type)
 
     async def _catchup(self) -> None:
         """Fetch recent messages from active channels to recover missed events."""
@@ -2538,6 +2655,75 @@ class SlackFrontend(Frontend):
         elapsed = int(time.monotonic() - start)
         verb = seq[(elapsed // STATUS_VERB_ROTATE_SECS) % len(seq)]
         await self._set_status(chat_id, f"is {verb}… ({elapsed}s)")
+
+    def managed_turn_policy(self, chat_id: int, text: str) -> ManagedTurnPolicy | None:
+        """Keep one execution alive across an opt-in background handoff."""
+        del chat_id
+        foreground = foreground_timeout_s()
+        if foreground is None:
+            return None
+        # Cap an oversized margin so an ordinary message still gets a real
+        # foreground window. Clearly long work is announced before execution.
+        margin = min(background_handoff_margin_s(), foreground / 2)
+        handoff_after = 0.0 if looks_like_long_task(text) else foreground - margin
+        return ManagedTurnPolicy(
+            background_after_s=handoff_after,
+            execution_timeout_s=background_timeout_s(),
+        )
+
+    async def notify_background(
+        self, chat_id: int, *, initial: bool, user_text: str
+    ) -> None:
+        route = self._sessions.get(chat_id)
+        if route is None or self._in_flight_reply_suppressed.get(chat_id, False):
+            return
+        if _uses_zh(user_text):
+            body = (
+                "這個問題需要較多資料交叉確認，我已在背景處理；你不需要重新送出，"
+                "完成後會直接回覆這個討論串。"
+                if initial
+                else "這次處理比預期久，我已改為背景繼續處理；你不需要重新送出，"
+                "完成後會直接回覆這個討論串。"
+            )
+        else:
+            body = (
+                "This looks like a longer task, so I’m processing it in the "
+                "background. You don’t need to resend it; I’ll reply in this "
+                "thread when it’s done."
+                if initial
+                else "This is taking longer than expected, so I’ve moved the same "
+                "task to the background. You don’t need to resend it; I’ll reply "
+                "in this thread when it’s done."
+            )
+        await self._post_notice(*route, body)
+
+    async def notify_timeout(
+        self,
+        chat_id: int,
+        *,
+        timeout_s: float | None,
+        background: bool,
+        user_text: str,
+    ) -> None:
+        route = self._sessions.get(chat_id)
+        if route is None or self._in_flight_reply_suppressed.get(chat_id, False):
+            return
+        if timeout_s is None:
+            limit_zh = "執行時間上限"
+            limit_en = "its execution limit"
+        elif timeout_s >= 60 and timeout_s % 60 == 0:
+            limit_zh = f"{timeout_s / 60:g} 分鐘執行上限"
+            limit_en = f"the {timeout_s / 60:g}-minute execution limit"
+        else:
+            limit_zh = f"{timeout_s:g} 秒執行上限"
+            limit_en = f"the {timeout_s:g}-second execution limit"
+        if _uses_zh(user_text):
+            scope = "背景工作" if background else "工作"
+            body = f"⚠️ 這項{scope}已達{limit_zh}，已停止且未能完成。"
+        else:
+            scope = "background task" if background else "task"
+            body = f"⚠️ This {scope} reached {limit_en} and stopped before it finished."
+        await self._post_notice(*route, body)
 
     async def notify_queued(self, chat_id: int, position: int) -> None:
         """React with hourglass on the most recently ingested message."""
@@ -3019,7 +3205,12 @@ def main() -> None:
     # message", which is what makes adding an allowed sender take effect without a
     # restart. preflight has already validated them and refused to start on a broken
     # one.
-    frontend = SlackFrontend(app_token=app_token, token=token, user_id=user_id)
+    frontend = SlackFrontend(
+        app_token=app_token,
+        token=token,
+        user_id=user_id,
+        event_state=SlackEventState(DATA_DIR / "state" / "slack.events.json"),
+    )
     asyncio.run(run(frontend, platform="slack"))
 
 

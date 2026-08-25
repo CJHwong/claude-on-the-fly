@@ -48,6 +48,11 @@ DEFAULT_SCHEDULE_YAML = DATA_DIR / "cron.yaml"  # see cron.resolve_config_path
 # test can redirect it (snapshot() takes no jobs argument).
 DEFAULT_JOBS_DIR = DATA_DIR / "jobs"
 
+# Stable launchers may point this at their managed ``current`` runtime. A TUI
+# can stay open across an atomic release switch, so its own interpreter may be
+# retired even while a launcher and new daemons point at the new release.
+EXPECTED_RUNTIME_EXECUTABLE_ENV = "COTF_EXPECTED_RUNTIME_EXECUTABLE"
+
 # Per-frontend staleness threshold (seconds). A poll cadence and a tracker
 # call latency can occasionally starve the heartbeat coroutine, so we give it
 # more headroom before we call it broken.
@@ -112,6 +117,7 @@ class Snapshot:
     # None when the configured queue is not the file adapter, so there is no
     # maildir to observe. Distinct from an empty queue.
     jobs_queue: JobsQueueView | None = None
+    controller_stale: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +154,19 @@ def tui_version() -> str:
         return "unknown"
 
 
+def same_runtime_environment(left: str, right: str) -> bool:
+    """Whether two Python entry points belong to the same virtual environment.
+
+    Resolve their ``bin`` directories rather than the executable files. Virtualenv
+    Python binaries often symlink to one shared system interpreter, which would
+    otherwise make different releases look identical.
+    """
+    try:
+        return Path(left).parent.resolve() == Path(right).parent.resolve()
+    except (OSError, RuntimeError):
+        return left == right
+
+
 def _is_stale(
     state_str: FrontendState,
     daemon_version: str | None,
@@ -163,7 +182,9 @@ def _is_stale(
         return False
     if daemon_version is not None and daemon_version != self_version:
         return True
-    return daemon_executable is not None and daemon_executable != self_executable
+    return daemon_executable is not None and not same_runtime_environment(
+        daemon_executable, self_executable
+    )
 
 
 def _frontend_status_from_heartbeat(
@@ -376,14 +397,24 @@ def snapshot(
 ) -> Snapshot:
     """Snapshot the current state of every supervisable frontend + cron.
 
-    self_version / self_executable default to the live TUI's values; tests
-    can override either to simulate a fresh upgrade.
+    self_version defaults to the live TUI. self_executable prefers the managed
+    runtime declared by a stable launcher, then the live TUI. Tests can override
+    either to simulate an upgrade.
     """
     sd = state_dir if state_dir is not None else STATE_DIR
     sy = schedule_yaml if schedule_yaml is not None else DEFAULT_SCHEDULE_YAML
     ts = now if now is not None else datetime.now(UTC)
     sv = self_version if self_version is not None else tui_version()
-    se = self_executable if self_executable is not None else sys.executable
+    managed_executable = os.environ.get(EXPECTED_RUNTIME_EXECUTABLE_ENV)
+    se = (
+        self_executable
+        if self_executable is not None
+        else managed_executable or sys.executable
+    )
+    controller_stale = bool(
+        managed_executable
+        and not same_runtime_environment(sys.executable, managed_executable)
+    )
 
     frontends = [
         _frontend_status_from_heartbeat(name, sd, ts, process_check, sv, se)
@@ -396,4 +427,5 @@ def snapshot(
         jobs=jobs,
         schedule_error=schedule_error,
         jobs_queue=_jobs_queue_view(),
+        controller_stale=controller_stale,
     )

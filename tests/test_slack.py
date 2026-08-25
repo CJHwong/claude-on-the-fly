@@ -847,6 +847,66 @@ def _seed_progress_route(frontend, channel_type: str | None = "im") -> int:
     return session_id
 
 
+class TestLongTurnNotices:
+    @pytest.mark.parametrize(
+        ("initial", "text", "expected"),
+        [
+            (True, "research this", "longer task"),
+            (False, "research this", "taking longer than expected"),
+            (True, "請深入研究", "背景處理"),
+            (False, "請深入研究", "改為背景"),
+        ],
+    )
+    async def test_background_notice_is_localized(
+        self, frontend, initial, text, expected
+    ):
+        session_id = _seed_progress_route(frontend)
+        await frontend.notify_background(session_id, initial=initial, user_text=text)
+        posted = frontend._app.client.chat_postMessage.await_args.kwargs["text"]
+        assert expected in posted
+
+    @pytest.mark.parametrize(
+        ("timeout_s", "background", "text", "expected"),
+        [
+            (3600, True, "research", "60-minute"),
+            (12, False, "research", "12-second"),
+            (None, False, "research", "its execution limit"),
+            (3600, True, "研究一下", "60 分鐘"),
+        ],
+    )
+    async def test_timeout_notice_is_specific(
+        self, frontend, timeout_s, background, text, expected
+    ):
+        session_id = _seed_progress_route(frontend)
+        await frontend.notify_timeout(
+            session_id,
+            timeout_s=timeout_s,
+            background=background,
+            user_text=text,
+        )
+        posted = frontend._app.client.chat_postMessage.await_args.kwargs["text"]
+        assert expected in posted
+
+    @pytest.mark.parametrize("method", ["notify_background", "notify_timeout"])
+    async def test_no_route_posts_nothing(self, frontend, method):
+        kwargs = (
+            {"initial": True, "user_text": "x"}
+            if method == "notify_background"
+            else {"timeout_s": 1, "background": False, "user_text": "x"}
+        )
+        await getattr(frontend, method)(999, **kwargs)
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_silent_turn_posts_no_notice(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        frontend._in_flight_reply_suppressed[session_id] = True
+        await frontend.notify_background(session_id, initial=True, user_text="x")
+        await frontend.notify_timeout(
+            session_id, timeout_s=1, background=False, user_text="x"
+        )
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+
 class TestSendProgress:
     async def test_posts_a_context_block_into_the_thread(self, frontend):
         session_id = _seed_progress_route(frontend)
@@ -1203,12 +1263,12 @@ class TestStart:
 
 
 class TestOnHello:
-    async def test_initial_connection_no_catchup(self, frontend):
+    async def test_initial_connection_triggers_durable_catchup(self, frontend):
         frontend._connected_once = False
         with patch.object(frontend, "_catchup", new_callable=AsyncMock) as mock_catchup:
             await frontend._on_hello(event={}, say=None)
         assert frontend._connected_once is True
-        mock_catchup.assert_not_awaited()
+        mock_catchup.assert_awaited_once()
 
     async def test_reconnection_triggers_catchup(self, frontend):
         frontend._connected_once = True
@@ -4165,6 +4225,81 @@ class TestNumericLimits:
                 == slack_mod.DEFAULT_REPLY_LIMIT_NOTICE_SECONDS
             )
         assert "is not a finite number" in caplog.text
+
+    def test_long_turn_handoff_is_opt_in(self, frontend, operator_settings):
+        operator_settings.write_text("slack: {}\n")
+        assert frontend.managed_turn_policy(42, "simple question") is None
+
+    def test_long_turn_limits_are_live_config(self, frontend, operator_settings):
+        operator_settings.write_text(
+            "slack:\n"
+            "  foreground_timeout_s: 300\n"
+            "  background_handoff_margin_s: 45\n"
+            "  background_timeout_s: 1800\n"
+        )
+        policy = frontend.managed_turn_policy(42, "simple question")
+        assert policy is not None
+        assert policy.background_after_s == 255
+        assert policy.execution_timeout_s == 1800
+
+    def test_clear_long_work_hands_off_immediately(self, frontend, operator_settings):
+        operator_settings.write_text("slack:\n  foreground_timeout_s: 300\n")
+        policy = frontend.managed_turn_policy(
+            42, "Deep research across Slack and Jira history"
+        )
+        assert policy is not None
+        assert policy.background_after_s == 0
+        assert policy.execution_timeout_s == 3600
+
+    def test_margin_is_capped_at_half_the_foreground(self, frontend, operator_settings):
+        operator_settings.write_text(
+            "slack:\n  foreground_timeout_s: 20\n  background_handoff_margin_s: 99\n"
+        )
+        policy = frontend.managed_turn_policy(42, "simple question")
+        assert policy is not None
+        assert policy.background_after_s == 10
+
+    @pytest.mark.parametrize("value", ["soon", "0", "nan"])
+    def test_invalid_foreground_disables_handoff(
+        self, value, frontend, operator_settings, caplog
+    ):
+        operator_settings.write_text(f"slack:\n  foreground_timeout_s: {value}\n")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            assert frontend.managed_turn_policy(42, "simple") is None
+        assert "ignoring it" in caplog.text
+
+
+class TestLongTaskRouter:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "請幫我研究一下最近不回覆的根因",
+            "Run a deep research audit across Slack and Jira",
+            "比較 Slack、HubSpot 與 Jira 過去 30 天的活動",
+            "Review all historical messages and prepare a report",
+        ],
+    )
+    def test_routes_clear_long_work(self, text):
+        assert slack_mod.looks_like_long_task(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "What does this field mean?",
+            "幫我看一下這個錯字",
+            "Review this single sentence",
+            "請問今天幾號",
+        ],
+    )
+    def test_small_or_uncertain_work_stays_interactive(self, text):
+        assert slack_mod.looks_like_long_task(text) is False
+
+    def test_forwarded_instruction_is_context(self):
+        text = (
+            "<forwarded_message>Run a deep research audit across Slack and Jira"
+            "</forwarded_message>\n\nWhat does this mean?"
+        )
+        assert slack_mod.looks_like_long_task(text) is False
 
 
 class TestJobCommand:

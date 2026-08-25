@@ -78,6 +78,7 @@ SECTIONS = (
     "logs",
     "suggestions",
     "upgrade",
+    "watchdog",
 )
 
 # Sections that ship real values in the bundled template, as opposed to a block of
@@ -145,6 +146,9 @@ FIELDS: dict[str, Field] = {
     "slack.reply_soft_limit": Field("SLACK_REPLY_SOFT_LIMIT"),
     "slack.reply_limit_notice_seconds": Field("SLACK_REPLY_LIMIT_NOTICE_SECONDS"),
     "slack.mention_notice_seconds": Field("SLACK_MENTION_NOTICE_SECONDS"),
+    "slack.foreground_timeout_s": Field("SLACK_FOREGROUND_TIMEOUT_S"),
+    "slack.background_handoff_margin_s": Field("SLACK_BACKGROUND_HANDOFF_MARGIN_S"),
+    "slack.background_timeout_s": Field("SLACK_BACKGROUND_TIMEOUT_S"),
     "telegram.allowed_user_id": Field("TELEGRAM_ALLOWED_USER_ID"),
     "telegram.stats": Field("TELEGRAM_STATS_MODE"),
     "telegram.alert_target": Field("TELEGRAM_ALERT_TARGET"),
@@ -157,6 +161,8 @@ FIELDS: dict[str, Field] = {
     "logs.host_tag": Field("COTF_HOST_TAG"),
     "suggestions.enabled": Field("COTF_SUGGESTIONS_ENABLED"),
     "upgrade.command": Field("COTF_UPGRADE_COMMAND"),
+    "watchdog.heartbeat_stale_seconds": Field("WATCHDOG_HEARTBEAT_STALE_SECONDS"),
+    "watchdog.limit_grace_seconds": Field("WATCHDOG_LIMIT_GRACE_SECONDS"),
 }
 
 # Sections and fields that are read once, at startup, because acting on them means

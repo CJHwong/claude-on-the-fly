@@ -1484,6 +1484,8 @@ def test_codex_execution_control_paths_are_unwritable_in_the_jail(
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     path = original_home / ".codex" / target
+    if not path.parent.is_dir():
+        pytest.skip(f"{path.parent} is absent; the live deny probe is inconclusive")
     existed = path.exists()
 
     done = _run_jailed(["/bin/sh", "-c", f"printf '' >> {path}"], tmp_path)

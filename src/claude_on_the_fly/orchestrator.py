@@ -32,6 +32,7 @@ from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
     SUGGESTIONS_BLOCK_RE,
+    AgentTimeoutError,
     ClaudeUnavailableError,
     Response,
     current_backend_key,
@@ -656,6 +657,39 @@ class Orchestrator:
             await self._frontend.send_typing(chat_id)
             await asyncio.sleep(4)
 
+    async def _announce_background(
+        self,
+        chat_id: int,
+        *,
+        delay_s: float,
+        user_text: str,
+        backgrounded: asyncio.Event,
+    ) -> None:
+        """Promote a live turn without cancelling or replaying its process."""
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
+        # State changes before frontend I/O. A slow notification must not hide
+        # the fact that this execution crossed its interactive boundary.
+        backgrounded.set()
+        in_flight = self._in_flight.get(chat_id)
+        if in_flight is not None:
+            in_flight["backgrounded"] = True
+        logger.info(
+            "process: chat_id=%s promoted to background after %.1fs",
+            chat_id,
+            delay_s,
+        )
+        try:
+            await self._frontend.notify_background(
+                chat_id, initial=delay_s <= 0, user_text=user_text
+            )
+        except Exception:
+            # The courtesy notification must never kill the work it describes.
+            logger.exception(
+                "process: chat_id=%s could not announce background promotion",
+                chat_id,
+            )
+
     async def _report_config_restarts(self, chat_id: int) -> None:
         """Name any config edit that this turn will not honour.
 
@@ -735,6 +769,8 @@ class Orchestrator:
         # abort while it is in progress still clears the in-flight slot and
         # any partially-applied frontend status/reaction.
         typing_task: asyncio.Task | None = None
+        background_task: asyncio.Task | None = None
+        backgrounded = asyncio.Event()
         env_token = None
         relay: sandbox.SessionRelay | None = None
         command_token: str | None = None
@@ -771,6 +807,33 @@ class Orchestrator:
                 env_token = sandbox.session_env(session_overrides)
             await self._frontend.notify_start(chat_id)
             typing_task = asyncio.create_task(self._typing_loop(chat_id))
+            managed_policy = (
+                None
+                if turn.compact
+                else self._frontend.managed_turn_policy(chat_id, text)
+            )
+            execution_timeout = self._frontend.timeout_for(chat_id)
+            if managed_policy is not None:
+                execution_timeout = managed_policy.execution_timeout_s
+                self._in_flight[chat_id]["timeout_s"] = execution_timeout
+                if managed_policy.background_after_s <= 0:
+                    await self._announce_background(
+                        chat_id,
+                        delay_s=0,
+                        user_text=text,
+                        backgrounded=backgrounded,
+                    )
+                else:
+                    background_task = asyncio.create_task(
+                        self._announce_background(
+                            chat_id,
+                            delay_s=managed_policy.background_after_s,
+                            user_text=text,
+                            backgrounded=backgrounded,
+                        )
+                    )
+            else:
+                self._in_flight[chat_id]["timeout_s"] = execution_timeout
             if turn.compact:
                 response = await self._run_compaction(
                     chat_id, workspace, session, self._frontend.timeout_for(chat_id)
@@ -803,7 +866,7 @@ class Orchestrator:
                             else self._frontend.sender_name(chat_id)
                         ),
                         channel_context=self._frontend.channel_context(chat_id),
-                        timeout=self._frontend.timeout_for(chat_id),
+                        timeout=execution_timeout,
                         nudge_prompt=nudge_prompt,
                     )
                 except asyncio.CancelledError:
@@ -840,6 +903,13 @@ class Orchestrator:
                     # land after the answer it was leading up to. Discards whatever
                     # is still held rather than dumping a digest above the reply.
                     await interim.aclose()
+                # Do not let a handoff timer land while the completed answer is
+                # being rendered or posted. If it already fired, backgrounded
+                # remains set and this is an idempotent gather.
+                if background_task is not None:
+                    background_task.cancel()
+                    await asyncio.gather(background_task, return_exceptions=True)
+                    background_task = None
             if self._permissions is not None:
                 # After the turn, because the tool count only exists once it is
                 # over. Reporting late beats not reporting: an ungated turn is
@@ -902,6 +972,35 @@ class Orchestrator:
                 error=str(exc),
                 reason="unavailable",
             )
+        except AgentTimeoutError as exc:
+            logger.warning(
+                "Agent timed out for chat %s after %ss (background=%s)",
+                chat_id,
+                exc.timeout_s,
+                backgrounded.is_set(),
+            )
+            try:
+                await self._frontend.notify_timeout(
+                    chat_id,
+                    timeout_s=exc.timeout_s,
+                    background=backgrounded.is_set(),
+                    user_text=text,
+                )
+            except Exception:
+                logger.exception(
+                    "process: chat_id=%s could not announce timeout", chat_id
+                )
+            self._event_log.append(
+                EVENT_WORKER_FAILED,
+                source=self._platform,
+                backend=current_backend_key(),
+                identifier=identifier,
+                workspace=workspace,
+                session_uuid=session,
+                error=str(exc),
+                reason="timeout",
+                background=backgrounded.is_set(),
+            )
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)
             await self._frontend.send(
@@ -925,6 +1024,9 @@ class Orchestrator:
             self._in_flight.pop(chat_id, None)
             if typing_task is not None:
                 typing_task.cancel()
+            if background_task is not None:
+                background_task.cancel()
+                await asyncio.gather(background_task, return_exceptions=True)
             if sink_token is not None:
                 agent.reset_progress_sink(sink_token)
             if interim is not None:
@@ -994,6 +1096,8 @@ class Orchestrator:
                 "chat_id": chat_id,
                 "uptime_s": int(now - j["started_at_monotonic"]),
                 "session_uuid": j["session_uuid"],
+                "background": bool(j.get("backgrounded", False)),
+                "timeout_s": j.get("timeout_s"),
             }
             for chat_id, j in self._in_flight.items()
         ]

@@ -263,6 +263,24 @@ class TestSupervisorActionFailures:
         )
         assert any("/logs/cron.stdout" in msg for msg, _s in notices)
 
+    async def test_restart_in_progress_is_named(self, isolated, monkeypatch):
+        notices = await self._press(
+            isolated,
+            monkeypatch,
+            "restart",
+            supervisor.RestartInProgress("cron"),
+        )
+        assert any("already in progress" in msg for msg, _s in notices)
+
+    async def test_stale_controller_is_named(self, isolated, monkeypatch):
+        notices = await self._press(
+            isolated,
+            monkeypatch,
+            "restart",
+            supervisor.ControllerOutOfDate("old", "new"),
+        )
+        assert any("old managed release" in msg for msg, _s in notices)
+
     async def test_an_unexpected_error_is_reported_verbatim(
         self, isolated, monkeypatch
     ):
@@ -2051,6 +2069,25 @@ class TestStaleBanner:
             await pilot.pause()
             banner = str(app.screen.query_one("#stale-banner", Static).content)
         assert banner.strip() == ""
+
+    async def test_stale_controller_tells_operator_to_reopen(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            snap = self._snap([self._frontend("slack", stale=True)])
+            snap = type(snap)(
+                timestamp=snap.timestamp,
+                frontends=snap.frontends,
+                jobs=snap.jobs,
+                schedule_error=snap.schedule_error,
+                jobs_queue=snap.jobs_queue,
+                controller_stale=True,
+            )
+            screen._refresh_stale_banner(snap)
+            await pilot.pause()
+            banner = str(app.screen.query_one("#stale-banner", Static).content)
+        assert "previous managed release" in banner
+        assert "Quit and reopen" in banner
 
 
 class TestDaemonLogAppendPath:

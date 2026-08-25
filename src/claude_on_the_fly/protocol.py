@@ -4,10 +4,25 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.approvals import ApprovalRequest
+
+
+@dataclass(frozen=True)
+class ManagedTurnPolicy:
+    """Separate the user-facing handoff clock from the execution timeout.
+
+    ``background_after_s`` changes only delivery mode: the same process keeps
+    running after the frontend announces the handoff. Zero announces it before
+    the agent starts. ``execution_timeout_s`` is the real wall-clock limit for
+    that one execution.
+    """
+
+    background_after_s: float
+    execution_timeout_s: float | None
 
 
 def interrupted_notice(*, running: bool, queued: int) -> str:
@@ -176,6 +191,44 @@ class Frontend(ABC):
         price of not putting a delivery-outcome contract on every frontend.
         """
 
+    async def notify_background(
+        self, chat_id: int, *, initial: bool, user_text: str
+    ) -> None:
+        """Tell the user that the same execution continues in the background."""
+        del initial, user_text
+        await self.send(
+            chat_id,
+            Response(
+                body=(
+                    "This task is taking longer than expected, so I’m continuing "
+                    "it in the background. You don’t need to resend it; I’ll reply "
+                    "in this conversation when it’s done."
+                )
+            ),
+        )
+
+    async def notify_timeout(
+        self,
+        chat_id: int,
+        *,
+        timeout_s: float | None,
+        background: bool,
+        user_text: str,
+    ) -> None:
+        """Tell the user that the execution limit stopped the task."""
+        del user_text
+        scope = "background task" if background else "task"
+        limit = f" after {timeout_s:g} seconds" if timeout_s is not None else ""
+        await self.send(
+            chat_id,
+            Response(
+                body=(
+                    f"The {scope} reached its execution limit{limit} and stopped. "
+                    "It is not still running."
+                )
+            ),
+        )
+
     async def ask_approval(
         self, request: ApprovalRequest, chat_id: int | None = None
     ) -> bool:
@@ -210,6 +263,11 @@ class Frontend(ABC):
 
     def timeout_for(self, chat_id: int) -> float | None:
         """Per-message subprocess timeout in seconds. None = use agent default."""
+        return None
+
+    def managed_turn_policy(self, chat_id: int, text: str) -> ManagedTurnPolicy | None:
+        """Optional seamless foreground-to-background policy for one turn."""
+        del chat_id, text
         return None
 
     @abstractmethod

@@ -787,6 +787,14 @@ DEFAULT_TIMEOUT = 3600.0
 MAX_AGENT_OUTPUT_BYTES = 8 * 1024 * 1024
 
 
+class AgentTimeoutError(RuntimeError):
+    """An agent execution exceeded its real wall-clock limit."""
+
+    def __init__(self, message: str, timeout_s: float | None) -> None:
+        super().__init__(message)
+        self.timeout_s = timeout_s
+
+
 class AgentOutputLimitError(RuntimeError):
     """The CLI produced more output than a supervised turn may buffer."""
 
@@ -1173,7 +1181,9 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         return await _consume(proc)
     except TimeoutError:
         logger.warning("exec: timed out after %ss", timeout)
-        raise RuntimeError(f"Claude CLI timed out after {timeout}s") from None
+        raise AgentTimeoutError(
+            f"Claude CLI timed out after {timeout}s", timeout
+        ) from None
     finally:
         await _kill_process_tree(proc)
 

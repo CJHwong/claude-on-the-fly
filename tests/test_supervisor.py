@@ -62,6 +62,20 @@ class TestSpawn:
         with pytest.raises(ValueError, match="unknown frontend"):
             supervisor.spawn("nope", env={})
 
+    def test_old_managed_controller_cannot_spawn(self, tmp_path, monkeypatch):
+        old = tmp_path / "old" / ".venv" / "bin" / "python"
+        current = tmp_path / "current" / ".venv" / "bin" / "python"
+        old.parent.mkdir(parents=True)
+        current.parent.mkdir(parents=True)
+        monkeypatch.setenv(supervisor.EXPECTED_RUNTIME_EXECUTABLE_ENV, str(current))
+        monkeypatch.setattr(supervisor.sys, "executable", str(old))
+        popen = MagicMock()
+
+        with pytest.raises(supervisor.ControllerOutOfDate, match="old managed release"):
+            supervisor.spawn("slack", env={}, popen_factory=popen)
+
+        popen.assert_not_called()
+
     def test_preflight_failure_refuses_spawn(self, monkeypatch):
         popen = MagicMock()
         with pytest.raises(supervisor.PreflightFailed) as excinfo:
@@ -234,6 +248,35 @@ class TestStop:
 
 
 class TestRestart:
+    def test_old_controller_is_refused_before_stop(self, tmp_path, monkeypatch):
+        old = tmp_path / "old" / ".venv" / "bin" / "python"
+        current = tmp_path / "current" / ".venv" / "bin" / "python"
+        old.parent.mkdir(parents=True)
+        current.parent.mkdir(parents=True)
+        monkeypatch.setenv(supervisor.EXPECTED_RUNTIME_EXECUTABLE_ENV, str(current))
+        monkeypatch.setattr(supervisor.sys, "executable", str(old))
+        stop = MagicMock()
+        monkeypatch.setattr(supervisor, "stop", stop)
+
+        with pytest.raises(supervisor.ControllerOutOfDate):
+            supervisor.restart("slack", env={})
+
+        stop.assert_not_called()
+
+    def test_restart_lock_refuses_a_second_owner(self, isolated_state):
+        with (
+            supervisor._restart_lock("slack"),
+            pytest.raises(supervisor.RestartInProgress, match="already"),
+            supervisor._restart_lock("slack"),
+        ):
+            raise AssertionError("second owner entered")
+
+        # The inode may remain, but the kernel lock is gone and immediately
+        # reusable after the owner exits.
+        assert supervisor._restart_lock_file("slack").read_text().isdigit()
+        with supervisor._restart_lock("slack"):
+            pass
+
     def test_restart_stops_then_spawns(self, isolated_state, monkeypatch):
         _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1111)
 

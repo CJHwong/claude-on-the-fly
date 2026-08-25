@@ -47,6 +47,12 @@ Leave `upgrade.command` unset unless the derived command is wrong for your deplo
 
 A `uvx --from git+...` run needs no upgrade: it fetches the current code at every start.
 
+For a deployment that atomically switches a `current` release symlink, have its
+stable launcher set `COTF_EXPECTED_RUNTIME_EXECUTABLE` to
+`current/.venv/bin/python`. A dashboard left open across the switch then shows a
+stale-controller warning and refuses to start or restart daemons from its retired
+release. Quit and reopen the dashboard through the stable launcher to continue.
+
 ```yaml
 upgrade:
   command: git fetch --tags && git checkout v1.4.0 && uv sync

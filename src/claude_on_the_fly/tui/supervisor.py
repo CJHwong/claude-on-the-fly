@@ -19,6 +19,7 @@ heartbeat (or a timeout fires), so callers get a real "did it start" signal.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -35,7 +36,13 @@ from claude_on_the_fly import checks, envfile, logs, settings
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.checks import CheckResult
 from claude_on_the_fly.heartbeat import STATE_DIR
-from claude_on_the_fly.tui.state import process_exists as _process_exists
+from claude_on_the_fly.tui.state import (
+    EXPECTED_RUNTIME_EXECUTABLE_ENV,
+    same_runtime_environment,
+)
+from claude_on_the_fly.tui.state import (
+    process_exists as _process_exists,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +64,10 @@ HEARTBEAT_FRESH_WINDOW_S = 30.0
 def _last_running_file() -> Path:
     """Resolved lazily so tests can monkeypatch STATE_DIR."""
     return STATE_DIR / "last_running.json"
+
+
+def _restart_lock_file(frontend: str) -> Path:
+    return STATE_DIR / f"restart-{frontend}.lock"
 
 
 # Frontend name → module path runnable via `python -m`. Skips the `uv run`
@@ -106,6 +117,26 @@ class NotRunning(SupervisorError):
     """stop() called but no live daemon found."""
 
 
+class RestartInProgress(SupervisorError):
+    """Another operator or watchdog owns this frontend's restart."""
+
+    def __init__(self, frontend: str) -> None:
+        super().__init__(f"{frontend} restart is already in progress")
+        self.frontend = frontend
+
+
+class ControllerOutOfDate(SupervisorError):
+    """A controller from a retired managed release cannot launch daemons."""
+
+    def __init__(self, actual: str, expected: str) -> None:
+        super().__init__(
+            "this dashboard belongs to an old managed release; quit it and "
+            "reopen the dashboard before starting or restarting services"
+        )
+        self.actual = actual
+        self.expected = expected
+
+
 class SpawnTimeout(SupervisorError):
     """Child did not write a heartbeat within the timeout. Child has been killed."""
 
@@ -139,6 +170,35 @@ class SpawnTimeout(SupervisorError):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_controller_current() -> None:
+    expected = os.environ.get(EXPECTED_RUNTIME_EXECUTABLE_ENV)
+    if expected and not same_runtime_environment(sys.executable, expected):
+        raise ControllerOutOfDate(sys.executable, expected)
+
+
+@contextlib.contextmanager
+def _restart_lock(frontend: str):
+    """Serialize restart's stop/spawn pair across processes.
+
+    The lock file may remain on disk; ``flock`` ownership belongs to the open
+    descriptor and is released by the kernel even if the owner crashes.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_restart_lock_file(frontend), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RestartInProgress(frontend) from None
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _pid_file(frontend: str) -> Path:
@@ -422,6 +482,7 @@ def spawn(
     """
     if frontend not in _FRONTEND_MODULE:
         raise ValueError(f"unknown frontend: {frontend!r}")
+    _assert_controller_current()
 
     existing = _resolve_pid(frontend)
     if existing is not None and _process_exists(existing):
@@ -541,20 +602,22 @@ def restart(
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
 ) -> int:
     """Stop (if running) and respawn. Returns the new pid."""
-    with contextlib.suppress(NotRunning):
-        stop(frontend, grace_s=grace_s)
-    # Remove stale heartbeat so spawn's wait_for_heartbeat checks a fresh write
-    # rather than the one the old daemon wrote before exiting.
-    with contextlib.suppress(FileNotFoundError):
-        _heartbeat_file(frontend).unlink()
-    return spawn(
-        frontend,
-        env_file=env_file,
-        env=env,
-        popen_factory=popen_factory,
-        wait_for_heartbeat=wait_for_heartbeat,
-        spawn_timeout_s=spawn_timeout_s,
-    )
+    _assert_controller_current()
+    with _restart_lock(frontend):
+        with contextlib.suppress(NotRunning):
+            stop(frontend, grace_s=grace_s)
+        # Remove stale heartbeat so spawn's wait checks a fresh write rather
+        # than the one the old daemon wrote before exiting.
+        with contextlib.suppress(FileNotFoundError):
+            _heartbeat_file(frontend).unlink()
+        return spawn(
+            frontend,
+            env_file=env_file,
+            env=env,
+            popen_factory=popen_factory,
+            wait_for_heartbeat=wait_for_heartbeat,
+            spawn_timeout_s=spawn_timeout_s,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -337,6 +337,15 @@ slack:
   # reply_limit_notice_seconds: 0
   # mention_notice_seconds: 0
 
+  # Optional long-turn handoff. Unset preserves the normal agent timeout and
+  # sends no handoff notice. When foreground_timeout_s is set, clearly long work
+  # moves to background immediately; other work moves there margin seconds before
+  # the foreground window ends. The same process continues until
+  # background_timeout_s -- it is never killed and replayed at handoff.
+  # foreground_timeout_s: 300
+  # background_handoff_margin_s: 30
+  # background_timeout_s: 3600
+
   # Per-chat persona: a file, relative to the data root, that REPLACES the data-root
   # CLAUDE.md for one chat. Key by channel id (survives renames; the C... in any Slack
   # link), channel name, a U... sender id, `dm`, or `default`. Read per message.
@@ -423,3 +432,11 @@ upgrade:
   # `uv tool upgrade <tool>`. Set it when neither applies, or when your
   # deployment updates some other way (a container image, a pinned tag).
   # command: git fetch --tags && git checkout v1.4.0 && uv sync
+
+watchdog:
+  # Optional one-shot health-check thresholds. An external scheduler invokes
+  # `claude-watchdog`; cotf does not install launchd/systemd/cron jobs for you.
+  # A managed turn may exceed its advertised execution timeout by the grace
+  # below before recovery intervenes.
+  # heartbeat_stale_seconds: 90
+  # limit_grace_seconds: 120

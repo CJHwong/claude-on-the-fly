@@ -3414,10 +3414,10 @@ class TestOutboxSurvivesAFilesystemThatSaysNo:
         outbox.mkdir()
         vanishing = outbox / "report.txt"
         vanishing.write_text("body")
-        real_stat = Path.stat
+        real_lstat = Path.lstat
         seen = 0
 
-        def stat_then_vanish(self, *args, **kwargs):
+        def lstat_then_vanish(self, *args, **kwargs):
             # The realistic version of this: the file passes the is_file() check
             # and the agent deletes it before the size is read.
             nonlocal seen
@@ -3425,9 +3425,9 @@ class TestOutboxSurvivesAFilesystemThatSaysNo:
                 seen += 1
                 if seen > 1:
                     vanishing.unlink(missing_ok=True)
-            return real_stat(self, *args, **kwargs)
+            return real_lstat(self, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "stat", stat_then_vanish)
+        monkeypatch.setattr(Path, "lstat", lstat_then_vanish)
         with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
             assert collect_outbox(tmp_path) == []
         assert "cannot stat" in "\n".join(r.getMessage() for r in caplog.records)

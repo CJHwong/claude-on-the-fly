@@ -21,6 +21,7 @@ from claude_on_the_fly import (
 )
 from claude_on_the_fly.agent import (
     DEFAULT_TIMEOUT,
+    AgentTimeoutError,
     Compaction,
     OllamaLauncher,
     Response,
@@ -789,7 +790,9 @@ async def _exec_pty(
             stdout, stderr, rc = await _wait()
     except TimeoutError:
         logger.warning("exec_pty: timed out after %ss", timeout)
-        raise RuntimeError(f"claude-pty timed out after {timeout}s") from None
+        raise AgentTimeoutError(
+            f"claude-pty timed out after {timeout}s", timeout
+        ) from None
     finally:
         # Cancellation is how frontends stop a live turn. Reap the dedicated
         # process group here (rather than only in the timeout branch) so the

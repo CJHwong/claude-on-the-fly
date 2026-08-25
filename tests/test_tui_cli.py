@@ -85,6 +85,15 @@ class TestStart:
             assert app.cmd_start("slack", Path("/nope")) == 2
         assert "no such env file" in capsys.readouterr().err
 
+    def test_a_stale_controller_exits_one(self, capsys):
+        with patch.object(
+            app.supervisor,
+            "spawn",
+            side_effect=supervisor.ControllerOutOfDate("old", "new"),
+        ):
+            assert app.cmd_start("slack", None) == 1
+        assert "old managed release" in capsys.readouterr().err
+
 
 class TestStop:
     def test_a_successful_stop_reports_the_pid(self, capsys):
@@ -172,6 +181,18 @@ class TestRestart:
         ):
             assert app.cmd_restart("slack", None, force=False) == 2
         assert "bad env file" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            supervisor.RestartInProgress("slack"),
+            supervisor.ControllerOutOfDate("old", "new"),
+        ],
+    )
+    def test_runtime_guard_exits_one(self, error, capsys):
+        with patch.object(app.supervisor, "restart", side_effect=error):
+            assert app.cmd_restart("slack", None, force=False) == 1
+        assert capsys.readouterr().err
 
 
 class TestInteractive:

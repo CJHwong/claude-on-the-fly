@@ -19,7 +19,12 @@ from claude_on_the_fly import orchestrator as orchestrator_mod
 from claude_on_the_fly import permissions as permissions_mod
 from claude_on_the_fly import settings
 from claude_on_the_fly import turns as turns_mod
-from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
+from claude_on_the_fly.agent import (
+    AgentTimeoutError,
+    ClaudeUnavailableError,
+    Compaction,
+    Response,
+)
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import (
     SUGGESTIONS_TEMPLATE,
@@ -28,7 +33,7 @@ from claude_on_the_fly.orchestrator import (
     _extract_suggestions,
     _parse_suggestion_block,
 )
-from claude_on_the_fly.protocol import Frontend, interrupted_notice
+from claude_on_the_fly.protocol import Frontend, ManagedTurnPolicy, interrupted_notice
 from claude_on_the_fly.turns import PendingTurn
 
 # ---------------------------------------------------------------------------
@@ -554,6 +559,133 @@ class TestProcess:
 
         assert mock_agent.run.call_args.kwargs["timeout"] == 99.0
 
+    async def test_known_long_turn_starts_background_without_replaying_agent(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        frontend.managed_turn_policy = MagicMock(  # type: ignore[method-assign]
+            return_value=ManagedTurnPolicy(0, 3600)
+        )
+        frontend.notify_background = AsyncMock()  # type: ignore[method-assign]
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="done"))
+            await orch._process(7, Turn("research Slack and Jira"))
+
+        mock_agent.run.assert_awaited_once()
+        assert mock_agent.run.await_args.kwargs["timeout"] == 3600
+        frontend.notify_background.assert_awaited_once()  # type: ignore[attr-defined]
+        assert frontend.notify_background.await_args.kwargs["initial"] is True  # type: ignore[attr-defined]
+
+    async def test_uncertain_turn_promotes_the_same_live_execution(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        release = asyncio.Event()
+
+        async def live_run(*_args, **_kwargs) -> Response:
+            await release.wait()
+            return Response(body="done")
+
+        frontend.managed_turn_policy = MagicMock(  # type: ignore[method-assign]
+            return_value=ManagedTurnPolicy(0.01, 1)
+        )
+        frontend.notify_background = AsyncMock()  # type: ignore[method-assign]
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=live_run)
+            task = asyncio.create_task(orch._process(7, Turn("ordinary question")))
+            await asyncio.sleep(0.03)
+            frontend.notify_background.assert_awaited_once()  # type: ignore[attr-defined]
+            assert mock_agent.run.await_count == 1
+            assert not task.done()
+            row = orch.heartbeat_extra()["running_jobs"][0]
+            assert row["background"] is True
+            assert row["timeout_s"] == 1
+            release.set()
+            await task
+
+        assert frontend.notify_background.await_args.kwargs["initial"] is False  # type: ignore[attr-defined]
+
+    async def test_fast_turn_cancels_pending_background_notice(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        frontend.managed_turn_policy = MagicMock(  # type: ignore[method-assign]
+            return_value=ManagedTurnPolicy(60, 3600)
+        )
+        frontend.notify_background = AsyncMock()  # type: ignore[method-assign]
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="done"))
+            await orch._process(7, Turn("quick"))
+        frontend.notify_background.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_failed_turn_cancels_pending_background_notice(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        frontend.managed_turn_policy = MagicMock(  # type: ignore[method-assign]
+            return_value=ManagedTurnPolicy(60, 3600)
+        )
+        frontend.notify_background = AsyncMock()  # type: ignore[method-assign]
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=RuntimeError("boom"))
+            await orch._process(7, Turn("fails quickly"))
+        frontend.notify_background.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_background_notice_failure_does_not_kill_agent(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        frontend.managed_turn_policy = MagicMock(  # type: ignore[method-assign]
+            return_value=ManagedTurnPolicy(0, 3600)
+        )
+        frontend.notify_background = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("offline")
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="done"))
+            await orch._process(7, Turn("long"))
+        assert frontend.sent[-1][1].body == "done"
+
+    @pytest.mark.parametrize("notice_fails", [False, True])
+    async def test_timeout_has_dedicated_notice_and_audited_reason(
+        self,
+        notice_fails: bool,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+    ) -> None:
+        frontend.managed_turn_policy = MagicMock(  # type: ignore[method-assign]
+            return_value=ManagedTurnPolicy(0, 3600)
+        )
+        frontend.notify_background = AsyncMock()  # type: ignore[method-assign]
+        frontend.notify_timeout = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("offline") if notice_fails else None
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=AgentTimeoutError("timed out", 3600))
+            await orch._process(7, Turn("research"))
+
+        frontend.notify_timeout.assert_awaited_once_with(  # type: ignore[attr-defined]
+            7, timeout_s=3600, background=True, user_text="research"
+        )
+        failed = event_log.tail(10)[-1]
+        assert failed["reason"] == "timeout"
+        assert failed["background"] is True
+
     async def test_typing_loop_is_cancelled_after_process(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
@@ -969,6 +1101,8 @@ class TestEventEmission:
             assert job["identifier"] == "test/9"
             assert job["chat_id"] == 9
             assert "session_uuid" in job
+            assert job["background"] is False
+            assert job["timeout_s"] is None
 
             gate.set()
             await task
@@ -2230,6 +2364,32 @@ class TestFrontendApprovalDefault:
 
         assert Frontend.route_for(frontend, 1) == {}
         assert Frontend.restore_route(frontend, 1, {"channel": "C1"}) is None
+
+    def test_managed_turns_are_opt_in(self) -> None:
+        frontend = StubFrontend()
+        assert frontend.managed_turn_policy(1, "long") is None
+
+    async def test_default_background_notice_is_plain_text(self) -> None:
+        frontend = StubFrontend()
+        await Frontend.notify_background(frontend, 1, initial=False, user_text="long")
+        assert "background" in frontend.sent[0][1].body
+
+    @pytest.mark.parametrize(
+        ("timeout_s", "background", "expected"),
+        [(12, False, "12 seconds"), (None, True, "background task")],
+    )
+    async def test_default_timeout_notice_is_plain_text(
+        self, timeout_s, background, expected
+    ) -> None:
+        frontend = StubFrontend()
+        await Frontend.notify_timeout(
+            frontend,
+            1,
+            timeout_s=timeout_s,
+            background=background,
+            user_text="x",
+        )
+        assert expected in frontend.sent[0][1].body
 
 
 # --- per-session approval services ---

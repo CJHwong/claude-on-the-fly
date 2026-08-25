@@ -49,6 +49,9 @@ def cmd_start(frontend: str, env_file: Path | None) -> int:
                 if hint:
                     print(hint, file=sys.stderr)
         return 2
+    except supervisor.ControllerOutOfDate as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -125,6 +128,9 @@ def cmd_restart(frontend: str, env_file: Path | None, *, force: bool) -> int:
             if r.status != "ok":
                 print(f"  {r.name}: {r.status} — {r.detail}", file=sys.stderr)
         return 2
+    except (supervisor.RestartInProgress, supervisor.ControllerOutOfDate) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
