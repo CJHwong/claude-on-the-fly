@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -379,3 +380,32 @@ def test_the_writer_exposes_the_path_it_owns(tmp_path):
     writer.write_once()
     assert writer.path == tmp_path / "slack.json"
     assert writer.path.is_file()
+
+
+class TestResolvedRuntimeDir:
+    def test_the_bin_directory_is_resolved_not_the_binary(self, tmp_path):
+        """A virtualenv python is often a symlink to one shared system
+        interpreter, so resolving the file would make every release identical."""
+        real = tmp_path / "release-A" / ".venv" / "bin"
+        real.mkdir(parents=True)
+        link = tmp_path / "current"
+        link.symlink_to(tmp_path / "release-A")
+
+        assert heartbeat.resolved_runtime_dir(
+            str(link / ".venv" / "bin" / "python")
+        ) == str(real.resolve())
+
+    def test_an_unresolvable_path_reads_as_cannot_tell(self, monkeypatch):
+        def refuse(_self, *_a, **_kw):
+            raise OSError("too many levels of symbolic links")
+
+        monkeypatch.setattr("pathlib.Path.resolve", refuse)
+        assert heartbeat.resolved_runtime_dir("/anything/bin/python") is None
+
+    def test_it_is_recorded_in_the_heartbeat(self, tmp_path):
+        writer = HeartbeatWriter("slack", state_dir=tmp_path)
+        writer.write_once()
+        payload = json.loads((tmp_path / "slack.json").read_text())
+        assert payload["resolved_executable"] == heartbeat.resolved_runtime_dir(
+            sys.executable
+        )

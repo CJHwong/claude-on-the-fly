@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from claude_on_the_fly.checks import SUPERVISABLE_FRONTENDS
+from claude_on_the_fly.tui import state
 from claude_on_the_fly.tui.state import (
     Snapshot,
     snapshot,
@@ -661,3 +662,82 @@ def test_the_queue_kind_is_cached_until_the_env_file_changes(tmp_path, monkeypat
     assert state_mod._queue_kind() == "file"
     assert state_mod._queue_kind() == "file"
     assert reads["n"] == 1
+
+
+class TestManagedReleaseStaleness:
+    """A deployment that flips a `current` release symlink.
+
+    Both the daemon and the reader are launched through the symlink, so both
+    record the same literal path. Comparing those two strings, or two live
+    resolutions of them, can never show a release change.
+    """
+
+    @staticmethod
+    def _releases(tmp_path):
+        for name in ("A", "B"):
+            (tmp_path / name / ".venv" / "bin").mkdir(parents=True)
+        current = tmp_path / "current"
+        current.symlink_to(tmp_path / "A")
+        return current, str(current / ".venv" / "bin" / "python")
+
+    def test_the_exact_string_comparison_cannot_see_a_flip(self, tmp_path):
+        """Why the resolved field exists. This is the old behaviour, and it is
+        the bug: after the switch the daemon still reads as current."""
+        current, launcher = self._releases(tmp_path)
+        current.unlink()
+        current.symlink_to(tmp_path / "B")
+
+        assert (
+            state._is_stale("running", "1.0", launcher, "1.0", launcher, None) is False
+        )
+
+    def test_a_flip_makes_the_running_daemon_stale(self, tmp_path):
+        current, launcher = self._releases(tmp_path)
+        # What the daemon froze at startup, while current still pointed at A.
+        daemon_resolved = str((tmp_path / "A" / ".venv" / "bin").resolve())
+
+        current.unlink()
+        current.symlink_to(tmp_path / "B")
+
+        assert (
+            state._is_stale(
+                "running", "1.0", launcher, "1.0", launcher, daemon_resolved
+            )
+            is True
+        )
+
+    def test_before_a_flip_the_daemon_is_current(self, tmp_path):
+        _current, launcher = self._releases(tmp_path)
+        daemon_resolved = str((tmp_path / "A" / ".venv" / "bin").resolve())
+
+        assert (
+            state._is_stale(
+                "running", "1.0", launcher, "1.0", launcher, daemon_resolved
+            )
+            is False
+        )
+
+    def test_an_older_daemon_without_the_field_keeps_the_old_comparison(self):
+        """Missing fields read as "cannot tell" so a rollout does not go amber
+        for every daemon started before this shipped."""
+        assert (
+            state._is_stale("running", "1.0", "/a/bin/py", "1.0", "/b/bin/py") is True
+        )
+        assert state._is_stale("running", "1.0", None, "1.0", "/b/bin/py") is False
+
+    def test_a_stopped_daemon_is_never_stale(self, tmp_path):
+        _current, launcher = self._releases(tmp_path)
+        assert (
+            state._is_stale("stopped", "9.9", launcher, "1.0", launcher, "/gone")
+            is False
+        )
+
+    def test_a_version_difference_still_wins(self, tmp_path):
+        _current, launcher = self._releases(tmp_path)
+        daemon_resolved = str((tmp_path / "A" / ".venv" / "bin").resolve())
+        assert (
+            state._is_stale(
+                "running", "0.9", launcher, "1.0", launcher, daemon_resolved
+            )
+            is True
+        )

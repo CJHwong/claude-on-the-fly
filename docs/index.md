@@ -17,6 +17,7 @@ empty configuration and ends with a sandboxed agent whose tool calls require app
 - [Broker a credentialed CLI](how-to/broker-a-command.md).
 - [Configure background workers](how-to/configure-workers.md).
 - [Upgrade safely](how-to/upgrade-safely.md).
+- [Recover a wedged daemon](how-to/recover-a-wedged-daemon.md).
 - [Troubleshoot configuration](how-to/troubleshoot-configuration.md).
 
 ## Look something up

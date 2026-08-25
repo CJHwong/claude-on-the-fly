@@ -329,7 +329,7 @@ class TestIngestEvent:
         frontend._on_message.assert_not_awaited()
 
     async def test_skips_already_processed(self, frontend):
-        frontend._processed_ts.append("2.0")
+        frontend._processed_ts.add("2.0")
         await frontend._ingest_event({"ts": "2.0", "text": "hi", "channel": "C1"})
         frontend._on_message.assert_not_awaited()
 
@@ -4281,6 +4281,41 @@ class TestBotPolicies:
         with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
             assert frontend._bot_policy("B1") is None
         assert "expected a mapping" in caplog.text
+
+
+class TestProcessedEventDurability:
+    async def test_a_redelivery_after_a_restart_is_not_run_twice(
+        self, frontend, monkeypatch, tmp_path
+    ):
+        """The gap this closes.
+
+        The in-memory set starts empty on every start, so a redelivery landing
+        after a restart used to be indistinguishable from a new message. The
+        turn journal does not cover it: that replays turns the daemon accepted
+        and lost, while this answers whether the event was ever accepted.
+        """
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "data")
+        frontend._processed_ts.add("1700000000.0001")
+
+        # A second instance stands in for the next daemon start.
+        with patch("claude_on_the_fly.slack.AsyncApp"):
+            restarted = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        assert "1700000000.0001" in restarted._processed_ts
+
+    def test_the_set_is_reread_when_the_data_dir_moves(
+        self, frontend, monkeypatch, tmp_path
+    ):
+        """Cached against its own path, so a later redirection is still seen."""
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "one")
+        frontend._processed_ts.add("a")
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "two")
+        assert "a" not in frontend._processed_ts
+
+    def test_the_loaded_set_is_not_reread_per_message(self, frontend, monkeypatch):
+        """It reads a file on construction, unlike the journal it borrows its
+        laziness from, so rebuilding per call would be a read per message."""
+        first = frontend._processed_ts
+        assert frontend._processed_ts is first
 
 
 class TestSenderLists:
