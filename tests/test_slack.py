@@ -262,6 +262,7 @@ def frontend(monkeypatch):
         mock_app = MagicMock()
         mock_app.client = MagicMock()
         mock_app.client.chat_postMessage = AsyncMock()
+        mock_app.client.chat_postEphemeral = AsyncMock()
         mock_app.client.users_info = AsyncMock()
         mock_app.client.conversations_info = AsyncMock()
         mock_app.client.conversations_members = AsyncMock()
@@ -393,6 +394,7 @@ class TestIngestEvent:
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = _session_key("C1", "5.1")
         frontend._sessions[session_id] = ("C1", "5.1")
+        frontend._mention_taggers[session_id] = "U_ALLOWED"
         event = {
             "ts": "5.2",
             "thread_ts": "5.1",
@@ -1699,6 +1701,7 @@ class TestNoticeToggles:
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = _session_key("C1", "t1")
         frontend._sessions[session_id] = ("C1", "t1")
+        frontend._mention_taggers[session_id] = "U_ALLOWED"
         frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
 
         await frontend._ingest_event(
@@ -1738,6 +1741,8 @@ class TestMentionNotice:
     def _live_thread(self, frontend) -> int:
         session_id = _session_key("C1", "t1")
         frontend._sessions[session_id] = ("C1", "t1")
+        # A live thread is one somebody tagged into being.
+        frontend._mention_taggers[session_id] = "U_ALLOWED"
         frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
         return session_id
 
@@ -1749,13 +1754,18 @@ class TestMentionNotice:
 
         await frontend._ingest_event(self._event("t2"))
         # Held back, not posted inline.
-        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._app.client.chat_postEphemeral.assert_not_called()
         await frontend._mention_notices[session_id]
 
-        note = frontend._app.client.chat_postMessage.call_args[1]["text"]
-        assert note.startswith("<@U_ALLOWED> ")  # pings whoever forgot
-        assert "<@U_SELF>" in note  # and names the tag to use
+        sent = frontend._app.client.chat_postEphemeral.call_args[1]
+        assert sent["user"] == "U_ALLOWED"  # only whoever forgot sees it
+        assert sent["thread_ts"] == "t1"  # in the thread, not at channel root
+        assert "<@U_SELF>" in sent["text"]  # and it names the tag to use
+        # Cosmetic, not a ping: an ephemeral message cannot notify anyone.
+        assert sent["text"].startswith("<@U_ALLOWED> ")
         assert session_id in frontend._mention_hinted
+        # Never the public form: the whole point is that the thread stays clean.
+        frontend._app.client.chat_postMessage.assert_not_called()
         frontend._on_message.assert_not_awaited()
 
     async def test_the_wait_is_the_configured_one(self, frontend, monkeypatch):
@@ -1817,7 +1827,7 @@ class TestMentionNotice:
         await frontend._ingest_event(self._event("t3", "still forgetting"))
 
         assert not frontend._mention_notices
-        assert frontend._app.client.chat_postMessage.call_count == 1
+        assert frontend._app.client.chat_postEphemeral.call_count == 1
 
     async def test_a_thread_the_bot_is_not_in_gets_nothing(self, frontend):
         """Ordinary channel chatter. Answering it would make the bot talk in
@@ -1850,6 +1860,70 @@ class TestMentionNotice:
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert not frontend._mention_notices
+
+    async def test_a_failed_post_is_logged_not_raised(self, frontend, monkeypatch):
+        """The notice is a courtesy. A Slack error here must not surface as a task
+        exception on a thread that is otherwise working."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+        frontend._app.client.chat_postEphemeral.side_effect = RuntimeError("nope")
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id]
+
+        assert session_id in frontend._mention_hinted
+
+    async def test_only_the_person_who_tagged_is_nudged(self, frontend, monkeypatch):
+        """A thread the bot was pulled into still carries other conversations.
+        Somebody answering their colleague did not forget a tag, so telling them
+        to add one is the bot talking over a conversation it is not in."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        self._live_thread(frontend)
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_OTHER"}
+        event = self._event("t2") | {"user": "U_OTHER"}
+
+        await frontend._ingest_event(event)
+
+        assert not frontend._mention_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._on_message.assert_not_awaited()
+
+    async def test_an_app_posting_into_the_thread_is_not_nudged(
+        self, frontend, monkeypatch
+    ):
+        """The same guard covers a Slack app with a bot user: it posts with a
+        `user` id and no `bot_message` subtype, so it reaches the tag gate like a
+        human would. It has never tagged anyone, and it cannot read a nudge."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        self._live_thread(frontend)
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_APP"}
+        event = self._event("t2") | {"user": "U_APP", "bot_id": "B_APP"}
+
+        await frontend._ingest_event(event)
+
+        assert not frontend._mention_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_tagging_records_the_tagger(self, frontend, monkeypatch):
+        """End to end: the tag that opens the thread is what later licenses the
+        notice, so a real conversation needs no hand-placed state."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+
+        await frontend._ingest_event(self._event("t1", "<@U_SELF> have a look"))
+        assert frontend._mention_taggers[session_id] == "U_ALLOWED"
+
+        await frontend._ingest_event(self._event("t2"))
+        assert session_id in frontend._mention_notices
+        frontend._cancel_mention_notice(session_id)
+
+    async def test_forgetting_the_thread_drops_the_tagger(self, frontend):
+        session_id = self._live_thread(frontend)
+
+        frontend._forget_session(session_id)
+
+        assert session_id not in frontend._mention_taggers
 
 
 # ---------------------------------------------------------------------------
