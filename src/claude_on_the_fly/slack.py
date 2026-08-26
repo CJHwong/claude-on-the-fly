@@ -1171,13 +1171,17 @@ class SlackFrontend(Frontend):
         # session -> monotonic time the notice can no longer be deferred past.
         # Held across reschedules, which is what bounds the debounce.
         self._gate_deadlines: dict[int, float] = {}
-        # Threads already told that a channel needs an @mention. Once each.
-        self._mention_hinted: set[int] = set()
-        # session -> the last human who actually tagged the bot in that thread.
-        # The notice is only for them; see `_hint_mention_required`.
-        self._mention_taggers: dict[int, str] = {}
-        # session -> the idle reminder waiting for the thread to stay quiet.
-        self._mention_notices: dict[int, asyncio.Task[None]] = {}
+        # (session, user) pairs already told that a channel needs an @mention.
+        # Per person, not per thread: two people can each tag, each forget, and
+        # each deserve one telling.
+        self._mention_hinted: set[tuple[int, str]] = set()
+        # session -> everyone who has tagged the bot in that thread. A set rather
+        # than the last one: a later tagger must not silently take over an earlier
+        # tagger's claim. See `_hint_mention_required`.
+        self._mention_taggers: dict[int, set[str]] = {}
+        # (session, user) -> that person's reminder waiting out its delay. Keyed
+        # per person because two of them can be pending in one thread at once.
+        self._mention_notices: dict[tuple[int, str], asyncio.Task[None]] = {}
         # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
         # button's `value` stays opaque and a subject never has to be encoded
         # into a client-supplied field.
@@ -1429,8 +1433,9 @@ class SlackFrontend(Frontend):
         self._session_sender_ids.pop(session_id, None)
         self._reply_counts.pop(session_id, None)
         self._cancel_gate_notice(session_id)
-        self._cancel_mention_notice(session_id)
-        self._mention_hinted.discard(session_id)
+        self._cancel_thread_mention_notices(session_id)
+        for key in [k for k in self._mention_hinted if k[0] == session_id]:
+            self._mention_hinted.discard(key)
         self._mention_taggers.pop(session_id, None)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
@@ -2135,7 +2140,12 @@ class SlackFrontend(Frontend):
                     return
                 # Remember who tagged, so a later untagged message can be matched
                 # against them rather than nudging whoever happened to speak next.
-                self._mention_taggers[_session_key(channel, thread_ts)] = sender_id
+                # Added, never replaced: in a thread two people are both talking to
+                # the bot in, whoever tags second must not cancel the first one's
+                # standing as somebody who could plausibly forget.
+                self._mention_taggers.setdefault(
+                    _session_key(channel, thread_ts), set()
+                ).add(sender_id)
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
             # Under a bot token the app also receives the authorizing user's own
@@ -2153,10 +2163,11 @@ class SlackFrontend(Frontend):
         is_new_session = session_id not in self._sessions
         is_mid_thread = bool(event.get("thread_ts")) and event["thread_ts"] != ts
         self._remember_session(session_id, channel, thread_ts)
-        # They tagged the bot, so they know how this works: drop any pending
+        # They tagged the bot, so they know how this works: drop their pending
         # "you need to tag me" notice rather than lecturing them about a mistake
-        # they have already corrected.
-        self._cancel_mention_notice(session_id)
+        # they have already corrected. Only theirs. Somebody else in the thread who
+        # forgot still has, and this message does nothing to fix that.
+        self._cancel_mention_notice(session_id, sender_id)
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
@@ -2410,8 +2421,8 @@ class SlackFrontend(Frontend):
     async def stop(self) -> None:
         for session_id in list(self._gate_notices):
             self._cancel_gate_notice(session_id)
-        for session_id in list(self._mention_notices):
-            self._cancel_mention_notice(session_id)
+        for key in list(self._mention_notices):
+            self._cancel_mention_notice(*key)
         if self._handler:
             await self._handler.close_async()
 
@@ -2609,12 +2620,18 @@ class SlackFrontend(Frontend):
         of. Called from inside the channel/group branch, so a DM (where no tag is
         needed) can never reach it.
 
-        Narrowed further to the person who tagged. A thread the bot has been
+        Narrowed further to people who have tagged. A thread the bot has been
         pulled into carries other conversations: two people answering each other,
         or another app posting. Those are not addressed to the bot and their
         authors never forgot anything, so nudging them is both wrong and, for an
-        app, unreadable. Only an untagged message from the same person who last
-        tagged is a plausible slip.
+        app, unreadable. Only an untagged message from somebody who tagged in this
+        thread is a plausible slip.
+
+        Everyone who tagged counts, and each is told at most once. Two people can
+        be mid-conversation with the bot in one thread, and both can forget; the
+        one who tagged more recently has no better claim to the reminder than the
+        other. So the tagger set only grows, and `_mention_hinted` is keyed by
+        person rather than by thread.
 
         Posted as an ephemeral message, so only the person who forgot sees it.
         The thread stays clean for everyone else, which matters because this fires
@@ -2637,9 +2654,11 @@ class SlackFrontend(Frontend):
         if delay <= 0:
             return
         session_id = _session_key(channel, thread_ts)
-        if session_id not in self._sessions or session_id in self._mention_hinted:
+        if session_id not in self._sessions:
             return
-        if self._mention_taggers.get(session_id) != sender_id:
+        if (session_id, sender_id) in self._mention_hinted:
+            return
+        if sender_id not in self._mention_taggers.get(session_id, frozenset()):
             logger.debug(
                 "mention notice: %s did not tag in %s/%s, staying quiet",
                 sender_id,
@@ -2647,16 +2666,23 @@ class SlackFrontend(Frontend):
                 thread_ts,
             )
             return
-        self._cancel_mention_notice(session_id)
-        self._mention_notices[session_id] = asyncio.create_task(
+        self._cancel_mention_notice(session_id, sender_id)
+        self._mention_notices[(session_id, sender_id)] = asyncio.create_task(
             self._notice_mention_later(session_id, channel, thread_ts, sender_id, delay)
         )
 
-    def _cancel_mention_notice(self, session_id: int) -> None:
-        """Drop a notice that has not fired yet."""
-        task = self._mention_notices.pop(session_id, None)
+    def _cancel_mention_notice(self, session_id: int, user: str) -> None:
+        """Drop one person's notice in one thread, if it has not fired yet."""
+        task = self._mention_notices.pop((session_id, user), None)
         if task is not None:
             task.cancel()
+
+    def _cancel_thread_mention_notices(self, session_id: int) -> None:
+        """Drop every pending notice in a thread, whoever each was for. For the
+        cases where the thread itself is going away, not a correction by one
+        person."""
+        for key in [key for key in self._mention_notices if key[0] == session_id]:
+            self._cancel_mention_notice(*key)
 
     async def _notice_mention_later(
         self,
@@ -2670,14 +2696,15 @@ class SlackFrontend(Frontend):
         # not leave a task that wakes minutes later and posts anyway.
         try:
             await asyncio.sleep(delay)
-            self._mention_hinted.add(session_id)
+            self._mention_hinted.add((session_id, sender_id))
         finally:
             # Deregister before posting, for the same reason the gate notice
             # does: a cancel landing inside `chat_postMessage` aborts a half-sent
-            # request. Only if this task is still the thread's notice — a restart
+            # request. Only if this task is still this person's notice — a restart
             # cancels us *after* the replacement is stored.
-            if self._mention_notices.get(session_id) is asyncio.current_task():
-                self._mention_notices.pop(session_id, None)
+            key = (session_id, sender_id)
+            if self._mention_notices.get(key) is asyncio.current_task():
+                self._mention_notices.pop(key, None)
         logger.info("slack %s/%s: told the thread it needs a tag", channel, thread_ts)
         # The leading `<@sender_id>` is cosmetic here, unlike on the other notices
         # where it turns a thread reply into a notification: an ephemeral message

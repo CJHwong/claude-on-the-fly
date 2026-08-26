@@ -136,7 +136,7 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
 | `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
 | `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands unread instead of being read on arrival by a sender who is about to leave; `0` posts it immediately | Immediate |
-| `mention_notice_seconds` | non-negative number / `0` | Seconds an untagged channel message waits before the bot tells the sender, in an ephemeral message only they see, that it only sees messages tagging it; once per thread, and only for the person who last tagged the bot there; `0` disables the notice and records no per-thread state for it | Immediate |
+| `mention_notice_seconds` | non-negative number / `0` | Seconds an untagged channel message waits before the bot tells the sender, in an ephemeral message only they see, that it only sees messages tagging it; once per person per thread, and only for someone who has tagged the bot there; `0` disables the notice and records no per-thread state for it | Immediate |
 | `personas` | mapping / empty | Per-chat instructions file, replacing the data-root `CLAUDE.md`; keys are channel id, channel name, sender id, `dm`, or `default` | Immediate |
 
 Persona values are paths relative to the data root and must resolve inside it. A value
