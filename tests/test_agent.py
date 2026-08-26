@@ -2224,10 +2224,11 @@ class TestClaudeBackendLauncher:
         assert model_indices == [3]
 
     async def test_effort_flag_only_under_launcher(self, monkeypatch):
-        """OLLAMA_EFFORT must not reach native argv: native inherits the CLI's
-        own settings.json effortLevel, and a flag here would override it."""
+        """OLLAMA_EFFORT belongs to the mode that swapped the model out. It must
+        not leak into native argv, which has a key of its own."""
         output = _cli_output()
         monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
@@ -2235,6 +2236,65 @@ class TestClaudeBackendLauncher:
         ) as mock:
             await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
         assert "--effort" not in mock.call_args[0][1]
+
+    async def test_native_effort_flag_from_its_own_key(self, monkeypatch):
+        """CLAUDE_EFFORT is how an operator overrides effort for cotf's own
+        native spawns, without touching their interactive claude."""
+        output = _cli_output()
+        monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        cmd = mock.call_args[0][1]
+        assert cmd[cmd.index("--effort") + 1] == "xhigh"
+
+    async def test_native_effort_omitted_when_its_key_is_unset(self, monkeypatch):
+        """Unset means "inherit": no flag, so the CLI reads effortLevel from the
+        operator's own settings.json exactly as it did before this key existed."""
+        output = _cli_output()
+        monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert "--effort" not in mock.call_args[0][1]
+
+    async def test_ollama_effort_wins_over_the_native_key(self, monkeypatch):
+        """Both set: the launcher chose the model, so the launcher's key decides.
+        The native key is not consulted, not merged."""
+        output = _cli_output()
+        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        monkeypatch.setenv("CLAUDE_EFFORT", "low")
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher).run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        cmd = mock.call_args[0][1]
+        assert cmd[cmd.index("--effort") + 1] == "max"
+
+    async def test_native_effort_level_out_of_set_skipped(self, monkeypatch, caplog):
+        """A typo in config.yaml warns here rather than failing the turn in the
+        CLI's own validation."""
+        output = _cli_output()
+        monkeypatch.setenv("CLAUDE_EFFORT", "enormous")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert "--effort" not in mock.call_args[0][1]
+        assert "ignoring unknown effort 'enormous'" in caplog.text
 
     async def test_effort_flag_under_launcher(self, monkeypatch):
         """Ollama mode: the served model differs from the CLI's native provider,
@@ -2674,6 +2734,31 @@ class TestClaudeBackendPty:
         assert "--system-prompt" not in cmd
         assert "--resume" in cmd
         assert cmd[-1] == "hi"
+
+    async def test_effort_never_reaches_pty_argv(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
+    ):
+        """pty resolves its own settings, and whether interactive claude honours
+        `--effort` is untested, so neither effort key applies here."""
+        monkeypatch.setenv("CLAUDE_EFFORT", "max")
+        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(pty=True).run(workspace, "sess-1", "hi", "telegram")
+
+        assert "--effort" not in mock.call_args[0][1]
 
     async def test_response_carries_rate_limits_and_context_window(self):
         envelope = _pty_envelope(

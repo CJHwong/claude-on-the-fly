@@ -26,9 +26,12 @@ configuration writes, not those persona links.
 | `backend` | string / `claude` | `claude` or `codex` | Next turn |
 | `claude.mode` | string / `native` | `native`, `pty`, or `ollama` | Next turn |
 | `claude.model` | string / unset | Passed to Claude in native/pty mode | Next turn |
+| `claude.effort` | string / unset | `low`, `medium`, `high`, `xhigh`, `max`; native mode only, and unset lets the CLI read its own `effortLevel`; an unaccepted level is ignored with a warning | Next turn |
 | `codex.mode` | string / `native` | `native` or `ollama` | Next turn |
 | `codex.model` | string / unset | Passed to Codex native mode | Next turn |
+| `codex.effort` | string / unset | `minimal`, `low`, `medium`, `high`, `xhigh`; native mode only, and unset lets codex read its own `model_reasoning_effort`; an unaccepted level is ignored with a warning | Next turn |
 | `ollama.model` | string / unset | Required when either backend mode is `ollama` | Next turn |
+| `ollama.effort` | string / unset | Effort for the ollama-served model, whichever backend runs under it; wins over the backend's own `effort` key | Next turn |
 | `ollama.context_window` | integer / unset | Window that `ctx N%` and `auto_compact_pct` measure against in ollama mode; unset reports no reading | Next turn |
 | `auto_compact_pct` | integer / unset | `1..100`; invalid disables automatic compaction | Immediate |
 | `skills_cache_ttl_seconds` | number / `3600` | `<=0` probes on every query; invalid uses default | Immediate |
@@ -133,7 +136,7 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
 | `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
 | `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands unread instead of being read on arrival by a sender who is about to leave; `0` posts it immediately | Immediate |
-| `mention_notice_seconds` | non-negative number / `0` | Seconds an untagged channel message waits before the bot replies that it only sees messages tagging it, once per thread; `0` disables the notice and records no per-thread state for it | Immediate |
+| `mention_notice_seconds` | non-negative number / `0` | Seconds an untagged channel message waits before the bot tells the sender, in an ephemeral message only they see, that it only sees messages tagging it; once per thread, and only for the person who last tagged the bot there; `0` disables the notice and records no per-thread state for it | Immediate |
 | `personas` | mapping / empty | Per-chat instructions file, replacing the data-root `CLAUDE.md`; keys are channel id, channel name, sender id, `dm`, or `default` | Immediate |
 
 Persona values are paths relative to the data root and must resolve inside it. A value

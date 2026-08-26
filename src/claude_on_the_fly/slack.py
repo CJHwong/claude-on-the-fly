@@ -1173,6 +1173,9 @@ class SlackFrontend(Frontend):
         self._gate_deadlines: dict[int, float] = {}
         # Threads already told that a channel needs an @mention. Once each.
         self._mention_hinted: set[int] = set()
+        # session -> the last human who actually tagged the bot in that thread.
+        # The notice is only for them; see `_hint_mention_required`.
+        self._mention_taggers: dict[int, str] = {}
         # session -> the idle reminder waiting for the thread to stay quiet.
         self._mention_notices: dict[int, asyncio.Task[None]] = {}
         # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
@@ -1428,6 +1431,7 @@ class SlackFrontend(Frontend):
         self._cancel_gate_notice(session_id)
         self._cancel_mention_notice(session_id)
         self._mention_hinted.discard(session_id)
+        self._mention_taggers.pop(session_id, None)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
         self._in_flight.pop(session_id, None)
@@ -2129,6 +2133,9 @@ class SlackFrontend(Frontend):
                     logger.debug("skipped: no mention of %s in text", self._user_id)
                     await self._hint_mention_required(channel, thread_ts, sender_id)
                     return
+                # Remember who tagged, so a later untagged message can be matched
+                # against them rather than nudging whoever happened to speak next.
+                self._mention_taggers[_session_key(channel, thread_ts)] = sender_id
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
             # Under a bot token the app also receives the authorizing user's own
@@ -2602,6 +2609,21 @@ class SlackFrontend(Frontend):
         of. Called from inside the channel/group branch, so a DM (where no tag is
         needed) can never reach it.
 
+        Narrowed further to the person who tagged. A thread the bot has been
+        pulled into carries other conversations: two people answering each other,
+        or another app posting. Those are not addressed to the bot and their
+        authors never forgot anything, so nudging them is both wrong and, for an
+        app, unreadable. Only an untagged message from the same person who last
+        tagged is a plausible slip.
+
+        Posted as an ephemeral message, so only the person who forgot sees it.
+        The thread stays clean for everyone else, which matters because this fires
+        on a mistake and a public correction reads as the bot telling somebody off
+        in front of their colleagues. The cost is real and deliberate: Slack drops
+        an ephemeral message unless the recipient is active, and clears it when
+        they reload, so the one who forgot *and* walked away never gets it. That
+        was the case the delay below was built for. Privacy won.
+
         Opt-in (`slack.mention_notice_seconds`, off by default) and, when on, held
         for that many seconds rather than posted now. Each further untagged
         message restarts the wait: while they are still typing they are also
@@ -2616,6 +2638,14 @@ class SlackFrontend(Frontend):
             return
         session_id = _session_key(channel, thread_ts)
         if session_id not in self._sessions or session_id in self._mention_hinted:
+            return
+        if self._mention_taggers.get(session_id) != sender_id:
+            logger.debug(
+                "mention notice: %s did not tag in %s/%s, staying quiet",
+                sender_id,
+                channel,
+                thread_ts,
+            )
             return
         self._cancel_mention_notice(session_id)
         self._mention_notices[session_id] = asyncio.create_task(
@@ -2649,9 +2679,15 @@ class SlackFrontend(Frontend):
             if self._mention_notices.get(session_id) is asyncio.current_task():
                 self._mention_notices.pop(session_id, None)
         logger.info("slack %s/%s: told the thread it needs a tag", channel, thread_ts)
-        await self._post_notice(
+        # The leading `<@sender_id>` is cosmetic here, unlike on the other notices
+        # where it turns a thread reply into a notification: an ephemeral message
+        # has no `ts` and never enters channel history, so nothing can ping. It
+        # stays because it renders as a normal mention and marks at a glance who
+        # the bot is answering.
+        await self._post_ephemeral_notice(
             channel,
             thread_ts,
+            sender_id,
             f"<@{sender_id}> I only see messages in a channel that tag me. "
             f"Add <@{self._user_id}> and I'll pick it up.",
         )
@@ -2741,6 +2777,22 @@ class SlackFrontend(Frontend):
             return
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
+
+    async def _post_ephemeral_notice(
+        self, channel: str, thread_ts: str | None, user: str, text: str
+    ) -> None:
+        """Post a notice only `user` can see.
+
+        No echo-guard bookkeeping, unlike `_post_notice`: an ephemeral message has
+        no `ts` to record and Slack never delivers it back as an inbound event, so
+        there is nothing a user-token deploy could re-ingest.
+        """
+        try:
+            await self._app.client.chat_postEphemeral(
+                channel=channel, user=user, text=text, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("post_ephemeral_notice: failed to post %r: %s", text, exc)
 
     async def send_progress(self, chat_id: int, text: str) -> None:
         """Post one mid-turn progress message into the thread the turn runs in.

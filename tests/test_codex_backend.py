@@ -681,11 +681,12 @@ class TestCodexBackendRun:
         assert "o3" not in cmd
 
     async def test_effort_config_only_under_launcher(self, tmp_path, monkeypatch):
-        """OLLAMA_EFFORT must not reach native argv: native inherits the
-        operator's own model_reasoning_effort in ~/.codex/config.toml."""
+        """OLLAMA_EFFORT belongs to the mode that swapped the model out. It must
+        not leak into native argv, which has a key of its own."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         monkeypatch.setenv("OLLAMA_EFFORT", "high")
+        monkeypatch.delenv("CODEX_EFFORT", raising=False)
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
@@ -693,6 +694,71 @@ class TestCodexBackendRun:
         ) as mock:
             await CodexBackend().run(workspace, "sess", "hi", "telegram")
         assert "-c" not in mock.call_args[0][1]
+
+    async def test_native_effort_from_its_own_key(self, tmp_path, monkeypatch):
+        """CODEX_EFFORT is how an operator overrides effort for cotf's own native
+        spawns, without touching their own ~/.codex/config.toml."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("CODEX_EFFORT", "xhigh")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+        assert 'model_reasoning_effort="xhigh"' in mock.call_args[0][1]
+
+    async def test_native_effort_omitted_when_its_key_is_unset(
+        self, tmp_path, monkeypatch
+    ):
+        """Unset means "inherit": no override, so codex reads
+        model_reasoning_effort from the operator's own config exactly as before."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.delenv("CODEX_EFFORT", raising=False)
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+        assert "-c" not in mock.call_args[0][1]
+
+    async def test_ollama_effort_wins_over_the_native_key(self, tmp_path, monkeypatch):
+        """Both set: the launcher chose the model, so the launcher's key decides.
+        The native key is not consulted, not merged."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("OLLAMA_EFFORT", "high")
+        monkeypatch.setenv("CODEX_EFFORT", "low")
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(launcher=launcher).run(
+                workspace, "sess", "hi", "telegram"
+            )
+        assert 'model_reasoning_effort="high"' in mock.call_args[0][1]
+
+    async def test_native_effort_level_out_of_set_skipped(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A typo in config.yaml warns here rather than dying in codex's own
+        config parse."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("CODEX_EFFORT", "enormous")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+        assert "-c" not in mock.call_args[0][1]
+        assert "ignoring unknown effort 'enormous'" in caplog.text
 
     async def test_effort_config_under_launcher(self, tmp_path, monkeypatch):
         """Ollama mode: effort is passed as a TOML-quoted -c override."""

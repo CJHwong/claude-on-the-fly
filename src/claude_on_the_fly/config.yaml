@@ -266,9 +266,11 @@ agent:
   # claude:
   #   mode: native
   #   model: sonnet
+  #   effort: high
   # codex:
   #   mode: native
   #   model: o3
+  #   effort: high
   # ollama:
   #   model: deepseek-v4-flash:cloud
   #   effort: high
@@ -277,12 +279,16 @@ agent:
   #   # it is not actually talking to. State it here and both work; leave it unset
   #   # and neither does. Match it to the CLI's own limit.
   #   context_window: 200000
-  # Effort applies to the ollama-served model, whichever backend runs under it;
-  # in native (or pty) mode the CLIs inherit their own config and this setting
-  # never overrides it. Both backends accept low | medium | high | xhigh;
-  # claude additionally accepts max, codex additionally minimal. A level the
-  # active backend doesn't accept is ignored with a warning. Unset means
-  # whatever the CLI's own default is.
+  # Effort is set by whichever key owns the model. `ollama.effort` applies to the
+  # ollama-served model, whichever backend runs under it, and wins whenever the
+  # launcher is in play. A backend's own `effort` applies to its native mode,
+  # where the CLI is the operator's: unset, nothing is passed and the CLI reads
+  # its own config (claude's effortLevel, codex's model_reasoning_effort); set,
+  # it overrides that for this daemon's spawns only. pty mode takes neither -- it
+  # resolves its own settings.
+  # Both backends accept low | medium | high | xhigh; claude additionally accepts
+  # max, codex additionally minimal. A level the active backend doesn't accept is
+  # ignored with a warning.
 
   # Compact before answering once the previous turn left the context at or above
   # this share of the window. Unset means compaction only on $compact.
