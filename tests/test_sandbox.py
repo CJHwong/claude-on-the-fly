@@ -1462,6 +1462,45 @@ def test_the_codex_directory_is_deny_default_not_a_denylist(profile):
     assert "/.codex" not in granted, "the blanket ~/.codex grant is back"
 
 
+def _grant_covers(kind: str, granted: str, target: str) -> bool:
+    """True if an `allow file-write*` rule for `granted` also permits `target`.
+
+    Seatbelt is last-match-wins, so a re-grant written after the blanket ~/.codex
+    deny takes back everything it covers. `subpath` covers the directory and
+    everything below it; `literal` covers exactly one path. Compared on whole
+    segments, or `plugins/cacher` would read as covered by `plugins/cache`.
+    """
+    if kind == "literal":
+        return granted == target
+    return target == granted or target.startswith(granted + "/")
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_no_regrant_reaches_a_codex_execution_control_path(profile):
+    """The other half of the deny-default contract, and the half CI can check.
+
+    Its sibling above proves the paths codex needs are granted back. Nothing proved
+    the re-grants stop there, and widening one is the natural way this breaks: a
+    plugin write fails, somebody moves the `plugins/cache` grant up to `plugins`,
+    and `plugins/manifest.toml` becomes writable again. The live test below would
+    catch it, but only on a machine that has a real ~/.codex, so on CI the
+    _CODEX_MUST_NOT_WRITE list asserted nothing at all.
+    """
+    grants = re.findall(
+        r"\(allow file-write\*\s*\n?\s*\((subpath|literal) "
+        r'\(string-append \(param "_HOME"\) "([^"]+)"',
+        profile.read_text(),
+    )
+    for target in _CODEX_MUST_NOT_WRITE:
+        full = f"/.codex/{target}"
+        covering = [
+            f"{kind} {granted}"
+            for kind, granted in grants
+            if _grant_covers(kind, granted, full)
+        ]
+        assert not covering, f"{full} is writable again via {covering}"
+
+
 @pytest.mark.parametrize("target", _CODEX_MUST_NOT_WRITE)
 def test_codex_execution_control_paths_are_unwritable_in_the_jail(
     monkeypatch, tmp_path, original_home, target, scoped_sessions
@@ -1476,6 +1515,13 @@ def test_codex_execution_control_paths_are_unwritable_in_the_jail(
     Appends zero bytes so an existing file cannot be altered even if a deny had stopped
     working, and for the paths that do not exist the only possible damage is a stray
     empty file that codex's own parsers would reject rather than act on.
+
+    A target one directory down (`rules/`, `plugins/`) only gets that treatment on a
+    machine where codex has already made the directory. Where it has not, an append
+    dies of ENOENT in the shell before the kernel is ever asked, which passes the
+    returncode check for the wrong reason. So probe the missing directory instead:
+    refusing to let codex invent a `rules/` is the same protection, and its own parent
+    `~/.codex` does exist, so a refusal there is the deny talking.
     """
     if not shutil.which("sandbox-exec"):
         pytest.skip("macOS only")
@@ -1484,13 +1530,17 @@ def test_codex_execution_control_paths_are_unwritable_in_the_jail(
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     path = original_home / ".codex" / target
-    existed = path.exists()
+    if path.parent.is_dir():
+        probed, command = path, f"printf '' >> {path}"
+    else:
+        probed, command = path.parent, f"mkdir {path.parent}"
+    existed = probed.exists()
 
-    done = _run_jailed(["/bin/sh", "-c", f"printf '' >> {path}"], tmp_path)
+    done = _run_jailed(["/bin/sh", "-c", command], tmp_path)
 
-    assert done.returncode != 0, f"{target} was writable inside the jail"
+    assert done.returncode != 0, f"{probed} was writable inside the jail"
     assert "not permitted" in done.stderr.lower(), done.stderr
-    assert path.exists() == existed, f"the probe changed {target} on disk"
+    assert probed.exists() == existed, f"the probe changed {probed} on disk"
 
 
 def test_codex_can_still_write_what_a_real_turn_needs(
