@@ -26,9 +26,12 @@ configuration writes, not those persona links.
 | `backend` | string / `claude` | `claude` or `codex` | Next turn |
 | `claude.mode` | string / `native` | `native`, `pty`, or `ollama` | Next turn |
 | `claude.model` | string / unset | Passed to Claude in native/pty mode | Next turn |
+| `claude.effort` | string / unset | `low`, `medium`, `high`, `xhigh`, `max`; native mode only, and unset lets the CLI read its own `effortLevel`; an unaccepted level is ignored with a warning | Next turn |
 | `codex.mode` | string / `native` | `native` or `ollama` | Next turn |
 | `codex.model` | string / unset | Passed to Codex native mode | Next turn |
+| `codex.effort` | string / unset | `minimal`, `low`, `medium`, `high`, `xhigh`; native mode only, and unset lets codex read its own `model_reasoning_effort`; an unaccepted level is ignored with a warning | Next turn |
 | `ollama.model` | string / unset | Required when either backend mode is `ollama` | Next turn |
+| `ollama.effort` | string / unset | Effort for the ollama-served model, whichever backend runs under it; wins over the backend's own `effort` key | Next turn |
 | `ollama.context_window` | integer / unset | Window that `ctx N%` and `auto_compact_pct` measure against in ollama mode; unset reports no reading | Next turn |
 | `auto_compact_pct` | integer / unset | `1..100`; invalid disables automatic compaction | Immediate |
 | `skills_cache_ttl_seconds` | number / `3600` | `<=0` probes on every query; invalid uses default | Immediate |

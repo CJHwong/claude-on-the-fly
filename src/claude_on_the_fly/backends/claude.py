@@ -49,8 +49,9 @@ COMPACT_PROMPT = "/compact"
 # thread), and the drain loop is serial per chat, so an unbounded one wedges
 # every message queued behind it.
 COMPACT_TIMEOUT = 900.0
-# `--effort` choices, from `claude --help`. The shared OLLAMA_EFFORT setting is
-# validated against this before it reaches the CLI (codex's accepted set differs).
+# `--effort` choices, from `claude --help`. Both keys that can set it, the shared
+# OLLAMA_EFFORT and this backend's own CLAUDE_EFFORT, are validated against this
+# before reaching the CLI (codex's accepted set differs).
 _CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
@@ -533,14 +534,21 @@ class ClaudeBackend:
         # its own default (don't pin sonnet).
         model = "" if self.launcher else settings.get("CLAUDE_MODEL").strip()
         model_args = ["--model", model] if model else []
-        # Effort is passed only for the ollama-served model. Native mode inherits
-        # the operator's own settings (effortLevel in ~/.claude/settings.json),
-        # and pty resolves its own settings — a flag here would silently override
-        # both, so only the mode that swapped the model underneath gets one.
+        # Which key owns effort depends on who chose the model. The ollama path
+        # swapped it out from under the operator, so OLLAMA_EFFORT keeps that job
+        # there. Native `-p` runs the operator's own claude, so it gets its own
+        # key, unset by default: absent, no flag is passed and the CLI still reads
+        # effortLevel from ~/.claude/settings.json exactly as before. pty never
+        # reaches here (see `_pty_base_argv`) and deliberately gets neither: it
+        # resolves its own settings, and whether interactive claude honours the
+        # flag at all is untested.
         # OLLAMA_EFFORT is shared with the codex backend, whose accepted levels
         # differ (no `max`), so a value claude doesn't accept is skipped, not
-        # passed through to die in the CLI's own validation.
-        effort = settings.get("OLLAMA_EFFORT").strip() if self.launcher else ""
+        # passed through to die in the CLI's own validation. CLAUDE_EFFORT is not
+        # shared, but it takes the same check: a typo in config.yaml should warn
+        # here rather than fail the turn.
+        effort = settings.get("OLLAMA_EFFORT" if self.launcher else "CLAUDE_EFFORT")
+        effort = effort.strip()
         if effort and effort not in _CLAUDE_EFFORT_LEVELS:
             logger.warning(
                 "claude: ignoring unknown effort %r (low|medium|high|xhigh|max)",

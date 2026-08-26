@@ -715,15 +715,21 @@ class CodexBackend:
         binary = [] if self.launcher else ["codex"]
         model_env = settings.get("CODEX_MODEL").strip()
         model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
-        # Reasoning effort is passed only for the ollama-served model. Native
-        # mode inherits the operator's own model_reasoning_effort in
-        # ~/.codex/config.toml; an override here would silently trump it. Quoted
-        # as TOML per the `-c` contract. Responses-API-only in codex, so it
-        # reaches the model only when the ollama endpoint honors it — harmless
-        # either way. OLLAMA_EFFORT is shared with the claude backend, whose
-        # accepted levels differ (no `minimal`), so a value codex doesn't accept
-        # is skipped, not passed through to die in codex's own config parse.
-        effort = settings.get("OLLAMA_EFFORT").strip() if self.launcher else ""
+        # Which key owns reasoning effort depends on who chose the model. The
+        # ollama path swapped it out from under the operator, so OLLAMA_EFFORT
+        # keeps that job there. Native `codex exec` runs the operator's own codex,
+        # so it gets its own key, unset by default: absent, no `-c` is passed and
+        # codex still reads model_reasoning_effort from ~/.codex/config.toml
+        # exactly as before. Quoted as TOML per the `-c` contract.
+        # Responses-API-only in codex, so under ollama it reaches the model only
+        # when that endpoint honors it — harmless either way. OLLAMA_EFFORT is
+        # shared with the claude backend, whose accepted levels differ (no
+        # `minimal`), so a value codex doesn't accept is skipped, not passed
+        # through to die in codex's own config parse. CODEX_EFFORT is not shared,
+        # but it takes the same check: a typo in config.yaml should warn here
+        # rather than fail the turn.
+        effort = settings.get("OLLAMA_EFFORT" if self.launcher else "CODEX_EFFORT")
+        effort = effort.strip()
         if effort and effort not in _CODEX_EFFORT_LEVELS:
             logger.warning(
                 "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
