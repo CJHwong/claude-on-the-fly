@@ -902,29 +902,37 @@ class TestCodexBackendRun:
         assert resp.tokens_in == 200
 
     async def test_tokens_in_uses_session_file_delta(self, tmp_path: Path):
-        """When session-file totals are available, report this exec's delta,
-        not codex stdout's cumulative running total."""
+        """Report the counts this exec appended, not codex stdout's figure.
+
+        Codex writes each model call's own usage into the session file, so a
+        turn's cost is the sum of the records it added. Subtracting two
+        `total_token_usage` snapshots undercounted input by three orders of
+        magnitude and went negative whenever a turn produced less output than
+        the one before it.
+        """
         workspace = tmp_path / "ws"
         workspace.mkdir()
         _write_mapping(workspace, "sess-resume", "existing-thread")
 
-        # Simulate: pre-exec total was 12000 in, 100 out.
-        # Post-exec total is 26000 in, 250 out. This exec contributed 14000 / 150.
-        pre = {
-            "input_tokens": 12000,
-            "output_tokens": 100,
-            "reasoning_output_tokens": 0,
-        }
-        post = {
+        # One record existed before the exec; the exec appended one of its own.
+        # Its own record is the answer, whatever the earlier turn happened to
+        # cost -- note the earlier one is larger, which is what used to render
+        # a negative.
+        earlier = {
             "input_tokens": 26000,
             "output_tokens": 250,
+            "reasoning_output_tokens": 0,
+        }
+        this_turn = {
+            "input_tokens": 14000,
+            "output_tokens": 150,
             "reasoning_output_tokens": 0,
         }
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                side_effect=[pre, post],
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                side_effect=[[earlier], [earlier, this_turn]],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -953,8 +961,8 @@ class TestCodexBackendRun:
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                return_value=None,
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                return_value=[],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -984,8 +992,8 @@ class TestCodexBackendRun:
                 return_value="gpt-test",
             ),
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                return_value=None,
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                return_value=[],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -1006,19 +1014,19 @@ class TestCodexBackendRun:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         _write_mapping(workspace, "sess-resume", "existing-thread")
-        pre = {
+        earlier = {
             "input_tokens": 1000,
             "cached_input_tokens": 600,
             "cache_write_input_tokens": 100,
             "output_tokens": 100,
             "reasoning_output_tokens": 20,
         }
-        post = {
-            "input_tokens": 1200,
-            "cached_input_tokens": 700,
-            "cache_write_input_tokens": 150,
-            "output_tokens": 140,
-            "reasoning_output_tokens": 35,
+        this_turn = {
+            "input_tokens": 200,
+            "cached_input_tokens": 100,
+            "cache_write_input_tokens": 50,
+            "output_tokens": 40,
+            "reasoning_output_tokens": 15,
         }
 
         with (
@@ -1027,8 +1035,8 @@ class TestCodexBackendRun:
                 return_value="gpt-test",
             ),
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                side_effect=[pre, post],
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                side_effect=[[earlier], [earlier, this_turn]],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -1046,6 +1054,49 @@ class TestCodexBackendRun:
 
         assert resp.cost == 0.24
         assert cost_for.call_args.args == ("gpt-test", 50, 55, 100, 50)
+
+    async def test_a_quieter_turn_after_a_loud_one_is_not_negative(
+        self, tmp_path: Path
+    ):
+        """A turn that says less than the previous one still costs what it cost.
+
+        Measured against codex 0.150.1: `total_token_usage` carries each call's
+        own figures, not a running total, so subtracting consecutive snapshots
+        rendered `↓-285` in chat on two of four consecutive resumes. Nothing
+        about a short reply after a long one is unusual, so this is the common
+        case rather than an edge one.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "sess-resume", "existing-thread")
+        loud = {
+            "input_tokens": 17647,
+            "output_tokens": 285,
+            "reasoning_output_tokens": 5,
+        }
+        quiet = {
+            "input_tokens": 17813,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0,
+        }
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                side_effect=[[loud], [loud, quiet]],
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(thread_id="existing-thread"),
+            ),
+        ):
+            resp = await CodexBackend().run(
+                workspace, "sess-resume", "next turn", "telegram"
+            )
+
+        assert resp.tokens_out == 5
+        assert resp.tokens_in == 17813
 
     async def test_response_sums_output_and_reasoning_tokens(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -1107,14 +1158,26 @@ class TestCodexBackendRun:
 
 
 class TestCodexUsageAccounting:
-    def test_new_thread_usage_has_no_previous_snapshot(self):
-        current = {
-            "input_tokens": 100,
-            "cached_input_tokens": 40,
-            "cache_write_input_tokens": 20,
+    def test_a_turn_costs_the_sum_of_the_calls_it_made(self):
+        """One exec can fan out to several model calls, and the turn's cost is
+        all of them. Reading only the last record would undercount it."""
+        calls = [
+            {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 7},
+            {"input_tokens": 250, "cached_input_tokens": 90, "output_tokens": 3},
+        ]
+
+        assert codex_mod._usage_from_events(calls) == {
+            "input_tokens": 350,
+            "cached_input_tokens": 130,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 0,
         }
 
-        assert codex_mod._usage_delta(current, None) == current
+    def test_a_thread_with_no_records_costs_nothing(self):
+        assert codex_mod._usage_from_events([]) == dict.fromkeys(
+            codex_mod._CODEX_USAGE_FIELDS, 0
+        )
 
 
 # ---------------------------------------------------------------------------

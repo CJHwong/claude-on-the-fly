@@ -303,33 +303,46 @@ def extract_codex_model(thread_id: str) -> str | None:
     return None
 
 
-def extract_codex_cumulative_tokens(thread_id: str) -> dict | None:
-    """Return the cumulative `total_token_usage` snapshot for a codex thread.
+def codex_rollout_path(thread_id: str) -> Path | None:
+    """The rollout file a token snapshot for this thread would be read from.
 
-    Codex's stdout `turn.completed.usage` re-reports the thread's running
-    total on every exec, not per-turn — so by turn N, `input_tokens` has
-    been summed N times. The session file carries the same `total_token_usage`
-    on every `event_msg/token_count` event, growing monotonically. Snapshot
-    it before and after one exec call and the delta is that exec's true
-    contribution (including any internal tool-fanout sub-calls).
+    Exposed so a caller can pin it. `_find_codex_rollout` picks the newest file
+    by mtime across every sessions root, and one thread can legitimately have a
+    copy in more than one root: `codex_state.adopt_rollout` puts one in the
+    workspace home and leaves the original in the shared tree. The two then
+    diverge, so a before/after pair read by thread id alone can come from two
+    different histories and subtract to a negative.
+    """
+    return _find_codex_rollout(thread_id)
 
-    Returns the `total_token_usage` dict from the LAST `token_count` event,
-    or None when no event exists yet.
+
+def extract_codex_usage_events(thread_id: str) -> list[dict]:
+    """Every `last_token_usage` this thread has recorded, oldest first.
+
+    Each entry is one model call's own counts. Counting how many exist before
+    an exec and summing whatever it appends gives that exec's true cost, which
+    a subtraction cannot: codex 0.150.1 writes the same figures into
+    `total_token_usage`, so that field is per-call rather than a running total.
+    Diffing it undercounted input by three orders of magnitude and rendered a
+    negative whenever one call produced fewer output tokens than the one before.
+
+    A call fanning out to several model calls appends several events, so the
+    sum covers the whole exec rather than only its last step.
     """
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
-        return None
-    latest: dict | None = None
+        return []
+    events: list[dict] = []
     for msg in _iter_jsonl(rollout):
         if msg.get("type") != "event_msg":
             continue
         payload = msg.get("payload") or {}
         if payload.get("type") != "token_count":
             continue
-        total = (payload.get("info") or {}).get("total_token_usage")
-        if isinstance(total, dict):
-            latest = total
-    return latest
+        last = (payload.get("info") or {}).get("last_token_usage")
+        if isinstance(last, dict):
+            events.append(last)
+    return events
 
 
 def extract_codex_prompt_tokens(thread_id: str) -> tuple[int, int] | None:
