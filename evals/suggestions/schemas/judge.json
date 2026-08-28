@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":false,
+ "properties":{"verdict":{"type":"string","enum":["match","near","miss"]},
+               "index":{"type":["integer","null"]},
+               "why":{"type":"string"}},
+ "required":["verdict","index","why"]}

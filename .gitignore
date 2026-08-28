@@ -34,3 +34,8 @@ src/claude_on_the_fly/_version.py
 # Installed by the commit-message checks in CI. This is not a Node project; the
 # directory is CI tooling only, and is never committed.
 node_modules/
+
+# Suggestions eval: the raw corpus is real conversation text and the run
+# outputs are large. Only the redacted corpus under corpus/ is committed.
+evals/suggestions/raw/
+evals/suggestions/runs/
