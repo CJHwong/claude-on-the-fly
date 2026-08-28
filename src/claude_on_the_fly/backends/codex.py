@@ -244,12 +244,10 @@ _CODEX_USAGE_FIELDS = (
 )
 
 
-def _usage_delta(current: dict, previous: dict | None) -> dict:
-    """Return one turn's counts from Codex's cumulative usage snapshots."""
-    if previous is None:
-        return dict(current)
+def _usage_from_events(events: list[dict]) -> dict:
+    """Sum a run of per-call usage records into one turn's counts."""
     return {
-        field: current.get(field, 0) - previous.get(field, 0)
+        field: sum(int(event.get(field, 0) or 0) for event in events)
         for field in _CODEX_USAGE_FIELDS
     }
 
@@ -569,10 +567,20 @@ class CodexBackend:
         # Snapshot the thread's cumulative token usage before invoking codex
         # so we can compute this exec's per-turn delta afterward. For fresh
         # threads there's no prior session, so pre-totals are zero.
-        pre_totals = (
-            transcript.extract_codex_cumulative_tokens(existing_thread)
+        # Pin the file the baseline came from. Reading the pair by thread id
+        # alone lets the newest-by-mtime lookup return a different rollout
+        # after the exec than before it, and the two do not share a history.
+        # Count the per-call usage records this thread already has, and pin the
+        # file they were counted in. What the exec appends is its own cost. A
+        # before/after subtraction of `total_token_usage` cannot give that:
+        # codex writes each call's own figures there, not a running total.
+        pre_rollout = (
+            transcript.codex_rollout_path(existing_thread) if existing_thread else None
+        )
+        pre_event_count = (
+            len(transcript.extract_codex_usage_events(existing_thread))
             if existing_thread
-            else None
+            else 0
         )
 
         started_at = time.monotonic()
@@ -648,20 +656,21 @@ class CodexBackend:
             if thread_for_lookup
             else None
         ) or configured_label
-        # Codex's stdout `turn.completed.usage` re-reports the thread's
-        # running total on every exec, not per-turn. Diff cumulative totals
-        # from the session file to get this exec's true contribution. Falls
-        # back to stdout usage when the session file isn't reachable (mocked
-        # tests, rare race) — accepted to be cumulative in that path.
-        post_totals = (
-            transcript.extract_codex_cumulative_tokens(thread_for_lookup)
+        post_rollout = (
+            transcript.codex_rollout_path(thread_for_lookup)
             if thread_for_lookup
             else None
         )
-        if post_totals is not None:
-            usage = _usage_delta(post_totals, pre_totals)
-        else:
-            usage = result.get("usage") or {}
+        events = (
+            transcript.extract_codex_usage_events(thread_for_lookup)
+            if thread_for_lookup
+            else []
+        )
+        # A rollout that moved under the turn makes the earlier count refer to
+        # another file's history, so only this exec's own last record is safe.
+        start = pre_event_count if pre_rollout == post_rollout else len(events) - 1
+        fresh = events[max(start, 0) :]
+        usage = _usage_from_events(fresh) if fresh else (result.get("usage") or {})
         tokens_in = usage.get("input_tokens", 0)
         tokens_out = usage.get("output_tokens", 0) + usage.get(
             "reasoning_output_tokens", 0
