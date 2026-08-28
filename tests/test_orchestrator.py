@@ -396,6 +396,21 @@ class TestProcess:
         assert '<suggestions>["Tell me more about its history"' in SUGGESTIONS_TEMPLATE
         assert "The block is mandatory in every reply" in SUGGESTIONS_TEMPLATE
 
+    def test_template_does_not_demand_a_fixed_option_count(self) -> None:
+        """The template used to ask for "3 short follow-up options", and 96.2%
+        of two weeks of real offers came back with exactly three (audit,
+        2026-08-28). Widening the count is the one change that removes padding
+        without suppressing an offer somebody would have clicked."""
+        assert "1 to 3 short follow-up options" in SUGGESTIONS_TEMPLATE
+        assert "Never invent one to reach a count" in SUGGESTIONS_TEMPLATE
+
+    def test_template_ranks_and_bans_filler(self) -> None:
+        """First position takes 71.5% of clicks, so ordering is worth stating.
+        Monitor and wait labels clicked at 4.0% against 25.9% for
+        authorization, so they are named as filler (audit, 2026-08-28)."""
+        assert "Put the most concrete executable step first" in SUGGESTIONS_TEMPLATE
+        assert '"monitor"' in SUGGESTIONS_TEMPLATE
+
     async def test_malformed_block_yields_no_suggestions(
         self,
         orch: Orchestrator,
