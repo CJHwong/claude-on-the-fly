@@ -796,9 +796,7 @@ class AgentOutputLimitError(RuntimeError):
 _READ_CHUNK_BYTES = 64 * 1024
 
 
-async def _read_to_eof_capped(
-    stream: asyncio.StreamReader, on_chunk: Callable[[bytes], None] | None = None
-) -> bytes:
+async def _read_to_eof_capped(stream: asyncio.StreamReader) -> bytes:
     """Read a stream to EOF, stopping early once the cap is passed.
 
     `StreamReader.read(n)` with a positive `n` returns as soon as *any* byte is
@@ -812,10 +810,6 @@ async def _read_to_eof_capped(
     different things from an over-cap stream: one reports it, one kills the
     process group. Reading one byte past the cap before stopping is what keeps
     their `len(...) > cap` test honest.
-
-    `on_chunk` sees each chunk as it lands, for a caller that needs to react to
-    output *during* the turn rather than after EOF — which a backend whose CLI
-    can finish its work and then never close the pipe has no other way to do.
     """
     chunks: list[bytes] = []
     total = 0
@@ -825,8 +819,6 @@ async def _read_to_eof_capped(
             break
         chunks.append(chunk)
         total += len(chunk)
-        if on_chunk is not None:
-            on_chunk(chunk)
     return b"".join(chunks)
 
 
@@ -1023,15 +1015,8 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     return result
 
 
-async def communicate_capped(
-    proc, on_stdout_chunk: Callable[[bytes], None] | None = None
-) -> tuple[bytes, bytes]:
-    """Collect both subprocess streams without allowing unbounded buffering.
-
-    `on_stdout_chunk` is forwarded to the stdout reader; see
-    `_read_to_eof_capped`. It never fires on the `communicate()` fallback below,
-    which has no chunks to report.
-    """
+async def communicate_capped(proc) -> tuple[bytes, bytes]:
+    """Collect both subprocess streams without allowing unbounded buffering."""
     stdout_stream = getattr(proc, "stdout", None)
     stderr_stream = getattr(proc, "stderr", None)
     if not isinstance(stdout_stream, asyncio.StreamReader) or not isinstance(
@@ -1046,9 +1031,7 @@ async def communicate_capped(
             )
         return stdout, stderr
 
-    stdout_task = asyncio.create_task(
-        _read_to_eof_capped(stdout_stream, on_stdout_chunk)
-    )
+    stdout_task = asyncio.create_task(_read_to_eof_capped(stdout_stream))
     stderr_task = asyncio.create_task(_read_to_eof_capped(stderr_stream))
     tasks = {stdout_task, stderr_task}
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
