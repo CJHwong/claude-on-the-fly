@@ -52,8 +52,9 @@ to `jail` after the first successful turn to add filesystem and network confinem
 uv run claude-tui
 ```
 
-Press `d` for doctor. Fix blocking failures before starting Slack. If using Claude pty,
-install tmux; approvals cannot drive the fallback script backend.
+Press `d` for doctor. Fix blocking failures before starting Slack. Install tmux: with
+Claude pty, approvals cannot drive the fallback script backend, and with any backend the
+dashboard's watch pane shows the agent's live terminal instead of a transcript tail.
 
 ## 5. Start and verify
 

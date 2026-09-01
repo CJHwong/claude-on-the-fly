@@ -155,3 +155,12 @@ A keyed workspace is never swept, however old. It *is* the continuity for the ne
 | `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token. Stays in `.env`: it is a credential |
 
 Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`) token from `SLACK_TOKEN` makes the worker post results as that user, and the Slack frontend — a separate process with its own dedup set — re-ingests them as new input, one spurious agent turn per job. `cli._notifier_loop_warning` warns about exactly this at startup.
+
+
+## Panes
+
+A job runs inside its own tmux pane when tmux is present, named
+`cotf-job-<run id>` where the run id is the workspace's directory name. The TUI's watch
+pane mirrors it, and `OrchestratorAgentRunner` reaps it with `tmux.kill` in the same
+`finally` that clears `in_flight`. The worker sweeps whatever a killed worker left behind
+at startup, beside the workspace sweep. See [panes](panes.md).

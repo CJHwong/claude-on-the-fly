@@ -203,6 +203,45 @@ brokers. A `/notify` loop drives Escape keystrokes into the operator's pty pane.
 **pty dialog grants use a 48-bit truncated digest** of wrap-damaged pane text, while the
 other two subjects were widened to the full digest.
 
+## Considered while adding tmux panes
+
+Not a review's findings. What the pane work (`tmux.py`, `backends/codex.py`) changed
+about the boundary, so a later reviewer does not have to re-derive it.
+
+**The secret would have gone in argv, and does not.** Hosting a run in a tmux pane means
+the run is a child of a tmux server rather than of the daemon, so the obvious way to give
+it the curated environment is `tmux new-session -e KEY=VALUE`. Measured on tmux 3.7c: a
+pane on a server that is *already running* does not receive the client's environment at
+all, so `-e` is the only way that works on a shared server. It would put `COTF_CMD_TOKEN`
+— the bearer token for the broker that runs credentialed CLIs *outside* the jail — into a
+command line readable by any local `ps`, and with sandboxing off `agent_env()` is the
+whole daemon environment. Rejected. Each run gets a private server addressed by
+`TMUX_TMPDIR` instead: a server the daemon starts inherits the daemon's spawn env, and
+its panes inherit that, with nothing on any command line. Measured both directions.
+
+**Dropping the environment instead would be worse, not neutral.** A pane on a
+pre-existing server does not get an empty environment, it gets the operator's login
+shell. That inverts the curation, and it silently disarms the gates: no
+`COTF_APPROVE_URL` means the shim fails closed while codex skips an untrusted hook and
+runs the command anyway, and no proxy variables means no egress gating.
+
+**The jail moved inside the pane command.** `sandbox.wrap` is applied to the argv that
+becomes the pane's command string (`_run_codex_in_pane`), not to a process the daemon
+spawns. A quoting mistake there runs codex unjailed, which is why the pane command is
+built with `shlex.join` and the prompt is passed on stdin from a `0600` file rather than
+inlined.
+
+**Process-group kill does not reach a hosted run.** `agent._kill_process_tree` kills the
+daemon's own process group; a pane is a child of the tmux server. `tmux.kill` runs
+`kill-server`, which ends the session, its panes and everything started inside them, and
+both producers call it in their `finally`. `tmux.sweep` covers what a SIGKILLed daemon
+left.
+
+**A read command cannot start a server with the wrong environment.** Measured:
+`capture-pane` and `resize-window` against a missing socket fail with "error connecting"
+rather than starting a server. This matters because the TUI polls for panes that may not
+exist yet.
+
 ## Accepted, not fixing
 
 **One conversation can read another's transcripts** when `scope_sessions` is off. This is

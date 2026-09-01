@@ -36,8 +36,14 @@ configuration writes, not those persona links.
 | `auto_compact_pct` | integer / unset | `1..100`; invalid disables automatic compaction | Immediate |
 | `skills_cache_ttl_seconds` | number / `3600` | `<=0` probes on every query; invalid uses default | Immediate |
 | `pricing_ttl_seconds` | integer / `604800` | `0` always refreshes; negative never expires | Immediate |
+| `pane` | boolean / true | Host each turn in its own tmux server so the dashboard's watch pane mirrors the agent's terminal; `false`, `0`, `no` or `off` switches it off, anything else leaves it on. Inert without tmux | Next turn |
 | `pty.auto_install` | boolean / false | Install missing claude-pty without prompting | Startup |
 | `pty.auto_refresh` | boolean / true | Re-splice incomplete pty hooks | Startup |
+
+With `pane` off, every turn runs as a plain child: the watch pane falls back to
+tailing the session transcript, and a codex turn runs `codex exec` rather than its
+interactive UI. Native `claude -p` is never hosted either way, because its pane would
+show stream JSON.
 
 Automatic compaction requires a reliable context-window reading. Native and pty
 derive one. Ollama cannot, so it is inert there until `ollama.context_window`

@@ -28,6 +28,7 @@ src/claude_on_the_fly/
   settings.py          # config.yaml (all settings, re-read on save); .env is secrets only
   envfile.py           # Reads DATA_DIR/.env the way a spawned daemon receives it (file wins)
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
+  tmux.py              # Hosts a turn in a private tmux server; captures the pane
   turns.py             # Durable record of unanswered chat turns (restart recovery)
   upgrade.py           # Resolves how this install updates, and runs it
   protocol.py          # Frontend protocol (add new interfaces here)
@@ -58,8 +59,8 @@ uv run pytest                  # tests in tests/
 ```
 
 Coverage is 100% of statements and is enforced (`fail_under = 100`). It is not in
-pytest's `addopts` because it roughly triples the suite's wall clock, so run it
-explicitly when you add or change code:
+pytest's `addopts` because it adds about a minute to the suite's wall clock, so run
+it explicitly when you add or change code:
 
 ```bash
 uv run pytest --cov=claude_on_the_fly --cov-report=term-missing
@@ -81,6 +82,7 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/cron.md` — when touching the cron producer, its config schema, or key state
 - `docs/agent/frontend.md` — when adding a new frontend (Slack/Telegram-like)
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
+- `docs/agent/panes.md` — when changing how a turn is hosted in tmux, how the TUI's watch pane picks its source, or how a hosted turn is reaped
 - `docs/agent/broker.md` — when changing the credential broker or sandbox/jail wiring
 - `docs/agent/security-findings.md` — before changing a sandbox profile or a broker: what
   a review already found, what was accepted, and what is still open. Add findings here
