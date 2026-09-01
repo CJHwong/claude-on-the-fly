@@ -682,6 +682,11 @@ async def _run_codex_exec(
     env = sandbox.agent_env()
     env = {**(os.environ if env is None else env), "CODEX_HOME": str(codex_home)}
     pane = tmux.pane_from_env(env) if interactive else None
+    if interactive and pane is None:
+        logger.info(
+            "codex pty mode needs a hosted pane and this turn has none, so it "
+            "runs `codex exec`; install tmux, or check agent.pane"
+        )
     if pane is not None:
         # Before the spawn: the interactive TUI will not act until the directory
         # is trusted, and nobody is watching the pane to answer it.
@@ -834,8 +839,16 @@ class CodexBackend:
     the agent-writable workspace.
     """
 
-    def __init__(self, launcher: OllamaLauncher | None = None) -> None:
+    def __init__(
+        self, launcher: OllamaLauncher | None = None, pty: bool = False
+    ) -> None:
         self.launcher = launcher
+        # `pty` picks the interface, not the runtime: the interactive binary
+        # rather than `codex exec`. Kept separate from hosting so a break in
+        # codex's UI or its trust format costs this backend its TUI and nothing
+        # else -- `agent.pane` is global, so using it as the escape hatch would
+        # take claude-pty's mirror away too.
+        self._pty = pty
 
     async def run(
         self,
@@ -934,8 +947,10 @@ class CodexBackend:
             cmd,
             timeout=timeout,
             thread_id=existing_thread,
-            interactive=self._interactive_argv(
-                workspace, existing_thread, composed_prompt
+            interactive=(
+                self._interactive_argv(workspace, existing_thread, composed_prompt)
+                if self._pty
+                else None
             ),
         )
         duration = time.monotonic() - started_at
@@ -991,8 +1006,12 @@ class CodexBackend:
                     retry_cmd,
                     timeout=timeout,
                     thread_id=retry_thread,
-                    interactive=self._interactive_argv(
-                        workspace, retry_thread, nudge_prompt or NUDGE_PROMPT
+                    interactive=(
+                        self._interactive_argv(
+                            workspace, retry_thread, nudge_prompt or NUDGE_PROMPT
+                        )
+                        if self._pty
+                        else None
                     ),
                 )
                 duration += time.monotonic() - retry_started

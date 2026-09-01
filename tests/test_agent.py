@@ -2032,6 +2032,20 @@ class TestCurrentBackendKey:
         monkeypatch.delenv("CODEX_MODEL", raising=False)
         assert current_backend_key() == "codex:native:default"
 
+    def test_codex_pty_includes_model(self, clear_backend_env, monkeypatch):
+        """A distinct key from native: the same runtime, a different interface, so
+        a mode switch must not resume a thread recorded under the other one."""
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        monkeypatch.setenv("CODEX_MODEL", "gpt-5")
+        assert current_backend_key() == "codex:pty:gpt-5"
+
+    def test_codex_pty_blank_model_defaults(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        monkeypatch.delenv("CODEX_MODEL", raising=False)
+        assert current_backend_key() == "codex:pty:default"
+
     def test_codex_ollama_includes_model(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.setenv("CODEX_MODE", "ollama")

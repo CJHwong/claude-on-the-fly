@@ -1458,7 +1458,11 @@ def current_backend_key() -> str:
             if not model:
                 raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
             return f"codex:ollama:{model}"
-        raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+        if mode == "pty":
+            return f"codex:pty:{settings.get('CODEX_MODEL').strip() or 'default'}"
+        raise ValueError(
+            f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama, pty)"
+        )
     raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
 
 
@@ -1520,7 +1524,9 @@ def _build_codex_backend() -> AgentBackend:
         if not model:
             raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
         return CodexBackend(launcher=OllamaLauncher(model=model))
-    raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+    if mode == "pty":
+        return CodexBackend(pty=True)
+    raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama, pty)")
 
 
 async def run(

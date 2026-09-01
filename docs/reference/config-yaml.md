@@ -27,7 +27,7 @@ configuration writes, not those persona links.
 | `claude.mode` | string / `native` | `native`, `pty`, or `ollama` | Next turn |
 | `claude.model` | string / unset | Passed to Claude in native/pty mode | Next turn |
 | `claude.effort` | string / unset | `low`, `medium`, `high`, `xhigh`, `max`; native mode only, and unset lets the CLI read its own `effortLevel`; an unaccepted level is ignored with a warning | Next turn |
-| `codex.mode` | string / `native` | `native` or `ollama` | Next turn |
+| `codex.mode` | string / `native` | `native`, `pty`, or `ollama`; `pty` runs codex's interactive UI in a hosted pane, and degrades to `codex exec` with a log line when there is no pane | Next turn |
 | `codex.model` | string / unset | Passed to Codex native mode | Next turn |
 | `codex.effort` | string / unset | `minimal`, `low`, `medium`, `high`, `xhigh`; native mode only, and unset lets codex read its own `model_reasoning_effort`; an unaccepted level is ignored with a warning | Next turn |
 | `ollama.model` | string / unset | Required when either backend mode is `ollama` | Next turn |
@@ -40,10 +40,15 @@ configuration writes, not those persona links.
 | `pty.auto_install` | boolean / false | Install missing claude-pty without prompting | Startup |
 | `pty.auto_refresh` | boolean / true | Re-splice incomplete pty hooks | Startup |
 
-With `pane` off, every turn runs as a plain child: the watch pane falls back to
-tailing the session transcript, and a codex turn runs `codex exec` rather than its
-interactive UI. Native `claude -p` is never hosted either way, because its pane would
-show stream JSON.
+`pane` and the per-backend `mode` answer different questions. `mode` picks what runs
+— `claude.mode: pty` for claude's TUI, `codex.mode: pty` for codex's — and `pane`
+picks whether it is mirrored. Keeping them apart means a break in one backend's
+interactive path costs that backend its UI rather than taking the other's mirror
+away with it.
+
+With `pane` off, every turn runs as a plain child and the watch pane falls back to
+tailing the session transcript. Native `claude -p` and `codex.mode: native` are never
+worth hosting either way: their panes would show stream JSON and plain lines.
 
 Automatic compaction requires a reliable context-window reading. Native and pty
 derive one. Ollama cannot, so it is inert there until `ollama.context_window`

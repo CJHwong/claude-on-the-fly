@@ -259,8 +259,11 @@ sandbox:
 
 agent:
   # backend: claude (default) | codex
-  # Per-backend mode: native | ollama; claude also has pty, the only mode that
-  # reports a context reading and can forward claude's own permission dialog.
+  # Per-backend mode: native | ollama | pty. `pty` runs the CLI's own interactive
+  # UI on a terminal, which is what makes the dashboard's watch pane worth
+  # looking at; for claude it is also the only mode that reports a context
+  # reading and can forward claude's own permission dialog. codex's `pty` needs a
+  # hosted pane (see `pane` below) and runs `codex exec` without one.
   # Leave a model unset to let the CLI pick its own.
   # backend: claude
   # claude:

@@ -58,7 +58,8 @@ asks the server, which is the better source anyway.
 |---|---|---|
 | claude, `mode: pty` | Yes | claude's interactive TUI |
 | claude, `mode: native` | No | nothing — the tail covers it |
-| codex | Yes | codex's interactive TUI |
+| codex, `mode: pty` | Yes | codex's interactive TUI |
+| codex, `mode: native` | No | nothing — the tail covers it |
 
 `claude-pty` needs no change to take part: it calls bare `tmux`, so exporting
 `TMUX_TMPDIR` into its spawn env puts its session on the private server. codex is hosted
@@ -67,10 +68,10 @@ wrapper that would do it.
 
 Native `claude -p` is deliberately unhosted. Its pane would show stream JSON.
 
-### A hosted codex turn runs the interactive binary
+### `codex.mode: pty` runs the interactive binary
 
 `codex exec` is the *non-interactive* mode: it prints plain lines and never draws a UI,
-so mirroring it gives a pane that reads as dead next to claude-pty's. The hosted arm
+so mirroring it gives a pane that reads as dead next to claude-pty's. `codex.mode: pty`
 therefore runs `codex <prompt>` (or `codex resume <thread id> <prompt>`) — the same
 binary a person would use — and the mirror shows what they would see, status bar
 included.
@@ -90,8 +91,13 @@ Three consequences:
   spelling both the interactive entry point and `resume` document; `--yolo` is
   undocumented on `resume`.
 
-The unhosted arm still runs `codex exec`, and both arms read the turn from the rollout
-through one parser, so they cannot report it differently.
+`native` mode and any pty-mode turn that has no pane still run `codex exec`, and every
+arm reads the turn from the rollout through one parser, so they cannot report it
+differently.
+
+The mode is separate from `agent.pane` on purpose. `pane` is global, so using it to
+retreat from a break in codex's interactive path would take claude-pty's mirror away
+at the same time; `codex.mode: native` gives up only what broke.
 
 ## Lifecycle
 

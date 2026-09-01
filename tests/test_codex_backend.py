@@ -276,6 +276,7 @@ async def _run_exec(
     records: tuple[dict, ...] = (),
     kill: AsyncMock | None = None,
     rollout: Path | None = None,
+    interactive: list[str] | None = None,
 ):
     """Drive `_run_codex_exec` against a fake process and a fixture rollout.
 
@@ -297,7 +298,10 @@ async def _run_exec(
         ),
     ):
         return await codex_mod._run_codex_exec(
-            tmp_path, ["codex", "exec", "prompt"], timeout=None
+            tmp_path,
+            ["codex", "exec", "prompt"],
+            timeout=None,
+            interactive=interactive,
         )
 
 
@@ -2675,3 +2679,90 @@ class TestPaneArmEdges:
         self, tmp_path: Path
     ):
         assert codex_mod._pane_output_tail(tmp_path / "never-written") == ""
+
+
+class TestCodexPtyMode:
+    """`pty` picks the interface, `agent.pane` picks whether it is mirrored. Keeping
+    them apart is what stops a break in codex's UI costing claude-pty its pane."""
+
+    async def test_native_mode_never_offers_an_interactive_argv(
+        self, tmp_path: Path, monkeypatch
+    ):
+        seen: dict = {}
+
+        async def record(workspace, cmd, timeout, thread_id=None, interactive=None):
+            seen["interactive"] = interactive
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", record)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        await CodexBackend().run(workspace, "sess", "hi", "telegram")
+
+        assert seen["interactive"] is None
+
+    async def test_pty_mode_offers_the_interactive_binary(
+        self, tmp_path: Path, monkeypatch
+    ):
+        seen: dict = {}
+
+        async def record(workspace, cmd, timeout, thread_id=None, interactive=None):
+            seen["interactive"] = interactive
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", record)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        await CodexBackend(pty=True).run(workspace, "sess", "hi", "telegram")
+
+        argv = seen["interactive"]
+        assert argv is not None
+        # The interactive entry point takes no `exec` subcommand.
+        assert "exec" not in argv
+        assert "--dangerously-bypass-approvals-and-sandbox" in argv
+
+    async def test_pty_mode_resumes_with_the_interactive_subcommand(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """`codex exec resume` and `codex resume` are different entry points."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        argv = CodexBackend(pty=True)._interactive_argv(workspace, "thread-1", "go on")
+
+        assert argv[:2] == ["codex", "resume"]
+        assert argv[-2:] == ["thread-1", "go on"]
+
+    async def test_pty_mode_without_a_pane_says_it_is_running_exec(
+        self, tmp_path: Path, caplog
+    ):
+        """The operator asked for a UI. Getting plain lines instead is worth a line."""
+        proc = _exec_proc(0)
+        with caplog.at_level(logging.INFO, logger=codex_mod.__name__):
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_task_complete("done"),),
+                interactive=["codex", "p"],
+            )
+
+        assert "runs `codex exec`" in caplog.text
+
+
+def test_get_backend_routes_codex_pty_mode(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "pty")
+    backend = get_backend()
+
+    assert isinstance(backend, CodexBackend)
+    assert backend._pty is True
+
+
+def test_an_unknown_codex_mode_still_names_the_supported_ones(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "telepathy")
+
+    with pytest.raises(ValueError, match="native, ollama, pty"):
+        get_backend()
