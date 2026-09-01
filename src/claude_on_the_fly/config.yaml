@@ -259,8 +259,11 @@ sandbox:
 
 agent:
   # backend: claude (default) | codex
-  # Per-backend mode: native | ollama; claude also has pty, the only mode that
-  # reports a context reading and can forward claude's own permission dialog.
+  # Per-backend mode: native | ollama | pty. `pty` runs the CLI's own interactive
+  # UI on a terminal, which is what makes the dashboard's watch pane worth
+  # looking at; for claude it is also the only mode that reports a context
+  # reading and can forward claude's own permission dialog. codex's `pty` needs a
+  # hosted pane (see `pane` below) and runs `codex exec` without one.
   # Leave a model unset to let the CLI pick its own.
   # backend: claude
   # claude:
@@ -298,6 +301,14 @@ agent:
   # pricing_ttl_seconds of 0 always refreshes, negative never expires.
   # skills_cache_ttl_seconds: 3600
   # pricing_ttl_seconds: 21600
+
+  # Host each turn in its own tmux server, so the dashboard's watch pane can
+  # mirror the agent's own terminal instead of tailing its transcript. On
+  # wherever tmux is installed. Turn it off to run every turn as a plain child:
+  # the watch pane then falls back to the transcript, and codex runs
+  # `codex exec` rather than its interactive UI. Read per turn, so an edit takes
+  # effect on the next one without a restart.
+  # pane: true
 
   # claude-pty, used by claude's pty mode.
   # These controls act during startup preflight.

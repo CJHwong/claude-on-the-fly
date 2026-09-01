@@ -48,7 +48,6 @@ from claude_on_the_fly.agent import (
     stats_mode,
     write_attachment,
 )
-from claude_on_the_fly.backends import codex as codex_mod
 from claude_on_the_fly.backends.claude import ClaudeBackend
 from claude_on_the_fly.transcript import Turn
 
@@ -513,27 +512,6 @@ def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     return proc
 
 
-def _codex_item_event(event_type: str, item_type: str, text: str | None = None) -> dict:
-    item = {"type": item_type}
-    if text is not None:
-        item["text"] = text
-    return {"type": event_type, "item": item}
-
-
-def _make_codex_chunked_proc(stdout: bytes):
-    split_points = (7, 31, 67, 103, len(stdout))
-    chunks = [
-        stdout[start:end]
-        for start, end in zip((0, *split_points[:-1]), split_points, strict=True)
-    ]
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.stdout = _ChunkedStreamReader(chunks)
-    proc.stderr = _ChunkedStreamReader([b""])
-    proc.wait = AsyncMock(return_value=0)
-    return proc
-
-
 class TestExec:
     async def test_success_returns_parsed_stream(self):
         stream = _ndjson(
@@ -795,69 +773,6 @@ class TestExec:
             reset_progress_sink(token)
 
         assert result["result"] == "done"
-        assert "progress relay failed" in caplog.text
-
-
-class TestCodexInterimProgress:
-    def test_observer_ignores_blank_and_malformed_lines(self, caplog):
-        observer = codex_mod._CodexStreamObserver(
-            codex_mod._StreamWatch(), lambda _text: None
-        )
-
-        with caplog.at_level("ERROR", logger=codex_mod.__name__):
-            observer.feed(b"\nnot-json\n[]\n")
-            observer.finish()
-
-        assert "progress relay failed" in caplog.text
-
-    async def test_forwards_narration_across_chunk_boundaries_without_final_duplication(
-        self,
-    ):
-        stream = b"\n".join(
-            json.dumps(event).encode()
-            for event in (
-                {"type": "thread.started", "thread_id": "thread-1"},
-                _codex_item_event("item.completed", "agent_message", "first step"),
-                _codex_item_event("item.started", "command_execution"),
-                _codex_item_event("item.completed", "command_execution"),
-                _codex_item_event("item.completed", "agent_message", "final answer"),
-                {"type": "turn.completed", "usage": {}},
-            )
-        )
-        proc = _make_codex_chunked_proc(stream)
-        emitted: list[str] = []
-        token = set_progress_sink(emitted.append)
-        try:
-            captured, _stderr = await codex_mod._collect_codex_output(proc)
-        finally:
-            reset_progress_sink(token)
-
-        assert emitted == ["first step"]
-        assert codex_mod.parse_codex_stream(captured)["body"] == "final answer"
-
-    async def test_a_broken_progress_sink_does_not_break_codex_output(self, caplog):
-        stream = b"\n".join(
-            json.dumps(event).encode()
-            for event in (
-                _codex_item_event("item.completed", "agent_message", "working"),
-                _codex_item_event("item.started", "command_execution"),
-                _codex_item_event("item.completed", "agent_message", "done"),
-                {"type": "turn.completed", "usage": {}},
-            )
-        )
-        proc = _make_codex_chunked_proc(stream)
-
-        def fail(_text: str) -> None:
-            raise RuntimeError("progress sink failed")
-
-        token = set_progress_sink(fail)
-        try:
-            with caplog.at_level("ERROR", logger=codex_mod.__name__):
-                captured, _stderr = await codex_mod._collect_codex_output(proc)
-        finally:
-            reset_progress_sink(token)
-
-        assert codex_mod.parse_codex_stream(captured)["body"] == "done"
         assert "progress relay failed" in caplog.text
 
 
@@ -2116,6 +2031,20 @@ class TestCurrentBackendKey:
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.delenv("CODEX_MODEL", raising=False)
         assert current_backend_key() == "codex:native:default"
+
+    def test_codex_pty_includes_model(self, clear_backend_env, monkeypatch):
+        """A distinct key from native: the same runtime, a different interface, so
+        a mode switch must not resume a thread recorded under the other one."""
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        monkeypatch.setenv("CODEX_MODEL", "gpt-5")
+        assert current_backend_key() == "codex:pty:gpt-5"
+
+    def test_codex_pty_blank_model_defaults(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        monkeypatch.delenv("CODEX_MODEL", raising=False)
+        assert current_backend_key() == "codex:pty:default"
 
     def test_codex_ollama_includes_model(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "codex")

@@ -7,11 +7,12 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, Response
+from claude_on_the_fly.jobs import agent_runner as agent_runner_mod
 from claude_on_the_fly.jobs.agent_runner import (
     RUNS_DIRNAME,
     OrchestratorAgentRunner,
@@ -651,3 +652,49 @@ def test_sweep_skips_an_entry_it_cannot_stat(tmp_path: Path) -> None:
 
     assert removed == [good]
     assert not good.exists()
+
+
+class TestJobPaneLifecycle:
+    async def test_a_hosted_job_publishes_its_pane_and_reaps_it(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """pytest's tmp_path is deep enough that pane_for correctly refuses it, so
+        the hosted path needs a pane handed in."""
+        from claude_on_the_fly import sandbox, tmux
+
+        pane = tmux.Pane(tmpdir=tmp_path / "sock", session="cotf-job-run-1")
+        killed: list[str] = []
+        monkeypatch.setattr(tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux, "pane_for", lambda _name: pane)
+        monkeypatch.setattr(tmux, "kill", lambda p: killed.append(p.session))
+        seen: dict = {}
+
+        async def capture_env(*_args, **_kwargs):
+            seen["env"] = dict(sandbox.agent_env() or {})
+            return Response(body="done")
+
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with patch.object(agent_runner_mod.agent, "run", capture_env):
+            result = await runner.run(_job(prompt="hi"))
+
+        assert result.ok is True
+        assert seen["env"]["TMUX_TMPDIR"] == str(pane.tmpdir)
+        assert killed == ["cotf-job-run-1"]
+
+    async def test_an_unhosted_job_reaps_nothing(self, tmp_path: Path, monkeypatch):
+        from claude_on_the_fly import tmux
+
+        monkeypatch.setattr(tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux, "pane_for", lambda _name: None)
+
+        def refuse(_pane):
+            raise AssertionError("reaped a pane that was never created")
+
+        monkeypatch.setattr(tmux, "kill", refuse)
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with patch.object(
+            agent_runner_mod.agent, "run", AsyncMock(return_value=Response(body="done"))
+        ):
+            result = await runner.run(_job(prompt="hi"))
+
+        assert result.ok is True

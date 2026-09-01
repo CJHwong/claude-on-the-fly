@@ -113,7 +113,13 @@ def check_backend() -> None:
         if mode == "ollama":
             check_ollama_mode("codex")
             return
-        raise _exit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+        if mode == "pty":
+            # Same binary as native, so the same check. tmux is not required:
+            # without a pane the turn degrades to `codex exec` rather than
+            # failing, which is why this does not refuse to start.
+            check_codex_cli()
+            return
+        raise _exit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama, pty)")
     raise _exit(f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex)")
 
 

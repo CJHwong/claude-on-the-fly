@@ -208,6 +208,17 @@ class TestCheckBackend:
         check_backend()
         mock_check.assert_called_once_with("codex")
 
+    @patch("claude_on_the_fly.preflight.check_codex_cli")
+    def test_codex_pty_checks_the_same_binary(
+        self, mock_check, clear_backend_env, monkeypatch
+    ):
+        """tmux is not required: without a pane the turn degrades to `codex exec`
+        rather than failing, so this must not refuse to start."""
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        check_backend()
+        mock_check.assert_called_once()
+
     def test_codex_unknown_mode_exits(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.setenv("CODEX_MODE", "magic")

@@ -25,6 +25,7 @@ from claude_on_the_fly import (
     permissions,
     sandbox,
     settings,
+    tmux,
     turns,
 )
 from claude_on_the_fly import approvals as approvals_mod
@@ -746,6 +747,7 @@ class Orchestrator:
         env_token = None
         relay: sandbox.SessionRelay | None = None
         command_token: str | None = None
+        pane: tmux.Pane | None = None
         interim: InterimProgress | None = None
         sink_token = None
         try:
@@ -759,6 +761,26 @@ class Orchestrator:
             # entirely: the in-flight slot set just above leaked, notify_complete
             # never ran, and the whole drain task died with turns still queued.
             session_overrides: dict[str, str] = {}
+            # Host this turn in its own tmux server so the TUI can mirror the
+            # pane. The name is `permissions.tmux_session_name` because the
+            # approval path addresses the same pane to type an answer into it;
+            # both call that one function, so the two cannot name different
+            # panes. Skipped entirely when tmux is absent — a turn then runs
+            # unmirrored rather than not at all.
+            if tmux.hosting_available():
+                pane = tmux.pane_for(permissions.tmux_session_name(chat_id, session))
+            if pane is not None:
+                session_overrides.update(pane.env)
+                logger.debug("tmux: chat %s hosted in pane %s", chat_id, pane.session)
+            elif not tmux.available():
+                # INFO rather than debug: this is the whole reason a watch pane
+                # shows a transcript instead of the agent's terminal, and it is
+                # the one cause an operator can actually fix. Silent when they
+                # switched hosting off themselves — that one is not a surprise.
+                logger.info(
+                    "tmux is not on PATH, so this turn runs unmirrored; "
+                    "install tmux to watch the agent's own terminal"
+                )
             if self._egress is not None:
                 session_overrides.update(await self._egress.env_for(chat_id, session))
             if self._permissions is not None:
@@ -942,6 +964,12 @@ class Orchestrator:
                 interim.cancel()
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
+            if pane is not None:
+                # Ends the server, so a backend that left its pane running past
+                # the deadline is reaped here too. A process-group kill cannot
+                # reach a pane child, which is why this is not covered by the
+                # backend's own teardown.
+                tmux.kill(pane)
             if relay is not None:
                 # Closing this drops the namespace's only route to the host, so
                 # it has to outlive the spawn. Safe on every path including the
@@ -1331,6 +1359,11 @@ async def run(frontend: Frontend, platform: str) -> None:
         process_ledger.sweep()
         agent.add_process_listener(process_ledger.on_process)
         listener_attached = True
+        # Same recovery, one layer out: a pane is a child of its own tmux server,
+        # so the process ledger above never saw it. The server dies with the
+        # daemon that started it, but its socket directory does not, and one per
+        # turn would otherwise accumulate.
+        tmux.sweep()
 
         # When sandboxing is enabled, the broker holds the real API keys and the
         # agent reaches them only through loopback. start_default_broker publishes

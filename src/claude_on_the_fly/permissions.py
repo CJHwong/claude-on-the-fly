@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import shlex
 from collections.abc import Awaitable, Callable
@@ -665,7 +666,9 @@ class PermissionService:
         which is cotf's problem and is recoverable -- Escape refuses that one call and
         the turn carries on.
         """
-        alive, _ = await _tmux("has-session", "-t", self.tmux_session)
+        alive, _ = await _tmux(
+            "has-session", "-t", self.tmux_session, session=self.tmux_session
+        )
         if alive != 0:
             logger.error(
                 "permissions[%s]: tmux session %s does not exist, so claude-pty "
@@ -1144,14 +1147,30 @@ NO_PANE_NOTICE = (
 )
 
 
-async def _tmux(*args: str) -> tuple[int, str]:
-    """Run tmux and return (returncode, stdout). Never raises."""
+async def _tmux(*args: str, session: str = "") -> tuple[int, str]:
+    """Run tmux against `session`'s server and return (returncode, stdout).
+
+    `session` decides which server, which is the whole point: a hosted turn puts
+    claude-pty's session on its own server, addressed by TMUX_TMPDIR, and a tmux
+    run without it talks to the operator's default server instead. Every probe
+    here would then report the dialog missing, so the turn would park on a
+    question nobody could read, answer, or cancel.
+
+    Empty, or a session with no run directory, keeps the default server, which is
+    where claude-pty puts its session when hosting is off.
+
+    Never raises.
+    """
+    from claude_on_the_fly import tmux as tmux_mod
+
+    overrides = tmux_mod.session_env(session) if session else {}
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **overrides} if overrides else None,
         )
         out, _err = await proc.communicate()
     except (OSError, ValueError) as exc:
@@ -1162,7 +1181,7 @@ async def _tmux(*args: str) -> tuple[int, str]:
 
 async def capture_pane(session: str) -> str:
     """The visible pane of `session`, or "" when it cannot be read."""
-    code, text = await _tmux("capture-pane", "-p", "-t", session)
+    code, text = await _tmux("capture-pane", "-p", "-t", session, session=session)
     return text if code == 0 else ""
 
 
@@ -1194,7 +1213,7 @@ async def answer_dialog(session: str, dialog: Dialog, *, allowed: bool) -> bool:
     keystroke carries no text.
     """
     key = dialog.yes_key if allowed else dialog.no_key
-    code, _ = await _tmux("send-keys", "-t", session, key)
+    code, _ = await _tmux("send-keys", "-t", session, key, session=session)
     if code != 0:
         logger.error("permissions: could not answer the dialog in %s", session)
         return False
@@ -1214,9 +1233,9 @@ async def _deliver_refusal(session: str) -> None:
     by which the reason reaches the model.
     """
     await asyncio.sleep(_POLL_INTERVAL_SECONDS * 4)
-    await _tmux("send-keys", "-t", session, PTY_DENY_MESSAGE)
+    await _tmux("send-keys", "-t", session, PTY_DENY_MESSAGE, session=session)
     await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-    await _tmux("send-keys", "-t", session, "Enter")
+    await _tmux("send-keys", "-t", session, "Enter", session=session)
 
 
 async def cancel_dialog(session: str) -> bool:
@@ -1234,7 +1253,7 @@ async def cancel_dialog(session: str) -> bool:
     envelope written, terminal_reason=completed) with the model explaining what it
     would have needed.
     """
-    code, _ = await _tmux("send-keys", "-t", session, _CANCEL_KEY)
+    code, _ = await _tmux("send-keys", "-t", session, _CANCEL_KEY, session=session)
     if code != 0:
         logger.error("permissions: could not cancel the dialog in %s", session)
         return False

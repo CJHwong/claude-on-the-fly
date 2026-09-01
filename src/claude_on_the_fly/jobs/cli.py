@@ -28,7 +28,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
-from claude_on_the_fly import agent, checks, sandbox, settings
+from claude_on_the_fly import agent, checks, sandbox, settings, tmux
 from claude_on_the_fly.heartbeat import (
     HeartbeatWriter,
     InstanceAlreadyClaimed,
@@ -249,6 +249,12 @@ async def _run(token: str) -> None:
             )
         agent.add_process_listener(ledger.on_process)
         listener_attached = True
+
+        # Socket directories of panes this worker's last life left behind. Beside
+        # the workspace sweep because it is the same startup-is-the-cadence
+        # argument, and a pane is a child of its own tmux server, so the process
+        # ledger above never saw it.
+        tmux.sweep()
 
         # Retention for finished one-shot workspaces. Startup is the whole cadence:
         # the sweep is bounded by what one worker's lifetime accumulated, and a worker

@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
@@ -580,7 +580,13 @@ class TelegramFrontend(Frontend):
         """Send one message; return its id, or None when the app is absent."""
         if not self._app:
             raise RuntimeError("App not started")
-        kwargs = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        # Annotated because the values are not one type: `reply_markup` carries a
+        # Telegram markup object, and `parse_mode` is dropped entirely on retry.
+        kwargs: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
         try:

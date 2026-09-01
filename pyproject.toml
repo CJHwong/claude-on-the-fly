@@ -70,8 +70,8 @@ ignore = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
-# Coverage is deliberately NOT in `addopts`: it roughly triples the suite's wall
-# clock (~30s -> ~105s), and the inner loop runs `uv run pytest` constantly. Run
+# Coverage is deliberately NOT in `addopts`: it adds about a minute to the suite's
+# wall clock (~150s -> ~210s), and the inner loop runs `uv run pytest` constantly. Run
 # the gate explicitly instead:
 #
 #     uv run pytest --cov=claude_on_the_fly --cov-report=term-missing

@@ -44,21 +44,51 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
 ### Tool / skill counts (footer display)
 
 - **claude**: skills populated by CLI; tools from `tool_use` blocks.
-- **codex**: no skill concept in the footer (`skill_counts` always empty). Tools from `item.completed` events. `list_skills()` scans `$CODEX_HOME/prompts/*.md` for the picker.
+- **codex**: no skill concept in the footer (`skill_counts` always empty). Tools from the rollout's `item_completed` events, which name items in PascalCase (`CommandExecution`, `FileChange`). `Reasoning`, `UserMessage`, `AgentMessage` and `ContextCompaction` are what the turn did rather than tools it called, so they are excluded; an unknown type counts as a tool, so a new one appears in the footer rather than vanishing. `list_skills()` scans `$CODEX_HOME/prompts/*.md` for the picker.
 
 ### Interim progress
 
 When enabled, native and Ollama turns from both backends can forward mid-turn
 narration through the shared progress sink. Claude consumes its stream line by line
-in `agent._consume`; Codex observes its `--json` JSONL chunks incrementally and keeps
-partial lines until the next chunk arrives. An `agent_message` is held until a tool
-event proves it is narration, then the existing `InterimProgress` relay applies its
-warm-up and pacing policy. The final Codex message is discarded from the relay when
-`turn.completed` arrives because `Response.body` posts it once as the answer.
+in `agent._consume`; Codex follows its rollout file (`_RolloutFollower`), polling it
+once a second while the turn runs. An `AgentMessage` carries a `phase`, so narration is
+read from the producer rather than inferred: `commentary` is forwarded, `final_answer` is
+not, because `Response.body` posts that one once as the answer. The existing
+`InterimProgress` relay then applies its warm-up and pacing policy.
 
 Progress delivery is best effort: a parser or frontend failure is logged and never
 turns a successful agent run into an error. Claude pty has no line-oriented stream,
 and Telegram still inherits the frontend no-op, so both remain unsupported.
+
+### Where codex's machine data comes from
+
+A hosted codex turn runs the **interactive** binary rather than `codex exec`, so the
+pane mirrors codex's own UI; see [panes](panes.md). Either way it runs **without
+`--json`**. The flag would put the same events on stdout, but a
+`--json` run renders JSONL into the terminal, and the terminal is what the pane mirrors
+(see [panes](panes.md)) — so it buys a parser and costs the live view.
+
+Everything is read from the rollout instead, by `parse_codex_rollout`:
+
+| Needed | Rollout record |
+|---|---|
+| thread id | `session_meta.session_id` |
+| the reply | `event_msg/task_complete.last_agent_message` |
+| turn finished | `event_msg/task_complete` present |
+| turn failed | `event_msg/turn_aborted.reason` |
+| tool counts | `event_msg/item_completed.item.type` |
+| usage fallback | `event_msg/token_count.info.last_token_usage` |
+
+Usage and the context reading already came from the rollout before this, so the numbers
+in the footer did not move.
+
+One parser serves both the hosted and the unhosted arm. That is the point: two readers of
+one turn drift, and a hosted turn reporting differently from an unhosted one would be
+invisible until somebody compared them.
+
+The rollout is append-only across `codex exec resume`, so the follower records the file's
+size before the spawn and reads only what arrives after it. Parsing from the top would
+fold an earlier turn's tool counts and final message into this one.
 
 ### System prompt
 

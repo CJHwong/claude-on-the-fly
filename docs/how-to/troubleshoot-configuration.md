@@ -31,6 +31,14 @@ The executable must be on the daemon's PATH at startup, the tool must be under
 Slack needs a bot token. Claude pty needs tmux. Confirm `permissions.mode: ask`, restart
 the chat daemon, and check that the spawned session receives an approval endpoint.
 
+## The watch pane shows a transcript instead of the live terminal
+
+The dashboard mirrors the agent's own terminal when the run is hosted in a tmux pane, and
+falls back to tailing the session transcript when it is not. Install tmux if it is
+missing. Native `claude -p` is never hosted, so it always shows the tail. A run whose
+`COTF_DATA_DIR` is very deep is not hosted either: the daemon log names the socket length
+it would have needed.
+
 ## A malformed section changed behavior
 
 Readers normally log an error and use packaged or code defaults for that section. Fix

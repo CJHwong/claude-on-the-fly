@@ -128,6 +128,7 @@ FIELDS: dict[str, Field] = {
     "agent.skills_cache_ttl_seconds": Field("SKILLS_CACHE_TTL_SECONDS"),
     "agent.pricing_ttl_seconds": Field("COTF_PRICING_TTL_SECONDS"),
     "agent.auto_compact_pct": Field("COTF_AUTO_COMPACT_PCT"),
+    "agent.pane": Field("COTF_AGENT_PANE"),
     "agent.pty.auto_install": Field("COTF_AUTO_INSTALL_PTY"),
     "agent.pty.auto_refresh": Field("COTF_PTY_AUTO_REFRESH"),
     # Its own section because every section here names a module, and mid-turn

@@ -29,6 +29,7 @@ until then means a run that failed overnight can still be inspected. A keyed
 workspace is never swept; it is the continuity.
 
 NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
+(the codex backend passes DEVNULL itself; this is about the claude path)
 so the child inherits this process's stdin. That is harmless for the supervised
 worker — `supervisor.spawn` starts daemons with `stdin=subprocess.DEVNULL` — but
 a worker run in the foreground from a terminal hands the agent CLI that terminal's
@@ -45,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, sandbox, tmux
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.keys import safe_segment
@@ -145,6 +146,20 @@ class OrchestratorAgentRunner:
             platform_dir / run_id if keyed else platform_dir / RUNS_DIRNAME / run_id
         )
         workspace.mkdir(parents=True, exist_ok=True)
+        # Host the run in its own tmux server, the same as a chat turn, so the
+        # TUI can mirror a job nobody is watching in a conversation. The name
+        # carries the key rather than the run id, because the key is what an
+        # operator recognises in the watch list; an unkeyed job falls back to the
+        # id, which is at least unique.
+        # None when hosting is off, tmux is absent, or the socket path would not
+        # fit an address: every one of those means an unhosted turn, not a failed
+        # one.
+        pane = (
+            tmux.pane_for(tmux.job_session_name(run_id))
+            if tmux.hosting_available()
+            else None
+        )
+        env_token = sandbox.session_env(pane.env) if pane is not None else None
         try:
             # Keyed on `job.key`, the same field that names the unit of work in the
             # log line below: a poller aimed at one tracker can run its own
@@ -190,6 +205,12 @@ class OrchestratorAgentRunner:
             return Result(ok=True, text=response.body)
         finally:
             self.in_flight.pop(job.id, None)
+            if env_token is not None:
+                sandbox.reset_session_env(env_token)
+            if pane is not None:
+                # Ends the server, which is the only reap that reaches a process
+                # the agent left running inside the pane.
+                tmux.kill(pane)
             # No workspace is deleted here, keyed or not.
             #
             # A keyed job's workspace and session ARE its continuity: the next run
