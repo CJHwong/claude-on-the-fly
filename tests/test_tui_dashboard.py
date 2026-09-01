@@ -2798,3 +2798,141 @@ class TestTheWatchPaneRendersRemoteTextAsData:
             rendered = self._drive(screen, label)
 
         assert label in render_markup(rendered).plain
+
+
+class TestWatchGrid:
+    """The watch pane prefers the agent's own terminal when the run is hosted."""
+
+    @staticmethod
+    def _call(screen, workspace):
+        from textual.widgets import RichLog, Static
+
+        return screen._refresh_watch_grid(
+            "12345",
+            workspace,
+            "telegram/H",
+            screen.query_one("#watch-header", Static),
+            screen.query_one("#watch-pane", RichLog),
+        )
+
+    async def test_a_hosted_run_renders_its_pane_instead_of_the_transcript(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-pty-12345-abcd")
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(
+            tmux_mod, "capture", lambda *_a, **_k: "\x1b[32mrunning tests\x1b[0m"
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._watch_path = isolated / "stale.jsonl"
+            handled = self._call(screen, isolated / "workspaces" / "telegram" / "H")
+            await pilot.pause()
+            rendered = _pane_text(app, "#watch-pane")
+            header = str(app.screen.query_one("#watch-header", Static).content)
+
+        assert handled is True
+        assert "running tests" in rendered
+        assert "live pane" in header
+        # Cleared, or a later switch back to the transcript would refuse to reload.
+        assert screen._watch_path is None
+
+    async def test_the_watch_pane_itself_prefers_a_live_pane(
+        self, isolated, monkeypatch
+    ):
+        """Through the real refresh path, not the helper: the tail must not also
+        run and overwrite the grid."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-pty-777-abcd")
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "live grid text")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            from textual.widgets import RichLog, Static
+
+            screen._refresh_watch_session(
+                "telegram",
+                "777",
+                screen.query_one("#watch-header", Static),
+                screen.query_one("#watch-pane", RichLog),
+                True,
+            )
+            await pilot.pause()
+            rendered = _pane_text(app, "#watch-pane")
+
+        assert "live grid text" in rendered
+
+    async def test_an_unhosted_run_falls_back_to_the_transcript_tail(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            assert self._call(screen, isolated / "ws") is False
+
+    async def test_a_host_without_tmux_never_probes_for_a_pane(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        monkeypatch.setattr(tmux_mod, "available", lambda: False)
+
+        def fail(_prefix):
+            raise AssertionError("probed for a pane with no tmux installed")
+
+        monkeypatch.setattr(tmux_mod, "pane_named", fail)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            assert self._call(screen, isolated / "ws") is False
+
+    async def test_a_pane_that_ends_mid_capture_falls_back(self, isolated, monkeypatch):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-job-run1")
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            assert self._call(screen, isolated / "ws") is False
+
+
+class TestWatchGridBlank:
+    async def test_a_pane_that_has_not_drawn_yet_falls_back_to_the_transcript(
+        self, isolated, monkeypatch
+    ):
+        """A live pane trims to "" until the agent draws. Rendering that would
+        blank the watch pane for the opening stretch of every turn."""
+        from textual.widgets import RichLog, Static
+
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-job-run1")
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "   \n  \n")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            handled = screen._refresh_watch_grid(
+                "12345",
+                isolated / "ws",
+                "telegram/H",
+                screen.query_one("#watch-header", Static),
+                screen.query_one("#watch-pane", RichLog),
+            )
+
+        assert handled is False

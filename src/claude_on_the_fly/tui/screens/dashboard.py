@@ -56,7 +56,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from claude_on_the_fly import checks, logs, upgrade
+from claude_on_the_fly import checks, logs, permissions, tmux, upgrade
 from claude_on_the_fly.agent import (
     DATA_DIR,
     get_backend,
@@ -1203,6 +1203,14 @@ class DashboardScreen(Screen):
         # workspace path above is built from it.
         shown = session_format._safe(label)
 
+        # Prefer the agent's own terminal when this run is hosted in a tmux
+        # pane. The grid is what the agent is drawing, rather than a rendering
+        # rebuilt from transcript events, and it shows the states the transcript
+        # cannot: a turn parked on a prompt writes no event at all while it
+        # waits. Falls through to the JSONL tail for every run with no pane.
+        if self._refresh_watch_grid(identifier, workspace, shown, header, pane):
+            return
+
         session_uuid = self._job_sessions.get(key)
         if not session_uuid:
             if force_reload or self._watch_path is not None:
@@ -1268,6 +1276,50 @@ class DashboardScreen(Screen):
             pane.write(f"[dim](no displayable events yet in {path.name})[/dim]")
         if not stick:
             render.restore_scroll(pane, prev_y=prev_y)
+
+    def _refresh_watch_grid(
+        self,
+        identifier: str,
+        workspace: Path,
+        shown: str,
+        header: Static,
+        pane: RichLog,
+    ) -> bool:
+        """Render this run's live tmux pane. True when it did, False to fall back.
+
+        Two name shapes because the two producers name their panes differently
+        and neither can be asked at this distance: a chat turn's pane carries the
+        session discriminator the orchestrator minted, so only its `<chat id>`
+        prefix is knowable here, while a job's pane is named for the workspace
+        directory this row already resolved.
+
+        The capture is synchronous on the 1Hz refresh. It costs single-digit
+        milliseconds normally, and `CAPTURE_TIMEOUT_S` bounds the pathological
+        case at a stutter rather than a hang.
+        """
+        if not tmux.available():
+            return False
+        found = tmux.pane_named(
+            f"{permissions.TMUX_SESSION_PREFIX}-{identifier}-"
+        ) or tmux.pane_named(tmux.job_session_name(workspace.name))
+        if found is None:
+            return False
+        grid = tmux.capture(found, cols=pane.size.width, rows=pane.size.height)
+        # Blank counts as nothing to show, not as something to show. A pane that
+        # exists but has not drawn yet trims to the empty string, and rendering
+        # that would replace the transcript with an empty widget for the opening
+        # stretch of every turn — which reads as the feature being broken.
+        if not grid or not grid.strip():
+            return False
+        # The tail's bookkeeping has to be cleared, not just bypassed: it decides
+        # whether a later switch back to a file counts as a switch, and a stale
+        # path here would leave the tail refusing to reload the pane it lost.
+        self._watch_path = None
+        self._watch_mtime = None
+        header.update(f"[bold]watch: {shown}[/bold] [dim]live pane[/dim]")
+        pane.clear()
+        pane.write(Text.from_ansi(grid))
+        return True
 
     def _refresh_watch_cron(
         self, job: str, header: Static, pane: RichLog, force_reload: bool
