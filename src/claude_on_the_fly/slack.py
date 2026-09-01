@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import aiohttp
@@ -494,8 +494,13 @@ def _bot_rules(
             )
             return None
 
-        name = str(item.get("name", "")).strip()
-        expression = item.get("match")
+        # Cast rather than annotate: `isinstance(item, Mapping)` narrows a bare
+        # `object` to a mapping of unknown keys, every `.get` below then fails to
+        # match an overload, and a plain assignment cannot fix it because Mapping
+        # is invariant in its key type. The check above is the runtime guarantee.
+        entry = cast("Mapping[str, Any]", item)
+        name = str(entry.get("name", "")).strip()
+        expression = entry.get("match")
         if not name or not isinstance(expression, str) or not expression.strip():
             logger.error(
                 "slack: ignoring bot policy for %s: %s entry needs a non-empty "
@@ -537,7 +542,9 @@ def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
             type(raw).__name__,
         )
         return None
-    mode = str(raw.get("mode", "all")).strip()
+    # See `_bot_rules` for why this is a cast.
+    policy = cast("Mapping[str, Any]", raw)
+    mode = str(policy.get("mode", "all")).strip()
     if mode not in _BOT_POLICY_MODES:
         logger.error(
             "slack: ignoring bot policy for %s: unknown mode %r (expected one of %s)",
@@ -548,10 +555,10 @@ def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
         return None
 
     processed = _bot_rules(
-        raw.get("process_if"), field="process_if", bot_id=bot_id, allow_mention=True
+        policy.get("process_if"), field="process_if", bot_id=bot_id, allow_mention=True
     )
     dropped = _bot_rules(
-        raw.get("drop_before_ai"),
+        policy.get("drop_before_ai"),
         field="drop_before_ai",
         bot_id=bot_id,
         allow_mention=False,
@@ -565,7 +572,7 @@ def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
     # the first symptom of a pattern that does not match what the operator
     # expected is "the agent stopped answering my bot". At DEBUG there is nothing
     # in a normal log to explain it.
-    audit = raw.get("audit_dropped_events", True)
+    audit = policy.get("audit_dropped_events", True)
     if not isinstance(audit, bool):
         logger.error(
             "slack: ignoring bot policy for %s: audit_dropped_events must be true or false",
