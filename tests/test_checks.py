@@ -428,16 +428,16 @@ class TestCheckBackend:
         assert any(r.name == "CODEX_MODE" for r in bad)
 
     def test_claude_pty_mode_accepted(self):
-        """`pty` is a valid CLAUDE_MODE (claude-only); env validation passes."""
+        """`pty` is a valid CLAUDE_MODE; env validation passes."""
         results = check_backend({"CLAUDE_MODE": "pty"})
         bad = [r for r in results if r.name == "CLAUDE_MODE" and r.status == "invalid"]
         assert not bad
 
-    def test_codex_pty_mode_rejected(self):
-        """pty is claude-only; codex should not accept it."""
+    def test_codex_pty_mode_accepted(self):
+        """codex reaches pty through its own backend rather than claude-pty, so
+        the mode is valid for both backends."""
         results = check_backend({"AGENT_BACKEND": "codex", "CODEX_MODE": "pty"})
-        bad = [r for r in results if r.status == "invalid"]
-        assert any(r.name == "CODEX_MODE" for r in bad)
+        assert all_ok(results)
 
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1187,19 @@ class TestAutoCompactCapability:
         row = next(r for r in results if r.name == "COTF_AUTO_COMPACT_PCT")
         assert row.status == "ok"
 
+    def test_ok_under_codex_pty(self):
+        """A hosted turn compacts on the plain `exec` arm, the same as an
+        unhosted one, so the pane changes nothing about the threshold."""
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "codex",
+                "CODEX_MODE": "pty",
+                "COTF_AUTO_COMPACT_PCT": "60",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_AUTO_COMPACT_PCT")
+        assert row.status == "ok"
+
     def test_warns_under_ollama(self):
         results = check_backend(
             {
@@ -1265,12 +1278,27 @@ class TestInterimProgressCheck:
         assert row.status == "warn"
         assert "claude/pty" in row.detail
 
-    def test_codex_warns(self):
+    def test_codex_native_is_ok(self):
+        """codex follows its rollout as the turn writes it, so narration reaches
+        the same sink claude's stream feeds."""
         results = check_backend(
             {"AGENT_BACKEND": "codex", "COTF_INTERIM_PROGRESS": "1"}
         )
         row = next(r for r in results if r.name == "COTF_INTERIM_PROGRESS")
-        assert row.status == "warn"
+        assert row.status == "ok"
+
+    def test_codex_pty_is_ok(self):
+        """The follower is shared by both codex arms, so hosting a turn in a pane
+        does not cost it the narration."""
+        results = check_backend(
+            {
+                "AGENT_BACKEND": "codex",
+                "CODEX_MODE": "pty",
+                "COTF_INTERIM_PROGRESS": "1",
+            }
+        )
+        row = next(r for r in results if r.name == "COTF_INTERIM_PROGRESS")
+        assert row.status == "ok"
 
     @pytest.mark.parametrize(
         ("raw", "on"),
