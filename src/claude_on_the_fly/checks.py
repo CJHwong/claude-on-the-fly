@@ -663,9 +663,11 @@ def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
 # ---------------------------------------------------------------------------
 
 _VALID_BACKENDS = ("claude", "codex")
-_VALID_MODES = ("native", "ollama")
-# claude-pty is claude-only; codex has no equivalent wrapper.
-_VALID_CLAUDE_MODES = ("native", "ollama", "pty")
+# One list for both backends. They reach pty by different routes -- claude wraps
+# itself in claude-pty, while codex's own backend hosts the interactive binary
+# (see `docs/agent/panes.md`) -- but an operator picks from the same three names
+# either way. A second list only drifted from this one.
+_VALID_MODES = ("native", "ollama", "pty")
 
 
 def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
@@ -688,15 +690,14 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
     )
 
     mode_var = f"{backend.upper()}_MODE"
-    valid_modes = _VALID_CLAUDE_MODES if backend == "claude" else _VALID_MODES
     mode = env.get(mode_var, "native").lower()
-    if mode not in valid_modes:
+    if mode not in _VALID_MODES:
         results.append(
             CheckResult(
                 name=mode_var,
                 status="invalid",
-                detail=f"{mode!r} (supported: {', '.join(valid_modes)})",
-                fix_hint=f"Set {mode_var}={' or '.join(valid_modes)}",
+                detail=f"{mode!r} (supported: {', '.join(_VALID_MODES)})",
+                fix_hint=f"Set {mode_var}={' or '.join(_VALID_MODES)}",
             )
         )
         return results
@@ -797,13 +798,16 @@ def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
 # withholds the window on purpose (see `ClaudeBackend.run`) because the claude
 # CLI reports one for whichever model it thinks is answering rather than the one
 # ollama routed to — so the gate there has nothing trustworthy to compare
-# against however the threshold is set. codex reports both in its rollout.
+# against however the threshold is set. Every codex mode reports both in its
+# rollout, and pty is no exception: compaction runs on the plain `exec` arm
+# whether or not the turn has a pane.
 _AUTO_COMPACT_CAPABLE: frozenset[tuple[str, str]] = frozenset(
     {
         ("claude", "native"),
         ("claude", "pty"),
         ("codex", "native"),
         ("codex", "ollama"),
+        ("codex", "pty"),
     }
 )
 
@@ -839,14 +843,21 @@ def _check_auto_compact(
     )
 
 
-# Backend/mode pairs whose output we read line by line as it is produced. Not the
-# same set as _AUTO_COMPACT_CAPABLE and not derivable from it: claude's ollama
-# mode streams exactly as native does (the launcher only prepends an argv
-# prefix), while pty returns a single envelope from claude-pty and codex buffers
-# all of stdout before parsing it. Auto-compact's gap is ollama, for an unrelated
-# reason — the window figure describes the wrong model there.
+# Backend/mode pairs whose output we read as the turn produces it. Not the same
+# set as _AUTO_COMPACT_CAPABLE and not derivable from it: claude's ollama mode
+# streams exactly as native does (the launcher only prepends an argv prefix),
+# while claude's pty returns a single envelope from claude-pty. codex reads the
+# rollout as it is written and feeds the same sink from either arm, so both its
+# hosted and unhosted turns narrate. Auto-compact's gap is ollama, for an
+# unrelated reason -- the window figure describes the wrong model there.
 _INTERIM_CAPABLE: frozenset[tuple[str, str]] = frozenset(
-    {("claude", "native"), ("claude", "ollama")}
+    {
+        ("claude", "native"),
+        ("claude", "ollama"),
+        ("codex", "native"),
+        ("codex", "ollama"),
+        ("codex", "pty"),
+    }
 )
 
 

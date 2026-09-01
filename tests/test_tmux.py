@@ -14,6 +14,10 @@ import pytest
 
 from claude_on_the_fly import tmux
 
+# Long enough for a loaded CI runner to start a shell and flush its first line,
+# short enough that a genuine regression fails the test rather than hanging it.
+_PROBE_DEADLINE_S = 10.0
+
 HAS_TMUX = shutil.which("tmux") is not None
 needs_tmux = pytest.mark.skipif(not HAS_TMUX, reason="tmux is not installed")
 
@@ -359,9 +363,19 @@ def test_a_real_pane_inherits_the_curated_env_and_can_be_captured(
         )
         assert tmux.alive(pane) is True
 
-        grid = tmux.capture(pane)
+        # A live session does not mean the shell has drawn yet: `alive` asks
+        # whether the server has the session, and on a loaded runner `printenv`
+        # can still be ahead of its first write. Capturing once read an empty
+        # grid there and failed a claim about the environment. Poll instead.
+        deadline = time.monotonic() + _PROBE_DEADLINE_S
+        grid = ""
+        while time.monotonic() < deadline:
+            grid = tmux.capture(pane)
+            assert grid is not None
+            if "inherited" in grid:
+                break
+            time.sleep(0.05)
 
-        assert grid is not None
         assert "inherited" in grid
     finally:
         tmux.kill(pane)

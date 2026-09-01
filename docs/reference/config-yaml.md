@@ -83,7 +83,7 @@ separates a crash from a deliberate stop or from the middle of an upgrade. See
 
 Interim progress needs a line-by-line stream, so it is inert under `agent.claude.mode:
 pty` and on a frontend that does not implement progress delivery (today, Telegram).
-Claude native/ollama and Codex native/ollama provide the required stream. It posts only
+Claude native/ollama provides the required stream, and so does every Codex mode: Codex narrates from its rollout, which a hosted pane does not change. It posts only
 in DMs and group DMs, is paced by `warmup_seconds` and `min_gap_seconds` so a short turn
 produces nothing and a long one a periodic digest, and it does not count against
 `slack.reply_soft_limit`.
