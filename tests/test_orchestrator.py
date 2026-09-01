@@ -313,6 +313,22 @@ class TestDrain:
 
 
 class TestProcess:
+    async def test_a_host_without_tmux_says_why_the_turn_is_unmirrored(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """The one cause of "the watch pane shows a transcript" that an operator
+        can actually fix, so it is INFO rather than a silent skip."""
+        monkeypatch.setattr(orchestrator_mod.tmux, "available", lambda: False)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"),
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        assert "runs unmirrored" in caplog.text
+
     async def test_creates_workspace_and_calls_agent(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
@@ -3073,3 +3089,27 @@ class TestResumingPendingTurns:
 
         assert (replayed, nudged) == (0, 1)
         assert "could not offer" in caplog.text
+
+
+class TestPaneCanBeSwitchedOff:
+    async def test_hosting_off_runs_the_turn_as_a_plain_child(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """Switching it off is not a failure, so it says nothing: the watch pane
+        falls back to the transcript and the turn is otherwise unchanged."""
+        monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: False)
+        monkeypatch.setattr(orchestrator_mod.tmux, "available", lambda: True)
+
+        def refuse(_name):
+            raise AssertionError("built a pane with hosting switched off")
+
+        monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", refuse)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"),
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        assert "runs unmirrored" not in caplog.text
