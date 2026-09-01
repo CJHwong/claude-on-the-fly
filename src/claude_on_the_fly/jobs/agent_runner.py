@@ -151,6 +151,9 @@ class OrchestratorAgentRunner:
         # carries the key rather than the run id, because the key is what an
         # operator recognises in the watch list; an unkeyed job falls back to the
         # id, which is at least unique.
+        # None when hosting is off, tmux is absent, or the socket path would not
+        # fit an address: every one of those means an unhosted turn, not a failed
+        # one.
         pane = (
             tmux.pane_for(tmux.job_session_name(run_id))
             if tmux.hosting_available()

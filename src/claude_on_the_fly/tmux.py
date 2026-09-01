@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,12 @@ CONTROL_TIMEOUT_S = 5.0
 # anyway: it reports the name tmux actually gave the session.
 _DIR_CHARS = 12
 _SUN_PATH_MAX = 104
+
+# How long a run directory is left alone before a sweep may reap it. Long enough
+# to cover the gap between the daemon creating it and the agent's tmux starting
+# the server in it, which is the window a concurrent sweep would otherwise take
+# a live turn's socket directory in.
+_SWEEP_GRACE_S = 120.0
 
 
 # OSC (window-title and friends). `Text.from_ansi` drops the introducer but leaves
@@ -184,24 +191,45 @@ def socket_path(tmpdir: Path) -> Path:
     return tmpdir / f"tmux-{os.getuid()}" / "default"
 
 
-def pane_for(session: str) -> Pane:
+def pane_dir(session: str) -> Path:
+    """Where a run named `session` keeps its socket, without creating anything.
+
+    Pure so a caller that must not create a pane can still address one. The
+    approval path needs exactly that: it has to reach the server hosting a turn,
+    and whether the directory exists is also how it tells a hosted turn from one
+    on the operator's default server.
+    """
+    return (
+        panes_root()
+        / hashlib.blake2b(session.encode(), digest_size=8).hexdigest()[:_DIR_CHARS]
+    )
+
+
+def session_env(session: str) -> dict[str, str]:
+    """`TMUX_TMPDIR` for a hosted session, or nothing when it is not hosted.
+
+    Empty is the meaningful answer, not a failure: with hosting off, or before
+    this build existed, claude-pty puts its session on the default server, and a
+    caller that forced TMUX_TMPDIR would look for it on a server that has it not.
+    """
+    directory = pane_dir(session)
+    return {"TMUX_TMPDIR": str(directory)} if directory.is_dir() else {}
+
+
+def pane_for(session: str) -> Pane | None:
     """The pane a run named `session` gets, creating its socket directory.
 
     The directory is 0700 because tmux refuses a socket directory group or world
     can write, and because the socket in it is a full command channel to the
     server hosting the agent.
     """
-    tmpdir = (
-        panes_root()
-        / hashlib.blake2b(session.encode(), digest_size=8).hexdigest()[:_DIR_CHARS]
-    )
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    tmpdir.chmod(0o700)
+    tmpdir = pane_dir(session)
     projected = len(str(socket_path(tmpdir)))
     if projected > _SUN_PATH_MAX:
-        # Warn rather than raise: the pane is a mirror, and losing it must not
-        # lose the turn. Without the number the operator would only ever see
-        # tmux's own "File name too long", which names no fix.
+        # None, not a pane. Returning one anyway published TMUX_TMPDIR and hosted
+        # the turn regardless, so the agent's own tmux failed with "File name too
+        # long" -- costing the turn, which is the opposite of what this warning
+        # promises. Unhosted is the degrade; the turn still runs.
         logger.warning(
             "tmux: %s needs a %d-byte socket path and the limit is %d, so this turn "
             "runs unmirrored; point COTF_DATA_DIR somewhere shallower",
@@ -209,6 +237,9 @@ def pane_for(session: str) -> Pane:
             projected,
             _SUN_PATH_MAX,
         )
+        return None
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    tmpdir.chmod(0o700)
     return Pane(tmpdir=tmpdir, session=session)
 
 
@@ -281,6 +312,16 @@ def capture(
     return trim_trailing_blank_rows(result.stdout)
 
 
+def kill_session(pane: Pane) -> None:
+    """End the session, leaving the server and the run directory in place.
+
+    What a backend calls when its turn is over but the run is not: a nudge retry
+    opens a new session with the same name, and `tmux new-session` refuses a
+    duplicate. The server exits by itself once its last session goes.
+    """
+    _run(pane, ["kill-session", "-t", pane.session], CONTROL_TIMEOUT_S)
+
+
 def kill(pane: Pane) -> None:
     """End the run's server and remove its socket directory. Best-effort.
 
@@ -305,7 +346,10 @@ def _sessions_on(tmpdir: Path) -> list[str]:
     result = _run(
         Pane(tmpdir=tmpdir, session=""),
         ["list-sessions", "-F", "#{session_name}"],
-        CONTROL_TIMEOUT_S,
+        # The capture deadline, not the control one: this runs on the TUI's 1Hz
+        # refresh, once per run directory, so a wedged server has to cost a stale
+        # frame rather than five seconds of frozen dashboard.
+        CAPTURE_TIMEOUT_S,
     )
     if result is None or result.returncode != 0:
         return []
@@ -335,7 +379,7 @@ def live_panes() -> list[Pane]:
     ]
 
 
-def pane_named(prefix: str) -> Pane | None:
+def pane_named(*prefixes: str) -> Pane | None:
     """The live pane whose session starts with `prefix`, or None.
 
     A prefix rather than an exact name because a viewer knows less than the
@@ -345,8 +389,13 @@ def pane_named(prefix: str) -> Pane | None:
     orchestrator owns. A job pane is named for its run, which the TUI does know
     in full, so the prefix is the whole name there.
     """
+    if not prefixes:
+        return None
+    # One scan for all of them. Each call costs a `tmux list-sessions` per run
+    # directory and this sits on the TUI's 1Hz refresh, so asking twice doubled
+    # the subprocesses per frame for no more information.
     for pane in live_panes():
-        if pane.session.startswith(prefix):
+        if any(pane.session.startswith(prefix) for prefix in prefixes):
             return pane
     return None
 
@@ -359,8 +408,18 @@ def sweep() -> int:
     stays and would otherwise accumulate one per turn forever.
     """
     reaped = 0
+    cutoff = time.time() - _SWEEP_GRACE_S
     for tmpdir in _run_dirs():
         if _sessions_on(tmpdir):
+            continue
+        # A directory is created at the top of a turn and the server appears a
+        # moment later, when the agent's own tmux runs. Both daemons sweep this
+        # shared root, so a worker restarting inside that window would otherwise
+        # reap a chat turn that is just starting and leave its TMUX_TMPDIR gone.
+        try:
+            if tmpdir.stat().st_mtime > cutoff:
+                continue
+        except OSError:
             continue
         kill(Pane(tmpdir=tmpdir, session=""))
         reaped += 1

@@ -378,11 +378,23 @@ class _RolloutFollower:
         found = (
             transcript._find_codex_rollout(self._thread_id)
             if self._thread_id
-            else transcript._find_codex_rollout_by_cwd(str(self._workspace))
+            # Resolved, because the comparison is a string equality against the
+            # cwd codex recorded, and codex records the path it resolved. On
+            # macOS a workspace under /tmp is written as /private/tmp/..., so the
+            # unresolved name matches nothing and the turn never resolves at all.
+            else transcript._find_codex_rollout_by_cwd(
+                os.path.realpath(self._workspace)
+            )
         )
         if found is not None:
             self._path = found
-            self._offset = 0
+            # Only a thread with no id starts at the top. A resumed one already
+            # holds every earlier turn, so reading from 0 folds their tool counts
+            # and their last reply into this turn -- and fires turn_completed on
+            # a task_complete that happened before this turn began. Starting at
+            # the current size can miss a few of this turn's opening records; it
+            # cannot invent a finished turn.
+            self._offset = 0 if not self._thread_id else rollout_size(found)
 
     def _drain(self) -> None:
         """Read new records once, feeding progress and completion. Never raises."""
@@ -460,8 +472,18 @@ def _ensure_workspace_trusted(workspace: Path, codex_home: Path) -> None:
     if stanza in current:
         return
     separator = "" if current.endswith("\n") or not current else "\n"
-    with config.open("a") as handle:
-        handle.write(f'{separator}\n{stanza}\ntrust_level = "trusted"\n')
+    try:
+        with config.open("a") as handle:
+            handle.write(f'{separator}\n{stanza}\ntrust_level = "trusted"\n')
+    except OSError as exc:
+        # Best effort, like every other pane concern: an unwritable CODEX_HOME
+        # costs the interactive UI (the turn parks on the trust dialog and the
+        # timeout ends it), and raising here would cost the turn outright even
+        # where the plain arm would have run it.
+        logger.warning(
+            "codex: could not record workspace trust in %s (%s)", config, exc
+        )
+        return
     logger.debug("codex: trusted %s for the interactive pane", real)
 
 
@@ -622,6 +644,12 @@ async def _run_codex_in_pane(
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         if follower.turn_completed.is_set():
+            # End the session here, not at the end of the run. The TUI does not
+            # exit on its own, and a nudge retry opens a session with this same
+            # name -- `tmux new-session` refuses a duplicate, so leaving it alive
+            # turned every retry into "tmux refused to host the codex turn". The
+            # run directory stays, so the retry gets its own session in it.
+            tmux.kill_session(pane)
             return 0, ""
         if not await asyncio.to_thread(tmux.alive, pane):
             # The TUI went away without finishing. Whatever it printed on the way

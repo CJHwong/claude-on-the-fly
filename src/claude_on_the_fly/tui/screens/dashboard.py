@@ -1297,11 +1297,14 @@ class DashboardScreen(Screen):
         milliseconds normally, and `CAPTURE_TIMEOUT_S` bounds the pathological
         case at a stutter rather than a hang.
         """
-        if not tmux.available():
+        if not tmux.hosting_available():
             return False
+        # One scan, both shapes. Asking twice ran a `tmux list-sessions` per run
+        # directory twice per frame, on the refresh thread.
         found = tmux.pane_named(
-            f"{permissions.TMUX_SESSION_PREFIX}-{identifier}-"
-        ) or tmux.pane_named(tmux.job_session_name(workspace.name))
+            f"{permissions.TMUX_SESSION_PREFIX}-{identifier}-",
+            tmux.job_session_name(workspace.name),
+        )
         if found is None:
             return False
         grid = tmux.capture(found, cols=pane.size.width, rows=pane.size.height)

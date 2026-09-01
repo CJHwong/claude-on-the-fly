@@ -2821,8 +2821,8 @@ class TestWatchGrid:
         from claude_on_the_fly import tmux as tmux_mod
 
         pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-pty-12345-abcd")
-        monkeypatch.setattr(tmux_mod, "available", lambda: True)
-        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(
             tmux_mod, "capture", lambda *_a, **_k: "\x1b[32mrunning tests\x1b[0m"
         )
@@ -2849,8 +2849,8 @@ class TestWatchGrid:
         from claude_on_the_fly import tmux as tmux_mod
 
         pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-pty-777-abcd")
-        monkeypatch.setattr(tmux_mod, "available", lambda: True)
-        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "live grid text")
         app = _Host()
         async with app.run_test() as pilot:
@@ -2874,22 +2874,22 @@ class TestWatchGrid:
     ):
         from claude_on_the_fly import tmux as tmux_mod
 
-        monkeypatch.setattr(tmux_mod, "available", lambda: True)
-        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: None)
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: None)
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             assert self._call(screen, isolated / "ws") is False
 
-    async def test_a_host_without_tmux_never_probes_for_a_pane(
+    async def test_hosting_unavailable_never_probes_for_a_pane(
         self, isolated, monkeypatch
     ):
         from claude_on_the_fly import tmux as tmux_mod
 
-        monkeypatch.setattr(tmux_mod, "available", lambda: False)
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: False)
 
-        def fail(_prefix):
-            raise AssertionError("probed for a pane with no tmux installed")
+        def fail(*_prefixes):
+            raise AssertionError("probed for a pane with hosting unavailable")
 
         monkeypatch.setattr(tmux_mod, "pane_named", fail)
         app = _Host()
@@ -2901,8 +2901,8 @@ class TestWatchGrid:
         from claude_on_the_fly import tmux as tmux_mod
 
         pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-job-run1")
-        monkeypatch.setattr(tmux_mod, "available", lambda: True)
-        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: None)
         app = _Host()
         async with app.run_test() as pilot:
@@ -2921,8 +2921,8 @@ class TestWatchGridBlank:
         from claude_on_the_fly import tmux as tmux_mod
 
         pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-job-run1")
-        monkeypatch.setattr(tmux_mod, "available", lambda: True)
-        monkeypatch.setattr(tmux_mod, "pane_named", lambda prefix: pane)
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "   \n  \n")
         app = _Host()
         async with app.run_test() as pilot:

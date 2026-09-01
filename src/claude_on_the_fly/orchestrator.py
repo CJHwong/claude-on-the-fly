@@ -769,6 +769,7 @@ class Orchestrator:
             # unmirrored rather than not at all.
             if tmux.hosting_available():
                 pane = tmux.pane_for(permissions.tmux_session_name(chat_id, session))
+            if pane is not None:
                 session_overrides.update(pane.env)
                 logger.debug("tmux: chat %s hosted in pane %s", chat_id, pane.session)
             elif not tmux.available():

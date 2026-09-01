@@ -228,8 +228,15 @@ runs the command anyway, and no proxy variables means no egress gating.
 **The jail moved inside the pane command.** `sandbox.wrap` is applied to the argv that
 becomes the pane's command string (`_run_codex_in_pane`), not to a process the daemon
 spawns. A quoting mistake there runs codex unjailed, which is why the pane command is
-built with `shlex.join` and the prompt is passed on stdin from a `0600` file rather than
-inlined.
+built with `shlex.join`.
+
+**The prompt is in that command line, and `ps` can read it.** The interactive UI needs
+its stdin to be the terminal, so the prompt cannot arrive on stdin from a file the way
+the earlier `codex exec` arm passed it; it is an argv element instead. The unhosted arm
+has always done the same. What that exposes to any local user is the system prompt, the
+handoff, and the message text — conversation content, not credentials, which the broker
+keeps out of the agent's environment entirely. Worth knowing before putting anything in
+a prompt that a local user should not see.
 
 **Process-group kill does not reach a hosted run.** `agent._kill_process_tree` kills the
 daemon's own process group; a pane is a child of the tmux server. `tmux.kill` runs

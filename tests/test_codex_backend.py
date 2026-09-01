@@ -2766,3 +2766,107 @@ def test_an_unknown_codex_mode_still_names_the_supported_ones(monkeypatch):
 
     with pytest.raises(ValueError, match="native, ollama, pty"):
         get_backend()
+
+
+class TestHostedTurnCleanup:
+    """The interactive TUI never exits, so the turn has to end its own session."""
+
+    async def test_a_finished_turn_frees_the_session_for_a_nudge_retry(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """`tmux new-session` refuses a duplicate name, so leaving the session
+        alive turned every retry into "tmux refused to host the codex turn"."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        killed: list[str] = []
+        monkeypatch.setattr(
+            tmux_mod, "kill_session", lambda p: killed.append(p.session)
+        )
+        pane = tmux_mod.Pane(tmpdir=tmp_path, session="cotf-job-retry")
+        created = MagicMock()
+        created.returncode = 0
+        created.communicate = AsyncMock(return_value=(b"", b""))
+        plain = MagicMock()
+        plain.returncode = 0
+        plain.wait = AsyncMock(return_value=0)
+        plain.communicate = AsyncMock(return_value=(b"", b""))
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        follower.turn_completed.set()
+        procs = [created, plain, plain]
+        with patch(
+            "asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=lambda *_a, **_k: procs.pop(0)),
+        ):
+            returncode, _ = await codex_mod._run_codex_in_pane(
+                pane, ["codex", "p"], tmp_path, dict(os.environ), follower, timeout=None
+            )
+
+        assert returncode == 0
+        assert killed == ["cotf-job-retry"]
+
+
+class TestFollowerResolvesLate:
+    """The rollout is looked up by mtime and cwd, so it is not always there when
+    the turn starts."""
+
+    def test_a_resumed_thread_does_not_rewind_to_the_top(self, tmp_path: Path):
+        """Reading from 0 folds every earlier turn's tool counts and last reply
+        into this one, and fires turn_completed on a task_complete that already
+        happened -- so in pty mode the turn ends before codex has answered."""
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(
+            _rollout_text(_item("CommandExecution"), _task_complete("an earlier turn"))
+        )
+        with patch.object(codex_mod.transcript, "_find_codex_rollout", lambda _t: None):
+            follower = codex_mod._RolloutFollower(tmp_path, "thread-1", None)
+        assert follower._path is None
+
+        with patch.object(codex_mod.transcript, "_find_codex_rollout", lambda _t: path):
+            follower._drain()
+
+        assert follower.turn_completed.is_set() is False
+        out = parse_codex_rollout(follower.records)
+        assert out["body"] == ""
+        assert out["tool_counts"] == {}
+
+    def test_a_fresh_thread_still_reads_the_whole_file(self, tmp_path: Path):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(_rollout_text(_task_complete("this turn")))
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: path
+        ):
+            follower._drain()
+
+        assert parse_codex_rollout(follower.records)["body"] == "this turn"
+
+    def test_the_cwd_lookup_uses_the_path_codex_recorded(self, tmp_path: Path):
+        """The comparison is a string equality against codex's own resolved cwd,
+        so on macOS a /tmp workspace is written as /private/tmp/... and the
+        unresolved name matches nothing."""
+        seen: list[str] = []
+        follower = codex_mod._RolloutFollower(Path("/tmp"), None, None)
+        with patch.object(
+            codex_mod.transcript,
+            "_find_codex_rollout_by_cwd",
+            lambda cwd, **_k: seen.append(cwd) or None,
+        ):
+            follower._drain()
+
+        assert seen == [os.path.realpath("/tmp")]
+
+
+def test_an_unwritable_codex_home_costs_the_pane_not_the_turn(tmp_path: Path, caplog):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text("model = 'x'\n")
+    (home / "config.toml").chmod(0o400)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    try:
+        with caplog.at_level(logging.WARNING, logger=codex_mod.__name__):
+            codex_mod._ensure_workspace_trusted(workspace, home)
+    finally:
+        (home / "config.toml").chmod(0o600)
+
+    assert "could not record workspace trust" in caplog.text

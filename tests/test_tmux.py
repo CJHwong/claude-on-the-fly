@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def test_pane_env_carries_both_keys_so_claude_pty_lands_on_the_private_server():
     }
 
 
-def test_pane_for_creates_a_private_directory(panes_root: Path):
+def test_pane_for_creates_a_private_directory(short_panes_root: Path):
     pane = tmux.pane_for("cotf-pty-7-abcd")
 
     assert pane.tmpdir.is_dir()
@@ -60,12 +61,15 @@ def test_pane_for_creates_a_private_directory(panes_root: Path):
     assert pane.session == "cotf-pty-7-abcd"
 
 
-def test_pane_for_keeps_the_directory_short_enough_for_a_unix_socket(panes_root: Path):
+def test_pane_for_keeps_the_directory_short_enough_for_a_unix_socket(
+    short_panes_root: Path,
+):
     """A session name in the path costs a whole turn, not just the mirror: tmux fails
     the spawn with "File name too long" once the socket exceeds sun_path."""
     pane = tmux.pane_for("job/jira/ACE-1234-a-very-long-key-" + "x" * 120)
 
-    assert pane.tmpdir.parent == panes_root
+    assert pane is not None
+    assert pane.tmpdir.parent == short_panes_root
     assert len(pane.tmpdir.name) == 12
 
 
@@ -76,21 +80,26 @@ def test_pane_for_warns_when_the_data_dir_is_too_deep_for_a_socket(
     monkeypatch.setattr(tmux, "panes_root", lambda: deep)
 
     with caplog.at_level("WARNING"):
-        tmux.pane_for("cotf-chat-1")
+        pane = tmux.pane_for("cotf-chat-1")
 
     assert "COTF_DATA_DIR" in caplog.text
+    # None, not a pane. Returning one published TMUX_TMPDIR and hosted the turn
+    # anyway, so the agent's own tmux failed with "File name too long" -- the
+    # turn, not just its mirror.
+    assert pane is None
+    assert not deep.exists()
 
 
 def test_pane_for_says_nothing_when_the_path_fits(
     short_panes_root: Path, caplog: pytest.LogCaptureFixture
 ):
     with caplog.at_level("WARNING"):
-        tmux.pane_for("cotf-chat-1")
+        assert tmux.pane_for("cotf-chat-1") is not None
 
     assert caplog.text == ""
 
 
-def test_pane_for_is_idempotent_so_a_retry_reuses_the_directory(panes_root: Path):
+def test_pane_for_is_idempotent_so_a_retry_reuses_the_directory(short_panes_root: Path):
     first = tmux.pane_for("cotf-job-1")
     second = tmux.pane_for("cotf-job-1")
 
@@ -237,7 +246,7 @@ def test_capture_does_not_resize_when_the_viewer_gives_no_size(
 
 
 def test_kill_ends_the_server_and_removes_the_directory(
-    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
 ):
     calls: list[list[str]] = []
     monkeypatch.setattr(tmux, "_run", lambda _p, args, _t: calls.append(args))
@@ -262,12 +271,12 @@ def test_live_panes_is_empty_before_any_turn_runs(panes_root: Path):
 
 
 def test_live_panes_names_each_session_from_its_own_server(
-    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
 ):
     """The directory is a digest, so the human name can only come from tmux."""
     live = tmux.pane_for("cotf-chat-1")
     tmux.pane_for("cotf-chat-2")
-    (panes_root / "stray-file").write_text("not a socket directory")
+    (short_panes_root / "stray-file").write_text("not a socket directory")
     monkeypatch.setattr(
         tmux, "_sessions_on", lambda d: ["cotf-chat-1"] if d == live.tmpdir else []
     )
@@ -276,11 +285,16 @@ def test_live_panes_names_each_session_from_its_own_server(
 
 
 def test_sweep_reaps_the_leftovers_of_a_killed_daemon(
-    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
 ):
     dead = tmux.pane_for("cotf-chat-dead")
     live = tmux.pane_for("cotf-chat-live")
-    (panes_root / "stray-file").write_text("not a socket directory")
+    assert dead is not None and live is not None
+    # Older than the grace: a directory younger than that belongs to a turn that
+    # may not have started its server yet.
+    aged = time.time() - tmux._SWEEP_GRACE_S - 1
+    os.utime(dead.tmpdir, (aged, aged))
+    (short_panes_root / "stray-file").write_text("not a socket directory")
     monkeypatch.setattr(
         tmux, "_sessions_on", lambda d: ["cotf-chat-live"] if d == live.tmpdir else []
     )
@@ -480,3 +494,84 @@ class TestHostingCanBeSwitchedOff:
 
         monkeypatch.setattr(tmux.shutil, "which", lambda _name: None)
         assert tmux.hosting_available() is False
+
+
+def test_sweep_leaves_a_turn_that_is_still_starting_alone(
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+):
+    """The directory is created at the top of a turn and the server appears a
+    moment later. Both daemons sweep this root, so a worker restarting inside that
+    window would otherwise take a live chat turn's socket directory with it."""
+    starting = tmux.pane_for("cotf-chat-starting")
+    assert starting is not None
+    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
+
+    assert tmux.sweep() == 0
+    assert starting.tmpdir.exists()
+
+
+def test_pane_dir_answers_without_creating_anything(short_panes_root: Path):
+    """The approval path has to address a pane without bringing one into being."""
+    directory = tmux.pane_dir("cotf-pty-1-abcd")
+
+    assert directory.parent == short_panes_root
+    assert not directory.exists()
+
+
+def test_session_env_points_at_a_hosted_pane_and_nothing_otherwise(
+    short_panes_root: Path,
+):
+    """Empty is the meaningful answer: with hosting off, claude-pty puts its
+    session on the default server, and forcing TMUX_TMPDIR would look for it on a
+    server that does not have it."""
+    assert tmux.session_env("cotf-pty-1-abcd") == {}
+
+    pane = tmux.pane_for("cotf-pty-1-abcd")
+    assert pane is not None
+    assert tmux.session_env("cotf-pty-1-abcd") == {"TMUX_TMPDIR": str(pane.tmpdir)}
+
+
+def test_kill_session_leaves_the_directory_for_a_retry(
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+):
+    """A nudge retry opens a session with the same name, and tmux refuses a
+    duplicate, so the session has to go while the run directory stays."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(tmux, "_run", lambda _p, args, _t: calls.append(args))
+    pane = tmux.pane_for("cotf-job-retry")
+    assert pane is not None
+
+    tmux.kill_session(pane)
+
+    assert calls == [["kill-session", "-t", "cotf-job-retry"]]
+    assert pane.tmpdir.exists()
+
+
+def test_pane_named_scans_once_for_every_shape_a_viewer_tries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Discovery sits on the TUI's 1Hz refresh and costs a subprocess per run
+    directory, so asking twice doubled the cost per frame."""
+    job = tmux.Pane(tmpdir=tmp_path / "b", session="cotf-job-run-1")
+    scans = []
+
+    def counted():
+        scans.append(1)
+        return [job]
+
+    monkeypatch.setattr(tmux, "live_panes", counted)
+
+    assert tmux.pane_named("cotf-pty-777-", "cotf-job-run-1") == job
+    assert len(scans) == 1
+    assert tmux.pane_named() is None
+
+
+def test_sweep_skips_a_directory_that_vanishes_under_it(
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+):
+    """Two daemons sweep this root, so the other one may remove a directory
+    between the listing and the stat."""
+    monkeypatch.setattr(tmux, "_run_dirs", lambda: [short_panes_root / "already-gone"])
+    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
+
+    assert tmux.sweep() == 0

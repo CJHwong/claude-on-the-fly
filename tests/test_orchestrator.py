@@ -3113,3 +3113,58 @@ class TestPaneCanBeSwitchedOff:
             await orch._process(1, Turn("question"))
 
         assert "runs unmirrored" not in caplog.text
+
+
+class TestPaneLifecycleAcrossATurn:
+    async def test_a_hosted_turn_publishes_its_pane_and_reaps_it(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch
+    ) -> None:
+        """pytest's own tmp_path is deep enough that pane_for correctly refuses it,
+        so the hosted path needs a root a socket address can actually fit."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(tmpdir=tmp_path / "sock", session="cotf-pty-1-abcd")
+        killed: list[str] = []
+        monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", lambda _name: pane)
+        monkeypatch.setattr(
+            orchestrator_mod.tmux, "kill", lambda p: killed.append(p.session)
+        )
+        seen: dict = {}
+
+        async def capture_env(*_args, **_kwargs):
+            seen["env"] = dict(orchestrator_mod.sandbox.agent_env() or {})
+            return Response(body="answer")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=capture_env)
+            await orch._process(1, Turn("question"))
+
+        assert seen["env"]["TMUX_TMPDIR"] == str(pane.tmpdir)
+        assert seen["env"]["CLAUDE_PTY_TMUX_SESSION"] == "cotf-pty-1-abcd"
+        # Reaped in the finally: the server outlives a process-group kill.
+        assert killed == ["cotf-pty-1-abcd"]
+
+    async def test_a_socket_path_that_will_not_fit_runs_the_turn_unhosted(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch
+    ) -> None:
+        """pane_for returns None rather than hosting anyway, or the agent's own
+        tmux fails with "File name too long" and costs the turn."""
+        monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", lambda _name: None)
+
+        def refuse(_pane):
+            raise AssertionError("reaped a pane that was never created")
+
+        monkeypatch.setattr(orchestrator_mod.tmux, "kill", refuse)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        assert mock_agent.run.await_count == 1
