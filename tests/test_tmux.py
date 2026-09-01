@@ -139,7 +139,7 @@ def test_run_points_tmux_at_the_panes_own_socket_directory(
 
     def record(argv, **kwargs):
         seen["argv"] = argv
-        seen["env"] = kwargs["env"]
+        seen["env"] = kwargs.get("env")
         return _done()
 
     monkeypatch.setattr(tmux.subprocess, "run", record)
@@ -147,8 +147,37 @@ def test_run_points_tmux_at_the_panes_own_socket_directory(
 
     tmux._run(pane, ["has-session", "-t", "s"], 1.0)
 
-    assert seen["argv"] == ["tmux", "has-session", "-t", "s"]
-    assert seen["env"]["TMUX_TMPDIR"] == str(tmp_path)
+    socket = str(tmux.socket_path(tmp_path))
+    assert seen["argv"] == ["tmux", "-S", socket, "has-session", "-t", "s"]
+
+
+def test_run_names_the_socket_so_a_reaped_directory_cannot_hit_the_default_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The bug this addressing exists for.
+
+    tmux reads TMUX_TMPDIR as a hint and falls back to the default socket when the
+    directory it names is gone -- so a `kill-server` meant for one finished turn
+    ended the operator's own server instead. A concurrent `sweep` removes that
+    directory, so the race is reachable, not theoretical.
+    """
+    monkeypatch.setattr(tmux.shutil, "which", lambda _name: "/usr/bin/tmux")
+    seen: dict = {}
+
+    def record(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        return _done()
+
+    monkeypatch.setattr(tmux.subprocess, "run", record)
+    gone = tmp_path / "already-reaped"
+    pane = tmux.Pane(tmpdir=gone, session="s")
+
+    tmux._run(pane, ["kill-server"], 1.0)
+
+    assert seen["argv"][:3] == ["tmux", "-S", str(tmux.socket_path(gone))]
+    # No hint form anywhere: an inherited TMUX_TMPDIR must not decide the target.
+    assert seen["env"] is None or "TMUX_TMPDIR" not in seen["env"]
 
 
 def test_run_keeps_the_env_out_of_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -298,6 +327,9 @@ def test_sweep_reaps_the_leftovers_of_a_killed_daemon(
     # may not have started its server yet.
     aged = time.time() - tmux._SWEEP_GRACE_S - 1
     os.utime(dead.tmpdir, (aged, aged))
+    # A leftover is one whose daemon died; `pane_for` stamped both with this
+    # live process, so the dead one has to name a pid that is really gone.
+    (dead.tmpdir / tmux._OWNER_FILE).write_text("0\n", encoding="utf-8")
     (short_panes_root / "stray-file").write_text("not a socket directory")
     monkeypatch.setattr(
         tmux, "_sessions_on", lambda d: ["cotf-chat-live"] if d == live.tmpdir else []
@@ -307,6 +339,47 @@ def test_sweep_reaps_the_leftovers_of_a_killed_daemon(
     assert tmux.sweep() == 1
     assert not dead.tmpdir.exists()
     assert live.tmpdir.exists()
+
+
+def test_sweep_spares_a_live_turn_whose_backend_never_starts_a_server(
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+):
+    """`agent.codex.mode: native` runs the agent outside the pane, so its directory
+    never gets a server and looks identical to a leftover for the whole turn. Only
+    the owner tells them apart, and the mtime grace runs out after two minutes."""
+    live = tmux.pane_for("cotf-chat-native")
+    assert live is not None
+    aged = time.time() - tmux._SWEEP_GRACE_S - 1
+    os.utime(live.tmpdir, (aged, aged))
+    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
+    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
+
+    assert tmux.sweep() == 0
+    assert live.tmpdir.exists()
+
+
+def test_sweep_reaps_a_directory_whose_owner_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+):
+    """Directories written before the owner stamp existed keep the old behavior
+    rather than being stranded forever."""
+    stale = short_panes_root / "0123456789ab"
+    stale.mkdir()
+    aged = time.time() - tmux._SWEEP_GRACE_S - 1
+    os.utime(stale, (aged, aged))
+    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
+    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
+
+    assert tmux.sweep() == 1
+    assert not stale.exists()
+
+
+def test_pane_for_stamps_the_owner_so_a_sibling_sweep_can_tell_it_is_live(
+    short_panes_root: Path,
+):
+    pane = tmux.pane_for("cotf-chat-owned")
+    assert pane is not None
+    assert (pane.tmpdir / tmux._OWNER_FILE).read_text().strip() == str(os.getpid())
 
 
 def test_sweep_is_a_no_op_before_any_turn_runs(panes_root: Path):

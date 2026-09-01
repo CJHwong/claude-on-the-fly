@@ -100,6 +100,19 @@ _SUN_PATH_MAX = 104
 # a live turn's socket directory in.
 _SWEEP_GRACE_S = 120.0
 
+# Names the process that owns a run directory, written when the directory is
+# created. The grace above assumes a live turn announces itself by starting a
+# server in its directory a moment later -- true for a backend that runs the
+# agent in the pane, false for one that does not (`agent.codex.mode: native`
+# never starts a tmux server at all). For those, `_sessions_on` is empty for the
+# whole turn, so the grace is the only thing between a restarting sibling daemon
+# and a live turn's directory, and any turn over two minutes outlives it.
+#
+# The pid is the daemon's, not the turn's: what a sweep needs to know is whether
+# the process that would later reap this directory is still around to do it,
+# which is the same question `sweep` exists to answer.
+_OWNER_FILE = "owner.pid"
+
 
 # OSC (window-title and friends). `Text.from_ansi` drops the introducer but leaves
 # the *payload* as visible text, so `ESC]0;title BEL` would print "0;title" — which
@@ -240,6 +253,7 @@ def pane_for(session: str) -> Pane | None:
         return None
     tmpdir.mkdir(parents=True, exist_ok=True)
     tmpdir.chmod(0o700)
+    _claim(tmpdir)
     return Pane(tmpdir=tmpdir, session=session)
 
 
@@ -247,6 +261,15 @@ def _run(
     pane: Pane, args: list[str], timeout: float
 ) -> subprocess.CompletedProcess | None:
     """One tmux command against `pane`'s server, or None when it could not run.
+
+    Addressed with `-S`, never with `TMUX_TMPDIR`. tmux treats that variable as a
+    hint for building a socket path and **silently falls back to the default
+    socket when the directory it names does not exist** -- measured on 3.7b:
+    `TMUX_TMPDIR=/nonexistent tmux kill-server` ends the operator's server and
+    exits 0. Every caller here can race a concurrent `sweep`, which removes the
+    directory, so the hint form turns a reap of one finished turn into
+    `kill-server` on whatever the operator was running. `-S` names the socket
+    outright: a missing path is an error, not a different server.
 
     Never raises. Every caller here is either painting a UI or reaping a finished
     turn, and neither has anything useful to do with a tmux failure except carry
@@ -256,11 +279,10 @@ def _run(
         return None
     try:
         return subprocess.run(
-            ["tmux", *args],
+            ["tmux", "-S", str(socket_path(pane.tmpdir)), *args],
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "TMUX_TMPDIR": str(pane.tmpdir)},
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -400,17 +422,53 @@ def pane_named(*prefixes: str) -> Pane | None:
     return None
 
 
+def _claim(tmpdir: Path) -> None:
+    """Record this process as the owner of `tmpdir`. Best-effort."""
+    with contextlib.suppress(OSError):
+        (tmpdir / _OWNER_FILE).write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+
+def _owner_alive(tmpdir: Path) -> bool:
+    """Whether the daemon that created `tmpdir` is still running.
+
+    False for a directory with no readable owner, which keeps every directory
+    written before this existed on the old mtime-only behavior rather than
+    stranding it forever.
+    """
+    try:
+        pid = int((tmpdir / _OWNER_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Alive, owned by somebody else. Not ours to reap either way.
+        return True
+    return True
+
+
 def sweep() -> int:
     """Reap run directories whose server is gone, returning how many.
 
     Called at daemon startup. A turn killed with its daemon leaves both a server
     and a directory: the server dies with the pane's parent, but the directory
     stays and would otherwise accumulate one per turn forever.
+
+    "No server answering" alone does not mean "finished": a backend that never
+    hosts the agent in the pane never starts one, so a live turn looks identical
+    to a leftover for its whole life. The owner check is what tells them apart --
+    a leftover's daemon is gone by definition, which is the case this exists for.
     """
     reaped = 0
     cutoff = time.time() - _SWEEP_GRACE_S
     for tmpdir in _run_dirs():
         if _sessions_on(tmpdir):
+            continue
+        if _owner_alive(tmpdir):
             continue
         # A directory is created at the top of a turn and the server appears a
         # moment later, when the agent's own tmux runs. Both daemons sweep this
