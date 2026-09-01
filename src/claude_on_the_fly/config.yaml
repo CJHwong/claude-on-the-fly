@@ -299,6 +299,14 @@ agent:
   # skills_cache_ttl_seconds: 3600
   # pricing_ttl_seconds: 21600
 
+  # Host each turn in its own tmux server, so the dashboard's watch pane can
+  # mirror the agent's own terminal instead of tailing its transcript. On
+  # wherever tmux is installed. Turn it off to run every turn as a plain child:
+  # the watch pane then falls back to the transcript, and codex runs
+  # `codex exec` rather than its interactive UI. Read per turn, so an edit takes
+  # effect on the next one without a restart.
+  # pane: true
+
   # claude-pty, used by claude's pty mode.
   # These controls act during startup preflight.
   # pty:
