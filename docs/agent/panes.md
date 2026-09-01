@@ -27,7 +27,18 @@ producers ask.
 
 ## One private tmux server per run
 
-A pane is addressed by `TMUX_TMPDIR`, not by `-L`, and every run gets its own server.
+Every run gets its own server. `TMUX_TMPDIR` places it; `-S` addresses it.
+
+The two are not interchangeable. `TMUX_TMPDIR` is a hint tmux uses to *build* a socket
+path, and when the directory it names does not exist tmux silently falls back to the
+default socket — `TMUX_TMPDIR=/nonexistent tmux kill-server` ends the operator's server
+and exits 0 (measured, tmux 3.7b). A `sweep` in a sibling daemon removes run directories,
+so any control command can find its own directory gone, and the hint form turned a reap
+of one finished turn into `kill-server` on whatever the operator was running. `_run`
+therefore passes `-S <socket_path(tmpdir)>`, which names the socket outright: a missing
+path is an error rather than a different server. Server *creation* and the agent's spawn
+env still carry `TMUX_TMPDIR`, because `claude-pty` calls bare `tmux` and derives its own
+socket from it.
 
 - **The curated env reaches the pane with nothing in argv.** A pane on a server that was
   already running does not see the client's environment (measured, tmux 3.7c), so the
@@ -39,7 +50,9 @@ A pane is addressed by `TMUX_TMPDIR`, not by `-L`, and every run gets its own se
   agent started in them. A process-group kill never reached a pane child, because a pane
   is a child of the tmux server rather than of the daemon.
 - **The operator's own tmux is untouched.** No cotf session appears in their `tmux ls`,
-  and their `kill-server` cannot end a turn.
+  and their `kill-server` cannot end a turn. This holds only because control commands are
+  addressed with `-S`; under the `TMUX_TMPDIR` hint a reaped directory pointed cotf's
+  `kill-server` straight at the default socket.
 
 ### The socket path is short on purpose
 
