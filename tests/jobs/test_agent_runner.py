@@ -662,7 +662,7 @@ class TestJobPaneLifecycle:
         the hosted path needs a pane handed in."""
         from claude_on_the_fly import sandbox, tmux
 
-        pane = tmux.Pane(tmpdir=tmp_path / "sock", session="cotf-job-run-1")
+        pane = tmux.Pane(session="cotf-job-run-1")
         killed: list[str] = []
         monkeypatch.setattr(tmux, "hosting_available", lambda: True)
         monkeypatch.setattr(tmux, "pane_for", lambda _name: pane)
@@ -678,7 +678,7 @@ class TestJobPaneLifecycle:
             result = await runner.run(_job(prompt="hi"))
 
         assert result.ok is True
-        assert seen["env"]["TMUX_TMPDIR"] == str(pane.tmpdir)
+        assert seen["env"]["TMUX_TMPDIR"] == str(tmux.panes_root())
         assert killed == ["cotf-job-run-1"]
 
     async def test_an_unhosted_job_reaps_nothing(self, tmp_path: Path, monkeypatch):

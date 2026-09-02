@@ -548,6 +548,64 @@ async def _run_codex_plain(
     )
 
 
+def _pane_env_file(env: dict[str, str], path: Path) -> Path | None:
+    """Write the curated env for a pane to sourceable 0600 file. None on failure.
+
+    A pane on a tmux server that was already running does not see the client's
+    environment at all (measured on tmux 3.7c), and cotf's panes now share one
+    server, so `env=` on the `new-session` client reaches the pane only for
+    whichever turn happened to start the server. The obvious fix, `-e KEY=VALUE`
+    per pair, is not available here: it would put `COTF_CMD_TOKEN` into a command
+    line any local `ps` can read, and that token reaches credentialed CLIs
+    *outside* the jail.
+
+    So the pane sources a file instead, which is what `claude-pty` has always
+    done. 0600, daemon-owned, and named per turn (`tmux.turn_file`) rather than in
+    the agent-writable workspace. The agent can read its own file, which is no new
+    exposure -- it is the agent's own environment, and it is about to have it.
+    Another turn reading it would be, which is why the name carries the session.
+
+    Only the keys cotf actually set are written. Forwarding all of `os.environ`
+    would be hundreds of pairs, and the ones that matter are exactly the ones
+    that differ from what the daemon inherited.
+    """
+    curated = {
+        key: value
+        for key, value in env.items()
+        if os.environ.get(key) != value and "\0" not in key
+    }
+    try:
+        # Opened through os.open so the mode is set at creation: a write_text
+        # followed by chmod leaves a window where the token is world-readable.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for key, value in sorted(curated.items()):
+                handle.write(f"export {key}={shlex.quote(value)}\n")
+    except OSError as exc:
+        logger.warning(
+            "codex exec: could not stage the pane env (%s); the pane runs with "
+            "whatever the tmux server inherited",
+            exc,
+        )
+        return None
+    return path
+
+
+# Names of the tmux server a daemon was started under. Dropped from every spawn
+# env: they would aim claude-pty at the operator's server, and nothing cotf runs
+# needs them (see `tmux.argv_prefix`).
+_INHERITED_TMUX = frozenset({"TMUX", "TMUX_PANE"})
+
+
+class _PaneUnavailable(Exception):
+    """The pane did not land on cotf's server, so this turn runs unhosted.
+
+    Private and caught one frame up. Not a `RuntimeError`: the caller has a
+    working fallback in `codex exec`, so this must not travel the same path as a
+    failure that costs the turn.
+    """
+
+
 async def _run_codex_in_pane(
     pane: tmux.Pane,
     argv: list[str],
@@ -570,15 +628,33 @@ async def _run_codex_in_pane(
     - **It never exits.** The TUI returns to its prompt when the turn is done and
       waits for the next one. So the end of a turn is read from the rollout
       (`task_complete`, via the follower) rather than from a process exit, and the
-      session is killed once it lands.
+      session is killed once it lands. A `tmux wait-for` on the command finishing
+      would never fire here, which is why this polls rather than blocks.
     - **There is no exit code.** A turn that completed is a success by definition,
       because the reply is already in the rollout. A pane that vanished before
       completing is the failure, and the tap explains it.
+
+    Every tmux call goes through `tmux.argv_prefix()`. Addressing the server by
+    name rather than by `TMUX_TMPDIR` is what stops an inherited `TMUX` -- which a
+    daemon started inside the operator's tmux has -- from putting the pane on the
+    operator's server while `tmux.alive` looks for it on cotf's, a split that read
+    a working agent as a dead pane and left it running unsupervised.
     """
-    output_path = pane.tmpdir / "output"
+    tmux_argv = tmux.argv_prefix()
+    output_path = tmux.turn_file(pane.session, "out")
     channel = f"{pane.session}-start"
+    env_file = _pane_env_file(env, tmux.turn_file(pane.session, "env"))
+    # The pane blocks on `start` first so the tap below cannot miss codex's
+    # opening output, then sources the curated env, then execs. `exec` so the
+    # pane's process is codex itself rather than a bash holding it: a
+    # `kill-session` reaps the process group either way, but the mirror and any
+    # `ps` read straighter without the shell in between.
+    inner = f"tmux wait-for {shlex.quote(channel)}; "
+    if env_file is not None:
+        inner += f". {shlex.quote(str(env_file))}; "
+    inner += f"exec {shlex.join(argv)}"
     create = [
-        "tmux",
+        *tmux_argv,
         "new-session",
         "-d",
         "-s",
@@ -594,11 +670,10 @@ async def _run_codex_in_pane(
         str(tmux.MIRROR_MIN_ROWS),
         # bash explicitly rather than whatever /bin/sh is: on a Debian-family
         # host that is dash, and this is the one place the backend depends on a
-        # shell it did not choose. The pane blocks on `start` first so the tap
-        # below cannot miss codex's opening output.
+        # shell it did not choose.
         "bash",
         "-c",
-        f"tmux wait-for {shlex.quote(channel)}; {shlex.join(argv)}",
+        inner,
     ]
     create_proc = await asyncio.create_subprocess_exec(
         *create,
@@ -612,10 +687,24 @@ async def _run_codex_in_pane(
         detail = (create_err or b"").decode(errors="replace").strip()
         raise RuntimeError(f"tmux refused to host the codex turn: {detail}")
 
+    # A zero exit from `new-session` is not proof the session landed on our
+    # server: tmux reports success for a session it created somewhere else. Ask
+    # the address we will poll, so a mismatch degrades to an unhosted turn here
+    # instead of being read as a dead pane forty lines below. That misread is the
+    # bug this check exists for -- it reported `Exit code -1` on turns whose agent
+    # was still running, and left them running.
+    if not await asyncio.to_thread(tmux.alive, pane):
+        logger.warning(
+            "codex exec: the session did not land on %s, so this turn runs "
+            "unmirrored; check for TMUX in the daemon's environment",
+            tmux.socket_path(),
+        )
+        raise _PaneUnavailable
+
     # Tap the pane, then release it. A failed tap costs the failure detail, not
     # the run, so it is logged and released anyway rather than wedging the pane.
     tap = await asyncio.create_subprocess_exec(
-        "tmux",
+        *tmux_argv,
         "pipe-pane",
         "-t",
         pane.session,
@@ -631,7 +720,7 @@ async def _run_codex_in_pane(
             (tap_err or b"").decode(errors="replace").strip(),
         )
     release = await asyncio.create_subprocess_exec(
-        "tmux",
+        *tmux_argv,
         "wait-for",
         "-S",
         channel,
@@ -642,23 +731,33 @@ async def _run_codex_in_pane(
     await release.wait()
 
     deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        if follower.turn_completed.is_set():
-            # End the session here, not at the end of the run. The TUI does not
-            # exit on its own, and a nudge retry opens a session with this same
-            # name -- `tmux new-session` refuses a duplicate, so leaving it alive
-            # turned every retry into "tmux refused to host the codex turn". The
-            # run directory stays, so the retry gets its own session in it.
-            tmux.kill_session(pane)
-            return 0, ""
-        if not await asyncio.to_thread(tmux.alive, pane):
-            # The TUI went away without finishing. Whatever it printed on the way
-            # out is the only account of why.
-            return -1, _pane_output_tail(output_path)
-        if deadline is not None and time.monotonic() > deadline:
-            logger.warning("codex exec: timed out after %ss", timeout)
-            raise RuntimeError(f"Codex CLI timed out after {timeout}s")
-        await asyncio.sleep(_PANE_POLL_S)
+    try:
+        while True:
+            if follower.turn_completed.is_set():
+                # End the session here, not at the end of the run. The TUI does
+                # not exit on its own, and a nudge retry opens a session with this
+                # same name -- `tmux new-session` refuses a duplicate, so leaving
+                # it alive turned every retry into "tmux refused to host the codex
+                # turn".
+                tmux.kill(pane)
+                return 0, ""
+            if not await asyncio.to_thread(tmux.alive, pane):
+                # The TUI went away without finishing. Whatever it printed on the
+                # way out is the only account of why.
+                return -1, _pane_output_tail(output_path)
+            if deadline is not None and time.monotonic() > deadline:
+                logger.warning("codex exec: timed out after %ss", timeout)
+                raise RuntimeError(f"Codex CLI timed out after {timeout}s")
+            await asyncio.sleep(_PANE_POLL_S)
+    finally:
+        # The env file holds this turn's `COTF_CMD_TOKEN`, so it goes as soon as
+        # the pane can no longer need it -- on the timeout and the crash paths
+        # too, not just the clean one. The tap output goes with it: one file per
+        # turn accumulates otherwise, and `_pane_output_tail` has already read
+        # whatever the caller is about to report.
+        if env_file is not None:
+            with contextlib.suppress(OSError):
+                env_file.unlink()
 
 
 def _pane_output_tail(path: Path) -> str:
@@ -707,8 +806,18 @@ async def _run_codex_exec(
     codex_home = codex_state.ensure_home(workspace)
     wrapped = sandbox.wrap(cmd, workspace)
     logger.debug("codex exec: cwd=%s cmd=%s", workspace, " ".join(wrapped[:8]) + "...")
-    env = sandbox.agent_env()
-    env = {**(os.environ if env is None else env), "CODEX_HOME": str(codex_home)}
+    curated = sandbox.agent_env()
+    # `TMUX` names a server, and a tmux client obeys it over every other hint. A
+    # daemon started from inside the operator's tmux carries it into every child,
+    # so forwarding it sends claude-pty -- which takes no `-S` and can only be
+    # aimed with `TMUX_TMPDIR` -- to the operator's server instead of cotf's.
+    # cotf's own calls use `tmux.argv_prefix()` and are already immune.
+    env: dict[str, str] = {
+        key: value
+        for key, value in (os.environ if curated is None else curated).items()
+        if key not in _INHERITED_TMUX
+    }
+    env["CODEX_HOME"] = str(codex_home)
     pane = tmux.pane_from_env(env) if interactive else None
     if interactive and pane is None:
         logger.info(
@@ -727,16 +836,20 @@ async def _run_codex_exec(
     follower = _RolloutFollower(workspace, thread_id, agent.progress_sink())
     follower.start()
     try:
-        if pane is not None and interactive is not None:
-            returncode, stderr_text = await _run_codex_in_pane(
-                pane,
-                sandbox.wrap(interactive, workspace),
-                workspace,
-                env,
-                follower,
-                timeout,
-            )
-        else:
+        hosted = pane is not None and interactive is not None
+        if hosted:
+            try:
+                returncode, stderr_text = await _run_codex_in_pane(
+                    pane,
+                    sandbox.wrap(interactive, workspace),
+                    workspace,
+                    env,
+                    follower,
+                    timeout,
+                )
+            except _PaneUnavailable:
+                hosted = False
+        if not hosted:
             returncode, stderr_text = await _run_codex_plain(
                 wrapped, workspace, env, follower, timeout
             )

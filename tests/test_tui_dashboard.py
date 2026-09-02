@@ -2808,6 +2808,7 @@ class TestWatchGrid:
         from textual.widgets import RichLog, Static
 
         return screen._refresh_watch_grid(
+            "telegram",
             "12345",
             workspace,
             "telegram/H",
@@ -2820,7 +2821,7 @@ class TestWatchGrid:
     ):
         from claude_on_the_fly import tmux as tmux_mod
 
-        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-pty-12345-abcd")
+        pane = tmux_mod.Pane(session="cotf-pty-telegram-12345-abcd")
         monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
         monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(
@@ -2848,7 +2849,7 @@ class TestWatchGrid:
         run and overwrite the grid."""
         from claude_on_the_fly import tmux as tmux_mod
 
-        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-pty-777-abcd")
+        pane = tmux_mod.Pane(session="cotf-pty-telegram-777-abcd")
         monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
         monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "live grid text")
@@ -2900,7 +2901,7 @@ class TestWatchGrid:
     async def test_a_pane_that_ends_mid_capture_falls_back(self, isolated, monkeypatch):
         from claude_on_the_fly import tmux as tmux_mod
 
-        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-job-run1")
+        pane = tmux_mod.Pane(session="cotf-job-run1")
         monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
         monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: None)
@@ -2920,7 +2921,7 @@ class TestWatchGridBlank:
 
         from claude_on_the_fly import tmux as tmux_mod
 
-        pane = tmux_mod.Pane(tmpdir=isolated / "sock", session="cotf-job-run1")
+        pane = tmux_mod.Pane(session="cotf-job-run1")
         monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
         monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
         monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "   \n  \n")
@@ -2928,6 +2929,7 @@ class TestWatchGridBlank:
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             handled = screen._refresh_watch_grid(
+                "telegram",
                 "12345",
                 isolated / "ws",
                 "telegram/H",

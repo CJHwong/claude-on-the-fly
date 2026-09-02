@@ -2327,7 +2327,7 @@ class TestFrontendApprovalDefault:
 async def test_session_permissions_is_inert_when_approvals_are_off(operator_settings):
     """Off is the default, so this is the path almost every deployment takes: no
     service, no env, nothing added to the spawn."""
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     assert await manager.env_for(1, "sess-a", Path("/tmp/ws")) == {}
 
 
@@ -2335,7 +2335,7 @@ async def test_session_permissions_hands_the_agent_its_endpoint(operator_setting
     from claude_on_the_fly import cotf_approve
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         env = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
         url = env[cotf_approve.ENDPOINT_ENV]
@@ -2353,7 +2353,7 @@ async def test_existing_session_reloads_approval_timing(operator_settings):
     operator_settings.write_text(
         "permissions:\n  mode: ask\n  ttl_seconds: 60\n  timeout_seconds: 30\n"
     )
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         first = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
         service = manager._services[7][1]
@@ -2374,7 +2374,7 @@ async def test_the_service_can_reach_the_conversation_it_belongs_to(operator_set
     ERROR alone left a stuck turn looking like a slow one."""
     operator_settings.write_text("permissions:\n  mode: ask\n")
     frontend = StubFrontend()
-    manager = orchestrator_mod.SessionPermissions(frontend)
+    manager = orchestrator_mod.SessionPermissions(frontend, "slack")
     try:
         await manager.env_for(11, "sess-a", Path("/tmp/ws"))
         service = manager._services[11][1]
@@ -2394,7 +2394,7 @@ async def test_a_new_session_drops_the_previous_grants(operator_settings, caplog
     from claude_on_the_fly import cotf_approve
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         first = await manager.env_for(9, "sess-a", Path("/tmp/ws"))
         with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
@@ -2411,7 +2411,7 @@ async def test_each_chat_gets_its_own_grant_store(operator_settings):
     from claude_on_the_fly import cotf_approve
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         one = await manager.env_for(1, "s", Path("/tmp/ws"))
         two = await manager.env_for(2, "s", Path("/tmp/ws"))
@@ -2423,7 +2423,7 @@ async def test_each_chat_gets_its_own_grant_store(operator_settings):
 async def test_check_turn_is_silent_for_a_chat_with_no_service(operator_settings):
     """A chat that never started a service cannot have been gated, and there is
     nothing to compare against."""
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     manager.check_turn(404, Response(body="x", tool_counts={"Bash": 2}), "codex")
 
 
@@ -2434,7 +2434,7 @@ async def test_check_turn_reports_a_turn_that_never_reached_the_gate(
     and runs the command, so an ungated turn is otherwise indistinguishable from a
     supervised one."""
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         await manager.env_for(3, "s", Path("/tmp/ws"))
         with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
@@ -2458,7 +2458,7 @@ async def test_the_spawn_env_carries_both_egress_and_approval_routing(
     egress_manager.env_for = AsyncMock(
         return_value={"HTTPS_PROXY": "http://127.0.0.1:1"}
     )
-    permissions_manager = orchestrator_mod.SessionPermissions(frontend)
+    permissions_manager = orchestrator_mod.SessionPermissions(frontend, "slack")
     orch = Orchestrator(
         frontend,
         "test",
@@ -2574,7 +2574,7 @@ async def test_the_guard_catches_a_gate_that_breaks_after_working_once(
     """
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         await manager.env_for(5, "s", Path("/tmp/ws"))
         service = manager._services[5][1]
@@ -2602,7 +2602,7 @@ async def test_a_new_session_resets_the_guards_baseline(operator_settings, caplo
     """The replacement service counts from zero, so a stale baseline would make the
     first turn's delta negative and silently pass."""
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         await manager.env_for(6, "first", Path("/tmp/ws"))
         manager._services[6][1].requests_seen = 7
@@ -3123,7 +3123,7 @@ class TestPaneLifecycleAcrossATurn:
         so the hosted path needs a root a socket address can actually fit."""
         from claude_on_the_fly import tmux as tmux_mod
 
-        pane = tmux_mod.Pane(tmpdir=tmp_path / "sock", session="cotf-pty-1-abcd")
+        pane = tmux_mod.Pane(session="cotf-pty-1-abcd")
         killed: list[str] = []
         monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: True)
         monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", lambda _name: pane)
@@ -3143,7 +3143,7 @@ class TestPaneLifecycleAcrossATurn:
             mock_agent.run = AsyncMock(side_effect=capture_env)
             await orch._process(1, Turn("question"))
 
-        assert seen["env"]["TMUX_TMPDIR"] == str(pane.tmpdir)
+        assert seen["env"]["TMUX_TMPDIR"] == str(tmux_mod.panes_root())
         assert seen["env"]["CLAUDE_PTY_TMUX_SESSION"] == "cotf-pty-1-abcd"
         # Reaped in the finally: the server outlives a process-group kill.
         assert killed == ["cotf-pty-1-abcd"]

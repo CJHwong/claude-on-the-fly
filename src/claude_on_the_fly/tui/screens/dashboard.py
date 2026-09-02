@@ -1208,7 +1208,7 @@ class DashboardScreen(Screen):
         # rebuilt from transcript events, and it shows the states the transcript
         # cannot: a turn parked on a prompt writes no event at all while it
         # waits. Falls through to the JSONL tail for every run with no pane.
-        if self._refresh_watch_grid(identifier, workspace, shown, header, pane):
+        if self._refresh_watch_grid(source, identifier, workspace, shown, header, pane):
             return
 
         session_uuid = self._job_sessions.get(key)
@@ -1279,6 +1279,7 @@ class DashboardScreen(Screen):
 
     def _refresh_watch_grid(
         self,
+        source: str,
         identifier: str,
         workspace: Path,
         shown: str,
@@ -1302,7 +1303,7 @@ class DashboardScreen(Screen):
         # One scan, both shapes. Asking twice ran a `tmux list-sessions` per run
         # directory twice per frame, on the refresh thread.
         found = tmux.pane_named(
-            f"{permissions.TMUX_SESSION_PREFIX}-{identifier}-",
+            f"{permissions.tmux_session_prefix(source)}{identifier}-",
             tmux.job_session_name(workspace.name),
         )
         if found is None:

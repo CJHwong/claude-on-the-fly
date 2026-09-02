@@ -48,75 +48,12 @@ def _done(returncode: int = 0, stdout: str = "") -> subprocess.CompletedProcess:
     )
 
 
-def test_pane_env_carries_both_keys_so_claude_pty_lands_on_the_private_server():
-    pane = tmux.Pane(tmpdir=Path("/tmp/sock"), session="cotf-pty-7-abcd")
-
-    assert pane.env == {
-        "TMUX_TMPDIR": "/tmp/sock",
-        "CLAUDE_PTY_TMUX_SESSION": "cotf-pty-7-abcd",
-    }
-
-
-def test_pane_for_creates_a_private_directory(short_panes_root: Path):
-    pane = tmux.pane_for("cotf-pty-7-abcd")
-
-    assert pane.tmpdir.is_dir()
-    assert pane.tmpdir.stat().st_mode & 0o777 == 0o700
-    assert pane.session == "cotf-pty-7-abcd"
-
-
-def test_pane_for_keeps_the_directory_short_enough_for_a_unix_socket(
-    short_panes_root: Path,
-):
-    """A session name in the path costs a whole turn, not just the mirror: tmux fails
-    the spawn with "File name too long" once the socket exceeds sun_path."""
-    pane = tmux.pane_for("job/jira/ACE-1234-a-very-long-key-" + "x" * 120)
-
-    assert pane is not None
-    assert pane.tmpdir.parent == short_panes_root
-    assert len(pane.tmpdir.name) == 12
-
-
-def test_pane_for_warns_when_the_data_dir_is_too_deep_for_a_socket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-):
-    deep = tmp_path / ("d" * 90)
-    monkeypatch.setattr(tmux, "panes_root", lambda: deep)
-
-    with caplog.at_level("WARNING"):
-        pane = tmux.pane_for("cotf-chat-1")
-
-    assert "COTF_DATA_DIR" in caplog.text
-    # None, not a pane. Returning one published TMUX_TMPDIR and hosted the turn
-    # anyway, so the agent's own tmux failed with "File name too long" -- the
-    # turn, not just its mirror.
-    assert pane is None
-    assert not deep.exists()
-
-
-def test_pane_for_says_nothing_when_the_path_fits(
-    short_panes_root: Path, caplog: pytest.LogCaptureFixture
-):
-    with caplog.at_level("WARNING"):
-        assert tmux.pane_for("cotf-chat-1") is not None
-
-    assert caplog.text == ""
-
-
-def test_pane_for_is_idempotent_so_a_retry_reuses_the_directory(short_panes_root: Path):
-    first = tmux.pane_for("cotf-job-1")
-    second = tmux.pane_for("cotf-job-1")
-
-    assert first == second
-
-
 def test_run_declines_when_tmux_is_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     monkeypatch.setattr(tmux.shutil, "which", lambda _name: None)
-    pane = tmux.Pane(tmpdir=tmp_path, session="s")
 
-    assert tmux._run(pane, ["has-session"], 1.0) is None
+    assert tmux._run(["has-session"], 1.0) is None
 
 
 def test_run_swallows_a_wedged_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -126,58 +63,8 @@ def test_run_swallows_a_wedged_server(monkeypatch: pytest.MonkeyPatch, tmp_path:
         raise subprocess.TimeoutExpired(cmd="tmux", timeout=1.5)
 
     monkeypatch.setattr(tmux.subprocess, "run", explode)
-    pane = tmux.Pane(tmpdir=tmp_path, session="s")
 
-    assert tmux._run(pane, ["capture-pane"], 1.5) is None
-
-
-def test_run_points_tmux_at_the_panes_own_socket_directory(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    monkeypatch.setattr(tmux.shutil, "which", lambda _name: "/usr/bin/tmux")
-    seen: dict = {}
-
-    def record(argv, **kwargs):
-        seen["argv"] = argv
-        seen["env"] = kwargs.get("env")
-        return _done()
-
-    monkeypatch.setattr(tmux.subprocess, "run", record)
-    pane = tmux.Pane(tmpdir=tmp_path, session="s")
-
-    tmux._run(pane, ["has-session", "-t", "s"], 1.0)
-
-    socket = str(tmux.socket_path(tmp_path))
-    assert seen["argv"] == ["tmux", "-S", socket, "has-session", "-t", "s"]
-
-
-def test_run_names_the_socket_so_a_reaped_directory_cannot_hit_the_default_server(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    """The bug this addressing exists for.
-
-    tmux reads TMUX_TMPDIR as a hint and falls back to the default socket when the
-    directory it names is gone -- so a `kill-server` meant for one finished turn
-    ended the operator's own server instead. A concurrent `sweep` removes that
-    directory, so the race is reachable, not theoretical.
-    """
-    monkeypatch.setattr(tmux.shutil, "which", lambda _name: "/usr/bin/tmux")
-    seen: dict = {}
-
-    def record(argv, **kwargs):
-        seen["argv"] = argv
-        seen["env"] = kwargs.get("env")
-        return _done()
-
-    monkeypatch.setattr(tmux.subprocess, "run", record)
-    gone = tmp_path / "already-reaped"
-    pane = tmux.Pane(tmpdir=gone, session="s")
-
-    tmux._run(pane, ["kill-server"], 1.0)
-
-    assert seen["argv"][:3] == ["tmux", "-S", str(tmux.socket_path(gone))]
-    # No hint form anywhere: an inherited TMUX_TMPDIR must not decide the target.
-    assert seen["env"] is None or "TMUX_TMPDIR" not in seen["env"]
+    assert tmux._run(["capture-pane"], 1.5) is None
 
 
 def test_run_keeps_the_env_out_of_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -192,7 +79,7 @@ def test_run_keeps_the_env_out_of_argv(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     monkeypatch.setattr(tmux.subprocess, "run", record)
 
-    tmux._run(tmux.Pane(tmpdir=tmp_path, session="s"), ["new-session", "-d"], 1.0)
+    tmux._run(["new-session", "-d"], 1.0)
 
     assert not any("super-secret" in part for part in seen["argv"])
 
@@ -200,7 +87,7 @@ def test_run_keeps_the_env_out_of_argv(monkeypatch: pytest.MonkeyPatch, tmp_path
 def test_alive_reads_the_probes_exit_code(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-    pane = tmux.Pane(tmpdir=tmp_path, session="s")
+    pane = tmux.Pane(session="s")
     monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: _done(returncode=0))
     assert tmux.alive(pane) is True
 
@@ -216,7 +103,7 @@ def test_capture_returns_none_when_the_turn_has_finished(
 ):
     monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: _done(returncode=1))
 
-    assert tmux.capture(tmux.Pane(tmpdir=tmp_path, session="gone")) is None
+    assert tmux.capture(tmux.Pane(session="gone")) is None
 
 
 def test_capture_returns_none_when_tmux_cannot_run(
@@ -224,7 +111,7 @@ def test_capture_returns_none_when_tmux_cannot_run(
 ):
     monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
 
-    assert tmux.capture(tmux.Pane(tmpdir=tmp_path, session="s")) is None
+    assert tmux.capture(tmux.Pane(session="s")) is None
 
 
 def test_capture_trims_the_rows_the_agent_never_drew(
@@ -234,7 +121,7 @@ def test_capture_trims_the_rows_the_agent_never_drew(
         tmux, "_run", lambda *_a, **_k: _done(stdout="hello\n   \n   \n")
     )
 
-    assert tmux.capture(tmux.Pane(tmpdir=tmp_path, session="s")) == "hello"
+    assert tmux.capture(tmux.Pane(session="s")) == "hello"
 
 
 def test_capture_reflows_to_the_viewer_but_never_below_the_floor(
@@ -242,13 +129,13 @@ def test_capture_reflows_to_the_viewer_but_never_below_the_floor(
 ):
     calls: list[list[str]] = []
 
-    def record(_pane, args, _timeout):
+    def record(args, _timeout):
         calls.append(args)
         return _done(stdout="out")
 
     monkeypatch.setattr(tmux, "_run", record)
 
-    tmux.capture(tmux.Pane(tmpdir=tmp_path, session="s"), cols=200, rows=4)
+    tmux.capture(tmux.Pane(session="s"), cols=200, rows=4)
 
     assert calls[0] == [
         "resize-window",
@@ -267,123 +154,19 @@ def test_capture_does_not_resize_when_the_viewer_gives_no_size(
 ):
     calls: list[list[str]] = []
 
-    def record(_pane, args, _timeout):
+    def record(args, _timeout):
         calls.append(args)
         return _done(stdout="out")
 
     monkeypatch.setattr(tmux, "_run", record)
 
-    tmux.capture(tmux.Pane(tmpdir=tmp_path, session="s"))
+    tmux.capture(tmux.Pane(session="s"))
 
     assert [args[0] for args in calls] == ["capture-pane"]
 
 
-def test_kill_ends_the_server_and_removes_the_directory(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
-):
-    calls: list[list[str]] = []
-    monkeypatch.setattr(tmux, "_run", lambda _p, args, _t: calls.append(args))
-    pane = tmux.pane_for("cotf-job-1")
-
-    tmux.kill(pane)
-
-    assert calls == [["kill-server"]]
-    assert not pane.tmpdir.exists()
-
-
-def test_kill_survives_a_directory_that_is_already_gone(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
-
-    tmux.kill(tmux.Pane(tmpdir=tmp_path / "never-made", session="s"))
-
-
 def test_live_panes_is_empty_before_any_turn_runs(panes_root: Path):
     assert tmux.live_panes() == []
-
-
-def test_live_panes_names_each_session_from_its_own_server(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
-):
-    """The directory is a digest, so the human name can only come from tmux."""
-    live = tmux.pane_for("cotf-chat-1")
-    tmux.pane_for("cotf-chat-2")
-    (short_panes_root / "stray-file").write_text("not a socket directory")
-    monkeypatch.setattr(
-        tmux, "_sessions_on", lambda d: ["cotf-chat-1"] if d == live.tmpdir else []
-    )
-
-    assert tmux.live_panes() == [live]
-
-
-def test_sweep_reaps_the_leftovers_of_a_killed_daemon(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
-):
-    dead = tmux.pane_for("cotf-chat-dead")
-    live = tmux.pane_for("cotf-chat-live")
-    assert dead is not None and live is not None
-    # Older than the grace: a directory younger than that belongs to a turn that
-    # may not have started its server yet.
-    aged = time.time() - tmux._SWEEP_GRACE_S - 1
-    os.utime(dead.tmpdir, (aged, aged))
-    # A leftover is one whose daemon died; `pane_for` stamped both with this
-    # live process, so the dead one has to name a pid that is really gone.
-    (dead.tmpdir / tmux._OWNER_FILE).write_text("0\n", encoding="utf-8")
-    (short_panes_root / "stray-file").write_text("not a socket directory")
-    monkeypatch.setattr(
-        tmux, "_sessions_on", lambda d: ["cotf-chat-live"] if d == live.tmpdir else []
-    )
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
-
-    assert tmux.sweep() == 1
-    assert not dead.tmpdir.exists()
-    assert live.tmpdir.exists()
-
-
-def test_sweep_spares_a_live_turn_whose_backend_never_starts_a_server(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
-):
-    """`agent.codex.mode: native` runs the agent outside the pane, so its directory
-    never gets a server and looks identical to a leftover for the whole turn. Only
-    the owner tells them apart, and the mtime grace runs out after two minutes."""
-    live = tmux.pane_for("cotf-chat-native")
-    assert live is not None
-    aged = time.time() - tmux._SWEEP_GRACE_S - 1
-    os.utime(live.tmpdir, (aged, aged))
-    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
-
-    assert tmux.sweep() == 0
-    assert live.tmpdir.exists()
-
-
-def test_sweep_reaps_a_directory_whose_owner_is_unreadable(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
-):
-    """Directories written before the owner stamp existed keep the old behavior
-    rather than being stranded forever."""
-    stale = short_panes_root / "0123456789ab"
-    stale.mkdir()
-    aged = time.time() - tmux._SWEEP_GRACE_S - 1
-    os.utime(stale, (aged, aged))
-    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
-
-    assert tmux.sweep() == 1
-    assert not stale.exists()
-
-
-def test_pane_for_stamps_the_owner_so_a_sibling_sweep_can_tell_it_is_live(
-    short_panes_root: Path,
-):
-    pane = tmux.pane_for("cotf-chat-owned")
-    assert pane is not None
-    assert (pane.tmpdir / tmux._OWNER_FILE).read_text().strip() == str(os.getpid())
-
-
-def test_sweep_is_a_no_op_before_any_turn_runs(panes_root: Path):
-    assert tmux.sweep() == 0
 
 
 def test_trim_keeps_a_row_that_paints_a_bar_with_no_characters():
@@ -412,70 +195,6 @@ def test_trim_leaves_a_grid_the_agent_filled_completely():
     assert tmux.trim_trailing_blank_rows("a\nb\nc") == "a\nb\nc"
 
 
-@needs_tmux
-def test_a_real_pane_inherits_the_curated_env_and_can_be_captured(
-    short_panes_root: Path,
-):
-    """The measured basis for the whole design, kept as a test so a tmux upgrade cannot
-    quietly take it away: a server this process starts hands its env to the pane, with
-    nothing on any command line."""
-    pane = tmux.pane_for("cotf-live-probe")
-    try:
-        subprocess.run(
-            [
-                "tmux",
-                "new-session",
-                "-d",
-                "-s",
-                pane.session,
-                "printenv COTF_PROBE_TOKEN; sleep 30",
-            ],
-            env={**os.environ, **pane.env, "COTF_PROBE_TOKEN": "inherited"},
-            check=True,
-            capture_output=True,
-        )
-        assert tmux.alive(pane) is True
-
-        # A live session does not mean the shell has drawn yet: `alive` asks
-        # whether the server has the session, and on a loaded runner `printenv`
-        # can still be ahead of its first write. Capturing once read an empty
-        # grid there and failed a claim about the environment. Poll instead.
-        deadline = time.monotonic() + _PROBE_DEADLINE_S
-        grid = ""
-        while time.monotonic() < deadline:
-            grid = tmux.capture(pane)
-            assert grid is not None
-            if "inherited" in grid:
-                break
-            time.sleep(0.05)
-
-        assert "inherited" in grid
-    finally:
-        tmux.kill(pane)
-
-    assert tmux.alive(pane) is False
-    assert not pane.tmpdir.exists()
-
-
-@needs_tmux
-def test_a_real_pane_is_invisible_to_the_operators_own_tmux(short_panes_root: Path):
-    pane = tmux.pane_for("cotf-isolation-probe")
-    try:
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", pane.session, "sleep 30"],
-            env={**os.environ, **pane.env},
-            check=True,
-            capture_output=True,
-        )
-        default = subprocess.run(
-            ["tmux", "list-sessions"], capture_output=True, text=True, check=False
-        )
-
-        assert pane.session not in default.stdout
-    finally:
-        tmux.kill(pane)
-
-
 def test_available_follows_the_path(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(tmux.shutil, "which", lambda _name: None)
     assert tmux.available() is False
@@ -490,50 +209,11 @@ def test_panes_root_hangs_off_the_data_dir():
     assert tmux.panes_root() == Path(DATA_DIR) / tmux.PANES_DIRNAME
 
 
-def test_sessions_on_reads_the_names_the_server_reports(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: _done(stdout="cotf-chat-1\n\n"))
-
-    assert tmux._sessions_on(tmp_path) == ["cotf-chat-1"]
-
-
-def test_sessions_on_reads_a_dead_or_wedged_server_as_nothing_to_mirror(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: _done(returncode=1))
-    assert tmux._sessions_on(tmp_path) == []
-
-    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
-    assert tmux._sessions_on(tmp_path) == []
-
-
 def test_paints_accepts_a_style_however_rich_hands_it_over():
     """`Text.from_ansi` spans carry a Style or its name, and an unstyled run carries None."""
     assert tmux._paints(None) is False
     assert tmux._paints("on green") is True
     assert tmux._paints("bold") is False
-
-
-def test_pane_named_finds_a_run_from_the_prefix_a_viewer_knows(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    """The TUI has the chat id but not the session discriminator the daemon minted."""
-    chat = tmux.Pane(tmpdir=tmp_path / "a", session="cotf-pty-777-9f3c1a2b")
-    job = tmux.Pane(tmpdir=tmp_path / "b", session="cotf-job-run-1")
-    monkeypatch.setattr(tmux, "live_panes", lambda: [chat, job])
-
-    assert tmux.pane_named("cotf-pty-777-") == chat
-    assert tmux.pane_named(tmux.job_session_name("run-1")) == job
-    assert tmux.pane_named("cotf-pty-778-") is None
-
-
-def test_pane_from_env_reads_where_the_daemon_published_the_pane():
-    pane = tmux.pane_from_env(
-        {"TMUX_TMPDIR": "/tmp/sock", "CLAUDE_PTY_TMUX_SESSION": "cotf-job-1"}
-    )
-
-    assert pane == tmux.Pane(tmpdir=Path("/tmp/sock"), session="cotf-job-1")
 
 
 def test_pane_from_env_reads_an_unhosted_spawn_as_having_no_pane():
@@ -583,82 +263,332 @@ class TestHostingCanBeSwitchedOff:
         assert tmux.hosting_available() is False
 
 
-def test_sweep_leaves_a_turn_that_is_still_starting_alone(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+# --- One server, one address -------------------------------------------------
+
+
+def test_pane_env_points_claude_pty_at_cotfs_server_not_the_operators(
+    panes_root: Path,
 ):
-    """The directory is created at the top of a turn and the server appears a
-    moment later. Both daemons sweep this root, so a worker restarting inside that
-    window would otherwise take a live chat turn's socket directory with it."""
-    starting = tmux.pane_for("cotf-chat-starting")
-    assert starting is not None
-    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
+    """claude-pty takes no `-S`, so `TMUX_TMPDIR` is the only way to aim it."""
+    pane = tmux.Pane(session="cotf-pty-7-abcd")
 
-    assert tmux.sweep() == 0
-    assert starting.tmpdir.exists()
+    assert pane.env == {
+        "TMUX_TMPDIR": str(panes_root),
+        "CLAUDE_PTY_TMUX_SESSION": "cotf-pty-7-abcd",
+    }
 
 
-def test_pane_dir_answers_without_creating_anything(short_panes_root: Path):
-    """The approval path has to address a pane without bringing one into being."""
-    directory = tmux.pane_dir("cotf-pty-1-abcd")
-
-    assert directory.parent == short_panes_root
-    assert not directory.exists()
-
-
-def test_session_env_points_at_a_hosted_pane_and_nothing_otherwise(
-    short_panes_root: Path,
+def test_every_pane_shares_one_socket_so_a_writer_and_a_reader_cannot_diverge(
+    panes_root: Path,
 ):
-    """Empty is the meaningful answer: with hosting off, claude-pty puts its
-    session on the default server, and forcing TMUX_TMPDIR would look for it on a
-    server that does not have it."""
-    assert tmux.session_env("cotf-pty-1-abcd") == {}
+    """The outage this design exists to prevent.
 
-    pane = tmux.pane_for("cotf-pty-1-abcd")
-    assert pane is not None
-    assert tmux.session_env("cotf-pty-1-abcd") == {"TMUX_TMPDIR": str(pane.tmpdir)}
+    The writer used to build its session from `TMUX_TMPDIR` while the reader
+    addressed `-S`, so a daemon holding an inherited `TMUX` created the pane on
+    the operator's server and then read it as dead. One address for both halves
+    is what makes that unrepresentable.
+    """
+    first = tmux.socket_path()
+    second = tmux.socket_path()
+
+    assert first == second
+    assert first.parent.parent == panes_root
+    assert tmux.argv_prefix() == ["tmux", "-S", str(first)]
 
 
-def test_kill_session_leaves_the_directory_for_a_retry(
-    monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
+def test_run_addresses_the_socket_by_name(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
 ):
-    """A nudge retry opens a session with the same name, and tmux refuses a
-    duplicate, so the session has to go while the run directory stays."""
-    calls: list[list[str]] = []
-    monkeypatch.setattr(tmux, "_run", lambda _p, args, _t: calls.append(args))
-    pane = tmux.pane_for("cotf-job-retry")
-    assert pane is not None
+    monkeypatch.setattr(tmux.shutil, "which", lambda _name: "/usr/bin/tmux")
+    seen: dict = {}
 
-    tmux.kill_session(pane)
+    def record(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        return _done()
 
-    assert calls == [["kill-session", "-t", "cotf-job-retry"]]
-    assert pane.tmpdir.exists()
+    monkeypatch.setattr(tmux.subprocess, "run", record)
+
+    tmux._run(["has-session", "-t", "s"], 1.0)
+
+    assert seen["argv"] == [
+        "tmux",
+        "-S",
+        str(tmux.socket_path()),
+        "has-session",
+        "-t",
+        "s",
+    ]
+    # No hint form anywhere: an inherited TMUX_TMPDIR must not decide the target.
+    assert seen["env"] is None or "TMUX_TMPDIR" not in seen["env"]
 
 
-def test_pane_named_scans_once_for_every_shape_a_viewer_tries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_kill_ends_the_session_and_never_the_shared_server(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
 ):
-    """Discovery sits on the TUI's 1Hz refresh and costs a subprocess per run
-    directory, so asking twice doubled the cost per frame."""
-    job = tmux.Pane(tmpdir=tmp_path / "b", session="cotf-job-run-1")
-    scans = []
+    """`kill-server` would take every other live turn down with this one."""
+    seen: list = []
+    monkeypatch.setattr(tmux, "_run", lambda args, _t: seen.append(args) or _done())
 
-    def counted():
-        scans.append(1)
-        return [job]
+    tmux.kill(tmux.Pane(session="cotf-job-abc"))
 
-    monkeypatch.setattr(tmux, "live_panes", counted)
+    assert seen == [["kill-session", "-t", "cotf-job-abc"]]
+    assert not any("kill-server" in part for args in seen for part in args)
 
-    assert tmux.pane_named("cotf-pty-777-", "cotf-job-run-1") == job
-    assert len(scans) == 1
+
+def test_ensure_root_creates_a_private_directory(short_panes_root: Path):
+    assert tmux.ensure_root() is True
+    assert short_panes_root.is_dir()
+    assert short_panes_root.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_root_refuses_an_address_too_long_for_a_unix_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    deep = tmp_path / ("d" * 90) / ("e" * 90)
+    monkeypatch.setattr(tmux, "panes_root", lambda: deep)
+
+    with caplog.at_level("WARNING"):
+        assert tmux.ensure_root() is False
+
+    assert "unmirrored" in caplog.text
+    assert not deep.exists()
+
+
+def test_pane_for_declines_when_the_address_is_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(tmux, "ensure_root", lambda: False)
+    assert tmux.pane_for("cotf-job-abc") is None
+
+
+def test_live_panes_asks_the_server_rather_than_walking_a_directory(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+):
+    monkeypatch.setattr(
+        tmux, "_run", lambda *_a, **_k: _done(stdout="cotf-pty-1-ab\ncotf-job-xyz\n")
+    )
+
+    assert [pane.session for pane in tmux.live_panes()] == [
+        "cotf-pty-1-ab",
+        "cotf-job-xyz",
+    ]
+
+
+def test_live_panes_reads_a_dead_or_wedged_server_as_nothing_to_mirror(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+):
+    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: _done(returncode=1))
+    assert tmux.live_panes() == []
+
+    monkeypatch.setattr(tmux, "_run", lambda *_a, **_k: None)
+    assert tmux.live_panes() == []
+
+
+def test_sweep_reaps_only_the_calling_daemons_own_prefix(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+):
+    """Segmentation by name replaced the per-run `owner.pid` file.
+
+    One server holds every daemon's panes now, so a worker restarting must not
+    reap a sibling's live turn. Each prefix has exactly one owner.
+    """
+    monkeypatch.setattr(
+        tmux,
+        "live_panes",
+        lambda: [
+            tmux.Pane(session="cotf-job-one"),
+            tmux.Pane(session="cotf-pty-9-live"),
+            tmux.Pane(session="cotf-job-two"),
+        ],
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(tmux, "kill", lambda pane: killed.append(pane.session))
+
+    assert tmux.sweep(tmux.JOB_SESSION_PREFIX) == 2
+    assert killed == ["cotf-job-one", "cotf-job-two"]
+
+
+def test_sweep_is_a_no_op_before_any_turn_runs(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+):
+    monkeypatch.setattr(tmux, "live_panes", list)
+    assert tmux.sweep(tmux.JOB_SESSION_PREFIX) == 0
+
+
+def test_pane_named_finds_a_run_from_the_prefix_a_viewer_knows(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+):
+    monkeypatch.setattr(
+        tmux,
+        "live_panes",
+        lambda: [tmux.Pane(session="cotf-pty-42-9f3c1d")],
+    )
+
+    found = tmux.pane_named("cotf-job-nope", "cotf-pty-42-")
+
+    assert found is not None
+    assert found.session == "cotf-pty-42-9f3c1d"
+    assert tmux.pane_named("cotf-pty-7-") is None
     assert tmux.pane_named() is None
 
 
-def test_sweep_skips_a_directory_that_vanishes_under_it(
+def test_pane_named_scans_once_for_every_shape_a_viewer_tries(
+    monkeypatch: pytest.MonkeyPatch, panes_root: Path
+):
+    """This sits on the TUI's 1Hz refresh, so one scan per frame, not one per prefix."""
+    scans = 0
+
+    def count():
+        nonlocal scans
+        scans += 1
+        return [tmux.Pane(session="cotf-job-run")]
+
+    monkeypatch.setattr(tmux, "live_panes", count)
+
+    tmux.pane_named("cotf-pty-1-", "cotf-job-run")
+
+    assert scans == 1
+
+
+def test_session_env_points_at_a_hosted_pane_and_nothing_otherwise(
     monkeypatch: pytest.MonkeyPatch, short_panes_root: Path
 ):
-    """Two daemons sweep this root, so the other one may remove a directory
-    between the listing and the stat."""
-    monkeypatch.setattr(tmux, "_run_dirs", lambda: [short_panes_root / "already-gone"])
-    monkeypatch.setattr(tmux, "_sessions_on", lambda _d: [])
+    monkeypatch.setattr(tmux, "hosting_available", lambda: True)
+    assert tmux.session_env("cotf-pty-1-abcd") == {
+        "TMUX_TMPDIR": str(short_panes_root),
+        "CLAUDE_PTY_TMUX_SESSION": "cotf-pty-1-abcd",
+    }
 
-    assert tmux.sweep() == 0
+    monkeypatch.setattr(tmux, "hosting_available", lambda: False)
+    assert tmux.session_env("cotf-pty-1-abcd") == {}
+
+
+def test_pane_from_env_reads_where_the_daemon_published_the_pane():
+    pane = tmux.pane_from_env(
+        {"TMUX_TMPDIR": "/tmp/cotf-panes", "CLAUDE_PTY_TMUX_SESSION": "cotf-job-7"}
+    )
+
+    assert pane is not None
+    assert pane.session == "cotf-job-7"
+
+
+@needs_tmux
+def test_a_real_pane_sources_its_env_and_can_be_captured(short_panes_root: Path):
+    """End to end on a real server, which is the only thing that proves the wiring."""
+    assert tmux.ensure_root()
+    pane = tmux.Pane(session="cotf-test-real")
+    prefix = tmux.argv_prefix()
+    env_file = short_panes_root / "env"
+    env_file.write_text("export COTF_PROBE=landed\n", encoding="utf-8")
+    try:
+        subprocess.run(
+            [
+                *prefix,
+                "new-session",
+                "-d",
+                "-s",
+                pane.session,
+                "bash",
+                "-c",
+                f". {env_file}; echo probe=$COTF_PROBE; sleep {_PROBE_DEADLINE_S}",
+            ],
+            check=True,
+            timeout=_PROBE_DEADLINE_S,
+        )
+        deadline = time.monotonic() + _PROBE_DEADLINE_S
+        grid = ""
+        while time.monotonic() < deadline:
+            grid = tmux.capture(pane) or ""
+            if "probe=" in grid:
+                break
+            time.sleep(0.05)
+
+        assert "probe=landed" in grid
+        assert tmux.alive(pane) is True
+    finally:
+        subprocess.run(
+            [*prefix, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+@needs_tmux
+def test_a_real_pane_is_invisible_to_the_operators_own_tmux(short_panes_root: Path):
+    """Why cotf keeps a socket at all instead of using the default server."""
+    assert tmux.ensure_root()
+    pane = tmux.Pane(session="cotf-test-hidden")
+    prefix = tmux.argv_prefix()
+    try:
+        subprocess.run(
+            [*prefix, "new-session", "-d", "-s", pane.session, "sleep", "30"],
+            check=True,
+            timeout=_PROBE_DEADLINE_S,
+        )
+        listed = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_DEADLINE_S,
+            check=False,
+            env={k: v for k, v in os.environ.items() if k != "TMUX_TMPDIR"},
+        )
+
+        assert pane.session not in listed.stdout
+        assert tmux.alive(pane) is True
+    finally:
+        subprocess.run(
+            [*prefix, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+@needs_tmux
+def test_an_inherited_tmux_cannot_steal_a_pane_from_cotfs_server(
+    short_panes_root: Path,
+):
+    """The regression, reproduced.
+
+    A daemon started inside the operator's tmux carries `TMUX`, and a tmux client
+    obeys it over `TMUX_TMPDIR`. Addressing with `-S` is what makes the pane land
+    where the reader will look for it.
+    """
+    assert tmux.ensure_root()
+    pane = tmux.Pane(session="cotf-test-hijack")
+    prefix = tmux.argv_prefix()
+    hostile = {**os.environ, "TMUX": "/tmp/some-other-server,999,0", **pane.env}
+    try:
+        subprocess.run(
+            [*prefix, "new-session", "-d", "-s", pane.session, "sleep", "30"],
+            check=True,
+            timeout=_PROBE_DEADLINE_S,
+            env=hostile,
+        )
+
+        assert tmux.alive(pane) is True
+    finally:
+        subprocess.run(
+            [*prefix, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def test_turn_files_are_named_per_turn_so_two_turns_cannot_clobber(panes_root: Path):
+    """A shared `pane-env` would let one turn source another's `COTF_CMD_TOKEN`.
+
+    Measured on a live daemon: with `sandbox.scoped_sessions()` off, the workspace
+    `CODEX_HOME` collapses onto the operator's `~/.codex`, so a fixed name there is
+    shared by every concurrent turn.
+    """
+    one = tmux.turn_file("cotf-job-aaa", "env")
+    two = tmux.turn_file("cotf-job-bbb", "env")
+
+    assert one != two
+    assert one.parent == panes_root
+    assert one != tmux.turn_file("cotf-job-aaa", "out")

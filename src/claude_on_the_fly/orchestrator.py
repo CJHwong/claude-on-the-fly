@@ -308,8 +308,9 @@ class SessionPermissions:
     are `permissions.mode`, and neither implies the other.
     """
 
-    def __init__(self, frontend: Frontend) -> None:
+    def __init__(self, frontend: Frontend, platform: str) -> None:
         self._frontend = frontend
+        self._platform = platform
         self._services: dict[int, tuple[str, permissions.PermissionService]] = {}
         # chat_id -> the service's request total as of the end of the last turn.
         # The guard needs a per-turn delta, not a lifetime count: a session that
@@ -348,7 +349,9 @@ class SessionPermissions:
             workspace=workspace,
             ttl_seconds=resolved.ttl_seconds,
             label=label,
-            tmux_session=permissions.tmux_session_name(chat_id, session),
+            tmux_session=permissions.tmux_session_name(
+                self._platform, chat_id, session
+            ),
             notify=self._notifier(chat_id),
         )
         await service.start()
@@ -768,7 +771,9 @@ class Orchestrator:
             # panes. Skipped entirely when tmux is absent — a turn then runs
             # unmirrored rather than not at all.
             if tmux.hosting_available():
-                pane = tmux.pane_for(permissions.tmux_session_name(chat_id, session))
+                pane = tmux.pane_for(
+                    permissions.tmux_session_name(self._platform, chat_id, session)
+                )
             if pane is not None:
                 session_overrides.update(pane.env)
                 logger.debug("tmux: chat %s hosted in pane %s", chat_id, pane.session)
@@ -1359,11 +1364,12 @@ async def run(frontend: Frontend, platform: str) -> None:
         process_ledger.sweep()
         agent.add_process_listener(process_ledger.on_process)
         listener_attached = True
-        # Same recovery, one layer out: a pane is a child of its own tmux server,
-        # so the process ledger above never saw it. The server dies with the
-        # daemon that started it, but its socket directory does not, and one per
-        # turn would otherwise accumulate.
-        tmux.sweep()
+        # Same recovery, one layer out: a pane is a child of cotf's tmux server,
+        # not of this daemon, so the process ledger above never saw it and it
+        # outlives a daemon that died mid-turn. Only this daemon's own prefix --
+        # the jobs worker reaps `cotf-job-` on its own schedule, and reaping a
+        # sibling's live turn is exactly what the prefix prevents.
+        tmux.sweep(permissions.tmux_session_prefix(platform))
 
         # When sandboxing is enabled, the broker holds the real API keys and the
         # agent reaches them only through loopback. start_default_broker publishes
@@ -1377,7 +1383,9 @@ async def run(frontend: Frontend, platform: str) -> None:
         # Approvals are independent of COTF_SANDBOX, so this is built whenever the
         # config asks for it rather than only inside the sandbox branch.
         session_permissions = (
-            SessionPermissions(frontend) if permissions.configured().enabled else None
+            SessionPermissions(frontend, platform)
+            if permissions.configured().enabled
+            else None
         )
         orch = Orchestrator(
             frontend,

@@ -25,45 +25,86 @@ socket or constructs a service, which is why it is deliberately absent from
 `settings.RESTART_REQUIRED`. `tmux.hosting_available()` is the single question both
 producers ask.
 
-## One private tmux server per run
+## One tmux server for all of cotf
 
-Every run gets its own server. `TMUX_TMPDIR` places it; `-S` addresses it.
+Every hosted turn is a session on **one** server, at a fixed socket under
+`DATA_DIR/panes/tmux-<uid>/default`. `argv_prefix()` addresses it with `-S`, and every
+call in `tmux.py` and in `backends/codex.py` goes through it.
 
-The two are not interchangeable. `TMUX_TMPDIR` is a hint tmux uses to *build* a socket
-path, and when the directory it names does not exist tmux silently falls back to the
-default socket — `TMUX_TMPDIR=/nonexistent tmux kill-server` ends the operator's server
-and exits 0 (measured, tmux 3.7b). A `sweep` in a sibling daemon removes run directories,
-so any control command can find its own directory gone, and the hint form turned a reap
-of one finished turn into `kill-server` on whatever the operator was running. `_run`
-therefore passes `-S <socket_path(tmpdir)>`, which names the socket outright: a missing
-path is an error rather than a different server. Server *creation* and the agent's spawn
-env still carry `TMUX_TMPDIR`, because `claude-pty` calls bare `tmux` and derives its own
-socket from it.
+There used to be a server per run. That is what produced the outage this section exists
+to prevent: the reader addressed `-S <per-run socket>` while the writer built its session
+from `TMUX_TMPDIR`, and the two disagree the moment `TMUX` is set.
 
-- **The curated env reaches the pane with nothing in argv.** A pane on a server that was
-  already running does not see the client's environment (measured, tmux 3.7c), so the
-  alternative is `tmux new-session -e KEY=VALUE` per pair. That would put `COTF_CMD_TOKEN`
-  — the bearer token for the broker that runs credentialed CLIs *outside* the jail — into
-  a command line any local `ps` can read. A server this daemon starts inherits the
-  daemon's spawn env, and its panes inherit that.
-- **Teardown is total.** `kill-server` ends the session, its panes, and everything the
-  agent started in them. A process-group kill never reached a pane child, because a pane
-  is a child of the tmux server rather than of the daemon.
-- **The operator's own tmux is untouched.** No cotf session appears in their `tmux ls`,
-  and their `kill-server` cannot end a turn. This holds only because control commands are
-  addressed with `-S`; under the `TMUX_TMPDIR` hint a reaped directory pointed cotf's
-  `kill-server` straight at the default socket.
+### `-S` beats `TMUX`; `TMUX_TMPDIR` does not
+
+A tmux client obeys `TMUX` over every other hint. A daemon started from inside the
+operator's tmux carries `TMUX` into every child, so a bare `tmux new-session` there lands
+on the operator's server no matter what `TMUX_TMPDIR` says. Measured: with `TMUX` set and
+`TMUX_TMPDIR` naming a fresh directory, `new-session` returned 0, created nothing under
+that directory, and the session appeared on the default server.
+
+What that cost: every hosted job reported `RuntimeError: Exit code -1` about a second
+after launch, because `tmux.alive` asked the private socket and found no server, while
+the agent kept running on the operator's server — unsupervised, sandbox bypassed, with
+nobody collecting its work. Six accumulated in twenty minutes before anyone looked.
+
+Three things follow, and none of them are optional:
+
+- **One address for the writer and the reader.** `argv_prefix()` is exported for exactly
+  this: `backends/codex.py` builds its own async `new-session`, `pipe-pane` and
+  `wait-for` argv rather than going through `_run`, and it must not build its own
+  address.
+- **The spawn env drops `TMUX` and `TMUX_PANE`.** `claude-pty` calls bare `tmux` and
+  takes no socket argument, so `TMUX_TMPDIR` is the only way to aim it — and an inherited
+  `TMUX` would beat that. It is the one participant that cannot use `-S`.
+- **`new-session` returning 0 is not proof.** tmux reports success for a session it
+  created somewhere else, so the backend asks `has-session` on the address it is about to
+  poll. A mismatch degrades to an unhosted `codex exec` turn, which works, instead of
+  being read as a dead pane forty lines later.
+
+### What sharing a server costs
+
+- **The curated env no longer reaches the pane by inheritance.** A pane on a server that
+  was already running does not see the client's environment (measured, tmux 3.7c). The
+  fix is *not* `tmux new-session -e KEY=VALUE`: that would put `COTF_CMD_TOKEN` — the
+  bearer token for the broker that runs credentialed CLIs *outside* the jail — into a
+  command line any local `ps` can read. The pane sources a 0600 file written beside the
+  workspace's `CODEX_HOME` instead, which is what `claude-pty` has always done.
+- **Teardown is `kill-session`, never `kill-server`.** One server holds every turn, so
+  ending it would take the others down. tmux ends the pane's process group with the
+  session, so the reap still cannot miss a pane child — a pane is a child of the tmux
+  server rather than of the daemon.
+- **The sweep segments by name.** Each prefix has exactly one owning daemon —
+  `cotf-job-` the jobs worker, `cotf-pty-<frontend>-` one orchestrator — so a restarting
+  daemon reaps only its own leftovers. That replaced the `owner.pid` file the per-run
+  directories carried; with no directory there is nowhere to write it, and a name we
+  already control answers the same question. rhapsody segments the same way and for the
+  same reason (`rhapsody-<owner>-`).
+
+  The frontend segment is load-bearing, not decoration. `claude-slack` and
+  `claude-telegram` are separate entry points running separate orchestrators against one
+  server, so a bare `cotf-pty-` sweep on a telegram restart would kill slack's live chat
+  panes mid-turn. `permissions.tmux_session_prefix` builds the sweep argument so it
+  cannot drift from `tmux_session_name`.
+
+### What it keeps
+
+**The operator's own tmux is untouched.** No cotf session appears in their `tmux ls`, and
+their `kill-server` cannot end a turn. This is the whole reason cotf keeps a socket at all
+rather than using the default server the way rhapsody does — rhapsody wants
+`rhapsody attach <KEY>` to work from any terminal, and cotf has the TUI mirror instead.
 
 ### The socket path is short on purpose
 
-A run's directory is named for a 12-character digest of its session, not for the session.
 The whole socket path has to fit a unix address: `sun_path` is 104 bytes on macOS. A
-96-character directory yields a 113-byte socket and tmux fails the spawn outright with
-"File name too long", which costs the turn and not just the mirror. `pane_for` warns with
-the projected length when a redirected `COTF_DATA_DIR` is too deep.
+96-character root yields a 113-byte socket and tmux fails the spawn outright with
+"File name too long", which costs the turn and not just the mirror. `ensure_root` warns
+with the projected length and returns False when a redirected `COTF_DATA_DIR` is too
+deep; every caller reads that as an unhosted turn rather than a failed one.
 
-Nothing reads the session name back out of the directory name as a result. `_sessions_on`
-asks the server, which is the better source anyway.
+`-S` binds the exact path it is given and creates nothing on the way, so `ensure_root`
+makes the `tmux-<uid>` segment itself. tmux would have made it from `TMUX_TMPDIR`, which
+is the hint form this module refuses to use.
 
 ## Who hosts what
 
@@ -114,15 +155,17 @@ at the same time; `codex.mode: native` gives up only what broke.
 
 ## Lifecycle
 
-1. The producer names the pane and creates its socket directory: `orchestrator.py` for a
+1. The producer names the pane and ensures the socket directory: `orchestrator.py` for a
    chat turn (via `permissions.tmux_session_name`, so approvals address the same pane),
    `jobs/agent_runner.py` for a job (via `tmux.job_session_name`).
-2. The name and directory go into `sandbox.session_env`, which `sandbox.agent_env` layers
+2. The name and the root go into `sandbox.session_env`, which `sandbox.agent_env` layers
    over the allowlist unconditionally.
-3. The backend hosts itself, or claude-pty does.
-4. The producer calls `tmux.kill` in its `finally`. That ends the server, so a backend
-   that left a process running past the deadline is reaped here too.
-5. `tmux.sweep` runs at daemon startup for whatever a killed daemon left behind.
+3. The backend hosts itself, or claude-pty does. The backend confirms the session landed
+   on cotf's server before it starts polling.
+4. The producer calls `tmux.kill` in its `finally`. That ends the session and its process
+   group, so a backend that left a process running past the deadline is reaped here too.
+5. `tmux.sweep(<own prefix>)` runs at daemon startup for whatever a killed daemon left
+   behind. The prefix is what stops it reaping a sibling daemon's live turn.
 
 ## Gotchas
 

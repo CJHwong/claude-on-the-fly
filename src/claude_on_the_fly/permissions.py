@@ -1270,13 +1270,29 @@ TMUX_SESSION_PREFIX = "cotf-pty"
 TMUX_SESSION_ENV = "CLAUDE_PTY_TMUX_SESSION"
 
 
-def tmux_session_name(chat_id: int, session: str) -> str:
-    """A pane name unique to one chat's current session.
+def tmux_session_name(platform: str, chat_id: int, session: str) -> str:
+    """A pane name unique to one chat's current session, on one frontend.
 
     Includes the session discriminator so `/new` cannot inherit a pane, and is short
     because tmux session names appear in every `tmux ls` the operator runs.
+
+    `platform` segments the name per daemon, which is what makes the startup sweep
+    safe. Every hosted turn now lives on one shared tmux server, so a restarting
+    orchestrator reaps by name prefix rather than by the per-run `owner.pid` a
+    private server used to carry -- and slack and telegram run as separate
+    orchestrators. Without this segment a telegram restart would reap slack's live
+    chat panes, killing turns mid-flight.
     """
-    return f"{TMUX_SESSION_PREFIX}-{chat_id}-{session[:8]}"
+    return f"{TMUX_SESSION_PREFIX}-{platform}-{chat_id}-{session[:8]}"
+
+
+def tmux_session_prefix(platform: str) -> str:
+    """Every chat pane one orchestrator owns, and no other daemon's.
+
+    The sweep's argument. Built here rather than spelled out at the call site so it
+    cannot drift from `tmux_session_name`.
+    """
+    return f"{TMUX_SESSION_PREFIX}-{platform}-"
 
 
 def pty_settings_path() -> Path:

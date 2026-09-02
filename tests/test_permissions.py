@@ -1365,10 +1365,18 @@ async def test_a_malformed_notify_is_rejected(body):
 def test_the_pane_name_is_unique_per_chat_and_session():
     """claude-pty's own default is PID-based, which the daemon cannot predict, and a
     shared name would let one chat's approval land in another chat's pane."""
-    first = permissions.tmux_session_name(1, "aaaaaaaa-1111")
-    assert first != permissions.tmux_session_name(2, "aaaaaaaa-1111")
-    assert first != permissions.tmux_session_name(1, "bbbbbbbb-2222")
-    assert first == permissions.tmux_session_name(1, "aaaaaaaa-9999")[: len(first)]
+    first = permissions.tmux_session_name("slack", 1, "aaaaaaaa-1111")
+    assert first != permissions.tmux_session_name("slack", 2, "aaaaaaaa-1111")
+    assert first != permissions.tmux_session_name("slack", 1, "bbbbbbbb-2222")
+    assert (
+        first
+        == permissions.tmux_session_name("slack", 1, "aaaaaaaa-9999")[: len(first)]
+    )
+    # Segmented per frontend: one shared tmux server means a restarting
+    # orchestrator reaps by prefix, and slack must not reap telegram's live panes.
+    assert first != permissions.tmux_session_name("telegram", 1, "aaaaaaaa-1111")
+    assert first.startswith(permissions.tmux_session_prefix("slack"))
+    assert not first.startswith(permissions.tmux_session_prefix("telegram"))
 
 
 def test_pty_settings_install_only_the_permission_prompt_hook(operator_settings):
