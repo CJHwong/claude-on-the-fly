@@ -153,6 +153,33 @@ The mode is separate from `agent.pane` on purpose. `pane` is global, so using it
 retreat from a break in codex's interactive path would take claude-pty's mirror away
 at the same time; `codex.mode: native` gives up only what broke.
 
+## Attaching to a live pane
+
+The watch pane is read-only. To type at the agent, attach to its session: the dashboard's
+`a` key copies the command for the highlighted run, on the chat tab and the jobs tab
+alike.
+
+The command carries `-S`, from `tmux.attach_command()`. A bare `tmux attach -t <name>`
+reads the *default* server and reports nothing, because cotf's sessions are not on it.
+That is the same split that once put a running agent on the operator's server and then
+reported it dead, so the command an operator pastes is built from `argv_prefix()` like
+every other caller.
+
+Two things the key deliberately does not do:
+
+- **It does not attach in place.** A tmux client seizes the terminal the TUI is drawing
+  in, and detaching drops the operator back mid-render. It copies instead.
+- **It does not hide itself when tmux is missing.** Hiding a binding also swallows the
+  keypress, so `a` would do nothing and explain nothing. It stays offered and answers.
+
+Liveness is probed on the press, off the event loop, and never in `check_action`.
+`check_action` runs on every `refresh_bindings`, so a wedged server there would freeze
+the footer.
+
+`t` is the other half. It copies the backend's resume command (`claude --resume`,
+`codex resume`) for a run whose session already exists, so an operator can take the
+conversation over in their own terminal rather than watch it. Both tabs offer both keys.
+
 ## Lifecycle
 
 1. The producer names the pane and ensures the socket directory: `orchestrator.py` for a

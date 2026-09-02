@@ -580,7 +580,7 @@ class ClaudeBackend:
 
         Runs in whichever mode this backend is in — a pty backend compacts
         through claude-pty, not through `claude -p`. Mixing them would forfeit
-        what pty is for: an operator can `tmux attach` to a live turn, and a
+        what pty is for: an operator can attach to a live turn (`a` in the TUI), and a
         compaction is the longest and priciest thing a thread does, so it is the
         worst one to make invisible. The two also resolve their own settings
         (effort, fast mode, output style), so a `-p` compaction could summarize a

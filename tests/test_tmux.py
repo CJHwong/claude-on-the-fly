@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -592,3 +593,63 @@ def test_turn_files_are_named_per_turn_so_two_turns_cannot_clobber(panes_root: P
     assert one != two
     assert one.parent == panes_root
     assert one != tmux.turn_file("cotf-job-aaa", "out")
+
+
+def test_attach_command_addresses_cotfs_socket_not_the_default_server(
+    panes_root: Path,
+):
+    """A bare `tmux attach -t <name>` looks at the default server and finds
+    nothing, so the copied command has to carry `-S` like every other caller."""
+    cmd = tmux.attach_command(tmux.Pane(session="cotf-job-run7"))
+
+    assert cmd.startswith("tmux -S ")
+    assert str(tmux.socket_path()) in cmd
+    assert cmd.endswith("attach -t cotf-job-run7")
+
+
+def test_attach_command_quotes_a_socket_path_with_a_space(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The data dir is the operator's to place, and `~/Active Work` is a real
+    shape. An unquoted path splits into two arguments and attach fails."""
+    monkeypatch.setattr(tmux, "panes_root", lambda: tmp_path / "Active Work")
+
+    cmd = tmux.attach_command(tmux.Pane(session="cotf-pty-slack-42-abc"))
+
+    assert "'" in cmd
+    assert shlex.split(cmd)[2] == str(tmux.socket_path())
+
+
+@needs_tmux
+def test_the_attach_command_names_a_session_the_server_really_has(
+    short_panes_root: Path,
+):
+    """The command is pasted into a terminal, so the only proof is a real
+    server answering to the exact argv it emits."""
+    assert tmux.ensure_root()
+    pane = tmux.Pane(session="cotf-test-attach")
+    prefix = tmux.argv_prefix()
+    try:
+        subprocess.run(
+            [*prefix, "new-session", "-d", "-s", pane.session, "sleep", "30"],
+            check=True,
+            timeout=_PROBE_DEADLINE_S,
+        )
+        argv = shlex.split(tmux.attach_command(pane))
+        # `has-session` takes the same address and target as `attach`, and
+        # answers without seizing this process's terminal.
+        probe = subprocess.run(
+            [*argv[:-3], "has-session", "-t", argv[-1]],
+            capture_output=True,
+            timeout=_PROBE_DEADLINE_S,
+            check=False,
+        )
+
+        assert probe.returncode == 0, probe.stderr.decode()
+    finally:
+        subprocess.run(
+            [*prefix, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )

@@ -231,6 +231,7 @@ class DashboardScreen(Screen):
         Binding("n", "run_now", "Run now"),
         Binding("S", "cycle_cron_sort", "Sort"),
         Binding("t", "copy_takeover", "Takeover"),
+        Binding("a", "attach", "Attach"),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("q", "app.quit", "Quit"),
         Binding("l", "app.push_screen('logs')", "Logs", show=False),
@@ -268,7 +269,8 @@ class DashboardScreen(Screen):
         "Refresh": "refresh now",
         "Stop all": "stop every running daemon",
         "Run now": "fire the highlighted cron entry now (cron tab)",
-        "Takeover": "copy the highlighted chat job's resume command (chat tab)",
+        "Takeover": "copy the highlighted run's resume command (chat / jobs tab)",
+        "Attach": "copy the tmux attach command for the highlighted run's live turn (chat / jobs tab)",
         "Sort": "toggle the cron table between next-fire and name order (cron tab)",
         "chat tab": "switch to the chat tab",
         "cron tab": "switch to the cron tab",
@@ -571,31 +573,90 @@ class DashboardScreen(Screen):
         # whenever the tab changes (see check_action).
         self.refresh_bindings()
 
-    # Action → the tab that owns it. An action absent from this map is global.
-    _TAB_ACTIONS: ClassVar[dict[str, str]] = {
-        "run_now": "tab-cron",
-        "cycle_cron_sort": "tab-cron",
-        "copy_takeover": "tab-chat",
+    # Action → the tabs that own it. An action absent from this map is global.
+    # Takeover and Attach are the two verbs for a live run, and both tabs that
+    # show a run carry one, so neither is pinned to a single tab.
+    _TAB_ACTIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "run_now": frozenset({"tab-cron"}),
+        "cycle_cron_sort": frozenset({"tab-cron"}),
+        "copy_takeover": frozenset({"tab-chat", "tab-jobs"}),
+        "attach": frozenset({"tab-chat", "tab-jobs"}),
     }
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide a tab-scoped key when its tab isn't in front.
 
-        The footer reads this, so `n` / `S` only appear on the cron tab and `t`
-        only on the chat tab. Returning False (not None) hides the key rather
-        than graying it out — a key you cannot use is noise, not information.
+        The footer reads this, so `n` / `S` only appear on the cron tab, and
+        `t` / `a` only on the two tabs that show a run. Returning False (not
+        None) hides the key rather than graying it out — a key you cannot use is
+        noise, not information.
+
+        Scoped by tab only. `attach` is deliberately NOT gated on tmux being
+        installed: hiding the binding also swallows the keypress, so `a` would
+        do nothing at all and say nothing about why. It stays offered, and
+        `action_attach` explains the missing-tmux case. Liveness is not probed
+        here either — this runs on every refresh_bindings, and a wedged tmux
+        must cost a stale footer at worst.
         """
-        owner = self._TAB_ACTIONS.get(action)
-        if owner is None:
+        owners = self._TAB_ACTIONS.get(action)
+        if owners is None:
             return True
         try:
-            return self.query_one("#daemon-tabs", TabbedContent).active == owner
+            return self.query_one("#daemon-tabs", TabbedContent).active in owners
         except Exception:
             return False  # pre-mount: no tab is in front yet
 
     def _selected_job(self) -> str | None:
         """Highlighted job name in the scheduled jobs DataTable, or None."""
         return self._datatable_cursor_key("#cron-entries")
+
+    def _selected_run(self) -> tuple[str, str] | None:
+        """The highlighted AI run as `(source, identifier)`, or None.
+
+        Both tabs that show a run answer here, so the watch pane, Takeover and
+        Attach all act on the row the operator is looking at. A chat run is
+        keyed by its frontend and chat id; a job run by the literal source
+        "jobs" and its job id. The cron tab has no run, so it answers None.
+        """
+        name = self._active_daemon()
+        if name in CHAT_FRONTENDS:
+            key = self._datatable_cursor_key("#chat-strip")
+            if key and key != "__empty__" and ":" in key:
+                source, _, identifier = key.partition(":")
+                return source, identifier
+            return None
+        if name == "jobs":
+            key = self._datatable_cursor_key("#jobs-queue")
+            if key and key != "__empty__":
+                return "jobs", key
+        return None
+
+    def _run_workspace(self, source: str, identifier: str) -> Path:
+        """The workspace directory for a run.
+
+        A job carries its own path in the worker's heartbeat. A chat run does
+        not, so its workspace is rebuilt from the frontend/user name the chat
+        strip resolved (`DATA_DIR/workspaces/<frontend>/<user>`).
+        """
+        key = f"{source}:{identifier}"
+        label = self._chat_workspaces.get(key, identifier)
+        return self._job_workspaces.get(key) or (DATA_DIR / "workspaces" / label)
+
+    def _pane_prefixes(
+        self, source: str, identifier: str, workspace: Path
+    ) -> tuple[str, str]:
+        """The two session-name shapes a run's pane can carry.
+
+        The two producers name their panes differently and neither can be asked
+        at this distance. A chat turn's pane carries the session discriminator
+        the orchestrator minted, so only its `<chat id>` prefix is knowable
+        here; a job's pane is named for its workspace directory, which the row
+        already resolved, so there the prefix is the whole name.
+        """
+        return (
+            f"{permissions.tmux_session_prefix(source)}{identifier}-",
+            tmux.job_session_name(workspace.name),
+        )
 
     def _datatable_cursor_key(self, selector: str) -> str | None:
         try:
@@ -865,22 +926,29 @@ class DashboardScreen(Screen):
         self._refresh()
 
     def action_copy_takeover(self) -> None:
-        """Copy `cd <workspace> && <resume cmd>` for the highlighted chat job.
+        """Copy `cd <workspace> && <resume cmd>` for the highlighted run.
 
         Same contract as the History screen's `t`: the row's own
         (workspace, session_uuid) pair, so the command resumes that exact
         session rather than whatever the current env points at.
+
+        Offered on the chat and the jobs tab alike. The worker publishes a
+        job's session uuid in its heartbeat, so a job row can name its session
+        exactly as a chat row can, and an operator taking over a background job
+        needs the command more than a chat user does.
         """
-        key = self._datatable_cursor_key("#chat-strip")
-        if not key or key == "__empty__":
+        run = self._selected_run()
+        if run is None:
             self._notify("no row selected", "warning")
             return
-        workspace_name = self._chat_workspaces.get(key)
+        source, identifier = run
+        key = f"{source}:{identifier}"
+        workspace_name = self._chat_workspaces.get(key, identifier)
         session_uuid = self._job_sessions.get(key)
-        if not workspace_name or not session_uuid:
+        if not session_uuid:
             self._notify("no takeover for this row", "warning")
             return
-        workspace = DATA_DIR / "workspaces" / workspace_name
+        workspace = self._run_workspace(source, identifier)
         try:
             cmd = get_backend().takeover_command(workspace, session_uuid)
         except Exception as exc:
@@ -904,6 +972,51 @@ class DashboardScreen(Screen):
             return
         self._notify(
             f"copied takeover cmd for {workspace_name}",
+            "information",
+        )
+
+    async def action_attach(self) -> None:
+        """Copy the `tmux attach` command for the highlighted run's live turn.
+
+        Works on the chat and the jobs tab: both host their turns in a pane on
+        cotf's own server, under the two name shapes `_pane_prefixes` knows.
+
+        Probe liveness off the event loop. `pane_named` shells out to tmux with
+        a 5s ceiling and Textual runs action handlers on the loop, so a sync
+        call would freeze the whole TUI whenever the server is wedged — the
+        stall `check_action` already refuses to risk.
+
+        Copy the command rather than attaching in place: a tmux client seizes
+        the terminal the TUI is drawing in, and detaching would drop the
+        operator back mid-render.
+        """
+        run = self._selected_run()
+        if run is None:
+            self._notify("no row selected", "warning")
+            return
+        if not tmux.available():
+            self._notify("attach unavailable: tmux is not installed", "warning")
+            return
+        source, identifier = run
+        workspace = self._run_workspace(source, identifier)
+        chat_prefix, job_name = self._pane_prefixes(source, identifier, workspace)
+        pane = await asyncio.to_thread(tmux.pane_named, chat_prefix, job_name)
+        if pane is None:
+            self._notify(
+                "no live pane for this run: the pane exists only while a turn "
+                "is running, and only when pane hosting is on "
+                f"({tmux.PANE_VAR})",
+                "warning",
+            )
+            return
+        try:
+            self.app.copy_to_clipboard(tmux.attach_command(pane))
+        except Exception as exc:
+            self._notify(f"clipboard write failed: {exc}", "error")
+            return
+        self._notify(
+            f"copied attach cmd for {pane.session} — paste it in a terminal "
+            "(Ctrl-b d to detach)",
             "information",
         )
 
@@ -1132,21 +1245,14 @@ class DashboardScreen(Screen):
             job = self._selected_job()
             if job is not None and job != "__empty__":
                 target = f"cron:{job}"
-        elif name in CHAT_FRONTENDS:
-            # Follow the highlighted request row (key = "<source>:<chat_id>")
-            # so selecting any request tails its own session, not just the
-            # first in-flight job for the daemon.
-            key = self._datatable_cursor_key("#chat-strip")
-            if key and key != "__empty__" and ":" in key:
-                source, _, identifier = key.partition(":")
-                target = f"session:{source}:{identifier}"
-        elif name == "jobs":
-            # The worker publishes the running job's session uuid in its
-            # heartbeat, so the highlighted job's live conversation is
-            # watchable like a chat job's.
-            key = self._datatable_cursor_key("#jobs-queue")
-            if key and key != "__empty__":
-                target = f"session:jobs:{key}"
+        else:
+            # Follow the highlighted run so selecting any row tails its own
+            # session, not just the first in-flight one for the daemon. The
+            # jobs worker publishes its running job's session uuid in the same
+            # heartbeat channel the chat daemons use, so both answer here.
+            run = self._selected_run()
+            if run is not None:
+                target = f"session:{run[0]}:{run[1]}"
 
         if target is None:
             if col.display:
@@ -1194,7 +1300,7 @@ class DashboardScreen(Screen):
         # resolved from the side map populated by the chat strip. Jobs rows
         # carry their full workspace path from the worker's heartbeat.
         label = self._chat_workspaces.get(key, identifier)
-        workspace = self._job_workspaces.get(key) or (DATA_DIR / "workspaces" / label)
+        workspace = self._run_workspace(source, identifier)
         # The header and the pane render Rich markup, and on the trusted-bot path
         # this name carries a Slack `username` the poster chooses. Every log and
         # tail path in the TUI already goes through the same helper: a body
@@ -1288,12 +1394,6 @@ class DashboardScreen(Screen):
     ) -> bool:
         """Render this run's live tmux pane. True when it did, False to fall back.
 
-        Two name shapes because the two producers name their panes differently
-        and neither can be asked at this distance: a chat turn's pane carries the
-        session discriminator the orchestrator minted, so only its `<chat id>`
-        prefix is knowable here, while a job's pane is named for the workspace
-        directory this row already resolved.
-
         The capture is synchronous on the 1Hz refresh. It costs single-digit
         milliseconds normally, and `CAPTURE_TIMEOUT_S` bounds the pathological
         case at a stutter rather than a hang.
@@ -1302,10 +1402,7 @@ class DashboardScreen(Screen):
             return False
         # One scan, both shapes. Asking twice ran a `tmux list-sessions` per run
         # directory twice per frame, on the refresh thread.
-        found = tmux.pane_named(
-            f"{permissions.tmux_session_prefix(source)}{identifier}-",
-            tmux.job_session_name(workspace.name),
-        )
+        found = tmux.pane_named(*self._pane_prefixes(source, identifier, workspace))
         if found is None:
             return False
         grid = tmux.capture(found, cols=pane.size.width, rows=pane.size.height)

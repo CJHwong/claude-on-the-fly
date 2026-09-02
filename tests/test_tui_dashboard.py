@@ -2365,6 +2365,216 @@ class TestChatTakeover:
         assert any("clipboard write failed" in msg for msg, _sev in notices)
 
 
+class TestJobTakeover:
+    """`t` reaches the jobs tab too.
+
+    The worker publishes a running job's session uuid in its heartbeat, so a job
+    row names its session exactly as a chat row does. It also carries its own
+    workspace path, which is the one the resume command must cd into.
+    """
+
+    def _wire_job(self, screen: DashboardScreen, monkeypatch, workspace: Path):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "job-7")
+        screen._job_sessions = {"jobs:job-7": "s-9"}
+        screen._job_workspaces = {"jobs:job-7": workspace}
+        screen._chat_workspaces = {"jobs:job-7": "job-7"}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+
+    async def test_a_job_row_copies_its_own_workspace_not_a_chat_path(
+        self, isolated, monkeypatch
+    ):
+        workspace = isolated / "runs" / "run7"
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_job(screen, monkeypatch, workspace)
+            backend = type(
+                "B", (), {"takeover_command": lambda _s, _w, _u: "codex resume t1"}
+            )()
+            monkeypatch.setattr(dash, "get_backend", lambda: backend)
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            await pilot.press("t")
+            await pilot.pause()
+        assert copied == [f"cd -- {shlex.quote(str(workspace))} && codex resume t1"]
+
+    async def test_a_job_row_with_no_session_says_no_takeover(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_job(screen, monkeypatch, isolated / "runs" / "run7")
+            screen._job_sessions = {}
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("no takeover for this row" in msg for msg, _sev in notices)
+
+
+class TestAttach:
+    """`a` copies the `tmux attach` command for the highlighted run's live pane.
+
+    Copy rather than attach in place: a tmux client seizes the terminal the TUI
+    draws in, and detaching would drop the operator back mid-render.
+    """
+
+    def _wire_chat(self, screen: DashboardScreen, monkeypatch):
+        screen.action_show_tab("tab-chat")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "telegram:42")
+        screen._chat_workspaces = {"telegram:42": "telegram/hoss"}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+
+    def _wire_job(self, screen: DashboardScreen, monkeypatch, workspace: Path):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "job-7")
+        screen._job_workspaces = {"jobs:job-7": workspace}
+        screen._chat_workspaces = {"jobs:job-7": "job-7"}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+
+    @staticmethod
+    def _serve(monkeypatch, session: str) -> list[tuple[str, ...]]:
+        """Stand in for the tmux server, recording what it was asked for."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        asked: list[tuple[str, ...]] = []
+
+        def pane_named(*prefixes: str):
+            asked.append(prefixes)
+            return tmux_mod.Pane(session=session)
+
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", pane_named)
+        return asked
+
+    async def test_a_chat_run_copies_the_attach_command_for_its_pane(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            asked = self._serve(monkeypatch, "cotf-pty-telegram-42-abcd1234")
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert copied == [
+            tmux_mod.attach_command(
+                tmux_mod.Pane(session="cotf-pty-telegram-42-abcd1234")
+            )
+        ]
+        # The chat id is all the viewer knows; the orchestrator minted the rest.
+        assert asked[0][0] == "cotf-pty-telegram-42-"
+        assert any("Ctrl-b d to detach" in msg for msg, _sev in notices)
+
+    async def test_a_job_run_asks_for_the_pane_named_after_its_workspace(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_job(screen, monkeypatch, isolated / "runs" / "run7")
+            asked = self._serve(monkeypatch, "cotf-job-run7")
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert asked[0][1] == "cotf-job-run7"
+        assert copied and copied[0].endswith("attach -t cotf-job-run7")
+
+    async def test_a_run_with_no_live_pane_copies_nothing(self, isolated, monkeypatch):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            monkeypatch.setattr(tmux_mod, "available", lambda: True)
+            monkeypatch.setattr(tmux_mod, "pane_named", lambda *_p: None)
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert copied == []
+        assert any("no live pane for this run" in msg for msg, _sev in notices)
+
+    async def test_no_tmux_explains_itself_instead_of_doing_nothing(
+        self, isolated, monkeypatch
+    ):
+        """The binding stays offered on a box without tmux, so the key has to
+        answer. Hiding it would swallow the press and say nothing at all."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            monkeypatch.setattr(tmux_mod, "available", lambda: False)
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert any("tmux is not installed" in msg for msg, _sev in notices)
+
+    async def test_an_empty_table_says_no_row(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+        assert any("no row selected" in msg for msg, _sev in notices)
+
+    async def test_a_clipboard_that_will_not_write_is_reported(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            self._serve(monkeypatch, "cotf-pty-telegram-42-abcd1234")
+            app.copy_to_clipboard = lambda _t: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                RuntimeError("no clipboard")
+            )
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+        assert any("clipboard write failed" in msg for msg, _sev in notices)
+
+
+class TestRunVerbsAreScopedToTheTabsThatShowARun:
+    """`t` and `a` act on a run, so both tabs that show one offer them and the
+    cron tab does not. A key the footer offers where it cannot work is noise."""
+
+    @pytest.mark.parametrize("action", ["copy_takeover", "attach"])
+    @pytest.mark.parametrize("tab", ["tab-chat", "tab-jobs"])
+    async def test_a_run_tab_offers_both_verbs(self, isolated, tab, action):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab(tab)
+            await pilot.pause()
+            assert screen.check_action(action, ()) is True
+
+    @pytest.mark.parametrize("action", ["copy_takeover", "attach"])
+    async def test_the_cron_tab_offers_neither(self, isolated, action):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            assert screen.check_action(action, ()) is False
+
+
 class TestRunNow:
     """`n` fires the highlighted cron entry via the daemon's trigger file. The
     trigger lands under the redirected DATA_DIR, so the tests assert on the file

@@ -358,9 +358,9 @@ class TestDashboardLayout:
 
         visible = {b.key for b in DashboardScreen.BINDINGS if b.show}
         hidden = {b.key for b in DashboardScreen.BINDINGS if not b.show}
-        # Footer: lifecycle (k/r), the three tab-scoped actions (filtered per
+        # Footer: lifecycle (k/r), the four tab-scoped actions (filtered per
         # tab by check_action), help, quit.
-        assert visible == {"k", "r", "n", "S", "t", "question_mark", "q"}
+        assert visible == {"k", "r", "n", "S", "t", "a", "question_mark", "q"}
         # Everything else stays bound but lives in the `?` help modal.
         assert hidden == {
             "l",
@@ -396,9 +396,11 @@ class TestDashboardLayout:
                 await pilot.pause()
                 keys = footer_keys()
                 assert {"k", "r", "?", "q"} <= keys, (tab, keys)
-                # Run-now and sort belong to cron, takeover to chat.
+                # Run-now and sort belong to cron; takeover and attach act on
+                # a run, so both tabs that show one carry them.
                 assert ({"n", "S"} <= keys) is (tab == "tab-cron"), (tab, keys)
-                assert ("t" in keys) is (tab == "tab-chat"), (tab, keys)
+                run_tab = tab in ("tab-chat", "tab-jobs")
+                assert ({"t", "a"} <= keys) is run_tab, (tab, keys)
 
     @pytest.mark.asyncio
     async def test_help_modal_lists_keys_hidden_from_footer(self):
