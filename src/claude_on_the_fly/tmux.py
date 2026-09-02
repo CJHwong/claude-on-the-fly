@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Mapping
@@ -204,6 +205,20 @@ def turn_file(session: str, suffix: str) -> Path:
     jailed pane can read the file with no profile change.
     """
     return panes_root() / f"{session}.{suffix}"
+
+
+def attach_command(pane: Pane) -> str:
+    """The shell command an operator pastes to watch a live turn's pane.
+
+    Carries `-S` for the same reason every other caller does: cotf's panes are
+    not on the default server, so a bare `tmux attach -t <name>` finds nothing
+    and reports the live agent as missing.
+
+    Emitted here rather than built at the call site so the viewer and the writer
+    keep one address. The last split between them put a running agent on the
+    operator's server and then reported it dead.
+    """
+    return f"{shlex.join(argv_prefix())} attach -t {shlex.quote(pane.session)}"
 
 
 def argv_prefix() -> list[str]:
