@@ -2296,13 +2296,27 @@ class TestCodexHomeReachesEverySpawn:
 class TestCodexInAPane:
     """The hosted arm runs the interactive TUI, which never exits on its own."""
 
+    @pytest.fixture(autouse=True)
+    def _own_socket(self, monkeypatch):
+        """A shallow panes root, held for the whole test.
+
+        The socket address is global now rather than carried on the Pane, so
+        patching it only while the pane is built left `alive` and `capture`
+        addressing the real one. Shallow because pytest's own tmp_path spends the
+        104-byte `sun_path` budget before tmux appends anything.
+        """
+        from claude_on_the_fly import tmux as tmux_mod
+
+        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
+        monkeypatch.setattr(tmux_mod, "panes_root", lambda: root)
+        yield root
+        shutil.rmtree(root, ignore_errors=True)
+
     @staticmethod
     def _pane(tmp_path: Path):
         from claude_on_the_fly import tmux as tmux_mod
 
-        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
-        with patch.object(tmux_mod, "panes_root", lambda: root):
-            return tmux_mod.pane_for("cotf-job-panearm")
+        return tmux_mod.pane_for("cotf-job-panearm")
 
     @staticmethod
     def _follower(tmp_path: Path):
@@ -2378,7 +2392,7 @@ class TestCodexInAPane:
         with (
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
             pytest.raises(RuntimeError, match="duplicate session"),
-        ):
+        ):  # new-session fails before the landing check, so alive is never asked
             await codex_mod._run_codex_in_pane(
                 pane,
                 ["codex", "p"],
@@ -2399,7 +2413,8 @@ class TestCodexInAPane:
         ok.wait = AsyncMock(return_value=0)
         with (
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=ok)),
-            # Alive but never finishing is the shape this guards against.
+            # Alive but never finishing is the shape this guards against. This
+            # also answers the post-create landing check.
             patch.object(tmux_mod, "alive", lambda _p: True),
             patch.object(codex_mod, "_PANE_POLL_S", 0.01),
             pytest.raises(RuntimeError, match=r"timed out after 0\.05s"),
@@ -2660,6 +2675,9 @@ class TestPaneArmEdges:
                 "asyncio.create_subprocess_exec",
                 AsyncMock(side_effect=lambda *_a, **_k: procs.pop(0)),
             ),
+            # No server is started here, so the post-create landing check has
+            # nothing to find; the transport is faked either way.
+            patch.object(tmux_mod, "alive", lambda _p: True),
             caplog.at_level(logging.WARNING, logger=codex_mod.__name__),
         ):
             returncode, _ = await codex_mod._run_codex_in_pane(
@@ -2779,10 +2797,9 @@ class TestHostedTurnCleanup:
         from claude_on_the_fly import tmux as tmux_mod
 
         killed: list[str] = []
-        monkeypatch.setattr(
-            tmux_mod, "kill_session", lambda p: killed.append(p.session)
-        )
-        pane = tmux_mod.Pane(tmpdir=tmp_path, session="cotf-job-retry")
+        monkeypatch.setattr(tmux_mod, "kill", lambda p: killed.append(p.session))
+        monkeypatch.setattr(tmux_mod, "alive", lambda _p: True)
+        pane = tmux_mod.Pane(session="cotf-job-retry")
         created = MagicMock()
         created.returncode = 0
         created.communicate = AsyncMock(return_value=(b"", b""))

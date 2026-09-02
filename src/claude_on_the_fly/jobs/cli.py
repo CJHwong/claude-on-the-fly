@@ -250,11 +250,12 @@ async def _run(token: str) -> None:
         agent.add_process_listener(ledger.on_process)
         listener_attached = True
 
-        # Socket directories of panes this worker's last life left behind. Beside
-        # the workspace sweep because it is the same startup-is-the-cadence
-        # argument, and a pane is a child of its own tmux server, so the process
-        # ledger above never saw it.
-        tmux.sweep()
+        # Panes this worker's last life left behind. Beside the workspace sweep
+        # because it is the same startup-is-the-cadence argument, and a pane is a
+        # child of cotf's tmux server rather than of this worker, so the process
+        # ledger above never saw it. Only `cotf-job-`: chat panes belong to the
+        # orchestrator, which reaps its own on its own restart.
+        tmux.sweep(tmux.JOB_SESSION_PREFIX)
 
         # Retention for finished one-shot workspaces. Startup is the whole cadence:
         # the sweep is bounded by what one worker's lifetime accumulated, and a worker
