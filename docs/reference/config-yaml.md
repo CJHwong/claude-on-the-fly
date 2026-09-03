@@ -26,10 +26,10 @@ configuration writes, not those persona links.
 | `backend` | string / `claude` | `claude` or `codex` | Next turn |
 | `claude.mode` | string / `native` | `native`, `pty`, or `ollama` | Next turn |
 | `claude.model` | string / unset | Passed to Claude in native/pty mode | Next turn |
-| `claude.effort` | string / unset | `low`, `medium`, `high`, `xhigh`, `max`; native mode only, and unset lets the CLI read its own `effortLevel`; an unaccepted level is ignored with a warning | Next turn |
+| `claude.effort` | string / unset | `low`, `medium`, `high`, `xhigh`, `max`; native mode only (claude pty resolves its own), and unset lets the CLI read its own `effortLevel`; an unaccepted level is ignored with a warning | Next turn |
 | `codex.mode` | string / `native` | `native`, `pty`, or `ollama`; `pty` runs codex's interactive UI in a hosted pane, and degrades to `codex exec` with a log line when there is no pane | Next turn |
 | `codex.model` | string / unset | Passed to Codex native mode | Next turn |
-| `codex.effort` | string / unset | `minimal`, `low`, `medium`, `high`, `xhigh`; native mode only, and unset lets codex read its own `model_reasoning_effort`; an unaccepted level is ignored with a warning | Next turn |
+| `codex.effort` | string / unset | `minimal`, `low`, `medium`, `high`, `xhigh`; applies in native **and** pty mode, and unset lets codex read its own `model_reasoning_effort`; an unaccepted level is ignored with a warning | Next turn |
 | `ollama.model` | string / unset | Required when either backend mode is `ollama` | Next turn |
 | `ollama.effort` | string / unset | Effort for the ollama-served model, whichever backend runs under it; wins over the backend's own `effort` key | Next turn |
 | `ollama.context_window` | integer / unset | Window that `ctx N%` and `auto_compact_pct` measure against in ollama mode; unset reports no reading | Next turn |

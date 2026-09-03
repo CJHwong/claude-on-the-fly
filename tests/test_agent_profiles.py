@@ -440,12 +440,14 @@ class TestGetBackendTakesTheProfile:
         assert backend.model == "gpt-5"
 
     def test_the_profile_reaches_the_interactive_argv_too(self, tmp_path: Path) -> None:
-        """codex pty builds its argv in a different method, which reads the
-        model and no effort. A profile has to reach that one as well."""
+        """codex pty builds its argv in a different method, so a profile has to
+        reach that one as well. Both halves: a hosted turn is the common case on
+        an operator running `mode: pty`, and it used to get the model without
+        the effort."""
         backend = agent.get_backend(agent.AgentProfile("codex", "pty", "gpt-5", "high"))
         argv = backend._interactive_argv(tmp_path, None, "hi")
         assert argv[argv.index("-m") + 1] == "gpt-5"
-        assert not any("model_reasoning_effort" in part for part in argv)
+        assert 'model_reasoning_effort="high"' in argv
 
     def test_the_profile_reaches_the_argv(self, tmp_path: Path) -> None:
         """The whole point: a profile decides what the CLI is spawned with, and
