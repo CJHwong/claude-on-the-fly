@@ -173,6 +173,18 @@ _NON_TOOL_ROLLOUT_ITEMS = frozenset(
     {"AgentMessage", "ContextCompaction", "Reasoning", "UserMessage"}
 )
 
+# The `response_item` shapes that are a tool call. These are the model's own
+# conversation history, which codex has to persist to resume a thread, so a call
+# cannot go missing from here. The item stream above is a UI notification and is
+# best-effort: it dropped at least one record on 393 of the 602 September
+# rollouts on the host that runs these turns, and every record on 2 of them.
+#
+# `local_shell_call` is the pre-0.149 spelling and carries no `name`, so the
+# record type is the fallback label.
+_RESPONSE_TOOL_TYPES = frozenset(
+    {"custom_tool_call", "function_call", "local_shell_call"}
+)
+
 # `phase` on an AgentMessage says what the message was for: codex marks its
 # closing reply `final_answer` and everything it says along the way
 # `commentary`. The stream had no such field, which is why the old relay had to
@@ -219,6 +231,49 @@ def _rollout_content_text(content: Any) -> str:
     return "".join(parts)
 
 
+def _count_tool_calls(
+    items: list[tuple[str, str]], calls: list[tuple[str, str]]
+) -> dict[str, int]:
+    """Fold both of a rollout's tool-call streams into one count per tool.
+
+    `items` is `(item type, item id)` per tool-typed `item_completed`, `calls` is
+    `(call_id, label)` per `response_item` tool call. The same call appears in
+    both, so neither stream can be added to the other, and neither can be read
+    alone: the item stream drops records, and the unified `exec` tool starts more
+    than one command per call, so items outnumbered calls on 113 of the 602
+    September rollouts measured. Reading either one alone undercounts.
+
+    Two id namespaces meet here. An orchestration item carries the model's own
+    `call_id` as its id, and every one of those on that host (418 of 418) matched
+    a `response_item` call_id, so that pair joins exactly. Anything the local
+    executor ran carries an id it minted itself (`exec-<uuid4>`), which is never
+    a call_id, so those cannot be joined at all.
+
+    What is left after the exact join is a count of the same calls from two
+    lossy angles, so the larger of the two readings is taken. That cannot
+    double-count a call both streams reported, and it cannot report zero while
+    either stream holds a record.
+
+    An item names its own count, because an item type (`CommandExecution`) is
+    what this footer has always shown. A call only names the shortfall the item
+    stream left, and it names it with the tool the model asked for (`exec`) --
+    the item that would have named it better is exactly what went missing.
+    """
+    call_ids = {call_id for call_id, _ in calls if call_id}
+    item_ids = {item_id for _, item_id in items if item_id}
+    counts: dict[str, int] = {}
+    unjoined_items = 0
+    for item_type, item_id in items:
+        counts[item_type] = counts.get(item_type, 0) + 1
+        if item_id not in call_ids:
+            unjoined_items += 1
+    unjoined_calls = [label for call_id, label in calls if call_id not in item_ids]
+    shortfall = max(len(unjoined_calls) - unjoined_items, 0)
+    for label in unjoined_calls[:shortfall]:
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
 def parse_codex_rollout(records: Iterable[dict]) -> dict:
     """One turn's rollout records folded into the same dict `run` consumes.
 
@@ -241,7 +296,8 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
     usage: dict = {}
     error: str | None = None
     completed = False
-    tool_counts: dict[str, int] = {}
+    tool_items: list[tuple[str, str]] = []
+    tool_calls: list[tuple[str, str]] = []
     for record in records:
         kind = record.get("type")
         payload = record.get("payload")
@@ -251,13 +307,18 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
             thread_id = payload.get("session_id") or thread_id
             continue
         if kind == "response_item":
-            if payload.get("type") == "message" and payload.get("role") == "assistant":
+            item_type = payload.get("type")
+            if item_type == "message" and payload.get("role") == "assistant":
                 text = _rollout_content_text(payload.get("content"))
                 # A lone <suggestions> block is the protocol token the prompt
                 # asked for, not something the agent said. Keeping the last real
                 # text is what lets a block-only reply fall back to it.
                 if strip_suggestions_blocks(text).strip():
                     last_assistant_text = text
+            elif item_type in _RESPONSE_TOOL_TYPES:
+                tool_calls.append(
+                    (payload.get("call_id") or "", payload.get("name") or item_type)
+                )
             continue
         if kind != "event_msg":
             continue
@@ -266,7 +327,7 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
             item = payload.get("item") or {}
             item_type = item.get("type")
             if item_type and item_type not in _NON_TOOL_ROLLOUT_ITEMS:
-                tool_counts[item_type] = tool_counts.get(item_type, 0) + 1
+                tool_items.append((item_type, item.get("id") or ""))
         elif sub == "token_count":
             usage = (payload.get("info") or {}).get("last_token_usage") or usage
         elif sub == "task_complete":
@@ -281,7 +342,7 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
         "usage": usage,
         "error": error,
         "completed": completed,
-        "tool_counts": tool_counts,
+        "tool_counts": _count_tool_calls(tool_items, tool_calls),
     }
 
 

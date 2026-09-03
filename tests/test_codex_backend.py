@@ -57,6 +57,20 @@ def _item(item_type: str, **fields) -> dict:
     }
 
 
+def _tool_call(
+    name: str = "exec", call_id: str = "", kind: str = "custom_tool_call"
+) -> dict:
+    """One `response_item` tool call, the rollout's record of what the model asked for.
+
+    This is the same tool call `_item` reports finishing, under the model's
+    `call_id` rather than the local executor's own id.
+    """
+    payload: dict = {"type": kind, "name": name}
+    if call_id:
+        payload["call_id"] = call_id
+    return {"type": "response_item", "payload": payload}
+
+
 def _agent_message(text: str, phase: str = "final_answer") -> dict:
     return _item("AgentMessage", content=[{"type": "Text", "text": text}], phase=phase)
 
@@ -207,6 +221,105 @@ class TestParseCodexRollout:
     def test_task_complete_without_a_message_does_not_clobber_the_body(self):
         out = parse_codex_rollout([_task_complete("real"), _task_complete("")])
         assert out["body"] == "real"
+
+    # -- the two tool-call streams ------------------------------------------
+    #
+    # A rollout reports one tool call twice: `item_completed` says what the
+    # local executor finished, `response_item` says what the model asked for.
+    # The item stream drops records, so it cannot be read on its own.
+
+    def test_a_dropped_item_is_recovered_from_the_response_item(self):
+        """The false zero: real exec calls, and the item stream reported none."""
+        out = parse_codex_rollout(
+            [
+                _session_meta("t1"),
+                _tool_call(call_id="call_a"),
+                _tool_call(call_id="call_b"),
+                _agent_message("done"),
+            ]
+        )
+        assert out["tool_counts"] == {"exec": 2}
+
+    def test_both_streams_reporting_one_call_counts_it_once(self):
+        """The local executor mints its own id, so the two records never join.
+        Summing them would double every call both streams did report."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(call_id="call_a"),
+                _item("CommandExecution", id="exec-1", command="ls"),
+                _tool_call(call_id="call_b"),
+                _item("CommandExecution", id="exec-2", command="pwd"),
+            ]
+        )
+        assert out["tool_counts"] == {"CommandExecution": 2}
+
+    def test_only_the_calls_the_item_stream_missed_are_added(self):
+        out = parse_codex_rollout(
+            [
+                _tool_call(call_id="call_a"),
+                _item("CommandExecution", id="exec-1"),
+                _tool_call(call_id="call_b"),
+                _tool_call(call_id="call_c"),
+            ]
+        )
+        # One of three calls arrived as an item; the other two are the shortfall.
+        assert out["tool_counts"] == {"CommandExecution": 1, "exec": 2}
+
+    def test_more_items_than_calls_keeps_the_item_count(self):
+        """One unified `exec` call starts more than one command, so the item
+        stream is the larger reading here and nothing is added to it."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(call_id="call_a"),
+                _item("CommandExecution", id="exec-1"),
+                _item("CommandExecution", id="exec-2"),
+                _item("CommandExecution", id="exec-3"),
+            ]
+        )
+        assert out["tool_counts"] == {"CommandExecution": 3}
+
+    def test_a_call_matched_by_id_is_not_counted_twice(self):
+        """An orchestration item carries the model's `call_id` as its own id,
+        so that pair joins exactly and the call adds nothing."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(name="spawn_agent", call_id="call_x", kind="function_call"),
+                _item("CollabAgentToolCall", id="call_x"),
+            ]
+        )
+        assert out["tool_counts"] == {"CollabAgentToolCall": 1}
+
+    def test_an_id_matched_call_does_not_absorb_an_unrelated_shortfall(self):
+        """The joined pair must not cover for the exec call the item stream
+        dropped; the two are different calls."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(name="spawn_agent", call_id="call_x", kind="function_call"),
+                _item("CollabAgentToolCall", id="call_x"),
+                _tool_call(call_id="call_y"),
+            ]
+        )
+        assert out["tool_counts"] == {"CollabAgentToolCall": 1, "exec": 1}
+
+    def test_a_tool_call_carrying_no_call_id_still_counts(self):
+        out = parse_codex_rollout([_tool_call(name="apply_patch")])
+        assert out["tool_counts"] == {"apply_patch": 1}
+
+    def test_an_unnamed_tool_call_is_counted_under_its_record_type(self):
+        """A `local_shell_call` names the tool in its type, not in a `name`."""
+        out = parse_codex_rollout(
+            [{"type": "response_item", "payload": {"type": "local_shell_call"}}]
+        )
+        assert out["tool_counts"] == {"local_shell_call": 1}
+
+    def test_a_response_item_that_is_not_a_tool_call_is_ignored(self):
+        out = parse_codex_rollout(
+            [
+                {"type": "response_item", "payload": {"type": "function_call_output"}},
+                {"type": "response_item", "payload": {"type": "reasoning"}},
+            ]
+        )
+        assert out["tool_counts"] == {}
 
 
 class TestReadRollout:
