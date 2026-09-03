@@ -160,6 +160,7 @@ FIELDS: dict[str, Field] = {
     "jobs.poll_interval_s": Field("JOBS_POLL_INTERVAL_S"),
     "jobs.timeout": Field("JOBS_TIMEOUT"),
     "jobs.workspace_keep_days": Field("JOBS_WORKSPACE_KEEP_DAYS"),
+    "jobs.diagnose_failures": Field("JOBS_DIAGNOSE_FAILURES"),
     "logs.keep_days": Field("COTF_LOG_KEEP_DAYS"),
     "logs.host_tag": Field("COTF_HOST_TAG"),
     "suggestions.enabled": Field("COTF_SUGGESTIONS_ENABLED"),

@@ -69,6 +69,11 @@ A cancelled job's origin is **told**, from `worker.run_once`'s `except Cancelled
 
 **`complete()` writes two files into `done/`** — `<id>.result.json` first (so a crash between the two still leaves a durable result), then the job file moves in. Anything counting finished jobs must count `*.result.json`; counting `*.json` double-counts every one of them.
 
+
+**A failed run can explain itself, behind a flag.** `jobs.diagnose_failures` (default off, codex only) makes `OrchestratorAgentRunner` read the run's own rollout before it builds the failure `Result`, and append what the timestamps say. The alert already carries whatever the CLI reported, which for a timeout is only that it timed out; the signals answer the next question. Four rules, all arithmetic and substring matching, no model call: whether the rollout reached `task_complete` (if it did, the agent finished and the fault is on our side of the CLI boundary, which is the difference between a real agent crash and cotf mis-reading a healthy run); how the wall clock split between the model and its tool calls; whether a `.py` or `.sh` path named in the prompt ever appears in a tool call; and whether three or more tool results came back as errors. They live in `transcript.diagnose_codex`, and `_failure_signals` in `jobs/agent_runner.py` is the gate that keeps them opt-in, codex-only, and non-fatal — a diagnosis is a courtesy on a path that is already failing, so a broken read must never replace the real error with its own traceback.
+
+Locating the rollout is the part with a trap. `_find_codex_rollout_by_cwd` looks right and is not: it reads only the single freshest rollout in the store, which is correct for its 1Hz live tailer (the run being watched *is* the freshest file) and wrong for a post-mortem. On a host firing cron every 15 minutes, several newer rollouts exist by the time a failure is diagnosed, and that helper found nothing on every real failure it was tried against. `_find_finished_rollout_by_cwd` is the post-mortem lookup: newest first, one line read per candidate, first cwd match wins, capped by `_MAX_ROLLOUT_CANDIDATES`. Unit tests do not catch this — each fixture writes one rollout, so any lookup passes. `TestRollutLookupUnderLoad` writes several.
+
 ## Reading the queue from outside
 
 `read_queue_depth(root)` and `read_queue_rows(root, limit)` at the bottom of `file_queue.py` are the observer half, used by the TUI's jobs tab.
@@ -152,6 +157,7 @@ A keyed workspace is never swept, however old. It *is* the continuity for the ne
 | `jobs.timeout` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit. A `Job.timeout` from a producer overrides it |
 | `jobs.concurrency` | `1` | How many jobs run at once. A property of the machine, deliberately separate from a producer's own `max_concurrent` |
 | `jobs.workspace_keep_days` | `30` | How long a finished one-shot workspace is kept before the startup sweep retires it; `0` keeps them forever. Keyed workspaces are never swept |
+| `jobs.diagnose_failures` | `false` | Experimental. On failure, read the run's own codex rollout and append deterministic signals to the alert text. Codex only |
 | `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token. Stays in `.env`: it is a credential |
 
 Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`) token from `SLACK_TOKEN` makes the worker post results as that user, and the Slack frontend — a separate process with its own dedup set — re-ingests them as new input, one spurious agent turn per job. `cli._notifier_loop_warning` warns about exactly this at startup.
