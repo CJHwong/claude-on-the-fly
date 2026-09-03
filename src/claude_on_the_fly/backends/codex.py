@@ -1251,24 +1251,7 @@ class CodexBackend:
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
         model_args = [] if self.launcher else (["-m", self.model] if self.model else [])
-        # Effort is unset by default: absent, no `-c` is passed and codex still
-        # reads model_reasoning_effort from ~/.codex/config.toml exactly as
-        # before. Quoted as TOML per the `-c` contract.
-        # Responses-API-only in codex, so under ollama it reaches the model only
-        # when that endpoint honors it — harmless either way. Under ollama the
-        # value came from the shared `ollama.effort`, whose accepted levels
-        # differ from codex's (claude has no `minimal`), so a value codex doesn't
-        # accept is skipped rather than passed through to die in codex's own
-        # config parse. A native value takes the same check: a typo in
-        # config.yaml should warn here rather than fail the turn.
-        effort = self.effort
-        if effort and effort not in _CODEX_EFFORT_LEVELS:
-            logger.warning(
-                "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
-                effort,
-            )
-            effort = ""
-        effort_args = ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
+        effort_args = self._effort_args()
         # --yolo stays whether approvals are on or not. codex exec overrides
         # approval_policy to `never` regardless (measured: request untrusted, get
         # never), so there is no CLI-side gate to leave enabled -- the PreToolUse
@@ -1289,6 +1272,36 @@ class CodexBackend:
             *model_args,
             *effort_args,
         ]
+
+    def _effort_args(self) -> list[str]:
+        """`-c model_reasoning_effort=...`, or [] when no effort is configured.
+
+        Unset means inherit: no `-c` is passed and codex reads
+        model_reasoning_effort from ~/.codex/config.toml exactly as it did
+        before this setting existed. Quoted as TOML per the `-c` contract.
+
+        Responses-API-only in codex, so under ollama it reaches the model only
+        when that endpoint honors it -- harmless either way. Under ollama the
+        value came from the shared `ollama.effort`, whose accepted levels differ
+        from codex's (claude has no `minimal`), so a value codex doesn't accept
+        is skipped rather than passed through to die in codex's own config
+        parse. A native value takes the same check: a typo in config.yaml should
+        warn here rather than fail the turn.
+
+        Shared by both argv builders because `-c` is a global codex option, not
+        an `exec` one. The interactive entry point honours it: driven under tmux
+        with `-c model_reasoning_effort="low"` against a config.toml saying
+        `medium`, codex's own statusline reads `gpt-5.6-luna low` and its
+        rollout records `effort: low`.
+        """
+        effort = self.effort
+        if effort and effort not in _CODEX_EFFORT_LEVELS:
+            logger.warning(
+                "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
+                effort,
+            )
+            return []
+        return ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
 
     def _interactive_argv(
         self, workspace: Path, thread_id: str | None, prompt: str
@@ -1311,6 +1324,7 @@ class CodexBackend:
             "-C",
             str(workspace),
             *model_args,
+            *self._effort_args(),
         ]
         if thread_id:
             return [*prefix, *binary, "resume", *flags, thread_id, prompt]

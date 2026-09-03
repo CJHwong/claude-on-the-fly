@@ -2876,3 +2876,56 @@ def test_an_unwritable_codex_home_costs_the_pane_not_the_turn(tmp_path: Path, ca
         (home / "config.toml").chmod(0o600)
 
     assert "could not record workspace trust" in caplog.text
+
+
+class TestEffortReachesTheInteractiveArgv:
+    """`-c` is a global codex option, not an `exec` one.
+
+    The interactive entry point honours it: driven under tmux with
+    `-c model_reasoning_effort="low"` against a config.toml saying `medium`,
+    codex's own statusline read `gpt-5.6-luna low` and its rollout recorded
+    `effort: low`. Before this, a hosted turn silently ran whatever
+    ~/.codex/config.toml said, so `agent.codex.effort` and any profile that set
+    it were dead settings for every operator running `mode: pty` with a pane.
+    """
+
+    def test_a_fresh_hosted_turn_carries_the_effort(self, tmp_path: Path) -> None:
+        argv = CodexBackend(pty=True, effort="low")._interactive_argv(
+            tmp_path, None, "hi"
+        )
+        assert 'model_reasoning_effort="low"' in argv
+        assert argv[argv.index('model_reasoning_effort="low"') - 1] == "-c"
+
+    def test_a_resumed_hosted_turn_carries_it_too(self, tmp_path: Path) -> None:
+        """The resume path builds its own argv, so it can lose the flag on its
+        own. Every turn after the first goes through here."""
+        argv = CodexBackend(pty=True, effort="high")._interactive_argv(
+            tmp_path, "thread-1", "hi"
+        )
+        assert 'model_reasoning_effort="high"' in argv
+        assert argv.index("resume") < argv.index("-c"), "global flag follows resume"
+        assert argv[-2:] == ["thread-1", "hi"]
+
+    def test_no_effort_configured_passes_no_flag(self, tmp_path: Path) -> None:
+        """Unset means inherit, so codex reads its own config exactly as before."""
+        argv = CodexBackend(pty=True)._interactive_argv(tmp_path, None, "hi")
+        assert not any("model_reasoning_effort" in part for part in argv)
+
+    def test_an_unknown_level_is_dropped_not_passed(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The shared `ollama.effort` accepts `max`, which codex does not. It is
+        skipped here rather than passed through to die in codex's config parse."""
+        argv = CodexBackend(pty=True, effort="max")._interactive_argv(
+            tmp_path, None, "hi"
+        )
+        assert not any("model_reasoning_effort" in part for part in argv)
+        assert "ignoring unknown effort" in caplog.text
+
+    def test_both_builders_agree(self, tmp_path: Path) -> None:
+        """One resolution, two callers. They drifted apart once already."""
+        backend = CodexBackend(effort="xhigh")
+        exec_argv = backend._base_argv(tmp_path)
+        hosted_argv = backend._interactive_argv(tmp_path, None, "hi")
+        flag = 'model_reasoning_effort="xhigh"'
+        assert flag in exec_argv and flag in hosted_argv
