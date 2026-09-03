@@ -26,8 +26,8 @@ from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 
 class _Host(App):
     CSS = """
-    #log-row { height: 1fr; min-height: 8; }
-    #log-pane, #live-view { height: 1fr; min-height: 8; }
+    #bottom-row { height: 1fr; min-height: 8; }
+    #log-pane, #live-view, #preview-view { height: 1fr; min-height: 8; }
     """
     SCREENS = {"doctor": DashboardScreen}  # replaced per-test where it matters
 
@@ -787,12 +787,40 @@ class TestBottomViewport:
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             _use_mode(screen, "log")
-            screen.action_cycle_view()
+            seen = []
+            for _ in range(3):
+                screen.action_cycle_view()
+                await pilot.pause()
+                seen.append(screen._mode())
+        assert seen == ["live", "preview", "log"]
+
+    async def test_p_jumps_to_the_preview_and_back(self, isolated):
+        """A glance at what a row runs returns you where you were, rather than
+        leaving you one step further around the cycle."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "log")
+            screen.action_preview()
             await pilot.pause()
-            assert screen._mode() == "live"
-            screen.action_cycle_view()
+            assert screen._mode() == "preview"
+            screen.action_preview()
             await pilot.pause()
             assert screen._mode() == "log"
+
+    async def test_p_from_the_tab_default_returns_to_it(self, isolated):
+        """`p` pressed before any `v` has nothing recorded to go back to."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            screen.action_preview()
+            await pilot.pause()
+            assert screen._mode() == "preview"
+            screen.action_preview()
+            await pilot.pause()
+            assert screen._mode() == "live"
 
     async def test_each_tab_remembers_its_own_mode(self, isolated):
         """A tab switch must not undo the mode you chose on the tab you left."""
@@ -801,19 +829,19 @@ class TestBottomViewport:
             screen = await _open(app, pilot)
             screen.action_show_tab("tab-cron")
             await pilot.pause()
-            screen.action_cycle_view()  # cron: log -> live
+            screen.action_cycle_view()  # cron: preview -> log
             await pilot.pause()
             screen.action_show_tab("tab-jobs")
             await pilot.pause()
             assert screen._mode() == "live"  # the jobs tab's own default
-            screen.action_cycle_view()  # jobs: live -> log
+            screen.action_cycle_view()  # jobs: live -> preview
             await pilot.pause()
             screen.action_show_tab("tab-cron")
             await pilot.pause()
-            assert screen._mode() == "live"
+            assert screen._mode() == "log"
             screen.action_show_tab("tab-jobs")
             await pilot.pause()
-            assert screen._mode() == "log"
+            assert screen._mode() == "preview"
 
     async def test_the_tabs_open_on_their_own_default(self, isolated):
         app = _Host()
@@ -822,7 +850,7 @@ class TestBottomViewport:
             assert screen._mode() == "live"  # chat: the running request
             screen.action_show_tab("tab-cron")
             await pilot.pause()
-            assert screen._mode() == "log"  # cron: where a fire reports itself
+            assert screen._mode() == "preview"  # cron: what the entry runs
 
     async def test_the_header_carries_the_strip_and_the_label(self, isolated):
         app = _Host()
@@ -1504,7 +1532,7 @@ class TestCronTable:
             depth=QueueDepth(new=0, running=len(rows), done=0, failed=0), rows=rows
         )
 
-    def _job(self, name="nightly", detail=""):
+    def _job(self, name="nightly", detail="", preview=None):
         from datetime import datetime, timedelta
 
         from claude_on_the_fly.tui.state import JobInfo
@@ -1515,6 +1543,7 @@ class TestCronTable:
             kind="prompt",
             next_fire=datetime.now() + timedelta(hours=1),
             detail=detail,
+            preview=detail if preview is None else preview,
         )
 
     @staticmethod
@@ -1809,9 +1838,9 @@ class TestCronTable:
         assert "summarise my inbox" in row
         assert "\n" not in row[4]
 
-    async def test_the_detail_block_shows_the_highlighted_row(self, isolated):
-        """The block below the table shows the full prompt as written, not the
-        collapsed one-liner the cell clips."""
+    async def test_the_preview_shows_the_highlighted_row(self, isolated):
+        """The preview mode shows the full prompt as written, not the collapsed
+        one-liner the cell clips."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1821,16 +1850,14 @@ class TestCronTable:
                 self._snap([self._job("digest", detail="summarise\nmy inbox")]),
                 self._status("running"),
             )
+            screen._refresh_bottom(force_reload=True)
             await pilot.pause()
-            header = app.screen.query_one("#cron-detail-header", Static)
-            rendered = _pane_text(app, "#cron-detail")
-            # Inside the run_test block: display reverts to the CSS default
-            # (none) when the app shuts down.
-            assert header.display
-            assert "digest" in str(header.content)
-            assert "summarise\nmy inbox" in rendered
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+            rendered = _pane_text(app, "#preview-view")
+        assert "digest" in header
+        assert "summarise\nmy inbox" in rendered
 
-    async def test_the_detail_block_follows_the_cursor(self, isolated):
+    async def test_the_preview_follows_the_cursor(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1845,13 +1872,11 @@ class TestCronTable:
             table = app.screen.query_one("#cron-entries", DataTable)
             table.move_cursor(row=1)
             await pilot.pause()
-            rendered = _pane_text(app, "#cron-detail")
+            rendered = _pane_text(app, "#preview-view")
         assert "prompt b" in rendered
         assert "prompt a" not in rendered
 
-    async def test_the_detail_block_hides_when_nothing_is_highlighted(self, isolated):
-        """An empty schedule leaves the block hidden so the log row keeps the
-        space."""
+    async def test_an_empty_schedule_has_nothing_to_preview(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1863,15 +1888,15 @@ class TestCronTable:
             )
             await pilot.pause()
             screen._refresh_cron(self._snap([]), self._status("running"))
+            screen._refresh_bottom()
             await pilot.pause()
-            header = app.screen.query_one("#cron-detail-header", Static)
-            pane = app.screen.query_one("#cron-detail", RichLog)
-        assert not header.display
-        assert not pane.display
+            rendered = _pane_text(app, "#preview-view")
+            assert "preview" in screen._unavailable_modes()
+        assert "nothing to preview" in rendered
 
-    async def test_the_detail_block_is_not_rewritten_when_unchanged(self, isolated):
-        """The 1Hz refresh must not repaint the block every tick; a rewrite
-        would clear the pane, so a clear that raises proves the skip."""
+    async def test_the_preview_is_not_rewritten_when_unchanged(self, isolated):
+        """The 1Hz refresh must not repaint the pane every tick; a rewrite
+        clears it, so a clear that raises proves the skip."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1881,15 +1906,18 @@ class TestCronTable:
                 self._snap([self._job("digest", detail="summarise")]),
                 self._status("running"),
             )
+            screen._refresh_bottom(force_reload=True)
             await pilot.pause()
-            pane = app.screen.query_one("#cron-detail", RichLog)
+            pane = app.screen.query_one("#preview-view", RichLog)
             pane.clear = lambda: (_ for _ in ()).throw(AssertionError("rewritten"))  # type: ignore[method-assign]
-            screen._refresh_cron_detail()
+            screen._refresh_bottom()
 
-    async def test_the_detail_block_hides_for_a_row_without_detail(self, isolated):
+    async def test_a_row_the_snapshot_does_not_know_has_nothing_to_preview(
+        self, isolated
+    ):
         """Defensive: a highlighted row the snapshot knows nothing about (it
-        can only appear by hand-editing the table) hides the block, even when
-        it was showing another job's prompt."""
+        can only appear by hand-editing the table) reports no preview, even
+        when the pane was showing another entry's prompt."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1906,11 +1934,10 @@ class TestCronTable:
             table.add_row("orphan-b", "", "", "", key="orphan-b")
             await pilot.pause()
             table.move_cursor(row=1)
+            screen._refresh_bottom()
             await pilot.pause()
-            header = app.screen.query_one("#cron-detail-header", Static)
-            pane = app.screen.query_one("#cron-detail", RichLog)
-        assert not header.display
-        assert not pane.display
+            rendered = _pane_text(app, "#preview-view")
+        assert "nothing to preview" in rendered
 
     async def test_the_header_shows_the_job_count(self, isolated):
         app = _Host()
@@ -1959,12 +1986,11 @@ class TestCronTable:
             await pilot.pause()
             assert screen._cron_sort == "next"
 
-    async def test_the_cron_table_leaves_room_for_the_detail_block(self, isolated):
-        """A long entry list must not push the prompt preview off the panel.
-
-        The table is the panel's flexible child, so it scrolls instead of
-        growing; the detail block below it stays on screen.
-        """
+    async def test_a_long_entry_list_does_not_push_the_viewport_off_screen(
+        self, isolated
+    ):
+        """The table is the panel's flexible child, so it scrolls instead of
+        growing, and the bottom viewport stays on screen below it."""
         app = _Host()
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
@@ -1976,13 +2002,13 @@ class TestCronTable:
             ]
             screen._refresh_cron(self._snap(jobs), self._status("running"))
             await pilot.pause()
-            panel = app.screen.query_one("#cron-panel")
+            body = app.screen.query_one("#dashboard-body")
             table = app.screen.query_one("#cron-entries", DataTable)
-            detail = app.screen.query_one("#cron-detail", RichLog)
-            assert detail.display
-            assert detail.region.height > 0
-            assert detail.region.bottom <= panel.region.bottom
-            assert table.region.bottom <= detail.region.y
+            viewport = app.screen.query_one("#preview-view", RichLog)
+            assert viewport.display
+            assert viewport.region.height > 0
+            assert viewport.region.bottom <= body.region.bottom
+            assert table.region.bottom <= viewport.region.y
 
     async def test_a_scrolled_table_stays_put_across_a_refresh(self, isolated):
         """`clear()` drops the scroll offset and the cursor restore scrolls
@@ -2012,8 +2038,8 @@ class TestCronTable:
     async def test_a_short_entry_list_keeps_the_table_at_its_content_height(
         self, isolated
     ):
-        """The flexible table is capped at the rows it has, so two entries
-        don't paint a half-screen of empty zebra stripes."""
+        """The table sizes to its rows, so two entries don't paint a half-screen
+        of empty zebra stripes."""
         app = _Host()
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
@@ -2023,8 +2049,12 @@ class TestCronTable:
             screen._refresh_cron(self._snap(jobs), self._status("running"))
             await pilot.pause()
             table = app.screen.query_one("#cron-entries", DataTable)
-            # 2 rows + the column header.
-            assert table.region.height == 3
+            panel = app.screen.query_one("#cron-panel")
+            # 2 rows, the column header, and the scrollbar row the table keeps
+            # for its overflowing prompt column. Asserted as a bound rather
+            # than an exact number: what matters is that it tracks the rows.
+            assert table.region.height <= len(jobs) + 2
+            assert table.region.height < panel.region.height
 
     async def test_name_sort_orders_the_table(self, isolated):
         """The snapshot arrives sorted by next fire; the name order is a

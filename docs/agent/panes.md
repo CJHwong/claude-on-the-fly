@@ -156,9 +156,10 @@ at the same time; `codex.mode: native` gives up only what broke.
 ## The bottom viewport and its modes
 
 The dashboard's bottom row is one viewport, not two panes side by side. It shows the
-daemon **log** or the highlighted row's **live** output, and `v` cycles between them.
-Only the active mode is displayed, and `_refresh_bottom` refreshes only that one: a
-hidden log is not read at all.
+daemon **log**, the highlighted row's **live** output, or a **preview** of what that row
+runs. `v` cycles; `p` jumps to the preview and back to where you were. Only the active
+mode is displayed, and `_refresh_bottom` refreshes only that one: a hidden log is not
+read at all.
 
 Half a terminal each is what this replaced. Both panes tailed a file every second
 whether or not anyone was reading them, and neither was wide enough to read.
@@ -166,8 +167,8 @@ whether or not anyone was reading them, and neither was wide enough to read.
 Three things follow:
 
 - **The mode is per tab, and remembered.** A tab that shows runs opens on `live`; the
-  cron tab opens on `log`, which is where a fire reports itself. The operator's own
-  choice wins from then on, for that tab, for the session.
+  cron tab opens on `preview`, which is what an operator reads a schedule for. The
+  operator's own choice wins from then on, for that tab, for the session.
 - **A mode owns the viewport, so it never hides itself.** The live view used to hide its
   column when nothing was highlighted. It now says nothing is highlighted, and the mode
   strip dims `live` — a dimmed mode is still reachable, it just has nothing behind it.
@@ -175,6 +176,12 @@ Three things follow:
   (`_set_bottom_label`); `_paint_bottom_header` draws the strip around it once per
   refresh. A mode that returns early — nothing appended since the last tick — still gets
   its label redrawn when the availability of another mode changes.
+
+`_preview_subject` and `_preview_text` are deliberately split. The mode strip asks the
+first one every tick to decide whether to dim `preview`, so it resolves the highlighted
+row to a name and reads nothing; only the refresh asks for the text. Keep it that way
+when you add a preview source — an availability check that opens a file is a file opened
+once a second to grey out one word.
 
 Writes to a mode that is not displayed are safe but pointless: `RichLog` defers every
 write until it knows its size and flushes on the first layout. That is why `_set_mode`

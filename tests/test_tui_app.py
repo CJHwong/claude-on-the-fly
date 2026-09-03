@@ -370,6 +370,7 @@ class TestDashboardLayout:
             "u",
             "d",
             "c",
+            "p",
             "R",
             "K",
             "U",

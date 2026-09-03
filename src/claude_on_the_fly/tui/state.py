@@ -80,11 +80,14 @@ class JobInfo:
     cron: str
     kind: str  # "prompt" | "producer" | "command"
     next_fire: datetime
-    # The full text of what this job runs, for the cron table's detail block:
-    # the command when there is one, else the prompt text, else the
-    # prompt_file path. Kept raw (newlines intact); the table cell collapses
-    # whitespace at display time.
+    # One line for the table cell: the command when there is one, else the
+    # prompt text, else the prompt_file path. Kept raw (newlines intact); the
+    # cell collapses whitespace at display time.
     detail: str = ""
+    # Everything this entry runs, for the bottom viewport's preview mode: the
+    # command and the prompt as separate sections, with a prompt file's own
+    # text inlined. See `_job_preview`.
+    preview: str = ""
 
 
 @dataclass(frozen=True)
@@ -341,19 +344,84 @@ def _jobs_queue_view() -> JobsQueueView | None:
 
 
 def _job_detail(entry: CronEntry) -> str:
-    """The full text of what this job runs, for the cron table's detail block.
+    """What this job runs, in one line, for the cron table's cell.
 
     The command when there is one (a producer's prompt is the template applied
     to each item the command lists; the command is what distinguishes it),
-    else the prompt text, else the prompt_file path. Kept raw — the table
-    cell collapses whitespace at display time, and the detail block shows the
-    text as written.
+    else the prompt text, else the prompt_file path. Kept raw — the cell
+    collapses whitespace at display time.
     """
     return (
         entry.command
         or entry.prompt
         or (str(entry.prompt_file) if entry.prompt_file else "")
     )
+
+
+# Longest prompt-file text the preview shows. A prompt is a brief, not a data
+# file; a runaway one belongs in an editor rather than in a 1Hz dashboard pane.
+PREVIEW_MAX_CHARS = 8192
+
+# path -> (mtime, size, text). cron re-reads a prompt file on every fire, so
+# the preview has to show what the next fire would use rather than what the
+# file said at config load. The dashboard asks at 1Hz, hence the memo: an
+# unchanged file costs one stat() a tick.
+_prompt_file_cache: dict[Path, tuple[float, int, str]] = {}
+
+
+def _read_prompt_file(path: Path) -> str:
+    """A prompt file's text for the preview, or the reason it cannot be read.
+
+    A read failure is not cached: config load already refused a missing file,
+    so this is a file deleted or chmod'd since, and fixing it has to show up on
+    the next tick.
+    """
+    try:
+        stat = path.stat()
+        cached = _prompt_file_cache.get(path)
+        if (
+            cached is not None
+            and cached[0] == stat.st_mtime
+            and cached[1] == stat.st_size
+        ):
+            return cached[2]
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"[cannot read: {exc.strerror or exc}]"
+    if len(text) > PREVIEW_MAX_CHARS:
+        text = (
+            text[:PREVIEW_MAX_CHARS]
+            + f"\n\n[truncated at {PREVIEW_MAX_CHARS} characters]"
+        )
+    _prompt_file_cache[path] = (stat.st_mtime, stat.st_size, text)
+    return text
+
+
+def _job_preview(entry: CronEntry) -> str:
+    """Everything this entry runs, for the preview mode.
+
+    A producer is a command *and* a prompt, and the table cell can only show
+    one of them, so the preview shows both as labelled sections. A prompt file
+    is inlined under its path: the path alone answers "where", never "what".
+
+    A section is labelled only when the label adds something — an entry with
+    just a prompt, or just a command, reads as its own text and nothing else.
+    """
+    prompt = ""
+    if entry.prompt_file is not None:
+        prompt = (
+            f"--- prompt ({entry.prompt_file}) ---\n"
+            f"{_read_prompt_file(entry.prompt_file)}"
+        )
+    elif entry.prompt is not None:
+        prompt = (
+            entry.prompt if entry.command is None else f"--- prompt ---\n{entry.prompt}"
+        )
+    if entry.command is None:
+        return prompt
+    if not prompt:
+        return entry.command
+    return f"--- command ---\n{entry.command}\n\n{prompt}"
 
 
 def _jobs_from_schedule(
@@ -375,6 +443,7 @@ def _jobs_from_schedule(
             kind=s.kind,
             next_fire=cron_next_fire(s.cron, local_now),
             detail=_job_detail(s),
+            preview=_job_preview(s),
         )
         for s in specs
     ]

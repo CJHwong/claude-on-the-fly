@@ -228,8 +228,8 @@ class TestJobs:
         assert snap.jobs[0].detail == "~/scripts/prune.sh --verbose"
 
     def test_job_detail_keeps_the_prompt_text(self, tmp_path, empty_state, alive_check):
-        """The detail block shows the prompt as written (newlines intact); the
-        table cell collapses whitespace at display time."""
+        """The preview shows the prompt as written (newlines intact); the table
+        cell collapses whitespace at display time."""
         schedule = tmp_path / "cron.yaml"
         _write_schedule(
             schedule,
@@ -247,9 +247,7 @@ class TestJobs:
     def test_job_detail_shows_the_prompt_file_path(
         self, tmp_path, empty_state, alive_check
     ):
-        """The file is not read per tick (a fire happens at most once a minute;
-        the table refreshes every second) — the path is what the operator needs
-        to see."""
+        """The cell names the file. Its contents are the preview's job."""
         prompt_file = tmp_path / "prompts" / "digest.md"
         prompt_file.parent.mkdir()
         prompt_file.write_text("summarise my inbox")
@@ -270,7 +268,7 @@ class TestJobs:
     def test_job_detail_keeps_a_long_prompt_in_full(
         self, tmp_path, empty_state, alive_check
     ):
-        """The detail block shows the whole prompt; only the table cell clips."""
+        """The preview shows the whole prompt; only the table cell clips."""
         schedule = tmp_path / "cron.yaml"
         _write_schedule(
             schedule,
@@ -278,6 +276,182 @@ class TestJobs:
         )
         snap = snapshot(empty_state, schedule, process_check=alive_check)
         assert snap.jobs[0].detail == "x" * 500
+
+
+class TestJobPreview:
+    """What the bottom viewport's preview mode shows for a cron entry."""
+
+    def test_a_plain_prompt_is_its_own_preview(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """One section needs no label to say what it is."""
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt": "summarise\nmy inbox"}],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.jobs[0].preview == "summarise\nmy inbox"
+
+    def test_a_bare_command_is_its_own_preview(
+        self, tmp_path, empty_state, alive_check
+    ):
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "prune", "cron": "0 4 * * *", "command": "prune.sh"}],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.jobs[0].preview == "prune.sh"
+
+    def test_a_producer_shows_the_command_and_the_prompt(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """The cell can only hold one of the two, and the command is the one it
+        keeps. The preview is where the prompt template is readable."""
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [
+                {
+                    "name": "jira",
+                    "cron": "*/5 * * * *",
+                    "command": "acli jira search | jq -c '.[]'",
+                    "prompt": "work on {{ item.key }}",
+                },
+            ],
+        )
+        preview = (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        assert preview == (
+            "--- command ---\nacli jira search | jq -c '.[]'\n\n"
+            "--- prompt ---\nwork on {{ item.key }}"
+        )
+
+    def test_a_prompt_file_is_inlined_under_its_path(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """The path answers "where", never "what"."""
+        prompt_file = tmp_path / "digest.md"
+        prompt_file.write_text("summarise my inbox")
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt_file": str(prompt_file)}],
+        )
+        preview = (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        assert preview == f"--- prompt ({prompt_file}) ---\nsummarise my inbox"
+
+    def test_an_edited_prompt_file_shows_its_new_text(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """cron re-reads the file on every fire, so the preview has to show what
+        the next fire would use — not what the file said at config load."""
+        prompt_file = tmp_path / "digest.md"
+        prompt_file.write_text("first")
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt_file": str(prompt_file)}],
+        )
+        first = (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        prompt_file.write_text("second, longer")
+        second = (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        assert "first" in first
+        assert "second, longer" in second
+
+    def test_an_unchanged_prompt_file_is_read_once(
+        self, tmp_path, empty_state, alive_check, monkeypatch
+    ):
+        """The dashboard asks at 1Hz; re-reading a file nothing touched is a
+        cost paid every second for the same bytes."""
+        prompt_file = tmp_path / "digest.md"
+        prompt_file.write_text("summarise")
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt_file": str(prompt_file)}],
+        )
+        snapshot(empty_state, schedule, process_check=alive_check)
+
+        reads: list[Path] = []
+        original = Path.read_text
+
+        def counting_read_text(self, *args, **kwargs):
+            reads.append(self)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", counting_read_text)
+        snapshot(empty_state, schedule, process_check=alive_check)
+        assert prompt_file not in reads
+
+    def test_a_long_prompt_file_is_truncated(self, tmp_path, empty_state, alive_check):
+        """A prompt is a brief, not a data file. A runaway one belongs in an
+        editor rather than in a pane repainted every second."""
+        from claude_on_the_fly.tui.state import PREVIEW_MAX_CHARS
+
+        prompt_file = tmp_path / "digest.md"
+        prompt_file.write_text("x" * (PREVIEW_MAX_CHARS + 100))
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt_file": str(prompt_file)}],
+        )
+        preview = (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        assert f"[truncated at {PREVIEW_MAX_CHARS} characters]" in preview
+        assert preview.count("x") == PREVIEW_MAX_CHARS
+
+    def test_a_prompt_file_that_vanished_says_why(
+        self, tmp_path, empty_state, alive_check
+    ):
+        """Config load already refused a missing file, so this is one deleted
+        since. The operator sees the entry is broken before it fires."""
+        prompt_file = tmp_path / "digest.md"
+        prompt_file.write_text("summarise")
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt_file": str(prompt_file)}],
+        )
+        snapshot(empty_state, schedule, process_check=alive_check)
+        prompt_file.unlink()
+        preview = (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        assert "[cannot read:" in preview
+
+    def test_a_read_failure_is_not_cached(self, tmp_path, empty_state, alive_check):
+        """Fixing the file has to show up on the next tick.
+
+        The config is loaded while the file exists, because load refuses an
+        entry whose prompt_file is already missing. What this covers is the
+        file disappearing under a schedule that is loaded and cached.
+        """
+        prompt_file = tmp_path / "digest.md"
+        prompt_file.write_text("summarise")
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [{"name": "digest", "cron": "0 9 * * *", "prompt_file": str(prompt_file)}],
+        )
+        snapshot(empty_state, schedule, process_check=alive_check)
+        prompt_file.unlink()
+        assert "[cannot read:" in (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
+        prompt_file.write_text("back again")
+        assert "back again" in (
+            snapshot(empty_state, schedule, process_check=alive_check).jobs[0].preview
+        )
 
 
 # ---------------------------------------------------------------------------

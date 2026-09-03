@@ -78,7 +78,8 @@ class ClaudeTuiApp(App):
         height: auto;
     }
     #dashboard-body #log-pane,
-    #dashboard-body #live-view {
+    #dashboard-body #live-view,
+    #dashboard-body #preview-view {
         height: 1fr;
         min-height: 8;
         border: solid grey;

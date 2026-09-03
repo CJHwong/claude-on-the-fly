@@ -96,17 +96,22 @@ LIVE_EVENTS = 80
 LOG_PANE_MAX_LINES = 10_000
 
 # The bottom viewport's modes, in the order `v` cycles them.
-BOTTOM_MODES = ("log", "live")
+BOTTOM_MODES = ("log", "live", "preview")
 # Which mode a tab opens on. A tab that shows runs opens on the run's output;
-# the cron tab opens on the daemon log, which is where a fire reports itself.
-# The operator's own choice wins from then on, per tab, for the session.
+# the cron tab opens on the entry's prompt, which is what an operator reads a
+# schedule for. The operator's own choice wins from then on, per tab, for the
+# session.
 DEFAULT_BOTTOM_MODE: dict[str, str] = {
     "tab-chat": "live",
-    "tab-cron": "log",
+    "tab-cron": "preview",
     "tab-jobs": "live",
 }
 # Mode -> the widget it owns in the bottom viewport.
-_MODE_WIDGETS: dict[str, str] = {"log": "log-pane", "live": "live-view"}
+_MODE_WIDGETS: dict[str, str] = {
+    "log": "log-pane",
+    "live": "live-view",
+    "preview": "preview-view",
+}
 
 # Reactive, user-driven daemons. Demoted to the compact strip so the
 # autonomous cron engine owns the top of the dashboard.
@@ -198,27 +203,15 @@ class DashboardScreen(Screen):
         height: auto;
         max-height: 100%;
     }
-    /* The cron table is the panel's flexible child: it takes the space the
-       header and the prompt-detail block below it don't need, and scrolls
-       inside that. `height: auto` let a long entry list grow past the panel
-       and push the detail block off the bottom of the screen. */
+    /* Sized to its rows, like the other two tabs' tables. It was `1fr` while
+       a detail block shared the panel with it: the two split the panel's
+       height between them. Alone, `1fr` stretched an empty table over half
+       the screen. The panel's own max-height bounds a long list, which
+       scrolls inside it. */
     #cron-entries {
-        height: 1fr;
+        height: auto;
+        max-height: 100%;
         min-height: 3;
-    }
-    #cron-detail-header, #cron-detail {
-        display: none;
-    }
-    #cron-detail-header {
-        height: auto;
-        padding: 0 0 0 1;
-    }
-    /* Half the panel at most: on a short terminal a fixed 8 rows would leave
-       the flexible table nothing and spill out of the panel again. */
-    #cron-detail {
-        height: auto;
-        max-height: 50%;
-        border: solid grey;
     }
     #action-cue {
         height: auto;
@@ -255,6 +248,7 @@ class DashboardScreen(Screen):
         Binding("u", "resume", "Resume", show=False),
         Binding("d", "app.push_screen('doctor')", "Doctor", show=False),
         Binding("c", "copy_log", "Copy tail", show=False),
+        Binding("p", "preview", "Preview", show=False),
         Binding("R", "refresh_now", "Refresh", show=False),
         Binding("K", "stop_all", "Stop all", show=False),
         Binding("U", "upgrade", "Upgrade", show=False),
@@ -287,7 +281,8 @@ class DashboardScreen(Screen):
         "Takeover": "copy the highlighted run's resume command (chat / jobs tab)",
         "Attach": "copy the tmux attach command for the highlighted run's live turn (chat / jobs tab)",
         "Sort": "toggle the cron table between next-fire and name order (cron tab)",
-        "View": "switch the bottom viewport between the daemon log and the highlighted run's live output",
+        "View": "cycle the bottom viewport: daemon log, the highlighted row's live output, what it runs",
+        "Preview": "jump the bottom viewport to what the highlighted row runs, and back",
         "chat tab": "switch to the chat tab",
         "cron tab": "switch to the cron tab",
         "jobs tab": "switch to the background-jobs tab",
@@ -344,16 +339,19 @@ class DashboardScreen(Screen):
         self._job_sessions: dict[str, str] = {}
         self._chat_workspaces: dict[str, str] = {}
         self._job_workspaces: dict[str, Path] = {}
-        # job name → raw detail text, rebuilt every tick from the snapshot.
-        # The detail block reads from here, not from the table cell, which
-        # holds the whitespace-collapsed one-liner.
-        self._cron_details: dict[str, str] = {}
+        # cron entry name → its full preview text, rebuilt every tick from the
+        # snapshot. The preview mode reads from here, not from the table cell,
+        # which holds a whitespace-collapsed one-liner of the command alone.
+        self._cron_previews: dict[str, str] = {}
         # Cron table order: "next" (the snapshot's natural order) or "name".
         # `s` toggles; the header names the current mode.
         self._cron_sort: Literal["next", "name"] = "next"
-        # (job name, detail) last shown in the cron detail block, so the 1Hz
-        # refresh skips the rewrite when the selection hasn't changed.
-        self._cron_detail_shown: tuple[str, str] | None = None
+        # (subject, text) last written to the preview, so the 1Hz refresh
+        # skips the rewrite when neither has changed.
+        self._preview_shown: tuple[str, str] | None = None
+        # The mode the operator was in when `p` jumped to preview, so pressing
+        # it again goes back rather than cycling on.
+        self._mode_before_preview: dict[str, str] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
         # Which daemon the lifecycle keys + log row follow for the cron /
@@ -388,15 +386,6 @@ class DashboardScreen(Screen):
                     yield DataTable(
                         id="cron-entries", cursor_type="row", zebra_stripes=True
                     )
-                    # The highlighted row's full prompt/command, wrapped —
-                    # the table cell only shows a clipped one-liner.
-                    yield Static(id="cron-detail-header", markup=True)
-                    yield RichLog(
-                        id="cron-detail",
-                        wrap=True,
-                        highlight=False,
-                        markup=False,
-                    )
                 # `jobs-queue`, NOT `cron-entries` — the latter is already the
                 # cron tab's cron table above.
                 with (
@@ -429,6 +418,19 @@ class DashboardScreen(Screen):
                     markup=True,
                     auto_scroll=False,  # scroll driven via render.apply_scroll
                     max_lines=LOG_PANE_MAX_LINES,
+                )
+                # The highlighted row's input, wrapped. Operator-written
+                # text, so markup is off: a prompt saying `[pytest]` is a
+                # prompt saying `[pytest]`, not a closing tag.
+                yield RichLog(
+                    id="preview-view",
+                    wrap=True,
+                    highlight=False,
+                    markup=False,
+                    # Read from the top. A prompt's first line is its subject,
+                    # and auto-scrolling to the end of a producer's preview
+                    # hides the command section that explains the prompt.
+                    auto_scroll=False,
                 )
             yield Static(id="status-line", markup=True)
             yield Static(id="action-cue", markup=True)
@@ -480,7 +482,7 @@ class DashboardScreen(Screen):
         # scrolls it) and the Run-now button (its keyboard path is `n`).
         self.query_one("#log-pane", RichLog).can_focus = False
         self.query_one("#live-view", RichLog).can_focus = False
-        self.query_one("#cron-detail", RichLog).can_focus = False
+        self.query_one("#preview-view", RichLog).can_focus = False
         self._apply_mode()
         self._refresh()
         self.set_interval(1.0, self._refresh)
@@ -733,8 +735,6 @@ class DashboardScreen(Screen):
         # hits the mtime guard and no-ops instead of rewriting 200+ lines.
         self._refresh_bottom()
         self._update_action_cue()
-        if event.data_table.id == "cron-entries":
-            self._refresh_cron_detail()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         # Tabbing between zones changes which daemon the lifecycle keys target.
@@ -1220,6 +1220,23 @@ class DashboardScreen(Screen):
         modes = BOTTOM_MODES
         self._set_mode(modes[(modes.index(self._mode()) + 1) % len(modes)])
 
+    def action_preview(self) -> None:
+        """Jump to the preview, or back where you came from (bound to `p`).
+
+        A jump rather than another step through the cycle: reading what a row
+        runs is a glance, and the mode you were in is the one you want back.
+        """
+        tab = self._active_tab()
+        if self._mode() == "preview":
+            self._set_mode(
+                self._mode_before_preview.pop(
+                    tab, DEFAULT_BOTTOM_MODE.get(tab, BOTTOM_MODES[0])
+                )
+            )
+            return
+        self._mode_before_preview[tab] = self._mode()
+        self._set_mode("preview")
+
     def _unavailable_modes(self) -> set[str]:
         """The modes with nothing to show for the current selection, dimmed in
         the strip. The daemon log is always offered: a missing log file is
@@ -1227,6 +1244,8 @@ class DashboardScreen(Screen):
         unavailable = set()
         if self._selected_live_target() is None:
             unavailable.add("live")
+        if self._preview_subject() is None:
+            unavailable.add("preview")
         return unavailable
 
     def _set_bottom_label(self, label: str) -> None:
@@ -1252,8 +1271,11 @@ class DashboardScreen(Screen):
     def _refresh_bottom(self, *, force_reload: bool = False) -> None:
         """Refresh whichever mode the viewport is showing. The hidden ones are
         not read at all — that is the point of one viewport rather than two."""
-        if self._mode() == "live":
+        mode = self._mode()
+        if mode == "live":
             self._refresh_live_view(force_reload=force_reload)
+        elif mode == "preview":
+            self._refresh_preview(force_reload=force_reload)
         else:
             self._refresh_daemon_log(force_reload=force_reload)
         self._paint_bottom_header()
@@ -1340,6 +1362,47 @@ class DashboardScreen(Screen):
             pane.write(line)
         if not was_bottom:
             render.restore_scroll(pane, prev_y=prev_y)
+
+    def _preview_subject(self) -> str | None:
+        """What the preview would describe for the current selection, or None.
+
+        Cheap by contract: the mode strip asks this every tick to decide
+        whether to dim `preview`, so it resolves a row to a name and reads no
+        files.
+        """
+        if self._active_daemon() == "cron":
+            job = self._selected_job()
+            return None if job is None or job == "__empty__" else job
+        return None
+
+    def _preview_text(self, subject: str) -> str:
+        """The full text `subject` runs. Empty when there is nothing to show."""
+        return self._cron_previews.get(subject, "")
+
+    def _refresh_preview(self, *, force_reload: bool) -> None:
+        """Show what the highlighted row runs, as written.
+
+        The source text, never a rendering: a cron prompt is a Liquid template
+        and `{{ item.key }}` is what the operator wrote, so that is what the
+        preview shows. Rewrites are skipped when neither the subject nor the
+        text has changed, so the 1Hz tick does not repaint a static pane.
+        """
+        pane = self.query_one("#preview-view", RichLog)
+        subject = self._preview_subject()
+        text = self._preview_text(subject) if subject is not None else ""
+        if subject is None or not text:
+            if self._preview_shown is not None or force_reload:
+                self._preview_shown = None
+                pane.clear()
+                pane.write(Text("nothing to preview", style="dim"))
+                self._set_bottom_label("[dim]nothing to preview[/dim]")
+            return
+        if (subject, text) == self._preview_shown and not force_reload:
+            return
+        self._preview_shown = (subject, text)
+        self._set_bottom_label(f"[bold]preview: {subject}[/bold]")
+        pane.clear()
+        pane.write(Text(text))
 
     def _selected_live_target(self) -> str | None:
         """What the live mode would follow for the current selection, or None.
@@ -1660,7 +1723,7 @@ class DashboardScreen(Screen):
         table = self.query_one("#cron-entries", DataTable)
         previously = self._selected_job()
         scroll_y = table.scroll_offset.y
-        self._cron_details = {job.name: job.detail for job in jobs}
+        self._cron_previews = {job.name: job.preview for job in jobs}
         table.clear()
         keys: list[str] = []
         running = _running_by_entry(snap.jobs_queue)
@@ -1704,49 +1767,7 @@ class DashboardScreen(Screen):
             )
         else:
             self._restore_cursor(table, keys, previously, scroll_y)
-        # The table is `height: 1fr`, so it fills the panel and scrolls once the
-        # list outgrows it — that is what keeps the detail block below it on
-        # screen. Capping it at the rows it actually has (+1 for the column
-        # header) stops a two-entry list painting half a screen of empty zebra
-        # stripes, the one thing `height: auto` was doing well.
-        table.styles.max_height = table.row_count + 1
         self._resize_flex_column(table, PROMPT_COLUMN, auto_label="name")
-        self._refresh_cron_detail()
-
-    def _refresh_cron_detail(self) -> None:
-        """Show the highlighted cron row's full prompt/command in the detail
-        block below the table; hide the block when nothing is highlighted.
-
-        The block shows the raw text (newlines intact), unlike the table cell
-        which collapses whitespace to one line. Rewrites are skipped when the
-        selection and text are unchanged, so the 1Hz refresh doesn't repaint
-        the block every tick.
-        """
-        header = self.query_one("#cron-detail-header", Static)
-        pane = self.query_one("#cron-detail", RichLog)
-        job = self._selected_job()
-        if job is None or job == "__empty__":
-            self._cron_detail_shown = None
-            if header.display:
-                header.display = False
-                pane.display = False
-            return
-        detail = self._cron_details.get(job, "")
-        if not detail:
-            self._cron_detail_shown = None
-            if header.display:
-                header.display = False
-                pane.display = False
-            return
-        if (job, detail) == self._cron_detail_shown:
-            return
-        self._cron_detail_shown = (job, detail)
-        header.update(f"[bold]prompt / command: {job}[/bold]")
-        pane.clear()
-        pane.write(Text(detail))
-        if not header.display:
-            header.display = True
-            pane.display = True
 
     def _resize_flex_column(
         self, table: DataTable, label: str, *, auto_label: str | None = None
