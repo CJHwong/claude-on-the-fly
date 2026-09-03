@@ -61,15 +61,25 @@ class Job:
     timeout: float | None = None
     platform: str = "jobs"
     profile: str | None = None
+    # How many tool calls this run has to make to count as a success. 0 means no
+    # floor, which is every job that does not ask for one. It rides on the job
+    # for the reason `timeout` does: the worker runs several jobs concurrently in
+    # one process, so a per-job setting has to travel as a value.
+    min_tool_calls: int = 0
 
 
 @dataclass(frozen=True)
 class Result:
     """Outcome of running a job. `ok` is False for a handled failure; `text` is
-    the agent's reply on success or the error summary on failure."""
+    the agent's reply on success or the error summary on failure.
+
+    `tool_calls` is how many tool calls the run made. A runner that cannot know
+    leaves it at 0, so this stays additive for every existing caller.
+    """
 
     ok: bool
     text: str
+    tool_calls: int = 0
 
 
 @dataclass(frozen=True)

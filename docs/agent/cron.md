@@ -133,6 +133,27 @@ and no prompt, because such an entry runs a shell rather than an agent. It is al
 checked against the profiles defined in `config.yaml` at load, which is the one
 validation here that reads a different file.
 
+`min_tool_calls` follows the same rule for the same reason: a bare command never
+reaches an agent, so a floor on its tool calls would bound nothing.
+
+## A run that did nothing is not a success
+
+A fire that raises is a failure the worker already alerts on. A fire that *answers*
+without acting was not, because the backend returns normally either way. That was
+observed once in 595 fires: a deploy-watch fire replied that a security boundary
+prohibited the check, made zero tool calls, and went down `ok=True` with no alert.
+
+`min_tool_calls` on an entry is the floor. `Response` already carries `tool_counts`,
+so `agent_runner` sums it, puts the total on `Result.tool_calls`, and returns
+`ok=False` when the total is below the entry's floor. That is deliberately all it
+does: the worker already alerts on `not ok` and `LogNotifier` already writes `FAILED`,
+so the floor rides the path a raised error takes instead of adding a second one.
+
+It is off by default and per entry, not global. `sys-codex-reflect` legitimately makes
+zero tool calls on odd ISO weeks and says so, so a blanket check would alert every
+other week. An entry only gets a floor when doing nothing is genuinely a fault for
+that entry.
+
 ## Why a profile change restarts a transcript
 
 `current_backend_key()` is `backend:mode:model` and seeds the session uuid, so a

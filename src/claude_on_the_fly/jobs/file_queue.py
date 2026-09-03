@@ -121,6 +121,7 @@ class FileInboxQueue:
             "timeout": job.timeout,
             "platform": job.platform,
             "profile": job.profile,
+            "min_tool_calls": job.min_tool_calls,
         }
         name = queue_filename(job.id, job.key)
         staging = self._tmp / name
@@ -332,6 +333,7 @@ class FileInboxQueue:
                 timeout=data.get("timeout"),
                 platform=data.get("platform") or "jobs",
                 profile=data.get("profile"),
+                min_tool_calls=data.get("min_tool_calls") or 0,
             )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("jobs: poison job file %s → failed/ (%s)", path.name, exc)
@@ -346,6 +348,11 @@ class FileInboxQueue:
             or not _optional(job.session_key, str)
             or not _optional(job.timeout, int, float)
             or not _optional(job.profile, str)
+            # Not `_optional`: the floor is compared against a count, so a
+            # string here would decide the job's outcome by whatever the
+            # comparison happened to do rather than by the operator's intent.
+            or not isinstance(job.min_tool_calls, int)
+            or isinstance(job.min_tool_calls, bool)
         ):
             logger.warning(
                 "jobs: malformed job %s → failed/ (bad field types)", path.name

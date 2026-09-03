@@ -56,6 +56,16 @@ def test_result_is_frozen() -> None:
         result.ok = False  # type: ignore[misc]
 
 
+def test_result_defaults_to_no_tool_calls() -> None:
+    """The count is additive: a caller that predates it, or a runner with nothing
+    to report, still constructs a Result from `ok` and `text` alone."""
+    assert Result(ok=True, text="done").tool_calls == 0
+
+
+def test_job_defaults_to_no_tool_call_floor() -> None:
+    assert Job(id="j1", prompt="p", origin={}).min_tool_calls == 0
+
+
 def test_origin_is_opaque_passthrough() -> None:
     """Core stores `origin` verbatim; it never reads or reshapes it."""
     origin = {"channel": "C1", "thread_ts": "1699.5", "sender_id": "U9", "n": 3}

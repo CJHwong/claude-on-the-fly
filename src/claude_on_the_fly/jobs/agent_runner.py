@@ -113,6 +113,35 @@ def sweep_run_workspaces(data_dir: Path, *, days: int) -> list[Path]:
     return removed
 
 
+def _apply_tool_call_floor(job: Job, response: agent.Response) -> Result:
+    """The run's Result, failed when it did less work than the entry demands.
+
+    A backend that answers raises nothing, so an agent that refused, or replied
+    without acting, used to be recorded `ok=True` and alerted nobody. Seen once
+    in 595 cron fires: a deploy-watch fire replied that a security boundary
+    prohibited the check, made no tool call, and went down as a success.
+
+    Failing here rather than in the worker is what keeps this to one change. The
+    worker already alerts on `not ok` and the cron log already writes `FAILED`,
+    so the floor rides the path a raised error takes and needs no new plumbing.
+
+    The agent's own text is kept, behind the reason. `_alert_body` truncates from
+    the tail, so a leading line is the part that reaches the alert intact.
+    """
+    tool_calls = sum(response.tool_counts.values())
+    if job.min_tool_calls and tool_calls < job.min_tool_calls:
+        return Result(
+            ok=False,
+            text=(
+                f"Job did nothing: made {tool_calls} tool "
+                f"call{'' if tool_calls == 1 else 's'}, below the floor of "
+                f"{job.min_tool_calls}.\n{response.body}"
+            ),
+            tool_calls=tool_calls,
+        )
+    return Result(ok=True, text=response.body, tool_calls=tool_calls)
+
+
 def _failure_signals(
     workspace: Path,
     session_uuid: str,
@@ -257,7 +286,7 @@ class OrchestratorAgentRunner:
                 # signals the text is byte-identical to what it always was.
                 text = f"Job failed:{notes}\n{exc}" if notes else f"Job failed: {exc}"
                 return Result(ok=False, text=text)
-            return Result(ok=True, text=response.body)
+            return _apply_tool_call_floor(job, response)
         finally:
             self.in_flight.pop(job.id, None)
             if env_token is not None:
