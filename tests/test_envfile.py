@@ -117,7 +117,7 @@ class TestTheViewerAgreesWithTheDaemon:
     def test_a_streaming_session_is_found_not_reported_as_absent(
         self, monkeypatch, tmp_path
     ):
-        """End to end: the watch pane's own lookup over a real JSONL.
+        """End to end: the live view's own lookup over a real JSONL.
 
         `resolve_session_log` returning None is what renders "agent hasn't run
         a turn", so this asserts the exact input to that branch.

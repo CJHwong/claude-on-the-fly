@@ -5,8 +5,8 @@ Layout (top → bottom):
   health badge ([1]–[3] switch key + state glyph) so switching to one zone
   never blinds the operator to the others' state. The chat tab's badge
   aggregates its daemons (broken > running > stopped). The active tab owns
-  the shared log/watch row below.
-- Log row: daemon log (left) + per-entry / per-job watch (right).
+  the shared log/live row below.
+- Log row: daemon log (left) + per-entry / per-job live view (right).
 
 The jobs tab is a read-only observer of the worker's maildir: it renders queue
 depth and the unfinished jobs, and never creates, moves, or writes anything
@@ -22,10 +22,10 @@ their uptime. Finished / failed requests aren't kept here — they live in the
 History overlay (h) and ping a notification when they happen.
 
 Selection model: the active tab decides which daemon the supervisor keys
-(k/r) and the log/watch row act on; tab state is stable across window blur,
+(k/r) and the log/live row act on; tab state is stable across window blur,
 unlike focus. On the chat tab ←/→ pick the frontend (header-owned, always
 visible so a stopped one can still be started), and the highlighted row points
-the watch pane at that job's session. Refresh runs at 1Hz, rebuilding tables
+the live view at that job's session. Refresh runs at 1Hz, rebuilding tables
 from a fresh state.snapshot() while preserving each table's cursor by row key
 and its scroll offset (see _restore_cursor).
 """
@@ -44,7 +44,7 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import (
     DataTable,
@@ -56,13 +56,14 @@ from textual.widgets import (
     TabPane,
 )
 
-from claude_on_the_fly import checks, logs, permissions, tmux, upgrade
+from claude_on_the_fly import checks, logs, permissions, tmux, turns, upgrade
 from claude_on_the_fly.agent import (
     DATA_DIR,
     get_backend,
     resolve_session_log,
 )
 from claude_on_the_fly.cron import request_run_now
+from claude_on_the_fly.jobs import file_queue
 from claude_on_the_fly.tui import (
     env_editor,
     render,
@@ -89,11 +90,29 @@ CRON_CONFIG = DATA_DIR / "cron.yaml"
 # `kind` column already says which of the two a row holds.
 PROMPT_COLUMN = "prompt"
 TAIL_LINES = 200
-# When showing an agent job watch, tail this many raw JSONL events; each
+# When showing a run in the live view, tail this many raw JSONL events; each
 # formats to 1–4 visible lines so the rendered pane stays manageable.
-WATCH_EVENTS = 80
+LIVE_EVENTS = 80
 # Cap on RichLog growth so a 24/7 dashboard doesn't accumulate unbounded memory.
 LOG_PANE_MAX_LINES = 10_000
+
+# The bottom viewport's modes, in the order `v` cycles them.
+BOTTOM_MODES = ("log", "live", "preview")
+# Which mode a tab opens on. A tab that shows runs opens on the run's output;
+# the cron tab opens on the entry's prompt, which is what an operator reads a
+# schedule for. The operator's own choice wins from then on, per tab, for the
+# session.
+DEFAULT_BOTTOM_MODE: dict[str, str] = {
+    "tab-chat": "live",
+    "tab-cron": "preview",
+    "tab-jobs": "live",
+}
+# Mode -> the widget it owns in the bottom viewport.
+_MODE_WIDGETS: dict[str, str] = {
+    "log": "log-pane",
+    "live": "live-view",
+    "preview": "preview-view",
+}
 
 # Reactive, user-driven daemons. Demoted to the compact strip so the
 # autonomous cron engine owns the top of the dashboard.
@@ -185,27 +204,15 @@ class DashboardScreen(Screen):
         height: auto;
         max-height: 100%;
     }
-    /* The cron table is the panel's flexible child: it takes the space the
-       header and the prompt-detail block below it don't need, and scrolls
-       inside that. `height: auto` let a long entry list grow past the panel
-       and push the detail block off the bottom of the screen. */
+    /* Sized to its rows, like the other two tabs' tables. It was `1fr` while
+       a detail block shared the panel with it: the two split the panel's
+       height between them. Alone, `1fr` stretched an empty table over half
+       the screen. The panel's own max-height bounds a long list, which
+       scrolls inside it. */
     #cron-entries {
-        height: 1fr;
+        height: auto;
+        max-height: 100%;
         min-height: 3;
-    }
-    #cron-detail-header, #cron-detail {
-        display: none;
-    }
-    #cron-detail-header {
-        height: auto;
-        padding: 0 0 0 1;
-    }
-    /* Half the panel at most: on a short terminal a fixed 8 rows would leave
-       the flexible table nothing and spill out of the panel again. */
-    #cron-detail {
-        height: auto;
-        max-height: 50%;
-        border: solid grey;
     }
     #action-cue {
         height: auto;
@@ -231,6 +238,7 @@ class DashboardScreen(Screen):
         Binding("r", "restart", "Restart"),
         Binding("n", "run_now", "Run now"),
         Binding("S", "cycle_cron_sort", "Sort"),
+        Binding("v", "cycle_view", "View"),
         Binding("t", "copy_takeover", "Takeover"),
         Binding("a", "attach", "Attach"),
         Binding("question_mark", "help", "Help", key_display="?"),
@@ -241,6 +249,7 @@ class DashboardScreen(Screen):
         Binding("u", "resume", "Resume", show=False),
         Binding("d", "app.push_screen('doctor')", "Doctor", show=False),
         Binding("c", "copy_log", "Copy tail", show=False),
+        Binding("p", "preview", "Preview", show=False),
         Binding("R", "refresh_now", "Refresh", show=False),
         Binding("K", "stop_all", "Stop all", show=False),
         Binding("U", "upgrade", "Upgrade", show=False),
@@ -273,6 +282,8 @@ class DashboardScreen(Screen):
         "Takeover": "copy the highlighted run's resume command (chat / jobs tab)",
         "Attach": "copy the tmux attach command for the highlighted run's live turn (chat / jobs tab)",
         "Sort": "toggle the cron table between next-fire and name order (cron tab)",
+        "View": "cycle the bottom viewport: daemon log, the highlighted row's live output, what it runs",
+        "Preview": "jump the bottom viewport to what the highlighted row runs, and back",
         "chat tab": "switch to the chat tab",
         "cron tab": "switch to the cron tab",
         "jobs tab": "switch to the background-jobs tab",
@@ -302,17 +313,26 @@ class DashboardScreen(Screen):
         # stable by name across refreshes (see _refresh_chat_strip).
         self._chat_selected_idx: int = 0
         # Watch pane state, tracked separately so the two panes refresh
-        # independently. _watch_target encodes what's being watched, e.g.
+        # independently. _live_target encodes what's being watched, e.g.
         # "session:cron:ACE-1" or "cron:cleanup-entry", so we know to
         # force a reload when the user navigates to a different item.
-        self._watch_path: Path | None = None
-        self._watch_mtime: float | None = None
-        self._watch_target: str | None = None
-        # ticket identifier → tracker source (jira | github), so the watch pane
+        self._live_path: Path | None = None
+        self._live_mtime: float | None = None
+        self._live_target: str | None = None
+        # Which mode the bottom viewport shows, per tab. Only the active mode
+        # is displayed and only it refreshes, so a hidden log costs nothing.
+        self._bottom_mode: dict[str, str] = dict(DEFAULT_BOTTOM_MODE)
+        # The active mode's own header text, kept here rather than written
+        # straight to the Static: the mode strip is painted around it once per
+        # refresh, so a mode that returns early still gets its label redrawn
+        # when the strip beside it changes.
+        self._bottom_label: str = ""
+        self._bottom_header_shown: str | None = None
+        # ticket identifier → tracker source (jira | github), so the live view
         # resolves the per-tracker workspace dir.
-        # "<frontend>:<identifier>" → session_uuid for the watch pane.
+        # "<frontend>:<identifier>" → session_uuid for the live view.
         # Chat rows key on the unique chat_id (workspace_name is not unique
-        # across concurrent jobs), so the watch pane needs the workspace name
+        # across concurrent jobs), so the live view needs the workspace name
         # resolved separately: "<frontend>:<chat_id>" → workspace_name.
         # Jobs rows carry the full workspace path from the worker's heartbeat
         # (their workspaces are not under the chat convention), so that gets
@@ -320,16 +340,27 @@ class DashboardScreen(Screen):
         self._job_sessions: dict[str, str] = {}
         self._chat_workspaces: dict[str, str] = {}
         self._job_workspaces: dict[str, Path] = {}
-        # job name → raw detail text, rebuilt every tick from the snapshot.
-        # The detail block reads from here, not from the table cell, which
-        # holds the whitespace-collapsed one-liner.
-        self._cron_details: dict[str, str] = {}
+        # cron entry name → its full preview text, rebuilt every tick from the
+        # snapshot. The preview mode reads from here, not from the table cell,
+        # which holds a whitespace-collapsed one-liner of the command alone.
+        self._cron_previews: dict[str, str] = {}
         # Cron table order: "next" (the snapshot's natural order) or "name".
         # `s` toggles; the header names the current mode.
         self._cron_sort: Literal["next", "name"] = "next"
-        # (job name, detail) last shown in the cron detail block, so the 1Hz
-        # refresh skips the rewrite when the selection hasn't changed.
-        self._cron_detail_shown: tuple[str, str] | None = None
+        # (subject, text) last written to the preview, so the 1Hz refresh
+        # skips the rewrite when neither has changed.
+        self._preview_shown: tuple[str, str] | None = None
+        # job id -> its prompt in full, read once per job. A job's prompt is
+        # written at enqueue and never changes, so the read is a one-off. The
+        # map is pruned against the queue listing on every refresh, so a job
+        # that finished takes its entry with it.
+        self._job_prompts: dict[str, str] = {}
+        # job id -> the opaque origin dict the producer attached, so the
+        # preview can name who asked for the job. Rebuilt from the listing.
+        self._job_origins: dict[str, dict] = {}
+        # The mode the operator was in when `p` jumped to preview, so pressing
+        # it again goes back rather than cycling on.
+        self._mode_before_preview: dict[str, str] = {}
         self._busy_msg: str | None = None
         self._busy_ticks: int = 0
         # Which daemon the lifecycle keys + log row follow for the cron /
@@ -345,7 +376,7 @@ class DashboardScreen(Screen):
             # One tab per daemon zone — chat first, then the two autonomous
             # engines. The tab title carries the at-a-glance health (badge set
             # in _refresh_tab_badges) so switching to one daemon never blinds
-            # the operator to the others' state. The shared log/watch row below
+            # the operator to the others' state. The shared log/live row below
             # follows the active tab.
             with TabbedContent(id="daemon-tabs"):
                 with (
@@ -364,15 +395,6 @@ class DashboardScreen(Screen):
                     yield DataTable(
                         id="cron-entries", cursor_type="row", zebra_stripes=True
                     )
-                    # The highlighted row's full prompt/command, wrapped —
-                    # the table cell only shows a clipped one-liner.
-                    yield Static(id="cron-detail-header", markup=True)
-                    yield RichLog(
-                        id="cron-detail",
-                        wrap=True,
-                        highlight=False,
-                        markup=False,
-                    )
                 # `jobs-queue`, NOT `cron-entries` — the latter is already the
                 # cron tab's cron table above.
                 with (
@@ -383,28 +405,42 @@ class DashboardScreen(Screen):
                     yield DataTable(
                         id="jobs-queue", cursor_type="row", zebra_stripes=True
                     )
-            with Horizontal(id="log-row"):
-                with Vertical(id="log-daemon-col"):
-                    yield Static(id="log-header", markup=True)
-                    yield RichLog(
-                        id="log-pane",
-                        wrap=False,
-                        highlight=False,
-                        # Scroll is driven explicitly per refresh (render.apply_scroll)
-                        # so a live update doesn't yank a reader who scrolled up.
-                        auto_scroll=False,
-                        max_lines=LOG_PANE_MAX_LINES,
-                    )
-                with Vertical(id="log-watch-col"):
-                    yield Static(id="watch-header", markup=True)
-                    yield RichLog(
-                        id="watch-pane",
-                        wrap=False,
-                        highlight=False,
-                        markup=True,
-                        auto_scroll=False,  # scroll driven via render.apply_scroll
-                        max_lines=LOG_PANE_MAX_LINES,
-                    )
+            # One viewport, not two panes side by side. The daemon log and a
+            # run's own output are rarely read in the same moment, and half a
+            # terminal each made both unreadable. `v` cycles the mode; only the
+            # active mode is displayed, and only it refreshes.
+            with Vertical(id="bottom-row"):
+                yield Static(id="bottom-header", markup=True)
+                yield RichLog(
+                    id="log-pane",
+                    wrap=False,
+                    highlight=False,
+                    # Scroll is driven explicitly per refresh (render.apply_scroll)
+                    # so a live update doesn't yank a reader who scrolled up.
+                    auto_scroll=False,
+                    max_lines=LOG_PANE_MAX_LINES,
+                )
+                yield RichLog(
+                    id="live-view",
+                    wrap=False,
+                    highlight=False,
+                    markup=True,
+                    auto_scroll=False,  # scroll driven via render.apply_scroll
+                    max_lines=LOG_PANE_MAX_LINES,
+                )
+                # The highlighted row's input, wrapped. Operator-written
+                # text, so markup is off: a prompt saying `[pytest]` is a
+                # prompt saying `[pytest]`, not a closing tag.
+                yield RichLog(
+                    id="preview-view",
+                    wrap=True,
+                    highlight=False,
+                    markup=False,
+                    # Read from the top. A prompt's first line is its subject,
+                    # and auto-scrolling to the end of a producer's preview
+                    # hides the command section that explains the prompt.
+                    auto_scroll=False,
+                )
             yield Static(id="status-line", markup=True)
             yield Static(id="action-cue", markup=True)
         yield Footer()
@@ -454,11 +490,12 @@ class DashboardScreen(Screen):
         # that tab's table. Same for the cron detail block (mouse wheel still
         # scrolls it) and the Run-now button (its keyboard path is `n`).
         self.query_one("#log-pane", RichLog).can_focus = False
-        self.query_one("#watch-pane", RichLog).can_focus = False
-        self.query_one("#cron-detail", RichLog).can_focus = False
+        self.query_one("#live-view", RichLog).can_focus = False
+        self.query_one("#preview-view", RichLog).can_focus = False
+        self._apply_mode()
         self._refresh()
         self.set_interval(1.0, self._refresh)
-        self.set_interval(1.0, self._refresh_log)
+        self.set_interval(1.0, self._refresh_bottom)
         self.set_interval(0.1, self._tick_busy)
         # Land focus on the chat strip (the chat tab is active first), so the
         # highlighted chat daemon is the default supervisor target.
@@ -549,7 +586,7 @@ class DashboardScreen(Screen):
         else:
             return
         self._refresh()
-        self._refresh_log(force_reload=True)
+        self._refresh_bottom(force_reload=True)
         self._update_action_cue()
 
     def action_show_tab(self, tab_id: str) -> None:
@@ -563,12 +600,14 @@ class DashboardScreen(Screen):
         self, event: TabbedContent.TabActivated
     ) -> None:
         """Switching tabs changes the active daemon: land focus on the new tab's
-        table and repoint the shared log/watch row + action cue."""
+        table and repoint the shared log/live row + action cue."""
         active = event.tabbed_content.active
         table_id = self._TAB_TABLES.get(active, "chat-strip")
         with contextlib.suppress(Exception):
             self.query_one(f"#{table_id}", DataTable).focus()
-        self._refresh_log(force_reload=True)
+        # Each tab remembers its own mode, so the viewport follows the tab.
+        self._apply_mode()
+        self._refresh_bottom(force_reload=True)
         self._update_action_cue()
         # The footer offers the active tab's actions, so it has to be rebuilt
         # whenever the tab changes (see check_action).
@@ -614,7 +653,7 @@ class DashboardScreen(Screen):
     def _selected_run(self) -> tuple[str, str] | None:
         """The highlighted AI run as `(source, identifier)`, or None.
 
-        Both tabs that show a run answer here, so the watch pane, Takeover and
+        Both tabs that show a run answer here, so the live view, Takeover and
         Attach all act on the row the operator is looking at. A chat run is
         keyed by its frontend and chat id; a job run by the literal source
         "jobs" and its job id. The cron tab has no run, so it answers None.
@@ -701,12 +740,10 @@ class DashboardScreen(Screen):
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         # Repoint the log pane when the cursor moves. No force_reload: a real
         # selection change is caught downstream by the path/target-switch checks
-        # (_refresh_daemon_log, _refresh_watch_pane), so a same-file highlight
+        # (_refresh_daemon_log, _refresh_live_view), so a same-file highlight
         # hits the mtime guard and no-ops instead of rewriting 200+ lines.
-        self._refresh_log()
+        self._refresh_bottom()
         self._update_action_cue()
-        if event.data_table.id == "cron-entries":
-            self._refresh_cron_detail()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         # Tabbing between zones changes which daemon the lifecycle keys target.
@@ -725,7 +762,7 @@ class DashboardScreen(Screen):
 
     def action_refresh_now(self) -> None:
         self._refresh()
-        self._refresh_log(force_reload=True)
+        self._refresh_bottom(force_reload=True)
 
     def action_help(self) -> None:
         """Show the full keymap — every binding, including the ones hidden from
@@ -1105,14 +1142,20 @@ class DashboardScreen(Screen):
         line.update(f"[yellow]{spinner} {self._busy_msg}…[/yellow]")
 
     # ------------------------------------------------------------------
-    # Log + watch panes
+    # Log + live views
     # ------------------------------------------------------------------
 
     def _current_log_path(self) -> Path | None:
-        """Whichever log pane is more specific takes precedence: the watch
-        pane (per-ticket session log) when something's highlighted there,
-        otherwise the daemon log for the active daemon."""
-        return self._watch_path if self._watch_path else self._log_path
+        """The file `c` copies: whatever the viewport is showing.
+
+        The mode decides, rather than "the more specific one wins" — copying a
+        session log while the operator reads the daemon log would answer a
+        question nobody asked. A live view rendering a tmux pane has no file,
+        and says so through the daemon log it falls back to.
+        """
+        if self._mode() == "live" and self._live_path is not None:
+            return self._live_path
+        return self._log_path
 
     def action_copy_log(self) -> None:
         """Copy the tail of the currently-relevant log to the clipboard.
@@ -1148,10 +1191,103 @@ class DashboardScreen(Screen):
             "information",
         )
 
-    def _refresh_log(self, *, force_reload: bool = False) -> None:
-        """Refresh both panes: daemon log on the left, ticket watch on the right."""
-        self._refresh_daemon_log(force_reload=force_reload)
-        self._refresh_watch_pane(force_reload=force_reload)
+    # ------------------------------------------------------------------
+    # The bottom viewport's mode
+    # ------------------------------------------------------------------
+
+    def _active_tab(self) -> str:
+        """The tab id in front. Falls back to the chat tab before mount, which
+        is the tab TabbedContent opens on."""
+        try:
+            return self.query_one("#daemon-tabs", TabbedContent).active or "tab-chat"
+        except Exception:
+            return "tab-chat"
+
+    def _mode(self) -> str:
+        return self._bottom_mode.get(self._active_tab(), BOTTOM_MODES[0])
+
+    def _set_mode(self, mode: str) -> None:
+        """Switch the viewport and repaint it from scratch.
+
+        The mode that was hidden did not refresh while it was away, so it is
+        reloaded rather than shown as it was left: a log would otherwise sit at
+        whatever it held when you last looked at it.
+        """
+        self._bottom_mode[self._active_tab()] = mode
+        self._apply_mode()
+        self._refresh_bottom(force_reload=True)
+
+    def _apply_mode(self) -> None:
+        """Display the active mode's widget and hide the others."""
+        active = self._mode()
+        for name, widget_id in _MODE_WIDGETS.items():
+            with contextlib.suppress(Exception):
+                self.query_one(f"#{widget_id}").display = name == active
+
+    def action_cycle_view(self) -> None:
+        """Step the bottom viewport to the next mode (bound to `v`)."""
+        modes = BOTTOM_MODES
+        self._set_mode(modes[(modes.index(self._mode()) + 1) % len(modes)])
+
+    def action_preview(self) -> None:
+        """Jump to the preview, or back where you came from (bound to `p`).
+
+        A jump rather than another step through the cycle: reading what a row
+        runs is a glance, and the mode you were in is the one you want back.
+        """
+        tab = self._active_tab()
+        if self._mode() == "preview":
+            self._set_mode(
+                self._mode_before_preview.pop(
+                    tab, DEFAULT_BOTTOM_MODE.get(tab, BOTTOM_MODES[0])
+                )
+            )
+            return
+        self._mode_before_preview[tab] = self._mode()
+        self._set_mode("preview")
+
+    def _unavailable_modes(self) -> set[str]:
+        """The modes with nothing to show for the current selection, dimmed in
+        the strip. The daemon log is always offered: a missing log file is
+        itself worth reading as a state."""
+        unavailable = set()
+        if self._selected_live_target() is None:
+            unavailable.add("live")
+        if self._preview_subject() is None:
+            unavailable.add("preview")
+        return unavailable
+
+    def _set_bottom_label(self, label: str) -> None:
+        """What the active mode has to say about its own source. The mode strip
+        is painted around it by `_paint_bottom_header`."""
+        self._bottom_label = label
+
+    def _paint_bottom_header(self) -> None:
+        """Draw the mode strip plus the active mode's own label.
+
+        Written from one place so the strip stays honest: a mode helper that
+        returns early (nothing appended since the last tick) still has its
+        label redrawn when the availability of another mode changes.
+        """
+        strip = render.mode_strip(self._mode(), BOTTOM_MODES, self._unavailable_modes())
+        text = f"{strip}  ·  {self._bottom_label}" if self._bottom_label else strip
+        if text == self._bottom_header_shown:
+            return
+        self._bottom_header_shown = text
+        with contextlib.suppress(Exception):
+            self.query_one("#bottom-header", Static).update(text)
+
+    def _refresh_bottom(self, *, force_reload: bool = False) -> None:
+        """Refresh whichever mode the viewport is showing. The hidden ones are
+        not read at all — that is the point of one viewport rather than two."""
+        mode = self._mode()
+        if mode == "live":
+            self._refresh_live_view(force_reload=force_reload)
+        elif mode == "preview":
+            self._refresh_preview(force_reload=force_reload)
+        else:
+            self._refresh_daemon_log(force_reload=force_reload)
+        self._paint_bottom_header()
 
     def _refresh_daemon_log(self, *, force_reload: bool) -> None:
         """Live-tail the active daemon's log into the dashboard pane.
@@ -1165,7 +1301,6 @@ class DashboardScreen(Screen):
         starting blank.
         """
         name = self._active_daemon() or "cron"
-        header = self.query_one("#log-header", Static)
         pane = self.query_one("#log-pane", RichLog)
 
         path = logs.find_log(name, directory=LOG_DIR)
@@ -1183,7 +1318,7 @@ class DashboardScreen(Screen):
                 self._log_buffer.pop(name, None)
                 pane.clear()
                 pane.write(Text(f"no log yet at {path}", style="dim"))
-                header.update(f"[dim]log: {path.name} (missing)[/dim]")
+                self._set_bottom_label(f"[dim]log: {path.name} (missing)[/dim]")
             return
 
         try:
@@ -1205,7 +1340,9 @@ class DashboardScreen(Screen):
             pane.write(Text("live tail · full log in [l]", style="dim"))
             for line in self._log_buffer.get(name, ()):
                 pane.write(line)
-            header.update(f"[bold]log: {path.name}[/bold] [dim]· live tail[/dim]")
+            self._set_bottom_label(
+                f"[bold]log: {path.name}[/bold] [dim]· live tail[/dim]"
+            )
 
         if not switched and not force_reload and mtime == self._log_mtime:
             return  # same daemon, nothing appended since last tick
@@ -1235,64 +1372,171 @@ class DashboardScreen(Screen):
         if not was_bottom:
             render.restore_scroll(pane, prev_y=prev_y)
 
-    def _refresh_watch_pane(self, *, force_reload: bool) -> None:
-        """Show the watch column when the active daemon has something to drill
-        into: a highlighted cron entry, or a
-        chat daemon with a running job. Otherwise the column is hidden so the
-        daemon log gets full width.
-        """
-        col = self.query_one("#log-watch-col", Vertical)
-        name = self._active_daemon()
+    def _preview_subject(self) -> str | None:
+        """What the preview would describe for the current selection, or None.
 
-        # "session:<frontend>:<identifier>" for an AI job, "schedule:<name>"
-        # for a cron job tail.
-        target: str | None = None
-        if name == "cron":
+        Cheap by contract: the mode strip asks this every tick to decide
+        whether to dim `preview`, so it resolves a row to a name and reads no
+        files.
+        """
+        if self._active_daemon() == "cron":
+            job = self._selected_job()
+            return None if job is None or job == "__empty__" else job
+        if self._active_daemon() == "jobs":
+            key = self._datatable_cursor_key("#jobs-queue")
+            return None if key in (None, "__empty__", "__more__") else key
+        run = self._selected_run()
+        return f"{run[0]}:{run[1]}" if run is not None else None
+
+    def _preview_text(self, subject: str) -> str:
+        """The full text `subject` runs. Empty when there is nothing to show."""
+        if self._active_daemon() == "jobs":
+            return self._job_prompt(subject)
+        if self._active_daemon() == "cron":
+            return self._cron_previews.get(subject, "")
+        return self._chat_turn(subject)
+
+    def _chat_turn(self, key: str) -> str:
+        """The text of the running turn behind a chat row.
+
+        It lives in the frontend's turn journal and nowhere else: the heartbeat
+        carries the identifier and the uptime, because a running_jobs entry is
+        a status line rather than a copy of the message. The journal holds a
+        turn from the moment it is accepted until it is answered, which is
+        exactly the window the chat tab lists.
+
+        A turn answered between the heartbeat and this read is gone from the
+        journal, and shows as nothing to preview rather than as somebody
+        else's message.
+        """
+        frontend, _, chat_id = key.partition(":")
+        path = state.STATE_DIR / f"{frontend}.turns.json"
+        journal = turns.TurnJournal(path)
+        for turn in journal.pending():
+            if str(turn.chat_id) == chat_id:
+                return turn.text
+        return ""
+
+    def _preview_label(self, subject: str) -> str:
+        """How the header names the subject: the string its own row shows.
+
+        A job id's time half is already the row's `enqueued` age, so the header
+        repeats the tail the table shows rather than 30 characters of it. A
+        chat row is named by its workspace, and that name carries remote text
+        on the trusted-bot path — the header renders markup, so it goes through
+        the same guard every other label does.
+        """
+        daemon = self._active_daemon()
+        if daemon == "jobs":
+            return _short_job_id(subject)
+        if daemon == "cron":
+            return subject
+        return session_format._safe(self._chat_workspaces.get(subject, subject))
+
+    def _job_prompt(self, job_id: str) -> str:
+        """A queued job's prompt, with the entry that produced it named above.
+
+        The table cell holds the truncated head the queue listing carries; this
+        reads the record itself, once, for the one job the operator is looking
+        at. A job claimed or finished since the listing has no record left to
+        read, and says so rather than showing a stale prompt.
+        """
+        cached = self._job_prompts.get(job_id)
+        if cached is not None:
+            return cached
+        prompt = file_queue.read_job_prompt(state.DEFAULT_JOBS_DIR, job_id)
+        if prompt is None:
+            return ""
+        origin = self._job_origins.get(job_id) or {}
+        source = _job_source(origin)
+        header = f"from {source}" if source != "-" else "from an unnamed producer"
+        text = f"{header}\n\n{prompt}"
+        self._job_prompts[job_id] = text
+        return text
+
+    def _refresh_preview(self, *, force_reload: bool) -> None:
+        """Show what the highlighted row runs, as written.
+
+        The source text, never a rendering: a cron prompt is a Liquid template
+        and `{{ item.key }}` is what the operator wrote, so that is what the
+        preview shows. Rewrites are skipped when neither the subject nor the
+        text has changed, so the 1Hz tick does not repaint a static pane.
+        """
+        pane = self.query_one("#preview-view", RichLog)
+        subject = self._preview_subject()
+        text = self._preview_text(subject) if subject is not None else ""
+        if subject is None or not text:
+            if self._preview_shown is not None or force_reload:
+                self._preview_shown = None
+                pane.clear()
+                pane.write(Text("nothing to preview", style="dim"))
+                self._set_bottom_label("[dim]nothing to preview[/dim]")
+            return
+        if (subject, text) == self._preview_shown and not force_reload:
+            return
+        self._preview_shown = (subject, text)
+        self._set_bottom_label(f"[bold]preview: {self._preview_label(subject)}[/bold]")
+        pane.clear()
+        pane.write(Text(text))
+
+    def _selected_live_target(self) -> str | None:
+        """What the live mode would follow for the current selection, or None.
+
+        `session:<frontend>:<identifier>` for an AI run, `cron:<name>` for a
+        cron entry's own job log. Asked by the mode strip as well as by the
+        refresh, so it stays free of side effects.
+        """
+        if self._active_daemon() == "cron":
             job = self._selected_job()
             if job is not None and job != "__empty__":
-                target = f"cron:{job}"
-        else:
-            # Follow the highlighted run so selecting any row tails its own
-            # session, not just the first in-flight one for the daemon. The
-            # jobs worker publishes its running job's session uuid in the same
-            # heartbeat channel the chat daemons use, so both answer here.
-            run = self._selected_run()
-            if run is not None:
-                target = f"session:{run[0]}:{run[1]}"
+                return f"cron:{job}"
+            return None
+        # Follow the highlighted run so selecting any row tails its own
+        # session, not just the first in-flight one for the daemon. The
+        # jobs worker publishes its running job's session uuid in the same
+        # heartbeat channel the chat daemons use, so both answer here.
+        run = self._selected_run()
+        return f"session:{run[0]}:{run[1]}" if run is not None else None
+
+    def _refresh_live_view(self, *, force_reload: bool) -> None:
+        """Tail the highlighted row's own output: a cron entry's job log, or a
+        run's session — its tmux pane when it has one, the transcript when not.
+
+        The viewport belongs to the mode, so nothing is hidden when there is no
+        target. The empty state says there is nothing highlighted, which is the
+        answer to the question the operator is asking.
+        """
+        target = self._selected_live_target()
+        pane = self.query_one("#live-view", RichLog)
 
         if target is None:
-            if col.display:
-                col.display = False
-                self._watch_path = None
-                self._watch_mtime = None
-                self._watch_target = None
+            if self._live_target is not None or force_reload:
+                self._live_target = None
+                self._live_path = None
+                self._live_mtime = None
+                pane.clear()
+                pane.write(Text("nothing highlighted to follow", style="dim"))
+                self._set_bottom_label("[dim]nothing highlighted[/dim]")
             return
 
-        if not col.display:
-            col.display = True
-
-        if target != self._watch_target:
-            self._watch_target = target
-            self._watch_path = None
-            self._watch_mtime = None
+        if target != self._live_target:
+            self._live_target = target
+            self._live_path = None
+            self._live_mtime = None
             force_reload = True
 
-        header = self.query_one("#watch-header", Static)
-        pane = self.query_one("#watch-pane", RichLog)
-
-        mode, _, rest = target.partition(":")
-        if mode == "session":
+        kind, _, rest = target.partition(":")
+        if kind == "session":
             # rest = "<frontend>:<identifier>"
             source, _, identifier = rest.partition(":")
-            self._refresh_watch_session(source, identifier, header, pane, force_reload)
+            self._refresh_live_session(source, identifier, pane, force_reload)
         else:
-            self._refresh_watch_cron(rest, header, pane, force_reload)
+            self._refresh_live_cron(rest, pane, force_reload)
 
-    def _refresh_watch_session(
+    def _refresh_live_session(
         self,
         source: str,
         identifier: str,
-        header: Static,
         pane: RichLog,
         force_reload: bool,
     ) -> None:
@@ -1320,17 +1564,19 @@ class DashboardScreen(Screen):
         # rebuilt from transcript events, and it shows the states the transcript
         # cannot: a turn parked on a prompt writes no event at all while it
         # waits. Falls through to the JSONL tail for every run with no pane.
-        if self._refresh_watch_grid(source, identifier, workspace, shown, header, pane):
+        if self._refresh_live_grid(source, identifier, workspace, shown, pane):
             return
 
         session_uuid = self._job_sessions.get(key)
         if not session_uuid:
-            if force_reload or self._watch_path is not None:
-                self._watch_path = None
-                self._watch_mtime = None
+            if force_reload or self._live_path is not None:
+                self._live_path = None
+                self._live_mtime = None
                 pane.clear()
                 pane.write(f"[dim]no session uuid for {shown} yet[/dim]")
-                header.update(f"[bold]watch: {shown}[/bold] [dim](pending)[/dim]")
+                self._set_bottom_label(
+                    f"[bold]live: {shown}[/bold] [dim](pending)[/dim]"
+                )
             return
 
         # Resolve across backends: the daemon may have run this job under a
@@ -1338,16 +1584,16 @@ class DashboardScreen(Screen):
         path = resolve_session_log(workspace, session_uuid)
 
         if path is None:
-            if force_reload or self._watch_path is not None:
-                self._watch_path = None
-                self._watch_mtime = None
+            if force_reload or self._live_path is not None:
+                self._live_path = None
+                self._live_mtime = None
                 pane.clear()
                 pane.write(
                     f"[dim]no session log yet for {shown} — "
                     f"agent hasn't run a turn[/dim]"
                 )
-                header.update(
-                    f"[bold]watch: {shown}[/bold] [dim](no session yet)[/dim]"
+                self._set_bottom_label(
+                    f"[bold]live: {shown}[/bold] [dim](no session yet)[/dim]"
                 )
             return
 
@@ -1356,19 +1602,19 @@ class DashboardScreen(Screen):
         except OSError:
             return
 
-        switched = path != self._watch_path
-        if not switched and not force_reload and mtime == self._watch_mtime:
+        switched = path != self._live_path
+        if not switched and not force_reload and mtime == self._live_mtime:
             return
 
-        self._watch_path = path
-        self._watch_mtime = mtime
-        header.update(f"[bold]watch: {shown}[/bold] [dim]{path.name}[/dim]")
+        self._live_path = path
+        self._live_mtime = mtime
+        self._set_bottom_label(f"[bold]live: {shown}[/bold] [dim]{path.name}[/dim]")
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
         render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
         import json
 
-        raw_lines = render.tail_lines(path, WATCH_EVENTS)
+        raw_lines = render.tail_lines(path, LIVE_EVENTS)
         any_rendered = False
         for raw in raw_lines:
             raw = raw.strip()
@@ -1389,13 +1635,12 @@ class DashboardScreen(Screen):
         if not stick:
             render.restore_scroll(pane, prev_y=prev_y)
 
-    def _refresh_watch_grid(
+    def _refresh_live_grid(
         self,
         source: str,
         identifier: str,
         workspace: Path,
         shown: str,
-        header: Static,
         pane: RichLog,
     ) -> bool:
         """Render this run's live tmux pane. True when it did, False to fall back.
@@ -1421,32 +1666,30 @@ class DashboardScreen(Screen):
         # The tail's bookkeeping has to be cleared, not just bypassed: it decides
         # whether a later switch back to a file counts as a switch, and a stale
         # path here would leave the tail refusing to reload the pane it lost.
-        self._watch_path = None
-        self._watch_mtime = None
-        header.update(f"[bold]watch: {shown}[/bold] [dim]live pane[/dim]")
+        self._live_path = None
+        self._live_mtime = None
+        self._set_bottom_label(f"[bold]live: {shown}[/bold] [dim]tmux pane[/dim]")
         pane.clear()
         pane.write(Text.from_ansi(grid))
         return True
 
-    def _refresh_watch_cron(
-        self, job: str, header: Static, pane: RichLog, force_reload: bool
-    ) -> None:
+    def _refresh_live_cron(self, job: str, pane: RichLog, force_reload: bool) -> None:
         """Tail the per-job log for `job` as plain text.
 
         Markup is bypassed via rich.text.Text so literal log brackets like
         [INFO] survive intact even though the pane has markup=True (which the
-        session watch relies on for colors).
+        live view relies on for colors).
         """
         path = logs.find_log(f"cron-{job}", directory=LOG_DIR)
         if path is None or not path.is_file():
-            if force_reload or self._watch_path is not None:
-                self._watch_path = None
-                self._watch_mtime = None
+            if force_reload or self._live_path is not None:
+                self._live_path = None
+                self._live_mtime = None
                 pane.clear()
                 pane.write(
                     f"[dim]no log yet at {path} — job hasn't fired since startup[/dim]"
                 )
-                header.update(f"[bold]job: {job}[/bold] [dim](no log)[/dim]")
+                self._set_bottom_label(f"[bold]job: {job}[/bold] [dim](no log)[/dim]")
             return
 
         try:
@@ -1454,13 +1697,13 @@ class DashboardScreen(Screen):
         except OSError:
             return
 
-        switched = path != self._watch_path
-        if not switched and not force_reload and mtime == self._watch_mtime:
+        switched = path != self._live_path
+        if not switched and not force_reload and mtime == self._live_mtime:
             return
 
-        self._watch_path = path
-        self._watch_mtime = mtime
-        header.update(f"[bold]job: {job}[/bold] [dim]{path.name}[/dim]")
+        self._live_path = path
+        self._live_mtime = mtime
+        self._set_bottom_label(f"[bold]job: {job}[/bold] [dim]{path.name}[/dim]")
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
         render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
@@ -1555,7 +1798,7 @@ class DashboardScreen(Screen):
         table = self.query_one("#cron-entries", DataTable)
         previously = self._selected_job()
         scroll_y = table.scroll_offset.y
-        self._cron_details = {job.name: job.detail for job in jobs}
+        self._cron_previews = {job.name: job.preview for job in jobs}
         table.clear()
         keys: list[str] = []
         running = _running_by_entry(snap.jobs_queue)
@@ -1599,49 +1842,7 @@ class DashboardScreen(Screen):
             )
         else:
             self._restore_cursor(table, keys, previously, scroll_y)
-        # The table is `height: 1fr`, so it fills the panel and scrolls once the
-        # list outgrows it — that is what keeps the detail block below it on
-        # screen. Capping it at the rows it actually has (+1 for the column
-        # header) stops a two-entry list painting half a screen of empty zebra
-        # stripes, the one thing `height: auto` was doing well.
-        table.styles.max_height = table.row_count + 1
         self._resize_flex_column(table, PROMPT_COLUMN, auto_label="name")
-        self._refresh_cron_detail()
-
-    def _refresh_cron_detail(self) -> None:
-        """Show the highlighted cron row's full prompt/command in the detail
-        block below the table; hide the block when nothing is highlighted.
-
-        The block shows the raw text (newlines intact), unlike the table cell
-        which collapses whitespace to one line. Rewrites are skipped when the
-        selection and text are unchanged, so the 1Hz refresh doesn't repaint
-        the block every tick.
-        """
-        header = self.query_one("#cron-detail-header", Static)
-        pane = self.query_one("#cron-detail", RichLog)
-        job = self._selected_job()
-        if job is None or job == "__empty__":
-            self._cron_detail_shown = None
-            if header.display:
-                header.display = False
-                pane.display = False
-            return
-        detail = self._cron_details.get(job, "")
-        if not detail:
-            self._cron_detail_shown = None
-            if header.display:
-                header.display = False
-                pane.display = False
-            return
-        if (job, detail) == self._cron_detail_shown:
-            return
-        self._cron_detail_shown = (job, detail)
-        header.update(f"[bold]prompt / command: {job}[/bold]")
-        pane.clear()
-        pane.write(Text(detail))
-        if not header.display:
-            header.display = True
-            pane.display = True
 
     def _resize_flex_column(
         self, table: DataTable, label: str, *, auto_label: str | None = None
@@ -1695,7 +1896,7 @@ class DashboardScreen(Screen):
         here creates or moves a file under jobs/.
 
         The worker publishes each running job's session uuid in its heartbeat,
-        which is what lets the watch pane tail the live agent conversation —
+        which is what lets the live view tail the live agent conversation —
         the same channel the chat tab uses.
         """
         running = ((jobs.extra or {}).get("running_jobs") or []) if jobs else []
@@ -1727,6 +1928,14 @@ class DashboardScreen(Screen):
         scroll_y = table.scroll_offset.y
         table.clear()
         keys: list[str] = []
+        self._job_origins = {row.id: row.origin for row in view.rows} if view else {}
+        # A job that left the queue takes its cached prompt with it, so a long
+        # session cannot accumulate the prompt of every job it ever showed.
+        self._job_prompts = {
+            job_id: prompt
+            for job_id, prompt in self._job_prompts.items()
+            if job_id in self._job_origins
+        }
         for row in view.rows if view else []:
             keys.append(row.id)
             age_s = (
@@ -1739,7 +1948,7 @@ class DashboardScreen(Screen):
             # third-party text (a Slack user's message). "[pytest]" would be
             # eaten as a tag and "[/]" raises MarkupError — which Textual turns
             # into an app exit, killing the whole dashboard. Same reason
-            # _refresh_watch_cron wraps log lines.
+            # _refresh_live_cron wraps log lines.
             table.add_row(
                 Text(_short_job_id(row.id)),
                 Text(_job_source(row.origin)),

@@ -513,6 +513,39 @@ def _read_row_fields(path: Path) -> tuple[str | None, dict]:
     )
 
 
+def read_job_prompt(root: Path, job_id: str) -> str | None:
+    """One unfinished job's prompt in full, read on demand.
+
+    `read_queue_rows` cuts every row's prompt at `PROMPT_PREVIEW_LIMIT`,
+    because the listing it returns is memoized and would otherwise pin every
+    queued prompt in the observing process. A reader that wants one job's
+    prompt whole asks here instead and pays one file read for the one job it
+    is looking at.
+
+    None when the job is no longer queued or running — it finished, or the
+    worker claimed it between the listing and this read — and when the record
+    does not parse. Same contract as the listing: a read never fails its
+    caller.
+    """
+    for directory in (root / "cur", root / "new"):
+        try:
+            paths = sorted(directory.glob(f"{job_id}*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            # The glob is a prefix match, so a longer id starting with this one
+            # would answer for it. The filename parse is the exact test.
+            if job_id_from_filename(path.name) != job_id:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            prompt = data.get("prompt") if isinstance(data, dict) else None
+            return prompt if isinstance(prompt, str) else None
+    return None
+
+
 def read_queue_depth(root: Path) -> QueueDepth:
     """Count each stage of the maildir at `root` without touching it.
 

@@ -778,7 +778,7 @@ class Orchestrator:
                 session_overrides.update(pane.env)
                 logger.debug("tmux: chat %s hosted in pane %s", chat_id, pane.session)
             elif not tmux.available():
-                # INFO rather than debug: this is the whole reason a watch pane
+                # INFO rather than debug: this is the whole reason a live view
                 # shows a transcript instead of the agent's terminal, and it is
                 # the one cause an operator can actually fix. Silent when they
                 # switched hosting off themselves — that one is not a surprise.

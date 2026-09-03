@@ -8,7 +8,7 @@ Every backend implements the `AgentBackend` Protocol at `src/claude_on_the_fly/a
 
 - `run(workspace, session_uuid, prompt, platform, user_name, channel_context, timeout) -> Response` — execute one turn
 - `takeover_command(workspace, session_uuid) -> str | None` — interactive resume command, or `None` if no session yet
-- `session_log_path(workspace, session_uuid) -> Path | None` — live JSONL for the TUI's watch pane to tail, or `None`
+- `session_log_path(workspace, session_uuid) -> Path | None` — live JSONL for the TUI's live view to tail, or `None`
 - `list_skills() -> list[tuple[str, str]]` — `(name, description)` pairs for the Slack picker; empty when the backend has no skill concept
 
 A new backend means: implement the protocol, add a builder in `agent.py:_build_*_backend()` (see `_build_claude_backend` at `agent.py:786`), and add the env-driven switch in `get_backend()` at `agent.py:706`.

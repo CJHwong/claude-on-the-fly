@@ -18,6 +18,7 @@ from claude_on_the_fly.jobs.file_queue import (
     DONE_RETENTION_S,
     PROMPT_PREVIEW_LIMIT,
     FileInboxQueue,
+    read_job_prompt,
     read_queue_depth,
     read_queue_rows,
 )
@@ -500,6 +501,81 @@ def test_row_prompt_is_truncated_at_read(tmp_path: Path) -> None:
     assert len(rows[0].prompt) == PROMPT_PREVIEW_LIMIT
 
 
+class TestReadJobPrompt:
+    """One job's prompt in full, for a reader looking at that one job."""
+
+    def test_it_returns_the_whole_prompt(self, tmp_path: Path) -> None:
+        root = tmp_path / "jobs"
+        queue = FileInboxQueue(root)
+        long_prompt = "x" * (PROMPT_PREVIEW_LIMIT * 4)
+        queue.enqueue(_job("100-a", prompt=long_prompt))
+
+        assert read_job_prompt(root, "100-a") == long_prompt
+
+    def test_it_finds_a_claimed_job(self, tmp_path: Path) -> None:
+        """A running job is the one most worth reading."""
+        root = tmp_path / "jobs"
+        queue = FileInboxQueue(root)
+        queue.enqueue(_job("100-a", prompt="do the thing"))
+        queue.claim()
+
+        assert read_job_prompt(root, "100-a") == "do the thing"
+
+    def test_it_finds_a_keyed_job(self, tmp_path: Path) -> None:
+        """A cron job's filename carries its entry and item after the id."""
+        root = tmp_path / "jobs"
+        queue = FileInboxQueue(root)
+        queue.enqueue(
+            Job(
+                id="100-a",
+                prompt="work on ACE-1",
+                origin={"kind": "cron", "entry": "jira"},
+                key="jira/ACE-1",
+            )
+        )
+
+        assert read_job_prompt(root, "100-a") == "work on ACE-1"
+
+    def test_an_id_that_only_shares_a_prefix_does_not_answer(
+        self, tmp_path: Path
+    ) -> None:
+        """The glob is a prefix match, so the filename parse is the exact test."""
+        root = tmp_path / "jobs"
+        queue = FileInboxQueue(root)
+        queue.enqueue(_job("100-abc", prompt="the longer id"))
+
+        assert read_job_prompt(root, "100-a") is None
+
+    def test_a_finished_job_has_nothing_to_read(self, tmp_path: Path) -> None:
+        root = tmp_path / "jobs"
+        FileInboxQueue(root)
+
+        assert read_job_prompt(root, "100-a") is None
+
+    def test_an_unparseable_record_is_not_a_failure(self, tmp_path: Path) -> None:
+        """Same contract as the listing: a read never fails its caller."""
+        root = tmp_path / "jobs"
+        queue = FileInboxQueue(root)
+        queue.enqueue(_job("100-a"))
+        next(iter((root / "new").glob("*.json"))).write_text("{ not json")
+
+        assert read_job_prompt(root, "100-a") is None
+
+    def test_a_record_without_a_prompt_string_reads_as_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "jobs"
+        queue = FileInboxQueue(root)
+        queue.enqueue(_job("100-a"))
+        path = next(iter((root / "new").glob("*.json")))
+        path.write_text(json.dumps({"id": "100-a", "prompt": 42, "origin": {}}))
+
+        assert read_job_prompt(root, "100-a") is None
+
+    def test_a_missing_queue_directory_reads_as_nothing(self, tmp_path: Path) -> None:
+        assert read_job_prompt(tmp_path / "never-created", "100-a") is None
+
+
 def test_observer_memos_stay_bounded_across_roots(tmp_path: Path) -> None:
     """The memos are process-global with no eviction of their own: a caller that
     varies root — every test in this suite, via tmp_path — would otherwise grow
@@ -978,6 +1054,18 @@ class TestReadOnlyObserversNeverRaise:
         rows = read_queue_rows(tmp_path)
         assert len(rows) == 1
         assert not rows[0].prompt
+
+    def test_a_prompt_read_from_a_directory_that_cannot_be_listed_is_none(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        (tmp_path / "cur").mkdir(parents=True)
+        (tmp_path / "new").mkdir(parents=True)
+
+        def glob_fails(self, _pattern):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "glob", glob_fails)
+        assert read_job_prompt(tmp_path, "1755000000000000000-abcdef12") is None
 
     def test_a_row_whose_json_is_not_a_mapping_still_lists(
         self, tmp_path: Path

@@ -316,7 +316,7 @@ class TestProcess:
     async def test_a_host_without_tmux_says_why_the_turn_is_unmirrored(
         self, orch: Orchestrator, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """The one cause of "the watch pane shows a transcript" that an operator
+        """The one cause of "the live view shows a transcript" that an operator
         can actually fix, so it is INFO rather than a silent skip."""
         monkeypatch.setattr(orchestrator_mod.tmux, "available", lambda: False)
         with (
@@ -3095,7 +3095,7 @@ class TestPaneCanBeSwitchedOff:
     async def test_hosting_off_runs_the_turn_as_a_plain_child(
         self, orch: Orchestrator, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """Switching it off is not a failure, so it says nothing: the watch pane
+        """Switching it off is not a failure, so it says nothing: the live view
         falls back to the transcript and the turn is otherwise unchanged."""
         monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: False)
         monkeypatch.setattr(orchestrator_mod.tmux, "available", lambda: True)

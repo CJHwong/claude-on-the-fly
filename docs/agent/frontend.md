@@ -103,6 +103,13 @@ The one exception is a turn that has been replayed to its limit
 (`turns.MAX_REPLAYS`): running it again is the likeliest reason the daemon keeps
 going down, so that one is offered back through `notify_nudge`.
 
+The journal has one reader outside the daemon: the dashboard's preview mode calls
+`TurnJournal.pending()` to show the message a running turn is answering. That text
+lives nowhere else -- a `running_jobs` heartbeat entry is a status line, carrying the
+identifier and the uptime rather than a copy of the message. `pending()` is read-only
+by contract: it marks, replays and forgets nothing, so an observer cannot cost a turn
+its recovery.
+
 There is deliberately no third "started but has not acted yet" phase -- both
 backends build their tool-event relay only when interim progress is on, so it
 would need new hooks in both and would change nothing now that both phases

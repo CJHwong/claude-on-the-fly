@@ -1,21 +1,21 @@
 # Panes
 
 A turn can run inside a tmux pane so something other than the turn itself can see what
-the agent is doing. `src/claude_on_the_fly/tmux.py` owns the pane; the TUI's watch pane
+the agent is doing. `src/claude_on_the_fly/tmux.py` owns the pane; the TUI's live view
 renders it read-only.
 
-Read this before changing how a turn is hosted, how the watch pane picks its source, or
+Read this before changing how a turn is hosted, how the live view picks its source, or
 how a hosted turn is reaped.
 
 ## Why a pane rather than the transcript
 
-The watch pane already tails the session JSONL and renders it through
+The live view already tails the session JSONL and renders it through
 `tui/session_format.py`. That covers every backend, and it is still the fallback. What it
 cannot show is a state the transcript never records. A turn parked on claude's
 workspace-trust dialog writes no event while it waits, so the tail is empty and the turn
 looks hung for no reason. The pane shows the dialog.
 
-So the watch pane prefers the pane when the selected run has one, and falls back to the
+So the live view prefers the pane when the selected run has one, and falls back to the
 tail when it does not.
 
 Hosting is on wherever tmux is installed, and `agent.pane: false` switches it off — an
@@ -153,9 +153,43 @@ The mode is separate from `agent.pane` on purpose. `pane` is global, so using it
 retreat from a break in codex's interactive path would take claude-pty's mirror away
 at the same time; `codex.mode: native` gives up only what broke.
 
+## The bottom viewport and its modes
+
+The dashboard's bottom row is one viewport, not two panes side by side. It shows the
+daemon **log**, the highlighted row's **live** output, or a **preview** of what that row
+runs. `v` cycles; `p` jumps to the preview and back to where you were. Only the active
+mode is displayed, and `_refresh_bottom` refreshes only that one: a hidden log is not
+read at all.
+
+Half a terminal each is what this replaced. Both panes tailed a file every second
+whether or not anyone was reading them, and neither was wide enough to read.
+
+Three things follow:
+
+- **The mode is per tab, and remembered.** A tab that shows runs opens on `live`; the
+  cron tab opens on `preview`, which is what an operator reads a schedule for. The
+  operator's own choice wins from then on, for that tab, for the session.
+- **A mode owns the viewport, so it never hides itself.** The live view used to hide its
+  column when nothing was highlighted. It now says nothing is highlighted, and the mode
+  strip dims `live` — a dimmed mode is still reachable, it just has nothing behind it.
+- **The header is painted from one place.** Each mode sets a label
+  (`_set_bottom_label`); `_paint_bottom_header` draws the strip around it once per
+  refresh. A mode that returns early — nothing appended since the last tick — still gets
+  its label redrawn when the availability of another mode changes.
+
+`_preview_subject` and `_preview_text` are deliberately split. The mode strip asks the
+first one every tick to decide whether to dim `preview`, so it resolves the highlighted
+row to a name and reads nothing; only the refresh asks for the text. Keep it that way
+when you add a preview source — an availability check that opens a file is a file opened
+once a second to grey out one word.
+
+Writes to a mode that is not displayed are safe but pointless: `RichLog` defers every
+write until it knows its size and flushes on the first layout. That is why `_set_mode`
+forces a reload rather than trusting what the widget was left holding.
+
 ## Attaching to a live pane
 
-The watch pane is read-only. To type at the agent, attach to its session: the dashboard's
+The live view is read-only. To type at the agent, attach to its session: the dashboard's
 `a` key copies the command for the highlighted run, on the chat tab and the jobs tab
 alike.
 

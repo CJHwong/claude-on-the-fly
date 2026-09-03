@@ -182,6 +182,23 @@ broken; an agent run that takes minutes is working.
 
 An entry's own work is done the moment it enqueues, so the cron daemon cannot say whether the work it produced is running — the jobs worker owns that. The cron table answers it from the queue instead: `_running_by_entry` counts the in-flight rows whose `origin` names that entry, and the row's next-fire cell reads `running`, or `running (N)` for a producer entry with several items in flight. Only a claimed job counts; a queued one leaves the countdown, which is still the honest answer to when the entry next fires. The count depends on the producer stamping `{"kind": "cron", "entry": <name>}` on the origin (`_enqueue`) — drop that and the table goes quiet rather than wrong.
 
+## What the preview shows
+
+The cron tab opens on the bottom viewport's preview mode, which shows the highlighted
+entry's own text: the command and the prompt as separate sections, and a `prompt_file`
+inlined under its path. The path alone answers "where", never "what", and "what" is the
+question an operator opens the schedule with.
+
+It is the *source* text, never a rendering. A prompt is a Liquid template, so
+`{{ item.key }}` is what the operator wrote and what the preview shows; rendering it
+would need an item, and a producer's items are not knowable without running it.
+
+`state._read_prompt_file` memoizes on the file's `(mtime, size)` rather than reading per
+tick, and caps the text. It deliberately does not share `CronEntry.prompt_source()`,
+which stays uncached: a fire happens at most once a minute and has to read what is on
+disk right then, while the dashboard asks 60 times in that minute for the same bytes. A
+read failure is not cached either, so restoring a deleted file recovers on the next tick.
+
 ## Run-now trigger
 
 The TUI's run-now key (`n` on the cron tab) is a file, not a signal: the
