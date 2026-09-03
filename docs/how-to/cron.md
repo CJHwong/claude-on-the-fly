@@ -41,7 +41,10 @@ uv run claude-jobs    # runs the queued work
 
 Output goes to `~/.claude-on-the-fly/logs/cron-<name>-<host>-<date>.log`, agent
 replies included. Config edits are picked up within a minute, no restart.
-`prompt_file` is re-read on every fire, so editing a brief takes effect next fire.
+`prompt_file` is re-read on every fire, so editing a brief takes effect next fire. The
+dashboard's cron tab shows the highlighted entry's command and prompt, with a
+`prompt_file` inlined, so you can read what an entry runs without opening the file. Press
+`v` there for the daemon log instead.
 
 ## The three shapes
 
