@@ -49,6 +49,12 @@ def cmd_start(frontend: str, env_file: Path | None) -> int:
                 if hint:
                     print(hint, file=sys.stderr)
         return 2
+    except supervisor.SpawnTimeout as exc:
+        # `str(exc)` is the cause, the pid, the log path and the last 25 lines.
+        # Printing it is the whole fix: without this clause the CLI ends in a
+        # traceback that says none of it.
+        print(str(exc), file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -124,6 +130,9 @@ def cmd_restart(frontend: str, env_file: Path | None, *, force: bool) -> int:
         for r in exc.results:
             if r.status != "ok":
                 print(f"  {r.name}: {r.status} — {r.detail}", file=sys.stderr)
+        return 2
+    except supervisor.SpawnTimeout as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     except ValueError as exc:
         print(str(exc), file=sys.stderr)

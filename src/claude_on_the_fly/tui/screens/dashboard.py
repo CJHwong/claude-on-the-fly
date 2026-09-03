@@ -73,6 +73,7 @@ from claude_on_the_fly.tui import (
 from claude_on_the_fly.tui.screens.config_picker import ConfigPickerScreen
 from claude_on_the_fly.tui.screens.env_diff import EnvDiffScreen
 from claude_on_the_fly.tui.screens.help import HelpScreen
+from claude_on_the_fly.tui.screens.logs import LogsScreen
 from claude_on_the_fly.tui.screens.upgrade import UpgradeScreen
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
@@ -776,7 +777,12 @@ class DashboardScreen(Screen):
                 self.app.push_screen("doctor")
                 return
             except supervisor.SpawnTimeout as exc:
-                self._notify(f"{name}: spawn timed out — see {exc.log_path}", "error")
+                # The exception already carries the cause, the log path and a
+                # tail. A toast has no room for 25 lines, so it names the cause
+                # and the logs screen shows the rest, the same handoff the
+                # preflight branch above makes to the doctor screen.
+                self._notify(f"{name}: {exc.cause} — opening logs", "error")
+                self.app.push_screen(LogsScreen(preselect=exc.log_path))
                 return
             except Exception as exc:
                 self._notify(f"{name}: {verb} failed: {exc}", "error")
