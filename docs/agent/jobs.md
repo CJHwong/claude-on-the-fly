@@ -133,6 +133,14 @@ A queue deeper than the row cap gets a trailing `… N more` row, so the cap nev
 
 The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#cron-entries` is a different widget** — the cron tab's cron table — and must not be reused.
 
+The preview mode shows the highlighted job's prompt in full, through
+`file_queue.read_job_prompt`. The queue listing cuts every row's prompt at
+`PROMPT_PREVIEW_LIMIT`, because the listing is memoized and would otherwise pin every
+queued prompt in the observing process; the preview asks for one job instead and pays
+one file read for it. The dashboard caches that read per job id and prunes the cache
+against the listing, because a job's prompt is written at enqueue and never changes,
+while a job that leaves the queue should not keep its prompt in memory.
+
 The live view tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
 
 ## Workspaces

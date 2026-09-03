@@ -63,6 +63,7 @@ from claude_on_the_fly.agent import (
     resolve_session_log,
 )
 from claude_on_the_fly.cron import request_run_now
+from claude_on_the_fly.jobs import file_queue
 from claude_on_the_fly.tui import (
     env_editor,
     render,
@@ -349,6 +350,14 @@ class DashboardScreen(Screen):
         # (subject, text) last written to the preview, so the 1Hz refresh
         # skips the rewrite when neither has changed.
         self._preview_shown: tuple[str, str] | None = None
+        # job id -> its prompt in full, read once per job. A job's prompt is
+        # written at enqueue and never changes, so the read is a one-off. The
+        # map is pruned against the queue listing on every refresh, so a job
+        # that finished takes its entry with it.
+        self._job_prompts: dict[str, str] = {}
+        # job id -> the opaque origin dict the producer attached, so the
+        # preview can name who asked for the job. Rebuilt from the listing.
+        self._job_origins: dict[str, dict] = {}
         # The mode the operator was in when `p` jumped to preview, so pressing
         # it again goes back rather than cycling on.
         self._mode_before_preview: dict[str, str] = {}
@@ -1373,11 +1382,45 @@ class DashboardScreen(Screen):
         if self._active_daemon() == "cron":
             job = self._selected_job()
             return None if job is None or job == "__empty__" else job
+        if self._active_daemon() == "jobs":
+            key = self._datatable_cursor_key("#jobs-queue")
+            return None if key in (None, "__empty__", "__more__") else key
         return None
 
     def _preview_text(self, subject: str) -> str:
         """The full text `subject` runs. Empty when there is nothing to show."""
+        if self._active_daemon() == "jobs":
+            return self._job_prompt(subject)
         return self._cron_previews.get(subject, "")
+
+    def _preview_label(self, subject: str) -> str:
+        """How the header names the subject: the string its own row shows.
+
+        A job id's time half is already the row's `enqueued` age, so the header
+        repeats the tail the table shows rather than 30 characters of it.
+        """
+        return _short_job_id(subject) if self._active_daemon() == "jobs" else subject
+
+    def _job_prompt(self, job_id: str) -> str:
+        """A queued job's prompt, with the entry that produced it named above.
+
+        The table cell holds the truncated head the queue listing carries; this
+        reads the record itself, once, for the one job the operator is looking
+        at. A job claimed or finished since the listing has no record left to
+        read, and says so rather than showing a stale prompt.
+        """
+        cached = self._job_prompts.get(job_id)
+        if cached is not None:
+            return cached
+        prompt = file_queue.read_job_prompt(state.DEFAULT_JOBS_DIR, job_id)
+        if prompt is None:
+            return ""
+        origin = self._job_origins.get(job_id) or {}
+        source = _job_source(origin)
+        header = f"from {source}" if source != "-" else "from an unnamed producer"
+        text = f"{header}\n\n{prompt}"
+        self._job_prompts[job_id] = text
+        return text
 
     def _refresh_preview(self, *, force_reload: bool) -> None:
         """Show what the highlighted row runs, as written.
@@ -1400,7 +1443,7 @@ class DashboardScreen(Screen):
         if (subject, text) == self._preview_shown and not force_reload:
             return
         self._preview_shown = (subject, text)
-        self._set_bottom_label(f"[bold]preview: {subject}[/bold]")
+        self._set_bottom_label(f"[bold]preview: {self._preview_label(subject)}[/bold]")
         pane.clear()
         pane.write(Text(text))
 
@@ -1853,6 +1896,14 @@ class DashboardScreen(Screen):
         scroll_y = table.scroll_offset.y
         table.clear()
         keys: list[str] = []
+        self._job_origins = {row.id: row.origin for row in view.rows} if view else {}
+        # A job that left the queue takes its cached prompt with it, so a long
+        # session cannot accumulate the prompt of every job it ever showed.
+        self._job_prompts = {
+            job_id: prompt
+            for job_id, prompt in self._job_prompts.items()
+            if job_id in self._job_origins
+        }
         for row in view.rows if view else []:
             keys.append(row.id)
             age_s = (

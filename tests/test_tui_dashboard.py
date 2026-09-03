@@ -2906,6 +2906,120 @@ class TestRunNow:
         assert any("run-now failed" in msg for msg, _sev in notices)
 
 
+class TestJobsPreview:
+    """The jobs tab's preview: what the highlighted job was asked to do."""
+
+    def _wire(self, screen, monkeypatch, job_id="t1-abc", origin=None):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: job_id)
+        default = {"kind": "cron", "entry": "jira"}
+        screen._job_origins = {job_id: default if origin is None else origin}
+
+    async def test_it_shows_the_whole_prompt_and_who_asked(self, isolated, monkeypatch):
+        """The table cell holds the truncated head the listing carries; the
+        preview reads the record itself."""
+        long_prompt = "work on ACE-2750. " * 60
+        monkeypatch.setattr(
+            dash.file_queue, "read_job_prompt", lambda _root, _id: long_prompt
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "from jira" in rendered
+        # Every repetition, not the truncated head the listing carries.
+        assert rendered.count("ACE-2750") == 60
+        assert "abc" in header
+
+    async def test_the_record_is_read_once_per_job(self, isolated, monkeypatch):
+        """A job's prompt is written at enqueue and never changes, so the 1Hz
+        tick must not re-read the file every second."""
+        reads: list[str] = []
+        monkeypatch.setattr(
+            dash.file_queue,
+            "read_job_prompt",
+            lambda _root, job_id: reads.append(job_id) or "do the thing",
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+        assert reads == ["t1-abc"]
+
+    async def test_a_job_that_left_the_queue_has_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        """Claimed or finished between the listing and the read: no record to
+        show, and a stale prompt would be worse than none."""
+        monkeypatch.setattr(dash.file_queue, "read_job_prompt", lambda _root, _id: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "nothing to preview" in rendered
+
+    async def test_a_job_with_no_named_producer_says_so(self, isolated, monkeypatch):
+        """An origin predating the `kind` field names no producer, and the
+        preview says that rather than claiming one."""
+        monkeypatch.setattr(
+            dash.file_queue, "read_job_prompt", lambda _root, _id: "do the thing"
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch, origin={})
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "unnamed producer" in rendered
+
+    async def test_the_placeholder_rows_have_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        """ "queue empty" and "… N more" are rows, but neither is a job."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch, job_id="__empty__")
+            assert screen._preview_subject() is None
+            self._wire(screen, monkeypatch, job_id="__more__")
+            assert screen._preview_subject() is None
+
+    async def test_a_finished_job_drops_its_cached_prompt(self, isolated):
+        """Otherwise a long session accumulates the prompt of every job it ever
+        showed."""
+        table = TestJobsQueueTable()
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._job_prompts = {"gone": "old prompt", "here": "current prompt"}
+            view = table._view([table._row(job_id="here")])
+            screen._refresh_jobs(table._snap(view), None)
+            await pilot.pause()
+        assert set(screen._job_prompts) == {"here"}
+
+
 class TestWatchJobs:
     """The jobs tab's live view: the worker publishes the running job's
     session uuid in its heartbeat, so the highlighted job's live agent
