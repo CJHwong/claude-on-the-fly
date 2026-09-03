@@ -117,9 +117,9 @@ def _apply_tool_call_floor(job: Job, response: agent.Response) -> Result:
     """The run's Result, failed when it did less work than the entry demands.
 
     A backend that answers raises nothing, so an agent that refused, or replied
-    without acting, used to be recorded `ok=True` and alerted nobody. Seen once
-    in 595 cron fires: a deploy-watch fire replied that a security boundary
-    prohibited the check, made no tool call, and went down as a success.
+    without acting, used to be recorded `ok=True` and alerted nobody. That is not
+    hypothetical: a scheduled fire replied that a security boundary prohibited the
+    work it was asked to do, made no tool call, and went down as a success.
 
     Failing here rather than in the worker is what keeps this to one change. The
     worker already alerts on `not ok` and the cron log already writes `FAILED`,

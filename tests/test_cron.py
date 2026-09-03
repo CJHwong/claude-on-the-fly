@@ -2174,8 +2174,8 @@ class TestSideEffectFiresInTheBackground:
 class TestMinToolCalls:
     """The optional per-entry floor on a run's tool calls.
 
-    Off by default: `sys-codex-reflect` legitimately makes zero tool calls on odd
-    ISO weeks, so a blanket check would alert every other week.
+    Off by default: an entry with a designed periodic no-op legitimately makes
+    zero tool calls on some fires, so a blanket check would alert on each of them.
     """
 
     def test_it_is_unset_by_default(self, tmp_path: Path) -> None:
@@ -2187,7 +2187,7 @@ class TestMinToolCalls:
         path = cfg(
             tmp_path,
             {
-                "name": "deploy-watch",
+                "name": "nightly-check",
                 "cron": "* * * * *",
                 "prompt": "check the deploy",
                 "min_tool_calls": 2,
@@ -2262,7 +2262,7 @@ class TestMinToolCalls:
         """The queue is the only thing between the entry and the runner, so the
         floor has to travel on the job rather than be re-read there."""
         entry = CronEntry(
-            name="deploy-watch",
+            name="nightly-check",
             cron="* * * * *",
             prompt="check the deploy",
             min_tool_calls=2,
@@ -2270,7 +2270,7 @@ class TestMinToolCalls:
         queue = FakeQueue()
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         cron._enqueue(
-            entry, key="deploy-watch", session_key=None, prompt="check the deploy"
+            entry, key="nightly-check", session_key=None, prompt="check the deploy"
         )
         (job,) = queue.jobs
         assert job.min_tool_calls == 2

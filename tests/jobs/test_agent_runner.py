@@ -728,8 +728,9 @@ class TestMinToolCalls:
         assert result.tool_calls == 4
 
     async def test_no_floor_keeps_a_toolless_run_green(self, tmp_path: Path):
-        """`sys-codex-reflect` legitimately does nothing on odd ISO weeks, so a
-        blanket check is wrong. Unset means unset."""
+        """An entry whose guard acts only every other run legitimately does
+        nothing on the runs in between, so a blanket check is wrong. Unset means
+        unset."""
         result = await self._run(tmp_path, Response(body="nothing to do"))
         assert result.ok is True
         assert result.tool_calls == 0
