@@ -48,7 +48,7 @@ replies included. Config edits are picked up within a minute, no restart.
 | Keys | What happens |
 |---|---|
 | `prompt` or `prompt_file` | One job per fire. Keyed to the entry, so a slow run blocks the next fire instead of overlapping. Fresh session every time. |
-| `command` + a prompt | Producer. Each stdout line is one work item; each becomes a job whose session **resumes** across fires. |
+| `command` + a prompt | Producer. Each stdout line is one work item; each becomes a job whose session **resumes** across fires. Runs in the background, one at a time per entry. |
 | `command` alone | Subprocess run for its side effects. No job, no agent. |
 
 `prompt` and `prompt_file` are mutually exclusive. `max_concurrent` above 1 needs
@@ -80,6 +80,19 @@ you have, and it works: if your workflow moves a ticket's status as the agent
 progresses, progress is visible. An agent that only comments will park after
 `max_fires`, which is usually the right outcome — three attempts with no movement
 is when a human should look.
+
+**One producer runs at a time per entry.** The command runs in the background, so
+it does not hold up any other entry due in the same minute, but a fire that
+arrives while the previous run is still going is skipped and logged:
+
+```
+cron jira: producer from a previous fire is still running, skipping this fire
+```
+
+Nothing is lost, since the next fire polls again. Seeing that line repeatedly
+means the command takes longer than the gap between fires: widen the cron
+expression, or make the command faster. Raise `producer_timeout` only if the
+command is being killed part-way, which logs `timed out after Ns` instead.
 
 Emit the object's fields consistently. Templates render strictly, so an item
 missing a field the template references is skipped with a warning. Give optional
