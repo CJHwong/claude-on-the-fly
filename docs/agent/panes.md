@@ -153,6 +153,33 @@ The mode is separate from `agent.pane` on purpose. `pane` is global, so using it
 retreat from a break in codex's interactive path would take claude-pty's mirror away
 at the same time; `codex.mode: native` gives up only what broke.
 
+## The bottom viewport and its modes
+
+The dashboard's bottom row is one viewport, not two panes side by side. It shows the
+daemon **log** or the highlighted row's **live** output, and `v` cycles between them.
+Only the active mode is displayed, and `_refresh_bottom` refreshes only that one: a
+hidden log is not read at all.
+
+Half a terminal each is what this replaced. Both panes tailed a file every second
+whether or not anyone was reading them, and neither was wide enough to read.
+
+Three things follow:
+
+- **The mode is per tab, and remembered.** A tab that shows runs opens on `live`; the
+  cron tab opens on `log`, which is where a fire reports itself. The operator's own
+  choice wins from then on, for that tab, for the session.
+- **A mode owns the viewport, so it never hides itself.** The live view used to hide its
+  column when nothing was highlighted. It now says nothing is highlighted, and the mode
+  strip dims `live` — a dimmed mode is still reachable, it just has nothing behind it.
+- **The header is painted from one place.** Each mode sets a label
+  (`_set_bottom_label`); `_paint_bottom_header` draws the strip around it once per
+  refresh. A mode that returns early — nothing appended since the last tick — still gets
+  its label redrawn when the availability of another mode changes.
+
+Writes to a mode that is not displayed are safe but pointless: `RichLog` defers every
+write until it knows its size and flushes on the first layout. That is why `_set_mode`
+forces a reload rather than trusting what the widget was left holding.
+
 ## Attaching to a live pane
 
 The live view is read-only. To type at the agent, attach to its session: the dashboard's

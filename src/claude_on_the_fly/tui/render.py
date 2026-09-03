@@ -5,6 +5,7 @@ multiple TUI screens (tail_lines)."""
 from __future__ import annotations
 
 import json
+from collections.abc import Container, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -238,6 +239,31 @@ def cron_header(
     if next_fire_str:
         return line + f"  ·  next fire {next_fire_str}"
     return line + "  ·  [dim]no jobs[/dim]"
+
+
+def mode_strip(
+    active: str, modes: Sequence[str], unavailable: Container[str] = ()
+) -> str:
+    """The bottom viewport's mode selector, for its header line.
+
+    One cell per mode, the active one reverse-video'd and a mode with nothing
+    to show dimmed — the same idiom as the chat tab's frontend strip, so which
+    mode `v` is about to leave is always visible. A dimmed mode is still
+    reachable; it just has nothing behind it for the current selection.
+
+    The cells are separated by a space-padded pipe. This is a status line whose
+    cells cannot be aligned into columns, which is the one place that separator
+    belongs.
+    """
+    cells = []
+    for name in modes:
+        if name == active:
+            cells.append(f"[reverse] {name.upper()} [/reverse]")
+        elif name in unavailable:
+            cells.append(f"[dim]{name}[/dim]")
+        else:
+            cells.append(name)
+    return " │ ".join(cells)
 
 
 def jobs_header(

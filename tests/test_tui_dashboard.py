@@ -44,7 +44,7 @@ def isolated(tmp_path, monkeypatch):
 
 
 def _freeze_refresh_ticks(screen: DashboardScreen) -> None:
-    """Keep the screen's repeating `_refresh` / `_refresh_log` timers from ever
+    """Keep the screen's repeating `_refresh` / `_refresh_bottom` timers from ever
     being scheduled.
 
     `_refresh` resets `_job_sessions`, `_chat_workspaces` and `_job_workspaces`
@@ -64,7 +64,7 @@ def _freeze_refresh_ticks(screen: DashboardScreen) -> None:
 
     def skip_refresh_timers(*args, **kwargs):
         callback = args[1] if len(args) > 1 else kwargs.get("callback")
-        if callback in (screen._refresh, screen._refresh_log):
+        if callback in (screen._refresh, screen._refresh_bottom):
             return None
         return real_set_interval(*args, **kwargs)
 
@@ -744,35 +744,178 @@ def _write_session(path: Path, *texts: str) -> Path:
     return path
 
 
+def _use_mode(screen: DashboardScreen, mode: str) -> None:
+    """Show the bottom viewport's `mode`, the way `v` does.
+
+    A hidden RichLog renders nothing, so a test that reads a pane has to say
+    which mode it is reading rather than lean on the active tab's default.
+    """
+    screen._bottom_mode[screen._active_tab()] = mode
+    screen._apply_mode()
+
+
 def _pane_text(app: _Host, selector: str) -> str:
     pane = app.screen.query_one(selector, RichLog)
     return "\n".join(seg.text for line in pane.lines for seg in line._segments)
 
 
-class TestWatchPaneVisibility:
-    async def test_it_hides_when_nothing_is_drilled_into(self, isolated):
-        """Hidden gives the daemon log full width, which is what an operator wants
-        when there is no specific job to follow."""
+class TestBottomViewport:
+    """One viewport, three modes. `v` cycles; each tab keeps its own choice."""
+
+    async def test_only_the_active_mode_is_displayed(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            screen.action_show_tab("tab-jobs")
+            _use_mode(screen, "log")
             await pilot.pause()
-            screen._refresh_live_view(force_reload=True)
+            assert app.screen.query_one("#log-pane").display is True
+            assert app.screen.query_one("#live-view").display is False
+            _use_mode(screen, "live")
             await pilot.pause()
-            assert app.screen.query_one("#live-col").display is False
-        assert screen._live_target is None
+            assert app.screen.query_one("#log-pane").display is False
+            assert app.screen.query_one("#live-view").display is True
 
-    async def test_a_highlighted_cron_entry_opens_it(self, isolated, monkeypatch):
+    def test_before_mount_it_answers_for_the_tab_that_opens_first(self):
+        """`_mode` is read while painting, so it cannot raise on a screen that
+        has not mounted its tabs yet."""
+        screen = DashboardScreen()
+        assert screen._active_tab() == "tab-chat"
+        assert screen._mode() == "live"
+
+    async def test_v_cycles_the_mode(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "log")
+            screen.action_cycle_view()
+            await pilot.pause()
+            assert screen._mode() == "live"
+            screen.action_cycle_view()
+            await pilot.pause()
+            assert screen._mode() == "log"
+
+    async def test_each_tab_remembers_its_own_mode(self, isolated):
+        """A tab switch must not undo the mode you chose on the tab you left."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             screen.action_show_tab("tab-cron")
             await pilot.pause()
+            screen.action_cycle_view()  # cron: log -> live
+            await pilot.pause()
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            assert screen._mode() == "live"  # the jobs tab's own default
+            screen.action_cycle_view()  # jobs: live -> log
+            await pilot.pause()
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            assert screen._mode() == "live"
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            assert screen._mode() == "log"
+
+    async def test_the_tabs_open_on_their_own_default(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            assert screen._mode() == "live"  # chat: the running request
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            assert screen._mode() == "log"  # cron: where a fire reports itself
+
+    async def test_the_header_carries_the_strip_and_the_label(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen._set_bottom_label("[bold]live: telegram/H[/bold]")
+            screen._paint_bottom_header()
+            await pilot.pause()
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "LIVE" in header
+        assert "telegram/H" in header
+
+    async def test_an_unchanged_header_is_not_rewritten(self, isolated):
+        """The 1Hz tick repaints the header; rewriting an identical Static
+        every second is churn the terminal pays for."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._set_bottom_label("stable")
+            screen._paint_bottom_header()
+            writes: list[object] = []
+            static = app.screen.query_one("#bottom-header", Static)
+            object.__setattr__(static, "update", writes.append)
+            screen._paint_bottom_header()
+        assert writes == []
+
+    async def test_a_mode_with_nothing_to_follow_is_reported_unavailable(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            monkeypatch.setattr(screen, "_selected_job", lambda: None)
+            assert "live" in screen._unavailable_modes()
+            monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
+            assert "live" not in screen._unavailable_modes()
+
+    async def test_copy_follows_the_visible_mode(self, isolated, monkeypatch):
+        """`c` copies what you are reading. Copying a session log while the
+        daemon log is on screen would answer a question nobody asked."""
+        daemon_log = isolated / "daemon.log"
+        session_log = isolated / "session.jsonl"
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._log_path = daemon_log
+            screen._live_path = session_log
+            _use_mode(screen, "log")
+            assert screen._current_log_path() == daemon_log
+            _use_mode(screen, "live")
+            assert screen._current_log_path() == session_log
+
+    async def test_live_mode_with_no_file_falls_back_to_the_daemon_log(self, isolated):
+        """A live view rendering a tmux pane holds no path at all."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._log_path = isolated / "daemon.log"
+            screen._live_path = None
+            _use_mode(screen, "live")
+            assert screen._current_log_path() == isolated / "daemon.log"
+
+
+class TestWatchPaneVisibility:
+    async def test_it_says_so_when_nothing_is_drilled_into(self, isolated):
+        """The viewport belongs to the mode, so an empty live view states the
+        reason rather than handing its space to another mode."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            screen._refresh_live_view(force_reload=True)
+            await pilot.pause()
+            assert "nothing highlighted" in _pane_text(app, "#live-view")
+        assert screen._live_target is None
+
+    async def test_a_highlighted_cron_entry_becomes_the_target(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
             screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            assert app.screen.query_one("#live-col").display is True
         assert screen._live_target == "cron:nightly"
 
     async def test_the_placeholder_row_is_not_a_target(self, isolated, monkeypatch):
@@ -780,6 +923,7 @@ class TestWatchPaneVisibility:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "__empty__")
@@ -791,6 +935,7 @@ class TestWatchPaneVisibility:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "one")
@@ -807,6 +952,7 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
@@ -825,13 +971,14 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
             screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             rendered = _pane_text(app, "#live-view")
-            header = str(app.screen.query_one("#live-header", Static).content)
+            header = screen._bottom_label
         assert "[INFO] started" in rendered
         assert "[WARN] slow" in rendered
         assert "nightly" in header
@@ -843,6 +990,7 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
@@ -858,6 +1006,7 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
@@ -894,6 +1043,7 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
@@ -915,6 +1065,7 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
@@ -946,12 +1097,13 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch, uuid="")
             await pilot.pause()
             screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             rendered = _pane_text(app, "#live-view")
-            header = str(app.screen.query_one("#live-header", Static).content)
+            header = screen._bottom_label
         assert "no session uuid" in rendered
         assert "pending" in header
 
@@ -961,6 +1113,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: None)
             await pilot.pause()
@@ -974,13 +1127,14 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
             screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             rendered = _pane_text(app, "#live-view")
-            header = str(app.screen.query_one("#live-header", Static).content)
+            header = screen._bottom_label
         assert "hello from the agent" in rendered
         assert "telegram/hoss" in header
 
@@ -990,6 +1144,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
@@ -1004,6 +1159,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
@@ -1017,6 +1173,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
@@ -1042,6 +1199,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
@@ -1060,6 +1218,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
@@ -1084,6 +1243,7 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-chat")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
             monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _s: "nocolon")
@@ -2087,6 +2247,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2105,6 +2266,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2126,6 +2288,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             target = {"name": "cron"}
             monkeypatch.setattr(screen, "_active_daemon", lambda: target["name"])
             screen._refresh_daemon_log(force_reload=True)
@@ -2158,6 +2321,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2189,6 +2353,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             monkeypatch.setattr(
                 dash.logs, "find_log", lambda _role, directory=None: VanishingPath()
@@ -2209,6 +2374,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2231,7 +2397,7 @@ class TestRefreshNowKey:
             monkeypatch.setattr(screen, "_refresh", lambda: calls.append("tables"))
             monkeypatch.setattr(
                 screen,
-                "_refresh_log",
+                "_refresh_bottom",
                 lambda *, force_reload=False: calls.append(f"log:{force_reload}"),
             )
             screen.action_refresh_now()
@@ -2728,6 +2894,7 @@ class TestWatchJobs:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_jobs(screen, monkeypatch, isolated)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
@@ -2742,6 +2909,7 @@ class TestWatchJobs:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_jobs(screen, monkeypatch, isolated, uuid="")
             await pilot.pause()
             screen._refresh_live_view(force_reload=True)
@@ -2785,6 +2953,7 @@ class TestWatchJobs:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen._refresh_jobs(snap, status)
             await pilot.pause()
         assert screen._job_sessions == {"jobs:t1-abc": "s-1"}
@@ -2981,7 +3150,7 @@ class TestTheWatchPaneRendersRemoteTextAsData:
     """
 
     class _Recorder:
-        """Stands in for the header Static and the live-view RichLog."""
+        """Stands in for the live-view RichLog."""
 
         def __init__(self) -> None:
             self.written: list[str] = []
@@ -2999,9 +3168,9 @@ class TestTheWatchPaneRendersRemoteTextAsData:
         screen._chat_workspaces = {"telegram:7": label}
         screen._job_sessions = {}
         screen._job_workspaces = {}
-        header, pane = self._Recorder(), self._Recorder()
-        screen._refresh_live_session("telegram", "7", header, pane, True)
-        return "\n".join(header.written + pane.written)
+        pane = self._Recorder()
+        screen._refresh_live_session("telegram", "7", pane, True)
+        return "\n".join([screen._bottom_label, *pane.written])
 
     async def test_markup_in_a_workspace_name_stays_literal(self, isolated):
         label = "telegram/[/bold]evil[blink]"
@@ -3030,14 +3199,13 @@ class TestWatchGrid:
 
     @staticmethod
     def _call(screen, workspace):
-        from textual.widgets import RichLog, Static
+        from textual.widgets import RichLog
 
         return screen._refresh_live_grid(
             "telegram",
             "12345",
             workspace,
             "telegram/H",
-            screen.query_one("#live-header", Static),
             screen.query_one("#live-view", RichLog),
         )
 
@@ -3055,11 +3223,12 @@ class TestWatchGrid:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen._live_path = isolated / "stale.jsonl"
             handled = self._call(screen, isolated / "workspaces" / "telegram" / "H")
             await pilot.pause()
             rendered = _pane_text(app, "#live-view")
-            header = str(app.screen.query_one("#live-header", Static).content)
+            header = screen._bottom_label
 
         assert handled is True
         assert "running tests" in rendered
@@ -3081,12 +3250,12 @@ class TestWatchGrid:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            from textual.widgets import RichLog, Static
+            _use_mode(screen, "live")
+            from textual.widgets import RichLog
 
             screen._refresh_live_session(
                 "telegram",
                 "777",
-                screen.query_one("#live-header", Static),
                 screen.query_one("#live-view", RichLog),
                 True,
             )
@@ -3105,6 +3274,7 @@ class TestWatchGrid:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             assert self._call(screen, isolated / "ws") is False
 
     async def test_hosting_unavailable_never_probes_for_a_pane(
@@ -3121,6 +3291,7 @@ class TestWatchGrid:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             assert self._call(screen, isolated / "ws") is False
 
     async def test_a_pane_that_ends_mid_capture_falls_back(self, isolated, monkeypatch):
@@ -3133,6 +3304,7 @@ class TestWatchGrid:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             assert self._call(screen, isolated / "ws") is False
 
 
@@ -3142,7 +3314,7 @@ class TestWatchGridBlank:
     ):
         """A live pane trims to "" until the agent draws. Rendering that would
         blank the live view for the opening stretch of every turn."""
-        from textual.widgets import RichLog, Static
+        from textual.widgets import RichLog
 
         from claude_on_the_fly import tmux as tmux_mod
 
@@ -3153,12 +3325,12 @@ class TestWatchGridBlank:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             handled = screen._refresh_live_grid(
                 "telegram",
                 "12345",
                 isolated / "ws",
                 "telegram/H",
-                screen.query_one("#live-header", Static),
                 screen.query_one("#live-view", RichLog),
             )
 

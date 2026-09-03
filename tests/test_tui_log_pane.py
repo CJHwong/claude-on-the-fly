@@ -17,7 +17,7 @@ from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 
 class _DashboardOnlyApp(App):
     CSS = """
-    #log-row { height: 1fr; min-height: 8; }
+    #bottom-row { height: 1fr; min-height: 8; }
     #log-pane, #live-view { height: 1fr; min-height: 8; }
     """
 
@@ -56,6 +56,13 @@ async def test_daemon_log_missing_present_recovery(tmp_path, monkeypatch):
         assert isinstance(
             screen, DashboardScreen
         )  # narrow for the private-method calls
+        # The pane only renders while its mode owns the viewport, and this
+        # screen opens on the chat tab, whose default mode is live. The pause
+        # lets the newly shown pane get a size: RichLog defers every write
+        # until it has one.
+        screen._bottom_mode[screen._active_tab()] = "log"
+        screen._apply_mode()
+        await pilot.pause()
         pane = screen.query_one("#log-pane", RichLog)
 
         def text() -> list[str]:
