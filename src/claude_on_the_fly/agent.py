@@ -1384,14 +1384,183 @@ async def cached_skills(
         return skills
 
 
-def get_backend() -> AgentBackend:
-    """Pick a backend from the `agent:` config. Raises ValueError on misconfiguration."""
-    name = settings.get("AGENT_BACKEND", "claude").lower()
-    if name == "claude":
-        return _build_claude_backend()
-    if name == "codex":
-        return _build_codex_backend()
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+# --------------------------------------------------------------------------
+# Agent profiles
+# --------------------------------------------------------------------------
+# A profile answers "which agent, which model, how hard" once, so the factory,
+# the session key, and both argv builders read one resolved value instead of
+# re-deriving it from settings three times over. It also makes a per-entry
+# override safe: the answer travels as an argument, so two jobs interleaved in
+# one process cannot read each other's.
+
+_BACKENDS = ("claude", "codex")
+_MODES = ("native", "ollama", "pty")
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """A fully resolved agent configuration.
+
+    Every field is already routed. Under `ollama` mode the model and the effort
+    come from the `ollama:` block, and a backend reading `self.model` no longer
+    has to know that.
+    """
+
+    backend: str
+    mode: str
+    model: str
+    effort: str
+    ollama_context_window: int | None = None
+
+    @property
+    def key(self) -> str:
+        """Canonical `backend:mode:model`, folded into session UUID seeds.
+
+        This is a wire format, not a label. It seeds `uuid5`, so changing the
+        string restarts every live session that used the old one. That is why
+        codex substitutes `default` for an empty model and claude does not: the
+        asymmetry predates this type, and preserving it is what keeps sessions
+        written by an earlier build resolvable.
+        """
+        model = self.model or ("default" if self.backend == "codex" else "")
+        return f"{self.backend}:{self.mode}:{model}"
+
+
+def profile_names() -> list[str]:
+    """Every defined profile name. Empty when none are configured."""
+    table = settings.operator("agent").get("profiles")
+    return sorted(str(name) for name in table) if isinstance(table, dict) else []
+
+
+def _profile_overlay(name: str) -> dict[str, object]:
+    """One named block out of `agent.profiles`. Raises when it does not exist.
+
+    A missing profile is a config error, not a reason to fall back to the
+    global settings: falling back would run the entry on the expensive model it
+    was explicitly moved off, and nothing would say so.
+    """
+    table = settings.operator("agent").get("profiles")
+    if not isinstance(table, dict):
+        raise ValueError(
+            f"agent.profiles: no profiles are defined, so {name!r} cannot resolve"
+        )
+    block = table.get(name)
+    if block is None:
+        known = ", ".join(sorted(str(k) for k in table)) or "none"
+        raise ValueError(f"Unknown agent profile: {name!r} (defined: {known})")
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"agent.profiles.{name}: must be a mapping, got {type(block).__name__}"
+        )
+    return cast("dict[str, object]", block)
+
+
+def _overlay_str(block: object, key: str, where: str, fallback: str) -> str:
+    """`block[key]` when the profile sets it, else the global value.
+
+    The profile beats the environment on purpose. The env-beats-file rule in
+    `settings` protects a daemon-wide default from a `config.yaml` nobody
+    edited; a profile is neither daemon-wide nor a default, and an operator who
+    names one on an entry means it.
+    """
+    if not isinstance(block, Mapping):
+        return fallback
+    value = block.get(key)
+    if value is None:
+        return fallback
+    if not isinstance(value, str):
+        raise ValueError(f"{where}.{key}: must be a string, got {type(value).__name__}")
+    return value
+
+
+def resolve_profile(name: str | None = None) -> AgentProfile:
+    """Resolve the agent configuration, optionally overlaid with a named profile.
+
+    `None` reproduces the global configuration exactly, so every caller that
+    does not care about profiles keeps today's behaviour.
+
+    Raises ValueError on an unknown profile, backend, or mode, and on an ollama
+    mode with no model -- the same misconfigurations `get_backend` has always
+    refused, now refused once instead of in each consumer.
+    """
+    overlay: dict[str, object] = _profile_overlay(name) if name else {}
+    # Only ever interpolated into an error, and only a profile can produce one:
+    # with no overlay every lookup falls through to the global value.
+    where = f"agent.profiles.{name}" if name else "agent"
+
+    backend = _overlay_str(
+        overlay, "backend", where, settings.get("AGENT_BACKEND", "claude")
+    ).lower()
+    if backend not in _BACKENDS:
+        raise ValueError(
+            f"Unknown AGENT_BACKEND: {backend!r} (supported: claude, codex)"
+        )
+
+    block = overlay.get(backend)
+    mode = _overlay_str(
+        block,
+        "mode",
+        f"{where}.{backend}",
+        settings.get(f"{backend.upper()}_MODE", "native"),
+    ).lower()
+    if mode not in _MODES:
+        raise ValueError(
+            f"Unknown {backend.upper()}_MODE: {mode!r} (supported: native, ollama, pty)"
+        )
+
+    if mode != "ollama":
+        return AgentProfile(
+            backend=backend,
+            mode=mode,
+            model=_overlay_str(
+                block,
+                "model",
+                f"{where}.{backend}",
+                settings.get(f"{backend.upper()}_MODEL"),
+            ).strip(),
+            effort=_overlay_str(
+                block,
+                "effort",
+                f"{where}.{backend}",
+                settings.get(f"{backend.upper()}_EFFORT"),
+            ).strip(),
+        )
+
+    ollama = overlay.get("ollama")
+    model = _overlay_str(
+        ollama, "model", f"{where}.ollama", settings.get("OLLAMA_MODEL")
+    ).strip()
+    if not model:
+        raise ValueError(
+            f"{backend.upper()}_MODE=ollama requires OLLAMA_MODEL to be set"
+        )
+    return AgentProfile(
+        backend=backend,
+        mode=mode,
+        model=model,
+        effort=_overlay_str(
+            ollama, "effort", f"{where}.ollama", settings.get("OLLAMA_EFFORT")
+        ).strip(),
+        ollama_context_window=_ollama_context_window(
+            _overlay_str(
+                ollama,
+                "context_window",
+                f"{where}.ollama",
+                settings.get("OLLAMA_CONTEXT_WINDOW"),
+            )
+        ),
+    )
+
+
+def get_backend(profile: AgentProfile | None = None) -> AgentBackend:
+    """Build the backend for `profile`, or for the global `agent:` config.
+
+    Raises ValueError on misconfiguration, via `resolve_profile`.
+    """
+    resolved = profile if profile is not None else resolve_profile()
+    if resolved.backend == "claude":
+        return _build_claude_backend(resolved)
+    return _build_codex_backend(resolved)
 
 
 def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
@@ -1422,59 +1591,31 @@ def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
     return None
 
 
-def current_backend_key() -> str:
-    """Canonical `backend:mode:model` string for the currently-configured agent.
+def current_backend_key(profile: AgentProfile | None = None) -> str:
+    """Canonical `backend:mode:model` string for `profile`, or for the global config.
 
     Folded into session UUID seeds so each (backend, mode, model) combo gets
     its own session JSONL. Switching between e.g. claude-native and
-    claude-via-ollama no longer poisons the saved session — the new combo
+    claude-via-ollama no longer poisons the saved session -- the new combo
     starts a fresh thread and picks up prior context via the cross-backend
-    handoff path in `transcript`.
+    handoff path in `transcript`. A job that names a profile gets the same
+    treatment, which is why changing an entry's model restarts its transcript.
 
     Raises ValueError on the same misconfigurations as `get_backend()` so
     callers fail loudly instead of silently colliding sessions.
     """
-    name = settings.get("AGENT_BACKEND", "claude").lower()
-    if name == "claude":
-        mode = settings.get("CLAUDE_MODE", "native").lower()
-        if mode == "native":
-            return f"claude:native:{settings.get('CLAUDE_MODEL').strip()}"
-        if mode == "ollama":
-            model = settings.get("OLLAMA_MODEL").strip()
-            if not model:
-                raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
-            return f"claude:ollama:{model}"
-        if mode == "pty":
-            return f"claude:pty:{settings.get('CLAUDE_MODEL').strip()}"
-        raise ValueError(
-            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)"
-        )
-    if name == "codex":
-        mode = settings.get("CODEX_MODE", "native").lower()
-        if mode == "native":
-            return f"codex:native:{settings.get('CODEX_MODEL').strip() or 'default'}"
-        if mode == "ollama":
-            model = settings.get("OLLAMA_MODEL").strip()
-            if not model:
-                raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
-            return f"codex:ollama:{model}"
-        if mode == "pty":
-            return f"codex:pty:{settings.get('CODEX_MODEL').strip() or 'default'}"
-        raise ValueError(
-            f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama, pty)"
-        )
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+    return (profile if profile is not None else resolve_profile()).key
 
 
-def _ollama_context_window() -> int | None:
-    """Resolve the operator-declared context window for ollama mode.
+def _ollama_context_window(raw: str) -> int | None:
+    """Parse the operator-declared context window for ollama mode.
 
     None for unset or unusable values, which leaves ollama reporting no reading
     at all — the behaviour before this setting existed. A junk value disables
     the reading rather than taking the daemon down, and is logged so a typo does
     not look like a silently working setting.
     """
-    raw = settings.get("OLLAMA_CONTEXT_WINDOW").strip()
+    raw = raw.strip()
     if not raw:
         return None
     try:
@@ -1494,39 +1635,32 @@ def _ollama_context_window() -> int | None:
     return window
 
 
-def _build_claude_backend() -> AgentBackend:
+def _build_claude_backend(profile: AgentProfile) -> AgentBackend:
     from claude_on_the_fly.backends.claude import ClaudeBackend
 
-    mode = settings.get("CLAUDE_MODE", "native").lower()
-    if mode == "native":
-        return ClaudeBackend()
-    if mode == "ollama":
-        model = settings.get("OLLAMA_MODEL").strip()
-        if not model:
-            raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
+    if profile.mode == "ollama":
+        # No `model`: the launcher already pins it, and passing it too would put
+        # `--model` on the claude argv that ollama is wrapping.
         return ClaudeBackend(
-            launcher=OllamaLauncher(model=model),
-            ollama_context_window=_ollama_context_window(),
+            launcher=OllamaLauncher(model=profile.model),
+            ollama_context_window=profile.ollama_context_window,
+            effort=profile.effort,
         )
-    if mode == "pty":
-        return ClaudeBackend(pty=True)
-    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")
+    return ClaudeBackend(
+        pty=profile.mode == "pty", model=profile.model, effort=profile.effort
+    )
 
 
-def _build_codex_backend() -> AgentBackend:
+def _build_codex_backend(profile: AgentProfile) -> AgentBackend:
     from claude_on_the_fly.backends.codex import CodexBackend
 
-    mode = settings.get("CODEX_MODE", "native").lower()
-    if mode == "native":
-        return CodexBackend()
-    if mode == "ollama":
-        model = settings.get("OLLAMA_MODEL").strip()
-        if not model:
-            raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
-        return CodexBackend(launcher=OllamaLauncher(model=model))
-    if mode == "pty":
-        return CodexBackend(pty=True)
-    raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama, pty)")
+    if profile.mode == "ollama":
+        return CodexBackend(
+            launcher=OllamaLauncher(model=profile.model), effort=profile.effort
+        )
+    return CodexBackend(
+        pty=profile.mode == "pty", model=profile.model, effort=profile.effort
+    )
 
 
 async def run(
@@ -1538,8 +1672,9 @@ async def run(
     channel_context: str = "dm",
     timeout: float | None = DEFAULT_TIMEOUT,
     nudge_prompt: str | None = None,
+    profile: AgentProfile | None = None,
 ) -> Response:
-    return await get_backend().run(
+    return await get_backend(profile).run(
         workspace,
         session_uuid,
         prompt,
@@ -1555,9 +1690,15 @@ async def compact(
     workspace: Path,
     session_uuid: str,
     timeout: float | None = DEFAULT_TIMEOUT,
+    profile: AgentProfile | None = None,
 ) -> Compaction | None:
-    """Compact a session's history. None when the backend doesn't support it."""
-    backend = get_backend()
+    """Compact a session's history. None when the backend doesn't support it.
+
+    Takes the profile because a compaction that ran under different settings
+    than the turn it compacts would summarize with a model the conversation
+    never used.
+    """
+    backend = get_backend(profile)
     compactor = getattr(backend, "compact", None)
     if compactor is None:
         return None

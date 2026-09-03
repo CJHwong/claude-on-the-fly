@@ -64,7 +64,7 @@ async def test_run_once_drives_real_composition(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr(agent, "run", _canned_run)
     monkeypatch.setattr(
         "claude_on_the_fly.jobs.agent_runner.current_backend_key",
-        lambda: "claude:native:sonnet",
+        lambda _profile=None: "claude:native:sonnet",
     )
 
     queue, runner, notifier, recorder, alert_sink = cli.build_components(
@@ -114,7 +114,7 @@ async def test_real_composition_alerts_a_failed_cron_job(
     monkeypatch.setattr(agent, "run", _fails)
     monkeypatch.setattr(
         "claude_on_the_fly.jobs.agent_runner.current_backend_key",
-        lambda: "claude:native:sonnet",
+        lambda _profile=None: "claude:native:sonnet",
     )
 
     queue, runner, notifier, recorder, alert_sink = cli.build_components(
@@ -165,7 +165,7 @@ async def test_real_composition_records_a_keyed_outcome(
     monkeypatch.setattr(agent, "run", _fails)
     monkeypatch.setattr(
         "claude_on_the_fly.jobs.agent_runner.current_backend_key",
-        lambda: "claude:native:sonnet",
+        lambda _profile=None: "claude:native:sonnet",
     )
 
     queue, runner, notifier, recorder, alert_sink = cli.build_components(

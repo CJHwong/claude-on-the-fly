@@ -293,6 +293,28 @@ agent:
   # max, codex additionally minimal. A level the active backend doesn't accept is
   # ignored with a warning.
 
+  # Named overrides of everything above, for one cron entry at a time. An entry
+  # in cron.yaml says `profile: cheap` and runs on that block; an entry that
+  # names none runs on the settings above, unchanged. Same nesting and same key
+  # names, so a profile reads like the block it overrides. Any key you leave out
+  # is inherited, which is why `local` below only has to name the two that
+  # differ. A profile also beats the matching environment variable: it is named
+  # per entry by the operator, not a daemon-wide default.
+  # Every profile is validated at daemon start, so a typo or an uninstalled CLI
+  # refuses to start rather than failing on the entry's first fire. Changing a
+  # profile's model changes the session identity, so a keyed entry starts a
+  # fresh transcript on the next fire instead of resuming its old one.
+  # profiles:
+  #   cheap:
+  #     codex:
+  #       model: gpt-5-mini
+  #       effort: low
+  #   local:
+  #     codex:
+  #       mode: ollama
+  #     ollama:
+  #       model: qwen3:30b
+
   # Compact before answering once the previous turn left the context at or above
   # this share of the window. Unset means compaction only on $compact.
   # auto_compact_pct: 80

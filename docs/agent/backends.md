@@ -121,6 +121,34 @@ Reading it:
 
 Warm resumes are faster than these cold numbers and skip the first-turn system-prompt re-send.
 
+## Where the model and the effort come from
+
+One resolver decides, and the backends consume its answer. `agent.resolve_profile(name)`
+returns a frozen `AgentProfile(backend, mode, model, effort, ollama_context_window)`
+with every value already routed, and `agent.get_backend(profile)` binds the model and
+the effort onto the backend it constructs. Nothing below that line reads `settings`
+for any of the four.
+
+Two things depend on that.
+
+**The routing lives in one place.** Which key owns the effort depends on the mode:
+under a launcher it is `agent.ollama.effort`, otherwise the backend's own. The model
+is suppressed entirely under a launcher, since `ollama launch … --model X` already
+pinned it and a second `--model` would be a dead flag on the wrapped argv. Both
+backends used to re-derive that, and `current_backend_key` derived it a third time.
+
+**A per-job override is safe under concurrency.** The worker runs several jobs as
+asyncio tasks in one interpreter. The answer travels as an argument from
+`jobs/agent_runner.py` through `agent.run(profile=…)` into the constructor, so two
+jobs cannot read each other's. Any design that swapped process-global settings around
+the call would be a data race, which is why the profile is a value and not ambient
+state.
+
+`AgentProfile.key` is the `backend:mode:model` string that seeds session uuids. It is
+a wire format: codex substitutes `default` for an empty model and claude does not, and
+that asymmetry is preserved deliberately because changing the rendering would restart
+every session an earlier build wrote.
+
 ## Transport modes
 
 ### ollama launch

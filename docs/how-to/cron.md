@@ -12,6 +12,7 @@ entries:
     cron: "30 6 * * 1-5"          # Mon-Fri 06:30
     prompt: "Summarise yesterday's merged PRs and post them to the team channel."
     timeout: 1800                 # optional, default 1800s, max 86400
+    profile: cheap                # optional, an agent.profiles block in config.yaml
 
   # 2. producer: the command lists work items, each becomes its own job
   - name: jira
@@ -125,6 +126,45 @@ uv run claude-tui   # then `d` for doctor
 Doctor parses the config and compiles every template, so a bad cron expression, a
 missing `prompt_file`, or a template typo shows up before you start the daemon.
 `claude-cron` also refuses to start on a config it cannot load.
+
+## Running one entry on a different model
+
+Every entry shares the daemon's agent config by default. A job that reads three
+files and posts a line does not need the same model as one that reviews a diff, and
+one global setting cannot serve both.
+
+Name the difference in `~/.claude-on-the-fly/config.yaml`:
+
+```yaml
+agent:
+  backend: codex
+  codex:
+    model: gpt-5
+    effort: high
+
+  profiles:
+    cheap:
+      codex:
+        model: gpt-5-mini
+        effort: low
+```
+
+Then point the entry at it with `profile: cheap`. Keys the profile leaves out are
+inherited, so `cheap` above changes the model and the effort and nothing else. See
+[config.yaml](../reference/config-yaml.md) for the full rules.
+
+Two things to know before you use it:
+
+- A bare `command:` entry cannot take a profile. It runs a shell and never reaches
+  an agent, so the config refuses it rather than accepting a setting that would do
+  nothing.
+- Changing a profile's **model** changes the session identity. A producer entry,
+  whose items resume across fires, starts a fresh transcript on the next fire.
+  Changing only the **effort** does not.
+
+An unknown profile name fails when the daemon loads the config, and a profile
+naming a backend whose CLI is not installed stops the daemon from starting. Neither
+waits for the entry to fire.
 
 ## Concurrency
 

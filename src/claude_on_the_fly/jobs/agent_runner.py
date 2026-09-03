@@ -114,7 +114,11 @@ def sweep_run_workspaces(data_dir: Path, *, days: int) -> list[Path]:
 
 
 def _failure_signals(
-    workspace: Path, session_uuid: str, prompt: str, timeout: float | None
+    workspace: Path,
+    session_uuid: str,
+    prompt: str,
+    timeout: float | None,
+    profile: agent.AgentProfile,
 ) -> str:
     """Deterministic notes about a failed run, or "" when there are none.
 
@@ -122,17 +126,18 @@ def _failure_signals(
     said, which for a timeout is only that it timed out; these say whether the
     agent finished, where the time went, and whether the work ever started.
 
+    The backend comes from the job's own resolved profile, not the daemon's
+    global config: an entry running a profile that switched backends would
+    otherwise be diagnosed against a transcript format it never wrote.
+
     Guarded whole: a diagnosis is a courtesy on a path that is already failing,
     so a broken read must not replace the real error with its own traceback.
     """
     if settings.get("JOBS_DIAGNOSE_FAILURES", "").lower() not in {"1", "true", "yes"}:
         return ""
+    if profile.backend != "codex":
+        return ""
     try:
-        # Inside the guard because `current_backend_key` raises on a
-        # misconfigured backend, and that must not become the error the
-        # operator reads in place of the one that actually failed the job.
-        if not current_backend_key().startswith("codex:"):
-            return ""
         signals = transcript.diagnose_codex(
             workspace, session_uuid, prompt=prompt, timeout_s=timeout
         )
@@ -197,10 +202,21 @@ class OrchestratorAgentRunner:
                 workspace,
                 agent.persona_for("jobs", (job.key,) if job.key else ()),
             )
+            # Resolved once, then used for both the session seed and the run.
+            # A bad profile name is the operator's typo, so it reports as a
+            # failed job with the name in it rather than as a traceback.
+            try:
+                profile = agent.resolve_profile(job.profile)
+            except ValueError as exc:
+                logger.error("jobs: %s", exc)
+                return Result(ok=False, text=f"Job failed: {exc}")
+            # The profile is part of the session identity, so an entry that
+            # changes model starts a fresh transcript rather than resuming one
+            # the new model never wrote.
             session_uuid = str(
                 uuid5(
                     NAMESPACE_URL,
-                    f"{job.platform}/{current_backend_key()}/{run_id}",
+                    f"{job.platform}/{current_backend_key(profile)}/{run_id}",
                 )
             )
             self.in_flight[job.id] = {
@@ -224,13 +240,16 @@ class OrchestratorAgentRunner:
                     # fallback for jobs that have no key.
                     channel_context=job.key or self.channel_context,
                     timeout=timeout,
+                    profile=profile,
                 )
             except ClaudeUnavailableError as exc:
                 logger.warning("jobs: agent unavailable: %s", exc)
                 return Result(ok=False, text=f"Claude is unavailable: {exc}")
             except Exception as exc:  # NOT BaseException — CancelledError propagates
                 logger.exception("jobs: agent run failed")
-                notes = _failure_signals(workspace, session_uuid, job.prompt, timeout)
+                notes = _failure_signals(
+                    workspace, session_uuid, job.prompt, timeout, profile
+                )
                 # Signals lead, the CLI's own text follows. `_alert_body` caps
                 # the alert at 500 characters from the tail, and a backend that
                 # dumps its banner on failure is unbounded — appending would

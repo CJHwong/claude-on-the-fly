@@ -65,6 +65,10 @@ restart notification:
 - `logs.keep_days` acts when pruning runs, normally daemon startup.
 - `logs.host_tag` selects the current log filename at handler construction; a daily
   rollover reads it again.
+- `agent.profiles` is read per turn, so an edit to an existing profile takes
+  effect on the next fire. Adding a profile is different: the CLI check that
+  refuses a bad one runs during preflight, so a newly added profile is not
+  validated until the daemon restarts.
 
 ## Validation
 

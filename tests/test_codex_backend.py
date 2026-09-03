@@ -814,18 +814,17 @@ class TestCodexBackendRun:
             await CodexBackend().run(workspace, "sess", "hi", "telegram")
         assert "-c" not in mock.call_args[0][1]
 
-    async def test_native_effort_from_its_own_key(self, tmp_path, monkeypatch):
-        """CODEX_EFFORT is how an operator overrides effort for cotf's own native
-        spawns, without touching their own ~/.codex/config.toml."""
+    async def test_native_effort_from_the_resolved_effort(self, tmp_path):
+        """A resolved effort reaches native argv, so an operator can override
+        effort for cotf's own spawns without touching ~/.codex/config.toml."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("CODEX_EFFORT", "xhigh")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+            await CodexBackend(effort="xhigh").run(workspace, "sess", "hi", "telegram")
         assert 'model_reasoning_effort="xhigh"' in mock.call_args[0][1]
 
     async def test_native_effort_omitted_when_its_key_is_unset(
@@ -844,53 +843,49 @@ class TestCodexBackendRun:
             await CodexBackend().run(workspace, "sess", "hi", "telegram")
         assert "-c" not in mock.call_args[0][1]
 
-    async def test_ollama_effort_wins_over_the_native_key(self, tmp_path, monkeypatch):
-        """Both set: the launcher chose the model, so the launcher's key decides.
-        The native key is not consulted, not merged."""
+    async def test_resolved_effort_reaches_argv_under_a_launcher(self, tmp_path):
+        """The resolver decides which effort a launcher run uses; the backend
+        passes exactly what it was handed, with no second opinion."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("OLLAMA_EFFORT", "high")
-        monkeypatch.setenv("CODEX_EFFORT", "low")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend(launcher=launcher).run(
+            await CodexBackend(launcher=launcher, effort="high").run(
                 workspace, "sess", "hi", "telegram"
             )
         assert 'model_reasoning_effort="high"' in mock.call_args[0][1]
 
-    async def test_native_effort_level_out_of_set_skipped(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    async def test_native_effort_level_out_of_set_skipped(self, tmp_path, caplog):
         """A typo in config.yaml warns here rather than dying in codex's own
         config parse."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("CODEX_EFFORT", "enormous")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+            await CodexBackend(effort="enormous").run(
+                workspace, "sess", "hi", "telegram"
+            )
         assert "-c" not in mock.call_args[0][1]
         assert "ignoring unknown effort 'enormous'" in caplog.text
 
-    async def test_effort_config_under_launcher(self, tmp_path, monkeypatch):
+    async def test_effort_config_under_launcher(self, tmp_path):
         """Ollama mode: effort is passed as a TOML-quoted -c override."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("OLLAMA_EFFORT", "high")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend(launcher=launcher).run(
+            await CodexBackend(launcher=launcher, effort="high").run(
                 workspace, "sess", "hi", "telegram"
             )
         cmd = mock.call_args[0][1]
@@ -912,39 +907,33 @@ class TestCodexBackendRun:
             )
         assert "-c" not in mock.call_args[0][1]
 
-    async def test_effort_level_not_in_codex_set_skipped(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    async def test_effort_level_not_in_codex_set_skipped(self, tmp_path, caplog):
         """`max` is claude-only; codex must skip it rather than hand it to its
         config parse, which would fail the spawn."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("OLLAMA_EFFORT", "max")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend(launcher=launcher).run(
+            await CodexBackend(launcher=launcher, effort="max").run(
                 workspace, "sess", "hi", "telegram"
             )
         assert "-c" not in mock.call_args[0][1]
         assert "ignoring unknown effort 'max'" in caplog.text
 
-    async def test_native_with_codex_model_injects_m_flag(
-        self, tmp_path: Path, monkeypatch
-    ):
+    async def test_native_with_codex_model_injects_m_flag(self, tmp_path: Path):
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("CODEX_MODEL", "gpt-4.1")
 
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+            await CodexBackend(model="gpt-4.1").run(workspace, "sess", "hi", "telegram")
 
         cmd = mock.call_args[0][1]
         m_idx = cmd.index("-m")

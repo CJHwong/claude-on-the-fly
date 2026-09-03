@@ -45,6 +45,12 @@ class Job:
     `platform` selects the agent's format hint and handoff behavior. It rides on
     the job rather than being read out of `origin` so that `origin` stays
     something only the notifier interprets.
+
+    `profile` names an `agent.profiles` block, or None for the daemon's global
+    agent config. It rides on the job for the same reason `timeout` does: the
+    worker runs several jobs as concurrent tasks in one process, so anything
+    that varies per job has to travel as a value rather than be read from
+    process-wide state at the moment it is needed.
     """
 
     id: str
@@ -54,6 +60,7 @@ class Job:
     session_key: str | None = None
     timeout: float | None = None
     platform: str = "jobs"
+    profile: str | None = None
 
 
 @dataclass(frozen=True)

@@ -76,6 +76,20 @@ rather than ignoring them — `max_concurrent > 1` without a `command` is an err
 because silently ignoring it would leave somebody waiting for parallelism that
 cannot happen.
 
+`profile` is the current example: it is refused on an entry that has a `command`
+and no prompt, because such an entry runs a shell rather than an agent. It is also
+checked against the profiles defined in `config.yaml` at load, which is the one
+validation here that reads a different file.
+
+## Why a profile change restarts a transcript
+
+`current_backend_key()` is `backend:mode:model` and seeds the session uuid, so a
+profile that changes the model gives a keyed entry a session it has never written
+to. Nothing migrates the old transcript: the cross-backend handoff in `transcript`
+already covers picking up prior context, and a migration would be machinery for a
+case an operator caused deliberately. Effort is not part of the key, so changing it
+leaves the session alone.
+
 ## Producer output
 
 `parse_items` is deliberately forgiving per line and unforgiving per contract: a

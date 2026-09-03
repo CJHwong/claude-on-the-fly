@@ -160,6 +160,14 @@ def test_extract_cli_result_blank_lines_skipped():
 
 
 class TestCheckBackend:
+    """`check_backend` now resolves every profile in `agent.profiles` as well as
+    the global config, so each case needs its own DATA_DIR: a `config.yaml` left
+    by another test would add profiles and extra CLI checks to these counts."""
+
+    @pytest.fixture(autouse=True)
+    def _own_config(self, operator_settings):
+        return operator_settings
+
     @patch("claude_on_the_fly.preflight.check_claude_cli")
     def test_default_dispatches_native(self, mock_check, clear_backend_env):
         check_backend()
@@ -176,6 +184,9 @@ class TestCheckBackend:
     @patch("claude_on_the_fly.preflight.check_ollama_mode")
     def test_ollama_mode_dispatches(self, mock_check, clear_backend_env, monkeypatch):
         monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        # The profile resolves before anything dispatches, and ollama mode does
+        # not resolve without a model.
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen3.6:latest")
         check_backend()
         mock_check.assert_called_once()
 
@@ -205,6 +216,7 @@ class TestCheckBackend:
     def test_codex_ollama_dispatches(self, mock_check, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.setenv("CODEX_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen3.6:latest")
         check_backend()
         mock_check.assert_called_once_with("codex")
 

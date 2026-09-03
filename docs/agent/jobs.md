@@ -53,6 +53,14 @@ Two properties everything else rests on:
 - **Ids are `f"{time.time_ns()}-{uuid4().hex[:8]}"`.** Time-sortable, so `sorted(new/)` is FIFO — and the enqueue time is readable straight out of the name, with no `stat()` and no reliance on an mtime a copy or a `touch` would move.
 - **A keyed job's filename carries its key**: `<id>__<entry>__<item>.json` in `new/` and `cur/` (`keys.queue_filename`). Unkeyed jobs stay `<id>.json`. The key is in the *name* so `count_unfinished` can answer a producer's dedup and concurrency questions with two globs and zero file reads — it is asked on every poll, and reading every queued job to answer it would put the cost of the whole queue on every fire. The id stays the first component, so FIFO and `_enqueued_at` are unaffected. **Anything wanting the id from a filename goes through `keys.job_id_from_filename`**; `Path.stem` is the id *plus* its key on a keyed file. `done/` deliberately does not follow the scheme — `complete()` archives to a bare `<id>.json` so `undelivered()` pairs a job with its result by id alone. That is also why the key charset excludes `.`: a key containing one could mint an id whose job file is indistinguishable from another id's `.result.json`.
 
+**A job payload carries `profile`.** It names an `agent.profiles` block, or is null for
+the daemon's global agent config, and `agent_runner` resolves it once per run for both
+the session-uuid seed and the `agent.run` call. `_load` reads it with `.get`, like the
+other dispatch fields, which means the tolerance runs both ways: a worker older than
+the field ignores a `profile` it does not understand and runs the daemon default. A
+mixed-version rollout therefore downgrades the model rather than failing, which is
+worth knowing before you deploy one half of a pair.
+
 **Delivery is tracked separately from completion.** `complete()` archives the result, and a `<id>.delivered.json` marker is written only once a notifier returns. A result with no marker is a reply somebody is still waiting for — the worker was cancelled between finishing and posting, or the post failed — and `redeliver_pending` re-posts it at the next start, before claiming new work. Only the *reply* is retried: the job's agent run already happened, and re-running it would repeat every side effect it had. Bounded by `DELIVERY_RETRY_WINDOW_S` (24h), so a permanently undeliverable result is not retried on every start until the archive prunes it.
 
 That is why `Notifier.notify` **raises** on a failed post rather than swallowing it: returning normally is what marks a result delivered, so an adapter that hides a failure turns a retryable miss into a reply nobody ever receives.
