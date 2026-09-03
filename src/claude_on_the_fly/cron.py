@@ -67,10 +67,15 @@ DEFAULT_TIMEOUT = 1800
 MAX_TIMEOUT = 86400
 DEFAULT_MAX_CONCURRENT = 1
 NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-# A producer command only has to print a work list, so it gets a fixed short
-# limit rather than the entry's `timeout` — that one bounds the *agent* run each
-# emitted item turns into, and is measured in tens of minutes.
+# A producer command only has to print a work list, so it gets a short limit of
+# its own rather than the entry's `timeout` — that one bounds the *agent* run
+# each emitted item turns into, and is measured in tens of minutes. An entry
+# whose producer is genuinely slow raises its own with `producer_timeout`; this
+# is the default, not the ceiling.
 PRODUCER_TIMEOUT_S = 120
+# A producer that needs longer than an hour to print a work list is doing the
+# work rather than listing it, which belongs in the job the item becomes.
+MAX_PRODUCER_TIMEOUT_S = 3600
 # Longest producer stdout we will parse, so a command that accidentally streams a
 # log file cannot exhaust memory.
 MAX_PRODUCER_BYTES = 4 * 1024 * 1024
@@ -116,6 +121,10 @@ EXAMPLE_YAML = """\
 # Optional on any entry:
 #   timeout          seconds for the agent run (or for a bare command); default
 #                    1800, max 86400
+#   producer_timeout seconds for the producer COMMAND to print its work list;
+#                    default 120, max 3600. A different limit from `timeout`,
+#                    which bounds the agent run each printed item becomes. Needs
+#                    a producer - a command paired with a prompt.
 #   max_concurrent   how many of THIS entry's items may be outstanding at once;
 #                    default 1. Needs a command - without one there is only ever
 #                    a single item, the entry itself.
@@ -123,6 +132,10 @@ EXAMPLE_YAML = """\
 #                    0 disables
 #   profile          name of an `agent.profiles` entry in config.yaml, to run
 #                    THIS entry on its own backend/model/effort. Needs a prompt.
+#
+# Any other key is REJECTED when this file loads. A key nobody reads would sit on
+# a live entry doing nothing and saying nothing, which reads exactly like a
+# setting that works.
 #
 # PROMPT TEMPLATES are Liquid. A producer's item arrives as `item`:
 #     Work on {{ item.key }}: {{ item.summary }}   (status: {{ item.status }})
@@ -173,6 +186,7 @@ class CronEntry:
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_fires: int = DEFAULT_MAX_FIRES
     profile: str | None = None
+    producer_timeout: int = PRODUCER_TIMEOUT_S
 
     @property
     def kind(self) -> Literal["prompt", "producer", "command"]:
@@ -268,6 +282,41 @@ def _entry_profile(
     return profile
 
 
+# Every key an entry may carry, after `_translate_legacy_entry` has consumed the
+# legacy `script` and `args`. This is the whole schema: see `_reject_unknown_keys`
+# for why an unlisted key is an error rather than a shrug.
+ENTRY_KEYS = frozenset(
+    {
+        "name",
+        "cron",
+        "prompt",
+        "prompt_file",
+        "command",
+        "timeout",
+        "producer_timeout",
+        "max_concurrent",
+        "max_fires",
+        "profile",
+    }
+)
+
+
+def _reject_unknown_keys(data: dict[str, object], where: str) -> None:
+    """Refuse a key this schema does not define.
+
+    Ignoring one is the worst failure this config has: the operator wrote a
+    setting, the file loaded, and nothing said the setting does nothing. That is
+    indistinguishable from a working entry until somebody audits the behaviour
+    by hand, so a typo can sit on a live entry for months.
+    """
+    unknown = sorted(set(data) - ENTRY_KEYS)
+    if not unknown:
+        return
+    named = ", ".join(repr(key) for key in unknown)
+    valid = ", ".join(sorted(ENTRY_KEYS))
+    raise ValueError(f"{where}: unknown key {named} (valid keys: {valid})")
+
+
 def _validate_entry(
     raw: object, index: int, seen: set[str], config_dir: Path
 ) -> CronEntry:
@@ -291,6 +340,7 @@ def _validate_entry(
         raise ValueError(f"{where}: invalid cron {cron_expr!r}: {exc}") from exc
 
     data = _translate_legacy_entry(data, where)
+    _reject_unknown_keys(data, where)
 
     has_prompt = "prompt" in data
     has_file = "prompt_file" in data
@@ -328,6 +378,22 @@ def _validate_entry(
             f"{where}: 'max_concurrent' above 1 needs a 'command' to produce items"
         )
     max_fires = _positive_int(data, "max_fires", DEFAULT_MAX_FIRES, where)
+    producer_timeout = _positive_int(
+        data, "producer_timeout", PRODUCER_TIMEOUT_S, where
+    )
+    if not 0 < producer_timeout <= MAX_PRODUCER_TIMEOUT_S:
+        raise ValueError(
+            f"{where}: 'producer_timeout' must be 1..{MAX_PRODUCER_TIMEOUT_S}"
+        )
+    if "producer_timeout" in data and not (
+        command is not None and (has_prompt or has_file)
+    ):
+        # Same rule as 'profile': an entry with no producer never runs one, so
+        # accepting the key would promise a limit that applies to nothing.
+        raise ValueError(
+            f"{where}: 'producer_timeout' needs a producer - a 'command' paired "
+            "with a 'prompt' or 'prompt_file'"
+        )
     profile = _entry_profile(data, command is not None, has_prompt or has_file, where)
 
     entry = CronEntry(
@@ -340,6 +406,7 @@ def _validate_entry(
         max_concurrent=max_concurrent,
         max_fires=max_fires,
         profile=profile,
+        producer_timeout=producer_timeout,
     )
     _validate_template(entry, where)
     return entry
@@ -873,7 +940,7 @@ class CronDaemon:
     async def _fire_producer(self, entry: CronEntry) -> None:
         assert entry.command is not None
         stdout, rc = await self._run_command(
-            entry.command, timeout=PRODUCER_TIMEOUT_S, capture=True
+            entry.command, timeout=entry.producer_timeout, capture=True
         )
         if rc != 0:
             logger.error(

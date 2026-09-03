@@ -70,11 +70,23 @@ dry-rendered against an empty context — that is what catches an entry referenc
 
 ## Adding a config field
 
-`_validate_entry` is the schema. New fields go on `CronEntry` and get validated
-there; there is no separate schema file. Reject illegal *combinations* explicitly
-rather than ignoring them — `max_concurrent > 1` without a `command` is an error,
-because silently ignoring it would leave somebody waiting for parallelism that
-cannot happen.
+`_validate_entry` is the schema. New fields go on `CronEntry`, get validated
+there, and get added to `ENTRY_KEYS`; there is no separate schema file. **A field
+missing from `ENTRY_KEYS` is refused at load**, which is deliberate: an unknown
+key used to be ignored, so an inert `model: sonnet` sat on a live entry doing
+nothing and saying nothing while the operator who wrote it believed it worked.
+The check runs after `_translate_legacy_entry`, so the legacy `script` and `args`
+are gone by then and a pre-rename config still loads.
+
+That strictness is only safe because the two failure paths differ, and both are
+pinned by tests. `cron.main` turns the `ValueError` into `SystemExit`, so the
+daemon refuses to start on a config it cannot fully read. `_maybe_reload` catches
+it, logs `keeping prior entries`, and returns, so a typo saved into a live config
+does not empty the schedule. Keep that asymmetry when you tighten anything here.
+
+Reject illegal *combinations* explicitly rather than ignoring them —
+`max_concurrent > 1` without a `command` is an error, because silently ignoring
+it would leave somebody waiting for parallelism that cannot happen.
 
 `profile` is the current example: it is refused on an entry that has a `command`
 and no prompt, because such an entry runs a shell rather than an agent. It is also
@@ -113,12 +125,18 @@ story either way. Agent-run job failures alert from the worker instead; see
 
 ## Timeouts
 
-Two different limits, both spelled `timeout` in different places:
+Two different limits, and the vocabulary keeps them apart:
 
-- a producer command gets a fixed short `PRODUCER_TIMEOUT_S` — it only has to
-  print a work list
+- a producer command gets `PRODUCER_TIMEOUT_S` — it only has to print a work list.
+  An entry whose producer is genuinely slow raises its own with `producer_timeout`,
+  bounded by `MAX_PRODUCER_TIMEOUT_S`; the constant is the default, not the ceiling.
+  The key is refused on an entry with no producer, for the reason `profile` is
+  refused on a bare command: it would bound nothing.
 - a side-effect command, and the agent run each item becomes, get the entry's own
   `timeout`, which rides to the worker on `Job.timeout`
+
+The two must not be collapsed into one number. A producer that takes minutes is
+broken; an agent run that takes minutes is working.
 
 ## What the cron tab shows as "running"
 
