@@ -85,17 +85,27 @@ def test_resolve_jobs_token_falls_back_to_slack_token() -> None:
 
 
 def test_loop_warning_fires_for_inherited_user_token() -> None:
-    # Inheriting a user token from SLACK_TOKEN is the loop-prone default.
-    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxp-abc") is not None
+    # Inheriting a user token from SLACK_TOKEN is the loop-prone default, and
+    # the Slack job trigger is on (default $job, no SLACK_JOB_COMMAND set) so
+    # a kind="slack" job can actually reach this worker.
+    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxp-abc", {}) is not None
 
 
 def test_loop_warning_silent_for_bot_token() -> None:
-    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxb-abc") is None
+    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxb-abc", {}) is None
 
 
 def test_loop_warning_silent_for_explicit_override() -> None:
     # Deployer chose JOBS_SLACK_TOKEN explicitly — even a user token is their call.
-    assert cli._notifier_loop_warning("JOBS_SLACK_TOKEN", "xoxp-abc") is None
+    assert cli._notifier_loop_warning("JOBS_SLACK_TOKEN", "xoxp-abc", {}) is None
+
+
+def test_loop_warning_silent_when_slack_producer_disabled() -> None:
+    # SLACK_JOB_COMMAND="" opts out of the Slack trigger entirely (cron/enqueue-
+    # only install), so no job can ever carry kind="slack" and the notifier's
+    # Slack route never fires — the loop-prone token is moot.
+    env = {"SLACK_JOB_COMMAND": ""}
+    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxp-abc", env) is None
 
 
 def test_run_refuses_to_start_beside_a_live_worker(monkeypatch, capsys) -> None:
@@ -163,6 +173,8 @@ def test_run_without_a_token_refuses_and_names_both_vars(monkeypatch, capsys) ->
 
 
 def test_run_warns_about_an_inherited_user_token(monkeypatch, caplog) -> None:
+    # Slack's job trigger is on (default $job) so the warning's hazard is real.
+    monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
     monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
     monkeypatch.setattr(cli, "_setup_logging", lambda: None)
     monkeypatch.setattr(cli, "check_backend", lambda: None)
@@ -173,6 +185,23 @@ def test_run_warns_about_an_inherited_user_token(monkeypatch, caplog) -> None:
     with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
         assert cli._cmd_run() == 0
     assert caplog.records, "an inherited user token deserves a warning"
+
+
+def test_run_silent_when_slack_job_trigger_is_disabled(monkeypatch, caplog) -> None:
+    # SLACK_JOB_COMMAND="" is an enqueue-only install (cron, a git hook,
+    # `claude-jobs enqueue`); no job can carry kind="slack" so the loop-prone
+    # token is moot and the worker must not warn about it on every start.
+    monkeypatch.setenv("SLACK_JOB_COMMAND", "")
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(
+        cli.checks, "resolve_jobs_token", lambda env: ("SLACK_TOKEN", "xoxp-user")
+    )
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro: coro.close())
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
+        assert cli._cmd_run() == 0
+    assert not caplog.records, "no Slack producer means no loop hazard to warn about"
 
 
 class TestDoctor:
