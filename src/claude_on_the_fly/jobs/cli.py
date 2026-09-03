@@ -125,7 +125,9 @@ def _timeout_s() -> float | None:
     return timeout if timeout > 0 else None
 
 
-def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
+def _notifier_loop_warning(
+    token_var: str | None, token: str, env: Mapping[str, str]
+) -> str | None:
     """Return a warning when the worker would post under the frontend's own user
     identity, else None.
 
@@ -134,7 +136,18 @@ def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
     process with a per-process dedup set, so it re-ingests those results as new
     input — one spurious agent turn per job. A bot (`xoxb-`) token, or an
     explicit `JOBS_SLACK_TOKEN` the deployer chose, is left alone.
+
+    But the token only ever reaches Slack for a `kind="slack"` job, and only
+    the Slack frontend's job trigger (`SLACK_JOB_COMMAND`) can create one — see
+    `slack.py`'s `_build_job_queue() if self._job_command else None`. An
+    enqueue-only worker (cron, `claude-jobs enqueue`, a git hook) never
+    produces one, so `RoutingNotifier` never calls the Slack route and the
+    token kind is moot. `checks.effective_job_command` is the same gate
+    `_slack_job_producer_note` already uses to report whether Slack can reach
+    this worker at all, so this reuses it instead of re-deriving the answer.
     """
+    if checks.effective_job_command(env) is None:
+        return None
     if token_var != "JOBS_SLACK_TOKEN" and token.startswith("xoxp-"):
         return (
             "jobs notifier inherits the frontend's user token; job results post "
@@ -329,7 +342,7 @@ def _cmd_run() -> int:
             f"set JOBS_SLACK_TOKEN or SLACK_TOKEN in {agent.DATA_DIR / '.env'}\n"
         )
         return 2
-    loop_warning = _notifier_loop_warning(token_var, token)
+    loop_warning = _notifier_loop_warning(token_var, token, os.environ)
     if loop_warning:
         logger.warning("%s", loop_warning)
     try:
