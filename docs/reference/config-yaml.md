@@ -221,6 +221,7 @@ shortcut list is suppressed; a reply without a suggestions block shows no button
 | `poll_interval_s` | number / `2.0` | Idle queue polling interval | Restart jobs |
 | `timeout` | number / agent default | Per-job wall clock; `<=0` means unlimited | Restart jobs |
 | `workspace_keep_days` | integer / `30` | Retention for finished one-shot job workspaces; `0` keeps them forever. A job with a session key keeps its workspace indefinitely | Restart jobs |
+| `diagnose_failures` | boolean / `false` | Experimental. Appends deterministic signals read from the run's own codex rollout to a failed job's alert. Codex only; the claude backend ignores it | Live |
 | `personas` | mapping / empty | Per-job instructions file, keyed by the job key or `default` | Immediate |
 
 A timeout carried by a cron job overrides the worker default for that job.

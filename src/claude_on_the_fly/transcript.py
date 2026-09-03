@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -569,3 +571,203 @@ def prepend_handoff(
         session_uuid,
     )
     return f"{handoff}{prompt}"
+
+
+# --- failure diagnosis (experimental, codex only) ---
+
+# A rollout is looked up after its run already died, so the mtime filter
+# `_find_codex_rollout_by_cwd` uses for live tailing is far too tight. A job may
+# have run for its whole timeout before failing, and the alert is built after
+# that. One hour covers the longest configured timeout with room to spare.
+DIAGNOSE_ROLLOUT_MAX_AGE_S = 3600.0
+# Upper bound on rollouts opened while looking for one run's, so a busy
+# store cannot turn a diagnosis into a full scan of the sessions tree.
+_MAX_ROLLOUT_CANDIDATES = 200
+# Below this share of the wall clock spent inside tool calls, the run was
+# waiting on the model, not doing work. Measured, not guessed: a healthy fire of
+# the same entry spends whole seconds in execs, a stalled one spends tenths.
+STALL_TOOL_SHARE = 0.05
+# A stall claim needs most of the budget consumed, or a slow-but-working run
+# reads as a stall. Runs with no configured timeout fall back to the constant.
+STALL_TIMEOUT_SHARE = 0.8
+DEFAULT_STALL_FLOOR_S = 300.0
+# One failing exec is noise; a run that keeps hitting the same wall is missing a
+# capability. Three is the smallest count that cannot be a retry pair.
+CAPABILITY_GAP_ERRORS = 3
+# Substrings that mark a tool result as a failure. Lowercased before matching.
+_TOOL_ERROR_MARKERS = (
+    "not safe to open",
+    "command not found",
+    "no such file",
+    "permission denied",
+)
+# Paths in the prompt that name something to execute. A cron entry says "run
+# this script"; if the script never appears in a tool call, the run never
+# started its actual work, which is a different failure from crashing during it.
+_PAYLOAD_PATTERN = re.compile(r"[\w./~-]+\.(?:py|sh)\b")
+
+
+def _find_finished_rollout_by_cwd(cwd: str, *, max_age_s: float) -> Path | None:
+    """The rollout a *finished* run wrote for a workspace, newest first.
+
+    Deliberately not `_find_codex_rollout_by_cwd`, which reads only the single
+    freshest rollout in the store. That is right for its 1Hz live tailer, where
+    the run being watched is by definition the freshest file. It is wrong here:
+    a failed run is diagnosed after the fact, and on a host firing cron every
+    15 minutes several newer rollouts already exist. Checking only the freshest
+    found nothing on every real failure it was tried against.
+
+    So this walks candidates newest first and stops at the first cwd match,
+    reading one line each. It runs once per failed job rather than every
+    second, and `_MAX_ROLLOUT_CANDIDATES` keeps a busy store from turning that
+    into an unbounded scan.
+    """
+    if not cwd:
+        return None
+    cutoff = time.time() - max_age_s
+    candidates: list[tuple[float, Path]] = []
+    for path in _iter_rollouts("**/rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            candidates.append((mtime, path))
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    for _, path in candidates[:_MAX_ROLLOUT_CANDIDATES]:
+        meta = _read_first_jsonl(path)
+        if (
+            meta is not None
+            and meta.get("type") == "session_meta"
+            and (meta.get("payload") or {}).get("cwd") == cwd
+        ):
+            return path
+    return None
+
+
+def _diagnose_rollout(workspace: Path, session_uuid: str) -> Path | None:
+    """The rollout for a finished run, by thread id when one was persisted.
+
+    A run that died inside its first turn never got a thread id written, which
+    is the case this feature exists to explain, so the cwd scan is the path
+    that matters rather than the fallback it looks like.
+    """
+    thread_id = codex_state.read_thread_id(workspace, session_uuid)
+    if thread_id:
+        rollout = _find_codex_rollout(thread_id)
+        if rollout is not None:
+            return rollout
+    return _find_finished_rollout_by_cwd(
+        str(workspace), max_age_s=DIAGNOSE_ROLLOUT_MAX_AGE_S
+    )
+
+
+def _tool_spans(rows: list[dict]) -> tuple[float, int, int, int]:
+    """`(seconds inside tool calls, calls, outputs, failed outputs)`.
+
+    Codex writes a call and its output as separate records, so the time a tool
+    actually took is the gap between the pair. Summing those and subtracting
+    from the run's span is what separates "the model was slow" from "the work
+    was slow", which no single field in the rollout answers.
+    """
+    tool_wall = 0.0
+    calls = outputs = failed = 0
+    open_calls: dict[object, float | None] = {}
+    for row in rows:
+        payload = row.get("payload") or {}
+        kind = payload.get("type")
+        if kind == "custom_tool_call":
+            calls += 1
+            open_calls[payload.get("call_id") or calls] = _row_time(row)
+        elif kind == "custom_tool_call_output":
+            outputs += 1
+            started = open_calls.pop(payload.get("call_id") or outputs, None)
+            ended = _row_time(row)
+            if started is not None and ended is not None:
+                tool_wall += max(0.0, ended - started)
+            if _looks_like_tool_error(payload.get("output")):
+                failed += 1
+    return tool_wall, calls, outputs, failed
+
+
+def _looks_like_tool_error(output: object) -> bool:
+    """Whether a tool result reads as a failure rather than a result."""
+    blob = json.dumps(output, default=str).lower()
+    return any(marker in blob for marker in _TOOL_ERROR_MARKERS)
+
+
+def _row_time(row: dict) -> float | None:
+    """A rollout record's timestamp as epoch seconds, or None if unusable."""
+    stamp = row.get("timestamp")
+    if not isinstance(stamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def diagnose_codex(
+    workspace: Path,
+    session_uuid: str,
+    *,
+    prompt: str = "",
+    timeout_s: float | None = None,
+) -> list[str]:
+    """Deterministic signals about why a codex run failed, newest evidence only.
+
+    Experimental, and codex-only on purpose: every rule below reads a codex
+    rollout's record shapes. Claude writes a different session format, so a
+    caller on that backend gets nothing rather than a guess.
+
+    The alert a failed job already sends says what the CLI reported, which for a
+    timeout is only that it timed out. These signals answer the next question
+    an operator asks, and they are arithmetic over timestamps rather than an
+    interpretation: whether the agent finished at all, where the wall clock
+    went, whether the job's own payload ever ran, and whether the run kept
+    hitting the same failing tool.
+
+    Returns an empty list when there is no rollout or nothing stands out, so a
+    caller can append unconditionally.
+    """
+    rollout = _diagnose_rollout(workspace, session_uuid)
+    if rollout is None:
+        return []
+    rows = list(_iter_jsonl(rollout))
+    if not rows:
+        return []
+    signals: list[str] = []
+    started, ended = _row_time(rows[0]), _row_time(rows[-1])
+    span = (ended - started) if (started is not None and ended is not None) else 0.0
+
+    last = (rows[-1].get("payload") or {}).get("type") or rows[-1].get("type")
+    if last == "task_complete":
+        # The agent finished and the job still failed, so the fault is on our
+        # side of the CLI boundary. Without this the alert reads as an agent
+        # crash and sends the operator to the wrong component.
+        signals.append(f"agent reached task_complete in {span:.0f}s, failure is ours")
+    else:
+        signals.append(f"no task_complete, last event was {last}")
+
+    tool_wall, calls, outputs, failed = _tool_spans(rows)
+    floor = timeout_s * STALL_TIMEOUT_SHARE if timeout_s else DEFAULT_STALL_FLOOR_S
+    if span >= floor and tool_wall < span * STALL_TOOL_SHARE:
+        signals.append(
+            f"{span - tool_wall:.0f}s model / {tool_wall:.1f}s tool, stalled upstream"
+        )
+
+    if calls:
+        ran = "\n".join(
+            json.dumps((row.get("payload") or {}).get("input", ""), default=str)
+            for row in rows
+            if (row.get("payload") or {}).get("type") == "custom_tool_call"
+        )
+        for payload_name in dict.fromkeys(_PAYLOAD_PATTERN.findall(prompt)):
+            if payload_name not in ran:
+                signals.append(
+                    f"payload never ran, {payload_name} absent from {calls} tool calls"
+                )
+
+    if failed >= CAPABILITY_GAP_ERRORS:
+        signals.append(f"{failed}/{outputs} tool results were errors, capability gap?")
+    return signals

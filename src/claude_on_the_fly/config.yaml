@@ -461,6 +461,13 @@ jobs:
   # Needs a claude-jobs restart.
   # workspace_keep_days: 30
 
+  # Experimental. On a failed job, read the run's own codex rollout and append
+  # deterministic signals to the alert: whether the agent reached task_complete,
+  # how the wall clock split between the model and its tools, whether a script
+  # the prompt named ever ran, and whether the same tool kept erroring. Codex
+  # only; the claude backend ignores it and alerts exactly as before.
+  # diagnose_failures: false
+
   # Per-job persona, keyed by the job key exactly as the producer set it. Only cron
   # sets one: the entry name, or <entry>/<item key> for a producer entry. A job with
   # no key ($job, claude-jobs enqueue) or an unlisted one gets `default`.

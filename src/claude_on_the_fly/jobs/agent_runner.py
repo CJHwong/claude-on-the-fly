@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from claude_on_the_fly import agent, sandbox, tmux
+from claude_on_the_fly import agent, sandbox, settings, tmux, transcript
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.keys import safe_segment
@@ -111,6 +111,35 @@ def sweep_run_workspaces(data_dir: Path, *, days: int) -> list[Path]:
             _discard_workspace(workspace)
             removed.append(workspace)
     return removed
+
+
+def _failure_signals(
+    workspace: Path, session_uuid: str, prompt: str, timeout: float | None
+) -> str:
+    """Deterministic notes about a failed run, or "" when there are none.
+
+    Opt-in and codex-only. The alert an operator reads carries whatever the CLI
+    said, which for a timeout is only that it timed out; these say whether the
+    agent finished, where the time went, and whether the work ever started.
+
+    Guarded whole: a diagnosis is a courtesy on a path that is already failing,
+    so a broken read must not replace the real error with its own traceback.
+    """
+    if settings.get("JOBS_DIAGNOSE_FAILURES", "").lower() not in {"1", "true", "yes"}:
+        return ""
+    try:
+        # Inside the guard because `current_backend_key` raises on a
+        # misconfigured backend, and that must not become the error the
+        # operator reads in place of the one that actually failed the job.
+        if not current_backend_key().startswith("codex:"):
+            return ""
+        signals = transcript.diagnose_codex(
+            workspace, session_uuid, prompt=prompt, timeout_s=timeout
+        )
+    except Exception:
+        logger.exception("jobs: could not diagnose the failed run")
+        return ""
+    return "".join(f"\n- {signal}" for signal in signals)
 
 
 @dataclass
@@ -201,7 +230,14 @@ class OrchestratorAgentRunner:
                 return Result(ok=False, text=f"Claude is unavailable: {exc}")
             except Exception as exc:  # NOT BaseException — CancelledError propagates
                 logger.exception("jobs: agent run failed")
-                return Result(ok=False, text=f"Job failed: {exc}")
+                notes = _failure_signals(workspace, session_uuid, job.prompt, timeout)
+                # Signals lead, the CLI's own text follows. `_alert_body` caps
+                # the alert at 500 characters from the tail, and a backend that
+                # dumps its banner on failure is unbounded — appending would
+                # put the diagnosis exactly where truncation eats it. With no
+                # signals the text is byte-identical to what it always was.
+                text = f"Job failed:{notes}\n{exc}" if notes else f"Job failed: {exc}"
+                return Result(ok=False, text=text)
             return Result(ok=True, text=response.body)
         finally:
             self.in_flight.pop(job.id, None)
