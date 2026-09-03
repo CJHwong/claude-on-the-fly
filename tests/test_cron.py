@@ -2169,3 +2169,108 @@ class TestSideEffectFiresInTheBackground:
         assert cron._command_tasks == set() or all(
             t.done() for t in cron._command_tasks
         )
+
+
+class TestMinToolCalls:
+    """The optional per-entry floor on a run's tool calls.
+
+    Off by default: `sys-codex-reflect` legitimately makes zero tool calls on odd
+    ISO weeks, so a blanket check would alert every other week.
+    """
+
+    def test_it_is_unset_by_default(self, tmp_path: Path) -> None:
+        path = cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"})
+        (entry,) = load_config(path)
+        assert entry.min_tool_calls == 0
+
+    def test_an_entry_may_set_one(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {
+                "name": "deploy-watch",
+                "cron": "* * * * *",
+                "prompt": "check the deploy",
+                "min_tool_calls": 2,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.min_tool_calls == 2
+
+    def test_a_negative_floor_is_refused(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {
+                "name": "a",
+                "cron": "* * * * *",
+                "prompt": "x",
+                "min_tool_calls": -1,
+            },
+        )
+        with pytest.raises(
+            ValueError, match=re.escape("'min_tool_calls' must be a non-negative int")
+        ):
+            load_config(path)
+
+    def test_a_non_integer_floor_is_refused(self, tmp_path: Path) -> None:
+        for bad in ("2", 1.5, True, None, [1]):
+            path = cfg(
+                tmp_path,
+                {
+                    "name": "a",
+                    "cron": "* * * * *",
+                    "prompt": "x",
+                    "min_tool_calls": bad,
+                },
+            )
+            with pytest.raises(
+                ValueError,
+                match=re.escape("'min_tool_calls' must be a non-negative int"),
+            ):
+                load_config(path)
+
+    def test_a_bare_command_cannot_carry_one(self, tmp_path: Path) -> None:
+        """Same rule as `profile`: a side-effect command runs no agent, so the
+        floor would bound nothing."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "prune",
+                "cron": "0 4 * * *",
+                "command": "true",
+                "min_tool_calls": 1,
+            },
+        )
+        with pytest.raises(ValueError, match="'min_tool_calls' needs a 'prompt'"):
+            load_config(path)
+
+    def test_a_producer_may_carry_one(self, tmp_path: Path) -> None:
+        """A producer's items each become an agent run, so the floor applies."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "command": "true",
+                "prompt": "work {{ item.key }}",
+                "min_tool_calls": 1,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.min_tool_calls == 1
+
+    def test_the_floor_rides_to_the_worker_on_the_job(self, tmp_path: Path) -> None:
+        """The queue is the only thing between the entry and the runner, so the
+        floor has to travel on the job rather than be re-read there."""
+        entry = CronEntry(
+            name="deploy-watch",
+            cron="* * * * *",
+            prompt="check the deploy",
+            min_tool_calls=2,
+        )
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        cron._enqueue(
+            entry, key="deploy-watch", session_key=None, prompt="check the deploy"
+        )
+        (job,) = queue.jobs
+        assert job.min_tool_calls == 2

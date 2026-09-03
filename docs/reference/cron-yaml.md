@@ -24,6 +24,7 @@ entries:
 | `max_concurrent` | integer / `1` | At least 1; above 1 requires a producer command |
 | `max_fires` | integer / `3` | Unchanged fires before parking; `0` disables parking |
 | `profile` | string / unset | Names an `agent.profiles` block in `config.yaml`; needs a prompt, since a bare command runs no agent |
+| `min_tool_calls` | integer / `0` | Fewest tool calls a fire must make to count as a success; `0` is no floor. Needs a prompt, since a bare command runs no agent |
 
 Every entry needs a prompt, prompt file, or command. A producer command writes one JSON
 object per line with a non-empty `key`.
@@ -36,6 +37,12 @@ before the check.
 `timeout` and `producer_timeout` bound two different things. `producer_timeout` bounds
 the command that prints the work list, and is measured in seconds. `timeout` bounds the
 agent run each printed item becomes, and is measured in tens of minutes.
+
+`min_tool_calls` catches a fire that ran and did nothing. A backend that answers
+raises nothing, so an agent that refused, or replied without acting, is recorded as a
+success and alerts nobody. Set the floor and a run below it is recorded `FAILED` and
+alerts on the ordinary failure path. Leave it unset on an entry that legitimately has
+nothing to do on some fires, or every such fire alerts.
 
 An unknown `profile` fails at load, so a typo is caught when you save the file rather
 than on the entry's next fire. Changing a profile's model changes the session identity,

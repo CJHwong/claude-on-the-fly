@@ -27,6 +27,8 @@ reconfigure an already-running worker.
 
 One worker drains both producers, so delivery fans back out by where a job came from: `notifiers.RoutingNotifier` dispatches on `origin["kind"]` to the Slack thread notifier or to `LogNotifier`, which appends a cron reply to that entry's own log. It raises on an unknown kind rather than returning, so a typo'd kind shows up as a stuck reply in `undelivered()` instead of one marked delivered to nowhere.
 
+`Result` carries `ok`, `text`, and `tool_calls` — how many tool calls the run made. The count defaults to 0, so a runner that cannot know it constructs a `Result` from `ok` and `text` alone. It exists because a run that answers without acting raises nothing and so used to be recorded as a success: `Job.min_tool_calls` is the per-job floor, and `agent_runner` returns `ok=False` when the run's count is below it. See [cron.md](cron.md) for why that floor is per entry and off by default.
+
 A `Job` carries an opaque `origin` dict. The core, the queue, and the worker pass it through untouched; only the notifier reads it. That is what keeps vendor vocabulary (`channel`, `thread_ts`) out of the core.
 
 `JobQueue` also carries `mark_delivered`/`undelivered` (see delivery tracking below) and `list_unfinished(limit)`, the read half of the port, returning `QueueRow`s. A producer answering "what is already queued?" goes through it rather than reaching into `file_queue`, so the answer survives a swap to a broker-backed adapter. Rows carry `origin` for the same reason a `Job` does: the core cannot filter by channel, but the Slack frontend can.

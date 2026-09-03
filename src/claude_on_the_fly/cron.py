@@ -132,6 +132,12 @@ EXAMPLE_YAML = """\
 #                    0 disables
 #   profile          name of an `agent.profiles` entry in config.yaml, to run
 #                    THIS entry on its own backend/model/effort. Needs a prompt.
+#   min_tool_calls   fewest tool calls a fire must make to count as a success;
+#                    default 0, meaning no floor. A run below it is recorded
+#                    FAILED and alerts, which is how an agent that refused or
+#                    answered without acting stops reading as a green run. Needs
+#                    a prompt. Leave it unset on an entry that legitimately has
+#                    nothing to do on some fires, or every such fire alerts.
 #
 # Any other key is REJECTED when this file loads. A key nobody reads would sit on
 # a live entry doing nothing and saying nothing, which reads exactly like a
@@ -187,6 +193,7 @@ class CronEntry:
     max_fires: int = DEFAULT_MAX_FIRES
     profile: str | None = None
     producer_timeout: int = PRODUCER_TIMEOUT_S
+    min_tool_calls: int = 0
 
     @property
     def kind(self) -> Literal["prompt", "producer", "command"]:
@@ -301,6 +308,7 @@ ENTRY_KEYS = frozenset(
         "max_concurrent",
         "max_fires",
         "profile",
+        "min_tool_calls",
     }
 )
 
@@ -400,6 +408,15 @@ def _validate_entry(
         )
     profile = _entry_profile(data, command is not None, has_prompt or has_file, where)
 
+    min_tool_calls = _positive_int(data, "min_tool_calls", 0, where)
+    if "min_tool_calls" in data and not (has_prompt or has_file):
+        # Same rule as 'profile': a bare command runs a shell and never reaches
+        # an agent, so a floor on its tool calls would bound nothing.
+        raise ValueError(
+            f"{where}: 'min_tool_calls' needs a 'prompt' or 'prompt_file' - a "
+            "bare command runs no agent"
+        )
+
     entry = CronEntry(
         name=name,
         cron=cron_expr,
@@ -411,6 +428,7 @@ def _validate_entry(
         max_fires=max_fires,
         profile=profile,
         producer_timeout=producer_timeout,
+        min_tool_calls=min_tool_calls,
     )
     _validate_template(entry, where)
     return entry
@@ -1057,6 +1075,7 @@ class CronDaemon:
             timeout=float(entry.timeout),
             platform="cron",
             profile=entry.profile,
+            min_tool_calls=entry.min_tool_calls,
         )
         self._queue.enqueue(job)
         logger.info("cron %s: queued %s as %s", entry.name, key, job.id)

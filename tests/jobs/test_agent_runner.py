@@ -698,3 +698,82 @@ class TestJobPaneLifecycle:
             result = await runner.run(_job(prompt="hi"))
 
         assert result.ok is True
+
+
+class TestMinToolCalls:
+    """A per-entry floor on how much work a run had to do to count as a success.
+
+    An agent that refuses, or answers without acting, raises nothing, so the old
+    code recorded it `ok=True` and alerted nobody. The floor rides the existing
+    failure path instead of adding a second one.
+    """
+
+    async def _run(self, tmp_path: Path, response: Response, **job_kwargs):
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with (
+            patch("claude_on_the_fly.jobs.agent_runner.agent.run") as mock_run,
+            patch(
+                "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+                return_value="claude:native:sonnet",
+            ),
+        ):
+            mock_run.return_value = response
+            return await runner.run(_job("p", **job_kwargs))
+
+    async def test_the_tool_call_count_rides_on_the_result(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, Response(body="done", tool_counts={"Bash": 3, "Read": 1})
+        )
+        assert result.ok is True
+        assert result.tool_calls == 4
+
+    async def test_no_floor_keeps_a_toolless_run_green(self, tmp_path: Path):
+        """`sys-codex-reflect` legitimately does nothing on odd ISO weeks, so a
+        blanket check is wrong. Unset means unset."""
+        result = await self._run(tmp_path, Response(body="nothing to do"))
+        assert result.ok is True
+        assert result.tool_calls == 0
+
+    async def test_a_run_below_the_floor_fails(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, Response(body="I will not do that"), min_tool_calls=1
+        )
+        assert result.ok is False
+        assert result.tool_calls == 0
+        # The agent's own words survive, so the alert says what it actually said.
+        assert "I will not do that" in result.text
+        # ...behind the reason, which is the part the reader needs first.
+        assert result.text.startswith("Job did nothing:")
+
+    async def test_a_run_that_meets_the_floor_passes(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            Response(body="done", tool_counts={"Bash": 2}),
+            min_tool_calls=2,
+        )
+        assert result.ok is True
+        assert result.text == "done"
+
+    async def test_a_run_under_a_floor_above_one_fails(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            Response(body="had a look", tool_counts={"Read": 1}),
+            min_tool_calls=3,
+        )
+        assert result.ok is False
+        assert result.tool_calls == 1
+        assert "made 1 tool call, below the floor of 3" in result.text
+
+    async def test_a_raised_failure_still_reports_no_tool_calls(self, tmp_path: Path):
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with (
+            patch("claude_on_the_fly.jobs.agent_runner.agent.run") as mock_run,
+            patch(
+                "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+                return_value="claude:native:sonnet",
+            ),
+        ):
+            mock_run.side_effect = ClaudeUnavailableError("no backend")
+            result = await runner.run(_job("p", min_tool_calls=1))
+        assert result.ok is False
+        assert result.tool_calls == 0

@@ -693,6 +693,7 @@ def test_dispatch_fields_survive_enqueue_and_claim(tmp_path: Path) -> None:
             session_key="jira/ACE-1",
             timeout=90.0,
             platform="cron",
+            min_tool_calls=2,
         )
     )
 
@@ -703,6 +704,7 @@ def test_dispatch_fields_survive_enqueue_and_claim(tmp_path: Path) -> None:
     assert claimed.session_key == "jira/ACE-1"
     assert claimed.timeout == 90.0
     assert claimed.platform == "cron"
+    assert claimed.min_tool_calls == 2
 
 
 def test_a_job_without_dispatch_fields_is_an_unkeyed_one_shot(tmp_path: Path) -> None:
@@ -722,6 +724,7 @@ def test_a_job_without_dispatch_fields_is_an_unkeyed_one_shot(tmp_path: Path) ->
     assert claimed.session_key is None
     assert claimed.timeout is None
     assert claimed.platform == "jobs"
+    assert claimed.min_tool_calls == 0
 
 
 def test_a_wrongly_typed_dispatch_field_is_poison(tmp_path: Path) -> None:
@@ -1107,3 +1110,17 @@ def test_list_unfinished_on_a_missing_maildir_reads_as_empty(tmp_path: Path) -> 
     queue = FileInboxQueue(tmp_path / "never-created")
     assert queue.list_unfinished() == []
     assert not (tmp_path / "never-created").exists()
+
+
+def test_a_wrongly_typed_tool_call_floor_is_poison(tmp_path: Path) -> None:
+    """The floor is compared against a count, so a non-integer would decide a
+    job's outcome by whatever the comparison happened to do."""
+    queue = FileInboxQueue(tmp_path)
+    (tmp_path / "new").mkdir(parents=True)
+    (tmp_path / "new" / "1-a.json").write_text(
+        json.dumps({"id": "1-a", "prompt": "p", "origin": {}, "min_tool_calls": "two"}),
+        encoding="utf-8",
+    )
+
+    assert queue.claim() is None
+    assert (tmp_path / "failed" / "1-a.json").is_file()
