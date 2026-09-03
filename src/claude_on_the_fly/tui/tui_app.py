@@ -77,18 +77,18 @@ class ClaudeTuiApp(App):
         width: 1fr;
         height: 1fr;
     }
-    #dashboard-body #log-watch-col {
+    #dashboard-body #live-col {
         width: 1fr;
         height: 1fr;
         padding: 0 0 0 2;
     }
     #dashboard-body #log-header,
-    #dashboard-body #watch-header {
+    #dashboard-body #live-header {
         padding: 1 0 0 0;
         height: auto;
     }
     #dashboard-body #log-pane,
-    #dashboard-body #watch-pane {
+    #dashboard-body #live-view {
         height: 1fr;
         min-height: 8;
         border: solid grey;

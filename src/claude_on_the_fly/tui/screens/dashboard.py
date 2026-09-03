@@ -5,8 +5,8 @@ Layout (top → bottom):
   health badge ([1]–[3] switch key + state glyph) so switching to one zone
   never blinds the operator to the others' state. The chat tab's badge
   aggregates its daemons (broken > running > stopped). The active tab owns
-  the shared log/watch row below.
-- Log row: daemon log (left) + per-entry / per-job watch (right).
+  the shared log/live row below.
+- Log row: daemon log (left) + per-entry / per-job live view (right).
 
 The jobs tab is a read-only observer of the worker's maildir: it renders queue
 depth and the unfinished jobs, and never creates, moves, or writes anything
@@ -22,10 +22,10 @@ their uptime. Finished / failed requests aren't kept here — they live in the
 History overlay (h) and ping a notification when they happen.
 
 Selection model: the active tab decides which daemon the supervisor keys
-(k/r) and the log/watch row act on; tab state is stable across window blur,
+(k/r) and the log/live row act on; tab state is stable across window blur,
 unlike focus. On the chat tab ←/→ pick the frontend (header-owned, always
 visible so a stopped one can still be started), and the highlighted row points
-the watch pane at that job's session. Refresh runs at 1Hz, rebuilding tables
+the live view at that job's session. Refresh runs at 1Hz, rebuilding tables
 from a fresh state.snapshot() while preserving each table's cursor by row key
 and its scroll offset (see _restore_cursor).
 """
@@ -89,9 +89,9 @@ CRON_CONFIG = DATA_DIR / "cron.yaml"
 # `kind` column already says which of the two a row holds.
 PROMPT_COLUMN = "prompt"
 TAIL_LINES = 200
-# When showing an agent job watch, tail this many raw JSONL events; each
+# When showing a run in the live view, tail this many raw JSONL events; each
 # formats to 1–4 visible lines so the rendered pane stays manageable.
-WATCH_EVENTS = 80
+LIVE_EVENTS = 80
 # Cap on RichLog growth so a 24/7 dashboard doesn't accumulate unbounded memory.
 LOG_PANE_MAX_LINES = 10_000
 
@@ -302,17 +302,17 @@ class DashboardScreen(Screen):
         # stable by name across refreshes (see _refresh_chat_strip).
         self._chat_selected_idx: int = 0
         # Watch pane state, tracked separately so the two panes refresh
-        # independently. _watch_target encodes what's being watched, e.g.
+        # independently. _live_target encodes what's being watched, e.g.
         # "session:cron:ACE-1" or "cron:cleanup-entry", so we know to
         # force a reload when the user navigates to a different item.
-        self._watch_path: Path | None = None
-        self._watch_mtime: float | None = None
-        self._watch_target: str | None = None
-        # ticket identifier → tracker source (jira | github), so the watch pane
+        self._live_path: Path | None = None
+        self._live_mtime: float | None = None
+        self._live_target: str | None = None
+        # ticket identifier → tracker source (jira | github), so the live view
         # resolves the per-tracker workspace dir.
-        # "<frontend>:<identifier>" → session_uuid for the watch pane.
+        # "<frontend>:<identifier>" → session_uuid for the live view.
         # Chat rows key on the unique chat_id (workspace_name is not unique
-        # across concurrent jobs), so the watch pane needs the workspace name
+        # across concurrent jobs), so the live view needs the workspace name
         # resolved separately: "<frontend>:<chat_id>" → workspace_name.
         # Jobs rows carry the full workspace path from the worker's heartbeat
         # (their workspaces are not under the chat convention), so that gets
@@ -345,7 +345,7 @@ class DashboardScreen(Screen):
             # One tab per daemon zone — chat first, then the two autonomous
             # engines. The tab title carries the at-a-glance health (badge set
             # in _refresh_tab_badges) so switching to one daemon never blinds
-            # the operator to the others' state. The shared log/watch row below
+            # the operator to the others' state. The shared log/live row below
             # follows the active tab.
             with TabbedContent(id="daemon-tabs"):
                 with (
@@ -395,10 +395,10 @@ class DashboardScreen(Screen):
                         auto_scroll=False,
                         max_lines=LOG_PANE_MAX_LINES,
                     )
-                with Vertical(id="log-watch-col"):
-                    yield Static(id="watch-header", markup=True)
+                with Vertical(id="live-col"):
+                    yield Static(id="live-header", markup=True)
                     yield RichLog(
-                        id="watch-pane",
+                        id="live-view",
                         wrap=False,
                         highlight=False,
                         markup=True,
@@ -454,7 +454,7 @@ class DashboardScreen(Screen):
         # that tab's table. Same for the cron detail block (mouse wheel still
         # scrolls it) and the Run-now button (its keyboard path is `n`).
         self.query_one("#log-pane", RichLog).can_focus = False
-        self.query_one("#watch-pane", RichLog).can_focus = False
+        self.query_one("#live-view", RichLog).can_focus = False
         self.query_one("#cron-detail", RichLog).can_focus = False
         self._refresh()
         self.set_interval(1.0, self._refresh)
@@ -563,7 +563,7 @@ class DashboardScreen(Screen):
         self, event: TabbedContent.TabActivated
     ) -> None:
         """Switching tabs changes the active daemon: land focus on the new tab's
-        table and repoint the shared log/watch row + action cue."""
+        table and repoint the shared log/live row + action cue."""
         active = event.tabbed_content.active
         table_id = self._TAB_TABLES.get(active, "chat-strip")
         with contextlib.suppress(Exception):
@@ -614,7 +614,7 @@ class DashboardScreen(Screen):
     def _selected_run(self) -> tuple[str, str] | None:
         """The highlighted AI run as `(source, identifier)`, or None.
 
-        Both tabs that show a run answer here, so the watch pane, Takeover and
+        Both tabs that show a run answer here, so the live view, Takeover and
         Attach all act on the row the operator is looking at. A chat run is
         keyed by its frontend and chat id; a job run by the literal source
         "jobs" and its job id. The cron tab has no run, so it answers None.
@@ -701,7 +701,7 @@ class DashboardScreen(Screen):
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         # Repoint the log pane when the cursor moves. No force_reload: a real
         # selection change is caught downstream by the path/target-switch checks
-        # (_refresh_daemon_log, _refresh_watch_pane), so a same-file highlight
+        # (_refresh_daemon_log, _refresh_live_view), so a same-file highlight
         # hits the mtime guard and no-ops instead of rewriting 200+ lines.
         self._refresh_log()
         self._update_action_cue()
@@ -1105,14 +1105,14 @@ class DashboardScreen(Screen):
         line.update(f"[yellow]{spinner} {self._busy_msg}…[/yellow]")
 
     # ------------------------------------------------------------------
-    # Log + watch panes
+    # Log + live views
     # ------------------------------------------------------------------
 
     def _current_log_path(self) -> Path | None:
-        """Whichever log pane is more specific takes precedence: the watch
-        pane (per-ticket session log) when something's highlighted there,
+        """Whichever log is more specific takes precedence: the live view
+        (per-ticket session log) when something's highlighted there,
         otherwise the daemon log for the active daemon."""
-        return self._watch_path if self._watch_path else self._log_path
+        return self._live_path if self._live_path else self._log_path
 
     def action_copy_log(self) -> None:
         """Copy the tail of the currently-relevant log to the clipboard.
@@ -1149,9 +1149,9 @@ class DashboardScreen(Screen):
         )
 
     def _refresh_log(self, *, force_reload: bool = False) -> None:
-        """Refresh both panes: daemon log on the left, ticket watch on the right."""
+        """Refresh both panes: daemon log on the left, the live view on the right."""
         self._refresh_daemon_log(force_reload=force_reload)
-        self._refresh_watch_pane(force_reload=force_reload)
+        self._refresh_live_view(force_reload=force_reload)
 
     def _refresh_daemon_log(self, *, force_reload: bool) -> None:
         """Live-tail the active daemon's log into the dashboard pane.
@@ -1235,13 +1235,13 @@ class DashboardScreen(Screen):
         if not was_bottom:
             render.restore_scroll(pane, prev_y=prev_y)
 
-    def _refresh_watch_pane(self, *, force_reload: bool) -> None:
-        """Show the watch column when the active daemon has something to drill
+    def _refresh_live_view(self, *, force_reload: bool) -> None:
+        """Show the live column when the active daemon has something to drill
         into: a highlighted cron entry, or a
         chat daemon with a running job. Otherwise the column is hidden so the
         daemon log gets full width.
         """
-        col = self.query_one("#log-watch-col", Vertical)
+        col = self.query_one("#live-col", Vertical)
         name = self._active_daemon()
 
         # "session:<frontend>:<identifier>" for an AI job, "schedule:<name>"
@@ -1263,32 +1263,32 @@ class DashboardScreen(Screen):
         if target is None:
             if col.display:
                 col.display = False
-                self._watch_path = None
-                self._watch_mtime = None
-                self._watch_target = None
+                self._live_path = None
+                self._live_mtime = None
+                self._live_target = None
             return
 
         if not col.display:
             col.display = True
 
-        if target != self._watch_target:
-            self._watch_target = target
-            self._watch_path = None
-            self._watch_mtime = None
+        if target != self._live_target:
+            self._live_target = target
+            self._live_path = None
+            self._live_mtime = None
             force_reload = True
 
-        header = self.query_one("#watch-header", Static)
-        pane = self.query_one("#watch-pane", RichLog)
+        header = self.query_one("#live-header", Static)
+        pane = self.query_one("#live-view", RichLog)
 
         mode, _, rest = target.partition(":")
         if mode == "session":
             # rest = "<frontend>:<identifier>"
             source, _, identifier = rest.partition(":")
-            self._refresh_watch_session(source, identifier, header, pane, force_reload)
+            self._refresh_live_session(source, identifier, header, pane, force_reload)
         else:
-            self._refresh_watch_cron(rest, header, pane, force_reload)
+            self._refresh_live_cron(rest, header, pane, force_reload)
 
-    def _refresh_watch_session(
+    def _refresh_live_session(
         self,
         source: str,
         identifier: str,
@@ -1320,17 +1320,17 @@ class DashboardScreen(Screen):
         # rebuilt from transcript events, and it shows the states the transcript
         # cannot: a turn parked on a prompt writes no event at all while it
         # waits. Falls through to the JSONL tail for every run with no pane.
-        if self._refresh_watch_grid(source, identifier, workspace, shown, header, pane):
+        if self._refresh_live_grid(source, identifier, workspace, shown, header, pane):
             return
 
         session_uuid = self._job_sessions.get(key)
         if not session_uuid:
-            if force_reload or self._watch_path is not None:
-                self._watch_path = None
-                self._watch_mtime = None
+            if force_reload or self._live_path is not None:
+                self._live_path = None
+                self._live_mtime = None
                 pane.clear()
                 pane.write(f"[dim]no session uuid for {shown} yet[/dim]")
-                header.update(f"[bold]watch: {shown}[/bold] [dim](pending)[/dim]")
+                header.update(f"[bold]live: {shown}[/bold] [dim](pending)[/dim]")
             return
 
         # Resolve across backends: the daemon may have run this job under a
@@ -1338,17 +1338,15 @@ class DashboardScreen(Screen):
         path = resolve_session_log(workspace, session_uuid)
 
         if path is None:
-            if force_reload or self._watch_path is not None:
-                self._watch_path = None
-                self._watch_mtime = None
+            if force_reload or self._live_path is not None:
+                self._live_path = None
+                self._live_mtime = None
                 pane.clear()
                 pane.write(
                     f"[dim]no session log yet for {shown} — "
                     f"agent hasn't run a turn[/dim]"
                 )
-                header.update(
-                    f"[bold]watch: {shown}[/bold] [dim](no session yet)[/dim]"
-                )
+                header.update(f"[bold]live: {shown}[/bold] [dim](no session yet)[/dim]")
             return
 
         try:
@@ -1356,19 +1354,19 @@ class DashboardScreen(Screen):
         except OSError:
             return
 
-        switched = path != self._watch_path
-        if not switched and not force_reload and mtime == self._watch_mtime:
+        switched = path != self._live_path
+        if not switched and not force_reload and mtime == self._live_mtime:
             return
 
-        self._watch_path = path
-        self._watch_mtime = mtime
-        header.update(f"[bold]watch: {shown}[/bold] [dim]{path.name}[/dim]")
+        self._live_path = path
+        self._live_mtime = mtime
+        header.update(f"[bold]live: {shown}[/bold] [dim]{path.name}[/dim]")
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
         render.begin_scroll_aware_rewrite(pane, stick_to_bottom=stick)
         import json
 
-        raw_lines = render.tail_lines(path, WATCH_EVENTS)
+        raw_lines = render.tail_lines(path, LIVE_EVENTS)
         any_rendered = False
         for raw in raw_lines:
             raw = raw.strip()
@@ -1389,7 +1387,7 @@ class DashboardScreen(Screen):
         if not stick:
             render.restore_scroll(pane, prev_y=prev_y)
 
-    def _refresh_watch_grid(
+    def _refresh_live_grid(
         self,
         source: str,
         identifier: str,
@@ -1421,27 +1419,27 @@ class DashboardScreen(Screen):
         # The tail's bookkeeping has to be cleared, not just bypassed: it decides
         # whether a later switch back to a file counts as a switch, and a stale
         # path here would leave the tail refusing to reload the pane it lost.
-        self._watch_path = None
-        self._watch_mtime = None
-        header.update(f"[bold]watch: {shown}[/bold] [dim]live pane[/dim]")
+        self._live_path = None
+        self._live_mtime = None
+        header.update(f"[bold]live: {shown}[/bold] [dim]tmux pane[/dim]")
         pane.clear()
         pane.write(Text.from_ansi(grid))
         return True
 
-    def _refresh_watch_cron(
+    def _refresh_live_cron(
         self, job: str, header: Static, pane: RichLog, force_reload: bool
     ) -> None:
         """Tail the per-job log for `job` as plain text.
 
         Markup is bypassed via rich.text.Text so literal log brackets like
         [INFO] survive intact even though the pane has markup=True (which the
-        session watch relies on for colors).
+        live view relies on for colors).
         """
         path = logs.find_log(f"cron-{job}", directory=LOG_DIR)
         if path is None or not path.is_file():
-            if force_reload or self._watch_path is not None:
-                self._watch_path = None
-                self._watch_mtime = None
+            if force_reload or self._live_path is not None:
+                self._live_path = None
+                self._live_mtime = None
                 pane.clear()
                 pane.write(
                     f"[dim]no log yet at {path} — job hasn't fired since startup[/dim]"
@@ -1454,12 +1452,12 @@ class DashboardScreen(Screen):
         except OSError:
             return
 
-        switched = path != self._watch_path
-        if not switched and not force_reload and mtime == self._watch_mtime:
+        switched = path != self._live_path
+        if not switched and not force_reload and mtime == self._live_mtime:
             return
 
-        self._watch_path = path
-        self._watch_mtime = mtime
+        self._live_path = path
+        self._live_mtime = mtime
         header.update(f"[bold]job: {job}[/bold] [dim]{path.name}[/dim]")
         was_bottom, prev_y = render.capture_scroll(pane)
         stick = switched or force_reload or was_bottom
@@ -1695,7 +1693,7 @@ class DashboardScreen(Screen):
         here creates or moves a file under jobs/.
 
         The worker publishes each running job's session uuid in its heartbeat,
-        which is what lets the watch pane tail the live agent conversation —
+        which is what lets the live view tail the live agent conversation —
         the same channel the chat tab uses.
         """
         running = ((jobs.extra or {}).get("running_jobs") or []) if jobs else []
@@ -1739,7 +1737,7 @@ class DashboardScreen(Screen):
             # third-party text (a Slack user's message). "[pytest]" would be
             # eaten as a tag and "[/]" raises MarkupError — which Textual turns
             # into an app exit, killing the whole dashboard. Same reason
-            # _refresh_watch_cron wraps log lines.
+            # _refresh_live_cron wraps log lines.
             table.add_row(
                 Text(_short_job_id(row.id)),
                 Text(_job_source(row.origin)),

@@ -472,7 +472,7 @@ async def test_platform_rides_on_the_job(tmp_path: Path) -> None:
 async def test_in_flight_is_populated_during_the_run_and_cleared_after(
     tmp_path: Path,
 ) -> None:
-    """The heartbeat's jobs watch pane resolves a running job's live session
+    """The heartbeat's jobs live view resolves a running job's live session
     from this; it must be present while the agent runs and gone when it
     ends."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)

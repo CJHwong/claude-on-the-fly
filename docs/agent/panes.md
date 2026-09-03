@@ -1,21 +1,21 @@
 # Panes
 
 A turn can run inside a tmux pane so something other than the turn itself can see what
-the agent is doing. `src/claude_on_the_fly/tmux.py` owns the pane; the TUI's watch pane
+the agent is doing. `src/claude_on_the_fly/tmux.py` owns the pane; the TUI's live view
 renders it read-only.
 
-Read this before changing how a turn is hosted, how the watch pane picks its source, or
+Read this before changing how a turn is hosted, how the live view picks its source, or
 how a hosted turn is reaped.
 
 ## Why a pane rather than the transcript
 
-The watch pane already tails the session JSONL and renders it through
+The live view already tails the session JSONL and renders it through
 `tui/session_format.py`. That covers every backend, and it is still the fallback. What it
 cannot show is a state the transcript never records. A turn parked on claude's
 workspace-trust dialog writes no event while it waits, so the tail is empty and the turn
 looks hung for no reason. The pane shows the dialog.
 
-So the watch pane prefers the pane when the selected run has one, and falls back to the
+So the live view prefers the pane when the selected run has one, and falls back to the
 tail when it does not.
 
 Hosting is on wherever tmux is installed, and `agent.pane: false` switches it off — an
@@ -155,7 +155,7 @@ at the same time; `codex.mode: native` gives up only what broke.
 
 ## Attaching to a live pane
 
-The watch pane is read-only. To type at the agent, attach to its session: the dashboard's
+The live view is read-only. To type at the agent, attach to its session: the dashboard's
 `a` key copies the command for the highlighted run, on the chat tab and the jobs tab
 alike.
 

@@ -787,10 +787,10 @@ class TestJobsTab:
         assert not root.exists()
 
     @pytest.mark.asyncio
-    async def test_arrows_and_watch_pane_no_op_on_the_jobs_tab(
+    async def test_arrows_and_live_view_no_op_on_the_jobs_tab(
         self, tmp_path, monkeypatch
     ):
-        """No frontend strip to move through, and no per-job watch yet
+        """No frontend strip to move through, and no per-job live view yet
         (the worker doesn't publish a session uuid) — so the daemon log keeps
         the full width."""
         from textual.containers import Vertical
@@ -808,7 +808,7 @@ class TestJobsTab:
             await pilot.pause()
             assert screen._chat_selected_idx == before
             assert screen._active_daemon() == "jobs"
-            assert app.screen.query_one("#log-watch-col", Vertical).display is False
+            assert app.screen.query_one("#live-col", Vertical).display is False
 
     @pytest.mark.asyncio
     async def test_log_pane_follows_the_worker_log(self, tmp_path, monkeypatch):

@@ -18,7 +18,7 @@ from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 class _DashboardOnlyApp(App):
     CSS = """
     #log-row { height: 1fr; min-height: 8; }
-    #log-pane, #watch-pane { height: 1fr; min-height: 8; }
+    #log-pane, #live-view { height: 1fr; min-height: 8; }
     """
 
     def on_mount(self) -> None:

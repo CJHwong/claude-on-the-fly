@@ -133,7 +133,7 @@ A queue deeper than the row cap gets a trailing `… N more` row, so the cap nev
 
 The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#cron-entries` is a different widget** — the cron tab's cron table — and must not be reused.
 
-The watch pane tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
+The live view tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
 
 ## Workspaces
 
@@ -174,7 +174,7 @@ Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`)
 ## Panes
 
 A job runs inside its own tmux pane when tmux is present, named
-`cotf-job-<run id>` where the run id is the workspace's directory name. The TUI's watch
-pane mirrors it, and `OrchestratorAgentRunner` reaps it with `tmux.kill` in the same
+`cotf-job-<run id>` where the run id is the workspace's directory name. The TUI's live
+view mirrors it, and `OrchestratorAgentRunner` reaps it with `tmux.kill` in the same
 `finally` that clears `in_flight`. The worker sweeps whatever a killed worker left behind
 at startup, beside the workspace sweep. See [panes](panes.md).

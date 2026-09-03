@@ -36,7 +36,7 @@ configuration writes, not those persona links.
 | `auto_compact_pct` | integer / unset | `1..100`; invalid disables automatic compaction | Immediate |
 | `skills_cache_ttl_seconds` | number / `3600` | `<=0` probes on every query; invalid uses default | Immediate |
 | `pricing_ttl_seconds` | integer / `604800` | `0` always refreshes; negative never expires | Immediate |
-| `pane` | boolean / true | Host each turn in its own tmux server so the dashboard's watch pane mirrors the agent's terminal; `false`, `0`, `no` or `off` switches it off, anything else leaves it on. Inert without tmux | Next turn |
+| `pane` | boolean / true | Host each turn in its own tmux server so the dashboard's live view mirrors the agent's terminal; `false`, `0`, `no` or `off` switches it off, anything else leaves it on. Inert without tmux | Next turn |
 | `pty.auto_install` | boolean / false | Install missing claude-pty without prompting | Startup |
 | `profiles` | mapping / unset | Named overrides of the keys above, one per cron entry. Same nesting and same key names; an omitted key inherits the global value. Validated at daemon start | Next turn |
 | `pty.auto_refresh` | boolean / true | Re-splice incomplete pty hooks | Startup |
@@ -47,7 +47,7 @@ picks whether it is mirrored. Keeping them apart means a break in one backend's
 interactive path costs that backend its UI rather than taking the other's mirror
 away with it.
 
-With `pane` off, every turn runs as a plain child and the watch pane falls back to
+With `pane` off, every turn runs as a plain child and the live view falls back to
 tailing the session transcript. Native `claude -p` and `codex.mode: native` are never
 worth hosting either way: their panes would show stream JSON and plain lines.
 

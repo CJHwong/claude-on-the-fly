@@ -82,7 +82,7 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/cron.md` — when touching the cron producer, its config schema, or key state
 - `docs/agent/frontend.md` — when adding a new frontend (Slack/Telegram-like)
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
-- `docs/agent/panes.md` — when changing how a turn is hosted in tmux, how the TUI's watch pane picks its source, or how a hosted turn is reaped
+- `docs/agent/panes.md` — when changing how a turn is hosted in tmux, how the TUI's live view picks its source, or how a hosted turn is reaped
 - `docs/agent/broker.md` — when changing the credential broker or sandbox/jail wiring
 - `docs/agent/security-findings.md` — before changing a sandbox profile or a broker: what
   a review already found, what was accepted, and what is still open. Add findings here

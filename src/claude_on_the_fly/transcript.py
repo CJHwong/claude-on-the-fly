@@ -91,7 +91,7 @@ def claude_projects_dir() -> Path:
     answer depend on who imported the module. The daemon writing the logs is
     spawned with `DATA_DIR/.env` merged in; the TUI reading them is not, so a
     deployment that sets `CLAUDE_CONFIG_DIR` in that file had the two processes
-    looking at different directories, and the watch pane reported "agent hasn't
+    looking at different directories, and the live view reported "agent hasn't
     run a turn" over a session that was streaming. Resolving through
     `envfile` per call is what makes the reader agree with the writer.
     """
