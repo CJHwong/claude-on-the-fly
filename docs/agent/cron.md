@@ -27,6 +27,46 @@ stops matching the query, so it stops being enqueued, and that *is* the stop
 signal. If you find yourself wanting to cancel an in-flight job because its item
 changed, don't: let the run finish and let the next fire decide.
 
+## Nothing blocks the minute scan
+
+`_fire` starts an entry's work and returns, for every kind of entry. The
+scheduling loop awaits it once per due entry, so a slow `_fire` is a delay
+charged to every other entry due in the same minute. A producer's shell command
+used to be awaited inline: a measured 38s poll, firing four times an hour, made
+the four other entries due at `:00` start 38s late. Nothing was lost, because
+`next_fire` advances before the await, but late is its own failure.
+
+So a producer goes through `_spawn`, the same helper as a side-effect command:
+one task, named after its entry, tracked in `_command_tasks`. That name is the
+only route from a task back to its entry, and three things read it — `stop`,
+`heartbeat_extra`, and `_is_running`.
+
+Two things follow from moving work into a task, and both are easy to get wrong.
+
+1. **The failure has to report itself.** `_fire`'s try/except now covers only
+   *starting* the task. `_logged` wraps the work so an exception is logged
+   against its entry, instead of sitting unretrieved in a Task object until the
+   garbage collector mentions it. A swallowed poll failure is the bug this
+   daemon can least afford, which is why `_fire_producer`'s own `_alert_failure`
+   is inside the task rather than around it.
+2. **`_spawn` takes the coroutine function, not a coroutine.** A task cancelled
+   before its first step never calls it, and `stop` cancels exactly that way. A
+   coroutine built by the caller would be left unawaited there.
+
+**One producer per entry at a time.** `_spawn_producer` refuses a fire while
+that entry's previous producer is still running, because two overlapping runs of
+one poll emit the same work list twice. The fire is dropped, not queued: a
+producer that cannot keep up with its own schedule is a config problem, and the
+next scheduled fire polls again anyway. It logs at INFO, since the operator's fix
+is to widen the cron expression or speed the command up. The guard is
+`_is_running`, which asks each task rather than reading
+`_running_command_names`: a finished task stays in `_command_tasks` until its
+done-callback runs a tick later, and letting that veto the next fire would drop a
+poll for no reason.
+
+A side-effect command has no such guard, and never had one. Its overlap costs a
+second subprocess, not a duplicated work list.
+
 ## The three gates on an item
 
 `_admit` applies them cheapest first, and logs every rejection — a silent skip is
@@ -127,7 +167,7 @@ story either way. Agent-run job failures alert from the worker instead; see
 
 Two different limits, and the vocabulary keeps them apart:
 
-- a producer command gets `PRODUCER_TIMEOUT_S` — it only has to print a work list.
+- a producer command runs in its own task and gets `PRODUCER_TIMEOUT_S` — it only has to print a work list.
   An entry whose producer is genuinely slow raises its own with `producer_timeout`,
   bounded by `MAX_PRODUCER_TIMEOUT_S`; the constant is the default, not the ceiling.
   The key is refused on an entry with no producer, for the reason `profile` is
@@ -160,9 +200,10 @@ from a crashed drain is processed by the next one.
 `stop()` sets the stop flag and cancels every task in `_command_tasks`. Nothing is
 lost that a notice could recover: an enqueued job is already durable, and a cancelled
 command fires again on its own schedule. So the daemon names the entries it cut, at
-WARNING, rather than telling anybody. Command tasks are named after their entry
-(`_spawn_command`) purely so that log line and `heartbeat_extra`'s `running_commands`
+WARNING, rather than telling anybody. Tasks are named after their entry
+(`_spawn`) purely so that log line and `heartbeat_extra`'s `running_commands`
 can identify them; the task object carries no other route back to the entry.
+Producers are in that set too, so a stop cuts a poll in flight and says so.
 
 `heartbeat_extra` publishes `running_commands` for one reader:
 `supervisor.pending_work`, which says what a stop will cancel *before* it signals.

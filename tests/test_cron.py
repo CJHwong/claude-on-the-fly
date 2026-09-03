@@ -99,6 +99,17 @@ def daemon(
 # ---------------------------------------------------------------------------
 
 
+async def fire_and_settle(cron: CronDaemon, entry: CronEntry) -> None:
+    """Fire an entry, then wait for whatever task the fire started.
+
+    `_fire` returns as soon as the work is under way, which is the whole point of
+    it, so a test that asserts on what a producer *did* has to wait for the task
+    itself. Nothing in production waits like this.
+    """
+    await cron._fire(entry)
+    await asyncio.gather(*list(cron._command_tasks), return_exceptions=True)
+
+
 class TestConfigShape:
     def test_prompt_only_entry_loads(self, tmp_path: Path) -> None:
         path = cfg(tmp_path, {"name": "digest", "cron": "0 9 * * *", "prompt": "hi"})
@@ -588,7 +599,7 @@ class TestFire:
             max_concurrent=2,
         )
 
-        await cron._fire(entry)
+        await fire_and_settle(cron, entry)
 
         assert [j.key for j in queue.jobs] == ["jira/ACE-1", "jira/ACE-2"]
 
@@ -604,7 +615,7 @@ class TestFire:
 
         cron._run_command = record  # type: ignore[method-assign]
 
-        await cron._fire(_producer_entry(producer_timeout=300, timeout=1800))
+        await fire_and_settle(cron, _producer_entry(producer_timeout=300, timeout=1800))
 
         assert seen == [300]
 
@@ -616,7 +627,9 @@ class TestFire:
         queue = FakeQueue()
         cron = daemon(tmp_path, cfg(tmp_path), queue)
 
-        await cron._fire(_producer_entry(command="sleep 30", producer_timeout=1))
+        await fire_and_settle(
+            cron, _producer_entry(command="sleep 30", producer_timeout=1)
+        )
 
         assert queue.jobs == []
         assert "timed out after 1s" in caplog.text
@@ -629,7 +642,7 @@ class TestFire:
         queue = FakeQueue()
         cron = daemon(tmp_path, cfg(tmp_path), queue)
 
-        await cron._fire(_producer_entry(command="exit 3"))
+        await fire_and_settle(cron, _producer_entry(command="exit 3"))
 
         assert queue.jobs == []
         assert "producer exited 3" in caplog.text
@@ -638,7 +651,7 @@ class TestFire:
         sink = _RecordingAlertSink()
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
 
-        await cron._fire(_producer_entry(command="exit 3"))
+        await fire_and_settle(cron, _producer_entry(command="exit 3"))
 
         assert sink.calls == [
             (
@@ -651,7 +664,7 @@ class TestFire:
         sink = _RecordingAlertSink()
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
 
-        await cron._fire(_producer_entry(command="true"))
+        await fire_and_settle(cron, _producer_entry(command="true"))
 
         assert sink.calls == []
 
@@ -719,6 +732,169 @@ class TestFire:
         entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 1", timeout=30)
 
         await cron._run_side_effect(entry)  # must not raise
+
+
+class TestProducerOffTheLoop:
+    """A producer runs as a task, not inline in the scheduling loop.
+
+    Awaiting it inline made every entry due in the same minute wait out the poll:
+    a measured 38s producer firing four times an hour delayed the four other
+    entries due at `:00` by 38s each.
+    """
+
+    def _config(self, tmp_path: Path) -> Path:
+        return cfg(
+            tmp_path,
+            {
+                "name": "slow",
+                "cron": "* * * * *",
+                "command": 'sleep 2; printf \'{"key":"ACE-1"}\\n\'',
+                "prompt": "work {{ item.key }}",
+            },
+            {"name": "quick", "cron": "* * * * *", "prompt": "x"},
+        )
+
+    async def test_a_slow_producer_does_not_delay_the_entry_behind_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The one test that pins the fix. `slow` comes first in the config, so
+        the loop reaches `quick` only after `_fire` returns."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, self._config(tmp_path), queue)
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        ticks = 0
+
+        async def one_pass_then_stop() -> None:
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                cron._stop.set()
+
+        cron._sleep_to_next_minute = one_pass_then_stop  # type: ignore[method-assign]
+        cron.reload()
+        for state in cron._state.values():
+            state.next_fire = datetime(2000, 1, 1)
+
+        started = time.monotonic()
+        await asyncio.wait_for(cron.run(), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert [j.key for j in queue.jobs] == ["quick"]
+        assert elapsed < 1, f"the scan waited for the producer ({elapsed:.1f}s)"
+        assert cron._is_running("slow")
+
+        await asyncio.gather(*list(cron._command_tasks))
+        assert [j.key for j in queue.jobs] == ["quick", "slow/ACE-1"]
+
+    async def test_the_producer_still_does_its_work_after_the_scan_moves_on(
+        self, tmp_path: Path
+    ) -> None:
+        """Not blocking is only worth anything if the poll still lands."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+
+        await fire_and_settle(
+            cron,
+            _producer_entry(command='printf \'{"key":"ACE-9"}\\n\''),
+        )
+
+        assert [j.key for j in queue.jobs] == ["jira/ACE-9"]
+
+    async def test_a_second_fire_is_skipped_while_the_first_still_runs(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Two overlapping runs of one poll would emit the same work list twice,
+        and every item would be handed to `_admit` a second time."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        entry = _producer_entry(command='sleep 2; printf \'{"key":"ACE-1"}\\n\'')
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.cron"):
+            await cron._fire(entry)
+            await cron._fire(entry)
+
+        assert len([t for t in cron._command_tasks if t.get_name() == "jira"]) == 1
+        assert "still running, skipping this fire" in caplog.text
+
+        await asyncio.gather(*list(cron._command_tasks))
+        assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
+
+    async def test_a_finished_producer_does_not_block_the_next_fire(
+        self, tmp_path: Path
+    ) -> None:
+        """The done-callback that removes a task runs a tick late, so the guard
+        asks each task whether it is done rather than trusting the set."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        entry = _producer_entry(command='printf \'{"key":"ACE-1"}\\n\'')
+
+        await fire_and_settle(cron, entry)
+        await cron._fire(entry)
+        await asyncio.gather(*list(cron._command_tasks))
+
+        assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
+        assert cron._queue.count_unfinished("jira") == 1
+
+    async def test_an_exception_in_the_task_is_logged_against_its_entry(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """`_fire` has already returned by then, so its try/except cannot catch
+        this. Unhandled, it would sit in the Task until the garbage collector
+        mentioned it, with no entry name attached."""
+        cron = daemon(tmp_path, cfg(tmp_path), FakeQueue())
+
+        def explode(_entry, _items):
+            raise RuntimeError("queue exploded")
+
+        cron._admit = explode  # type: ignore[method-assign]
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            await fire_and_settle(
+                cron, _producer_entry(command='printf \'{"key":"ACE-1"}\\n\'')
+            )
+
+        assert "cron jira: fire failed" in caplog.text
+
+    async def test_a_run_now_still_fires_a_producer(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """`_drain_triggers` fires through `_fire` too, so the spawn has to work
+        from there as well as from the scheduled scan."""
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {
+                    "name": "jira",
+                    "cron": "0 9 * * *",
+                    "command": 'printf \'{"key":"ACE-1"}\\n\'',
+                    "prompt": "work {{ item.key }}",
+                },
+            ),
+            queue,
+        )
+        cron.reload()
+        request_run_now("jira")
+
+        await cron._drain_triggers()
+        await asyncio.gather(*list(cron._command_tasks))
+
+        assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
+
+    async def test_stop_cancels_a_running_producer(self, tmp_path: Path) -> None:
+        """A producer is a running command like any other, so a shutdown cuts it
+        and names it. The work is not lost: the next fire polls again."""
+        cron = daemon(tmp_path, cfg(tmp_path), FakeQueue())
+
+        await cron._fire(_producer_entry(command="sleep 30"))
+        assert cron._running_command_names() == ["jira"]
+        await cron.stop()
+
+        assert all(task.done() for task in cron._command_tasks)
 
 
 class TestReload:

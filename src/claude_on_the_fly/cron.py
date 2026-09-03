@@ -33,7 +33,7 @@ import re
 import shlex
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -208,6 +208,10 @@ class CronEntry:
         if self.prompt_file is not None:
             return self.prompt_file.read_text(encoding="utf-8")
         return self.prompt or ""
+
+
+# What `CronDaemon._spawn` runs in a task: a coroutine function taking the entry.
+_EntryWork = Callable[["CronEntry"], Coroutine[Any, Any, None]]
 
 
 @dataclass
@@ -808,6 +812,18 @@ class CronDaemon:
         """Entry names of the commands running right now."""
         return sorted(task.get_name() for task in self._command_tasks)
 
+    def _is_running(self, name: str) -> bool:
+        """Whether this entry has a command or producer in flight.
+
+        Asks each task rather than reading `_running_command_names`, because a
+        finished task stays in the set until its done-callback runs on the next
+        loop iteration. Naming it in a log line one tick late costs nothing;
+        letting it veto the next fire would drop a poll for no reason.
+        """
+        return any(
+            task.get_name() == name and not task.done() for task in self._command_tasks
+        )
+
     def heartbeat_extra(self) -> dict:
         """The commands running right now, by entry name.
 
@@ -905,6 +921,13 @@ class CronDaemon:
     # --- firing ---
 
     async def _fire(self, entry: CronEntry) -> None:
+        """Start an entry's work and return. No kind of entry blocks the caller.
+
+        The scheduling loop awaits this once per due entry, so anything slow here
+        delays every entry due in the same minute. A producer's shell command is
+        the slow one: it used to be awaited inline, and a 38s poll pushed the
+        other entries due at `:00` 38s late.
+        """
         logger.info("cron: firing %s (%s)", entry.name, entry.kind)
         try:
             if entry.kind == "command":
@@ -912,7 +935,7 @@ class CronDaemon:
             elif entry.kind == "prompt":
                 self._enqueue_plain(entry)
             else:
-                await self._fire_producer(entry)
+                self._spawn_producer(entry)
         except Exception:
             # One broken entry must not take the daemon down; the next fire of
             # every other entry is still due.
@@ -1038,14 +1061,62 @@ class CronDaemon:
         self._queue.enqueue(job)
         logger.info("cron %s: queued %s as %s", entry.name, key, job.id)
 
+    # --- running a command off the loop ---
+
+    def _spawn(self, entry: CronEntry, work: _EntryWork) -> None:
+        """Run `work(entry)` as a task named after its entry.
+
+        `work` is the coroutine *function*, not a coroutine: a task cancelled
+        before its first step never calls it, and a coroutine built by the caller
+        would then be left unawaited. `stop` cancels exactly that way.
+
+        The name is the only route back from the task to the entry, and three
+        things read it: `stop` to say what it cancelled, `heartbeat_extra` to
+        publish what a stop *would* cancel, and `_is_running` to tell whether
+        this entry is already working.
+        """
+        task = asyncio.create_task(self._logged(entry, work), name=entry.name)
+        self._command_tasks.add(task)
+        task.add_done_callback(self._command_tasks.discard)
+
+    async def _logged(self, entry: CronEntry, work: _EntryWork) -> None:
+        """Report a failure the task's caller is no longer around to catch.
+
+        `_fire`'s own try/except only covers starting the task now, so without
+        this an exception would sit unretrieved in a Task object until the
+        garbage collector mentioned it, with no entry name attached. A swallowed
+        failure in a poll is the failure this daemon can least afford.
+        """
+        try:
+            await work(entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("cron %s: fire failed", entry.name)
+
+    def _spawn_producer(self, entry: CronEntry) -> None:
+        """Run the producer off the loop, one at a time per entry.
+
+        Two overlapping runs of the same poll would emit the same work list
+        twice, so a fire that arrives while the previous producer is still
+        running is dropped rather than queued: a producer that cannot keep up
+        with its own schedule is a config problem, and the next scheduled fire
+        picks the work up anyway. It logs at INFO because the operator's fix is
+        to widen the cron expression or speed the command up.
+        """
+        if self._is_running(entry.name):
+            logger.info(
+                "cron %s: producer from a previous fire is still running, "
+                "skipping this fire",
+                entry.name,
+            )
+            return
+        self._spawn(entry, self._fire_producer)
+
     # --- side-effect commands ---
 
     def _spawn_command(self, entry: CronEntry) -> None:
-        # Named so `stop` can say which entry it cancelled; the task object
-        # itself carries no other route back to the entry.
-        task = asyncio.create_task(self._run_side_effect(entry), name=entry.name)
-        self._command_tasks.add(task)
-        task.add_done_callback(self._command_tasks.discard)
+        self._spawn(entry, self._run_side_effect)
 
     async def _run_side_effect(self, entry: CronEntry) -> None:
         assert entry.command is not None
