@@ -2906,6 +2906,113 @@ class TestRunNow:
         assert any("run-now failed" in msg for msg, _sev in notices)
 
 
+class TestChatPreview:
+    """The chat tab's preview: the message the running turn is answering."""
+
+    def _journal(self, isolated, frontend, chat_id, text):
+        from claude_on_the_fly import turns
+
+        journal = turns.TurnJournal(isolated / "state" / f"{frontend}.turns.json")
+        journal.record(
+            turns.PendingTurn(
+                chat_id=chat_id,
+                text=text,
+                turn_id=turns.new_turn_id(),
+                recorded_at=1.0,
+            )
+        )
+
+    def _wire(self, screen, monkeypatch, chat_id="4242"):
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+        monkeypatch.setattr(screen, "_selected_run", lambda: ("telegram", chat_id))
+        screen._chat_workspaces = {f"telegram:{chat_id}": "telegram/H"}
+
+    async def test_it_shows_the_message_the_turn_is_answering(
+        self, isolated, monkeypatch
+    ):
+        """The heartbeat carries the identifier and the uptime; the message
+        itself lives only in the turn journal."""
+        (isolated / "state").mkdir(exist_ok=True)
+        self._journal(isolated, "telegram", 4242, "rebase this branch onto main")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "rebase this branch onto main" in rendered
+        assert "telegram/H" in header
+
+    async def test_another_conversation_s_turn_is_not_shown(
+        self, isolated, monkeypatch
+    ):
+        """One journal holds every unanswered turn for that frontend."""
+        (isolated / "state").mkdir(exist_ok=True)
+        self._journal(isolated, "telegram", 1, "someone else's question")
+        self._journal(isolated, "telegram", 4242, "mine")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "mine" in rendered
+        assert "someone else" not in rendered
+
+    async def test_a_turn_already_answered_has_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        """The journal drops a turn when it is answered, and a stale message
+        would be worse than none."""
+        (isolated / "state").mkdir(exist_ok=True)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "nothing to preview" in rendered
+
+    async def test_markup_in_a_workspace_name_stays_literal(
+        self, isolated, monkeypatch
+    ):
+        """The header renders markup and the name is remote text on the
+        trusted-bot path: `[/bold]` would eat the line or raise."""
+        (isolated / "state").mkdir(exist_ok=True)
+        self._journal(isolated, "telegram", 4242, "hello")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            screen._chat_workspaces = {"telegram:4242": "telegram/[/bold]evil"}
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "evil" in header
+
+    async def test_no_highlighted_run_has_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+            monkeypatch.setattr(screen, "_selected_run", lambda: None)
+            assert screen._preview_subject() is None
+
+
 class TestJobsPreview:
     """The jobs tab's preview: what the highlighted job was asked to do."""
 

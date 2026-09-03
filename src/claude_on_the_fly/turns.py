@@ -297,6 +297,17 @@ class TurnJournal:
         nudge.sort(key=lambda t: t.turn_id)
         return replay, nudge
 
+    def pending(self) -> list[PendingTurn]:
+        """Every unanswered turn, as recorded. Read-only.
+
+        For an observer: the dashboard shows a running turn's own text, which
+        lives nowhere else — a chat frontend's heartbeat carries the identifier
+        and the uptime, not the message. `take()` is the daemon's path and this
+        is not a substitute for it: nothing here marks, replays, or forgets a
+        turn.
+        """
+        return self._read()
+
     def _read(self) -> list[PendingTurn]:
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))

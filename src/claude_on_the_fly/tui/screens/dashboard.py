@@ -56,7 +56,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from claude_on_the_fly import checks, logs, permissions, tmux, upgrade
+from claude_on_the_fly import checks, logs, permissions, tmux, turns, upgrade
 from claude_on_the_fly.agent import (
     DATA_DIR,
     get_backend,
@@ -1385,21 +1385,53 @@ class DashboardScreen(Screen):
         if self._active_daemon() == "jobs":
             key = self._datatable_cursor_key("#jobs-queue")
             return None if key in (None, "__empty__", "__more__") else key
-        return None
+        run = self._selected_run()
+        return f"{run[0]}:{run[1]}" if run is not None else None
 
     def _preview_text(self, subject: str) -> str:
         """The full text `subject` runs. Empty when there is nothing to show."""
         if self._active_daemon() == "jobs":
             return self._job_prompt(subject)
-        return self._cron_previews.get(subject, "")
+        if self._active_daemon() == "cron":
+            return self._cron_previews.get(subject, "")
+        return self._chat_turn(subject)
+
+    def _chat_turn(self, key: str) -> str:
+        """The text of the running turn behind a chat row.
+
+        It lives in the frontend's turn journal and nowhere else: the heartbeat
+        carries the identifier and the uptime, because a running_jobs entry is
+        a status line rather than a copy of the message. The journal holds a
+        turn from the moment it is accepted until it is answered, which is
+        exactly the window the chat tab lists.
+
+        A turn answered between the heartbeat and this read is gone from the
+        journal, and shows as nothing to preview rather than as somebody
+        else's message.
+        """
+        frontend, _, chat_id = key.partition(":")
+        path = state.STATE_DIR / f"{frontend}.turns.json"
+        journal = turns.TurnJournal(path)
+        for turn in journal.pending():
+            if str(turn.chat_id) == chat_id:
+                return turn.text
+        return ""
 
     def _preview_label(self, subject: str) -> str:
         """How the header names the subject: the string its own row shows.
 
         A job id's time half is already the row's `enqueued` age, so the header
-        repeats the tail the table shows rather than 30 characters of it.
+        repeats the tail the table shows rather than 30 characters of it. A
+        chat row is named by its workspace, and that name carries remote text
+        on the trusted-bot path — the header renders markup, so it goes through
+        the same guard every other label does.
         """
-        return _short_job_id(subject) if self._active_daemon() == "jobs" else subject
+        daemon = self._active_daemon()
+        if daemon == "jobs":
+            return _short_job_id(subject)
+        if daemon == "cron":
+            return subject
+        return session_format._safe(self._chat_workspaces.get(subject, subject))
 
     def _job_prompt(self, job_id: str) -> str:
         """A queued job's prompt, with the entry that produced it named above.
