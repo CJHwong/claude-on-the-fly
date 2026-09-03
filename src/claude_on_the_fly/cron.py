@@ -45,7 +45,7 @@ from croniter import croniter
 from liquid import Environment, StrictUndefined
 from liquid.exceptions import LiquidError, LiquidSyntaxError
 
-from claude_on_the_fly import logs
+from claude_on_the_fly import agent, logs
 from claude_on_the_fly.agent import DATA_DIR
 from claude_on_the_fly.jobs.core import AlertSink, Job, JobQueue, Result
 from claude_on_the_fly.jobs.key_state import (
@@ -121,6 +121,8 @@ EXAMPLE_YAML = """\
 #                    a single item, the entry itself.
 #   max_fires        fires against an unchanged item before parking; default 3,
 #                    0 disables
+#   profile          name of an `agent.profiles` entry in config.yaml, to run
+#                    THIS entry on its own backend/model/effort. Needs a prompt.
 #
 # PROMPT TEMPLATES are Liquid. A producer's item arrives as `item`:
 #     Work on {{ item.key }}: {{ item.summary }}   (status: {{ item.status }})
@@ -170,6 +172,7 @@ class CronEntry:
     timeout: int = DEFAULT_TIMEOUT
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_fires: int = DEFAULT_MAX_FIRES
+    profile: str | None = None
 
     @property
     def kind(self) -> Literal["prompt", "producer", "command"]:
@@ -237,6 +240,34 @@ def _translate_legacy_entry(data: dict[str, object], where: str) -> dict[str, ob
     return translated
 
 
+def _entry_profile(
+    data: dict[str, object], has_command: bool, has_prompt: bool, where: str
+) -> str | None:
+    """Validate the optional `profile` key against the defined agent profiles.
+
+    Checked at load so a typo fails when the operator saves the file, not at 3am
+    on the first fire. A command-only entry is refused rather than ignored: it
+    runs a shell and never reaches an agent, so a model named on it would do
+    nothing and say nothing.
+    """
+    if "profile" not in data:
+        return None
+    profile = _require_str(data, "profile", where)
+    if has_command and not has_prompt:
+        raise ValueError(
+            f"{where}: 'profile' needs a 'prompt' or 'prompt_file' - a bare "
+            "command runs no agent"
+        )
+    known = agent.profile_names()
+    if profile not in known:
+        defined = ", ".join(known) or "none"
+        raise ValueError(
+            f"{where}: unknown profile {profile!r} (defined in agent.profiles: "
+            f"{defined})"
+        )
+    return profile
+
+
 def _validate_entry(
     raw: object, index: int, seen: set[str], config_dir: Path
 ) -> CronEntry:
@@ -297,6 +328,7 @@ def _validate_entry(
             f"{where}: 'max_concurrent' above 1 needs a 'command' to produce items"
         )
     max_fires = _positive_int(data, "max_fires", DEFAULT_MAX_FIRES, where)
+    profile = _entry_profile(data, command is not None, has_prompt or has_file, where)
 
     entry = CronEntry(
         name=name,
@@ -307,6 +339,7 @@ def _validate_entry(
         timeout=timeout,
         max_concurrent=max_concurrent,
         max_fires=max_fires,
+        profile=profile,
     )
     _validate_template(entry, where)
     return entry
@@ -933,6 +966,7 @@ class CronDaemon:
             session_key=session_key,
             timeout=float(entry.timeout),
             platform="cron",
+            profile=entry.profile,
         )
         self._queue.enqueue(job)
         logger.info("cron %s: queued %s as %s", entry.name, key, job.id)

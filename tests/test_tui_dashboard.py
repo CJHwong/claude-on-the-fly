@@ -253,15 +253,30 @@ class TestSupervisorActionFailures:
         assert any("already running (pid 42)" in msg for msg, _s in notices)
 
     async def test_a_spawn_timeout_points_at_the_log(self, isolated, monkeypatch):
-        notices = await self._press(
-            isolated,
-            monkeypatch,
-            "restart",
-            supervisor.SpawnTimeout(
+        """A toast has no room for the tail, so it names the cause and hands the
+        operator to the logs screen with the failing file already selected."""
+        pushed: list[object] = []
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            notices = _capture(screen)
+            error = supervisor.SpawnTimeout(
                 frontend="cron", pid=1, log_path=Path("/logs/cron.stdout")
-            ),
-        )
-        assert any("/logs/cron.stdout" in msg for msg, _s in notices)
+            )
+            monkeypatch.setattr(
+                supervisor,
+                "restart",
+                lambda _name: (_ for _ in ()).throw(error),
+            )
+            app.push_screen = lambda scr, *a, **kw: pushed.append(scr)  # type: ignore[method-assign]
+            await screen.action_restart()
+            await pilot.pause()
+
+        assert any(f"cron: {error.cause} — opening logs" == msg for msg, _s in notices)
+        assert [type(scr).__name__ for scr in pushed] == ["LogsScreen"]
+        assert pushed[0]._preselect == Path("/logs/cron.stdout")  # type: ignore[attr-defined]
 
     async def test_an_unexpected_error_is_reported_verbatim(
         self, isolated, monkeypatch

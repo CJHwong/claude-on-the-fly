@@ -2083,22 +2083,22 @@ class TestCurrentBackendKey:
 
 
 class TestClaudeBackendLauncher:
-    async def test_model_flag_follows_env(self, monkeypatch):
+    async def test_model_flag_follows_the_configured_model(self):
         output = _cli_output()
-        # Explicit CLAUDE_MODEL → --model present.
-        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        # A model was resolved → --model present.
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+            await ClaudeBackend(model="opus").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
         cmd = mock.call_args[0][1]
         assert cmd[0] == "claude"
         assert "--model" in cmd and "opus" in cmd
 
-        # Unset CLAUDE_MODEL → --model omitted (claude CLI picks its default).
-        monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+        # No model resolved → --model omitted (claude CLI picks its default).
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
@@ -2166,17 +2166,18 @@ class TestClaudeBackendLauncher:
             await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
         assert "--effort" not in mock.call_args[0][1]
 
-    async def test_native_effort_flag_from_its_own_key(self, monkeypatch):
-        """CLAUDE_EFFORT is how an operator overrides effort for cotf's own
-        native spawns, without touching their interactive claude."""
+    async def test_native_effort_flag_from_the_resolved_effort(self):
+        """A resolved effort reaches native argv, so an operator can override
+        effort for cotf's own spawns without touching their interactive claude."""
         output = _cli_output()
-        monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+            await ClaudeBackend(effort="xhigh").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
         cmd = mock.call_args[0][1]
         assert cmd[cmd.index("--effort") + 1] == "xhigh"
 
@@ -2193,50 +2194,48 @@ class TestClaudeBackendLauncher:
             await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
         assert "--effort" not in mock.call_args[0][1]
 
-    async def test_ollama_effort_wins_over_the_native_key(self, monkeypatch):
-        """Both set: the launcher chose the model, so the launcher's key decides.
-        The native key is not consulted, not merged."""
+    async def test_resolved_effort_reaches_argv_under_a_launcher(self):
+        """The resolver decides which effort a launcher run uses; the backend
+        passes exactly what it was handed, with no second opinion."""
         output = _cli_output()
-        monkeypatch.setenv("OLLAMA_EFFORT", "max")
-        monkeypatch.setenv("CLAUDE_EFFORT", "low")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend(launcher=launcher).run(
+            await ClaudeBackend(launcher=launcher, effort="max").run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
         cmd = mock.call_args[0][1]
         assert cmd[cmd.index("--effort") + 1] == "max"
 
-    async def test_native_effort_level_out_of_set_skipped(self, monkeypatch, caplog):
+    async def test_native_effort_level_out_of_set_skipped(self, caplog):
         """A typo in config.yaml warns here rather than failing the turn in the
         CLI's own validation."""
         output = _cli_output()
-        monkeypatch.setenv("CLAUDE_EFFORT", "enormous")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+            await ClaudeBackend(effort="enormous").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
         assert "--effort" not in mock.call_args[0][1]
         assert "ignoring unknown effort 'enormous'" in caplog.text
 
-    async def test_effort_flag_under_launcher(self, monkeypatch):
+    async def test_effort_flag_under_launcher(self):
         """Ollama mode: the served model differs from the CLI's native provider,
         so the operator's effort setting is passed explicitly."""
         output = _cli_output()
-        monkeypatch.setenv("OLLAMA_EFFORT", "max")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend(launcher=launcher).run(
+            await ClaudeBackend(launcher=launcher, effort="max").run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
         cmd = mock.call_args[0][1]
@@ -2258,18 +2257,17 @@ class TestClaudeBackendLauncher:
             )
         assert "--effort" not in mock.call_args[0][1]
 
-    async def test_effort_level_not_in_claude_set_skipped(self, monkeypatch, caplog):
+    async def test_effort_level_not_in_claude_set_skipped(self, caplog):
         """`minimal` is codex-only; claude must skip it rather than pass it to
         the CLI, which would reject the turn."""
         output = _cli_output()
-        monkeypatch.setenv("OLLAMA_EFFORT", "minimal")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend(launcher=launcher).run(
+            await ClaudeBackend(launcher=launcher, effort="minimal").run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
         assert "--effort" not in mock.call_args[0][1]
@@ -2623,12 +2621,10 @@ def _pty_envelope(
 
 class TestClaudeBackendPty:
     async def test_argv_uses_pty_binary_and_drops_p_flags(
-        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
         from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
-        # Explicit model so --model is in the argv (it's omitted when unset).
-        monkeypatch.setenv("CLAUDE_MODEL", "sonnet")
         workspace = tmp_path / "ws"
         workspace.mkdir()
         # Pre-create the session JSONL so the backend takes the --resume
@@ -2648,7 +2644,10 @@ class TestClaudeBackendPty:
                 return_value=_pty_envelope(),
             ) as mock,
         ):
-            await ClaudeBackend(pty=True).run(workspace, "sess-1", "hi", "telegram")
+            # Explicit model so --model is in the argv (it's omitted when empty).
+            await ClaudeBackend(pty=True, model="sonnet").run(
+                workspace, "sess-1", "hi", "telegram"
+            )
 
         cmd = mock.call_args[0][1]
         assert cmd[0] == "/fake/bin/claude-pty"
@@ -3605,7 +3604,7 @@ async def test_compact_returns_none_when_the_backend_cannot_do_it(
     """codex has no compaction, so the caller gets None rather than an error, and
     reports "not supported" instead of "failed"."""
     backend = MagicMock(spec=[])
-    monkeypatch.setattr(agent_mod, "get_backend", lambda: backend)
+    monkeypatch.setattr(agent_mod, "get_backend", lambda _profile=None: backend)
     assert await agent_mod.compact(tmp_path, "session-uuid") is None
 
 
@@ -3613,7 +3612,7 @@ async def test_compact_delegates_when_the_backend_supports_it(monkeypatch, tmp_p
     expected = Compaction(ok=True, pre_tokens=10, post_tokens=1)
     backend = MagicMock()
     backend.compact = AsyncMock(return_value=expected)
-    monkeypatch.setattr(agent_mod, "get_backend", lambda: backend)
+    monkeypatch.setattr(agent_mod, "get_backend", lambda _profile=None: backend)
     assert await agent_mod.compact(tmp_path, "session-uuid", timeout=5) is expected
     backend.compact.assert_awaited_once_with(tmp_path, "session-uuid", timeout=5)
 
@@ -4238,26 +4237,25 @@ class TestOllamaContextWindowSetting:
     """Unset or unusable leaves ollama reporting nothing, which is how the
     feature behaved before the setting existed."""
 
-    def _resolve(self, monkeypatch, raw):
+    def _resolve(self, raw):
         from claude_on_the_fly import agent as agent_mod
 
-        monkeypatch.setattr(agent_mod.settings, "get", lambda *a, **k: raw)
-        return agent_mod._ollama_context_window()
+        return agent_mod._ollama_context_window(raw)
 
-    def test_unset_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "") is None
+    def test_unset_is_none(self):
+        assert self._resolve("") is None
 
-    def test_blank_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "   ") is None
+    def test_blank_is_none(self):
+        assert self._resolve("   ") is None
 
-    def test_junk_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "wide") is None
+    def test_junk_is_none(self):
+        assert self._resolve("wide") is None
 
-    def test_zero_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "0") is None
+    def test_zero_is_none(self):
+        assert self._resolve("0") is None
 
-    def test_negative_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "-1") is None
+    def test_negative_is_none(self):
+        assert self._resolve("-1") is None
 
-    def test_positive_is_used(self, monkeypatch):
-        assert self._resolve(monkeypatch, "200000") == 200000
+    def test_positive_is_used(self):
+        assert self._resolve("200000") == 200000

@@ -16,7 +16,7 @@ import subprocess
 
 import httpx
 
-from claude_on_the_fly import checks, settings
+from claude_on_the_fly import agent, checks, settings
 from claude_on_the_fly.checks import CheckResult
 
 logger = logging.getLogger(__name__)
@@ -86,41 +86,51 @@ _AGENT_INSTALL_HINTS = {
 
 
 def check_backend() -> None:
-    """Validate the configured agent backend before startup.
+    """Validate the configured agent backend, and every agent profile, before startup.
 
-    Dispatches by `AGENT_BACKEND` (default `claude`) and `<AGENT>_MODE`
-    (default `native`). Native mode runs the agent-specific live check;
-    ollama mode skips it and validates the ollama wrap instead.
+    Profiles are checked here so an uninstalled CLI or a mode typo fails while
+    the operator is watching the daemon start, rather than at 3am on the first
+    fire of whichever cron entry names it.
+
+    Each distinct (backend, mode) pair is checked once. Several profiles that
+    differ only by model share one CLI, and the checks below spawn it.
     """
-    backend_name = settings.get("AGENT_BACKEND", "claude").lower()
-    if backend_name == "claude":
-        mode = settings.get("CLAUDE_MODE", "native").lower()
-        if mode == "native":
+    checked: set[tuple[str, str]] = set()
+    for name in (None, *agent.profile_names()):
+        profile = _resolve_or_exit(name)
+        pair = (profile.backend, profile.mode)
+        if pair in checked:
+            continue
+        checked.add(pair)
+        _check_agent_cli(profile)
+
+
+def _resolve_or_exit(name: str | None) -> agent.AgentProfile:
+    """Resolve one profile, turning its config error into a startup refusal."""
+    try:
+        return agent.resolve_profile(name)
+    except ValueError as exc:
+        where = f"agent.profiles.{name}: " if name else ""
+        raise _exit(f"{where}{exc}") from exc
+
+
+def _check_agent_cli(profile: agent.AgentProfile) -> None:
+    """Run the live CLI check that matches one resolved profile."""
+    if profile.backend == "claude":
+        if profile.mode == "native":
             check_claude_cli()
-            return
-        if mode == "ollama":
+        elif profile.mode == "ollama":
             check_ollama_mode("claude")
-            return
-        if mode == "pty":
+        else:
             check_pty_mode()
-            return
-        raise _exit(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")
-    if backend_name == "codex":
-        mode = settings.get("CODEX_MODE", "native").lower()
-        if mode == "native":
-            check_codex_cli()
-            return
-        if mode == "ollama":
-            check_ollama_mode("codex")
-            return
-        if mode == "pty":
-            # Same binary as native, so the same check. tmux is not required:
-            # without a pane the turn degrades to `codex exec` rather than
-            # failing, which is why this does not refuse to start.
-            check_codex_cli()
-            return
-        raise _exit(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama, pty)")
-    raise _exit(f"Unknown AGENT_BACKEND: {backend_name!r} (supported: claude, codex)")
+        return
+    if profile.mode == "ollama":
+        check_ollama_mode("codex")
+        return
+    # pty is the same binary as native, so the same check. tmux is not required:
+    # without a pane the turn degrades to `codex exec` rather than failing,
+    # which is why this does not refuse to start.
+    check_codex_cli()
 
 
 def check_codex_cli() -> None:

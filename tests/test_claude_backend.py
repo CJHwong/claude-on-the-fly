@@ -164,6 +164,8 @@ class TestClaudeBackendCompact:
         backend.launcher = None
         backend.pty = True
         backend._pty_path = "/somewhere/claude-pty"
+        backend.model = ""
+        backend.effort = ""
 
         with (
             patch.object(backend, "session_log_path", return_value=session),
@@ -433,6 +435,8 @@ class TestCompactRefusals:
         backend = claude_mod.ClaudeBackend.__new__(claude_mod.ClaudeBackend)
         backend.launcher, backend.pty = None, True
         backend._pty_path = "/somewhere/claude-pty"
+        backend.model = ""
+        backend.effort = ""
         return backend
 
     async def test_no_session_is_not_reported_as_unsupported(self, tmp_path):

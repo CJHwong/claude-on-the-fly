@@ -38,6 +38,7 @@ configuration writes, not those persona links.
 | `pricing_ttl_seconds` | integer / `604800` | `0` always refreshes; negative never expires | Immediate |
 | `pane` | boolean / true | Host each turn in its own tmux server so the dashboard's watch pane mirrors the agent's terminal; `false`, `0`, `no` or `off` switches it off, anything else leaves it on. Inert without tmux | Next turn |
 | `pty.auto_install` | boolean / false | Install missing claude-pty without prompting | Startup |
+| `profiles` | mapping / unset | Named overrides of the keys above, one per cron entry. Same nesting and same key names; an omitted key inherits the global value. Validated at daemon start | Next turn |
 | `pty.auto_refresh` | boolean / true | Re-splice incomplete pty hooks | Startup |
 
 `pane` and the per-backend `mode` answer different questions. `mode` picks what runs
@@ -53,6 +54,53 @@ worth hosting either way: their panes would show stream JSON and plain lines.
 Automatic compaction requires a reliable context-window reading. Native and pty
 derive one. Ollama cannot, so it is inert there until `ollama.context_window`
 supplies one; manual `$compact` remains available either way.
+
+### Profiles
+
+A profile answers the same questions the block above does, for one cron entry at a
+time. A `cron.yaml` entry names one with `profile: cheap`; an entry that names none
+runs on the settings above, unchanged.
+
+```yaml
+agent:
+  backend: codex
+  codex:
+    mode: native
+    model: gpt-5
+    effort: high
+
+  profiles:
+    cheap:
+      codex:
+        model: gpt-5-mini
+        effort: low
+    local:
+      codex:
+        mode: ollama
+      ollama:
+        model: qwen3:30b
+```
+
+Three rules decide what a profile does.
+
+1. **Anything it leaves out is inherited.** `cheap` above changes the model and the
+   effort and keeps everything else, `local` changes the mode and lets the `ollama`
+   block supply the rest.
+2. **A profile beats the matching environment variable.** Everywhere else in this
+   file the environment wins, so a deployment cannot lose a daemon-wide default to a
+   file nobody edited. A profile is neither daemon-wide nor a default.
+3. **It overlays the same key space, so it is inert in the wrong place.** A `codex:`
+   block under a claude backend does nothing, exactly as the global `agent.codex.model`
+   does nothing there. Set `backend` in the profile too, or move the override under
+   the backend that is running.
+
+Every profile is resolved and its CLI checked when the daemon starts, so an
+uninstalled backend or a mode typo refuses to start rather than failing on the first
+fire of whichever entry names it. Profiles that differ only by model share one check.
+
+The model is part of the session identity, so a keyed entry whose profile changes its
+model starts a fresh transcript rather than resuming one that model never wrote.
+Effort is not, so raising it leaves the transcript alone.
 
 ## `watchdog`
 

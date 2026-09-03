@@ -20,7 +20,6 @@ from claude_on_the_fly import (
     permissions,
     pricing,
     sandbox,
-    settings,
     tmux,
     transcript,
 )
@@ -87,9 +86,10 @@ async def _kill_once_quiet_after_turn(
     await agent._kill_process_tree(proc)
 
 
-# `model_reasoning_effort` choices, from codex's config reference. The shared
-# OLLAMA_EFFORT setting is validated against this before it reaches codex
-# (claude's accepted set differs: no `minimal`, plus `max`).
+# `model_reasoning_effort` choices, from codex's config reference. Whichever key
+# the resolver read it from is validated against this before it reaches codex,
+# because the shared `agent.ollama.effort` is also claude's, and claude's
+# accepted set differs: no `minimal`, plus `max`.
 _CODEX_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 
 
@@ -981,9 +981,19 @@ class CodexBackend:
     """
 
     def __init__(
-        self, launcher: OllamaLauncher | None = None, pty: bool = False
+        self,
+        launcher: OllamaLauncher | None = None,
+        pty: bool = False,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         self.launcher = launcher
+        # Both already resolved by `agent.resolve_profile`, which is also where
+        # the ollama/native key routing lives. Binding them here rather than
+        # reading settings at argv time is what lets one process run two jobs
+        # under different models without them reading each other's.
+        self.model = model
+        self.effort = effort
         # `pty` picks the interface, not the runtime: the interactive binary
         # rather than `codex exec`. Kept separate from hosting so a break in
         # codex's UI or its trust format costs this backend its TUI and nothing
@@ -1162,13 +1172,11 @@ class CodexBackend:
                 body = "No response"
 
         # Prefer the model codex actually recorded in its session file; fall
-        # back to whatever the user configured. In native mode without
-        # CODEX_MODEL the configured value is just the literal "codex", which
-        # is uninformative — the session-file lookup gives us the real name.
+        # back to whatever the profile resolved. With no model configured that
+        # is the literal "codex", which is uninformative — the session-file
+        # lookup gives us the real name.
         configured_label = (
-            self.launcher.model
-            if self.launcher
-            else (settings.get("CODEX_MODEL").strip() or "codex")
+            self.launcher.model if self.launcher else (self.model or "codex")
         )
         thread_for_lookup = result.get("thread_id") or existing_thread
         model_label = (
@@ -1242,23 +1250,18 @@ class CodexBackend:
         # subcommand. Skip the binary when the launcher is set.
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
-        model_env = settings.get("CODEX_MODEL").strip()
-        model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
-        # Which key owns reasoning effort depends on who chose the model. The
-        # ollama path swapped it out from under the operator, so OLLAMA_EFFORT
-        # keeps that job there. Native `codex exec` runs the operator's own codex,
-        # so it gets its own key, unset by default: absent, no `-c` is passed and
-        # codex still reads model_reasoning_effort from ~/.codex/config.toml
-        # exactly as before. Quoted as TOML per the `-c` contract.
+        model_args = [] if self.launcher else (["-m", self.model] if self.model else [])
+        # Effort is unset by default: absent, no `-c` is passed and codex still
+        # reads model_reasoning_effort from ~/.codex/config.toml exactly as
+        # before. Quoted as TOML per the `-c` contract.
         # Responses-API-only in codex, so under ollama it reaches the model only
-        # when that endpoint honors it — harmless either way. OLLAMA_EFFORT is
-        # shared with the claude backend, whose accepted levels differ (no
-        # `minimal`), so a value codex doesn't accept is skipped, not passed
-        # through to die in codex's own config parse. CODEX_EFFORT is not shared,
-        # but it takes the same check: a typo in config.yaml should warn here
-        # rather than fail the turn.
-        effort = settings.get("OLLAMA_EFFORT" if self.launcher else "CODEX_EFFORT")
-        effort = effort.strip()
+        # when that endpoint honors it — harmless either way. Under ollama the
+        # value came from the shared `ollama.effort`, whose accepted levels
+        # differ from codex's (claude has no `minimal`), so a value codex doesn't
+        # accept is skipped rather than passed through to die in codex's own
+        # config parse. A native value takes the same check: a typo in
+        # config.yaml should warn here rather than fail the turn.
+        effort = self.effort
         if effort and effort not in _CODEX_EFFORT_LEVELS:
             logger.warning(
                 "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
@@ -1301,8 +1304,7 @@ class CodexBackend:
         """
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
-        model_env = settings.get("CODEX_MODEL").strip()
-        model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
+        model_args = [] if self.launcher else (["-m", self.model] if self.model else [])
         flags = [
             "--dangerously-bypass-approvals-and-sandbox",
             *permissions.codex_argv(),

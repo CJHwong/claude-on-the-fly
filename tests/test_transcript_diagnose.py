@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly import transcript
+from claude_on_the_fly import agent, transcript
 
 
 def _row(ordinal: int, seconds: int, payload: dict) -> dict:
@@ -254,13 +254,13 @@ class TestDiagnoseCodex:
         ]
 
 
+def _profile(backend: str = "codex") -> agent.AgentProfile:
+    """A resolved profile, which is what `_failure_signals` gates on now."""
+    return agent.AgentProfile(backend=backend, mode="native", model="", effort="")
+
+
 class TestFailureSignalsWiring:
     """`_failure_signals` is the gate: opt-in, codex-only, and never fatal."""
-
-    @pytest.fixture(autouse=True)
-    def _codex_backend(self, monkeypatch):
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        monkeypatch.setenv("CODEX_MODE", "native")
 
     def test_off_by_default(self, monkeypatch, tmp_path):
         from claude_on_the_fly.jobs import agent_runner
@@ -274,20 +274,24 @@ class TestFailureSignalsWiring:
             return ["should not be reached"]
 
         monkeypatch.setattr(agent_runner.transcript, "diagnose_codex", _never)
-        assert agent_runner._failure_signals(tmp_path, "uuid", "", 600) == ""
+        assert (
+            agent_runner._failure_signals(tmp_path, "uuid", "", 600, _profile()) == ""
+        )
         assert called is False
 
     def test_claude_backend_gets_nothing(self, monkeypatch, tmp_path):
         from claude_on_the_fly.jobs import agent_runner
 
         monkeypatch.setenv("JOBS_DIAGNOSE_FAILURES", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "claude")
         monkeypatch.setattr(
             agent_runner.transcript,
             "diagnose_codex",
             lambda *_a, **_k: ["should not be reached"],
         )
-        assert agent_runner._failure_signals(tmp_path, "uuid", "", 600) == ""
+        signals = agent_runner._failure_signals(
+            tmp_path, "uuid", "", 600, _profile("claude")
+        )
+        assert signals == ""
 
     def test_signals_render_as_bullets(self, monkeypatch, tmp_path):
         from claude_on_the_fly.jobs import agent_runner
@@ -301,7 +305,7 @@ class TestFailureSignalsWiring:
                 "599s model / 0.2s tool, stalled upstream",
             ],
         )
-        assert agent_runner._failure_signals(tmp_path, "uuid", "", 600) == (
+        assert agent_runner._failure_signals(tmp_path, "uuid", "", 600, _profile()) == (
             "\n- no task_complete, last event was reasoning"
             "\n- 599s model / 0.2s tool, stalled upstream"
         )
@@ -317,7 +321,9 @@ class TestFailureSignalsWiring:
             raise OSError("rollout store went away")
 
         monkeypatch.setattr(agent_runner.transcript, "diagnose_codex", _boom)
-        assert agent_runner._failure_signals(tmp_path, "uuid", "", 600) == ""
+        assert (
+            agent_runner._failure_signals(tmp_path, "uuid", "", 600, _profile()) == ""
+        )
         assert "could not diagnose" in caplog.text
 
 
@@ -453,15 +459,11 @@ class TestRollutLookupUnderLoad:
 class TestSignalsSurviveTheAlert:
     """The alert body is capped from the tail, so placement is not cosmetic."""
 
-    def test_a_misconfigured_backend_does_not_become_the_error(
-        self, monkeypatch, tmp_path, caplog
-    ):
-        from claude_on_the_fly.jobs import agent_runner
-
-        monkeypatch.setenv("JOBS_DIAGNOSE_FAILURES", "1")
-        monkeypatch.setenv("AGENT_BACKEND", "nonsense")
-        assert agent_runner._failure_signals(tmp_path, "uuid", "", 600) == ""
-        assert "could not diagnose" in caplog.text
+    # A misconfigured backend can no longer reach here: the runner resolves the
+    # profile before calling this, and refuses the job when it will not resolve.
+    # That case is covered at its new home, `test_agent_profiles.py`'s
+    # `test_a_bad_profile_name_fails_the_job_not_the_worker`, and the generic
+    # guard is still covered by the OSError case above.
 
     def test_signals_survive_a_body_that_overflows_the_alert_cap(self):
         from claude_on_the_fly.jobs.alerts import ALERT_BODY_LIMIT, _alert_body

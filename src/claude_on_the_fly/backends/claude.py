@@ -16,7 +16,6 @@ from claude_on_the_fly import (
     pricing,
     pty_install,
     sandbox,
-    settings,
     transcript,
 )
 from claude_on_the_fly.agent import (
@@ -49,9 +48,10 @@ COMPACT_PROMPT = "/compact"
 # thread), and the drain loop is serial per chat, so an unbounded one wedges
 # every message queued behind it.
 COMPACT_TIMEOUT = 900.0
-# `--effort` choices, from `claude --help`. Both keys that can set it, the shared
-# OLLAMA_EFFORT and this backend's own CLAUDE_EFFORT, are validated against this
-# before reaching the CLI (codex's accepted set differs).
+# `--effort` choices, from `claude --help`. Whichever key the resolver read it
+# from -- the shared `agent.ollama.effort` or this backend's own
+# `agent.claude.effort` -- it is validated against this before reaching the CLI,
+# because codex's accepted set differs and the ollama key is shared with it.
 _CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
@@ -307,11 +307,19 @@ class ClaudeBackend:
         launcher: OllamaLauncher | None = None,
         pty: bool = False,
         ollama_context_window: int | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         if launcher is not None and pty:
             raise ValueError("ClaudeBackend: launcher and pty are mutually exclusive")
         self.launcher = launcher
         self.pty = pty
+        # Both already resolved by `agent.resolve_profile`, which is also where
+        # the ollama/native key routing lives. Binding them here rather than
+        # reading settings at argv time is what lets one process run two jobs
+        # under different models without them reading each other's.
+        self.model = model
+        self.effort = effort
         # Only meaningful in ollama mode, where the CLI's own `contextWindow`
         # describes the wrong model. Unset keeps the old behaviour: no reading,
         # so the footer omits `ctx` and the auto-compact gate stays off.
@@ -530,25 +538,22 @@ class ClaudeBackend:
         # the prompt and silently drops the real one.
         prefix = self.launcher.prefix("claude") if self.launcher else []
         binary = [] if self.launcher else ["claude"]
-        # Empty/unset CLAUDE_MODEL → omit --model and let the claude CLI use
-        # its own default (don't pin sonnet).
-        model = "" if self.launcher else settings.get("CLAUDE_MODEL").strip()
+        # Empty model → omit --model and let the claude CLI use its own default
+        # (don't pin sonnet). Under a launcher it is always empty: `ollama launch
+        # claude --model X` already pinned it.
+        model = "" if self.launcher else self.model
         model_args = ["--model", model] if model else []
-        # Which key owns effort depends on who chose the model. The ollama path
-        # swapped it out from under the operator, so OLLAMA_EFFORT keeps that job
-        # there. Native `-p` runs the operator's own claude, so it gets its own
-        # key, unset by default: absent, no flag is passed and the CLI still reads
-        # effortLevel from ~/.claude/settings.json exactly as before. pty never
-        # reaches here (see `_pty_base_argv`) and deliberately gets neither: it
-        # resolves its own settings, and whether interactive claude honours the
-        # flag at all is untested.
-        # OLLAMA_EFFORT is shared with the codex backend, whose accepted levels
-        # differ (no `max`), so a value claude doesn't accept is skipped, not
-        # passed through to die in the CLI's own validation. CLAUDE_EFFORT is not
-        # shared, but it takes the same check: a typo in config.yaml should warn
-        # here rather than fail the turn.
-        effort = settings.get("OLLAMA_EFFORT" if self.launcher else "CLAUDE_EFFORT")
-        effort = effort.strip()
+        # Effort is unset by default: absent, no flag is passed and the CLI still
+        # reads effortLevel from ~/.claude/settings.json exactly as before. pty
+        # never reaches here (see `_pty_base_argv`) and deliberately gets no
+        # effort at all: it resolves its own settings, and whether interactive
+        # claude honours the flag is untested.
+        # Under ollama the value came from the shared `ollama.effort`, whose
+        # accepted levels differ from claude's (codex has no `max`), so a value
+        # claude doesn't accept is skipped rather than passed through to die in
+        # the CLI's own validation. A native value takes the same check: a typo
+        # in config.yaml should warn here rather than fail the turn.
+        effort = self.effort
         if effort and effort not in _CLAUDE_EFFORT_LEVELS:
             logger.warning(
                 "claude: ignoring unknown effort %r (low|medium|high|xhigh|max)",
@@ -641,8 +646,7 @@ class ClaudeBackend:
         """claude-pty argv minus the prompt and --system-prompt; the caller appends
         --system-prompt only when (re-)establishing a session."""
         assert self._pty_path is not None  # set in __init__ when pty=True
-        model = settings.get("CLAUDE_MODEL").strip()
-        model_args = ["--model", model] if model else []
+        model_args = ["--model", self.model] if self.model else []
         # claude-pty forwards every flag to claude verbatim, so the same argv
         # works here. What differs is which of them claude honours: interactive
         # mode ignores --permission-prompt-tool and draws its own dialog instead,

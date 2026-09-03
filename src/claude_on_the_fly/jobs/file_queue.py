@@ -120,6 +120,7 @@ class FileInboxQueue:
             "session_key": job.session_key,
             "timeout": job.timeout,
             "platform": job.platform,
+            "profile": job.profile,
         }
         name = queue_filename(job.id, job.key)
         staging = self._tmp / name
@@ -315,10 +316,13 @@ class FileInboxQueue:
         """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            # The four dispatch fields are read with `.get` defaults rather than
+            # The five dispatch fields are read with `.get` defaults rather than
             # required: a job enqueued before they existed, or by a producer that
             # does not care about any of them, is an ordinary unkeyed one-shot
-            # and not poison.
+            # and not poison. The same tolerance runs the other way, and it is
+            # worth knowing about: a worker older than the field ignores a
+            # `profile` it does not understand and runs the daemon default, so a
+            # mixed-version rollout downgrades the model rather than failing.
             job = Job(
                 id=data["id"],
                 prompt=data["prompt"],
@@ -327,6 +331,7 @@ class FileInboxQueue:
                 session_key=data.get("session_key"),
                 timeout=data.get("timeout"),
                 platform=data.get("platform") or "jobs",
+                profile=data.get("profile"),
             )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("jobs: poison job file %s → failed/ (%s)", path.name, exc)
@@ -340,6 +345,7 @@ class FileInboxQueue:
             or not _optional(job.key, str)
             or not _optional(job.session_key, str)
             or not _optional(job.timeout, int, float)
+            or not _optional(job.profile, str)
         ):
             logger.warning(
                 "jobs: malformed job %s → failed/ (bad field types)", path.name

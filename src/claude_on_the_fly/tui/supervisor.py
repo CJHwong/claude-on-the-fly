@@ -119,21 +119,28 @@ class SpawnTimeout(SupervisorError):
         exited: bool = False,
         returncode: int | None = None,
     ) -> None:
-        cause = (
-            f"exited (rc={returncode}) before heartbeat"
-            if exited
-            else "did not heartbeat within timeout"
-        )
-        msg = f"{frontend} {cause} (pid {pid}); see {log_path}"
-        if log_tail:
-            msg += f"\n--- last lines ---\n{log_tail}"
-        super().__init__(msg)
         self.frontend = frontend
         self.pid = pid
         self.log_path = log_path
         self.log_tail = log_tail
         self.exited = exited
         self.returncode = returncode
+        msg = f"{frontend} {self.cause} (pid {pid}); see {log_path}"
+        if log_tail:
+            msg += f"\n--- last lines ---\n{log_tail}"
+        super().__init__(msg)
+
+    @property
+    def cause(self) -> str:
+        """What actually happened, in one line.
+
+        A crash and a hang are different failures and send an operator looking
+        in different places, so the wording has to tell them apart. Callers with
+        no room for the tail show this instead.
+        """
+        if self.exited:
+            return f"exited (rc={self.returncode}) before heartbeat"
+        return "did not heartbeat within timeout"
 
 
 # ---------------------------------------------------------------------------
