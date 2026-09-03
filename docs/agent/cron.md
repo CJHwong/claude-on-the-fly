@@ -139,9 +139,9 @@ reaches an agent, so a floor on its tool calls would bound nothing.
 ## A run that did nothing is not a success
 
 A fire that raises is a failure the worker already alerts on. A fire that *answers*
-without acting was not, because the backend returns normally either way. That was
-observed once in 595 fires: a deploy-watch fire replied that a security boundary
-prohibited the check, made zero tool calls, and went down `ok=True` with no alert.
+without acting was not, because the backend returns normally either way. That is not
+hypothetical: a scheduled fire replied that a security boundary prohibited the work
+it was asked to do, made zero tool calls, and went down `ok=True` with no alert.
 
 `min_tool_calls` on an entry is the floor. `Response` already carries `tool_counts`,
 so `agent_runner` sums it, puts the total on `Result.tool_calls`, and returns
@@ -149,10 +149,10 @@ so `agent_runner` sums it, puts the total on `Result.tool_calls`, and returns
 does: the worker already alerts on `not ok` and `LogNotifier` already writes `FAILED`,
 so the floor rides the path a raised error takes instead of adding a second one.
 
-It is off by default and per entry, not global. `sys-codex-reflect` legitimately makes
-zero tool calls on odd ISO weeks and says so, so a blanket check would alert every
-other week. An entry only gets a floor when doing nothing is genuinely a fault for
-that entry.
+It is off by default and per entry, not global. An entry can have a designed periodic
+no-op: a guard that acts only every other run does nothing on the runs in between, and
+says so in its reply. A blanket floor would alert on every one of those. An entry only
+gets a floor when doing nothing is genuinely a fault for that entry.
 
 ## Why a profile change restarts a transcript
 
