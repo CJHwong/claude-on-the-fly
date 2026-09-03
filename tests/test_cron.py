@@ -13,8 +13,11 @@ from pathlib import Path
 import pytest
 import yaml
 
+from claude_on_the_fly import cron as cron_mod
 from claude_on_the_fly.cron import (
     DEFAULT_MAX_FIRES,
+    MAX_PRODUCER_TIMEOUT_S,
+    PRODUCER_TIMEOUT_S,
     CronDaemon,
     CronEntry,
     load_config,
@@ -181,6 +184,167 @@ class TestConfigShape:
             load_config(path)
 
 
+class TestUnknownKeys:
+    """A key the schema does not define is an error, not a shrug.
+
+    Ignoring one let an inert `model: sonnet` sit on a live entry: the file
+    loaded, the entry fired, and nothing ever said the setting did nothing.
+    """
+
+    def test_an_unrecognised_key_is_rejected(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {"name": "digest", "cron": "0 9 * * *", "prompt": "x", "model": "sonnet"},
+        )
+        with pytest.raises(ValueError, match="unknown key 'model'"):
+            load_config(path)
+
+    def test_the_message_names_the_entry_and_the_valid_keys(
+        self, tmp_path: Path
+    ) -> None:
+        """The operator edits this file by hand, so "invalid config" alone is
+        unactionable: the message has to say which entry and what is allowed."""
+        path = cfg(
+            tmp_path,
+            {"name": "digest", "cron": "0 9 * * *", "prompt": "x", "model": "sonnet"},
+        )
+        with pytest.raises(ValueError) as caught:
+            load_config(path)
+        message = str(caught.value)
+        assert "(digest)" in message
+        assert "valid keys: " in message
+        assert "prompt_file" in message
+        assert "max_concurrent" in message
+
+    def test_every_unknown_key_is_named_at_once(self, tmp_path: Path) -> None:
+        """Naming one per load would make fixing a pasted block a guessing game."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "a",
+                "cron": "* * * * *",
+                "prompt": "x",
+                "model": "sonnet",
+                "effort": "high",
+            },
+        )
+        with pytest.raises(ValueError, match=re.escape("'effort', 'model'")):
+            load_config(path)
+
+    def test_every_documented_key_is_accepted(self, tmp_path: Path) -> None:
+        """Pins the schema against the reference table: a key the docs promise
+        but the validator forgot would now be rejected outright."""
+        (tmp_path / "brief.md").write_text("work {{ item.key }}", encoding="utf-8")
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "prompt_file": "./brief.md",
+                "command": "true",
+                "timeout": 600,
+                "producer_timeout": 300,
+                "max_concurrent": 2,
+                "max_fires": 5,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.kind == "producer"
+
+    def test_a_legacy_script_entry_still_loads(self, tmp_path: Path) -> None:
+        """`script` and `args` are consumed by the translation before the check,
+        so tightening the schema must not lock out a pre-rename config."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "prune",
+                "cron": "0 4 * * *",
+                "script": "/opt/prune.sh",
+                "args": ["--verbose"],
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.command == "/opt/prune.sh --verbose"
+
+
+class TestProducerTimeout:
+    """The producer's own limit, separate from the entry's `timeout`."""
+
+    def test_it_defaults_to_the_module_limit(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "command": "true",
+                "prompt": "work {{ item.key }}",
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.producer_timeout == PRODUCER_TIMEOUT_S
+
+    def test_an_entry_may_raise_its_own(self, tmp_path: Path) -> None:
+        """One slow producer must not force every other entry to wait as long."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "command": "true",
+                "prompt": "work {{ item.key }}",
+                "producer_timeout": 300,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.producer_timeout == 300
+        assert entry.timeout == 1800
+
+    def test_bounds_are_enforced(self, tmp_path: Path) -> None:
+        for bad in (0, MAX_PRODUCER_TIMEOUT_S + 1):
+            path = cfg(
+                tmp_path,
+                {
+                    "name": "jira",
+                    "cron": "* * * * *",
+                    "command": "true",
+                    "prompt": "work {{ item.key }}",
+                    "producer_timeout": bad,
+                },
+            )
+            with pytest.raises(
+                ValueError, match=re.escape("'producer_timeout' must be 1..")
+            ):
+                load_config(path)
+
+    def test_it_needs_a_producer(self, tmp_path: Path) -> None:
+        """A plain entry runs no command, so the key would bound nothing."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "a",
+                "cron": "* * * * *",
+                "prompt": "x",
+                "producer_timeout": 300,
+            },
+        )
+        with pytest.raises(ValueError, match="'producer_timeout' needs a producer"):
+            load_config(path)
+
+    def test_a_side_effect_command_cannot_carry_it(self, tmp_path: Path) -> None:
+        """A bare command is bounded by the entry's own `timeout`, not this one."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "prune",
+                "cron": "0 4 * * *",
+                "command": "true",
+                "producer_timeout": 300,
+            },
+        )
+        with pytest.raises(ValueError, match="'producer_timeout' needs a producer"):
+            load_config(path)
+
+
 class TestPromptFile:
     def test_relative_path_resolves_against_the_config(self, tmp_path: Path) -> None:
         """So a config plus its prompts stays one movable bundle."""
@@ -297,6 +461,7 @@ def _producer_entry(**overrides) -> CronEntry:
         max_concurrent=base.get("max_concurrent", 1),
         max_fires=base.get("max_fires", DEFAULT_MAX_FIRES),
         timeout=base.get("timeout", 1800),
+        producer_timeout=base.get("producer_timeout", PRODUCER_TIMEOUT_S),
     )
 
 
@@ -426,6 +591,35 @@ class TestFire:
         await cron._fire(entry)
 
         assert [j.key for j in queue.jobs] == ["jira/ACE-1", "jira/ACE-2"]
+
+    async def test_the_producer_gets_the_entrys_own_limit(self, tmp_path: Path) -> None:
+        """Not the entry's `timeout`: that one bounds the agent run each printed
+        item becomes, and is measured in tens of minutes."""
+        cron = daemon(tmp_path, cfg(tmp_path))
+        seen: list[float] = []
+
+        async def record(command: str, *, timeout: float, capture: bool):
+            seen.append(timeout)
+            return "", 0
+
+        cron._run_command = record  # type: ignore[method-assign]
+
+        await cron._fire(_producer_entry(producer_timeout=300, timeout=1800))
+
+        assert seen == [300]
+
+    async def test_a_producer_over_its_limit_is_killed(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A real subprocess, so this pins that the per-entry value reaches the
+        wait rather than only reaching the dataclass."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+
+        await cron._fire(_producer_entry(command="sleep 30", producer_timeout=1))
+
+        assert queue.jobs == []
+        assert "timed out after 1s" in caplog.text
 
     async def test_a_failing_producer_enqueues_nothing(
         self, tmp_path: Path, caplog
@@ -1094,6 +1288,73 @@ class TestMaybeReload:
         assert "reloaded (+1 -0 ~0)" in "\n".join(
             r.getMessage() for r in caplog.records
         )
+
+
+class TestUnknownKeyIsFatalOnlyAtStartup:
+    """The two halves of the same rejection, which must not behave the same way.
+
+    A stricter validator is only safe because a running daemon survives it. At
+    startup an unknown key stops the process, so nobody gets a daemon quietly
+    running a config it could not fully read. On a live edit the same error keeps
+    the prior entries, so a typo saved at 3am does not empty the schedule.
+    """
+
+    def test_the_daemon_refuses_to_start(self, tmp_path: Path, monkeypatch) -> None:
+        import dotenv
+
+        from claude_on_the_fly import preflight
+
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: True)
+        monkeypatch.setattr(preflight, "setup_daemon_logging", lambda _role: None)
+        path = cfg(
+            tmp_path,
+            {"name": "a", "cron": "* * * * *", "prompt": "x", "model": "sonnet"},
+        )
+        monkeypatch.setattr("sys.argv", ["claude-cron", "--config", str(path)])
+
+        with pytest.raises(SystemExit, match=r"config error: .*unknown key 'model'"):
+            cron_mod.main()
+
+    def test_a_running_daemon_keeps_its_entries(self, tmp_path: Path, caplog) -> None:
+        path = cfg(tmp_path, {"name": "a", "cron": "0 9 * * *", "prompt": "x"})
+        cron = daemon(tmp_path, path, FakeQueue())
+        cron.reload()
+        before = cron._state["a"].next_fire
+
+        write_config(
+            path,
+            [{"name": "a", "cron": "0 9 * * *", "prompt": "x", "model": "sonnet"}],
+        )
+        import os as _os
+
+        _os.utime(path, (0, 0))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            cron._maybe_reload()
+
+        assert set(cron._state) == {"a"}
+        assert cron._state["a"].next_fire == before
+        assert "keeping prior entries" in caplog.text
+        assert "unknown key 'model'" in caplog.text
+
+    async def test_the_kept_entries_still_fire(self, tmp_path: Path) -> None:
+        """Keeping the entries is only worth anything if they still do their work,
+        so this fires one after the failed reload rather than reading the dict."""
+        queue = FakeQueue()
+        path = cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"})
+        cron = daemon(tmp_path, path, queue)
+        cron.reload()
+
+        write_config(
+            path,
+            [{"name": "a", "cron": "* * * * *", "prompt": "x", "model": "sonnet"}],
+        )
+        import os as _os
+
+        _os.utime(path, (0, 0))
+        cron._maybe_reload()
+        await cron._fire(cron._state["a"].entry)
+
+        assert [j.key for j in queue.jobs] == ["a"]
 
 
 # ---------------------------------------------------------------------------

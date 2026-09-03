@@ -19,6 +19,7 @@ entries:
     cron: "*/2 * * * *"
     max_concurrent: 3             # how many of THIS entry's items run at once
     max_fires: 3                  # fires against an unchanged item before parking
+    producer_timeout: 300         # seconds for the command below; default 120, max 3600
     prompt_file: ./prompts/jira.md
     command: |
       acli jira workitem search --jql 'assignee = currentUser() AND status not in (Done)' \
