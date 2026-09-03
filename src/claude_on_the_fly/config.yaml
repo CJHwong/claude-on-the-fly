@@ -291,8 +291,8 @@ agent:
   # too, because `-c` is a global codex option rather than an `exec` one; claude
   # pty takes neither, because whether interactive claude honours `--effort` is
   # untested and a flag it ignores is worse than no flag.
-  # Both backends accept low | medium | high | xhigh; claude additionally accepts
-  # max, codex additionally minimal. A level the active backend doesn't accept is
+  # Both backends accept low | medium | high | xhigh | max; codex additionally
+  # accepts minimal and ultra. A level the active backend doesn't accept is
   # ignored with a warning.
 
   # Named overrides of everything above, for one cron entry at a time. An entry
