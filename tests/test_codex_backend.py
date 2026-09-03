@@ -908,8 +908,8 @@ class TestCodexBackendRun:
         assert "-c" not in mock.call_args[0][1]
 
     async def test_effort_level_not_in_codex_set_skipped(self, tmp_path, caplog):
-        """`max` is claude-only; codex must skip it rather than hand it to its
-        config parse, which would fail the spawn."""
+        """A level neither CLI accepts must be skipped rather than handed to
+        codex's config parse, which would fail the spawn."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
@@ -918,11 +918,41 @@ class TestCodexBackendRun:
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend(launcher=launcher, effort="max").run(
+            await CodexBackend(launcher=launcher, effort="colossal").run(
                 workspace, "sess", "hi", "telegram"
             )
         assert "-c" not in mock.call_args[0][1]
-        assert "ignoring unknown effort 'max'" in caplog.text
+        assert "ignoring unknown effort 'colossal'" in caplog.text
+
+    async def test_max_is_a_codex_level_and_reaches_argv(self, tmp_path, caplog):
+        """`max` is in codex's own catalog, so it must survive validation.
+
+        It used to be treated as claude-only: the warning fired, the `-c` was
+        dropped, and the turn silently inherited ~/.codex/config.toml's level.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(effort="max").run(workspace, "sess", "hi", "telegram")
+        assert 'model_reasoning_effort="max"' in mock.call_args[0][1]
+        assert "ignoring unknown effort" not in caplog.text
+
+    async def test_ultra_is_a_codex_level_too(self, tmp_path, caplog):
+        """`ultra` sits above max for gpt-5.6-sol and gpt-5.6-terra."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(effort="ultra").run(workspace, "sess", "hi", "telegram")
+        assert 'model_reasoning_effort="ultra"' in mock.call_args[0][1]
+        assert "ignoring unknown effort" not in caplog.text
 
     async def test_native_with_codex_model_injects_m_flag(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -2914,9 +2944,9 @@ class TestEffortReachesTheInteractiveArgv:
     def test_an_unknown_level_is_dropped_not_passed(
         self, tmp_path: Path, caplog
     ) -> None:
-        """The shared `ollama.effort` accepts `max`, which codex does not. It is
-        skipped here rather than passed through to die in codex's config parse."""
-        argv = CodexBackend(pty=True, effort="max")._interactive_argv(
+        """A level neither CLI accepts is skipped here rather than passed
+        through to die in codex's config parse."""
+        argv = CodexBackend(pty=True, effort="colossal")._interactive_argv(
             tmp_path, None, "hi"
         )
         assert not any("model_reasoning_effort" in part for part in argv)

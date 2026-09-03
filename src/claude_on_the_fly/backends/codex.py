@@ -89,8 +89,21 @@ async def _kill_once_quiet_after_turn(
 # `model_reasoning_effort` choices, from codex's config reference. Whichever key
 # the resolver read it from is validated against this before it reaches codex,
 # because the shared `agent.ollama.effort` is also claude's, and claude's
-# accepted set differs: no `minimal`, plus `max`.
-_CODEX_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+# accepted set differs: no `minimal`.
+#
+# `max` is codex's too, not claude-only, and `ultra` sits above it. Codex's own
+# model catalog is the source: `supported_reasoning_levels` reads
+# [low, medium, high, xhigh, max] for gpt-5.6-luna and gpt-reserve, and adds
+# `ultra` for gpt-5.6-sol and gpt-5.6-terra. Omitting them here made
+# `effort: max` a silently dropped setting -- warned, replaced with no `-c`,
+# leaving the turn on whatever ~/.codex/config.toml said.
+#
+# Levels are per-model in that catalog (gpt-5.5 stops at xhigh), so this one
+# flat set is a lower bound on correctness: it can still accept a level the
+# chosen model lacks, and codex rejects that itself.
+_CODEX_EFFORT_LEVELS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 
 
 def _merge_codex_results(first: dict, second: dict) -> dict:
@@ -1297,7 +1310,8 @@ class CodexBackend:
         effort = self.effort
         if effort and effort not in _CODEX_EFFORT_LEVELS:
             logger.warning(
-                "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
+                "codex: ignoring unknown effort %r "
+                "(minimal|low|medium|high|xhigh|max|ultra)",
                 effort,
             )
             return []
