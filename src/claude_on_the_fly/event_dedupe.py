@@ -1,4 +1,4 @@
-"""Which chat events this install has already acted on, across restarts.
+"""Which chat events this install has already handled, across restarts.
 
 A frontend keeps a bounded set of processed event ids in memory so a redelivery
 inside one process cannot run the same message twice. `slack.py` says why that
@@ -18,6 +18,12 @@ has no failure mode worse than forgetting; going back to fetch what was missed
 is a different feature with a different risk (a long outage turning into a burst
 of history calls and a replay of stale mentions), and it belongs in its own
 change with its own argument.
+
+The restart catch-up feature keeps that separate watermark, but shares this
+ledger for dedupe. It also records COTF's own posted Slack timestamps: a user-token
+install deliberately accepts messages authored by its own user, and only those
+durable ids distinguish a reply sent by COTF from a new message typed by the same
+person after the in-memory echo guard is lost at restart.
 
 Durability is deliberately atomic-but-not-synced. The file is replaced by rename
 so a reader never sees a partial set, and there is no fsync: a power loss can

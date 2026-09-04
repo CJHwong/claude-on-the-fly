@@ -118,5 +118,10 @@ next one without a restart.
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
 - Each thread = one Claude session with memory
 - The app must be invited to private channels (`/invite @your-app-name`)
+- A restart reloads recent active-conversation watermarks and asks Slack history
+  for messages sent while Socket Mode was down. The scan is bounded to the 50
+  most recently active conversations, one hour of history, and 20 messages per
+  conversation; Slack redeliveries are deduplicated against the same durable
+  processed-event ledger.
 
 See the [`slack` reference](../reference/config-yaml.md#slack) for every field.
