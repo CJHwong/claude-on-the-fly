@@ -31,6 +31,8 @@ from claude_on_the_fly.slack import (
 from claude_on_the_fly.slack_mrkdwn import (
     SLACK_MARKDOWN_LIMIT,
     SLACK_MESSAGE_CHAR_LIMIT,
+    SLACK_TEXT_FIELD_BYTES,
+    fit_text_field,
 )
 
 # ---------------------------------------------------------------------------
@@ -73,19 +75,27 @@ class TestReplyMessages:
         body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
         messages = _reply_messages(body, Response(body=body))
         assert len(messages) == 2
-        assert "".join(text for text, _ in messages) == body
+        assert "".join(blocks[0]["text"] for _, blocks in messages) == body
         for _, blocks in messages:
             assert [b["type"] for b in blocks] == ["markdown"]
 
     def test_each_message_carries_its_own_text(self):
         """`text` is the fallback Slack shows for a message, so a part must not
-        claim the whole reply."""
+        claim the whole reply. The fallback is fitted under chat.update's
+        4,000-byte cap, so a long part's text is a prefixed truncation of its
+        markdown block rather than a copy."""
         body = "".join(f"line {i}\n\n" for i in range(800))
         messages = _reply_messages(body, Response(body=body))
         assert len(messages) > 1
         for text, blocks in messages:
-            assert text == blocks[0]["text"]
-            assert len(text) < len(body)
+            assert len(text.encode()) <= SLACK_TEXT_FIELD_BYTES
+            chunk = blocks[0]["text"]
+            assert text == fit_text_field(chunk)
+
+    def test_a_short_part_keeps_its_text_whole(self):
+        body = "just a line"
+        [text, blocks] = _reply_messages(body, Response(body=body))[0]
+        assert text == body == blocks[0]["text"]
 
     def test_footer_closes_the_last_message_only(self):
         body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
@@ -795,11 +805,15 @@ class TestSend:
         delivered = await frontend.send(session_id, Response(body=body))
 
         assert frontend._app.client.chat_postMessage.await_count == 2
-        texts = [
-            call[1]["text"]
+        # The full body rides the markdown blocks; the `text` fallback of each
+        # part is fitted under chat.update's 4,000-byte cap.
+        posted = [
+            call[1]["blocks"][0]["text"]
             for call in frontend._app.client.chat_postMessage.call_args_list
         ]
-        assert "".join(texts) == body
+        assert "".join(posted) == body
+        for call in frontend._app.client.chat_postMessage.call_args_list:
+            assert len(call[1]["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
         assert delivered == []
 
     async def test_footer_and_buttons_close_the_last_message_only(self, frontend):
@@ -4355,6 +4369,41 @@ class TestSuggestionActions:
         actions = next(b for b in blocks if b["type"] == "actions")
         labels = [e["text"]["text"] for e in actions["elements"]]
         assert labels == ["alpha?", "beta?"]
+
+    async def test_send_fits_the_text_fallback_under_the_update_cap(self, frontend):
+        # The suggestion-menu retire re-sends the stored text through
+        # chat.update, whose 4,000-byte cap Slack counts in bytes. The markdown
+        # block keeps the chunk whole; only the `text` fallback shrinks.
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+
+        body = "字" * 2000  # 6,000 bytes of body
+        await frontend.send(session_id, Response(body=body, suggestions=[]))
+
+        kwargs = frontend._app.client.chat_postMessage.call_args[1]
+        assert len(kwargs["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
+        assert kwargs["text"].endswith("…")
+        # The visible content is untouched: the markdown block carries the
+        # chunk in full.
+        assert kwargs["blocks"][0]["text"] == body
+
+    async def test_the_retire_re_sends_a_fitted_text(self, frontend):
+        # A message stored before the fit-at-post change still carries
+        # full-length text; the retire must fit it or Slack rejects the update
+        # with msg_too_long and the menu never collapses.
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        tap = self._tap(label="alpha?")
+        tap["message"]["text"] = "字" * 2000  # 6,000 bytes of stored text
+
+        await frontend._on_suggestion_action(tap)
+
+        kwargs = frontend._app.client.chat_update.await_args.kwargs
+        assert len(kwargs["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
+        assert kwargs["text"].endswith("…")
+        status = next(b for b in kwargs["blocks"] if b["type"] == "context")
+        assert status["elements"][0]["text"] == "✓ alpha?"
 
     async def test_send_no_buttons_when_suggestions_empty(self, frontend):
         session_id = _session_key("C1", "t1")

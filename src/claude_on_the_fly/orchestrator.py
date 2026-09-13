@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -81,6 +82,9 @@ SUGGESTIONS_TEMPLATE = (
     "Offer as many real options as the fork actually has. Never invent one to "
     "reach a count: two real options beat three, and one beats two padded.\n"
     "\n"
+    "Cap each option's length: at most 16 CJK characters or 32 English "
+    "letters. Slack cannot display a longer option.\n"
+    "\n"
     "Put the most concrete executable step first. The first option is the one "
     "you judge most likely.\n"
     "\n"
@@ -105,6 +109,14 @@ SUGGESTIONS_TEMPLATE = (
 # parser agree without importing each other.
 MAX_SUGGESTIONS = 5
 MAX_SUGGESTION_LENGTH = 75
+# The template asks for short options -- 16 CJK characters or 32 English
+# letters -- because Slack cannot display an option longer than that. This
+# parser-side cap enforces the same figure width-aware: a CJK character
+# occupies two columns, so 16 CJK chars and 32 ASCII chars land on the same
+# 32-column ceiling. Truncation keeps the ellipsis inside the cap, and the
+# 75-character block-kit cap above is unreachable at this width, which is what
+# keeps a long agent label from sinking a whole actions block.
+MAX_SUGGESTION_WIDTH = 32
 
 _SUGGESTIONS_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -184,12 +196,38 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
     return cleaned, _parse_suggestion_block(matches[-1].group(1))
 
 
+def _display_width(text: str) -> int:
+    """Display columns of a label: two per East-Asian-wide character, one
+    otherwise. Matches how Slack renders button text for CJK readers."""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def _fit_label(label: str) -> str:
+    """One option label at or under MAX_SUGGESTION_WIDTH display columns.
+
+    The template asks the agent for 16 CJK / 32 ASCII characters, so this only
+    bites on labels that ignore the ask. An ellipsis marks the cut, and the
+    ellipsis is counted so the fitted label stays inside the cap."""
+    if _display_width(label) <= MAX_SUGGESTION_WIDTH:
+        return label
+    keep = MAX_SUGGESTION_WIDTH - 1  # room for the ellipsis
+    fitted: list[str] = []
+    width = 0
+    for char in label:
+        char_width = 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if width + char_width > keep:
+            break
+        fitted.append(char)
+        width += char_width
+    return "".join(fitted) + "…"
+
+
 def _labels_from(data: object) -> list[str]:
     """Suggestion labels out of a parsed block payload (a list of strings)."""
     if not isinstance(data, list):
         return []
     return [
-        str(item).strip()[:MAX_SUGGESTION_LENGTH]
+        _fit_label(str(item).strip())
         for item in data
         if isinstance(item, str) and item.strip()
     ]
@@ -216,7 +254,7 @@ def _parse_suggestion_block(raw: str) -> list[str]:
             for line in content.splitlines():
                 match = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
                 if match:
-                    items.append(match.group(1)[:MAX_SUGGESTION_LENGTH])
+                    items.append(_fit_label(match.group(1)))
     return items[:MAX_SUGGESTIONS]
 
 
