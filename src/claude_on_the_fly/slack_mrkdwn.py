@@ -247,40 +247,154 @@ def _render_link(
     return f"<{href}|{label}>" if label and label != href else f"<{href}>"
 
 
-# Slack rejects a markdown block whose text exceeds this, so a long reply has to
-# be laid across several blocks. Measured against a live workspace: 12000 passes
-# and 12001 fails, and the count is characters rather than bytes -- 12000 CJK
-# characters (36000 bytes) go through. That is four times what a `section` holds,
-# which is why a reply now rarely needs splitting at all.
+# Slack rejects a markdown block whose text exceeds this. Measured against a live
+# workspace: 12000 passes and 12001 fails, and the count is characters rather than
+# bytes -- 12000 CJK characters (36000 bytes) go through. That is four times what a
+# `section` holds.
 SLACK_MARKDOWN_LIMIT = 12000
 
+# Slack caps the whole message as well as one block, and the message cap is the
+# smaller of the two. Slack publishes no number for it: the method reference
+# defers block limits to the block types, and `msg_blocks_too_long` comes back
+# with no count. What this install has measured is a 5,732 character body
+# accepted and a 15,181 character body rejected, with no send landing between.
+# 5,500 keeps a message under the accepted one whichever half of the payload
+# Slack counts, because the body ships twice: once as the message `text`, once
+# as its markdown blocks.
+SLACK_MESSAGE_CHAR_LIMIT = 5500
 
-def split_blocks(text: str) -> list[str]:
-    """Split text into chunks within Slack's per-block limit, preferring line
-    breaks.
+_FENCE_MARKERS = ("```", "~~~")
+
+
+def _fence_marker(line: str) -> str | None:
+    stripped = line.lstrip()
+    for marker in _FENCE_MARKERS:
+        if stripped.startswith(marker):
+            return marker
+    return None
+
+
+def _open_fence_at(lines: list[str]) -> list[bool]:
+    """Mark the lines that leave a code fence open: the opening marker and every
+    line inside it, the closing marker excluded.
+
+    A split may not land after one of these. An unclosed fence at the end of a
+    message swallows the text after it, and the next message opens a fence that
+    closes somewhere else. A split before the opening marker is fine, and so is
+    one after the closing marker.
+    """
+    open_fence = [False] * len(lines)
+    opened: str | None = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if opened is None:
+            if marker is None:
+                continue
+            opened = marker
+        elif marker == opened:
+            opened = None
+            continue
+        open_fence[index] = True
+    return open_fence
+
+
+def _in_table(lines: list[str], open_fence: list[bool]) -> list[bool]:
+    """Mark the lines that carry a table row: a non-blank line with a pipe in it,
+    outside a fence. Coarser than the markdown table grammar on purpose. A prose
+    line that holds a stray pipe only costs a worse split point, while a table
+    cut at a row boundary loses its header row and Slack renders the tail as
+    plain text."""
+    return [
+        "|" in line and bool(line.strip()) and not open_fence[index]
+        for index, line in enumerate(lines)
+    ]
+
+
+def _cut_points(
+    lines: list[str], open_fence: list[bool], in_table: list[bool]
+) -> tuple[list[bool], list[bool]]:
+    """Boundaries a split may land on, indexed by the line that would open the
+    next chunk. Returns the block boundaries (a blank line ends a markdown block)
+    and the line boundaries a split falls back to."""
+    block_cut = [False] * len(lines)
+    line_cut = [False] * len(lines)
+    for index in range(1, len(lines)):
+        previous = index - 1
+        if open_fence[previous]:
+            continue  # the chunk would end with the fence still open
+        if in_table[previous] and in_table[index]:
+            continue  # a table keeps its header with its rows
+        line_cut[index] = True
+        block_cut[index] = not lines[previous].strip()
+    return block_cut, line_cut
+
+
+def _rendered(lines: list[str], start: int, end: int) -> str:
+    """The chunk holding lines [start, end). The newline the split consumed rides
+    with the following chunk, so the chunks still reassemble into the input."""
+    leading = "\n" if start else ""
+    return leading + "\n".join(lines[start:end])
+
+
+def _sliced_line(line: str, leading_newline: bool, limit: int) -> list[str]:
+    """One line longer than the limit, cut into limit-sized pieces."""
+    segment = f"\n{line}" if leading_newline else line
+    pieces: list[str] = []
+    while len(segment) > limit:
+        pieces.append(segment[:limit])
+        segment = segment[limit:]
+    pieces.append(segment)
+    return pieces
+
+
+def _next_cut(start: int, end: int, block_cut: list[bool], line_cut: list[bool]) -> int:
+    """The line the next chunk opens on: the last block boundary that fits, else
+    the last line boundary, else `end`, which cuts inside a fence or a table and
+    is what a table longer than the whole limit leaves."""
+    for allowed in (block_cut, line_cut):
+        for index in range(end, start, -1):
+            if allowed[index]:
+                return index
+    return end
+
+
+def split_blocks(text: str, limit: int = SLACK_MARKDOWN_LIMIT) -> list[str]:
+    """Split text into chunks of at most `limit` characters.
 
     Lossless: every character of `text`, newlines included, lands in exactly one
-    chunk in order, so ``"".join(split_blocks(text)) == text``. A single line
-    longer than the limit is sliced into limit-sized pieces rather than cut off,
-    because the alternative is dropping the tail of somebody's output with no
-    error and no log line — and the reader has no way to tell it happened.
+    chunk in order, so ``"".join(split_blocks(text)) == text``.
+
+    Split points, in the order they are taken:
+
+    1. a blank line outside a fence and outside a table. That is a markdown
+       block boundary, so a paragraph, a list and a table stay in one piece.
+    2. any line boundary outside a fence and outside a table.
+    3. `end`, when neither of the above fits, so a table or a fence longer than
+       `limit` is cut mid-way. Nothing else is left, and dropping the tail is not
+       an option: the reader would have no way to tell it happened.
     """
+    lines = text.split("\n")
+    open_fence = _open_fence_at(lines)
+    in_table = _in_table(lines, open_fence)
+    block_cut, line_cut = _cut_points(lines, open_fence, in_table)
+    total = len(lines)
+
     chunks: list[str] = []
-    chunk = ""
-    for index, line in enumerate(text.split("\n")):
-        segment = f"\n{line}" if index else line  # restore the split newline
-        if len(chunk) + len(segment) <= SLACK_MARKDOWN_LIMIT:
-            chunk += segment
+    start = 0
+    while start < total:
+        first = start == 0  # a later chunk carries the newline the split consumed
+        room = limit if first else limit - 1
+        if len(lines[start]) > room:
+            chunks.extend(_sliced_line(lines[start], not first, limit))
+            start += 1
             continue
-        # Overflow: flush the running chunk, then lay `segment` down, slicing it
-        # into limit-sized pieces if the line alone exceeds the limit.
-        if chunk:
-            chunks.append(chunk)
-            chunk = ""
-        while len(segment) > SLACK_MARKDOWN_LIMIT:
-            chunks.append(segment[:SLACK_MARKDOWN_LIMIT])
-            segment = segment[SLACK_MARKDOWN_LIMIT:]
-        chunk = segment
-    if chunk:
-        chunks.append(chunk)
+        end = start + 1
+        while end < total and len(_rendered(lines, start, end + 1)) <= limit:
+            end += 1
+        if end >= total:
+            chunks.append(_rendered(lines, start, total))
+            break
+        cut = _next_cut(start, end, block_cut, line_cut)
+        chunks.append(_rendered(lines, start, cut))
+        start = cut
     return chunks or [""]

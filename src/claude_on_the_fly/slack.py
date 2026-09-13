@@ -47,8 +47,8 @@ from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.slack_mrkdwn import SLACK_MESSAGE_CHAR_LIMIT, to_mrkdwn
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -722,19 +722,10 @@ def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> st
     return "\n".join(lines)
 
 
-def _build_response_blocks(body: str, response: Response) -> list[dict]:
-    """Render a Response as Slack block-kit: markdown chunks + stats/tools context.
-
-    The body goes out as the agent wrote it, in a `markdown` block. Slack parses
-    it server-side, so a list becomes a real `rich_text_list` that indents, and a
-    table becomes a real `table` block. Converting to mrkdwn first would throw
-    both away: the legacy parser has no list and no table, so a nested list
-    flattens to literal dashes and a table lands in a code fence.
-    """
-    blocks: list[dict] = []
-    for chunk in _split_blocks(body):
-        blocks.append({"type": "markdown", "text": chunk})
+def _footer_blocks(response: Response) -> list[dict]:
+    """The stats and tools lines that close a reply."""
     stats, tools = footer_parts(response, "slack")
+    blocks: list[dict] = []
     if stats:
         blocks.append(
             {"type": "context", "elements": [{"type": "mrkdwn", "text": stats}]}
@@ -744,6 +735,51 @@ def _build_response_blocks(body: str, response: Response) -> list[dict]:
             {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
         )
     return blocks
+
+
+def _suggestion_blocks(labels: list[str]) -> list[dict]:
+    """The follow-up buttons under a reply; none when the agent suggested none."""
+    if not labels:
+        return []
+    return [
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": label},
+                    "action_id": f"cotf-sugg:{i}",
+                }
+                for i, label in enumerate(labels)
+            ],
+        }
+    ]
+
+
+def _reply_messages(body: str, response: Response) -> list[tuple[str, list[dict]]]:
+    """Render a Response as the messages Slack will take, in order.
+
+    A message cap sits below the per-block one, so a long reply goes out as
+    several messages instead of one oversized post that Slack rejects whole. The
+    body goes out as the agent wrote it, in a `markdown` block: Slack parses it
+    server-side, so a list becomes a real `rich_text_list` that indents, and a
+    table becomes a real `table` block. Converting to mrkdwn first would throw
+    both away.
+
+    The stats/tools footer and the suggestion buttons ride the last message only.
+    Repeated per message they read as noise, and the buttons would sit above the
+    rest of the reply.
+    """
+    chunks = _split_blocks(body, limit=SLACK_MESSAGE_CHAR_LIMIT)
+    last = len(chunks) - 1
+    messages: list[tuple[str, list[dict]]] = []
+    for index, chunk in enumerate(chunks):
+        blocks: list[dict] = [{"type": "markdown", "text": chunk}]
+        if index == last:
+            blocks += _footer_blocks(response)
+            blocks += _suggestion_blocks(response.suggestions)
+        messages.append((chunk, blocks))
+    return messages
 
 
 CONTINUE_ACTION_ID = "cotf-continue"
@@ -2668,28 +2704,58 @@ class SlackFrontend(Frontend):
             return response.attachments
         logger.info("slack %s/%s => %s", channel, thread_ts, logs.redact(response.body))
 
-        blocks = _build_response_blocks(response.body, response)
-        # Suggestions parsed out of the reply; empty means no buttons.
-        labels = response.suggestions
-        if labels:
-            blocks.append(
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": label},
-                            "action_id": f"cotf-sugg:{i}",
-                        }
-                        for i, label in enumerate(labels)
-                    ],
-                }
+        messages = _reply_messages(response.body, response)
+        for index, (text, blocks) in enumerate(messages, start=1):
+            error = await self._post_reply_part(
+                channel, thread_ts, text, blocks, index, len(messages)
             )
+            if error is None:
+                continue
+            if error in _FALLBACK_ERRORS:
+                return await self._fallback_dm(chat_id, response, channel, error)
+            await self._notify_send_failure(
+                channel, thread_ts, error, index, len(messages)
+            )
+            return []
+        await self._upload_attachments(channel, thread_ts, response.attachments)
+        return response.attachments
 
+    async def _notify_send_failure(
+        self, channel: str, thread_ts: str | None, error: str, index: int, total: int
+    ) -> None:
+        """Tell the user in-thread that the reply did not go out, and why.
+
+        They cannot see the daemon log, and a reply that never arrives reads as
+        the agent ignoring them. Naming the code is what makes the failure
+        reportable instead of a mystery."""
+        where = f" (part {index} of {total})" if total > 1 else ""
+        note = f"_(couldn't deliver my reply{where}: `{error}`. Please report this.)_"
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, text=note, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("send: failed to post the failure notice: %s", exc)
+            return
+        if resp.get("ok"):
+            self._our_sent_timestamps.append(resp["ts"])
+
+    async def _post_reply_part(
+        self,
+        channel: str,
+        thread_ts: str | None,
+        text: str,
+        blocks: list[dict],
+        index: int,
+        total: int,
+    ) -> str | None:
+        """Post one part of a reply. `None` means it landed; anything else is the
+        error code, with the part number in the log line so a reply that stops
+        half way is diagnosable from the log alone."""
         try:
             resp = await self._app.client.chat_postMessage(
                 channel=channel,
-                text=response.body,
+                text=text,
                 blocks=blocks,
                 thread_ts=thread_ts,
                 # A reply's links are for the user to click, not for Slack to
@@ -2699,24 +2765,24 @@ class SlackFrontend(Frontend):
             )
         except SlackApiError as exc:
             error = exc.response.get("error", "unknown_error")
-            logger.error("send: slack api error %s: %s", error, exc)
-            if error in _FALLBACK_ERRORS:
-                return await self._fallback_dm(chat_id, response, channel, error)
-            return []
+            logger.error(
+                "send: slack api error %s on part %s/%s: %s", error, index, total, exc
+            )
+            return error
         except Exception as exc:
-            logger.error("send: failed to post message: %s", exc)
-            return []
+            logger.error("send: failed to post part %s/%s: %s", index, total, exc)
+            # Not a Slack error code, so it never matches _FALLBACK_ERRORS.
+            return "transport_error"
 
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
             logger.debug("send: ok ts=%s", resp["ts"])
-            await self._upload_attachments(channel, thread_ts, response.attachments)
-            return response.attachments
+            return None
         error = resp.get("error", "unknown_error")
-        logger.warning("send: slack responded not ok: %s", resp)
-        if error in _FALLBACK_ERRORS:
-            return await self._fallback_dm(chat_id, response, channel, error)
-        return []
+        logger.warning(
+            "send: slack responded not ok on part %s/%s: %s", index, total, resp
+        )
+        return error
 
     async def _upload_attachments(
         self, channel: str, thread_ts: str | None, attachments: list[Path]
@@ -3403,29 +3469,27 @@ class SlackFrontend(Frontend):
             f"Here it is via DM instead.)_\n\n"
         )
         body = prefix + response.body
-        blocks = _build_response_blocks(body, response)
-        try:
-            resp = await self._app.client.chat_postMessage(
-                channel=dm_channel,
-                text=body,
-                blocks=blocks,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
-        except Exception as exc:
-            logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
-            return []
-        if resp.get("ok"):
+        for text, blocks in _reply_messages(body, response):
+            try:
+                resp = await self._app.client.chat_postMessage(
+                    channel=dm_channel,
+                    text=text,
+                    blocks=blocks,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+            except Exception as exc:
+                logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
+                return []
+            if not resp.get("ok"):
+                logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
+                return []
             self._our_sent_timestamps.append(resp["ts"])
-            await self._upload_attachments(dm_channel, None, response.attachments)
-            logger.info(
-                "fallback_dm: delivered response to %s for session %s",
-                sender_id,
-                chat_id,
-            )
-            return response.attachments
-        logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
-        return []
+        await self._upload_attachments(dm_channel, None, response.attachments)
+        logger.info(
+            "fallback_dm: delivered response to %s for session %s", sender_id, chat_id
+        )
+        return response.attachments
 
     def _workspace_path(self, session_id: int) -> Path:
         return workspace_path(self.workspace_name(session_id), DATA_DIR)
