@@ -22,9 +22,11 @@ from claude_on_the_fly import turns as turns_mod
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import (
+    MAX_SUGGESTION_WIDTH,
     SUGGESTIONS_TEMPLATE,
     Orchestrator,
     Turn,
+    _display_width,
     _extract_suggestions,
     _parse_suggestion_block,
 )
@@ -2649,6 +2651,33 @@ class TestSuggestionsParsing:
         assert _parse_suggestion_block('{"x": 1}') == []
         assert _parse_suggestion_block('"just a string"') == []
 
+    def test_label_at_the_cjk_cap_is_kept_whole(self):
+        # 16 CJK characters = 32 display columns: exactly at the cap, no cut.
+        label = "字" * 16
+        assert _parse_suggestion_block(f'["{label}"]') == [label]
+
+    def test_overlong_cjk_label_is_cut_with_the_ellipsis_counted(self):
+        # 17 CJK chars = 34 columns. 15 chars (30 columns) + "…" (1) stays in.
+        [fitted] = _parse_suggestion_block(f'["{"字" * 17}"]')
+        assert fitted == "字" * 15 + "…"
+        assert _display_width(fitted) <= MAX_SUGGESTION_WIDTH
+
+    def test_label_at_the_ascii_cap_is_kept_whole(self):
+        label = "x" * 32
+        assert _parse_suggestion_block(f'["{label}"]') == [label]
+
+    def test_overlong_ascii_label_is_cut(self):
+        assert _parse_suggestion_block(f'["{"y" * 40}"]') == ["y" * 31 + "…"]
+
+    def test_mixed_width_label_is_measured_width_aware(self):
+        # 15 CJK chars fill 30 columns; two ASCII chars still fit the cap, but
+        # an ASCII char plus anything else does not.
+        base = "選" * 15
+        assert _parse_suggestion_block(f'["{base}ab"]') == [base + "ab"]
+        [fitted] = _parse_suggestion_block(f'["{base}abc"]')
+        assert fitted == base + "a" + "…"
+        assert _display_width(fitted) == MAX_SUGGESTION_WIDTH
+
     def test_garbage_yields_nothing(self):
         assert _parse_suggestion_block("whatever") == []
 
@@ -2657,10 +2686,11 @@ class TestSuggestionsParsing:
         assert _parse_suggestion_block(json.dumps(labels)) == labels[:5]
 
     def test_overlong_labels_are_truncated(self):
-        # 75, not 80: Slack's block-kit button text hard cap is 75 characters,
-        # and a longer label would reject the whole message.
+        # The template asks for 16 CJK / 32 ASCII characters, and the parser
+        # enforces the same 32-column cap width-aware: a 201-character label
+        # is cut at 31 columns with an ellipsis counted inside the cap.
         long = "x" * 200
-        assert _parse_suggestion_block(f'["{long}?"]') == ["x" * 75]
+        assert _parse_suggestion_block(f'["{long}?"]') == ["x" * 31 + "…"]
 
     def test_single_quoted_json_is_parsed(self):
         # LLMs emit single-quoted lists despite the template; the parser

@@ -47,7 +47,11 @@ from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend
-from claude_on_the_fly.slack_mrkdwn import SLACK_MESSAGE_CHAR_LIMIT, to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import (
+    SLACK_MESSAGE_CHAR_LIMIT,
+    fit_text_field,
+    to_mrkdwn,
+)
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
 
 if TYPE_CHECKING:
@@ -778,7 +782,10 @@ def _reply_messages(body: str, response: Response) -> list[tuple[str, list[dict]
         if index == last:
             blocks += _footer_blocks(response)
             blocks += _suggestion_blocks(response.suggestions)
-        messages.append((chunk, blocks))
+        # The markdown block carries the chunk in full; the `text` fallback is
+        # fitted under chat.update's 4,000-byte cap, because the suggestion-menu
+        # retire re-sends it and Slack counts the cap in bytes, not characters.
+        messages.append((fit_text_field(chunk), blocks))
     return messages
 
 
@@ -2039,7 +2046,14 @@ class SlackFrontend(Frontend):
             await self._app.client.chat_update(
                 channel=channel,
                 ts=ts,
-                text=message.get("text", ""),
+                # Slack caps chat.update's text at 4,000 UTF-8 bytes
+                # (msg_too_long) even though the character count the reference
+                # names still reads fine, so the stored fallback is fitted
+                # before it is re-sent. Replies posted since the fit-at-post
+                # change carry a text that already fits; this is the backstop
+                # for older messages still sitting in history with full-length
+                # text.
+                text=fit_text_field(message.get("text", "")),
                 blocks=_retire_suggestion_block(blocks, label),
             )
         except Exception as exc:

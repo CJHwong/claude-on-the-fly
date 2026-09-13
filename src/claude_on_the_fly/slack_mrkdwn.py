@@ -263,7 +263,44 @@ SLACK_MARKDOWN_LIMIT = 12000
 # as its markdown blocks.
 SLACK_MESSAGE_CHAR_LIMIT = 5500
 
+# Slack caps the `text` argument of `chat.update` at 4,000, and the count is
+# UTF-8 bytes rather than the characters the method reference names: this
+# install measured a 1,993-character (4,121-byte) CJK reply rejected with
+# `msg_too_long` and a 2,035-character (3,971-byte) one accepted. The only
+# `chat.update` that re-sends a reply body is the suggestion-menu retire, so
+# every reply part posts its markdown block at full length and fits only its
+# `text` fallback under this ceiling. That fallback is what a later
+# `chat.update` re-sends, so fitting it there is the safety space: the split
+# itself needs none, because `chat.postMessage` truncates at 40k instead of
+# rejecting.
+SLACK_UPDATE_TEXT_MAX_BYTES = 4000
+# The retire re-sends the stored text with room to spare under the 4,000-byte
+# cap, so a measured limit drift or a surrogate pair at the cut cannot flip the
+# update to `msg_too_long`.
+SLACK_TEXT_FIELD_BYTES = 3800
+
 _FENCE_MARKERS = ("```", "~~~")
+
+
+def fit_text_field(text: str, max_bytes: int = SLACK_TEXT_FIELD_BYTES) -> str:
+    """A `text` field value Slack can re-send through `chat.update` intact.
+
+    Slack rejects an update whose `text` exceeds `SLACK_UPDATE_TEXT_MAX_BYTES`
+    UTF-8 bytes with `msg_too_long`, and a CJK body passes the character count
+    the reference names long after it fails the byte count. Long bodies are cut
+    on a code-point boundary with a trailing ellipsis; blocks carry the full
+    content, so only the notification fallback loses tail text.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    # "…" costs 3 bytes, so the kept slice targets max_bytes - 3. Stepping back
+    # from the cut while it lands on a continuation byte ends the slice on a
+    # codepoint boundary, and `errors="ignore"` makes that belt-and-suspenders.
+    cut = max_bytes - len("…".encode())
+    while cut > 0 and cut < len(encoded) and (encoded[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return encoded[:cut].decode("utf-8", errors="ignore") + "…"
 
 
 def _fence_marker(line: str) -> str | None:
