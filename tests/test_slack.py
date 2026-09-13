@@ -23,51 +23,91 @@ from claude_on_the_fly.slack import (
     JOB_LIST_LIMIT,
     RATE_LIMIT_RETRIES,
     SlackFrontend,
-    _build_response_blocks,
     _render_job_list,
+    _reply_messages,
     _session_key,
     _split_blocks,
 )
-from claude_on_the_fly.slack_mrkdwn import SLACK_MARKDOWN_LIMIT
+from claude_on_the_fly.slack_mrkdwn import (
+    SLACK_MARKDOWN_LIMIT,
+    SLACK_MESSAGE_CHAR_LIMIT,
+)
 
 # ---------------------------------------------------------------------------
-# _build_response_blocks
+# _reply_messages
 # ---------------------------------------------------------------------------
 
 
-class TestBuildResponseBlocks:
+class TestReplyMessages:
     """The body ships as Markdown for Slack to parse, not as pre-cooked mrkdwn.
 
     Slack's `markdown` block gives back a real `rich_text_list` that indents and
     a real `table`. Converting first would flatten both, which is what the old
     `section` path did.
+
+    A message cap sits below the per-block cap, so a long reply becomes several
+    messages, and the footer and buttons close the last one only.
     """
 
     def test_body_is_a_markdown_block(self):
-        blocks = _build_response_blocks("hello", Response(body="hello"))
+        text, blocks = _reply_messages("hello", Response(body="hello"))[0]
+        assert text == "hello"
         assert blocks[0] == {"type": "markdown", "text": "hello"}
 
     def test_nested_list_reaches_slack_unconverted(self):
         body = "- top\n  - child"
-        blocks = _build_response_blocks(body, Response(body=body))
+        _, blocks = _reply_messages(body, Response(body=body))[0]
         assert blocks[0]["text"] == body
 
     def test_table_is_not_flattened_into_a_code_fence(self):
         body = "| a | b |\n| --- | --- |\n| 1 | 2 |"
-        blocks = _build_response_blocks(body, Response(body=body))
+        _, blocks = _reply_messages(body, Response(body=body))[0]
         assert blocks[0]["text"] == body
         assert "```" not in blocks[0]["text"]
 
     def test_bold_keeps_its_markdown_spelling(self):
-        blocks = _build_response_blocks("**bold**", Response(body="**bold**"))
+        _, blocks = _reply_messages("**bold**", Response(body="**bold**"))[0]
         assert blocks[0]["text"] == "**bold**"
 
-    def test_a_long_body_is_laid_across_several_markdown_blocks(self):
-        body = "x" * (SLACK_MARKDOWN_LIMIT + 10)
-        blocks = _build_response_blocks(body, Response(body=body))
-        bodies = [b for b in blocks if b["type"] == "markdown"]
-        assert len(bodies) == 2
-        assert "".join(b["text"] for b in bodies) == body
+    def test_a_long_body_goes_out_as_several_messages(self):
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+        messages = _reply_messages(body, Response(body=body))
+        assert len(messages) == 2
+        assert "".join(text for text, _ in messages) == body
+        for _, blocks in messages:
+            assert [b["type"] for b in blocks] == ["markdown"]
+
+    def test_each_message_carries_its_own_text(self):
+        """`text` is the fallback Slack shows for a message, so a part must not
+        claim the whole reply."""
+        body = "".join(f"line {i}\n\n" for i in range(800))
+        messages = _reply_messages(body, Response(body=body))
+        assert len(messages) > 1
+        for text, blocks in messages:
+            assert text == blocks[0]["text"]
+            assert len(text) < len(body)
+
+    def test_footer_closes_the_last_message_only(self):
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+        response = Response(body=body, cost=0.01, model="sonnet")
+        messages = _reply_messages(body, response)
+        types = [[b["type"] for b in blocks] for _, blocks in messages]
+        assert types[0] == ["markdown"]
+        assert "context" in types[-1]
+
+    def test_buttons_ride_the_last_message_only(self):
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+        response = Response(body=body, suggestions=["more", "stop"])
+        messages = _reply_messages(body, response)
+        actions = [
+            b for _, blocks in messages for b in blocks if b["type"] == "actions"
+        ]
+        assert len(actions) == 1
+        assert [b["type"] for b in messages[-1][1]][-1] == "actions"
+
+    def test_no_suggestions_means_no_actions_block(self):
+        messages = _reply_messages("hello", Response(body="hello"))
+        assert not any(b["type"] == "actions" for b in messages[0][1])
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +161,45 @@ class TestSplitBlocks:
         result = _split_blocks(text)
         assert result[0] == short
         assert all(len(chunk) <= SLACK_MARKDOWN_LIMIT for chunk in result)
-        assert "".join(result) == text
+
+    def test_a_table_is_not_cut_at_a_row_boundary(self):
+        """A table cut at a row boundary loses its header row, and Slack renders
+        the rows below the split as plain text."""
+        text = "intro line\n| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\noutro line"
+        chunks = _split_blocks(text, limit=60)
+        holders = [chunk for chunk in chunks if "| a | b |" in chunk]
+        assert len(holders) == 1
+        assert "| 3 | 4 |" in holders[0]
+
+    def test_a_fence_that_fits_is_not_cut_at_a_blank_line_inside_it(self):
+        text = "x" * 10 + "\n```\n" + "a" * 10 + "\n\n" + "b" * 10 + "\n```"
+        chunks = _split_blocks(text, limit=30)
+        # The fence does not fit beside the prose, so the split lands before it
+        # opens rather than on the blank line inside it.
+        assert chunks[0] == "x" * 10
+
+    def test_a_fence_that_fits_beside_the_prose_is_kept_whole(self):
+        text = "before\n```\nline one\nline two\n```\nafter"
+        chunks = _split_blocks(text, limit=30)
+        holders = [chunk for chunk in chunks if "```" in chunk]
+        assert len(holders) == 1
+        assert "line two" in holders[0]
+
+    def test_a_block_boundary_beats_a_later_line_boundary(self):
+        first, second, third = "x" * 20, "y" * 20, "z" * 20
+        text = f"{first}\n\n{second}\n{third}"
+        assert _split_blocks(text, limit=55) == [
+            f"{first}\n",
+            f"\n{second}\n{third}",
+        ]
+
+    def test_a_table_longer_than_the_limit_is_still_cut(self):
+        rows = "\n".join(f"| row {i} | value {i} |" for i in range(20))
+        text = f"| a | b |\n| --- | --- |\n{rows}"
+        chunks = _split_blocks(text, limit=100)
+        assert len(chunks) > 1
+        assert all(len(chunk) <= 100 for chunk in chunks)
+        assert "".join(chunks) == text
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +785,143 @@ class TestSend:
         blocks = call_kwargs["blocks"]
         assert any(b["type"] == "markdown" for b in blocks)
         assert any(b["type"] == "context" for b in blocks)
+
+    async def test_a_long_reply_posts_one_message_per_part(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+
+        delivered = await frontend.send(session_id, Response(body=body))
+
+        assert frontend._app.client.chat_postMessage.await_count == 2
+        texts = [
+            call[1]["text"]
+            for call in frontend._app.client.chat_postMessage.call_args_list
+        ]
+        assert "".join(texts) == body
+        assert delivered == []
+
+    async def test_footer_and_buttons_close_the_last_message_only(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        response = Response(
+            body="x" * (SLACK_MESSAGE_CHAR_LIMIT + 10),
+            cost=0.01,
+            model="sonnet",
+            suggestions=["more"],
+        )
+
+        await frontend.send(session_id, response)
+
+        calls = frontend._app.client.chat_postMessage.call_args_list
+        first = [b["type"] for b in calls[0][1]["blocks"]]
+        last = [b["type"] for b in calls[-1][1]["blocks"]]
+        assert first == ["markdown"]
+        assert last == ["markdown", "context", "actions"]
+
+    async def test_every_part_records_its_timestamp(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.side_effect = [
+            {"ok": True, "ts": "1.0"},
+            {"ok": True, "ts": "2.0"},
+        ]
+
+        await frontend.send(
+            session_id, Response(body="x" * (SLACK_MESSAGE_CHAR_LIMIT + 10))
+        )
+
+        assert "1.0" in frontend._our_sent_timestamps
+        assert "2.0" in frontend._our_sent_timestamps
+
+    async def test_a_failed_part_stops_the_rest(self, frontend, caplog):
+        """The failure that cost a reply: Slack rejects one part and the send
+        path drops the rest, so the log has to name the part that failed."""
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if len(posts) == 2:
+                raise SlackApiError(
+                    "too long", {"ok": False, "error": "msg_blocks_too_long"}
+                )
+            return {"ok": True, "ts": "1.0"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+        body = "x" * 3000 + "\n\n" + "y" * 3000 + "\n\n" + "z" * 3000
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            delivered = await frontend.send(session_id, Response(body=body))
+
+        assert posts[0]["text"].startswith("x")
+        assert posts[1]["text"].lstrip("\n").startswith("y")
+        assert delivered == []
+        assert "msg_blocks_too_long on part 2/3" in caplog.text
+
+    async def test_an_uncovered_error_tells_the_user_to_report(self, frontend):
+        """A code Slack returns that this frontend has no path for leaves the user
+        with silence, so the notice names the code and asks for a report."""
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if len(posts) == 1:
+                raise SlackApiError(
+                    "too long", {"ok": False, "error": "msg_blocks_too_long"}
+                )
+            return {"ok": True, "ts": "9.0"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+
+        await frontend.send(session_id, Response(body="hello"))
+
+        assert posts[1]["channel"] == "C1"
+        assert posts[1]["thread_ts"] == "t1"
+        assert "msg_blocks_too_long" in posts[1]["text"]
+        assert "Please report this" in posts[1]["text"]
+        assert "9.0" in frontend._our_sent_timestamps
+
+    async def test_the_notice_names_the_part_that_failed(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if len(posts) == 2:
+                raise SlackApiError("nope", {"ok": False, "error": "invalid_blocks"})
+            return {"ok": True, "ts": "1.0"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+        body = "x" * 3000 + "\n\n" + "y" * 3000 + "\n\n" + "z" * 3000
+
+        await frontend.send(session_id, Response(body=body))
+
+        assert "part 2 of 3" in posts[2]["text"]
+
+    async def test_a_notice_that_cannot_be_posted_is_logged_not_raised(
+        self, frontend, caplog
+    ):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=[
+                SlackApiError("nope", {"ok": False, "error": "invalid_blocks"}),
+                RuntimeError("socket reset"),
+            ]
+        )
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            delivered = await frontend.send(session_id, Response(body="hello"))
+
+        assert delivered == []
+        assert "failed to post the failure notice" in caplog.text
 
     async def test_suppressed_bot_reply_omits_slack_post(self, frontend):
         session_id = _session_key("C1", "t1")
@@ -5496,7 +5711,7 @@ class TestSendFallsBackToDm:
         )
         with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
             assert await frontend.send(1, Response(body="x")) == []
-        assert "failed to post message" in "\n".join(
+        assert "failed to post part 1/1" in "\n".join(
             r.getMessage() for r in caplog.records
         )
 
