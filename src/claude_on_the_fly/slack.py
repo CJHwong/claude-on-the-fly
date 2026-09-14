@@ -2410,7 +2410,12 @@ class SlackFrontend(Frontend):
             logger.debug("skipped: subtype=%s", subtype)
             return
         ts = event.get("ts", "")
-        sender_id = event.get("user", "")
+        # A trusted bot post carries no `user`, so its bot id is the sender:
+        # the same id the allowlist keyed on, and the id the DM workspace is
+        # named after. An empty sender here became `users//` in the prompt
+        # and, after a restart skipped the empty journaled value, the numeric
+        # chat id.
+        sender_id = event.get("user") or bot_id
         if ts in self._our_sent_timestamps:
             logger.debug("skipped: our own message ts=%s", ts)
             return
