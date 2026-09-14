@@ -11,12 +11,12 @@ Now there is one file, `~/.claude-on-the-fly/config.yaml`, seeded from the bundl
 template on first run so the operator opens something commented rather than
 inventing a schema.
 
-**Why a file and not the environment.** All four entrypoints call `load_dotenv()`
-with no argument, so python-dotenv searches upward from the *cwd*: the `.env` in
-DATA_DIR is read only when `tui/supervisor` injects it into the child, or when the
-daemon happens to be launched from that directory. This file is resolved from an
-absolute path, so it reads the same however the daemon started. Credentials stay
-in `.env`, which is where a secret scanner expects them.
+**Why a file and not the environment.** An environment variable can come from the
+shell, from `DATA_DIR/.env` (`envfile.load_into_process`), or from the merge
+`tui/supervisor` does when it spawns a child, and a shell export silently beats the
+file. This file is resolved from an absolute path, so it reads the same however the
+daemon started. Credentials stay in `.env`, which is where a secret scanner expects
+them.
 
 **`.env` keeps working.** Every environment variable a setting moved from still
 overrides the file, and warns once naming where it went -- a deployment must not lose

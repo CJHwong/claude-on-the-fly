@@ -818,8 +818,7 @@ def main() -> None:
     import argparse
     import sys
 
-    from dotenv import load_dotenv
-
+    from claude_on_the_fly import envfile
     from claude_on_the_fly.heartbeat import (
         InstanceAlreadyClaimed,
         InstanceLockUnavailable,
@@ -839,7 +838,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    load_dotenv()
+    envfile.load_into_process()
     if args.migrate_workspaces:
         raise SystemExit(migrate_workspaces(apply=args.apply))
     token, allowed_user_id = run_telegram()

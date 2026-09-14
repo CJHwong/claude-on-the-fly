@@ -1209,7 +1209,7 @@ class SlackFrontend(Frontend):
         # not switch the feature on, since the branch gated on the module
         # global, and a caller had to reach in and patch that too. Resolving at
         # construction also means a SLACK_JOB_COMMAND that only exists in .env
-        # works — `main` calls load_dotenv() before this runs, whereas the
+        # works — `main` loads DATA_DIR/.env before this runs, whereas the
         # import-time binding needed the value already in the environment.
         # `None` means "not specified, read the environment"; `""` means off.
         # Without that split a caller could rename the trigger but never
@@ -3867,9 +3867,7 @@ def main() -> None:
     import argparse
     import sys
 
-    from dotenv import load_dotenv
-
-    from claude_on_the_fly import slack_manifest
+    from claude_on_the_fly import envfile, slack_manifest
     from claude_on_the_fly.heartbeat import (
         InstanceAlreadyClaimed,
         InstanceLockUnavailable,
@@ -3914,7 +3912,7 @@ def main() -> None:
             )
         )
 
-    load_dotenv()
+    envfile.load_into_process()
     if args.migrate_workspaces:
         raise SystemExit(migrate_workspaces(apply=args.apply))
     app_token, token, user_id = run_slack()
@@ -3940,10 +3938,10 @@ def migrate_workspaces(*, apply: bool) -> int:
     do it from a host where the daemon is not configured to start.
 
     The token is read the way the daemon receives it, `DATA_DIR/.env` merged over
-    the shell (`envfile.daemon_environment`). `load_dotenv()` in `main` searches
-    from this file's directory, not the working one, so a hand-run CLI never saw
-    the file: measured on a deployed host, the dry run asked for `SLACK_TOKEN`
-    with the token sitting in `.env` beside the workspaces.
+    the shell (`envfile.daemon_environment`). `main` once loaded `.env` by
+    searching upward from this module's directory, so a hand-run CLI never saw
+    `DATA_DIR/.env`: measured on a deployed host, the dry run
+    asked for `SLACK_TOKEN` with the token sitting in `.env` beside the workspaces.
     """
     import sys
 

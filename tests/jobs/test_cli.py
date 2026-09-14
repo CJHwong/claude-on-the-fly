@@ -246,13 +246,13 @@ class TestDoctor:
 
 class TestMainDispatch:
     def test_doctor_is_dispatched(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
         monkeypatch.setattr(cli.sys, "argv", ["claude-jobs", "doctor"])
         monkeypatch.setattr(cli, "_cmd_doctor", lambda: 7)
         assert cli.main() == 7
 
     def test_enqueue_is_dispatched_with_its_options(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
         monkeypatch.setattr(
             cli.sys,
             "argv",
@@ -274,7 +274,7 @@ class TestMainDispatch:
         assert seen == [("do it", "C1", "1.1")]
 
     def test_a_bare_invocation_runs_the_worker(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
         monkeypatch.setattr(cli.sys, "argv", ["claude-jobs"])
         monkeypatch.setattr(cli, "_cmd_run", lambda: 3)
         assert cli.main() == 3
