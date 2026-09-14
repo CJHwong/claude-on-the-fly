@@ -157,12 +157,18 @@ OUTBOX_INSTRUCTION = (
     "  {outbox_dir}\n"
     "Use that absolute path, not a relative `outbox/` — your shell's working "
     "directory may differ. Everything left in that directory is uploaded to the "
-    "user along with your reply. When the user asks for a file, deliver it this "
-    "way. Do NOT tell the user you can only send text or cannot attach files, that "
-    "is false. Keep scratch and working files out of it.\n"
-    "If you have several files to deliver, zip them into a single archive and drop "
-    "that in instead, so the user gets one file rather than a flood of separate "
-    "uploads. A lone file goes in as-is.\n"
+    "user along with your reply. Do NOT tell the user you can only send text or "
+    "cannot attach files, that is false.\n"
+    "Rules for it:\n"
+    "- Answer in your reply by default. Use the outbox when the user asks for a "
+    "file, or when what they asked for is a file (a report, an export, an image).\n"
+    "- The file arrives with your reply, so do not announce the delivery and do "
+    "not name the outbox or its path. Describe the content if that helps.\n"
+    "- One file per deliverable, never zipped: the user prefers separate files "
+    "they can open. Only bundle when there are more than {max_attachments} files, "
+    "and say so.\n"
+    "- Keep scratch and working files out of it. Never touch `.sent/` next to "
+    "it, the daemon owns that archive.\n"
     "</IMPORTANT>"
 )
 
@@ -672,7 +678,9 @@ def build_system_prompt(
             if session_uuid
             else workspace / OUTBOX_DIRNAME
         )
-        outbox = OUTBOX_INSTRUCTION.format(outbox_dir=outbox_dir)
+        outbox = OUTBOX_INSTRUCTION.format(
+            outbox_dir=outbox_dir, max_attachments=MAX_ATTACHMENTS
+        )
     else:
         outbox = ""
     prompt = PROMPT_TEMPLATE.format(

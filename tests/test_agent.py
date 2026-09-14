@@ -406,6 +406,16 @@ class TestBuildSystemPrompt:
             assert "You CAN send files" in result
             assert "{outbox_dir}" not in result  # placeholder fully substituted
 
+    def test_outbox_rules_are_the_operators(self, tmp_path: Path):
+        """Lifted from a deployed persona that had to correct the old text: no
+        announcing, no zipping, no touching the archive."""
+        result = build_system_prompt("slack", "hoss", "dm", tmp_path)
+        assert "do not announce the delivery" in result
+        assert "never zipped" in result
+        assert f"more than {MAX_ATTACHMENTS} files" in result
+        assert "Never touch `.sent/`" in result
+        assert "{max_attachments}" not in result
+
     def test_outbox_is_the_sessions_own_when_a_session_is_named(self, tmp_path: Path):
         """Two threads of one conversation share the workspace and can run at
         once; a shared outbox handed one thread's file to the other's reply."""
