@@ -346,6 +346,7 @@ class ClaudeBackend:
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response:
         logger.info(
             "session: id=%s platform=%s user=%s context=%s workspace=%s",
@@ -356,7 +357,7 @@ class ClaudeBackend:
             workspace,
         )
         system_prompt = build_system_prompt(
-            platform, user_name, channel_context, workspace
+            platform, user_name, channel_context, workspace, session_uuid, facts
         )
         # --system-prompt is only attached when (re-)establishing a session; a
         # healthy --resume reuses the prompt already persisted in the session.

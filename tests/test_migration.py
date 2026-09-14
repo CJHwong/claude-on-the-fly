@@ -153,28 +153,80 @@ class TestCodex:
 
 
 class TestFiles:
-    def test_leftovers_move_under_threads_and_old_dir_goes(
+    def test_leftovers_go_flat_into_the_workspace_and_old_dir_goes(
         self, old_workspace, new_workspace
     ):
         (old_workspace / "report.pdf").write_bytes(b"pdf")
-        (old_workspace / "outbox" / ".sent").mkdir(parents=True)
-        (old_workspace / "outbox" / ".sent" / "a.txt").write_text("a")
+        (old_workspace / "notes").mkdir()
+        (old_workspace / "notes" / "n.md").write_text("n")
         migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
-        thread_dir = new_workspace / "threads" / "1-2"
-        assert (thread_dir / "report.pdf").read_bytes() == b"pdf"
-        assert (thread_dir / "outbox" / ".sent" / "a.txt").is_file()
+        assert (new_workspace / "report.pdf").read_bytes() == b"pdf"
+        assert (new_workspace / "notes" / "n.md").read_text() == "n"
+        assert not (new_workspace / "threads").exists()
         assert not old_workspace.exists()
+
+    def test_a_name_the_workspace_holds_takes_the_thread_key(
+        self, old_workspace, new_workspace
+    ):
+        (old_workspace / "report.pdf").write_bytes(b"old")
+        new_workspace.mkdir(parents=True)
+        (new_workspace / "report.pdf").write_bytes(b"current")
+        migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
+        assert (new_workspace / "report.pdf").read_bytes() == b"current"
+        assert (new_workspace / "report-1-2.pdf").read_bytes() == b"old"
+
+    def test_a_second_clash_is_refused_not_overwritten(
+        self, old_workspace, new_workspace, caplog
+    ):
+        (old_workspace / "report.pdf").write_bytes(b"old")
+        new_workspace.mkdir(parents=True)
+        (new_workspace / "report.pdf").write_bytes(b"current")
+        (new_workspace / "report-1-2.pdf").write_bytes(b"also taken")
+        migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
+        assert (new_workspace / "report-1-2.pdf").read_bytes() == b"also taken"
+        assert (old_workspace / "report.pdf").read_bytes() == b"old"
+        assert "already exists" in caplog.text
+
+    def test_sent_archives_merge_and_undelivered_files_go_to_the_root(
+        self, old_workspace, new_workspace
+    ):
+        sent = old_workspace / "outbox" / ".sent"
+        (sent / "20260801-101010-000001").mkdir(parents=True)
+        (sent / "20260801-101010-000001" / "a.txt").write_text("a")
+        (old_workspace / "outbox" / "never-sent.txt").write_text("x")
+        (new_workspace / "outbox" / ".sent" / "20260901-000000-000000").mkdir(
+            parents=True
+        )
+        migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
+        archive = new_workspace / "outbox" / ".sent"
+        assert (archive / "20260801-101010-000001" / "a.txt").read_text() == "a"
+        assert (archive / "20260901-000000-000000").is_dir()
+        assert (new_workspace / "never-sent.txt").read_text() == "x"
+        assert sorted(p.name for p in (new_workspace / "outbox").iterdir()) == [".sent"]
+        assert not old_workspace.exists()
+
+    def test_a_stamp_that_cannot_move_keeps_the_old_archive(
+        self, old_workspace, new_workspace, caplog
+    ):
+        """A stamp is a microsecond timestamp, so a clash is a copy of the same
+        archive. It is refused, and the old outbox stays for a human to look at."""
+        (old_workspace / "outbox" / ".sent" / "S").mkdir(parents=True)
+        (new_workspace / "outbox" / ".sent" / "S").mkdir(parents=True)
+        (new_workspace / "outbox" / ".sent" / "S-1-2").mkdir()
+        migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
+        assert (old_workspace / "outbox" / ".sent" / "S").is_dir()
+        assert "not removed" in caplog.text
 
     def test_persona_links_are_dropped_not_moved(self, old_workspace, new_workspace):
         os.symlink("/nonexistent/CLAUDE.md", old_workspace / "CLAUDE.md")
         os.symlink("/nonexistent/CLAUDE.md", old_workspace / "AGENTS.md")
         migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
-        assert not (new_workspace / "threads" / "1-2" / "CLAUDE.md").is_symlink()
+        assert not (new_workspace / "CLAUDE.md").is_symlink()
         assert not old_workspace.exists()
 
-    def test_empty_old_dir_leaves_no_thread_dir(self, old_workspace, new_workspace):
+    def test_empty_old_dir_leaves_nothing_behind(self, old_workspace, new_workspace):
         migration.migrate_thread(old_workspace, new_workspace, [UUID], "1-2")
-        assert not (new_workspace / "threads").exists()
+        assert not new_workspace.exists() or list(new_workspace.iterdir()) == []
         assert not old_workspace.exists()
 
     def test_move_failure_leaves_the_old_dir_in_place(
@@ -299,7 +351,7 @@ class TestApplyAndRender:
             ),
         ]
         text = migration.render_plans(plans)
-        assert "dm-hoss-1-2 -> slack/dm/U1/threads/1-2  sessions=1" in text
+        assert "dm-hoss-1-2 -> slack/dm/U1  sessions=1" in text
         assert "smoke  SKIP: not a thread directory" in text
         assert text.endswith("1 directories to move (1 sessions), 1 skipped")
 

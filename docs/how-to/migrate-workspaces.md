@@ -30,7 +30,7 @@ claude-telegram --migrate-workspaces
 Slack reads `SLACK_TOKEN` from `.env` in the data directory, or from the shell, because the old names hold display names and the new names need Slack ids. One line prints per directory:
 
 ```
-dm-hoss-1786342813-662689 -> slack/dm/U01ABCDEF/threads/1786342813-662689  sessions=1
+dm-hoss-1786342813-662689 -> slack/dm/U01ABCDEF  sessions=1
 old-channel-1786342813  SKIP: conversation 'old-channel' not on Slack
 smoke  SKIP: not a thread directory
 141 directories to move (139 sessions), 2 skipped
@@ -45,7 +45,7 @@ claude-slack --migrate-workspaces --apply
 claude-telegram --migrate-workspaces --apply
 ```
 
-Each session's claude transcript moves under the new directory's hash, each codex mapping is rewritten for the new path, and the thread's files move to `threads/<thread key>/` in the new directory. The old directory is removed once empty.
+Each session's claude transcript moves under the new directory's hash, each codex mapping is rewritten for the new path, and the thread's files move flat into the new directory: a name it already holds gets the thread key as a suffix, and the old `outbox/.sent/` archives merge into the new directory's. The old directory is removed once empty.
 
 ## 5. Start the daemon and check one thread
 

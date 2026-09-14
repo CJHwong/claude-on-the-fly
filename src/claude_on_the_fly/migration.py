@@ -10,9 +10,15 @@ keyed on the path and a `CODEX_HOME` named after it.
 
 So a thread's first message after the upgrade moves three things: the claude
 transcript to the new hash directory, the codex mapping and rollout to the new
-workspace's home, and whatever files the thread left behind to
-`<new>/threads/<key>/`. Both CLIs were measured resuming from a moved directory
-with the files moved this way; they record the new cwd from then on.
+workspace's home, and whatever files the thread left behind into the new
+workspace itself. Both CLIs were measured resuming from a moved directory with
+the files moved this way; they record the new cwd from then on.
+
+The files go flat into the workspace root rather than under a folder per
+thread: the workspace is the conversation's folder, for the human as much as
+for the agent, and one folder per old thread made it unreadable. A name the
+root already holds gets the thread key as a suffix. The old `outbox/.sent/`
+archives merge into the workspace's own.
 
 Every step is idempotent and best effort. A move that fails leaves its source in
 place and is logged, and the turn still runs in the new workspace: a forgetful
@@ -29,11 +35,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from claude_on_the_fly import codex_state, transcript
-from claude_on_the_fly.agent import PERSONA_FILENAMES, workspace_path
+from claude_on_the_fly.agent import (
+    OUTBOX_ARCHIVE,
+    OUTBOX_DIRNAME,
+    PERSONA_FILENAMES,
+    workspace_path,
+)
 
 logger = logging.getLogger(__name__)
-
-THREADS_DIRNAME = "threads"
 
 
 def migrate_thread(
@@ -45,8 +54,9 @@ def migrate_thread(
     """Move one thread's sessions and files out of `old_workspace`.
 
     `session_uuids` are the sessions to carry; the live path passes the one it is
-    about to run, the bulk pass everything it found. `thread_key` names the
-    subdirectory the leftover files go under. Returns True when anything moved.
+    about to run, the bulk pass everything it found. `thread_key` is the suffix
+    a leftover file takes when the workspace already holds its name. Returns
+    True when anything moved.
     """
     if not old_workspace.is_dir():
         return False
@@ -64,10 +74,7 @@ def migrate_thread(
             _move_claude_session(old_workspace, new_workspace, session_uuid) or moved
         )
         moved = _move_codex_session(old_workspace, new_workspace, session_uuid) or moved
-    moved = (
-        _move_files(old_workspace, new_workspace / THREADS_DIRNAME / thread_key)
-        or moved
-    )
+    moved = _move_files(old_workspace, new_workspace, thread_key) or moved
     return moved
 
 
@@ -127,24 +134,62 @@ def _move_rollout(old_home: Path, new_home: Path, thread_id: str) -> None:
         _move(rollout, new_home / rollout.relative_to(old_home))
 
 
-def _move_files(old: Path, thread_dir: Path) -> bool:
-    """Everything the thread left in its directory, then the directory itself.
+def _move_files(old: Path, new: Path, thread_key: str) -> bool:
+    """Everything the thread left in its directory into the workspace root,
+    then the directory itself.
 
     The persona links are dropped rather than moved: the new workspace gets its
-    own from `ensure_persona`, and a link carried along would point the thread
-    directory at a persona no config names for it.
+    own from `ensure_persona`. The outbox is merged rather than moved, because
+    the new workspace has one of its own.
     """
     moved = False
     for entry in sorted(old.iterdir()):
         if entry.name in PERSONA_FILENAMES and entry.is_symlink():
             entry.unlink()
             continue
-        moved = _move(entry, thread_dir / entry.name) or moved
-    try:
-        old.rmdir()
-    except OSError as exc:
-        logger.warning("migration: %s not removed: %s", old, exc)
+        if entry.name == OUTBOX_DIRNAME and entry.is_dir():
+            moved = _merge_outbox(entry, new / OUTBOX_DIRNAME, thread_key) or moved
+            continue
+        moved = _move(entry, _free_path(new, entry.name, thread_key)) or moved
+    _rmdir(old)
     return moved
+
+
+def _merge_outbox(old: Path, new: Path, thread_key: str) -> bool:
+    """The thread's delivered files join the workspace's `.sent/` archive under
+    their own stamps; anything else it left in its outbox was never delivered
+    and goes to the root like any other leftover."""
+    moved = False
+    sent = old / OUTBOX_ARCHIVE
+    if sent.is_dir():
+        for stamp in sorted(sent.iterdir()):
+            target = _free_path(new / OUTBOX_ARCHIVE, stamp.name, thread_key)
+            moved = _move(stamp, target) or moved
+        _rmdir(sent)
+    for entry in sorted(old.iterdir()):
+        if entry == sent:
+            continue
+        moved = _move(entry, _free_path(new.parent, entry.name, thread_key)) or moved
+    _rmdir(old)
+    return moved
+
+
+def _free_path(directory: Path, name: str, thread_key: str) -> Path:
+    """`directory/name`, or the same name with the thread key as a suffix when
+    the workspace already holds one. A second clash is left to `_move`, which
+    refuses to overwrite and says so."""
+    target = directory / name
+    if not target.exists() and not target.is_symlink():
+        return target
+    stem, suffix = Path(name).stem, Path(name).suffix
+    return directory / f"{stem}-{thread_key}{suffix}"
+
+
+def _rmdir(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError as exc:
+        logger.warning("migration: %s not removed: %s", path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +305,7 @@ def render_plans(plans: list[ThreadPlan]) -> str:
         placed += 1
         sessions += len(plan.session_uuids)
         lines.append(
-            f"{plan.old.name} -> {plan.new_name}/threads/{plan.thread_key}"
-            f"  sessions={len(plan.session_uuids)}"
+            f"{plan.old.name} -> {plan.new_name}  sessions={len(plan.session_uuids)}"
         )
     lines.append(
         f"{placed} directories to move ({sessions} sessions), {skipped} skipped"

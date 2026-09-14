@@ -57,6 +57,10 @@ so a workspace path no longer identifies a session. Three places used to assume 
   `asyncio.Lock` per directory for the length of a first turn, so the only new rollout with
   that cwd is its own. A resumed turn takes no lock. Without both, the loser of two
   concurrent first turns delivered the winner's reply and stored the winner's thread id.
+- **The outbox and the inbox.** A turn's outbox is `outbox/<session uuid>/`, created and
+  retired by the orchestrator, so two threads' deliveries never mix; uploads land flat in
+  `inbox/` with a numeric suffix on a clash. The workspace root is the conversation's own
+  folder, for the human as much as the agent, so nothing else is split per thread.
 - **The session stores.** claude keys `projects/<hash of path>/`, codex keys the mapping
   and `CODEX_HOME` on the path, so a moved directory orphans both. `migration.migrate_thread`
   moves the transcript, the mapping and the rollout on a session's first turn in the new

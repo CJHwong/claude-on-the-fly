@@ -35,6 +35,7 @@ from claude_on_the_fly.agent import (
     cached_skills,
     footer_parts,
     get_backend,
+    inbox_path,
     persona_for,
     read_attachment,
     sender_marker,
@@ -1456,6 +1457,26 @@ class SlackFrontend(Frontend):
 
     def sender_name(self, chat_id: int) -> str:
         return self._sender_names.get(chat_id, "unknown")
+
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        facts: dict[str, str] = {}
+        entry = self._sessions.get(chat_id)
+        if entry is not None:
+            channel, thread_ts = entry
+            kind = self._workspace_names.get(chat_id, "").split("/", 1)[0]
+            label = {"dm": "dm", "mpim": "group-dm", "channel": "channel"}.get(
+                kind, "conversation"
+            )
+            name = self._channel_names.get(chat_id, "")
+            facts["conversation"] = f"{label} {channel}" + (f" #{name}" if name else "")
+            facts["thread"] = thread_ts or "root"
+        sender_id = self._session_sender_ids.get(chat_id)
+        if sender_id:
+            facts["sender_id"] = sender_id
+        sender_name = self._sender_names.get(chat_id)
+        if sender_name:
+            facts["sender_name"] = sender_name
+        return facts
 
     def sender_identity(self, chat_id: int) -> str:
         """Stable Slack user id used for prompt/memory routing."""
@@ -3581,17 +3602,12 @@ class SlackFrontend(Frontend):
         return workspace_path(self.workspace_name(session_id), DATA_DIR)
 
     async def _save_files(self, session_id: int, files: list[dict]) -> list[str]:
-        """Download Slack files to the thread's own directory under the
-        workspace. Returns '[File saved: threads/<key>/name]' lines.
-
-        Under `threads/<key>` rather than the workspace root because every thread
-        of the conversation shares the root, and two of them uploading
-        `report.pdf` at once would overwrite each other. The line names the path
-        relative to the workspace, which is the agent's cwd.
+        """Download Slack files into the workspace's `inbox/`. Returns
+        '[File saved: inbox/name]' lines, relative to the workspace, which is
+        the agent's cwd. Every thread of the conversation shares the inbox, so
+        a name already taken gets a numeric suffix (`agent.inbox_path`).
         """
         workspace = self._workspace_path(session_id)
-        thread_dir = workspace / "threads" / self._thread_keys.get(session_id, "root")
-        thread_dir.mkdir(parents=True, exist_ok=True)
         token: str = self._app.client.token or ""
         lines: list[str] = []
         for f in files:
@@ -3600,7 +3616,7 @@ class SlackFrontend(Frontend):
             if not url:
                 logger.warning("file %s has no url_private_download, skipping", name)
                 continue
-            dest = thread_dir / Path(name).name
+            dest = inbox_path(workspace, name)
             try:
                 await self._download_file(url, dest, token)
                 lines.append(f"[File saved: {dest.relative_to(workspace)}]")

@@ -484,9 +484,7 @@ class TestMigrateWorkspacesFlag:
             slack_mod.main()
         assert exit_info.value.code == 0
         out = capsys.readouterr().out
-        assert (
-            "dm-hoss-1786342813-662689 -> slack/dm/U1/threads/1786342813-662689" in out
-        )
+        assert "dm-hoss-1786342813-662689 -> slack/dm/U1  sessions=" in out
         assert "dry run" in out
         assert old.is_dir()
 
@@ -508,16 +506,7 @@ class TestMigrateWorkspacesFlag:
             slack_mod.main()
         assert exit_info.value.code == 0
         assert "moved 1 directories" in capsys.readouterr().out
-        assert (
-            tmp_path
-            / "workspaces"
-            / "slack"
-            / "dm"
-            / "U1"
-            / "threads"
-            / "1786342813-662689"
-            / "a.txt"
-        ).is_file()
+        assert (tmp_path / "workspaces" / "slack" / "dm" / "U1" / "a.txt").is_file()
         assert not old.exists()
 
     def test_slack_reads_the_token_from_the_data_dir_env_file(
@@ -587,9 +576,7 @@ class TestMigrateWorkspacesFlag:
         with pytest.raises(SystemExit) as exit_info:
             telegram_mod.main()
         assert exit_info.value.code == 0
-        assert "42-20260606-120000 -> telegram/42/threads/20260606-120000" in (
-            capsys.readouterr().out
-        )
+        assert "42-20260606-120000 -> telegram/42  sessions=" in capsys.readouterr().out
         assert old.is_dir()
 
         monkeypatch.setattr(
@@ -597,12 +584,4 @@ class TestMigrateWorkspacesFlag:
         )
         with pytest.raises(SystemExit):
             telegram_mod.main()
-        assert (
-            tmp_path
-            / "workspaces"
-            / "telegram"
-            / "42"
-            / "threads"
-            / "20260606-120000"
-            / "a.txt"
-        ).is_file()
+        assert (tmp_path / "workspaces" / "telegram" / "42" / "a.txt").is_file()

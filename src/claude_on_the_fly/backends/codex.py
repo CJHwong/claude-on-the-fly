@@ -1208,6 +1208,7 @@ class CodexBackend:
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response:
         logger.info(
             "session: id=%s platform=%s user=%s context=%s workspace=%s",
@@ -1253,7 +1254,7 @@ class CodexBackend:
                     workspace, prompt, session_uuid=session_uuid, platform=platform
                 )
             system_prompt = build_system_prompt(
-                platform, user_name, channel_context, workspace
+                platform, user_name, channel_context, workspace, session_uuid, facts
             )
             composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"
 

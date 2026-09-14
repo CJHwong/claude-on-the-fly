@@ -139,6 +139,9 @@ NO_HANDOFF_PLATFORMS = frozenset({"jobs"})
 # and picks its earlier transcript up from the same directory on purpose.
 SHARED_WORKSPACE_PLATFORMS = frozenset({"slack", "telegram"})
 OUTBOX_DIRNAME = "outbox"
+# Where a frontend puts what the person uploaded. Flat, inside the workspace, so
+# the agent's cwd-relative `inbox/<name>` in the message is the path it reads.
+INBOX_DIRNAME = "inbox"
 # The conversation's own memory, inside its workspace. Inside rather than under
 # `memory/` because the jail grants only the running workspace: a DM's notes are
 # then unreachable from a channel's session by the sandbox, not by a prompt rule.
@@ -154,14 +157,71 @@ OUTBOX_INSTRUCTION = (
     "  {outbox_dir}\n"
     "Use that absolute path, not a relative `outbox/` — your shell's working "
     "directory may differ. Everything left in that directory is uploaded to the "
-    "user along with your reply. When the user asks for a file, deliver it this "
-    "way. Do NOT tell the user you can only send text or cannot attach files, that "
-    "is false. Keep scratch and working files out of it.\n"
-    "If you have several files to deliver, zip them into a single archive and drop "
-    "that in instead, so the user gets one file rather than a flood of separate "
-    "uploads. A lone file goes in as-is.\n"
+    "user along with your reply. Do NOT tell the user you can only send text or "
+    "cannot attach files, that is false.\n"
+    "Rules for it:\n"
+    "- Answer in your reply by default. Use the outbox when the user asks for a "
+    "file, or when what they asked for is a file (a report, an export, an image).\n"
+    "- The file arrives with your reply, so do not announce the delivery and do "
+    "not name the outbox or its path. Describe the content if that helps.\n"
+    "- One file per deliverable, never zipped: the user prefers separate files "
+    "they can open. Only bundle when there are more than {max_attachments} files, "
+    "and say so.\n"
+    "- Keep scratch and working files out of it. Never touch `.sent/` next to "
+    "it, the daemon owns that archive.\n"
     "</IMPORTANT>"
 )
+
+# Appended to every chat turn on an attachment platform. The system prompt
+# names the outbox too, but claude persists that prompt with the session and a
+# healthy `--resume` never re-reads it, so a session started before a move (or
+# before the outbox became per session) would deliver into a directory nothing
+# collects. The turn's line wins over whatever the session remembers.
+OUTBOX_TURN_NOTE = (
+    "<cotf-outbox>System instruction, not user text. Files for the user go in "
+    "{outbox_dir} (this path replaces any outbox path given earlier). Nothing "
+    "else goes there.</cotf-outbox>"
+)
+
+
+def session_outbox(workspace: Path, session_uuid: str) -> Path:
+    """This session's own outbox. Every thread of a conversation shares the
+    workspace, and two can run at once, so a shared `outbox/` would hand one
+    thread's file to the other's reply and archive it away from its author.
+    The uuid is the one key both backends know before the turn starts."""
+    return workspace / OUTBOX_DIRNAME / session_uuid
+
+
+def outbox_note(outbox: Path) -> str:
+    return OUTBOX_TURN_NOTE.format(outbox_dir=outbox)
+
+
+def retire_outbox(outbox: Path) -> None:
+    """Drop a session's outbox once collected, so a human opening the
+    workspace sees `outbox/.sent/` and at most one directory for a turn in
+    flight. Anything still inside stays, and so does the directory."""
+    with contextlib.suppress(OSError):
+        outbox.rmdir()
+
+
+def unique_path(directory: Path, name: str) -> Path:
+    """`directory/name`, or the first `name-2`, `name-3`... that is free."""
+    candidate = directory / name
+    stem, suffix = Path(name).stem, Path(name).suffix
+    counter = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def inbox_path(workspace: Path, name: str) -> Path:
+    """A free path under `inbox/` for an upload called `name`. Flat rather than
+    per thread, because a thread folder per upload made the workspace unreadable
+    for the human it belongs to; a clash gets a numeric suffix instead."""
+    inbox = workspace / INBOX_DIRNAME
+    inbox.mkdir(parents=True, exist_ok=True)
+    return unique_path(inbox, Path(name).name)
 
 
 # The per-turn suggestions block the orchestrator appends to chat prompts, and
@@ -213,14 +273,14 @@ def strip_sender_markers(text: str) -> str:
     return _SENDER_MARKER_RE.sub("", text).strip()
 
 
-def collect_outbox(workspace: Path) -> list[Path]:
-    """Files the agent left in workspace/outbox to attach to the reply.
+def collect_outbox(outbox: Path) -> list[Path]:
+    """Files the agent left in `outbox` (a session's, see `session_outbox`) to
+    attach to the reply.
 
-    Only regular files directly under outbox/ — skips the archive dir, subdirs,
-    and dotfiles. Sorted by name for a deterministic order. Enforces count/size
-    caps and logs every skip; nothing is dropped silently.
+    Only regular files directly under it — skips subdirs and dotfiles. Sorted by
+    name for a deterministic order. Enforces count/size caps and logs every
+    skip; nothing is dropped silently.
     """
-    outbox = workspace / OUTBOX_DIRNAME
     try:
         outbox_stat = outbox.lstat()
     except OSError:
@@ -562,21 +622,79 @@ FORMAT_HINTS = {
 }
 
 
+def where_you_are(
+    platform: str,
+    user_name: str,
+    channel_context: str,
+    workspace: Path | None,
+    session_uuid: str | None,
+    outbox_dir: Path | None,
+    facts: dict[str, str],
+) -> str:
+    """The block that closes the system prompt: every id the agent needs to know
+    where it is and where its own files go.
+
+    It is the one place the memory rules bind to a real path. Left to guess,
+    an agent keyed one person's memory on the display name in one thread and on
+    the platform id in the next (measured: both directories on one deployment).
+    Last in the prompt because everything in it varies per session, and the
+    prompt cache reuses the stable prefix before it.
+    """
+    sender_id = facts.get("sender_id") or user_name
+    sender = sender_id
+    if facts.get("sender_name"):
+        sender = f'{sender_id} (display "{facts["sender_name"]}")'
+    rows = [
+        ("platform", platform),
+        ("conversation", facts.get("conversation") or channel_context),
+        ("thread", facts.get("thread", "")),
+        ("session", session_uuid or ""),
+        ("sender", sender),
+        (
+            "workspace",
+            f"{workspace} (your cwd)" if workspace else "(current directory)",
+        ),
+        ("your memory", f"{MEMORY_ROOT}/users/{sender_id}/"),
+        ("uploads", f"{INBOX_DIRNAME}/ in the workspace"),
+        ("deliveries", str(outbox_dir) if outbox_dir else ""),
+    ]
+    width = max(len(label) for label, _value in rows) + 1
+    lines = [f"  {label + ':':<{width}} {value}" for label, value in rows if value]
+    return "Where you are\n" + "\n".join(lines)
+
+
 def build_system_prompt(
     platform: str,
     user_name: str,
     channel_context: str = "dm",
     workspace: Path | None = None,
+    session_uuid: str | None = None,
+    facts: dict[str, str] | None = None,
 ) -> str:
+    outbox_dir: Path | None = None
     if platform in ATTACHMENT_PLATFORMS and workspace is not None:
-        outbox = OUTBOX_INSTRUCTION.format(outbox_dir=workspace / OUTBOX_DIRNAME)
+        outbox_dir = (
+            session_outbox(workspace, session_uuid)
+            if session_uuid
+            else workspace / OUTBOX_DIRNAME
+        )
+        outbox = OUTBOX_INSTRUCTION.format(
+            outbox_dir=outbox_dir, max_attachments=MAX_ATTACHMENTS
+        )
     else:
         outbox = ""
     prompt = PROMPT_TEMPLATE.format(
         format_hint=FORMAT_HINTS.get(platform, FORMAT_HINTS["telegram"]),
         outbox_instruction=outbox,
-        user_name=user_name,
-        channel_context=channel_context,
+        location=where_you_are(
+            platform,
+            user_name,
+            channel_context,
+            workspace,
+            session_uuid,
+            outbox_dir,
+            facts or {},
+        ),
         workspace=str(workspace) if workspace is not None else "(current directory)",
         memory_root=MEMORY_ROOT,
         knowledge_dir=KNOWLEDGE_DIR,
@@ -1283,6 +1401,7 @@ class AgentBackend(Protocol):
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response: ...
 
     async def compact(
@@ -1713,6 +1832,7 @@ async def run(
     timeout: float | None = DEFAULT_TIMEOUT,
     nudge_prompt: str | None = None,
     profile: AgentProfile | None = None,
+    facts: dict[str, str] | None = None,
 ) -> Response:
     return await get_backend(profile).run(
         workspace,
@@ -1723,6 +1843,7 @@ async def run(
         channel_context=channel_context,
         timeout=timeout,
         nudge_prompt=nudge_prompt,
+        facts=facts,
     )
 
 
