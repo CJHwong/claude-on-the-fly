@@ -13,12 +13,12 @@ Public surface:
   store, outside the agent-writable workspace
 - `format_handoff(turns, from_backend)` renders a labeled preamble, capped by
   turn count and char budget from the most recent backward
-- `find_latest_prior_transcript(workspace, exclude_uuid)` scans both backends'
-  per-workspace session stores and returns (turns, from_backend) for the
-  newest one, used to seed handoff after a model/backend switch mints a
-  fresh session UUID
-- `prepend_latest_handoff(workspace, prompt, exclude_uuid)` higher-level
-  wrapper that combines find + format + prepend, swallowing scan errors
+- `find_latest_prior_transcript(workspace, exclude_uuid, only_uuid)` scans both
+  backends' per-workspace session stores and returns (turns, from_backend) for
+  the newest one, used to seed handoff after a backend switch
+- `prepend_latest_handoff(workspace, prompt, session_uuid, platform)` higher-level
+  wrapper that combines find + format + prepend, swallowing scan errors. On a
+  shared chat workspace only the same session's other-backend file counts
 - `remove_workspace_sessions(workspace)` deletes the session directory a
   backend keyed to a workspace path but stored outside it
 """
@@ -219,7 +219,16 @@ def _read_first_jsonl(path: Path) -> dict | None:
     return record if isinstance(record, dict) else None
 
 
-def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | None:
+def snapshot_rollouts() -> frozenset[Path]:
+    """Every rollout on disk right now, for `_find_codex_rollout_by_cwd`'s
+    `exclude`. A turn takes this before it spawns, so the rollouts of the other
+    threads already running in the same directory cannot be mistaken for its own."""
+    return frozenset(_iter_rollouts("**/rollout-*.jsonl"))
+
+
+def _find_codex_rollout_by_cwd(
+    cwd: str, *, max_age_s: float = 300.0, exclude: frozenset[Path] = frozenset()
+) -> Path | None:
     """Locate the rollout codex is actively writing for a workspace, by the cwd
     in its session_meta. Needed for *live* tailing: codex only reveals its
     thread id (and we only persist the uuid->thread mapping) after the first
@@ -227,12 +236,19 @@ def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | 
 
     Bounded for a 1Hz caller: cheap stat-filter to recently-written rollouts (a
     live run keeps its mtime current), then read only the freshest candidate's
-    first line. Old rollouts are skipped without being opened."""
+    first line. Old rollouts are skipped without being opened.
+
+    A workspace is shared by every thread of one conversation, so the cwd alone
+    no longer names one session. `exclude` holds the rollouts that existed when
+    this turn started: a sibling thread resumed in the same directory keeps its
+    own rollout fresh, and it would otherwise be the freshest match."""
     if not cwd:
         return None
     cutoff = time.time() - max_age_s
     freshest: tuple[float, Path] | None = None
     for path in _iter_rollouts("**/rollout-*.jsonl"):
+        if path in exclude:
+            continue
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -459,6 +475,7 @@ def find_latest_prior_transcript(
     workspace: Path,
     *,
     exclude_uuid: str | None = None,
+    only_uuid: str | None = None,
 ) -> tuple[list[Turn], BackendName] | None:
     """Newest prior transcript for this workspace, across all backend_keys.
 
@@ -467,6 +484,11 @@ def find_latest_prior_transcript(
     current session never matches itself), runs the matching extractor, and
     returns (turns, from_backend).
 
+    `only_uuid` narrows the scan to one session's files. A chat workspace holds
+    every thread of a conversation, so "the newest transcript here" is usually a
+    different thread; the handoff a backend switch wants is this same session as
+    the other backend wrote it, and that file carries the same uuid.
+
     Returns None when no prior session exists, or the newest one yields no
     extractable turns. Used by all backends to seed a handoff preamble when
     a new (source, backend_key, ticket) combo starts fresh — typically right
@@ -474,13 +496,11 @@ def find_latest_prior_transcript(
     """
     candidates: list[tuple[float, str, BackendName, str]] = []
     for _path, uuid, mtime in _list_claude_session_files(workspace):
-        if uuid == exclude_uuid:
-            continue
-        candidates.append((mtime, uuid, "claude", uuid))
+        if _wanted(uuid, exclude_uuid, only_uuid):
+            candidates.append((mtime, uuid, "claude", uuid))
     for _path, uuid, mtime in _list_codex_session_files(workspace):
-        if uuid == exclude_uuid:
-            continue
-        candidates.append((mtime, uuid, "codex", uuid))
+        if _wanted(uuid, exclude_uuid, only_uuid):
+            candidates.append((mtime, uuid, "codex", uuid))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0], reverse=True)
@@ -503,24 +523,42 @@ def find_latest_prior_transcript(
     return None
 
 
+def _wanted(uuid: str, exclude_uuid: str | None, only_uuid: str | None) -> bool:
+    if uuid == exclude_uuid:
+        return False
+    return only_uuid is None or uuid == only_uuid
+
+
 def prepend_latest_handoff(
     workspace: Path,
     prompt: str,
     *,
-    exclude_uuid: str | None = None,
+    session_uuid: str,
+    platform: str,
 ) -> str:
-    """Return `prompt` with a preamble drawn from the newest prior transcript
-    (any backend) for this workspace. No-op when nothing prior exists.
+    """Return `prompt` with a preamble drawn from the prior transcript for this
+    session, or for this workspace. No-op when nothing prior exists.
 
     Use this from both backends after a fresh-session branch (no JSONL for
     the current uuid) so the new model picks up context written by whatever
     backend ran last — including a different mode of the *same* CLI.
 
+    Which transcript counts as prior depends on the platform. On a platform in
+    `agent.SHARED_WORKSPACE_PLATFORMS` only the same session's file on another
+    backend does. Elsewhere (cron) any other session in the workspace does, and
+    the current uuid is excluded so it never matches itself.
+
     Wraps the lookup in a broad except so a misbehaving transcript scan never
     crashes the caller; the user still gets a reply, just without handoff
     context."""
+    from claude_on_the_fly.agent import SHARED_WORKSPACE_PLATFORMS
+
+    if platform in SHARED_WORKSPACE_PLATFORMS:
+        scope: dict[str, str] = {"only_uuid": session_uuid}
+    else:
+        scope = {"exclude_uuid": session_uuid}
     try:
-        found = find_latest_prior_transcript(workspace, exclude_uuid=exclude_uuid)
+        found = find_latest_prior_transcript(workspace, **scope)
     except Exception:
         logger.exception("transcript: latest-prior lookup failed; starting clean")
         return prompt

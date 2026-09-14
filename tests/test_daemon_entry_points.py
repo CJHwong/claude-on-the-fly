@@ -160,6 +160,7 @@ class TestTelegramMain:
         from anything else would let an unvalidated config start."""
         from claude_on_the_fly import preflight
 
+        monkeypatch.setattr("sys.argv", ["claude-telegram"])
         monkeypatch.setattr(preflight, "run_telegram", lambda: ("tok-123", 4242))
         built: list[tuple] = []
         monkeypatch.setattr(
@@ -176,6 +177,7 @@ class TestTelegramMain:
     ):
         from claude_on_the_fly import preflight
 
+        monkeypatch.setattr("sys.argv", ["claude-telegram"])
         monkeypatch.setattr(
             preflight,
             "run_telegram",
@@ -409,6 +411,7 @@ class TestSecondInstanceIsRefusedCleanly:
     ):
         from claude_on_the_fly import preflight
 
+        monkeypatch.setattr("sys.argv", ["claude-telegram"])
         monkeypatch.setattr(preflight, "run_telegram", lambda: ("tok-123", 4242))
         monkeypatch.setattr(telegram_mod, "TelegramFrontend", lambda **_kw: MagicMock())
         monkeypatch.setattr(telegram_mod.asyncio, "run", self._claimed("telegram"))
@@ -459,3 +462,122 @@ class TestSecondInstanceIsRefusedCleanly:
         monkeypatch.setattr(cron_mod.asyncio, "run", raise_unlockable)
         assert cron_mod.main() == 2
         assert "without file locking" in capsys.readouterr().err
+
+
+class TestMigrateWorkspacesFlag:
+    """`--migrate-workspaces` plans, prints, and only moves with `--apply`."""
+
+    def test_slack_dry_run_prints_the_plan_and_moves_nothing(
+        self, monkeypatch, no_dotenv, capsys, tmp_path
+    ):
+        from claude_on_the_fly import migration
+
+        monkeypatch.setattr("sys.argv", ["claude-slack", "--migrate-workspaces"])
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+        monkeypatch.setattr(
+            migration, "SlackDirectory", lambda client: lambda kind, label: "dm/U1"
+        )
+        old = tmp_path / "workspaces" / "slack" / "dm-hoss-1786342813-662689"
+        old.mkdir(parents=True)
+        with pytest.raises(SystemExit) as exit_info:
+            slack_mod.main()
+        assert exit_info.value.code == 0
+        out = capsys.readouterr().out
+        assert (
+            "dm-hoss-1786342813-662689 -> slack/dm/U1/threads/1786342813-662689" in out
+        )
+        assert "dry run" in out
+        assert old.is_dir()
+
+    def test_slack_apply_moves(self, monkeypatch, no_dotenv, capsys, tmp_path):
+        from claude_on_the_fly import migration
+
+        monkeypatch.setattr(
+            "sys.argv", ["claude-slack", "--migrate-workspaces", "--apply"]
+        )
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+        monkeypatch.setattr(
+            migration, "SlackDirectory", lambda client: lambda kind, label: "dm/U1"
+        )
+        old = tmp_path / "workspaces" / "slack" / "dm-hoss-1786342813-662689"
+        old.mkdir(parents=True)
+        (old / "a.txt").write_text("a")
+        with pytest.raises(SystemExit) as exit_info:
+            slack_mod.main()
+        assert exit_info.value.code == 0
+        assert "moved 1 directories" in capsys.readouterr().out
+        assert (
+            tmp_path
+            / "workspaces"
+            / "slack"
+            / "dm"
+            / "U1"
+            / "threads"
+            / "1786342813-662689"
+            / "a.txt"
+        ).is_file()
+        assert not old.exists()
+
+    def test_slack_refuses_without_a_token(self, monkeypatch, no_dotenv, capsys):
+        monkeypatch.setattr("sys.argv", ["claude-slack", "--migrate-workspaces"])
+        for name in ("SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(SystemExit) as exit_info:
+            slack_mod.main()
+        assert exit_info.value.code == 2
+        assert "SLACK_TOKEN" in capsys.readouterr().err
+
+    def test_slack_reports_a_refused_lookup_without_a_traceback(
+        self, monkeypatch, no_dotenv, capsys
+    ):
+        from slack_sdk.errors import SlackApiError
+
+        from claude_on_the_fly import migration
+
+        monkeypatch.setattr("sys.argv", ["claude-slack", "--migrate-workspaces"])
+        monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
+
+        def refused(client):
+            raise SlackApiError(
+                "token_revoked", {"ok": False, "error": "token_revoked"}
+            )
+
+        monkeypatch.setattr(migration, "SlackDirectory", refused)
+        with pytest.raises(SystemExit) as exit_info:
+            slack_mod.main()
+        assert exit_info.value.code == 2
+        assert "token_revoked" in capsys.readouterr().err
+
+    def test_telegram_dry_run_then_apply(
+        self, monkeypatch, no_dotenv, capsys, tmp_path
+    ):
+        monkeypatch.setattr(telegram_mod, "DATA_DIR", tmp_path)
+        old = tmp_path / "workspaces" / "telegram" / "42-20260606-120000"
+        old.mkdir(parents=True)
+        (old / "a.txt").write_text("a")
+
+        monkeypatch.setattr("sys.argv", ["claude-telegram", "--migrate-workspaces"])
+        with pytest.raises(SystemExit) as exit_info:
+            telegram_mod.main()
+        assert exit_info.value.code == 0
+        assert "42-20260606-120000 -> telegram/42/threads/20260606-120000" in (
+            capsys.readouterr().out
+        )
+        assert old.is_dir()
+
+        monkeypatch.setattr(
+            "sys.argv", ["claude-telegram", "--migrate-workspaces", "--apply"]
+        )
+        with pytest.raises(SystemExit):
+            telegram_mod.main()
+        assert (
+            tmp_path
+            / "workspaces"
+            / "telegram"
+            / "42"
+            / "threads"
+            / "20260606-120000"
+            / "a.txt"
+        ).is_file()

@@ -30,7 +30,7 @@ from claude_on_the_fly.orchestrator import (
     _extract_suggestions,
     _parse_suggestion_block,
 )
-from claude_on_the_fly.protocol import Frontend, interrupted_notice
+from claude_on_the_fly.protocol import Frontend, LegacyWorkspace, interrupted_notice
 from claude_on_the_fly.turns import PendingTurn
 
 # ---------------------------------------------------------------------------
@@ -3198,3 +3198,67 @@ class TestPaneLifecycleAcrossATurn:
             await orch._process(1, Turn("question"))
 
         assert mock_agent.run.await_count == 1
+
+
+class TestLegacyWorkspaceFolding:
+    """A session's first turn after the upgrade folds its old per-thread
+    directory into the shared workspace, before anything runs there."""
+
+    async def _turn(self, orch, tmp_path):
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "run", AsyncMock(return_value=Response(body="ok"))),
+        ):
+            await orch._process(1, Turn("hello"))
+
+    async def test_default_frontend_migrates_nothing(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        assert frontend.legacy_workspace(1) is None
+        with patch("claude_on_the_fly.orchestrator.migration") as migrate:
+            await self._turn(orch, tmp_path)
+        migrate.migrate_thread.assert_not_called()
+        assert (tmp_path / "workspaces" / "test" / "1" / "memory").is_dir()
+
+    async def test_legacy_directory_is_folded_into_the_workspace(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        old = tmp_path / "workspaces" / "test" / "1-old"
+        old.mkdir(parents=True)
+        (old / "report.pdf").write_text("pdf")
+        frontend.legacy_workspace = lambda chat_id: LegacyWorkspace(  # type: ignore[method-assign]
+            "test/1-old", "old"
+        )
+        await self._turn(orch, tmp_path)
+        moved = (
+            tmp_path / "workspaces" / "test" / "1" / "threads" / "old" / "report.pdf"
+        )
+        assert moved.read_text() == "pdf"
+        assert not old.exists()
+
+    async def test_a_legacy_name_that_escapes_the_tree_is_refused(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path, caplog
+    ) -> None:
+        # `..` is reduced to `_` by `workspace_path`; an empty name is what it
+        # refuses outright.
+        frontend.legacy_workspace = lambda chat_id: LegacyWorkspace(  # type: ignore[method-assign]
+            "/", "old"
+        )
+        with patch("claude_on_the_fly.orchestrator.migration") as migrate:
+            await self._turn(orch, tmp_path)
+        migrate.migrate_thread.assert_not_called()
+        assert "refused" in caplog.text
+
+    async def test_a_migration_that_raises_does_not_cost_the_turn(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path, caplog
+    ) -> None:
+        frontend.legacy_workspace = lambda chat_id: LegacyWorkspace(  # type: ignore[method-assign]
+            "test/1-old", "old"
+        )
+        with patch(
+            "claude_on_the_fly.orchestrator.migration.migrate_thread",
+            side_effect=RuntimeError("boom"),
+        ):
+            await self._turn(orch, tmp_path)
+        assert frontend.sent[0][1].body == "ok"
+        assert "not migrated" in caplog.text

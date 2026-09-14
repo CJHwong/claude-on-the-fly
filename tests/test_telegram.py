@@ -101,14 +101,27 @@ class TestWorkspaceName:
         frontend._chat_names[1] = "hoss"
         assert frontend.workspace_name(1) == "telegram/1"
 
-    def test_session_token_adds_suffix(self, frontend: TelegramFrontend) -> None:
+    def test_session_token_does_not_change_the_directory(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        """`/new` is a new session in the same directory, not a new directory."""
         frontend._chat_names[1] = "hoss"
         frontend._session_tokens[1] = "20260606-123412"
-        assert frontend.workspace_name(1) == "telegram/1-20260606-123412"
+        assert frontend.workspace_name(1) == "telegram/1"
 
-    def test_unknown_chat_with_token(self, frontend: TelegramFrontend) -> None:
+    def test_legacy_workspace_is_the_pinned_tokens_old_directory(
+        self, frontend: TelegramFrontend
+    ) -> None:
         frontend._session_tokens[5] = "20260606-090000"
-        assert frontend.workspace_name(5) == "telegram/5-20260606-090000"
+        assert frontend.legacy_workspace(5) == (
+            "telegram/5-20260606-090000",
+            "20260606-090000",
+        )
+
+    def test_no_token_means_no_legacy_workspace(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        assert frontend.legacy_workspace(5) is None
 
 
 # ============================================================
@@ -567,9 +580,10 @@ class TestCmdNew:
         token = frontend._session_tokens[1]
         # YYYYMMDD-HHMMSS — unique and sortable, no disk scan or counter.
         assert re.fullmatch(r"\d{8}-\d{6}", token)
-        # The workspace suffix is the token, so it never recycles an old dir.
+        # The token seeds the session uuid; the directory stays the chat's.
         frontend._chat_names[1] = "hoss"
-        assert frontend.workspace_name(1) == f"telegram/1-{token}"
+        assert frontend.workspace_name(1) == "telegram/1"
+        assert frontend.legacy_workspace(1) == (f"telegram/1-{token}", token)
 
     async def test_pushes_token_to_orchestrator_in_step(
         self, frontend: TelegramFrontend
@@ -595,7 +609,7 @@ class TestCmdNew:
         await frontend._cmd_new(make_update(chat_id=9), MagicMock())
 
         assert frontend._session_tokens[9] == "20260606-120000"
-        assert frontend.workspace_name(9) == "telegram/9-20260606-120000"
+        assert frontend.workspace_name(9) == "telegram/9"
 
     async def test_replies_with_session_token(self, frontend: TelegramFrontend) -> None:
         update = make_update(chat_id=1)
@@ -639,7 +653,10 @@ class TestSessionPersistence:
         assert frontend._session_tokens[7] == "20260606-120000"
         orch.set_session_token.assert_called_once_with(7, "20260606-120000")
         frontend._chat_names[7] = "hoss"
-        assert frontend.workspace_name(7) == "telegram/7-20260606-120000"
+        assert frontend.legacy_workspace(7) == (
+            "telegram/7-20260606-120000",
+            "20260606-120000",
+        )
 
     def test_load_missing_file_is_noop(self, frontend: TelegramFrontend) -> None:
         # Fresh install: no file yet, no crash, no tokens (base session).
@@ -1976,7 +1993,11 @@ class TestRouteForAndRestore:
 
         assert frontend._session_tokens[1] == "20260606-123412"
         # The workspace the replayed turn will use matches the one it was in.
-        assert frontend.workspace_name(1) == "telegram/1-20260606-123412"
+        assert frontend.workspace_name(1) == "telegram/1"
+        assert frontend.legacy_workspace(1) == (
+            "telegram/1-20260606-123412",
+            "20260606-123412",
+        )
 
     @pytest.mark.parametrize("route", [{}, {"session_token": ""}, {"session_token": 7}])
     def test_a_route_without_a_usable_token_leaves_the_base_session(

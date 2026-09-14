@@ -39,7 +39,7 @@ from claude_on_the_fly.agent import (
     workspace_path,
 )
 from claude_on_the_fly.approvals import ApprovalRequest
-from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -123,13 +123,26 @@ class TelegramFrontend(Frontend):
             self._session_tokens[chat_id] = token
 
     def workspace_name(self, chat_id: int) -> str:
-        token = self._session_tokens.get(chat_id)
         # User-controlled usernames and first names are display data, never
         # filesystem identifiers. The Telegram chat id is platform-assigned and
         # therefore cannot traverse the workspace or change the seatbelt project
         # grant. Existing name-based workspaces are intentionally not reused.
-        folder = f"{chat_id}-{token}" if token else str(chat_id)
-        return f"telegram/{folder}"
+        #
+        # One directory per chat. `/new` mints a session token that seeds the
+        # session uuid (`set_session_token`) and nothing else: a fresh session in
+        # the same directory, with the same files and the same workspace memory.
+        return f"telegram/{chat_id}"
+
+    def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
+        """The `<chat_id>-<token>` directory a `/new` session used to get.
+
+        Only the pinned token's directory: the sessions before it are not
+        resumable from here either way, so their directories stay as they are.
+        """
+        token = self._session_tokens.get(chat_id)
+        if not token:
+            return None
+        return LegacyWorkspace(f"telegram/{chat_id}-{token}", token)
 
     def sender_name(self, chat_id: int) -> str:
         return self._chat_names.get(chat_id, "unknown")
@@ -790,6 +803,7 @@ class TelegramFrontend(Frontend):
 
 
 def main() -> None:
+    import argparse
     import sys
 
     from dotenv import load_dotenv
@@ -801,7 +815,21 @@ def main() -> None:
     from claude_on_the_fly.orchestrator import run
     from claude_on_the_fly.preflight import run_telegram
 
+    parser = argparse.ArgumentParser(prog="claude-telegram")
+    parser.add_argument(
+        "--migrate-workspaces",
+        action="store_true",
+        help="fold every old <chat>-<token> directory into the chat's workspace "
+        "(dry run unless --apply); stop the daemon first",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="with --migrate-workspaces: move"
+    )
+    args = parser.parse_args()
+
     load_dotenv()
+    if args.migrate_workspaces:
+        raise SystemExit(migrate_workspaces(apply=args.apply))
     token, allowed_user_id = run_telegram()
     frontend = TelegramFrontend(token=token, allowed_user_id=allowed_user_id)
     try:
@@ -811,6 +839,20 @@ def main() -> None:
         # traceback. The supervisor already treats exit 2 as a clean refusal.
         sys.stderr.write(f"claude-telegram: {exc}\n")
         raise SystemExit(2) from None
+
+
+def migrate_workspaces(*, apply: bool) -> int:
+    """`claude-telegram --migrate-workspaces`: plan, print, and with `apply` move.
+    No token needed: the old names already hold the chat id."""
+    from claude_on_the_fly import migration
+
+    plans = migration.plan_telegram(DATA_DIR)
+    print(migration.render_plans(plans))
+    if not apply:
+        print("dry run; add --apply to move")
+        return 0
+    print(f"moved {migration.apply_plans(plans, DATA_DIR)} directories")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

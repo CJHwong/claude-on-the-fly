@@ -23,6 +23,7 @@ from claude_on_the_fly import (
     cotf_approve,
     egress,
     logs,
+    migration,
     permissions,
     sandbox,
     settings,
@@ -33,6 +34,7 @@ from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
     DATA_DIR,
     SUGGESTIONS_BLOCK_RE,
+    WORKSPACE_MEMORY_DIRNAME,
     ClaudeUnavailableError,
     Response,
     current_backend_key,
@@ -557,6 +559,29 @@ class Orchestrator:
         """
         self._context.pop(chat_id, None)
 
+    def _fold_legacy_workspace(
+        self, chat_id: int, workspace: Path, session: str
+    ) -> None:
+        """Move this session out of the per-thread directory it had before
+        workspaces were shared, if that directory is still there.
+
+        Before `mkdir`, so a migration that cannot run leaves the old directory
+        exactly as it was. Never raises: a turn must run whether or not its
+        history could be carried over.
+        """
+        legacy = self._frontend.legacy_workspace(chat_id)
+        if legacy is None:
+            return
+        try:
+            old = workspace_path(legacy.name, DATA_DIR)
+        except ValueError as exc:
+            logger.warning("legacy workspace name refused: %s", exc)
+            return
+        try:
+            migration.migrate_thread(old, workspace, [session], legacy.thread_key)
+        except Exception:
+            logger.exception("legacy workspace %s not migrated", old)
+
     def is_busy(self, chat_id: int) -> bool:
         return chat_id in self._running and not self._running[chat_id].done()
 
@@ -753,11 +778,13 @@ class Orchestrator:
         interrupted = False
         await self._report_config_restarts(chat_id)
         workspace = workspace_path(self._frontend.workspace_name(chat_id), DATA_DIR)
+        session = self.session_uuid(chat_id)
+        self._fold_legacy_workspace(chat_id, workspace, session)
         workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / WORKSPACE_MEMORY_DIRNAME).mkdir(exist_ok=True)
         if self._platform in agent.ATTACHMENT_PLATFORMS:
             (workspace / agent.OUTBOX_DIRNAME).mkdir(exist_ok=True)
         agent.ensure_persona(workspace, self._frontend.persona_source(chat_id))
-        session = self.session_uuid(chat_id)
         identifier = self._frontend.workspace_name(chat_id)
         logger.debug(
             "process: chat_id=%s workspace=%s session=%s", chat_id, workspace, session

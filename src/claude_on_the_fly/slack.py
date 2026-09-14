@@ -46,7 +46,7 @@ from claude_on_the_fly.event_dedupe import ProcessedEvents
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
-from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
 from claude_on_the_fly.slack_mrkdwn import (
     SLACK_MESSAGE_CHAR_LIMIT,
     fit_text_field,
@@ -1281,6 +1281,12 @@ class SlackFrontend(Frontend):
         self._own_dm_ttl = 60.0
         self._connected_once = False
         self._workspace_names: dict[int, str] = {}
+        # session -> the per-thread directory name this session had before
+        # workspaces were shared, and the key its files move under. Both come
+        # from the same resolution as the workspace name, so a thread that was
+        # never resolved has neither and migrates nothing.
+        self._legacy_workspace_names: dict[int, str] = {}
+        self._thread_keys: dict[int, str] = {}
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
         # session -> channel name, or "" for a DM/group DM. Set alongside the
@@ -1438,6 +1444,12 @@ class SlackFrontend(Frontend):
     def workspace_name(self, chat_id: int) -> str:
         return f"slack/{self._workspace_names.get(chat_id, str(chat_id))}"
 
+    def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
+        name = self._legacy_workspace_names.get(chat_id)
+        if name is None:
+            return None
+        return LegacyWorkspace(f"slack/{name}", self._thread_keys[chat_id])
+
     def sender_name(self, chat_id: int) -> str:
         return self._sender_names.get(chat_id, "unknown")
 
@@ -1569,6 +1581,8 @@ class SlackFrontend(Frontend):
         is reconstructable, so a re-hydrating thread just re-resolves it."""
         self._sessions.pop(session_id, None)
         self._workspace_names.pop(session_id, None)
+        self._legacy_workspace_names.pop(session_id, None)
+        self._thread_keys.pop(session_id, None)
         self._sender_names.pop(session_id, None)
         self._channel_contexts.pop(session_id, None)
         self._channel_names.pop(session_id, None)
@@ -2229,7 +2243,7 @@ class SlackFrontend(Frontend):
             self._session_sender_ids[session_id] = user_id
         channel_type = await self._channel_type(channel)
         await self._resolve_session_metadata(
-            session_id, sender, channel, channel_type, thread_ts or ""
+            session_id, sender, user_id, channel, channel_type, thread_ts or ""
         )
         return session_id
 
@@ -3509,9 +3523,17 @@ class SlackFrontend(Frontend):
         return workspace_path(self.workspace_name(session_id), DATA_DIR)
 
     async def _save_files(self, session_id: int, files: list[dict]) -> list[str]:
-        """Download Slack files to workspace. Returns '[File saved: name]' lines."""
+        """Download Slack files to the thread's own directory under the
+        workspace. Returns '[File saved: threads/<key>/name]' lines.
+
+        Under `threads/<key>` rather than the workspace root because every thread
+        of the conversation shares the root, and two of them uploading
+        `report.pdf` at once would overwrite each other. The line names the path
+        relative to the workspace, which is the agent's cwd.
+        """
         workspace = self._workspace_path(session_id)
-        workspace.mkdir(parents=True, exist_ok=True)
+        thread_dir = workspace / "threads" / self._thread_keys.get(session_id, "root")
+        thread_dir.mkdir(parents=True, exist_ok=True)
         token: str = self._app.client.token or ""
         lines: list[str] = []
         for f in files:
@@ -3520,10 +3542,10 @@ class SlackFrontend(Frontend):
             if not url:
                 logger.warning("file %s has no url_private_download, skipping", name)
                 continue
-            dest = workspace / Path(name).name
+            dest = thread_dir / Path(name).name
             try:
                 await self._download_file(url, dest, token)
-                lines.append(f"[File saved: {dest.name}]")
+                lines.append(f"[File saved: {dest.relative_to(workspace)}]")
                 logger.info("saved file %s for session %s", dest.name, session_id)
             except Exception as exc:
                 logger.warning("failed to download file %s: %s", name, exc)
@@ -3667,7 +3689,12 @@ class SlackFrontend(Frontend):
             sender = await self._resolve_sender(event.get("user", "unknown"))
         self._sender_names[session_id] = sender
         await self._resolve_session_metadata(
-            session_id, sender, channel, channel_type, thread_ts
+            session_id,
+            sender,
+            event.get("user") or bot_id,
+            channel,
+            channel_type,
+            thread_ts,
         )
         return sender
 
@@ -3675,10 +3702,26 @@ class SlackFrontend(Frontend):
         self,
         session_id: int,
         sender: str,
+        sender_id: str | None,
         channel: str,
         channel_type: str,
         thread_ts: str,
     ) -> None:
+        """Fill in the workspace, the legacy workspace, and the context.
+
+        The workspace is the conversation's directory, keyed on a platform id: a
+        DM on the sender's user id, a group DM or channel on its channel id. Ids
+        rather than names because a name changes under a rename and the
+        directory must not, and because a display name is somebody else's string
+        to put in a path. Every thread of the conversation shares it, so the
+        thread key (`_thread_keys`) is what still tells one thread's files apart.
+
+        The legacy name is the per-thread directory this same thread was given
+        before workspaces were shared, computed the way it was then so the
+        orchestrator can find and fold it. `sender_id` is passed in rather than
+        read from `_session_sender_ids`, which the message path fills in only
+        after this runs.
+        """
         if session_id in self._workspace_names:
             return
 
@@ -3686,14 +3729,16 @@ class SlackFrontend(Frontend):
         # dash so it reads as one path segment. Truncating to the integer
         # second used to look tidier and silently collided: `_session_key`
         # hashes the full ts, so two messages in the same second are two
-        # separate sessions, and both landed on one workspace directory —
-        # concurrent agents sharing a cwd, and `_save_files` overwriting or
-        # cross-reading the other conversation's attachments. Slack emits
-        # sub-second duplicates often enough for this to be routine.
+        # separate sessions, and both landed on one thread directory —
+        # `_save_files` overwriting or cross-reading the other conversation's
+        # attachments. Slack emits sub-second duplicates often enough for this
+        # to be routine.
         short_ts = thread_ts.replace(".", "-") if thread_ts else "root"
+        self._thread_keys[session_id] = short_ts
 
         if channel_type == "im":
-            self._workspace_names[session_id] = f"dm-{sender}-{short_ts}"
+            self._workspace_names[session_id] = f"dm/{sender_id or channel}"
+            self._legacy_workspace_names[session_id] = f"dm-{sender}-{short_ts}"
             self._channel_contexts[session_id] = "dm (private)"
             self._channel_names[session_id] = ""
             return
@@ -3704,7 +3749,8 @@ class SlackFrontend(Frontend):
             name = ch["name"]
         except Exception as exc:
             logger.warning("Failed to resolve channel %s: %s", channel, exc)
-            self._workspace_names[session_id] = f"{channel}-{short_ts}"
+            self._workspace_names[session_id] = f"channel/{channel}"
+            self._legacy_workspace_names[session_id] = f"{channel}-{short_ts}"
             self._channel_contexts[session_id] = f"channel:{channel}"
             # Still a channel, just an unnamed one: the id is the only key a
             # persona can match, and falling through to the DM branch would key it
@@ -3712,16 +3758,17 @@ class SlackFrontend(Frontend):
             self._channel_names[session_id] = channel
             return
 
+        self._legacy_workspace_names[session_id] = f"{name}-{short_ts}"
         if ch.get("is_mpim"):
             members = await self._resolve_mpim_members(channel)
-            self._workspace_names[session_id] = f"{name}-{short_ts}"
+            self._workspace_names[session_id] = f"mpim/{channel}"
             context = f"group-dm (private)\nParticipants: {', '.join(members)}"
             self._channel_contexts[session_id] = context
             self._channel_names[session_id] = ""
         else:
             self._channel_names[session_id] = name
             visibility = "private" if ch.get("is_private") else "public"
-            self._workspace_names[session_id] = f"{name}-{short_ts}"
+            self._workspace_names[session_id] = f"channel/{channel}"
             self._channel_contexts[session_id] = (
                 f"channel:#{name} ({visibility}) id:{channel}"
             )
@@ -3775,6 +3822,15 @@ def main() -> None:
     parser.add_argument(
         "--out", help="write the manifest here instead of stdout (flag mode)"
     )
+    parser.add_argument(
+        "--migrate-workspaces",
+        action="store_true",
+        help="fold every old per-thread directory into its shared workspace "
+        "(dry run unless --apply); stop the daemon first",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="with --migrate-workspaces: move"
+    )
     args = parser.parse_args()
 
     if args.manifest:
@@ -3785,6 +3841,8 @@ def main() -> None:
         )
 
     load_dotenv()
+    if args.migrate_workspaces:
+        raise SystemExit(migrate_workspaces(apply=args.apply))
     app_token, token, user_id = run_slack()
     # Sender lists are left unset on purpose: unset means "read the config on every
     # message", which is what makes adding an allowed sender take effect without a
@@ -3798,6 +3856,40 @@ def main() -> None:
         # traceback. The supervisor already treats exit 2 as a clean refusal.
         sys.stderr.write(f"claude-slack: {exc}\n")
         raise SystemExit(2) from None
+
+
+def migrate_workspaces(*, apply: bool) -> int:
+    """`claude-slack --migrate-workspaces`: plan, print, and with `apply` move.
+
+    The lookups need only a bearer token, so the full preflight (Socket Mode app
+    token, sender lists) is not run: an operator migrating a data directory may
+    do it from a host where the daemon is not configured to start.
+    """
+    import sys
+
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    from claude_on_the_fly import checks, migration, settings
+
+    _, token = checks.resolve_slack_token(settings.environment())
+    if not token:
+        sys.stderr.write("claude-slack: set SLACK_TOKEN to resolve names to ids\n")
+        return 2
+    try:
+        directory = migration.SlackDirectory(WebClient(token))
+    except SlackApiError as exc:
+        # `token_revoked`, `missing_scope`, and the like: an operator problem
+        # with its name in it, not a traceback.
+        sys.stderr.write(f"claude-slack: Slack refused the lookup: {exc}\n")
+        return 2
+    plans = migration.plan_slack(DATA_DIR, directory)
+    print(migration.render_plans(plans))
+    if not apply:
+        print("dry run; add --apply to move")
+        return 0
+    print(f"moved {migration.apply_plans(plans, DATA_DIR)} directories")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
