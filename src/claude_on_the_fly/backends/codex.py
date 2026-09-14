@@ -414,10 +414,15 @@ class _RolloutFollower:
         workspace: Path,
         thread_id: str | None,
         emit: Callable[[str], None] | None,
+        known_rollouts: frozenset[Path] = frozenset(),
     ) -> None:
         self._workspace = workspace
         self._thread_id = thread_id
         self._emit = emit
+        # A first turn finds its rollout by cwd, and the cwd is shared with every
+        # other thread of the conversation. The rollouts that existed before this
+        # turn spawned are theirs, whatever their mtime says.
+        self._known_rollouts = known_rollouts
         self._path = transcript._find_codex_rollout(thread_id) if thread_id else None
         # Everything already in a resumed thread's file belongs to earlier turns.
         # Starting at its current size is what keeps their tool counts and their
@@ -457,7 +462,7 @@ class _RolloutFollower:
             # macOS a workspace under /tmp is written as /private/tmp/..., so the
             # unresolved name matches nothing and the turn never resolves at all.
             else transcript._find_codex_rollout_by_cwd(
-                os.path.realpath(self._workspace)
+                os.path.realpath(self._workspace), exclude=self._known_rollouts
             )
         )
         if found is not None:
@@ -739,6 +744,29 @@ def _write_pane_script(body: str, path: Path) -> Path:
 # needs them (see `tmux.argv_prefix`).
 _INHERITED_TMUX = frozenset({"TMUX", "TMUX_PANE"})
 
+# One lock per workspace directory, held for the length of a first turn.
+#
+# A first turn has no thread id until codex has written its rollout, so the
+# follower finds the file by cwd, and the cwd is shared by every thread of the
+# conversation. Two first turns in one directory at once would race to claim the
+# same new rollout: the loser delivers the winner's reply and records the winner's
+# thread id as its own. Holding the lock for the whole turn is the simple version
+# of "until the rollout is identified"; a resumed turn takes no lock, because it
+# already holds the thread id and reads its own file by name.
+_first_turn_locks: dict[str, asyncio.Lock] = {}
+
+
+def _first_turn_guard(
+    workspace: Path, thread_id: str | None
+) -> contextlib.AbstractAsyncContextManager:
+    if thread_id:
+        return contextlib.nullcontext()
+    key = os.path.realpath(workspace)
+    lock = _first_turn_locks.get(key)
+    if lock is None:
+        lock = _first_turn_locks[key] = asyncio.Lock()
+    return lock
+
 
 class _PaneUnavailable(Exception):
     """The pane did not land on cotf's server, so this turn runs unhosted.
@@ -1001,7 +1029,8 @@ async def _run_codex_exec(
         "codex exec: %s",
         f"hosted in pane {pane.session}" if pane is not None else "not hosted",
     )
-    follower = _RolloutFollower(workspace, thread_id, agent.progress_sink())
+    known = frozenset() if thread_id else transcript.snapshot_rollouts()
+    follower = _RolloutFollower(workspace, thread_id, agent.progress_sink(), known)
     follower.start()
     try:
         hosted = pane is not None and interactive is not None
@@ -1221,7 +1250,7 @@ class CodexBackend:
             user_payload = prompt
             if platform not in agent.NO_HANDOFF_PLATFORMS:
                 user_payload = transcript.prepend_latest_handoff(
-                    workspace, prompt, exclude_uuid=session_uuid
+                    workspace, prompt, session_uuid=session_uuid, platform=platform
                 )
             system_prompt = build_system_prompt(
                 platform, user_name, channel_context, workspace
@@ -1261,17 +1290,18 @@ class CodexBackend:
         )
 
         started_at = time.monotonic()
-        result = await _run_codex_exec(
-            workspace,
-            cmd,
-            timeout=timeout,
-            thread_id=existing_thread,
-            interactive=(
-                self._interactive_argv(workspace, existing_thread, composed_prompt)
-                if self._pty
-                else None
-            ),
-        )
+        async with _first_turn_guard(workspace, existing_thread):
+            result = await _run_codex_exec(
+                workspace,
+                cmd,
+                timeout=timeout,
+                thread_id=existing_thread,
+                interactive=(
+                    self._interactive_argv(workspace, existing_thread, composed_prompt)
+                    if self._pty
+                    else None
+                ),
+            )
         duration = time.monotonic() - started_at
 
         new_thread = result.get("thread_id")

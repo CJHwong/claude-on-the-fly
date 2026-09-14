@@ -131,7 +131,18 @@ ATTACHMENT_PLATFORMS = frozenset({"slack", "telegram"})
 # `cron` is deliberately absent: a keyed cron job resumes its own earlier session
 # on purpose, which is the whole reason it carries a session key.
 NO_HANDOFF_PLATFORMS = frozenset({"jobs"})
+# Frontends whose sessions share one workspace directory per conversation: every
+# thread of a Slack DM, group DM or channel, and every `/new` of a Telegram chat.
+# Their handoff must come from the same session on the other backend, never from
+# the newest transcript in the directory, which is a different thread's. `cron`
+# is deliberately absent: a keyed entry gets a new uuid when its profile changes
+# and picks its earlier transcript up from the same directory on purpose.
+SHARED_WORKSPACE_PLATFORMS = frozenset({"slack", "telegram"})
 OUTBOX_DIRNAME = "outbox"
+# The conversation's own memory, inside its workspace. Inside rather than under
+# `memory/` because the jail grants only the running workspace: a DM's notes are
+# then unreachable from a channel's session by the sandbox, not by a prompt rule.
+WORKSPACE_MEMORY_DIRNAME = "memory"
 OUTBOX_ARCHIVE = ".sent"
 MAX_ATTACHMENTS = 10
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -569,6 +580,11 @@ def build_system_prompt(
         workspace=str(workspace) if workspace is not None else "(current directory)",
         memory_root=MEMORY_ROOT,
         knowledge_dir=KNOWLEDGE_DIR,
+        workspace_memory=(
+            str(workspace / WORKSPACE_MEMORY_DIRNAME)
+            if workspace is not None
+            else WORKSPACE_MEMORY_DIRNAME
+        ),
     )
     # Backend-agnostic sandbox note (empty unless COTF_SANDBOX is on).
     guidance = sandbox.agent_guidance(workspace)

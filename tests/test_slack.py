@@ -1302,53 +1302,77 @@ class TestResolveSender:
 class TestResolveSessionMetadata:
     async def test_noop_if_already_resolved(self, frontend):
         frontend._workspace_names[42] = "already-set"
-        await frontend._resolve_session_metadata(42, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            42, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         frontend._app.client.conversations_info.assert_not_awaited()
 
     async def test_dm_sets_workspace_and_context(self, frontend):
-        await frontend._resolve_session_metadata(100, "hoss", "D1", "im", "123.456")
-        assert frontend._workspace_names[100] == "dm-hoss-123-456"
+        await frontend._resolve_session_metadata(
+            100, "hoss", "U_SENDER", "D1", "im", "123.456"
+        )
+        assert frontend._workspace_names[100] == "dm/U_SENDER"
+        assert frontend._legacy_workspace_names[100] == "dm-hoss-123-456"
+        assert frontend._thread_keys[100] == "123-456"
         assert frontend._channel_contexts[100] == "dm (private)"
+        assert frontend.legacy_workspace(100) == ("slack/dm-hoss-123-456", "123-456")
 
-    async def test_two_messages_in_one_second_get_separate_workspaces(self, frontend):
+    async def test_dm_without_a_user_id_keys_on_the_channel(self, frontend):
+        """A trusted bot's DM has no `user`; the im channel id is stable too."""
+        await frontend._resolve_session_metadata(100, "bot", None, "D1", "im", "1.0")
+        assert frontend._workspace_names[100] == "dm/D1"
+
+    async def test_unresolved_session_has_no_legacy_workspace(self, frontend):
+        assert frontend.legacy_workspace(404) is None
+
+    async def test_two_messages_in_one_second_share_a_workspace_not_a_thread_key(
+        self, frontend
+    ):
         """`_session_key` hashes the full thread_ts, so sub-second-apart
-        messages are separate sessions. Their workspaces must be separate too:
-        the directory is the agent's cwd and where `_save_files` writes Slack
-        attachments, so sharing one lets concurrent sessions overwrite or
-        cross-read each other's downloads. Slack emits duplicate notifications
-        inside one second routinely."""
+        messages are separate sessions. They share the conversation's directory
+        now, so the thread key is what keeps their attachments apart, and it must
+        carry the fraction: Slack emits duplicate notifications inside one second
+        routinely."""
         await frontend._resolve_session_metadata(
-            101, "bot", "D1", "im", "1786342813.662689"
+            101, "bot", "U_SENDER", "D1", "im", "1786342813.662689"
         )
         await frontend._resolve_session_metadata(
-            102, "bot", "D1", "im", "1786342813.872239"
+            102, "bot", "U_SENDER", "D1", "im", "1786342813.872239"
         )
-        assert frontend._workspace_names[101] != frontend._workspace_names[102]
+        assert frontend._workspace_names[101] == frontend._workspace_names[102]
+        assert frontend._thread_keys[101] != frontend._thread_keys[102]
 
-    async def test_thread_ts_fraction_survives_in_a_channel_workspace(self, frontend):
-        """Every workspace name runs through the same `short_ts`, so the
-        channel and mpim branches must not collide either."""
+    async def test_thread_ts_fraction_survives_in_a_channel_legacy_name(self, frontend):
+        """The legacy name is the per-thread directory as it was written then,
+        fraction included, or the migration would look for a directory that
+        never existed."""
         frontend._app.client.conversations_info.return_value = {
             "channel": {"name": "general", "is_mpim": False, "is_private": False}
         }
         await frontend._resolve_session_metadata(
-            203, "hoss", "C1", "channel", "1786342813.662689"
+            203, "hoss", "U_SENDER", "C1", "channel", "1786342813.662689"
         )
-        assert frontend._workspace_names[203] == "general-1786342813-662689"
+        assert frontend._workspace_names[203] == "channel/C1"
+        assert frontend._legacy_workspace_names[203] == "general-1786342813-662689"
 
     async def test_channel_resolves_name_and_visibility_public(self, frontend):
         frontend._app.client.conversations_info.return_value = {
             "channel": {"name": "general", "is_mpim": False, "is_private": False}
         }
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
-        assert "general" in frontend._workspace_names[200]
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
+        assert frontend._workspace_names[200] == "channel/C1"
+        assert "general" in frontend._channel_contexts[200]
         assert "public" in frontend._channel_contexts[200]
 
     async def test_channel_resolves_private(self, frontend):
         frontend._app.client.conversations_info.return_value = {
             "channel": {"name": "secret", "is_mpim": False, "is_private": True}
         }
-        await frontend._resolve_session_metadata(201, "hoss", "C2", "group", "1.0")
+        await frontend._resolve_session_metadata(
+            201, "hoss", "U_SENDER", "C2", "group", "1.0"
+        )
         assert "private" in frontend._channel_contexts[201]
 
     async def test_mpim_resolves_members(self, frontend):
@@ -1359,14 +1383,21 @@ class TestResolveSessionMetadata:
             "members": ["U_SELF", "U_OTHER"]
         }
         frontend._app.client.users_info.return_value = {"user": {"name": "other_user"}}
-        await frontend._resolve_session_metadata(300, "hoss", "G1", "mpim", "1.0")
+        await frontend._resolve_session_metadata(
+            300, "hoss", "U_SENDER", "G1", "mpim", "1.0"
+        )
+        assert frontend._workspace_names[300] == "mpim/G1"
+        assert frontend._legacy_workspace_names[300] == "mpdm-a-b-1-0"
         assert "group-dm" in frontend._channel_contexts[300]
         assert "other_user" in frontend._channel_contexts[300]
 
     async def test_api_failure_sets_fallback(self, frontend):
         frontend._app.client.conversations_info.side_effect = Exception("boom")
-        await frontend._resolve_session_metadata(400, "hoss", "C99", "channel", "5.0")
-        assert "C99" in frontend._workspace_names[400]
+        await frontend._resolve_session_metadata(
+            400, "hoss", "U_SENDER", "C99", "channel", "5.0"
+        )
+        assert frontend._workspace_names[400] == "channel/C99"
+        assert frontend._legacy_workspace_names[400] == "C99-5-0"
         assert "C99" in frontend._channel_contexts[400]
 
 
@@ -1386,7 +1417,9 @@ class TestPersonaSource:
 
     async def test_a_channel_is_keyed_by_id_then_name(self, frontend):
         frontend._remember_session(200, "C1", "1.0")
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         assert self._keys(frontend, 200) == ("C1", "general")
 
     async def test_an_unresolvable_channel_is_still_keyed_by_id(self, frontend):
@@ -1395,13 +1428,17 @@ class TestPersonaSource:
         frontend._app.client.conversations_info.side_effect = Exception("boom")
         frontend._remember_session(400, "C99", "5.0")
         frontend._session_sender_ids[400] = "U_ALLOWED"
-        await frontend._resolve_session_metadata(400, "hoss", "C99", "channel", "5.0")
+        await frontend._resolve_session_metadata(
+            400, "hoss", "U_SENDER", "C99", "channel", "5.0"
+        )
         assert self._keys(frontend, 400) == ("C99", "C99")
 
     async def test_a_dm_is_keyed_by_channel_then_sender_then_dm(self, frontend):
         frontend._remember_session(100, "D1", None)
         frontend._session_sender_ids[100] = "U_ALLOWED"
-        await frontend._resolve_session_metadata(100, "hoss", "D1", "im", "")
+        await frontend._resolve_session_metadata(
+            100, "hoss", "U_SENDER", "D1", "im", ""
+        )
         assert self._keys(frontend, 100) == ("D1", "U_ALLOWED", "dm")
 
     async def test_a_group_dm_is_keyed_like_a_dm(self, frontend):
@@ -1411,14 +1448,18 @@ class TestPersonaSource:
         frontend._app.client.conversations_members.return_value = {"members": ["U_A"]}
         frontend._remember_session(300, "G1", "1.0")
         frontend._session_sender_ids[300] = "U_A"
-        await frontend._resolve_session_metadata(300, "hoss", "G1", "mpim", "1.0")
+        await frontend._resolve_session_metadata(
+            300, "hoss", "U_SENDER", "G1", "mpim", "1.0"
+        )
         assert self._keys(frontend, 300) == ("G1", "U_A", "dm")
 
     async def test_a_dm_with_no_known_sender_drops_that_key(self, frontend):
         """A message with no `user` field (a bot post) resolves the session without
         a sender id. The empty key must not reach the config lookup."""
         frontend._remember_session(101, "D2", None)
-        await frontend._resolve_session_metadata(101, "hoss", "D2", "im", "")
+        await frontend._resolve_session_metadata(
+            101, "hoss", "U_SENDER", "D2", "im", ""
+        )
         assert self._keys(frontend, 101) == ("D2", "dm")
 
     def test_an_unknown_session_asks_for_the_dm_default(self, frontend):
@@ -1428,13 +1469,17 @@ class TestPersonaSource:
         persona = tmp_path / "oncall.md"
         persona.write_text("# oncall")
         frontend._remember_session(200, "C1", "1.0")
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         with patch("claude_on_the_fly.slack.persona_for", return_value=persona):
             assert frontend.persona_source(200) == persona
 
     async def test_a_forgotten_session_drops_its_channel_name(self, frontend):
         frontend._remember_session(200, "C1", "1.0")
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         frontend._forget_session(200)
         assert 200 not in frontend._channel_names
 
@@ -1652,8 +1697,27 @@ class TestSaveFiles:
         ):
             result = await frontend._save_files(42, files)
 
-        assert result == ["[File saved: doc.pdf]", "[File saved: img.png]"]
+        assert result == [
+            "[File saved: threads/root/doc.pdf]",
+            "[File saved: threads/root/img.png]",
+        ]
         assert mock_dl.await_count == 2
+
+    async def test_files_land_in_the_threads_own_directory(self, frontend, tmp_path):
+        """Every thread of a conversation shares the workspace root, so two of
+        them uploading `report.pdf` must not overwrite each other."""
+        frontend._thread_keys[42] = "1786342813-662689"
+        files = [{"id": "F1", "name": "report.pdf", "url_private_download": "u"}]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(frontend, "_download_file", new_callable=AsyncMock) as dl,
+        ):
+            result = await frontend._save_files(42, files)
+        assert result == ["[File saved: threads/1786342813-662689/report.pdf]"]
+        assert (
+            dl.await_args[0][1]
+            == tmp_path / "threads" / "1786342813-662689" / "report.pdf"
+        )
 
     async def test_skips_file_without_url(self, frontend, tmp_path):
         files = [{"id": "F1", "name": "no_url.txt"}]
@@ -1684,7 +1748,7 @@ class TestSaveFiles:
             ),
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: good.txt]"]
+        assert result == ["[File saved: threads/root/good.txt]"]
 
     async def test_fallback_name_when_name_missing(self, frontend, tmp_path):
         files = [{"id": "F99", "url_private_download": "https://example.com/f99"}]
@@ -1693,7 +1757,7 @@ class TestSaveFiles:
             patch.object(frontend, "_download_file", new_callable=AsyncMock),
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: file_F99]"]
+        assert result == ["[File saved: threads/root/file_F99]"]
 
 
 class TestDownloadFile:
@@ -3877,8 +3941,13 @@ class TestCompactResolvesTheWorkspace:
 
         name = frontend.workspace_name(session)
         assert name != f"slack/{session}", "fell back to the session key"
-        # sender + the whole thread ts, fraction included
-        assert name == "slack/dm-testuser-1784899718-993159"
+        assert name == "slack/dm/U_ALLOWED"
+        # the per-thread directory it had before: sender display name + the
+        # whole thread ts, fraction included
+        assert frontend.legacy_workspace(session) == (
+            "slack/dm-testuser-1784899718-993159",
+            "1784899718-993159",
+        )
 
     async def test_it_matches_what_an_ordinary_message_would_produce(self, frontend):
         """Same thread, same workspace, whichever path got there first — else the

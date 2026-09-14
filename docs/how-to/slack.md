@@ -116,7 +116,7 @@ next one without a restart.
 - Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
 - A `slack.bot_policies` entry can narrow an allowed bot before agent dispatch. Under `selective`, a message reaches the agent only if it mentions the agent or matches one of your `process_if` patterns; everything else is dropped without consuming an agent turn
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
-- Each thread = one Claude session with memory
+- Each thread = one Claude session. All threads of a DM, group DM or channel share one working directory and one conversation memory (`memory/notes.md` in that directory), on top of the per-person memory
 - The app must be invited to private channels (`/invite @your-app-name`)
 
 See the [`slack` reference](../reference/config-yaml.md#slack) for every field.

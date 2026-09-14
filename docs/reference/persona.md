@@ -66,7 +66,7 @@ it, slashes included. A job filed by `$job` or `claude-jobs enqueue` has no key 
 all and only ever matches `default`.
 
 A Slack channel is never keyed on the sender, only on the channel. Its workspace is
-per thread while its sender changes per message, so a sender key would flip the
+per conversation while its sender changes per message, so a sender key would flip the
 persona mid-conversation.
 
 Values are paths relative to the data root and must stay inside it. A value that

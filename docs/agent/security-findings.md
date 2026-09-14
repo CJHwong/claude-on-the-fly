@@ -255,6 +255,12 @@ exist yet.
 the design position, recorded in the security model. Protection at that level is an
 instruction in `_JAIL_GUIDANCE`, not a boundary.
 
+**The threads of one conversation can read each other's transcripts and files** even with
+`scope_sessions` on, since a workspace is the conversation's directory and the grant follows
+it (`protocol.Frontend.workspace_name`). Accepted: a Slack channel's threads share their
+audience, and a DM's threads share their one person. The conversation memory at
+`<workspace>/memory/` is shared on purpose for the same reason.
+
 **`--cap-drop ALL` and `no_new_privs` are absent from the bwrap argv.** Measured inside
 the jail: `CapEff=0`, `CapBnd=0`, `NoNewPrivs=1`. bubblewrap's defaults already cover it.
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.approvals import ApprovalRequest
@@ -49,6 +50,11 @@ def nudge_notice(text: str) -> str:
         "I keep failing on this one, so I have stopped retrying it:\n\n"
         f"{strip_sender_markers(text)}\n\nSend it again if you want me to try once more."
     )
+
+
+class LegacyWorkspace(NamedTuple):
+    name: str
+    thread_key: str
 
 
 class Frontend(ABC):
@@ -214,7 +220,24 @@ class Frontend(ABC):
 
     @abstractmethod
     def workspace_name(self, chat_id: int) -> str:
-        """Human-readable workspace path segment, e.g. 'telegram/hoss'."""
+        """Workspace path segment, e.g. 'telegram/123' or 'slack/dm/U123'.
+
+        One workspace per conversation, not per session: every thread of a Slack
+        DM, group DM or channel, and every `/new` of a Telegram chat, runs in the
+        same directory. The session is what `chat_id` keys; the directory is what
+        the conversation keys.
+        """
+
+    def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
+        """Where this session's files lived before workspaces were shared.
+
+        Workspaces used to be one directory per session. A frontend that had
+        that layout returns the old name so the orchestrator can fold that
+        directory into the shared one on the session's next turn (`migration`).
+        `thread_key` names the subdirectory the old files go under. None means
+        nothing to migrate, which is right for a frontend born after the change.
+        """
+        return None
 
     @abstractmethod
     def sender_name(self, chat_id: int) -> str:

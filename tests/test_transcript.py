@@ -1234,14 +1234,24 @@ class TestPrependLatestHandoff:
             lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("scan blew up")),
         )
         with caplog.at_level("ERROR", logger="claude_on_the_fly.transcript"):
-            assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+            assert (
+                transcript.prepend_latest_handoff(
+                    tmp_path, "hi", session_uuid="u", platform="cron"
+                )
+                == "hi"
+            )
         assert "starting clean" in "\n".join(r.getMessage() for r in caplog.records)
 
     def test_nothing_prior_leaves_the_prompt_alone(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(
             transcript, "find_latest_prior_transcript", lambda *_a, **_kw: None
         )
-        assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+        assert (
+            transcript.prepend_latest_handoff(
+                tmp_path, "hi", session_uuid="u", platform="cron"
+            )
+            == "hi"
+        )
 
     def test_turns_that_format_to_nothing_leave_the_prompt_alone(
         self, tmp_path: Path, monkeypatch
@@ -1251,7 +1261,12 @@ class TestPrependLatestHandoff:
             "find_latest_prior_transcript",
             lambda *_a, **_kw: ([], "claude"),
         )
-        assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+        assert (
+            transcript.prepend_latest_handoff(
+                tmp_path, "hi", session_uuid="u", platform="cron"
+            )
+            == "hi"
+        )
 
     def test_a_real_handoff_is_prefixed(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(
@@ -1259,7 +1274,9 @@ class TestPrependLatestHandoff:
             "find_latest_prior_transcript",
             lambda *_a, **_kw: ([Turn(role="user", text="earlier")], "codex"),
         )
-        out = transcript.prepend_latest_handoff(tmp_path, "now")
+        out = transcript.prepend_latest_handoff(
+            tmp_path, "now", session_uuid="u", platform="cron"
+        )
         assert out.endswith("now")
         assert "earlier" in out
 
@@ -1417,4 +1434,90 @@ class TestCodexSessionsDirsResolution:
         )
         assert (
             transcript.codex_sessions_dirs()[-1] == tmp_path / "elsewhere" / "sessions"
+        )
+
+
+class TestHandoffScope:
+    """A shared chat workspace holds every thread's transcript, so the handoff
+    for a backend switch must come from the same session, not the newest file."""
+
+    def _two_sessions(self, monkeypatch):
+        monkeypatch.setattr(
+            transcript,
+            "_list_claude_session_files",
+            lambda _ws: [(Path("/x"), "other-thread", 200.0)],
+        )
+        monkeypatch.setattr(
+            transcript,
+            "_list_codex_session_files",
+            lambda _ws: [(Path("/y"), "mine", 100.0)],
+        )
+        monkeypatch.setattr(
+            transcript, "extract_codex", lambda _ws, uuid: [Turn("user", uuid)]
+        )
+        monkeypatch.setattr(
+            transcript, "extract_claude", lambda _ws, uuid: [Turn("user", uuid)]
+        )
+
+    def test_only_uuid_ignores_a_newer_sibling(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        result = transcript.find_latest_prior_transcript(tmp_path, only_uuid="mine")
+        assert result is not None
+        turns, backend = result
+        assert backend == "codex"
+        assert turns[0].text == "mine"
+
+    def test_only_uuid_with_no_match_is_none(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        assert (
+            transcript.find_latest_prior_transcript(tmp_path, only_uuid="nope") is None
+        )
+
+    def test_chat_platform_hands_off_the_same_session(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        out = transcript.prepend_latest_handoff(
+            tmp_path, "now", session_uuid="mine", platform="slack"
+        )
+        assert "mine" in out
+        assert "other-thread" not in out
+
+    def test_cron_hands_off_the_newest_other_session(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        out = transcript.prepend_latest_handoff(
+            tmp_path, "now", session_uuid="mine", platform="cron"
+        )
+        assert "other-thread" in out
+
+
+class TestRolloutSnapshot:
+    def _rollout(self, root: Path, thread: str, cwd: str) -> Path:
+        rollout_dir = root / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        path = rollout_dir / f"rollout-2026-07-30T12-00-00-{thread}.jsonl"
+        path.write_bytes(
+            json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}).encode()
+            + b"\n"
+        )
+        return path
+
+    def test_snapshot_lists_every_rollout(self, codex_sessions_dir):
+        first = self._rollout(codex_sessions_dir, "a", "/ws")
+        second = self._rollout(codex_sessions_dir, "b", "/ws")
+        assert transcript.snapshot_rollouts() == frozenset({first, second})
+
+    def test_an_excluded_sibling_is_not_matched_even_when_freshest(
+        self, codex_sessions_dir
+    ):
+        """A resumed thread in the same directory keeps its rollout fresh. It was
+        there before this turn started, so it is excluded, and the new one wins."""
+        mine = self._rollout(codex_sessions_dir, "mine", "/ws")
+        sibling = self._rollout(codex_sessions_dir, "sibling", "/ws")
+        stamp = time.time() + 5
+        import os
+
+        os.utime(sibling, (stamp, stamp))
+        assert transcript._find_codex_rollout_by_cwd("/ws") == sibling
+        assert (
+            transcript._find_codex_rollout_by_cwd("/ws", exclude=frozenset({sibling}))
+            == mine
         )

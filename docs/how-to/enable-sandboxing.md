@@ -45,9 +45,10 @@ path that reaches a credential store are logged at ERROR and dropped, and the re
 entries are still granted. If the agent then reports a blocked read, grant the narrowest
 directory that unblocks it.
 
-To also stop a turn reading other threads' transcripts, add `scope_sessions: true`.
-It moves the session stores, so the first turn of each existing chat thread has to
-find its history in the new place. A codex thread carries its rollout across and keeps
+To also stop a turn reading other conversations' transcripts, add `scope_sessions: true`.
+The boundary is the conversation's directory, so the threads of one DM, group DM or
+channel still see each other's. It moves the session stores, so the first turn of each
+existing chat thread has to find its history in the new place. A codex thread carries its rollout across and keeps
 its memory. A claude thread keeps its session where it already is, and a rollout that
 no longer exists anywhere starts the thread again rather than failing the turn.
 

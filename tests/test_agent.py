@@ -325,6 +325,10 @@ class TestBuildSystemPrompt:
         assert "alice" in result
         assert "#general" in result
 
+    def test_workspace_memory_is_the_workspaces_own_directory(self, tmp_path):
+        result = build_system_prompt("slack", "alice", "dm", workspace=tmp_path)
+        assert f"{tmp_path / 'memory'}/notes.md" in result
+
     def test_unknown_platform_falls_back_to_telegram(self):
         result = build_system_prompt("discord", "charlie", "dm")
         assert FORMAT_HINTS["telegram"] in result

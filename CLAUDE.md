@@ -18,6 +18,7 @@ src/claude_on_the_fly/
   pricing.py           # OpenRouter-backed price table (codex)
   logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
+  migration.py         # Folds a pre-shared-workspace thread directory into its workspace
   interim.py           # Mid-turn progress: coalescing + rate limiting for one turn
   broker.py            # Loopback credential broker (keeps API keys out of the agent)
   egress.py            # CONNECT proxy gating outbound HTTPS by destination host

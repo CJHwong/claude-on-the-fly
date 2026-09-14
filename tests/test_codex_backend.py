@@ -3346,3 +3346,106 @@ class TestPlainDiagnosticCapture:
             b"reply",
             b"diagnostic",
         )
+
+
+class TestSharedWorkspaceFirstTurns:
+    """Every thread of a conversation runs in one directory, so a first turn
+    cannot claim a rollout by cwd alone."""
+
+    async def test_a_first_turn_excludes_the_rollouts_that_predate_it(
+        self, tmp_path: Path, monkeypatch
+    ):
+        older = tmp_path / "rollout-older.jsonl"
+        seen: dict[str, object] = {}
+
+        def by_cwd(_cwd, **kwargs):
+            seen["exclude"] = kwargs.get("exclude")
+            return None
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            follower._drain()
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(
+            codex_mod.transcript, "snapshot_rollouts", lambda: frozenset({older})
+        )
+        monkeypatch.setattr(codex_mod.transcript, "_find_codex_rollout_by_cwd", by_cwd)
+        await codex_mod._run_codex_exec(tmp_path, ["codex", "exec", "p"], None)
+        assert seen["exclude"] == frozenset({older})
+
+    async def test_a_resumed_turn_takes_no_snapshot(self, tmp_path: Path, monkeypatch):
+        """It reads its own file by thread id, and the snapshot walks every home."""
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            return 0, ""
+
+        def no_snapshot():
+            raise AssertionError("snapshot taken for a resumed thread")
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(codex_mod.transcript, "snapshot_rollouts", no_snapshot)
+        monkeypatch.setattr(
+            codex_mod.transcript, "_find_codex_rollout", lambda _t: None
+        )
+        await codex_mod._run_codex_exec(
+            tmp_path, ["codex", "exec", "p"], None, thread_id="t1"
+        )
+
+    async def test_two_first_turns_in_one_workspace_run_one_at_a_time(
+        self, tmp_path: Path, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        running: list[str] = []
+        overlap: list[bool] = []
+        release = asyncio.Event()
+
+        async def fake_exec(_ws, cmd, **_kw):
+            # The prompt is the argv tail; a first turn's carries the system
+            # prompt in front of the user's text.
+            running.append(cmd[-1][-3:])
+            overlap.append(len(running) > 1)
+            await release.wait()
+            running.remove(cmd[-1][-3:])
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
+        monkeypatch.setattr(
+            codex_mod.transcript, "prepend_latest_handoff", lambda _w, p, **_k: p
+        )
+        backend = CodexBackend()
+        first = asyncio.create_task(backend.run(workspace, "s1", "one", "slack"))
+        second = asyncio.create_task(backend.run(workspace, "s2", "two", "slack"))
+        await asyncio.sleep(0.05)
+        assert running == ["one"]
+        release.set()
+        await asyncio.gather(first, second)
+        assert overlap == [False, False]
+
+    async def test_a_resumed_turn_is_not_held_behind_a_first_turn(
+        self, tmp_path: Path, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "resumed", "thread-r")
+        monkeypatch.setattr(codex_mod.codex_state, "adopt_rollout", lambda *_a: True)
+        running: list[str] = []
+        release = asyncio.Event()
+
+        async def fake_exec(_ws, cmd, **_kw):
+            running.append(cmd[-1][-3:])
+            await release.wait()
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
+        monkeypatch.setattr(
+            codex_mod.transcript, "prepend_latest_handoff", lambda _w, p, **_k: p
+        )
+        backend = CodexBackend()
+        first = asyncio.create_task(backend.run(workspace, "fresh", "one", "slack"))
+        second = asyncio.create_task(backend.run(workspace, "resumed", "two", "slack"))
+        await asyncio.sleep(0.05)
+        assert running == ["one", "two"]
+        release.set()
+        await asyncio.gather(first, second)

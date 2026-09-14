@@ -93,7 +93,7 @@ relying on either state.
 
 The setting is off by default, because scoping the stores moves them. A codex thread
 started while it was off left its rollout in the shared tree, where `codex resume` cannot
-reach it from a per-thread `CODEX_HOME`. The backend copies that rollout into the new home
+reach it from a per-workspace `CODEX_HOME`. The backend copies that rollout into the new home
 on the first turn after the flip, so the conversation survives; a thread whose rollout is
 gone for good starts again instead of failing the turn. Turn it on deliberately, on a
 deployment where more than one person's messages reach the same host.
@@ -114,7 +114,10 @@ it stops the CLI persisting the session, the turn still completes, and nothing s
 until a later resume comes back with no memory of the conversation.
 
 Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside that same
-per-thread directory, so it is covered by the same grant and isolated by the same rule.
+per-workspace directory, so it is covered by the same grant and isolated by the same rule.
+A workspace is one conversation, so the boundary is the DM, group DM or channel, and every
+thread inside it shares the grant. cotf's own conversation memory sits inside the workspace
+(`<workspace>/memory/`) for the same reason: the jail already grants exactly that directory.
 That is also why a blanket deny cost more than resume: the agent's memory was off too,
 just as quietly. This is separate from cotf's own memory under `DATA_DIR/memory`, which
 has its own grant.
