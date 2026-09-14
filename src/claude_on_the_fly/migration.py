@@ -44,6 +44,13 @@ from claude_on_the_fly.agent import (
 
 logger = logging.getLogger(__name__)
 
+# Where a build from before `DATA_DIR/codex-sessions/` kept a thread's codex
+# mapping: one file per session uuid inside the workspace, holding the thread
+# id. Nothing reads it any more, but the rollouts it points at are still on
+# disk (measured: 20 of 20 sampled on one deployment), so a mapping written
+# for the new workspace makes those threads resumable again.
+LEGACY_CODEX_STORE = ".codex_sessions"
+
 
 def migrate_thread(
     old_workspace: Path,
@@ -150,6 +157,9 @@ def _move_files(old: Path, new: Path, thread_key: str) -> bool:
         if entry.name == OUTBOX_DIRNAME and entry.is_dir():
             moved = _merge_outbox(entry, new / OUTBOX_DIRNAME, thread_key) or moved
             continue
+        if entry.name == LEGACY_CODEX_STORE and entry.is_dir():
+            moved = _adopt_legacy_codex(entry, old, new) or moved
+            continue
         moved = _move(entry, _free_path(new, entry.name, thread_key)) or moved
     _rmdir(old)
     return moved
@@ -172,6 +182,33 @@ def _merge_outbox(old: Path, new: Path, thread_key: str) -> bool:
         moved = _move(entry, _free_path(new.parent, entry.name, thread_key)) or moved
     _rmdir(old)
     return moved
+
+
+def _adopt_legacy_codex(store: Path, old: Path, new: Path) -> bool:
+    """Turn each `<uuid>` file of the old in-workspace store into a mapping for
+    the new workspace, then drop the store. A mapping the new workspace already
+    has wins; a file codex would reject stays, and so does the store."""
+    adopted = False
+    for entry in sorted(store.iterdir()):
+        if not entry.is_file() or not _UUID.match(entry.name):
+            continue
+        thread_id = entry.read_text().strip()
+        if not thread_id:
+            entry.unlink()
+            continue
+        if codex_state.read_thread_id(new, entry.name) is None:
+            try:
+                codex_state.write_thread_id(new, entry.name, thread_id)
+            except ValueError as exc:
+                logger.warning("migration: %s not adopted: %s", entry, exc)
+                continue
+            old_home, new_home = codex_state.home_dir(old), codex_state.home_dir(new)
+            if old_home != new_home:
+                _move_rollout(old_home, new_home, thread_id)
+        entry.unlink()
+        adopted = True
+    _rmdir(store)
+    return adopted
 
 
 def _free_path(directory: Path, name: str, thread_key: str) -> Path:

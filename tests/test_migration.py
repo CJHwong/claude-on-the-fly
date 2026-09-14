@@ -217,6 +217,62 @@ class TestFiles:
         assert (old_workspace / "outbox" / ".sent" / "S").is_dir()
         assert "not removed" in caplog.text
 
+    def test_the_old_in_workspace_codex_store_becomes_mappings(
+        self, old_workspace, new_workspace
+    ):
+        """A build from before `codex-sessions/` kept `<uuid>` files holding the
+        thread id inside the workspace. The rollouts are still on disk, so a
+        mapping for the new workspace makes the thread resumable again."""
+        store = old_workspace / ".codex_sessions"
+        store.mkdir()
+        (store / UUID).write_text("thread-legacy\n")
+        (store / "README").write_text("not a session")
+        migration.migrate_thread(old_workspace, new_workspace, [], "1-2")
+        assert codex_state.read_thread_id(new_workspace, UUID) == "thread-legacy"
+        assert not (new_workspace / ".codex_sessions").exists()
+        assert not (new_workspace / "README").exists()
+        assert (old_workspace / ".codex_sessions" / "README").is_file()
+
+    def test_the_old_store_carries_its_rollout_between_scoped_homes(
+        self, old_workspace, new_workspace, scoped_sessions
+    ):
+        rollout_dir = (
+            codex_state.home_dir(old_workspace) / "sessions" / "2026" / "09" / "14"
+        )
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-2026-09-14T00-00-00-thread-legacy.jsonl"
+        rollout.write_text("{}\n")
+        store = old_workspace / ".codex_sessions"
+        store.mkdir()
+        (store / UUID).write_text("thread-legacy")
+        migration.migrate_thread(old_workspace, new_workspace, [], "1-2")
+        moved = codex_state.home_dir(new_workspace) / "sessions" / "2026" / "09" / "14"
+        assert (moved / rollout.name).is_file()
+        assert not rollout.exists()
+
+    def test_an_existing_mapping_wins_over_the_old_store(
+        self, old_workspace, new_workspace
+    ):
+        new_workspace.mkdir(parents=True)
+        codex_state.write_thread_id(new_workspace, UUID, "thread-current")
+        store = old_workspace / ".codex_sessions"
+        store.mkdir()
+        (store / UUID).write_text("thread-legacy")
+        migration.migrate_thread(old_workspace, new_workspace, [], "1-2")
+        assert codex_state.read_thread_id(new_workspace, UUID) == "thread-current"
+        assert not store.exists()
+
+    def test_an_empty_or_invalid_store_file(self, old_workspace, new_workspace, caplog):
+        store = old_workspace / ".codex_sessions"
+        store.mkdir()
+        (store / UUID).write_text("")
+        bad = "11111111-1111-5111-8111-111111111111"
+        (store / bad).write_text("not a thread id!")
+        migration.migrate_thread(old_workspace, new_workspace, [], "1-2")
+        assert not (store / UUID).exists()
+        assert (store / bad).is_file()
+        assert "not adopted" in caplog.text
+
     def test_persona_links_are_dropped_not_moved(self, old_workspace, new_workspace):
         os.symlink("/nonexistent/CLAUDE.md", old_workspace / "CLAUDE.md")
         os.symlink("/nonexistent/CLAUDE.md", old_workspace / "AGENTS.md")
