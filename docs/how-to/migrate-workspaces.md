@@ -45,7 +45,7 @@ claude-slack --migrate-workspaces --apply
 claude-telegram --migrate-workspaces --apply
 ```
 
-Each session's claude transcript moves under the new directory's hash, each codex mapping is rewritten for the new path, and the thread's files move flat into the new directory: a name it already holds gets the thread key as a suffix, and the old `outbox/.sent/` archives merge into the new directory's. The old directory is removed once empty.
+Each session's claude transcript moves under the new directory's hash, each codex mapping is rewritten for the new path, and the thread's files move flat into the new directory: a name it already holds gets the thread key as a suffix, and the old `outbox/.sent/` archives merge into the new directory's. A `.codex_sessions/` store from a build before `codex-sessions/` becomes mappings for the new directory, so those threads resume again. The old directory is removed once empty.
 
 ## 5. Start the daemon and check one thread
 
