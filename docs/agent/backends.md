@@ -41,6 +41,28 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
   system prompt and the handoff, because `resume` on a missing rollout fails the turn
   outright (`thread/resume failed: no rollout found for thread id`).
 
+### Shared workspaces
+
+Every session of a conversation runs in one directory (`protocol.Frontend.workspace_name`),
+so a workspace path no longer identifies a session. Three places used to assume it did:
+
+- **Handoff.** `transcript.prepend_latest_handoff` takes the session uuid and the platform.
+  On a platform in `agent.SHARED_WORKSPACE_PLATFORMS` it reads only the same uuid's file on
+  the other backend; the newest transcript in the directory is a different thread's.
+  `cron` keeps the old rule (newest other session in the workspace), because a profile
+  change mints a new uuid there on purpose.
+- **A codex first turn.** It has no thread id until codex writes the rollout, so the
+  follower finds the file by cwd, and the cwd is shared. `_run_codex_exec` snapshots the
+  rollouts on disk before the spawn and excludes them, and `CodexBackend.run` holds one
+  `asyncio.Lock` per directory for the length of a first turn, so the only new rollout with
+  that cwd is its own. A resumed turn takes no lock. Without both, the loser of two
+  concurrent first turns delivered the winner's reply and stored the winner's thread id.
+- **The session stores.** claude keys `projects/<hash of path>/`, codex keys the mapping
+  and `CODEX_HOME` on the path, so a moved directory orphans both. `migration.migrate_thread`
+  moves the transcript, the mapping and the rollout on a session's first turn in the new
+  layout. Measured on both CLIs: `claude --resume` and `codex exec resume` pick the
+  conversation up from the moved directory and record the new cwd from then on.
+
 ### Tool / skill counts (footer display)
 
 - **claude**: skills populated by CLI; tools from `tool_use` blocks.

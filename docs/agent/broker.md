@@ -75,7 +75,7 @@ Codex requires the hook trust bypass because inline hooks have no persisted trus
 Seatbelt therefore denies writes to Codex execution-control paths and re-grants only the
 runtime paths measured as necessary.
 
-## Per-thread session grants
+## Per-workspace session grants
 
 `sandbox.scope_sessions` gates the whole boundary and is off by default
 (`sandbox.scoped_sessions()`). Off, the granted path resolves back onto the store it
@@ -150,9 +150,11 @@ Linux wrap creates each mount source, and `mkdir` on a file target leaves a
 distinction, and same reason, as `_CODEX_PROTECTED_DIRS`.
 
 Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside the
-per-thread grant, so it is isolated by the same rule as the transcript and needs no
-grant of its own. Before the per-thread grant existed it was denied along with the
-session file, so memory was silently off under `jail` too.
+per-workspace grant, so it is isolated by the same rule as the transcript and needs no
+grant of its own. Before the per-workspace grant existed it was denied along with the
+session file, so memory was silently off under `jail` too. A workspace is one
+conversation, so every thread of a Slack channel or DM shares the grant; the boundary
+is between conversations, not between threads.
 
 Both bases reference all four, unlike `_EXTRA_*`, so `jail_argv` always passes them. A
 profile referencing an unpassed `-D` is refused outright, which is the failure worth
