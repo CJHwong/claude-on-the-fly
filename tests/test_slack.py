@@ -1699,26 +1699,36 @@ class TestSaveFiles:
             result = await frontend._save_files(42, files)
 
         assert result == [
-            "[File saved: threads/root/doc.pdf]",
-            "[File saved: threads/root/img.png]",
+            "[File saved: inbox/doc.pdf]",
+            "[File saved: inbox/img.png]",
         ]
         assert mock_dl.await_count == 2
 
-    async def test_files_land_in_the_threads_own_directory(self, frontend, tmp_path):
-        """Every thread of a conversation shares the workspace root, so two of
-        them uploading `report.pdf` must not overwrite each other."""
-        frontend._thread_keys[42] = "1786342813-662689"
+    async def test_files_land_flat_in_the_inbox(self, frontend, tmp_path):
         files = [{"id": "F1", "name": "report.pdf", "url_private_download": "u"}]
         with (
             patch.object(frontend, "_workspace_path", return_value=tmp_path),
             patch.object(frontend, "_download_file", new_callable=AsyncMock) as dl,
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: threads/1786342813-662689/report.pdf]"]
-        assert (
-            dl.await_args[0][1]
-            == tmp_path / "threads" / "1786342813-662689" / "report.pdf"
-        )
+        assert result == ["[File saved: inbox/report.pdf]"]
+        assert dl.await_args[0][1] == tmp_path / "inbox" / "report.pdf"
+
+    async def test_a_second_upload_of_the_same_name_keeps_both(
+        self, frontend, tmp_path
+    ):
+        """Every thread of a conversation shares the inbox, so two of them
+        uploading `report.pdf` must not overwrite each other."""
+        (tmp_path / "inbox").mkdir()
+        (tmp_path / "inbox" / "report.pdf").write_text("the other thread's")
+        files = [{"id": "F1", "name": "report.pdf", "url_private_download": "u"}]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(frontend, "_download_file", new_callable=AsyncMock) as dl,
+        ):
+            result = await frontend._save_files(42, files)
+        assert result == ["[File saved: inbox/report-2.pdf]"]
+        assert dl.await_args[0][1] == tmp_path / "inbox" / "report-2.pdf"
 
     async def test_skips_file_without_url(self, frontend, tmp_path):
         files = [{"id": "F1", "name": "no_url.txt"}]
@@ -1749,7 +1759,7 @@ class TestSaveFiles:
             ),
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: threads/root/good.txt]"]
+        assert result == ["[File saved: inbox/good.txt]"]
 
     async def test_fallback_name_when_name_missing(self, frontend, tmp_path):
         files = [{"id": "F99", "url_private_download": "https://example.com/f99"}]
@@ -1758,7 +1768,7 @@ class TestSaveFiles:
             patch.object(frontend, "_download_file", new_callable=AsyncMock),
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: threads/root/file_F99]"]
+        assert result == ["[File saved: inbox/file_F99]"]
 
 
 class TestDownloadFile:

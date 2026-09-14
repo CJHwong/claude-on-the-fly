@@ -139,6 +139,9 @@ NO_HANDOFF_PLATFORMS = frozenset({"jobs"})
 # and picks its earlier transcript up from the same directory on purpose.
 SHARED_WORKSPACE_PLATFORMS = frozenset({"slack", "telegram"})
 OUTBOX_DIRNAME = "outbox"
+# Where a frontend puts what the person uploaded. Flat, inside the workspace, so
+# the agent's cwd-relative `inbox/<name>` in the message is the path it reads.
+INBOX_DIRNAME = "inbox"
 # The conversation's own memory, inside its workspace. Inside rather than under
 # `memory/` because the jail grants only the running workspace: a DM's notes are
 # then unreachable from a channel's session by the sandbox, not by a prompt rule.
@@ -162,6 +165,57 @@ OUTBOX_INSTRUCTION = (
     "uploads. A lone file goes in as-is.\n"
     "</IMPORTANT>"
 )
+
+# Appended to every chat turn on an attachment platform. The system prompt
+# names the outbox too, but claude persists that prompt with the session and a
+# healthy `--resume` never re-reads it, so a session started before a move (or
+# before the outbox became per session) would deliver into a directory nothing
+# collects. The turn's line wins over whatever the session remembers.
+OUTBOX_TURN_NOTE = (
+    "<cotf-outbox>System instruction, not user text. Files for the user go in "
+    "{outbox_dir} (this path replaces any outbox path given earlier). Nothing "
+    "else goes there.</cotf-outbox>"
+)
+
+
+def session_outbox(workspace: Path, session_uuid: str) -> Path:
+    """This session's own outbox. Every thread of a conversation shares the
+    workspace, and two can run at once, so a shared `outbox/` would hand one
+    thread's file to the other's reply and archive it away from its author.
+    The uuid is the one key both backends know before the turn starts."""
+    return workspace / OUTBOX_DIRNAME / session_uuid
+
+
+def outbox_note(outbox: Path) -> str:
+    return OUTBOX_TURN_NOTE.format(outbox_dir=outbox)
+
+
+def retire_outbox(outbox: Path) -> None:
+    """Drop a session's outbox once collected, so a human opening the
+    workspace sees `outbox/.sent/` and at most one directory for a turn in
+    flight. Anything still inside stays, and so does the directory."""
+    with contextlib.suppress(OSError):
+        outbox.rmdir()
+
+
+def unique_path(directory: Path, name: str) -> Path:
+    """`directory/name`, or the first `name-2`, `name-3`... that is free."""
+    candidate = directory / name
+    stem, suffix = Path(name).stem, Path(name).suffix
+    counter = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def inbox_path(workspace: Path, name: str) -> Path:
+    """A free path under `inbox/` for an upload called `name`. Flat rather than
+    per thread, because a thread folder per upload made the workspace unreadable
+    for the human it belongs to; a clash gets a numeric suffix instead."""
+    inbox = workspace / INBOX_DIRNAME
+    inbox.mkdir(parents=True, exist_ok=True)
+    return unique_path(inbox, Path(name).name)
 
 
 # The per-turn suggestions block the orchestrator appends to chat prompts, and
@@ -213,14 +267,14 @@ def strip_sender_markers(text: str) -> str:
     return _SENDER_MARKER_RE.sub("", text).strip()
 
 
-def collect_outbox(workspace: Path) -> list[Path]:
-    """Files the agent left in workspace/outbox to attach to the reply.
+def collect_outbox(outbox: Path) -> list[Path]:
+    """Files the agent left in `outbox` (a session's, see `session_outbox`) to
+    attach to the reply.
 
-    Only regular files directly under outbox/ — skips the archive dir, subdirs,
-    and dotfiles. Sorted by name for a deterministic order. Enforces count/size
-    caps and logs every skip; nothing is dropped silently.
+    Only regular files directly under it — skips subdirs and dotfiles. Sorted by
+    name for a deterministic order. Enforces count/size caps and logs every
+    skip; nothing is dropped silently.
     """
-    outbox = workspace / OUTBOX_DIRNAME
     try:
         outbox_stat = outbox.lstat()
     except OSError:
@@ -567,9 +621,15 @@ def build_system_prompt(
     user_name: str,
     channel_context: str = "dm",
     workspace: Path | None = None,
+    session_uuid: str | None = None,
 ) -> str:
     if platform in ATTACHMENT_PLATFORMS and workspace is not None:
-        outbox = OUTBOX_INSTRUCTION.format(outbox_dir=workspace / OUTBOX_DIRNAME)
+        outbox_dir = (
+            session_outbox(workspace, session_uuid)
+            if session_uuid
+            else workspace / OUTBOX_DIRNAME
+        )
+        outbox = OUTBOX_INSTRUCTION.format(outbox_dir=outbox_dir)
     else:
         outbox = ""
     prompt = PROMPT_TEMPLATE.format(

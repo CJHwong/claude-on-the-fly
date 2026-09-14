@@ -782,8 +782,10 @@ class Orchestrator:
         self._fold_legacy_workspace(chat_id, workspace, session)
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / WORKSPACE_MEMORY_DIRNAME).mkdir(exist_ok=True)
+        outbox: Path | None = None
         if self._platform in agent.ATTACHMENT_PLATFORMS:
-            (workspace / agent.OUTBOX_DIRNAME).mkdir(exist_ok=True)
+            outbox = agent.session_outbox(workspace, session)
+            outbox.mkdir(parents=True, exist_ok=True)
         agent.ensure_persona(workspace, self._frontend.persona_source(chat_id))
         identifier = self._frontend.workspace_name(chat_id)
         logger.debug(
@@ -878,7 +880,11 @@ class Orchestrator:
             else:
                 identity = getattr(self._frontend, "sender_identity", None)
                 suggestions = _suggestions_enabled()
-                prompt = f"{text}\n\n{SUGGESTIONS_TEMPLATE}" if suggestions else text
+                prompt = text
+                if outbox is not None:
+                    prompt = f"{prompt}\n\n{agent.outbox_note(outbox)}"
+                if suggestions:
+                    prompt = f"{prompt}\n\n{SUGGESTIONS_TEMPLATE}"
                 # The backend's nudge retry (an empty or block-only reply)
                 # carries the suggestions instruction too, so the retried
                 # answer comes back with working buttons rather than a bare
@@ -964,11 +970,13 @@ class Orchestrator:
                     response.context_tokens,
                     response.context_window_size,
                 )
-            if self._platform in agent.ATTACHMENT_PLATFORMS:
-                response.attachments = agent.collect_outbox(workspace)
+            if outbox is not None:
+                response.attachments = agent.collect_outbox(outbox)
             delivered = await self._frontend.send(chat_id, response)
             if delivered:
                 agent.archive_outbox(workspace, delivered)
+            if outbox is not None:
+                agent.retire_outbox(outbox)
             self._event_log.append(
                 EVENT_WORKER_DONE,
                 source=self._platform,

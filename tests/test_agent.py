@@ -39,13 +39,18 @@ from claude_on_the_fly.agent import (
     current_backend_key,
     ensure_persona,
     get_backend,
+    inbox_path,
+    outbox_note,
     parse_stream,
     persona_for,
     read_attachment,
     reset_progress_sink,
+    retire_outbox,
     run,
+    session_outbox,
     set_progress_sink,
     stats_mode,
+    unique_path,
     write_attachment,
 )
 from claude_on_the_fly.backends.claude import ClaudeBackend
@@ -352,6 +357,18 @@ class TestBuildSystemPrompt:
             assert "You CAN send files" in result
             assert "{outbox_dir}" not in result  # placeholder fully substituted
 
+    def test_outbox_is_the_sessions_own_when_a_session_is_named(self, tmp_path: Path):
+        """Two threads of one conversation share the workspace and can run at
+        once; a shared outbox handed one thread's file to the other's reply."""
+        result = build_system_prompt("slack", "hoss", "dm", tmp_path, "sess-1")
+        assert str(tmp_path / OUTBOX_DIRNAME / "sess-1") in result
+        assert f"{tmp_path / OUTBOX_DIRNAME}\n" not in result
+
+    def test_the_prompt_explains_the_shared_directory(self, tmp_path: Path):
+        result = build_system_prompt("slack", "hoss", "dm", tmp_path)
+        assert "every thread of it works here" in result
+        assert "`inbox/`" in result
+
     def test_outbox_instruction_absent_for_non_attachment_platforms(
         self, tmp_path: Path
     ):
@@ -370,16 +387,62 @@ class TestBuildSystemPrompt:
 # ---------------------------------------------------------------------------
 
 
+class TestSessionOutbox:
+    def test_lives_under_the_workspace_outbox(self, tmp_path: Path):
+        assert (
+            session_outbox(tmp_path, "sess-1") == tmp_path / OUTBOX_DIRNAME / "sess-1"
+        )
+
+    def test_the_turn_note_names_the_path_and_overrides_the_old_one(self, tmp_path):
+        note = outbox_note(tmp_path / OUTBOX_DIRNAME / "sess-1")
+        assert str(tmp_path / OUTBOX_DIRNAME / "sess-1") in note
+        assert "replaces any outbox path given earlier" in note
+        assert note.startswith("<cotf-outbox>") and note.endswith("</cotf-outbox>")
+
+    def test_retire_removes_an_empty_outbox_only(self, tmp_path: Path):
+        empty = tmp_path / "a"
+        empty.mkdir()
+        retire_outbox(empty)
+        assert not empty.exists()
+        kept = tmp_path / "b"
+        kept.mkdir()
+        (kept / "undelivered.txt").write_text("x")
+        retire_outbox(kept)
+        assert (kept / "undelivered.txt").is_file()
+        retire_outbox(tmp_path / "never-made")  # no error
+
+
+class TestInboxPath:
+    def test_creates_the_inbox_and_keeps_the_name(self, tmp_path: Path):
+        assert inbox_path(tmp_path, "report.pdf") == tmp_path / "inbox" / "report.pdf"
+        assert (tmp_path / "inbox").is_dir()
+
+    def test_a_taken_name_gets_a_numeric_suffix(self, tmp_path: Path):
+        """Every thread of the conversation shares the inbox; two uploads of
+        `report.pdf` must both survive."""
+        (tmp_path / "inbox").mkdir()
+        (tmp_path / "inbox" / "report.pdf").write_text("first")
+        (tmp_path / "inbox" / "report-2.pdf").write_text("second")
+        assert inbox_path(tmp_path, "report.pdf") == tmp_path / "inbox" / "report-3.pdf"
+
+    def test_only_the_basename_is_used(self, tmp_path: Path):
+        assert inbox_path(tmp_path, "../../etc/passwd") == tmp_path / "inbox" / "passwd"
+
+    def test_a_dangling_symlink_counts_as_taken(self, tmp_path: Path):
+        (tmp_path / "x.txt").symlink_to(tmp_path / "nowhere")
+        assert unique_path(tmp_path, "x.txt") == tmp_path / "x-2.txt"
+
+
 class TestCollectOutbox:
     def test_no_outbox_dir_returns_empty(self, tmp_path: Path):
-        assert collect_outbox(tmp_path) == []
+        assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
 
     def test_collects_regular_files_sorted_by_name(self, tmp_path: Path):
         outbox = tmp_path / OUTBOX_DIRNAME
         outbox.mkdir()
         (outbox / "b.txt").write_text("b")
         (outbox / "a.txt").write_text("a")
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert [p.name for p in result] == ["a.txt", "b.txt"]
 
     def test_skips_dotfiles_subdirs_and_archive(self, tmp_path: Path):
@@ -390,7 +453,7 @@ class TestCollectOutbox:
         (outbox / "sub").mkdir()
         (outbox / OUTBOX_ARCHIVE).mkdir()
         (outbox / OUTBOX_ARCHIVE / "old.txt").write_text("x")
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert [p.name for p in result] == ["keep.txt"]
 
     def test_skips_oversize_file(self, tmp_path: Path):
@@ -398,7 +461,7 @@ class TestCollectOutbox:
         outbox.mkdir()
         (outbox / "small.txt").write_text("x")
         (outbox / "big.bin").write_bytes(b"0" * (MAX_ATTACHMENT_BYTES + 1))
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert [p.name for p in result] == ["small.txt"]
 
     def test_enforces_count_cap(self, tmp_path: Path):
@@ -406,7 +469,7 @@ class TestCollectOutbox:
         outbox.mkdir()
         for i in range(MAX_ATTACHMENTS + 3):
             (outbox / f"f{i:02d}.txt").write_text("x")
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert len(result) == MAX_ATTACHMENTS
 
     def test_rejects_symlinks_at_collection_and_read(self, tmp_path: Path):
@@ -417,7 +480,7 @@ class TestCollectOutbox:
         link = outbox / "report.txt"
         link.symlink_to(target)
 
-        assert collect_outbox(tmp_path) == []
+        assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
         with pytest.raises(OSError):
             read_attachment(link)
 
@@ -450,7 +513,7 @@ class TestArchiveOutbox:
         assert len(archived) == 1
         assert archived[0].read_text() == "data"
         # A fresh scan finds nothing left to re-send.
-        assert collect_outbox(tmp_path) == []
+        assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
 
 
 # ---------------------------------------------------------------------------
@@ -3532,7 +3595,7 @@ class TestOutboxSurvivesAFilesystemThatSaysNo:
 
         monkeypatch.setattr(Path, "stat", stat_then_vanish)
         with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
-            assert collect_outbox(tmp_path) == []
+            assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
         assert "cannot stat" in "\n".join(r.getMessage() for r in caplog.records)
 
     def test_an_unwritable_archive_dir_leaves_the_files_where_they_are(
@@ -4087,7 +4150,7 @@ class TestAttachmentHandoffRefusesWhatItCannotVouchFor:
             patch.object(Path, "lstat", flaky),
             caplog.at_level("WARNING"),
         ):
-            collected = collect_outbox(workspace)
+            collected = collect_outbox(workspace / OUTBOX_DIRNAME)
 
         assert [p.name for p in collected] == ["good.txt"]
         assert "cannot inspect gone.txt" in caplog.text
@@ -4099,7 +4162,7 @@ class TestAttachmentHandoffRefusesWhatItCannotVouchFor:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         (workspace / OUTBOX_DIRNAME).write_text("a file, not a directory")
-        assert collect_outbox(workspace) == []
+        assert collect_outbox(workspace / OUTBOX_DIRNAME) == []
 
     def test_reading_a_non_regular_file_is_refused(self, tmp_path):
         """`os.open` on a fifo would block on a reader; the fstat check is what

@@ -1057,7 +1057,7 @@ class TestOnUpdate:
 
         frontend._on_message.assert_awaited_once()
         call_text = frontend._on_message.call_args[0][1]
-        assert "[File saved: report.pdf]" in call_text
+        assert "[File saved: inbox/report.pdf]" in call_text
         assert "check this" in call_text
 
     async def test_media_group_enqueues(self, frontend: TelegramFrontend) -> None:
@@ -1190,7 +1190,12 @@ class TestFlushMediaGroup:
         }
 
         with (
-            patch.object(frontend, "_save_file", new_callable=AsyncMock) as mock_save,
+            patch.object(
+                frontend,
+                "_save_file",
+                new_callable=AsyncMock,
+                side_effect=lambda _chat, _fid, name: Path("/ws/inbox") / name,
+            ) as mock_save,
             patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
         ):
             await frontend._flush_media_group("grp1")
@@ -1201,8 +1206,8 @@ class TestFlushMediaGroup:
 
         frontend._on_message.assert_awaited_once()
         call_text = frontend._on_message.call_args[0][1]
-        assert "[File saved: a.jpg]" in call_text
-        assert "[File saved: b.png]" in call_text
+        assert "[File saved: inbox/a.jpg]" in call_text
+        assert "[File saved: inbox/b.png]" in call_text
         assert "look at these" in call_text
         assert '[from-id: 1] [display: "hoss"]' in call_text
 
@@ -1957,7 +1962,8 @@ class TestDownloadCleanup:
         target = (
             tmp_path / "home" / ".claude-on-the-fly" / "workspaces" / "telegram/probe"
         )
-        assert [p.name for p in target.iterdir()] == []
+        assert [p.name for p in target.iterdir()] == ["inbox"]
+        assert list((target / "inbox").iterdir()) == []
         assert workspace.exists() is False
 
 

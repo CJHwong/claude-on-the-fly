@@ -612,8 +612,11 @@ class TestProcess:
 
         orch = Orchestrator(frontend, "slack", event_log=event_log)
         outbox = tmp_path / "workspaces" / "test/1" / "outbox"
-        outbox.mkdir(parents=True)
-        (outbox / "report.csv").write_text("data")
+        session_dir = outbox / orch.session_uuid(1)
+        session_dir.mkdir(parents=True)
+        (session_dir / "report.csv").write_text("data")
+        # Another thread's file in the shared outbox root is not this turn's.
+        (outbox / "theirs.csv").write_text("not mine")
 
         with (
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
@@ -623,8 +626,36 @@ class TestProcess:
 
         sent = frontend.sent[0][1]
         assert [p.name for p in sent.attachments] == ["report.csv"]
-        assert not (outbox / "report.csv").exists()  # archived, not left behind
+        assert not session_dir.exists()  # archived, then retired
         assert list((outbox / ".sent").rglob("report.csv"))
+        assert (outbox / "theirs.csv").is_file()
+
+    async def test_the_turn_names_its_own_outbox_and_makes_it(
+        self, frontend: StubFrontend, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        """claude never re-reads the system prompt on a healthy resume, so the
+        path has to ride the turn or a session from before the move delivers
+        into a directory nothing collects."""
+        from claude_on_the_fly import agent
+
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        expected = tmp_path / "workspaces" / "test/1" / "outbox" / orch.session_uuid(1)
+        seen: dict[str, object] = {}
+
+        async def run(workspace, session, prompt, *args, **kwargs):
+            seen["prompt"] = prompt
+            seen["exists"] = expected.is_dir()
+            return Response(body="ok")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", run),
+        ):
+            await orch._process(1, Turn("hello"))
+
+        assert seen["exists"] is True
+        assert agent.outbox_note(expected) in str(seen["prompt"])
+        assert not expected.exists()  # empty after the turn, so retired
 
     async def test_does_not_archive_when_send_reports_nothing_delivered(
         self, event_log: EventLog, tmp_path: Path
@@ -640,7 +671,7 @@ class TestProcess:
 
         frontend = UndeliveredFrontend()
         orch = Orchestrator(frontend, "slack", event_log=event_log)
-        outbox = tmp_path / "workspaces" / "test/1" / "outbox"
+        outbox = tmp_path / "workspaces" / "test/1" / "outbox" / orch.session_uuid(1)
         outbox.mkdir(parents=True)
         (outbox / "report.csv").write_text("data")
 
@@ -659,17 +690,20 @@ class TestProcess:
         from claude_on_the_fly import agent
 
         outbox = tmp_path / "workspaces" / "test/1" / "outbox"
-        outbox.mkdir(parents=True)
-        (outbox / "report.csv").write_text("data")
+        session_dir = outbox / orch.session_uuid(1)
+        session_dir.mkdir(parents=True)
+        (session_dir / "report.csv").write_text("data")
 
+        run = AsyncMock(return_value=Response(body="ok"))
         with (
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
-            patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
+            patch.object(agent, "run", run),
         ):
             await orch._process(1, Turn("hi"))
 
         assert frontend.sent[0][1].attachments == []
-        assert (outbox / "report.csv").exists()  # untouched
+        assert (session_dir / "report.csv").exists()  # untouched
+        assert "<cotf-outbox>" not in run.call_args.args[2]
 
 
 # ---------------------------------------------------------------------------
@@ -3230,9 +3264,7 @@ class TestLegacyWorkspaceFolding:
             "test/1-old", "old"
         )
         await self._turn(orch, tmp_path)
-        moved = (
-            tmp_path / "workspaces" / "test" / "1" / "threads" / "old" / "report.pdf"
-        )
+        moved = tmp_path / "workspaces" / "test" / "1" / "report.pdf"
         assert moved.read_text() == "pdf"
         assert not old.exists()
 

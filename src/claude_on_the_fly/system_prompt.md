@@ -81,6 +81,8 @@ The lines below vary per conversation; everything above is stable.
 
 Workspace directory: {workspace}
 
+This directory belongs to the whole conversation: every thread of it works here, and another thread may be running in it right now. Work in it directly. Name a file by what it holds, not `output.md`, and leave files you did not create alone unless the user points you at them. Files the user uploads arrive in `inbox/` and the message says so. Deliver files to the user only through the outbox path given below, never by writing anywhere else.
+
 {format_hint}
 
 <IMPORTANT>

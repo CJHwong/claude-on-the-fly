@@ -32,6 +32,7 @@ from claude_on_the_fly.agent import (
     DATA_DIR,
     Response,
     footer_parts,
+    inbox_path,
     install_download,
     persona_for,
     read_attachment,
@@ -647,8 +648,11 @@ class TelegramFrontend(Frontend):
             return
 
         if file_id and file_name:
-            await self._save_file(chat_id, file_id, file_name)
-            text = f"[File saved: {file_name}]\n{caption or 'Please review the uploaded file.'}"
+            saved = await self._save_file(chat_id, file_id, file_name)
+            text = (
+                f"[File saved: {saved.relative_to(saved.parent.parent)}]\n"
+                f"{caption or 'Please review the uploaded file.'}"
+            )
         else:
             text = caption
 
@@ -740,8 +744,7 @@ class TelegramFrontend(Frontend):
             raise RuntimeError("App not started")
         workspace = workspace_path(self.workspace_name(chat_id), DATA_DIR)
         workspace.mkdir(parents=True, exist_ok=True)
-        safe_name = Path(file_name).name
-        dest = workspace / safe_name
+        dest = inbox_path(workspace, file_name)
         tg_file = await self._app.bot.get_file(file_id)
         fd, temp_name = tempfile.mkstemp(prefix=".cotf-download-", dir=workspace)
         os.close(fd)
@@ -785,8 +788,10 @@ class TelegramFrontend(Frontend):
         try:
             file_lines = []
             for file_id, file_name in group["files"]:
-                await self._save_file(chat_id, file_id, file_name)
-                file_lines.append(f"[File saved: {file_name}]")
+                saved = await self._save_file(chat_id, file_id, file_name)
+                file_lines.append(
+                    f"[File saved: {saved.relative_to(saved.parent.parent)}]"
+                )
             text = "\n".join(file_lines)
             text += (
                 f"\n{group['caption']}"
