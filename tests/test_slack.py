@@ -398,6 +398,30 @@ class TestIngestEvent:
         await frontend._ingest_event({"subtype": "bot_message", "ts": "1"})
         frontend._on_message.assert_not_awaited()
 
+    async def test_a_trusted_bot_is_the_sender_of_its_own_dm(self, frontend):
+        """A bot post has no `user`, and an empty sender named `users//` in the
+        prompt; once a restart dropped the empty journaled value the fallback
+        was the numeric chat id. The bot id is what the allowlist trusted and
+        what the DM workspace is named after, so it is the sender too."""
+        frontend._pinned_allowed_bot_ids = {"B_ALERT"}
+        event = {
+            "subtype": "bot_message",
+            "bot_id": "B_ALERT",
+            "username": "Alerts",
+            "ts": "1.1",
+            "text": "deploy finished",
+            "channel": "D_BOT",
+            "channel_type": "im",
+        }
+
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_awaited_once()
+        chat_id = frontend._on_message.await_args.args[0]
+        assert frontend.sender_identity(chat_id) == "B_ALERT"
+        assert frontend.workspace_name(chat_id) == "slack/dm/B_ALERT"
+        assert frontend._session_metadata(chat_id)["sender_id"] == "B_ALERT"
+
     async def test_allows_file_share_subtype(self, frontend):
         event = {
             "subtype": "file_share",
