@@ -3254,3 +3254,22 @@ def test_linux_masked_covers_dotenvs_under_an_operator_grant(monkeypatch, tmp_pa
     secret.write_text("TOKEN=xoxp-not-a-real-token")
     monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(granted))
     assert secret in sandbox._linux_masked(tmp_path / "data")
+
+
+def test_linux_masked_skips_a_single_file_grant(monkeypatch, tmp_path):
+    """`extra_paths` may name one file, a tool binary say, rather than a tree.
+    There is nothing under it to sweep, and walking it must not stop the sweep of
+    the directory grant listed after it."""
+    tool = tmp_path / "bin" / "tool"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\n")
+    granted = tmp_path / "config-repo"
+    granted.mkdir()
+    secret = granted / ".env"
+    secret.write_text("TOKEN=not-a-real-token")
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", f"{tool}:{granted}")
+
+    masked = sandbox._linux_masked(tmp_path / "data")
+
+    assert secret in masked
+    assert tool not in masked
