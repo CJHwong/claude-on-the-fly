@@ -1129,6 +1129,8 @@ def _seed_progress_route(frontend, channel_type: str | None = "im") -> int:
     if channel_type is not None:
         frontend._channel_types["C1"] = channel_type
     frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+    frontend._app.client.chat_update = AsyncMock(return_value={"ok": True})
+    frontend._app.client.chat_delete = AsyncMock(return_value={"ok": True})
     return session_id
 
 
@@ -1257,6 +1259,126 @@ class TestSendProgress:
             await frontend.send_progress(session_id, "working")
 
         assert "failed to post" in caplog.text
+
+    async def test_second_call_edits_the_first_message_instead_of_posting_a_new_one(
+        self, frontend
+    ):
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "still working")
+        await frontend.send_progress(session_id, "still working, more")
+
+        client = frontend._app.client
+        client.chat_postMessage.assert_awaited_once()
+        client.chat_update.assert_awaited_once()
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["channel"] == "C1"
+        assert kwargs["ts"] == "99.0"
+        assert "still working, more" in kwargs["blocks"][0]["elements"][0]["text"]
+
+    async def test_an_update_over_the_edit_limit_starts_a_new_message(self, frontend):
+        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`. CJK
+        passes that byte cap long before the block's character cap, so a big
+        update goes out as a new message rather than a cut-down edit."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "開始")
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        long_update = "進度" * 1400
+        await frontend.send_progress(session_id, long_update)
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+        assert long_update[:1400] in client.chat_postMessage.await_args.kwargs["text"]
+        await frontend.send_progress(session_id, "繼續")
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+
+    async def test_end_progress_on_success_deletes_every_message_of_the_turn(
+        self, frontend
+    ):
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "開始")
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+        await frontend.send_progress(session_id, "進度" * 1400)
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        deleted = [call.kwargs["ts"] for call in client.chat_delete.await_args_list]
+        assert deleted == ["99.0", "100.0"]
+
+    async def test_a_failed_edit_posts_a_fresh_message_and_edits_that_one_next(
+        self, frontend, caplog
+    ):
+        """The message can be gone (deleted by a person) or refuse the edit. A
+        progress line that cannot land in place still lands."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "one")
+        client.chat_update.side_effect = SlackApiError(
+            "gone", {"ok": False, "error": "message_not_found"}
+        )
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.send_progress(session_id, "two")
+
+        assert client.chat_postMessage.await_count == 2
+        assert "could not edit" in caplog.text
+        client.chat_update.side_effect = None
+        await frontend.send_progress(session_id, "three")
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+
+    async def test_end_progress_on_success_deletes_the_message(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        frontend._app.client.chat_delete.assert_awaited_once_with(
+            channel="C1", ts="99.0"
+        )
+
+    async def test_end_progress_on_failure_keeps_the_message(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+
+        await frontend.end_progress(session_id, succeeded=False)
+
+        frontend._app.client.chat_delete.assert_not_awaited()
+
+    async def test_a_new_turn_never_edits_a_message_kept_from_an_earlier_one(
+        self, frontend
+    ):
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "turn one")
+        await frontend.end_progress(session_id, succeeded=False)
+
+        await frontend.send_progress(session_id, "turn two")
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+
+    async def test_end_progress_without_a_message_does_nothing(self, frontend):
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        frontend._app.client.chat_delete.assert_not_awaited()
+
+    async def test_a_failed_delete_is_logged_not_raised(self, frontend, caplog):
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+        frontend._app.client.chat_delete.side_effect = SlackApiError(
+            "nope", {"ok": False, "error": "cant_delete_message"}
+        )
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.end_progress(session_id, succeeded=True)
+
+        assert "could not delete" in caplog.text
 
     async def test_a_not_ok_response_records_nothing(self, frontend):
         session_id = _seed_progress_route(frontend)

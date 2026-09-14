@@ -46,6 +46,7 @@ class StubFrontend(Frontend):
         self.start_notifications: list[int] = []
         self.complete_notifications: list[int] = []
         self.progress: list[tuple[int, str]] = []
+        self.progress_ended: list[tuple[int, bool]] = []
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         pass
@@ -68,6 +69,9 @@ class StubFrontend(Frontend):
 
     async def send_progress(self, chat_id: int, text: str) -> None:
         self.progress.append((chat_id, text))
+
+    async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
+        self.progress_ended.append((chat_id, succeeded))
 
     async def stop(self) -> None:
         pass
@@ -1082,6 +1086,11 @@ def _watch_send_ordering(frontend: StubFrontend) -> list[int]:
     return seen
 
 
+def _progress_lines(frontend: StubFrontend) -> list[tuple[int, list[str]]]:
+    """Each progress message without its elapsed-time header line."""
+    return [(chat_id, text.splitlines()[1:]) for chat_id, text in frontend.progress]
+
+
 class SilentFrontend(StubFrontend):
     """A frontend that never overrode `send_progress` — the Telegram shape.
 
@@ -1149,8 +1158,11 @@ class TestProcessInterim:
         ):
             await orch._process(1, Turn("hi"))
 
-        assert frontend.progress == [(1, "盤點完成")]
+        assert _progress_lines(frontend) == [(1, ["盤點完成"])]
         assert order == [1]
+        # After the reply, and told the turn succeeded, so the frontend removes
+        # the progress message rather than leaving it above the answer.
+        assert frontend.progress_ended == [(1, True)]
 
     async def test_toggle_off_is_identical_to_today(
         self,
@@ -1176,6 +1188,7 @@ class TestProcessInterim:
 
         assert seen == [None]
         assert frontend.progress == []
+        assert frontend.progress_ended == []
         assert frontend.sent == [(1, response)]
         done = event_log.tail(10)[-1]
         assert done["type"] == "worker_done"
@@ -1237,9 +1250,13 @@ class TestProcessInterim:
         ):
             await orch._process(1, Turn("hi"))
 
-        assert frontend.progress == [(1, "halfway"), (1, "and then it broke")]
+        assert _progress_lines(frontend) == [
+            (1, ["halfway"]),
+            (1, ["halfway", "and then it broke"]),
+        ]
         assert order == [2]
         assert "Error: boom" in frontend.sent[0][1].body
+        assert frontend.progress_ended == [(1, False)]
         assert event_log.tail(10)[-1]["type"] == "worker_failed"
 
     async def test_an_unavailable_backend_takes_the_same_flush_path(
@@ -1271,9 +1288,13 @@ class TestProcessInterim:
         ):
             await orch._process(1, Turn("hi"))
 
-        assert frontend.progress == [(1, "halfway"), (1, "and then it broke")]
+        assert _progress_lines(frontend) == [
+            (1, ["halfway"]),
+            (1, ["halfway", "and then it broke"]),
+        ]
         assert order == [2]
         assert "Claude unavailable" in frontend.sent[0][1].body
+        assert frontend.progress_ended == [(1, False)]
         assert event_log.tail(10)[-1]["reason"] == "unavailable"
 
     async def test_an_aborted_turn_cancels_the_relay_without_awaiting(
@@ -1312,6 +1333,7 @@ class TestProcessInterim:
         assert relay._closed is True
         await asyncio.sleep(0)
         assert relay._task.done()
+        assert frontend.progress_ended == [(1, False)]
 
 
 # ---------------------------------------------------------------------------

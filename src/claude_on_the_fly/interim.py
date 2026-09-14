@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 from claude_on_the_fly import settings
@@ -13,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 # Forward the agent's own mid-turn narration into the conversation while the turn
 # runs. Off unless explicitly on: a 40-minute turn is silent today, and this is
-# the fix, but it also posts more messages into somebody's thread than they asked
-# for, so it is opted into. Read per turn (see `_seconds` for why nothing here
+# the fix, but it also puts a machine message into somebody's thread that they did
+# not ask for, so it is opted into. Read per turn (see `_seconds` for why nothing here
 # binds a setting at import).
 INTERIM_PROGRESS_VAR = "COTF_INTERIM_PROGRESS"
 INTERIM_WARMUP_VAR = "COTF_INTERIM_WARMUP_SECONDS"
@@ -32,18 +33,12 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 # much the agent happened to say.
 DEFAULT_INTERIM_WARMUP_S = 300.0
 DEFAULT_INTERIM_MIN_GAP_S = 300.0
-# Narration lines held between posts before the OLDEST is dropped, and the largest
-# single line that may be held. The producer is a stdout reader that must never
-# block, and the limiter can hold the buffer for minutes, so BOTH dimensions need
-# a bound: a line count alone bounds nothing in bytes.
-INTERIM_BUFFER_MAX = 20
-INTERIM_LINE_MAX_CHARS = 500
-# Largest coalesced message handed to a frontend. Owned here rather than deferred
-# to the adapter because trimming is a POLICY question — which end gets cut — and
-# the answer has to agree with the buffer's: newest wins, so whole lines go from
-# the FRONT. The adapter's own per-message limit still applies underneath and is
-# untouched; it is the last resort, not the mechanism.
-INTERIM_MESSAGE_MAX_CHARS = 2000
+# What one progress message shows: the newest lines, each cut to a cap. Constants
+# rather than settings because they are the shape of the message, not pacing. A
+# frontend edits one message in place for the whole turn, so it has to stay short
+# enough to glance at: what the agent is doing now, not a log of the turn.
+INTERIM_DIGEST_LINES = 3
+INTERIM_LINE_MAX_CHARS = 200
 # Coalesced messages awaiting delivery before the newest is dropped. Small,
 # because the limiter already caps delivery at one message per gap: a backlog of
 # more than a couple here means Slack is failing, not that the agent is chatty.
@@ -122,26 +117,11 @@ def interim_min_gap_seconds() -> float:
     return _seconds(INTERIM_MIN_GAP_VAR, DEFAULT_INTERIM_MIN_GAP_S)
 
 
-def _omitted_marker(dropped: int) -> str:
-    """The line a trimmed digest is prefixed with.
-
-    Its own function because its length has to be budgeted for BEFORE it is
-    written, and a marker built at the point it is prepended is a marker nothing
-    measured.
-    """
-    return f"[…{dropped} earlier line(s) omitted]"
-
-
-def _digest_length(lines: list[str], dropped: int) -> int:
-    """How long the finished message would be, the marker included.
-
-    `len(x) + 1` per part counts one newline too many (n parts are joined by
-    n - 1 of them), which is the safe direction to be wrong about a cap.
-    """
-    total = sum(len(x) + 1 for x in lines)
-    if dropped:
-        total += len(_omitted_marker(dropped)) + 1
-    return total
+def _elapsed_header(seconds: float) -> str:
+    """The first line of a progress message: how long the turn has run."""
+    minutes, secs = divmod(int(seconds), 60)
+    elapsed = f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+    return f"Running for {elapsed}"
 
 
 class InterimProgress:
@@ -180,35 +160,34 @@ class InterimProgress:
         self._warmup = interim_warmup_seconds()
         self._min_gap = interim_min_gap_seconds()
         self._last_post: float | None = None
-        self._buffer: list[str] = []
+        # The newest lines of the turn, posted or not: each message replaces the
+        # one before it, so it shows these rather than only what is new.
+        self._lines: deque[str] = deque(maxlen=INTERIM_DIGEST_LINES)
+        # Lines received since the last post. Zero means there is nothing to say.
+        self._fresh = 0
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=INTERIM_QUEUE_MAX)
         self._closed = False
         self._task = asyncio.create_task(self._drain())
 
     def emit(self, text: str) -> None:
-        """Hold one narration line, and release the whole buffer if it is due.
+        """Hold one narration block, and post if it is due.
 
         Never blocks, never raises: it runs inside the agent's stdout read loop.
 
-        The line is capped before it is held. The buffer bounds how MANY lines
-        wait, which bounds nothing at all in bytes on its own — one narration
-        block can be tens of thousands of characters, and the limiter may hold it
-        for minutes.
+        A block is split into its lines, because the message shows a count of
+        lines and one block can be a paragraph. Each line is cut before it is
+        held, and only the newest few are held, so neither dimension grows while
+        the limiter waits.
         """
         if self._closed:
             return
-        if len(text) > INTERIM_LINE_MAX_CHARS:
-            text = text[:INTERIM_LINE_MAX_CHARS] + " […]"
-        self._buffer.append(text)
-        if len(self._buffer) > INTERIM_BUFFER_MAX:
-            # Drop the OLDEST: what the agent is doing now is what a waiting
-            # person wants. `_post_buffer` trims from the front for the same
-            # reason, so both size policies agree that the newest survives.
-            self._buffer.pop(0)
-            logger.warning(
-                "interim: more than %d lines held, dropped the oldest",
-                INTERIM_BUFFER_MAX,
-            )
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            if len(line) > INTERIM_LINE_MAX_CHARS:
+                line = line[: INTERIM_LINE_MAX_CHARS - 1] + "…"
+            self._lines.append(line)
+            self._fresh += 1
         self._flush_if_due()
 
     def _flush_if_due(self) -> None:
@@ -229,7 +208,7 @@ class InterimProgress:
         path's deliberate flush calls `_post_buffer` directly and is, correctly,
         not subject to that guard.
         """
-        if self._closed or not self._buffer:
+        if self._closed or not self._fresh:
             return
         if not self._warmed_up():
             return
@@ -249,48 +228,17 @@ class InterimProgress:
         return self._now() - self._start >= self._warmup
 
     def _post_buffer(self) -> None:
-        """Enqueue everything held as ONE message. Sync; drops rather than blocks.
+        """Enqueue one message: the elapsed time, then the newest lines.
 
-        Trims from the FRONT, by whole lines, so the two size policies agree on
-        newest-wins: the buffer drops its OLDEST line on overflow because what the
-        agent is doing now is what a waiting person wants — and a frontend that
-        truncates at the tail would then cut off exactly the lines that policy
-        just protected. Doing it here, in whole lines, keeps the frontend's own
-        limit untouched and leaves it as a backstop rather than the mechanism.
-
-        A trim says so twice — a WARNING in the log and a marker on the message
-        itself — because at ordinary narration lengths a full buffer routinely
-        exceeds the cap, so this is a normal path and not a pathological one, and
-        because both neighbouring size policies already announce themselves:
-        `emit` marks a line it capped and warns about a line it dropped. A reader
-        who cannot tell that something was cut has no reason to go looking for it.
-
-        The marker is budgeted for INSIDE the loop rather than prepended after
-        it: a marker added to a message already trimmed to the cap puts it back
-        over the cap, which is the one thing this method exists to prevent. The
-        cap therefore holds whenever the marker fits — the `len(lines) > 1` guard
-        is deliberately stronger, so a single line plus its marker still ships
-        rather than the trim eating the last thing the agent said.
+        Sync; drops rather than blocks. The frontend edits one message in place,
+        so this message replaces the one before it. That is why it repeats the
+        newest lines already posted instead of carrying only the new ones.
         """
-        if not self._buffer:
+        if not self._fresh:
             return
-        lines = self._buffer
-        self._buffer = []
-        dropped = 0
-        while (
-            len(lines) > 1
-            and _digest_length(lines, dropped) > INTERIM_MESSAGE_MAX_CHARS
-        ):
-            lines.pop(0)
-            dropped += 1
-        if dropped:
-            logger.warning(
-                "interim: digest over %d chars, dropped the %d oldest line(s)",
-                INTERIM_MESSAGE_MAX_CHARS,
-                dropped,
-            )
-            lines.insert(0, _omitted_marker(dropped))
-        text = "\n".join(lines)
+        self._fresh = 0
+        header = _elapsed_header(self._now() - self._start)
+        text = "\n".join([header, *self._lines])
         try:
             self._queue.put_nowait(text)
         except asyncio.QueueFull:
@@ -366,13 +314,13 @@ class InterimProgress:
         self._closed = True
         if flush and self._warmed_up():
             self._post_buffer()
-        elif self._buffer:
+        elif self._fresh:
             logger.debug(
                 "interim: dropped %d held progress line(s); the turn's own "
                 "message is next",
-                len(self._buffer),
+                self._fresh,
             )
-            self._buffer.clear()
+            self._fresh = 0
         try:
             await asyncio.wait_for(self._queue.join(), timeout=INTERIM_CLOSE_GRACE)
         except TimeoutError:

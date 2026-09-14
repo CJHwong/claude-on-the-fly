@@ -19,6 +19,11 @@ from claude_on_the_fly.interim import (
 _LOGGER = "claude_on_the_fly.interim"
 
 
+def _bodies(sent: list[str]) -> list[str]:
+    """Each progress message without its elapsed-time header line."""
+    return [text.split("\n", 1)[1] for text in sent]
+
+
 @pytest.fixture
 async def make_relay(monkeypatch):
     """Build an InterimProgress and guarantee its drain task is stopped.
@@ -152,7 +157,7 @@ class TestInterimPacingSettings:
         relay.emit("held by the default gap")
         await asyncio.sleep(0)
 
-        assert sent == ["first"]
+        assert _bodies(sent) == ["first"]
         assert relay._min_gap == interim_mod.DEFAULT_INTERIM_MIN_GAP_S
 
     async def test_the_relay_reads_them_per_turn(self, make_relay, monkeypatch):
@@ -170,7 +175,7 @@ class TestInterimPacingSettings:
         relay.emit("straight away")
         await asyncio.sleep(0)
 
-        assert sent == ["straight away"]
+        assert _bodies(sent) == ["straight away"]
 
 
 class TestInterimProgress:
@@ -188,9 +193,9 @@ class TestInterimProgress:
         await asyncio.sleep(0)
 
         assert sent == []
-        assert relay._buffer == ["a", "b"]
+        assert list(relay._lines) == ["a", "b"]
 
-    async def test_the_first_post_coalesces_everything_held(self, make_relay):
+    async def test_the_first_post_shows_the_newest_three_lines(self, make_relay):
         sent: list[str] = []
         clock = [0.0]
 
@@ -205,7 +210,7 @@ class TestInterimProgress:
         relay.emit("four")
         await asyncio.sleep(0)
 
-        assert sent == ["one\ntwo\nthree\nfour"]
+        assert _bodies(sent) == ["two\nthree\nfour"]
 
     async def test_a_line_inside_the_gap_is_held(self, make_relay):
         sent: list[str] = []
@@ -222,8 +227,8 @@ class TestInterimProgress:
         relay.emit("inside the gap")
         await asyncio.sleep(0)
 
-        assert sent == ["first"]
-        assert relay._buffer == ["inside the gap"]
+        assert _bodies(sent) == ["first"]
+        assert relay._fresh == 1
 
     async def test_the_held_line_goes_out_once_the_gap_elapses(self, make_relay):
         sent: list[str] = []
@@ -242,7 +247,9 @@ class TestInterimProgress:
         relay.emit("new")
         await asyncio.sleep(0)
 
-        assert sent == ["first", "held\nnew"]
+        # The message is edited in place, so each one repeats what is still
+        # among the newest three rather than only what arrived since the last.
+        assert _bodies(sent) == ["first", "first\nheld\nnew"]
 
     async def test_the_ticker_posts_a_line_that_arrived_before_the_warm_up(
         self, make_relay, monkeypatch
@@ -265,7 +272,7 @@ class TestInterimProgress:
         clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
         await asyncio.sleep(0.01)
 
-        assert sent == ["halfway"]
+        assert _bodies(sent) == ["halfway"]
 
     async def test_a_tick_before_the_warm_up_posts_nothing(
         self, make_relay, monkeypatch
@@ -317,12 +324,9 @@ class TestInterimProgress:
 
         assert sent == []
 
-    async def test_the_buffer_drops_the_oldest_when_full(
-        self, make_relay, monkeypatch, caplog
-    ):
-        """The cap runs after every append, so the buffer never exceeds the max:
-        a,b,c -> [b,c], then d -> [c,d]."""
-        monkeypatch.setattr(interim_mod, "INTERIM_BUFFER_MAX", 2)
+    async def test_the_header_is_the_elapsed_time(self, make_relay, monkeypatch):
+        monkeypatch.setenv("COTF_INTERIM_WARMUP_SECONDS", "0")
+        monkeypatch.setenv("COTF_INTERIM_MIN_GAP_SECONDS", "0")
         sent: list[str] = []
         clock = [0.0]
 
@@ -330,122 +334,19 @@ class TestInterimProgress:
             sent.append(text)
 
         relay = make_relay(send, now=lambda: clock[0])
-        with caplog.at_level("WARNING", logger=_LOGGER):
-            relay.emit("a")
-            relay.emit("b")
-            relay.emit("c")
-            clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
-            relay.emit("d")
-            await asyncio.sleep(0)
-
-        assert sent == ["c\nd"]
-        assert "dropped the oldest" in caplog.text
-
-    async def test_an_overlong_line_is_capped_before_it_is_held(
-        self, make_relay, monkeypatch
-    ):
-        monkeypatch.setattr(interim_mod, "INTERIM_LINE_MAX_CHARS", 10)
-        sent: list[str] = []
-        clock = [0.0]
-
-        async def send(text: str) -> None:
-            sent.append(text)
-
-        relay = make_relay(send, now=lambda: clock[0])
-        relay.emit("x" * 40)
-        clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
-        relay.emit("y")
+        clock[0] = 45.4
+        relay.emit("a")
+        await asyncio.sleep(0)
+        clock[0] = 3725.0
+        relay.emit("b")
         await asyncio.sleep(0)
 
-        assert sent == ["xxxxxxxxxx […]\ny"]
+        assert [text.split("\n", 1)[0] for text in sent] == [
+            "Running for 45s",
+            "Running for 62m 05s",
+        ]
 
-    async def test_an_overlong_digest_is_trimmed_from_the_front(
-        self, make_relay, monkeypatch
-    ):
-        """Newest wins, so the trim agrees with the buffer's drop-oldest rule.
-
-        The cap is patched well clear of the marker's own length, because the
-        marker is part of what has to fit: budget it and four lines go, ignore it
-        and the loop stops after one and ships 83 characters against a cap of 60.
-        """
-        monkeypatch.setattr(interim_mod, "INTERIM_MESSAGE_MAX_CHARS", 60)
-        sent: list[str] = []
-        clock = [0.0]
-
-        async def send(text: str) -> None:
-            sent.append(text)
-
-        relay = make_relay(send, now=lambda: clock[0])
-        for line in ("aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"):
-            relay.emit(line)
-        relay.emit("eeeeeeeeee")
-        clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
-        relay.emit("ffffffffff")
-        await asyncio.sleep(0)
-
-        assert sent == ["[…4 earlier line(s) omitted]\neeeeeeeeee\nffffffffff"]
-        assert len(sent[0]) <= interim_mod.INTERIM_MESSAGE_MAX_CHARS
-
-    async def test_a_trimmed_digest_says_so_in_the_message_and_in_the_log(
-        self, make_relay, monkeypatch, caplog
-    ):
-        """Both neighbouring size policies announce themselves, and this one is
-        reached at ordinary narration lengths rather than pathological ones — so a
-        reader has to be able to tell that the count they can see is not all of
-        them.
-
-        And the message that carries the marker is still inside the cap: a marker
-        prepended after the trim loop is a marker nothing budgeted for, which
-        breaks the very limit the trim was enforcing.
-        """
-        monkeypatch.setattr(interim_mod, "INTERIM_MESSAGE_MAX_CHARS", 60)
-        sent: list[str] = []
-        clock = [0.0]
-
-        async def send(text: str) -> None:
-            sent.append(text)
-
-        relay = make_relay(send, now=lambda: clock[0])
-        with caplog.at_level("WARNING", logger=_LOGGER):
-            for line in ("aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"):
-                relay.emit(line)
-            relay.emit("eeeeeeeeee")
-            clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
-            relay.emit("ffffffffff")
-            await asyncio.sleep(0)
-
-        assert len(sent) == 1
-        assert sent[0].startswith("[…4 earlier line(s) omitted]\n")
-        assert len(sent[0]) <= interim_mod.INTERIM_MESSAGE_MAX_CHARS
-        assert "dropped the 4 oldest line(s)" in caplog.text
-
-    async def test_an_untrimmed_digest_carries_no_marker(self, make_relay):
-        """The marker is guarded on a trim having happened: the common case is a
-        digest well inside the cap, and a "0 omitted" line would be noise on it."""
-        sent: list[str] = []
-        clock = [0.0]
-
-        async def send(text: str) -> None:
-            sent.append(text)
-
-        relay = make_relay(send, now=lambda: clock[0])
-        relay.emit("aaa")
-        clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
-        relay.emit("bbb")
-        await asyncio.sleep(0)
-
-        assert sent == ["aaa\nbbb"]
-
-    async def test_a_single_line_over_the_message_cap_is_still_sent(
-        self, make_relay, monkeypatch
-    ):
-        """The trim loop stops at one line rather than eating the last one.
-
-        Both caps are patched: with the real values a held line is already capped
-        well under the message cap, so no single line can exceed it.
-        """
-        monkeypatch.setattr(interim_mod, "INTERIM_MESSAGE_MAX_CHARS", 12)
-        monkeypatch.setattr(interim_mod, "INTERIM_LINE_MAX_CHARS", 40)
+    async def test_an_overlong_line_is_cut_to_the_cap(self, make_relay):
         sent: list[str] = []
         clock = [0.0]
 
@@ -454,10 +355,42 @@ class TestInterimProgress:
 
         relay = make_relay(send, now=lambda: clock[0])
         clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
-        relay.emit("z" * 30)
+        relay.emit("x" * 5000)
         await asyncio.sleep(0)
 
-        assert sent == ["z" * 30]
+        (line,) = _bodies(sent)
+        assert len(line) == interim_mod.INTERIM_LINE_MAX_CHARS == 200
+        assert line.endswith("…")
+
+    async def test_a_multi_line_block_counts_as_its_lines(self, make_relay):
+        """Three lines means three lines on screen, not three narration blocks
+        that could each be a paragraph. Blank lines carry nothing."""
+        sent: list[str] = []
+        clock = [0.0]
+
+        async def send(text: str) -> None:
+            sent.append(text)
+
+        relay = make_relay(send, now=lambda: clock[0])
+        clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
+        relay.emit("a\n\nb\nc\n   \nd")
+        await asyncio.sleep(0)
+
+        assert _bodies(sent) == ["b\nc\nd"]
+
+    async def test_a_blank_block_posts_nothing(self, make_relay):
+        sent: list[str] = []
+        clock = [0.0]
+
+        async def send(text: str) -> None:
+            sent.append(text)
+
+        relay = make_relay(send, now=lambda: clock[0])
+        clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
+        relay.emit("\n  \n")
+        await asyncio.sleep(0)
+
+        assert sent == []
 
     async def test_a_dropped_message_does_not_start_the_gap(
         self, make_relay, monkeypatch
@@ -507,7 +440,7 @@ class TestInterimProgress:
             relay.emit("second")
             relay.emit("third")
 
-        assert sent == ["first"]
+        assert _bodies(sent) == ["first"]
         assert "dropping a progress message" in caplog.text
         gate.set()
 
@@ -531,7 +464,7 @@ class TestInterimProgress:
             relay.emit("two")
             await asyncio.sleep(0)
 
-        assert calls == ["one", "two"]
+        assert _bodies(calls) == ["one", "one\ntwo"]
         assert "could not post" in caplog.text
 
     async def test_emit_after_close_is_ignored(self, make_relay):
@@ -548,7 +481,7 @@ class TestInterimProgress:
         await asyncio.sleep(0)
 
         assert sent == []
-        assert relay._buffer == []
+        assert list(relay._lines) == []
 
     async def test_close_is_idempotent(self, make_relay):
         sent: list[str] = []
@@ -592,12 +525,12 @@ class TestInterimProgress:
         clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
         relay.emit("a")
         await asyncio.sleep(0)
-        assert sent == ["a"]
+        assert _bodies(sent) == ["a"]
 
         relay.emit("b")
         await relay.aclose(flush=True)
 
-        assert sent == ["a", "b"]
+        assert _bodies(sent) == ["a", "a\nb"]
 
     async def test_close_with_flush_before_the_warm_up_posts_nothing(
         self, make_relay, caplog
@@ -618,7 +551,7 @@ class TestInterimProgress:
             await relay.aclose(flush=True)
 
         assert sent == []
-        assert relay._buffer == []
+        assert relay._fresh == 0
         assert "dropped 1 held progress line(s)" in caplog.text
 
     async def test_close_with_flush_and_an_empty_buffer_posts_nothing(self, make_relay):
@@ -650,7 +583,7 @@ class TestInterimProgress:
         clock[0] = interim_mod.DEFAULT_INTERIM_WARMUP_S + 1
         relay.emit("stuck")
         await asyncio.sleep(0)
-        assert sent == ["stuck"]
+        assert _bodies(sent) == ["stuck"]
 
         with caplog.at_level("WARNING", logger=_LOGGER):
             await relay.aclose()

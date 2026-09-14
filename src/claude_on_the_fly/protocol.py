@@ -167,10 +167,12 @@ class Frontend(ABC):
 
         Called only while a turn is running, only when `interim.progress` is on,
         and only with the main agent's own text — not thinking, not sub-agent
-        output. The caller has already coalesced and rate-limited it, so one call
-        is one message the user should see. Implementations must mark it as machine
-        progress, distinct from the reply `send()` will post, and must not count it
-        against any reply budget.
+        output. The caller has already coalesced and rate-limited it, and each call
+        carries the whole current progress text: an implementation that can edit a
+        message should replace the turn's previous progress message rather than
+        add another. Implementations must mark it as machine progress, distinct
+        from the reply `send()` will post, and must not count it against any reply
+        budget.
 
         No-op by default, so a frontend with no thread to put it in — or no wish
         to — behaves exactly as it did before this existed.
@@ -180,6 +182,20 @@ class Frontend(ABC):
         next rate-limiting gap by the time this runs. A dropped message therefore
         costs a whole gap of silence rather than being retried — the accepted
         price of not putting a delivery-outcome contract on every frontend.
+        """
+
+    async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
+        """Close the turn's progress message. No-op by default.
+
+        Called once at the end of every turn that started a progress relay,
+        after the turn's own message. `succeeded` is True when the agent
+        answered: the answer now says everything the progress message did, so an
+        implementation may remove it. On a failure or a stop, the progress
+        message is the last record of what the agent was doing, so it stays.
+
+        Either way the implementation must forget the message, so the next
+        turn's `send_progress` starts a new one instead of editing this one.
+        Best-effort, like `send_progress`.
         """
 
     async def ask_approval(

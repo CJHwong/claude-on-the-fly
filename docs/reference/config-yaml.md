@@ -125,16 +125,24 @@ separates a crash from a deliberate stop or from the middle of an upgrade. See
 
 | Key | Type / default | Values and effect | Lifecycle |
 |---|---|---|---|
-| `progress` | boolean / false | Forward the agent's mid-turn narration into the thread as it is produced | Immediate |
-| `warmup_seconds` | number / `300` | Silence before a turn's first progress message; `0` posts from the first line; negative or invalid uses default | Immediate |
-| `min_gap_seconds` | number / `300` | Shortest gap between two progress messages; `0` posts every line as it arrives; negative or invalid uses default | Immediate |
+| `progress` | boolean / false | Show the agent's mid-turn narration in one progress message in the thread | Immediate |
+| `warmup_seconds` | number / `300` | Silence before a turn's progress message first appears; `0` shows it from the first line; negative or invalid uses default | Immediate |
+| `min_gap_seconds` | number / `300` | Shortest gap between two updates of the progress message; `0` updates it on every line; negative or invalid uses default | Immediate |
 
 Interim progress needs a line-by-line stream, so it is inert under `agent.claude.mode:
 pty` and on a frontend that does not implement progress delivery (today, Telegram).
 Claude native/ollama provides the required stream, and so does every Codex mode: Codex narrates from its rollout, which a hosted pane does not change. It posts only
 in DMs and group DMs, is paced by `warmup_seconds` and `min_gap_seconds` so a short turn
-produces nothing and a long one a periodic digest, and it does not count against
+produces nothing and a long one a periodic update, and it does not count against
 `slack.reply_soft_limit`.
+
+A turn normally has one progress message, and each update edits it in place. The
+message shows how long the turn has run, then the agent's newest 3 lines, each cut to
+200 characters. If an update is too big to edit (over Slack's `chat.update` size
+limit) or an edit fails, the update posts a new message and later updates edit that
+one. When the turn answers, all of its progress messages are deleted. When the turn
+fails, times out, or is stopped with `$stop`, they stay. The next turn starts a new
+message and never edits a kept one.
 
 ## `egress`
 
