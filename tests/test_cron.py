@@ -920,12 +920,14 @@ class TestReload:
         assert cron._state["a"].entry.timeout == 200
 
     def test_a_changed_cron_reschedules(self, tmp_path: Path) -> None:
+        """The two schedules never share a fire minute (:00 of hour nine against
+        :30 of any hour), so the assertion cannot depend on the wall clock."""
         path = cfg(tmp_path, {"name": "a", "cron": "0 9 * * *", "prompt": "x"})
         cron = daemon(tmp_path, path)
         cron.reload()
         before = cron._state["a"].next_fire
 
-        write_config(path, [{"name": "a", "cron": "*/5 * * * *", "prompt": "x"}])
+        write_config(path, [{"name": "a", "cron": "30 * * * *", "prompt": "x"}])
         cron.reload()
 
         assert cron._state["a"].next_fire != before

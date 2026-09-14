@@ -20,7 +20,8 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3 and _RUNTIME_1.._RUNTIME_5
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_5
+;; and _ANCESTOR_1.._ANCESTOR_8
 ;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
 (version 1)
@@ -108,6 +109,23 @@
 (allow file-read* (subpath (param "_EXTRA_1")))
 (allow file-read* (subpath (param "_EXTRA_2")))
 (allow file-read* (subpath (param "_EXTRA_3")))
+;; Metadata on the directories between $HOME and the project dir. The subpath
+;; grant on _PROJECT_DIR does not reach its parents, and the opaque $HOME denies
+;; stat() on them, so a tool that canonicalizes its cwd fails before it starts:
+;; git's repository discovery realpath()s every component, and `git init`,
+;; `git clone` and `git status` inside the workspace all died with "Operation
+;; not permitted" on the home directory. Metadata only, and one literal per
+;; link: the name and mode of each directory on the path, never its listing or
+;; its siblings. Eight slots because SBPL has no arrays; unused ones repeat
+;; _PROJECT_DIR, already allowed above.
+(allow file-read-metadata (literal (param "_ANCESTOR_1")))
+(allow file-read-metadata (literal (param "_ANCESTOR_2")))
+(allow file-read-metadata (literal (param "_ANCESTOR_3")))
+(allow file-read-metadata (literal (param "_ANCESTOR_4")))
+(allow file-read-metadata (literal (param "_ANCESTOR_5")))
+(allow file-read-metadata (literal (param "_ANCESTOR_6")))
+(allow file-read-metadata (literal (param "_ANCESTOR_7")))
+(allow file-read-metadata (literal (param "_ANCESTOR_8")))
 ;; -- Cross-thread session stores --
 ;; Placed here, after every allow above, for the reason the _DATA_DIR denies below
 ;; are placed last: SBPL is last-match-wins, and an operator grant or a runtime

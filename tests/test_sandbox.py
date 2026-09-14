@@ -286,6 +286,81 @@ def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
     assert f"_EXTRA_2={project}" in out and f"_EXTRA_3={project}" in out
 
 
+def test_home_ancestors_walks_from_the_home_to_the_project_parent():
+    from claude_on_the_fly import sandbox_macos
+
+    assert sandbox_macos.home_ancestors(
+        "/u/me/.cotf/workspaces/slack/dm/U1", "/u/me"
+    ) == [
+        "/u/me",
+        "/u/me/.cotf",
+        "/u/me/.cotf/workspaces",
+        "/u/me/.cotf/workspaces/slack",
+        "/u/me/.cotf/workspaces/slack/dm",
+    ]
+
+
+def test_home_ancestors_is_empty_when_the_project_is_not_under_the_home():
+    from claude_on_the_fly import sandbox_macos
+
+    # Reads outside $HOME are allowed already, so there is nothing to re-grant.
+    assert sandbox_macos.home_ancestors("/srv/cotf/ws", "/u/me") == []
+    assert sandbox_macos.home_ancestors("/u/me", "/u/me") == []
+
+
+def test_wrap_deny_most_grants_metadata_on_the_project_ancestors(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    home = tmp_path / "home"
+    project = home / "data" / "workspaces" / "ws"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    out = sandbox.wrap(["claude"], project)
+    resolved_home = str(home.resolve())
+    resolved = str(project.resolve())
+    slots = {
+        a.split("=", 1)[0]: a.split("=", 1)[1]
+        for a in out
+        if a.startswith("_ANCESTOR_")
+    }
+    assert len(slots) == 8
+    # $HOME down to the project's parent, then the (already allowed) project pads the rest.
+    assert slots["_ANCESTOR_1"] == resolved_home
+    assert slots["_ANCESTOR_2"] == f"{resolved_home}/data"
+    assert slots["_ANCESTOR_3"] == f"{resolved_home}/data/workspaces"
+    assert all(slots[f"_ANCESTOR_{i}"] == resolved for i in range(4, 9))
+
+
+def test_jail_argv_keeps_the_deepest_ancestors_when_the_chain_overflows(
+    tmp_path, caplog
+):
+    from claude_on_the_fly import sandbox_macos
+
+    chain = [f"/h/{i}" for i in range(10)]
+    with caplog.at_level("WARNING"):
+        out = sandbox_macos.jail_argv(
+            ["claude"],
+            home="/h",
+            data_dir="/h/d",
+            project=str(tmp_path),
+            tmpdir="/tmp",
+            claude_config="/h/.claude",
+            claude_projects="/h/.claude/projects",
+            claude_project="/h/.claude/projects/x",
+            codex_sessions="/h/.codex/sessions",
+            codex_home="/h/.codex",
+            base=sandbox_macos._DENY_MOST_PROFILE,
+            loopback=("a", "b", "c", "d"),
+            extra_paths=[],
+            ancestor_paths=chain,
+        )
+    assert "_ANCESTOR_1=/h/2" in out and "_ANCESTOR_8=/h/9" in out
+    assert "only the deepest 8" in caplog.text
+
+
 # --- operator read grants that would undo the profile ---
 
 

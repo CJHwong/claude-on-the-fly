@@ -1538,9 +1538,10 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     # `write_denied` whatever the setting says, so the shared tree keeps its
     # instruction files read-only there either way.
     codex_write = codex_home if scoped_sessions() else codex_sessions
+    resolved = sandbox_macos.realpaths(workspace, DATA_DIR)
     return sandbox_macos.jail_argv(
         argv,
-        **sandbox_macos.realpaths(workspace, DATA_DIR),
+        **resolved,
         claude_config=claude_config,
         claude_projects=claude_projects,
         claude_project=claude_project,
@@ -1551,6 +1552,9 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
+        ancestor_paths=sandbox_macos.home_ancestors(
+            resolved["project"], resolved["home"]
+        ),
     )
 
 
