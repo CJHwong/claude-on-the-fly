@@ -520,6 +520,31 @@ class TestMigrateWorkspacesFlag:
         ).is_file()
         assert not old.exists()
 
+    def test_slack_reads_the_token_from_the_data_dir_env_file(
+        self, monkeypatch, no_dotenv, capsys, tmp_path
+    ):
+        """A hand-run CLI has no supervisor to merge `.env` in, so it merges the
+        file itself; otherwise the token beside the workspaces is invisible."""
+        from claude_on_the_fly import migration
+
+        monkeypatch.setattr("sys.argv", ["claude-slack", "--migrate-workspaces"])
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", tmp_path)
+        for name in ("SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+        (tmp_path / ".env").write_text("SLACK_TOKEN=xoxb-from-file\n")
+        seen: list[str] = []
+
+        def directory(client):
+            seen.append(client.token)
+            return lambda kind, label: None
+
+        monkeypatch.setattr(migration, "SlackDirectory", directory)
+        with pytest.raises(SystemExit) as exit_info:
+            slack_mod.main()
+        assert exit_info.value.code == 0
+        assert seen == ["xoxb-from-file"]
+
     def test_slack_refuses_without_a_token(self, monkeypatch, no_dotenv, capsys):
         monkeypatch.setattr("sys.argv", ["claude-slack", "--migrate-workspaces"])
         for name in ("SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"):

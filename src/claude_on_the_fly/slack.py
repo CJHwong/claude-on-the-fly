@@ -3864,15 +3864,23 @@ def migrate_workspaces(*, apply: bool) -> int:
     The lookups need only a bearer token, so the full preflight (Socket Mode app
     token, sender lists) is not run: an operator migrating a data directory may
     do it from a host where the daemon is not configured to start.
+
+    The token is read the way the daemon receives it, `DATA_DIR/.env` merged over
+    the shell (`envfile.daemon_environment`). `load_dotenv()` in `main` searches
+    from this file's directory, not the working one, so a hand-run CLI never saw
+    the file: measured on a deployed host, the dry run asked for `SLACK_TOKEN`
+    with the token sitting in `.env` beside the workspaces.
     """
     import sys
 
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
 
-    from claude_on_the_fly import checks, migration, settings
+    from claude_on_the_fly import checks, envfile, migration, settings
 
-    _, token = checks.resolve_slack_token(settings.environment())
+    _, token = checks.resolve_slack_token(
+        settings.environment(envfile.daemon_environment())
+    )
     if not token:
         sys.stderr.write("claude-slack: set SLACK_TOKEN to resolve names to ids\n")
         return 2
