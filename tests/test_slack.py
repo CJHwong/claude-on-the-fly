@@ -1276,6 +1276,20 @@ class TestSendProgress:
         assert kwargs["ts"] == "99.0"
         assert "still working, more" in kwargs["blocks"][0]["elements"][0]["text"]
 
+    async def test_a_long_cjk_edit_keeps_the_text_field_under_the_byte_cap(
+        self, frontend
+    ):
+        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`, and
+        the edit would fall back to a new post every time. CJK passes the block's
+        character cap long before it passes that byte cap."""
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "開始")
+        await frontend.send_progress(session_id, "進度" * 1400)
+
+        kwargs = frontend._app.client.chat_update.await_args.kwargs
+        assert len(kwargs["text"].encode("utf-8")) <= 4000
+        frontend._app.client.chat_postMessage.assert_awaited_once()
+
     async def test_a_failed_edit_posts_a_fresh_message_and_edits_that_one_next(
         self, frontend, caplog
     ):

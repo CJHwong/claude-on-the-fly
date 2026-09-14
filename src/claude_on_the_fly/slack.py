@@ -3370,7 +3370,10 @@ class SlackFrontend(Frontend):
         if existing is not None:
             try:
                 await self._app.client.chat_update(
-                    channel=existing[0], ts=existing[1], text=rendered, blocks=blocks
+                    channel=existing[0],
+                    ts=existing[1],
+                    text=fit_text_field(rendered),
+                    blocks=blocks,
                 )
                 return
             except Exception as exc:
