@@ -27,7 +27,7 @@ claude-slack --migrate-workspaces
 claude-telegram --migrate-workspaces
 ```
 
-Slack needs `SLACK_TOKEN` set, because the old names hold display names and the new names need Slack ids. One line prints per directory:
+Slack reads `SLACK_TOKEN` from `.env` in the data directory, or from the shell, because the old names hold display names and the new names need Slack ids. One line prints per directory:
 
 ```
 dm-hoss-1786342813-662689 -> slack/dm/U01ABCDEF/threads/1786342813-662689  sessions=1
