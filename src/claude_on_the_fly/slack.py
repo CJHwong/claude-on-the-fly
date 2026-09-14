@@ -986,6 +986,10 @@ def _skill_option_groups(skills: list[tuple[str, str]]) -> list[dict]:
     return groups[:100]
 
 
+def _string_or(value: object, default: str) -> str:
+    return value if isinstance(value, str) else default
+
+
 def _session_key(channel: str, thread_ts: str | None) -> int:
     raw = f"{channel}:{thread_ts or 'root'}"
     return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
@@ -1545,7 +1549,56 @@ class SlackFrontend(Frontend):
             # The newest entry is this turn's: the frontend appends it before
             # dispatching, so `route_for` runs after that append.
             route["message_ts"] = pending[-1][1]
+        workspace = self._session_metadata(chat_id)
+        if workspace is not None:
+            route["workspace"] = workspace
         return route
+
+    def _session_metadata(self, chat_id: int) -> dict | None:
+        """What `_resolve_session_metadata` filled in, as one journalable dict.
+
+        A replay runs before any message arrives to resolve the thread again,
+        and `restore_route` is synchronous with no Slack client to ask. Carrying
+        the resolved names with the turn is what keeps a replayed turn in the
+        workspace the person was in: without them `workspace_name` falls back to
+        `slack/<session key>`, a directory nothing else ever uses, and the turn
+        runs in an empty one with no memory of the thread.
+        """
+        name = self._workspace_names.get(chat_id)
+        if name is None:
+            return None
+        return {
+            "name": name,
+            "legacy": self._legacy_workspace_names.get(chat_id),
+            "thread_key": self._thread_keys.get(chat_id, "root"),
+            "sender_id": self._session_sender_ids.get(chat_id),
+            "sender_name": self._sender_names.get(chat_id),
+            "context": self._channel_contexts.get(chat_id),
+            "channel_name": self._channel_names.get(chat_id),
+        }
+
+    def _restore_metadata(self, chat_id: int, workspace: object) -> None:
+        """Put back what `_session_metadata` journaled. A route from before the
+        field existed, or a junk one, leaves the tables alone: the next typed
+        message resolves the thread, the same as it always did."""
+        if chat_id in self._workspace_names or not isinstance(workspace, dict):
+            return
+        name = workspace.get("name")
+        if not isinstance(name, str) or not name:
+            return
+        self._workspace_names[chat_id] = name
+        self._thread_keys[chat_id] = _string_or(workspace.get("thread_key"), "root")
+        self._channel_names[chat_id] = _string_or(workspace.get("channel_name"), "")
+        optional = (
+            ("legacy", self._legacy_workspace_names),
+            ("sender_id", self._session_sender_ids),
+            ("sender_name", self._sender_names),
+            ("context", self._channel_contexts),
+        )
+        for key, table in optional:
+            value = workspace.get(key)
+            if isinstance(value, str) and value:
+                table[chat_id] = value
 
     def restore_route(self, chat_id: int, route: dict) -> None:
         """Re-register a journaled turn so a replay behaves like a fresh message.
@@ -1571,6 +1624,7 @@ class SlackFrontend(Frontend):
         self._remember_session(
             chat_id, channel, thread_ts if isinstance(thread_ts, str) else None
         )
+        self._restore_metadata(chat_id, route.get("workspace"))
         message_ts = route.get("message_ts")
         if isinstance(message_ts, str) and message_ts:
             # Appended in replay order, because notify_start pops from the left.
@@ -1923,10 +1977,14 @@ class SlackFrontend(Frontend):
         await self._retire_suggestion_menu(body, label)
         # A tap can arrive after a restart or a cap eviction emptied _sessions,
         # so the thread is registered here exactly as a typed message registers
-        # it. Without this, send() has no route for the reply.
-        self._remember_session(
-            chat_id, channel, (body.get("message") or {}).get("thread_ts")
-        )
+        # it: the route, or send() has nowhere to reply, and the workspace, or
+        # the turn runs in `slack/<session key>` instead of the conversation's
+        # directory. The tap carries who pressed it, which is all a DM needs.
+        thread_ts = (body.get("message") or {}).get("thread_ts")
+        if chat_id in self._workspace_names:
+            self._remember_session(chat_id, channel, thread_ts)
+        else:
+            await self._enter_command_session(channel, sender_id, thread_ts)
         # Mirror the typed-message bookkeeping: one (channel, ts) and one
         # suppressed flag per dispatched turn, so notify_start pairs this
         # turn's reactions with its own message instead of the next one's.

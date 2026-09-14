@@ -16,6 +16,7 @@ from slack_sdk.errors import SlackApiError
 from claude_on_the_fly import settings
 from claude_on_the_fly import slack as slack_mod
 from claude_on_the_fly.agent import Response
+from claude_on_the_fly.protocol import LegacyWorkspace
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
     DEFAULT_JOB_COMMAND,
@@ -4495,6 +4496,35 @@ class TestSuggestionActions:
         assert "what can you do?" in text
         assert text.startswith("[from-id: U_ALLOWED]")
 
+    async def test_a_tap_after_a_restart_resolves_the_workspace(self, frontend):
+        """A tap is the first contact for a thread the restart forgot. It used
+        to register only the route, so the turn ran in `slack/<session key>`."""
+        frontend._app.client.chat_update = AsyncMock()
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"is_im": True}
+        }
+        chat_id = _session_key("D1", "t1")
+
+        await frontend._on_suggestion_action(self._tap(channel="D1"))
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U_ALLOWED"
+        assert frontend.sender_identity(chat_id) == "U_ALLOWED"
+        assert frontend._sessions[chat_id] == ("D1", "t1")
+        frontend._on_message.assert_awaited_once()
+
+    async def test_a_tap_on_a_known_thread_does_not_ask_slack_again(self, frontend):
+        chat_id = _session_key("C1", "t1")
+        frontend._remember_session(chat_id, "C1", "t1")
+        frontend._workspace_names[chat_id] = "channel/C1"
+        frontend._app.client.chat_update = AsyncMock()
+        frontend._app.client.conversations_info.reset_mock()
+
+        await frontend._on_suggestion_action(self._tap())
+
+        frontend._app.client.conversations_info.assert_not_awaited()
+        assert frontend.workspace_name(chat_id) == "slack/channel/C1"
+        assert frontend._sessions[chat_id] == ("C1", "t1")
+
     async def test_tap_uses_thread_ts_for_session_match(self, frontend):
         frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
         frontend._app.client.chat_update = AsyncMock()
@@ -6315,6 +6345,121 @@ class TestRouteForAndRestore:
         frontend.restore_route(chat_id, {"channel": "C1", "thread_ts": 12.5})
 
         assert frontend._sessions[chat_id] == ("C1", None)
+
+
+class TestRouteCarriesTheWorkspace:
+    """A replay runs before any message resolves the thread, and `restore_route`
+    has no Slack client to ask. Without the resolved names in the journal a
+    replayed turn ran in `slack/<session key>`, a directory nothing else uses:
+    nine of them on one deployment, each holding one orphaned transcript."""
+
+    async def _resolved_dm(self, frontend) -> int:
+        chat_id = _session_key("D1", "111.222")
+        frontend._remember_session(chat_id, "D1", "111.222")
+        frontend._sender_names[chat_id] = "hoss"
+        frontend._session_sender_ids[chat_id] = "U_HOSS"
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "D1", "im", "111.222"
+        )
+        return chat_id
+
+    async def test_a_resolved_session_journals_its_workspace(self, frontend):
+        chat_id = await self._resolved_dm(frontend)
+
+        assert frontend.route_for(chat_id)["workspace"] == {
+            "name": "dm/U_HOSS",
+            "legacy": "dm-hoss-111-222",
+            "thread_key": "111-222",
+            "sender_id": "U_HOSS",
+            "sender_name": "hoss",
+            "context": "dm (private)",
+            "channel_name": "",
+        }
+
+    def test_an_unresolved_session_journals_no_workspace(self, frontend):
+        chat_id = _session_key("C1", "1.0")
+        frontend._remember_session(chat_id, "C1", "1.0")
+
+        assert "workspace" not in frontend.route_for(chat_id)
+
+    async def test_a_replayed_turn_runs_in_the_conversation_workspace(self, frontend):
+        chat_id = await self._resolved_dm(frontend)
+        route = frontend.route_for(chat_id)
+        frontend._forget_session(chat_id)  # what a restart leaves behind
+
+        frontend.restore_route(chat_id, route)
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U_HOSS"
+        assert frontend.legacy_workspace(chat_id) == LegacyWorkspace(
+            "slack/dm-hoss-111-222", "111-222"
+        )
+        assert frontend.sender_identity(chat_id) == "U_HOSS"
+        assert frontend.sender_name(chat_id) == "hoss"
+        assert frontend.channel_context(chat_id) == "dm (private)"
+
+    async def test_a_channel_route_round_trips_its_name(self, frontend):
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "general", "is_private": False}
+        }
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "C1", "channel", ""
+        )
+        route = frontend.route_for(chat_id)
+        frontend._forget_session(chat_id)
+
+        frontend.restore_route(chat_id, route)
+
+        assert frontend.workspace_name(chat_id) == "slack/channel/C1"
+        assert frontend._channel_names[chat_id] == "general"
+        assert frontend._thread_keys[chat_id] == "root"
+
+    def test_a_route_from_before_the_field_keeps_the_old_fallback(self, frontend):
+        chat_id = _session_key("C1", "1.0")
+
+        frontend.restore_route(chat_id, {"channel": "C1", "thread_ts": "1.0"})
+
+        assert frontend.workspace_name(chat_id) == f"slack/{chat_id}"
+
+    @pytest.mark.parametrize(
+        "workspace", ["dm/U1", {"name": 7}, {"name": ""}, {"legacy": "x"}]
+    )
+    def test_a_junk_workspace_is_ignored(self, frontend, workspace):
+        chat_id = _session_key("C1", "1.0")
+
+        frontend.restore_route(
+            chat_id, {"channel": "C1", "thread_ts": "1.0", "workspace": workspace}
+        )
+
+        assert chat_id not in frontend._workspace_names
+
+    def test_optional_fields_missing_leave_their_defaults(self, frontend):
+        chat_id = _session_key("C1", "1.0")
+
+        frontend.restore_route(
+            chat_id,
+            {"channel": "C1", "thread_ts": "1.0", "workspace": {"name": "dm/U1"}},
+        )
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U1"
+        assert frontend.legacy_workspace(chat_id) is None
+        assert frontend.sender_identity(chat_id) == str(chat_id)
+        assert frontend._thread_keys[chat_id] == "root"
+
+    async def test_a_known_session_is_not_overwritten(self, frontend):
+        chat_id = await self._resolved_dm(frontend)
+
+        frontend.restore_route(
+            chat_id,
+            {
+                "channel": "D1",
+                "thread_ts": "111.222",
+                "workspace": {"name": "dm/U_OTHER"},
+            },
+        )
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U_HOSS"
 
 
 class TestResumedReactions:
