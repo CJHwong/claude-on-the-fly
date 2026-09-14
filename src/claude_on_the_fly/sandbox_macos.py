@@ -50,6 +50,16 @@ _LOOPBACK_SLOTS = 4
 # launcher and the code it runs need not share a directory: `claude` is a symlink
 # in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>.
 _RUNTIME_SLOTS = 5
+# Metadata slots for the directories between $HOME and the project dir. A read
+# grant on the project subpath says nothing about its parents, and an opaque
+# $HOME denies even stat() on them, which breaks any tool that canonicalizes its
+# cwd: git's repository discovery realpath()s every component, so `git init`,
+# `git clone` and `git status` inside the workspace all died with "Operation not
+# permitted" on the home directory (measured on macOS 26 with the stock profile).
+# Eight covers `$HOME/.claude-on-the-fly/workspaces/<platform>/<kind>/<name>`
+# with room for a data dir a few levels deeper; a longer chain is truncated from
+# the top and logged, since every link is needed for the walk to succeed.
+_ANCESTOR_SLOTS = 8
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -112,6 +122,7 @@ def jail_argv(
     loopback: tuple[str, str, str, str],
     extra_paths: list[str],
     runtime_paths: list[str] | None = None,
+    ancestor_paths: list[str] | None = None,
     profile: Path | None = None,
     sandbox_exec: str = "sandbox-exec",
 ) -> list[str]:
@@ -183,6 +194,19 @@ def jail_argv(
         runtime += [str(project)] * (_RUNTIME_SLOTS - len(runtime))
         for index, path in enumerate(runtime, start=1):
             params += ["-D", f"_RUNTIME_{index}={path}"]
+        ancestors = [*(ancestor_paths or [])]
+        if len(ancestors) > _ANCESTOR_SLOTS:
+            logger.warning(
+                "sandbox: the project dir sits %d levels below the home; only the "
+                "deepest %d get a metadata grant, so path resolution inside the "
+                "workspace may fail",
+                len(ancestors),
+                _ANCESTOR_SLOTS,
+            )
+            ancestors = ancestors[-_ANCESTOR_SLOTS:]
+        ancestors += [str(project)] * (_ANCESTOR_SLOTS - len(ancestors))
+        for index, path in enumerate(ancestors, start=1):
+            params += ["-D", f"_ANCESTOR_{index}={path}"]
     # The one positive record that the jail was applied. Without it a run with an
     # unset sandbox mode produces a log indistinguishable from a jailed one: both
     # are simply free of denials, and no denials also reads as success.
@@ -195,6 +219,22 @@ def jail_argv(
     )
     logger.debug("sandbox: seatbelt params %s", params)
     return [sandbox_exec, "-f", str(profile), *params, *argv]
+
+
+def home_ancestors(project: str, home: str) -> list[str]:
+    """The directories from `home` down to the parent of `project`, both resolved.
+
+    Empty when the project is not under the home: reads outside `$HOME` are
+    allowed by the profile already, so there is nothing to re-grant. The project
+    itself is excluded because its subpath grant covers it.
+    """
+    project_path, home_path = Path(project), Path(home)
+    if not project_path.is_relative_to(home_path) or project_path == home_path:
+        return []
+    chain = [home_path]
+    for part in project_path.relative_to(home_path).parts[:-1]:
+        chain.append(chain[-1] / part)
+    return [str(directory) for directory in chain]
 
 
 def realpaths(workspace: Path, data_dir: Path) -> dict[str, str]:

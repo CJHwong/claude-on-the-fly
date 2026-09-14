@@ -257,6 +257,46 @@ def test_contract_holds_on_this_platform(case, world):
     assert not failures, f"{case.what} ({path}): " + "; ".join(failures)
 
 
+def test_git_can_start_a_repository_inside_the_workspace(world):
+    """The workspace is a work surface for git, not only for `cat` and `echo`.
+
+    git canonicalizes its cwd on every command, which stats each directory from
+    the root down. Under an opaque $HOME that walk used to die at the home
+    directory on macOS, so no git command worked inside the workspace at all.
+    """
+    project = world["project"]
+    proc = subprocess.run(
+        sandbox.wrap(
+            [
+                "/bin/sh",
+                "-c",
+                f"git init -q {project}/fresh && git -C {project}/fresh status --porcelain",
+            ],
+            project,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_the_ancestor_grant_is_metadata_on_the_path_and_nothing_beside_it(world):
+    project, home = world["project"], world["home"]
+    # Each directory on the way down is visible to stat()...
+    assert (
+        _run(
+            ["/bin/sh", "-c", f"test -d {home} && test -d {home}/.claude-on-the-fly"],
+            project,
+        )
+        == 0
+    )
+    # ...a sibling that is not on the path is not. (A listing of the home is not
+    # part of the contract: Linux mounts an empty tmpfs there, which lists fine
+    # and shows nothing, while seatbelt refuses the readdir outright.)
+    assert _run(["/bin/sh", "-c", f"test -e {home}/.ssh"], project) != 0
+
+
 # The daemons' bookkeeping, as the paths the state cases above use.
 _STATE_FILES = (
     "state/slack.turns.json",
