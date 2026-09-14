@@ -334,6 +334,16 @@ class TestBuildSystemPrompt:
         result = build_system_prompt("slack", "alice", "dm", workspace=tmp_path)
         assert f"{tmp_path / 'memory'}/notes.md" in result
 
+    def test_everything_above_the_session_marker_is_the_same_for_every_session(
+        self, tmp_path
+    ):
+        """The prefix is what the prompt cache can reuse across sessions, so
+        nothing per conversation may appear before the marker."""
+        one = build_system_prompt("slack", "alice", "dm", tmp_path / "a", "s1")
+        two = build_system_prompt("slack", "bob", "channel:#x", tmp_path / "b", "s2")
+        marker = "## This session"
+        assert one[: one.index(marker)] == two[: two.index(marker)]
+
     def test_unknown_platform_falls_back_to_telegram(self):
         result = build_system_prompt("discord", "charlie", "dm")
         assert FORMAT_HINTS["telegram"] in result
