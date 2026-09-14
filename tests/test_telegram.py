@@ -1177,6 +1177,20 @@ class TestSaveFile:
 # ============================================================
 
 
+class TestSessionFacts:
+    def test_reports_the_chat_as_conversation_and_sender(self, frontend):
+        frontend._chat_names[7] = "hoss"
+        assert frontend.session_facts(7) == {
+            "conversation": "dm chat 7",
+            "sender_id": "7",
+            "sender_name": "hoss",
+        }
+        assert frontend.session_facts(8) == {
+            "conversation": "dm chat 8",
+            "sender_id": "8",
+        }
+
+
 class TestFlushMediaGroup:
     async def test_saves_all_files_and_calls_on_message(
         self, frontend: TelegramFrontend

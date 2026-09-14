@@ -344,6 +344,45 @@ class TestBuildSystemPrompt:
         marker = "## This session"
         assert one[: one.index(marker)] == two[: two.index(marker)]
 
+    def test_where_you_are_closes_the_prompt_with_every_id(self, tmp_path):
+        """The memory rules bind to a real path only here: left to guess, one
+        deployment keyed a person's memory on the display name in one thread
+        and on the platform id in the next."""
+        facts = {
+            "conversation": "dm D1 ",
+            "thread": "1789360541.993339",
+            "sender_id": "U_HOSS",
+            "sender_name": "hoss",
+        }
+        result = build_system_prompt(
+            "slack", "U_HOSS", "dm (private)", tmp_path, "s1", facts
+        )
+        block = result[result.index("Where you are") :]
+        assert "platform:" in block and " slack" in block
+        assert "conversation:" in block and "dm D1" in block
+        assert "thread:" in block and "1789360541.993339" in block
+        assert "session:" in block and " s1" in block
+        assert "sender:" in block and 'U_HOSS (display "hoss")' in block
+        assert f"{tmp_path} (your cwd)" in block
+        assert "users/U_HOSS/" in block
+        assert "uploads:" in block and "inbox/ in the workspace" in block
+        assert str(tmp_path / "outbox" / "s1") in block
+        assert result.rstrip().endswith(block.rstrip())
+
+    def test_where_you_are_falls_back_to_what_the_frontend_gave(self, tmp_path):
+        result = build_system_prompt("cron", "profile-x", "cron", tmp_path)
+        block = result[result.index("Where you are") :]
+        assert "conversation:" in block and " cron" in block
+        assert "users/profile-x/" in block
+        assert "thread:" not in block
+        assert "deliveries:" not in block
+
+    def test_memory_rules_name_no_placeholder_directory(self):
+        result = build_system_prompt("slack", "U1", "dm")
+        assert "[sender]" not in result
+        assert "Never list `" in result
+        assert "other than your own memory directory" in result
+
     def test_unknown_platform_falls_back_to_telegram(self):
         result = build_system_prompt("discord", "charlie", "dm")
         assert FORMAT_HINTS["telegram"] in result

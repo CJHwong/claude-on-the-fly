@@ -6357,6 +6357,39 @@ class TestRouteForAndRestore:
         assert frontend._sessions[chat_id] == ("C1", None)
 
 
+class TestSessionFacts:
+    async def test_a_dm_thread_reports_its_ids(self, frontend):
+        chat_id = _session_key("D1", "111.222")
+        frontend._remember_session(chat_id, "D1", "111.222")
+        frontend._sender_names[chat_id] = "hoss"
+        frontend._session_sender_ids[chat_id] = "U_HOSS"
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "D1", "im", "111.222"
+        )
+        assert frontend.session_facts(chat_id) == {
+            "conversation": "dm D1",
+            "thread": "111.222",
+            "sender_id": "U_HOSS",
+            "sender_name": "hoss",
+        }
+
+    async def test_a_channel_root_reports_its_name(self, frontend):
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "general", "is_private": False}
+        }
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "C1", "channel", ""
+        )
+        facts = frontend.session_facts(chat_id)
+        assert facts["conversation"] == "channel C1 #general"
+        assert facts["thread"] == "root"
+
+    def test_an_unknown_session_reports_nothing(self, frontend):
+        assert frontend.session_facts(4242) == {}
+
+
 class TestRouteCarriesTheWorkspace:
     """A replay runs before any message resolves the thread, and `restore_route`
     has no Slack client to ask. Without the resolved names in the journal a

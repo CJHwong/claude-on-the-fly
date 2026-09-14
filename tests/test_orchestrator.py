@@ -354,6 +354,7 @@ class TestProcess:
             channel_context="dm",
             timeout=None,
             nudge_prompt=None,
+            facts={},
         )
 
         # Response was sent
@@ -629,6 +630,21 @@ class TestProcess:
         assert not session_dir.exists()  # archived, then retired
         assert list((outbox / ".sent").rglob("report.csv"))
         assert (outbox / "theirs.csv").is_file()
+
+    async def test_the_frontends_session_facts_reach_the_agent(
+        self, frontend: StubFrontend, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        frontend.session_facts = lambda chat_id: {"thread": "1.2"}  # type: ignore[method-assign]
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        run = AsyncMock(return_value=Response(body="ok"))
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", run),
+        ):
+            await orch._process(1, Turn("hello"))
+        assert run.call_args.kwargs["facts"] == {"thread": "1.2"}
 
     async def test_the_turn_names_its_own_outbox_and_makes_it(
         self, frontend: StubFrontend, event_log: EventLog, tmp_path: Path

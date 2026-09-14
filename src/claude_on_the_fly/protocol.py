@@ -247,6 +247,15 @@ class Frontend(ABC):
     def channel_context(self, chat_id: int) -> str:
         """Where this conversation is happening, e.g. 'dm', 'channel:#general'."""
 
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        """Platform ids for the "Where you are" block that closes the system
+        prompt: `conversation` (kind and id, e.g. "dm D0…" or "channel C0… #name"),
+        `thread` (the platform's thread id, or "root"), `sender_id` and
+        `sender_name`. All optional; the block falls back to `sender_name` and
+        `channel_context` for what a frontend leaves out.
+        """
+        return {}
+
     def persona_source(self, chat_id: int) -> Path | None:
         """Per-chat persona file, or None for the global CLAUDE.md.
 

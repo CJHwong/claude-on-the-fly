@@ -155,6 +155,13 @@ class TelegramFrontend(Frontend):
     def channel_context(self, chat_id: int) -> str:
         return "dm"  # Telegram bot is always a DM
 
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        facts = {"conversation": f"dm chat {chat_id}", "sender_id": str(chat_id)}
+        name = self._chat_names.get(chat_id)
+        if name:
+            facts["sender_name"] = name
+        return facts
+
     def persona_source(self, chat_id: int) -> Path | None:
         """The `telegram.personas` file for this chat, or None.
 

@@ -616,13 +616,56 @@ FORMAT_HINTS = {
 }
 
 
+def where_you_are(
+    platform: str,
+    user_name: str,
+    channel_context: str,
+    workspace: Path | None,
+    session_uuid: str | None,
+    outbox_dir: Path | None,
+    facts: dict[str, str],
+) -> str:
+    """The block that closes the system prompt: every id the agent needs to know
+    where it is and where its own files go.
+
+    It is the one place the memory rules bind to a real path. Left to guess,
+    an agent keyed one person's memory on the display name in one thread and on
+    the platform id in the next (measured: both directories on one deployment).
+    Last in the prompt because everything in it varies per session, and the
+    prompt cache reuses the stable prefix before it.
+    """
+    sender_id = facts.get("sender_id") or user_name
+    sender = sender_id
+    if facts.get("sender_name"):
+        sender = f'{sender_id} (display "{facts["sender_name"]}")'
+    rows = [
+        ("platform", platform),
+        ("conversation", facts.get("conversation") or channel_context),
+        ("thread", facts.get("thread", "")),
+        ("session", session_uuid or ""),
+        ("sender", sender),
+        (
+            "workspace",
+            f"{workspace} (your cwd)" if workspace else "(current directory)",
+        ),
+        ("your memory", f"{MEMORY_ROOT}/users/{sender_id}/"),
+        ("uploads", f"{INBOX_DIRNAME}/ in the workspace"),
+        ("deliveries", str(outbox_dir) if outbox_dir else ""),
+    ]
+    width = max(len(label) for label, _value in rows) + 1
+    lines = [f"  {label + ':':<{width}} {value}" for label, value in rows if value]
+    return "Where you are\n" + "\n".join(lines)
+
+
 def build_system_prompt(
     platform: str,
     user_name: str,
     channel_context: str = "dm",
     workspace: Path | None = None,
     session_uuid: str | None = None,
+    facts: dict[str, str] | None = None,
 ) -> str:
+    outbox_dir: Path | None = None
     if platform in ATTACHMENT_PLATFORMS and workspace is not None:
         outbox_dir = (
             session_outbox(workspace, session_uuid)
@@ -635,8 +678,15 @@ def build_system_prompt(
     prompt = PROMPT_TEMPLATE.format(
         format_hint=FORMAT_HINTS.get(platform, FORMAT_HINTS["telegram"]),
         outbox_instruction=outbox,
-        user_name=user_name,
-        channel_context=channel_context,
+        location=where_you_are(
+            platform,
+            user_name,
+            channel_context,
+            workspace,
+            session_uuid,
+            outbox_dir,
+            facts or {},
+        ),
         workspace=str(workspace) if workspace is not None else "(current directory)",
         memory_root=MEMORY_ROOT,
         knowledge_dir=KNOWLEDGE_DIR,
@@ -1343,6 +1393,7 @@ class AgentBackend(Protocol):
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response: ...
 
     async def compact(
@@ -1773,6 +1824,7 @@ async def run(
     timeout: float | None = DEFAULT_TIMEOUT,
     nudge_prompt: str | None = None,
     profile: AgentProfile | None = None,
+    facts: dict[str, str] | None = None,
 ) -> Response:
     return await get_backend(profile).run(
         workspace,
@@ -1783,6 +1835,7 @@ async def run(
         channel_context=channel_context,
         timeout=timeout,
         nudge_prompt=nudge_prompt,
+        facts=facts,
     )
 
 

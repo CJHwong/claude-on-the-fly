@@ -911,6 +911,7 @@ class Orchestrator:
                         channel_context=self._frontend.channel_context(chat_id),
                         timeout=self._frontend.timeout_for(chat_id),
                         nudge_prompt=nudge_prompt,
+                        facts=self._frontend.session_facts(chat_id),
                     )
                 except asyncio.CancelledError:
                     # FIRST, and the order is load-bearing rather than stylistic:

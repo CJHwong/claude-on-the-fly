@@ -1458,6 +1458,26 @@ class SlackFrontend(Frontend):
     def sender_name(self, chat_id: int) -> str:
         return self._sender_names.get(chat_id, "unknown")
 
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        facts: dict[str, str] = {}
+        entry = self._sessions.get(chat_id)
+        if entry is not None:
+            channel, thread_ts = entry
+            kind = self._workspace_names.get(chat_id, "").split("/", 1)[0]
+            label = {"dm": "dm", "mpim": "group-dm", "channel": "channel"}.get(
+                kind, "conversation"
+            )
+            name = self._channel_names.get(chat_id, "")
+            facts["conversation"] = f"{label} {channel}" + (f" #{name}" if name else "")
+            facts["thread"] = thread_ts or "root"
+        sender_id = self._session_sender_ids.get(chat_id)
+        if sender_id:
+            facts["sender_id"] = sender_id
+        sender_name = self._sender_names.get(chat_id)
+        if sender_name:
+            facts["sender_name"] = sender_name
+        return facts
+
     def sender_identity(self, chat_id: int) -> str:
         """Stable Slack user id used for prompt/memory routing."""
         return self._session_sender_ids.get(chat_id, str(chat_id))
