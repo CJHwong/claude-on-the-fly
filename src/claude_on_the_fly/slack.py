@@ -1311,6 +1311,10 @@ class SlackFrontend(Frontend):
         self._spent_menus: dict[tuple[str, str], None] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
+        # session -> (channel, ts) of the running turn's progress message, which
+        # `send_progress` edits in place. `end_progress` pops it at the end of
+        # every turn, so a later turn never edits a message an earlier one kept.
+        self._progress_messages: dict[int, tuple[str, str]] = {}
         # session -> turns handed to the agent. Counted at dispatch (`_charge_turn`)
         # rather than at the reply, so the gate reads a count that already
         # includes every message queued ahead of the one it is looking at.
@@ -3319,7 +3323,12 @@ class SlackFrontend(Frontend):
             logger.error("post_ephemeral_notice: failed to post %r: %s", text, exc)
 
     async def send_progress(self, chat_id: int, text: str) -> None:
-        """Post one mid-turn progress message into the thread the turn runs in.
+        """Show the turn's progress in one message in the thread the turn runs in.
+
+        The first call posts the message and later calls edit it, so a long turn
+        leaves one message behind rather than one per gap. If an edit fails (the
+        message is gone, or Slack refuses the edit), the call posts a new message
+        and later calls edit that one.
 
         Its own `chat_postMessage` rather than `send()`, for two reasons that are
         both about not spending the user's allowance: a progress line is a context
@@ -3354,23 +3363,47 @@ class SlackFrontend(Frontend):
             return
         logger.info("slack %s/%s ~> %s", channel, thread_ts, logs.redact(text))
         rendered = f"{INTERIM_PREFIX} {_fit_block(to_mrkdwn(text))}"
+        blocks = [
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": rendered}]}
+        ]
+        existing = self._progress_messages.get(chat_id)
+        if existing is not None:
+            try:
+                await self._app.client.chat_update(
+                    channel=existing[0], ts=existing[1], text=rendered, blocks=blocks
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "progress: could not edit %s, posting a new message: %s",
+                    existing[1],
+                    exc,
+                )
         try:
             resp = await self._app.client.chat_postMessage(
-                channel=channel,
-                text=rendered,
-                blocks=[
-                    {
-                        "type": "context",
-                        "elements": [{"type": "mrkdwn", "text": rendered}],
-                    }
-                ],
-                thread_ts=thread_ts,
+                channel=channel, text=rendered, blocks=blocks, thread_ts=thread_ts
             )
         except Exception as exc:
             logger.error("progress: failed to post: %s", exc)
             return
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
+            self._progress_messages[chat_id] = (channel, resp["ts"])
+
+    async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
+        """Forget the turn's progress message, and delete it if the turn succeeded.
+
+        A failed or stopped turn keeps it: it is the last record of what the
+        agent was doing. Deleting our own message needs only `chat:write`.
+        """
+        message = self._progress_messages.pop(chat_id, None)
+        if message is None or not succeeded:
+            return
+        channel, ts = message
+        try:
+            await self._app.client.chat_delete(channel=channel, ts=ts)
+        except Exception as exc:
+            logger.warning("progress: could not delete %s: %s", ts, exc)
 
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload

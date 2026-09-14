@@ -355,8 +355,9 @@ watchdog:
 interim:
   # Forward the agent's mid-turn narration into the thread while a turn runs, so a
   # long turn is not silent. Off by default; native/ollama backends only (not
-  # claude pty); DMs and group DMs only. Pacing, in seconds: silence, then one
-  # digest per gap.
+  # claude pty); DMs and group DMs only. One message per turn, edited in place and
+  # deleted when the turn answers. Pacing, in seconds: silence, then one update
+  # per gap.
   # progress: true
   # warmup_seconds: 300
   # min_gap_seconds: 300

@@ -819,6 +819,9 @@ class Orchestrator:
         command_token: str | None = None
         pane: tmux.Pane | None = None
         interim: InterimProgress | None = None
+        # Set only once the agent answered. A failed or stopped turn keeps its
+        # progress message, because it is the last thing the agent was doing.
+        answered = False
         sink_token = None
         try:
             # Point this turn's agent at its own egress proxy. Set here rather
@@ -947,6 +950,7 @@ class Orchestrator:
                     # land after the answer it was leading up to. Discards whatever
                     # is still held rather than dumping a digest above the reply.
                     await interim.aclose()
+                    answered = True
             if self._permissions is not None:
                 # After the turn, because the tool count only exists once it is
                 # over. Reporting late beats not reporting: an ungated turn is
@@ -1041,6 +1045,10 @@ class Orchestrator:
                 # not spend INTERIM_CLOSE_GRACE before the "Stopped" ack goes out.
                 # Idempotent with the aclose/cancel above.
                 interim.cancel()
+                # After the reply, so a successful turn's progress message goes
+                # only once the answer is there to replace it. On every path, so
+                # the next turn never edits a message this one kept.
+                await self._frontend.end_progress(chat_id, succeeded=answered)
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
             if pane is not None:
