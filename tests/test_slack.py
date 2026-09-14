@@ -1276,19 +1276,37 @@ class TestSendProgress:
         assert kwargs["ts"] == "99.0"
         assert "still working, more" in kwargs["blocks"][0]["elements"][0]["text"]
 
-    async def test_a_long_cjk_edit_keeps_the_text_field_under_the_byte_cap(
+    async def test_an_update_over_the_edit_limit_starts_a_new_message(self, frontend):
+        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`. CJK
+        passes that byte cap long before the block's character cap, so a big
+        update goes out as a new message rather than a cut-down edit."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "開始")
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        long_update = "進度" * 1400
+        await frontend.send_progress(session_id, long_update)
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+        assert long_update[:1400] in client.chat_postMessage.await_args.kwargs["text"]
+        await frontend.send_progress(session_id, "繼續")
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+
+    async def test_end_progress_on_success_deletes_every_message_of_the_turn(
         self, frontend
     ):
-        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`, and
-        the edit would fall back to a new post every time. CJK passes the block's
-        character cap long before it passes that byte cap."""
         session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
         await frontend.send_progress(session_id, "開始")
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
         await frontend.send_progress(session_id, "進度" * 1400)
 
-        kwargs = frontend._app.client.chat_update.await_args.kwargs
-        assert len(kwargs["text"].encode("utf-8")) <= 4000
-        frontend._app.client.chat_postMessage.assert_awaited_once()
+        await frontend.end_progress(session_id, succeeded=True)
+
+        deleted = [call.kwargs["ts"] for call in client.chat_delete.await_args_list]
+        assert deleted == ["99.0", "100.0"]
 
     async def test_a_failed_edit_posts_a_fresh_message_and_edits_that_one_next(
         self, frontend, caplog

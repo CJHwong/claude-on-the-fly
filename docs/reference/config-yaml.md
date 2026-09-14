@@ -136,11 +136,12 @@ in DMs and group DMs, is paced by `warmup_seconds` and `min_gap_seconds` so a sh
 produces nothing and a long one a periodic update, and it does not count against
 `slack.reply_soft_limit`.
 
-A turn has at most one progress message. Each update edits it in place. The message
-shows how long the turn has run, then the agent's newest 3 lines, each cut to 200
-characters. If an edit fails, the update posts a new message and later updates edit
-that one. When the turn answers, the progress message is deleted. When the turn fails,
-times out, or is stopped with `$stop`, the message stays. The next turn starts a new
+A turn normally has one progress message, and each update edits it in place. The
+message shows how long the turn has run, then the agent's newest 3 lines, each cut to
+200 characters. If an update is too big to edit (over Slack's `chat.update` size
+limit) or an edit fails, the update posts a new message and later updates edit that
+one. When the turn answers, all of its progress messages are deleted. When the turn
+fails, times out, or is stopped with `$stop`, they stay. The next turn starts a new
 message and never edits a kept one.
 
 ## `egress`
