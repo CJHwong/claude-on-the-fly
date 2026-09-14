@@ -1245,8 +1245,7 @@ def main() -> int:
     import argparse
     import signal
 
-    from dotenv import load_dotenv
-
+    from claude_on_the_fly import envfile
     from claude_on_the_fly.heartbeat import (
         HeartbeatWriter,
         InstanceAlreadyClaimed,
@@ -1264,7 +1263,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    load_dotenv()
+    envfile.load_into_process()
     setup_daemon_logging("cron")
 
     # Before resolving: an install that predates the rename gets its config

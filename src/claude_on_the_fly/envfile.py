@@ -70,6 +70,20 @@ def merged(env_file: Path | None) -> dict[str, str]:
     return values
 
 
+def load_into_process() -> None:
+    """Put `DATA_DIR/.env` into this process's environment. The shell wins.
+
+    Every entry point calls this, and nothing else loads a `.env`. A bare
+    `load_dotenv()` searches upward from the calling module's directory, so a
+    checkout nested in another one (a git worktree under `.claude/worktrees/`)
+    silently read the outer checkout's `.env`, stale token and all. Naming the
+    file makes a stray `.env` anywhere else unreachable.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(default_env_file())
+
+
 def daemon_environment() -> dict[str, str]:
     """What a supervised daemon on this machine receives, from any process."""
     return merged(default_env_file())

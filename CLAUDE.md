@@ -115,7 +115,8 @@ Settings live in `~/.claude-on-the-fly/config.yaml`; `.env` holds credentials an
    build does". `permissions:` is the exception and ships real values.
 3. Read it with `settings.get(NAME, default)`, which is a drop-in for
    `os.environ.get`. Never bind one to a module constant: that cannot see a value
-   `load_dotenv()` sets after import, nor a later edit to the file.
+   `envfile.load_into_process()` sets after import, nor a later edit to the file. That
+   is the only `.env` load: it reads `DATA_DIR/.env` by path, never a search upward.
 4. If acting on a change means binding a socket, writing a PATH shim, or constructing a
    service, add it to `RESTART_REQUIRED` — otherwise an operator's edit silently does
    nothing.

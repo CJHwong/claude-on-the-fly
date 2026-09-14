@@ -22,7 +22,7 @@ from claude_on_the_fly import telegram as telegram_mod
 
 @pytest.fixture
 def no_dotenv(monkeypatch):
-    """`load_dotenv` is imported inside each main(), so patch it at the source."""
+    """`envfile.load_into_process` imports `load_dotenv` per call, so patch the source."""
     import dotenv
 
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **kw: True)
@@ -585,3 +585,42 @@ class TestMigrateWorkspacesFlag:
         with pytest.raises(SystemExit):
             telegram_mod.main()
         assert (tmp_path / "workspaces" / "telegram" / "42" / "a.txt").is_file()
+
+
+class _EnvLoaded(Exception):
+    """Raised in place of the env load, so a main() stops right there."""
+
+
+@pytest.mark.parametrize(
+    ("module", "argv"),
+    [
+        ("claude_on_the_fly.slack", ["claude-slack"]),
+        ("claude_on_the_fly.telegram", ["claude-telegram"]),
+        ("claude_on_the_fly.cron", ["claude-cron"]),
+        ("claude_on_the_fly.jobs.cli", ["claude-jobs"]),
+        ("claude_on_the_fly.watchdog", ["claude-watchdog"]),
+    ],
+)
+def test_every_entry_point_loads_only_the_data_dir_env_file(monkeypatch, module, argv):
+    """A bare `load_dotenv()` searched upward and read a stray `.env` in a parent
+    checkout. The fence is `envfile.load_into_process`; each daemon must go
+    through it, and no path may reach the searching form first."""
+    import importlib
+
+    import dotenv
+
+    from claude_on_the_fly import envfile
+
+    def searching_load(*args, **kwargs):
+        raise AssertionError("load_dotenv called directly, bypassing envfile")
+
+    def loaded():
+        raise _EnvLoaded
+
+    monkeypatch.setattr(dotenv, "load_dotenv", searching_load)
+    monkeypatch.setattr(envfile, "load_into_process", loaded)
+    monkeypatch.setattr("sys.argv", argv)
+    main = importlib.import_module(module).main
+
+    with pytest.raises(_EnvLoaded):
+        main()

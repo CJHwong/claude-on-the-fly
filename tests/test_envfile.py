@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from claude_on_the_fly import checks, envfile, transcript
+from claude_on_the_fly import checks, envfile, settings, transcript
 
 
 class TestMerged:
@@ -205,3 +205,49 @@ class TestDefaultEnvFile:
         file goes away between the two calls. Answer empty rather than raise:
         a vanished env file is a deployment with no env file."""
         assert envfile._file_values(tmp_path / "gone" / ".env") == {}
+
+
+class TestLoadIntoProcess:
+    """What a daemon entry point puts in its own environment at startup."""
+
+    def _unset_on_teardown(self, monkeypatch, *names):
+        # `load_dotenv` writes os.environ directly. Set, then delete, so
+        # monkeypatch records the variables as absent and removes them again.
+        for name in names:
+            monkeypatch.setenv(name, "x")
+            monkeypatch.delenv(name)
+
+    def test_a_stray_env_file_above_the_cwd_is_never_read(
+        self, monkeypatch, tmp_path, isolate_env_file
+    ):
+        """A bare `load_dotenv()` searched upward, so a daemon run from a git
+        worktree loaded the outer checkout's stale `.env` and its revoked token."""
+        import dotenv.main
+
+        self._unset_on_teardown(monkeypatch, "SLACK_SILENT_SENDER_IDS", "COTF_DATA_KEY")
+        checkout = tmp_path / "checkout"
+        worktree = checkout / ".claude" / "worktrees" / "branch"
+        worktree.mkdir(parents=True)
+        (checkout / ".env").write_text("SLACK_SILENT_SENDER_IDS=B0STRAY\n")
+        isolate_env_file.write_text("COTF_DATA_KEY=data\n")
+        monkeypatch.chdir(worktree)
+        searched: list[object] = []
+        monkeypatch.setattr(
+            dotenv.main, "find_dotenv", lambda *a, **k: searched.append(a) or ""
+        )
+
+        envfile.load_into_process()
+
+        assert "SLACK_SILENT_SENDER_IDS" not in os.environ
+        assert settings.get("SLACK_SILENT_SENDER_IDS") == ""
+        assert os.environ["COTF_DATA_KEY"] == "data"
+        assert searched == []
+
+    def test_the_shell_still_wins_over_the_file(self, monkeypatch, isolate_env_file):
+        """An operator exporting a variable for one run must not be overridden."""
+        monkeypatch.setenv("COTF_DATA_KEY", "from-shell")
+        isolate_env_file.write_text("COTF_DATA_KEY=from-file\n")
+
+        envfile.load_into_process()
+
+        assert os.environ["COTF_DATA_KEY"] == "from-shell"

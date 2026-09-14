@@ -26,9 +26,7 @@ from collections.abc import Mapping
 from typing import cast
 from uuid import uuid4
 
-from dotenv import load_dotenv
-
-from claude_on_the_fly import agent, checks, sandbox, settings, tmux
+from claude_on_the_fly import agent, checks, envfile, sandbox, settings, tmux
 from claude_on_the_fly.heartbeat import (
     HeartbeatWriter,
     InstanceAlreadyClaimed,
@@ -426,7 +424,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 
 
 def main() -> int:
-    load_dotenv()
+    envfile.load_into_process()
     argv = _normalize_argv(sys.argv[1:])
     args = _build_parser().parse_args(argv)
 
