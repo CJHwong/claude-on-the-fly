@@ -168,11 +168,13 @@ class Frontend(ABC):
         Called only while a turn is running, only when `interim.progress` is on,
         and only with the main agent's own text — not thinking, not sub-agent
         output. The caller has already coalesced and rate-limited it, and each call
-        carries the whole current progress text: an implementation that can edit a
-        message should replace the turn's previous progress message rather than
-        add another. Implementations must mark it as machine progress, distinct
-        from the reply `send()` will post, and must not count it against any reply
-        budget.
+        carries ONLY what is new since the last one, led by its own elapsed-time
+        header: an implementation that can edit a message should APPEND the chunk
+        to the turn's progress message rather than replace what is there, so the
+        message grows into a timeline of the turn. What scrolled past is what
+        somebody reading a long turn actually wants, and a replace throws it away.
+        Implementations must mark it as machine progress, distinct from the reply
+        `send()` will post, and must not count it against any reply budget.
 
         No-op by default, so a frontend with no thread to put it in — or no wish
         to — behaves exactly as it did before this existed.
@@ -189,11 +191,12 @@ class Frontend(ABC):
 
         Called once at the end of every turn that started a progress relay,
         after the turn's own message. `succeeded` is True when the agent
-        answered: the answer now says everything the progress message did, so an
-        implementation may remove it. On a failure or a stop, the progress
-        message is the last record of what the agent was doing, so it stays.
+        answered. The message is a timeline of what the agent did on the way to
+        that answer, which the answer itself does not carry, so an implementation
+        should keep it either way; `succeeded` is passed for a frontend whose
+        surface cannot afford to.
 
-        Either way the implementation must forget the message, so the next
+        Whatever it keeps, the implementation must forget the message, so the next
         turn's `send_progress` starts a new one instead of editing this one.
         Best-effort, like `send_progress`.
         """

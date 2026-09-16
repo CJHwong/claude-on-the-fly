@@ -33,10 +33,11 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 # much the agent happened to say.
 DEFAULT_INTERIM_WARMUP_S = 300.0
 DEFAULT_INTERIM_MIN_GAP_S = 300.0
-# What one progress message shows: the newest lines, each cut to a cap. Constants
-# rather than settings because they are the shape of the message, not pacing. A
-# frontend edits one message in place for the whole turn, so it has to stay short
-# enough to glance at: what the agent is doing now, not a log of the turn.
+# What one chunk of progress shows: the newest lines of that gap, each cut to a
+# cap. Constants rather than settings because they are the shape of the message,
+# not pacing. A frontend appends each chunk to the turn's progress message, so a
+# chunk has to stay short enough to glance at: the cap bounds how much ONE gap
+# adds, and the turn's own duration bounds how many chunks there are.
 INTERIM_DIGEST_LINES = 3
 INTERIM_LINE_MAX_CHARS = 200
 # Coalesced messages awaiting delivery before the newest is dropped. Small,
@@ -160,8 +161,11 @@ class InterimProgress:
         self._warmup = interim_warmup_seconds()
         self._min_gap = interim_min_gap_seconds()
         self._last_post: float | None = None
-        # The newest lines of the turn, posted or not: each message replaces the
-        # one before it, so it shows these rather than only what is new.
+        # The newest lines received since the last post. The frontend APPENDS
+        # each chunk to the turn's progress message, so a chunk carries only what
+        # is new; `_post_buffer` clears this. Bounded rather than a plain list
+        # because one gap can narrate far more than anybody reads: when it does,
+        # the newest few lines are the ones worth appending.
         self._lines: deque[str] = deque(maxlen=INTERIM_DIGEST_LINES)
         # Lines received since the last post. Zero means there is nothing to say.
         self._fresh = 0
@@ -228,11 +232,14 @@ class InterimProgress:
         return self._now() - self._start >= self._warmup
 
     def _post_buffer(self) -> None:
-        """Enqueue one message: the elapsed time, then the newest lines.
+        """Enqueue one chunk: the elapsed time, then the lines since the last one.
 
-        Sync; drops rather than blocks. The frontend edits one message in place,
-        so this message replaces the one before it. That is why it repeats the
-        newest lines already posted instead of carrying only the new ones.
+        Sync; drops rather than blocks. The frontend APPENDS this chunk to the
+        turn's progress message, so it carries only what is new and clears the
+        buffer behind it. Repeating already-posted lines here would duplicate them
+        in the message rather than replace them, which is why the buffer is
+        cleared and why every chunk carries its own elapsed header: the message
+        reads as a timeline of the turn, not as a snapshot of its last moment.
         """
         if not self._fresh:
             return
@@ -247,6 +254,11 @@ class InterimProgress:
                 INTERIM_QUEUE_MAX,
             )
             return
+        # Cleared only on a successful enqueue, for the same reason `_last_post`
+        # is set only there: a chunk nobody took is a chunk whose lines have not
+        # been appended anywhere, and under append semantics clearing them would
+        # lose them outright. Held instead, so the next chunk carries them.
+        self._lines.clear()
         # Only after a successful enqueue: a dropped message must not also silence
         # the next gap, which is exactly when a person is most in need of hearing
         # something. That covers the ONE drop this method can see. Delivery can
@@ -255,7 +267,11 @@ class InterimProgress:
         # none of them reach back here, so a transient failure does cost a full
         # gap of silence. Left as is deliberately: reporting delivery back would
         # put an outcome contract on every frontend for a message the ABC defines
-        # as best-effort.
+        # as best-effort. Appending raises the price of that gap — a chunk nobody
+        # delivered is now absent from the timeline rather than re-shown by the
+        # next one — but only on a path Slack does not take: its `send_progress`
+        # handles its own failures and returns, so the drain's `except` is there
+        # for a frontend that does not.
         self._last_post = self._now()
 
     async def _drain(self) -> None:

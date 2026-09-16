@@ -1256,7 +1256,7 @@ class TestProcessInterim:
 
         assert _progress_lines(frontend) == [
             (1, ["halfway"]),
-            (1, ["halfway", "and then it broke"]),
+            (1, ["and then it broke"]),
         ]
         assert order == [2]
         assert "Error: boom" in frontend.sent[0][1].body
@@ -1294,7 +1294,7 @@ class TestProcessInterim:
 
         assert _progress_lines(frontend) == [
             (1, ["halfway"]),
-            (1, ["halfway", "and then it broke"]),
+            (1, ["and then it broke"]),
         ]
         assert order == [2]
         assert "Claude unavailable" in frontend.sent[0][1].body

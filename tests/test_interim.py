@@ -247,9 +247,9 @@ class TestInterimProgress:
         relay.emit("new")
         await asyncio.sleep(0)
 
-        # The message is edited in place, so each one repeats what is still
-        # among the newest three rather than only what arrived since the last.
-        assert _bodies(sent) == ["first", "first\nheld\nnew"]
+        # The frontend appends each chunk, so a chunk carries only what arrived
+        # since the last one. "held" waited out the gap and rides with "new".
+        assert _bodies(sent) == ["first", "held\nnew"]
 
     async def test_the_ticker_posts_a_line_that_arrived_before_the_warm_up(
         self, make_relay, monkeypatch
@@ -464,7 +464,7 @@ class TestInterimProgress:
             relay.emit("two")
             await asyncio.sleep(0)
 
-        assert _bodies(calls) == ["one", "one\ntwo"]
+        assert _bodies(calls) == ["one", "two"]
         assert "could not post" in caplog.text
 
     async def test_emit_after_close_is_ignored(self, make_relay):
@@ -530,7 +530,7 @@ class TestInterimProgress:
         relay.emit("b")
         await relay.aclose(flush=True)
 
-        assert _bodies(sent) == ["a", "a\nb"]
+        assert _bodies(sent) == ["a", "b"]
 
     async def test_close_with_flush_before_the_warm_up_posts_nothing(
         self, make_relay, caplog
