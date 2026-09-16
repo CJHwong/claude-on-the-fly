@@ -89,6 +89,9 @@ CRON_CONFIG = DATA_DIR / "cron.yaml"
 # no longer fits the width the column is left at an 80-column terminal, and the
 # `kind` column already says which of the two a row holds.
 PROMPT_COLUMN = "prompt"
+# The chat strip's only wide column. Named because it is looked up by
+# label to be re-fitted (see _FLEX_COLUMNS).
+RUNNING_COLUMN = "running request"
 TAIL_LINES = 200
 # When showing a run in the live view, tail this many raw JSONL events; each
 # formats to 1–4 visible lines so the rendered pane stays manageable.
@@ -484,7 +487,11 @@ class DashboardScreen(Screen):
         # The chat strip shows the selected frontend's currently-running jobs:
         # what's running and for how long. The header says which frontend.
         chat = self.query_one("#chat-strip", DataTable)
-        chat.add_column("running request", width=34)
+        # Flexible: a Slack row carries the channel or user id *and* the name
+        # it resolves to, which a fixed 34 clips on any real channel name. The
+        # uptime column is the only other one, so this takes the rest (see
+        # _resize_flex_column). The mount-time width is the 80-column fit.
+        chat.add_column(RUNNING_COLUMN, width=34)
         chat.add_column("uptime", width=8)
         # The log panes shouldn't grab Tab focus — within a tab, Tab cycles only
         # that tab's table. Same for the cron detail block (mouse wheel still
@@ -507,6 +514,7 @@ class DashboardScreen(Screen):
     _FLEX_COLUMNS: ClassVar[dict[str, tuple[str, str | None]]] = {
         "cron-entries": (PROMPT_COLUMN, "name"),
         "jobs-queue": (PROMPT_COLUMN, None),
+        "chat-strip": (RUNNING_COLUMN, None),
     }
 
     def _refit_flex_columns(self) -> None:
@@ -2036,9 +2044,11 @@ class DashboardScreen(Screen):
             self._chat_workspaces[key] = identifier
             if session:
                 self._job_sessions[key] = str(session)
-            table.add_row(
-                Text(identifier), render.fmt_age(job.get("uptime_s")), key=key
-            )
+            # The label carries the same identifier plus the conversation's
+            # human name; the identifier alone is the fallback for a producer
+            # that sends no label (the job worker's rows).
+            label = str(job.get("label") or identifier)
+            table.add_row(Text(label), render.fmt_age(job.get("uptime_s")), key=key)
             keys.append(key)
 
         if not keys:
@@ -2052,6 +2062,7 @@ class DashboardScreen(Screen):
             table.add_row(Text(msg, style="dim"), "", key="__empty__")
         else:
             self._restore_cursor(table, keys, previously, scroll_y)
+        self._resize_flex_column(table, RUNNING_COLUMN)
 
     def _refresh_stale_banner(self, snap: state.Snapshot) -> None:
         stale = [f.name for f in snap.frontends if f.stale]

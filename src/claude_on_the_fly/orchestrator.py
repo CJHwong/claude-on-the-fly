@@ -802,6 +802,10 @@ class Orchestrator:
         )
         self._in_flight[chat_id] = {
             "identifier": identifier,
+            # Same identifier with the conversation's human name on the end,
+            # for the dashboard row. Resolved here rather than in the TUI,
+            # which has no way to ask Slack what C09AB… is called.
+            "label": self._frontend.display_label(chat_id),
             "started_at_monotonic": time.monotonic(),
             "session_uuid": session,
             # So `abort` can drop the journal entry of the turn it cancels: a
@@ -1114,6 +1118,7 @@ class Orchestrator:
         running_jobs = [
             {
                 "identifier": j["identifier"],
+                "label": j["label"],
                 "chat_id": chat_id,
                 "uptime_s": int(now - j["started_at_monotonic"]),
                 "session_uuid": j["session_uuid"],

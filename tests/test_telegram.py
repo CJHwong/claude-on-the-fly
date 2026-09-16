@@ -125,6 +125,24 @@ class TestWorkspaceName:
 
 
 # ============================================================
+# display_label
+# ============================================================
+
+
+class TestDisplayLabel:
+    def test_names_the_person_in_the_chat(self, frontend: TelegramFrontend) -> None:
+        frontend._chat_names[1] = "hoss"
+        assert frontend.display_label(1) == "telegram/1 hoss"
+
+    def test_falls_back_to_the_id_alone(self, frontend: TelegramFrontend) -> None:
+        """A chat with no message seen yet, and one whose sender has neither a
+        username nor a first name (their chat id is stored as the name)."""
+        frontend._chat_names[2] = "2"
+        assert frontend.display_label(1) == "telegram/1"
+        assert frontend.display_label(2) == "telegram/2"
+
+
+# ============================================================
 # sender_name
 # ============================================================
 

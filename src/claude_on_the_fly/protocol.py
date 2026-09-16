@@ -244,6 +244,19 @@ class Frontend(ABC):
         the conversation keys.
         """
 
+    def display_label(self, chat_id: int) -> str:
+        """The workspace name plus the human name of the conversation.
+
+        What an operator reads in the dashboard's running-request column. The
+        workspace name alone is a platform id, so a Slack row says
+        `slack/channel/C09AB…` and nothing about which channel that is. A
+        frontend that can resolve the name appends it and keeps the id in
+        front, because the id is what the workspace path and the tmux session
+        are keyed on. Default is the workspace name, so a frontend with no
+        second name to give is unchanged.
+        """
+        return self.workspace_name(chat_id)
+
     def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
         """Where this session's files lived before workspaces were shared.
 
