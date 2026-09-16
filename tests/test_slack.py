@@ -1315,9 +1315,8 @@ class TestSendProgress:
 
         assert "failed to post" in caplog.text
 
-    async def test_second_call_edits_the_first_message_instead_of_posting_a_new_one(
-        self, frontend
-    ):
+    async def test_the_second_chunk_is_appended_to_the_first_one(self, frontend):
+        """The message is a timeline of the turn, so an edit keeps what it held."""
         session_id = _seed_progress_route(frontend)
 
         await frontend.send_progress(session_id, "still working")
@@ -1329,29 +1328,102 @@ class TestSendProgress:
         kwargs = client.chat_update.await_args.kwargs
         assert kwargs["channel"] == "C1"
         assert kwargs["ts"] == "99.0"
-        assert "still working, more" in kwargs["blocks"][0]["elements"][0]["text"]
+        rendered = kwargs["blocks"][0]["elements"][0]["text"]
+        assert "still working" in rendered
+        assert "still working, more" in rendered
+        assert rendered.index("still working") < rendered.index("still working, more")
+        assert kwargs["text"] == rendered
 
-    async def test_an_update_over_the_edit_limit_starts_a_new_message(self, frontend):
-        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`. CJK
-        passes that byte cap long before the block's character cap, so a big
-        update goes out as a new message rather than a cut-down edit."""
+    async def test_a_third_chunk_keeps_both_earlier_ones(self, frontend):
+        """The whole turn, not the last two gaps: the body grows, never rotates."""
+        session_id = _seed_progress_route(frontend)
+
+        for chunk in ("first", "second", "third"):
+            await frontend.send_progress(session_id, chunk)
+
+        rendered = frontend._app.client.chat_update.await_args.kwargs["blocks"][0][
+            "elements"
+        ][0]["text"]
+        assert [word for word in ("first", "second", "third") if word in rendered] == [
+            "first",
+            "second",
+            "third",
+        ]
+
+    async def test_a_body_over_the_block_character_cap_starts_a_new_message(
+        self, frontend
+    ):
+        """A context block's text is capped at 2,900 characters. In ASCII that is
+        the ceiling a growing body reaches first, well under the byte cap, and it
+        is the one the old replace-only size check never looked at."""
         session_id = _seed_progress_route(frontend)
         client = frontend._app.client
-        await frontend.send_progress(session_id, "開始")
+        await frontend.send_progress(session_id, "x" * 2880)
         client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
 
-        long_update = "進度" * 1400
-        await frontend.send_progress(session_id, long_update)
+        await frontend.send_progress(session_id, "y" * 100)
 
         client.chat_update.assert_not_awaited()
         assert client.chat_postMessage.await_count == 2
-        assert long_update[:1400] in client.chat_postMessage.await_args.kwargs["text"]
-        await frontend.send_progress(session_id, "繼續")
+
+    async def test_a_body_over_the_edit_byte_cap_starts_a_new_message(self, frontend):
+        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`. CJK
+        passes that byte cap long before the block's character cap, so a body that
+        grew past it goes out as a new message rather than a cut-down edit."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        # 3,600 bytes: a chunk that fits a message of its own and leaves the body
+        # with no room for the next one.
+        await frontend.send_progress(session_id, "進度" * 600)
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        await frontend.send_progress(session_id, "繼續" * 100)
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+        assert "繼續繼續" in client.chat_postMessage.await_args.kwargs["text"]
+        await frontend.send_progress(session_id, "還在")
         assert client.chat_update.await_args.kwargs["ts"] == "100.0"
 
-    async def test_end_progress_on_success_deletes_every_message_of_the_turn(
+    async def test_one_chunk_too_big_for_any_message_is_cut_to_fit_one(self, frontend):
+        """A chunk is bounded by both caps, so the message a full body rolls into
+        always accepts it. Unbounded, it would arrive over the cap there too and
+        every later chunk would roll again: a message per gap, which is what
+        appending replaces."""
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "進度" * 1400)
+
+        posted = frontend._app.client.chat_postMessage.await_args.kwargs["text"]
+        assert len(posted.encode("utf-8")) <= slack_mod.SLACK_TEXT_FIELD_BYTES
+        assert posted.endswith("…")
+
+    async def test_the_message_a_full_one_rolls_into_carries_only_the_new_chunk(
         self, frontend
     ):
+        """Otherwise the body that did not fit is what the new message starts with,
+        and it does not fit there either: every later chunk would roll again."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "x" * 2880)
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        await frontend.send_progress(session_id, "the newest chunk")
+
+        posted = client.chat_postMessage.await_args.kwargs["text"]
+        assert "the newest chunk" in posted
+        assert "xxxxxxxxxx" not in posted
+        await frontend.send_progress(session_id, "one more")
+        grown = client.chat_update.await_args.kwargs["text"]
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+        assert "the newest chunk" in grown
+        assert "one more" in grown
+
+    async def test_end_progress_on_success_keeps_every_message_of_the_turn(
+        self, frontend
+    ):
+        """The reply says what the agent concluded. Only these say how it got
+        there, so a successful turn is exactly when the timeline is worth reading."""
         session_id = _seed_progress_route(frontend)
         client = frontend._app.client
         await frontend.send_progress(session_id, "開始")
@@ -1360,8 +1432,7 @@ class TestSendProgress:
 
         await frontend.end_progress(session_id, succeeded=True)
 
-        deleted = [call.kwargs["ts"] for call in client.chat_delete.await_args_list]
-        assert deleted == ["99.0", "100.0"]
+        client.chat_delete.assert_not_awaited()
 
     async def test_a_failed_edit_posts_a_fresh_message_and_edits_that_one_next(
         self, frontend, caplog
@@ -1381,19 +1452,21 @@ class TestSendProgress:
 
         assert client.chat_postMessage.await_count == 2
         assert "could not edit" in caplog.text
+        # "one" stays in the message the edit could not reach, so the fresh one
+        # starts from "two" rather than repeating a chunk already in the thread.
+        assert "one" not in client.chat_postMessage.await_args.kwargs["text"]
         client.chat_update.side_effect = None
         await frontend.send_progress(session_id, "three")
         assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+        assert "two" in client.chat_update.await_args.kwargs["text"]
 
-    async def test_end_progress_on_success_deletes_the_message(self, frontend):
+    async def test_end_progress_on_success_keeps_the_message(self, frontend):
         session_id = _seed_progress_route(frontend)
         await frontend.send_progress(session_id, "working")
 
         await frontend.end_progress(session_id, succeeded=True)
 
-        frontend._app.client.chat_delete.assert_awaited_once_with(
-            channel="C1", ts="99.0"
-        )
+        frontend._app.client.chat_delete.assert_not_awaited()
 
     async def test_end_progress_on_failure_keeps_the_message(self, frontend):
         session_id = _seed_progress_route(frontend)
@@ -1403,18 +1476,22 @@ class TestSendProgress:
 
         frontend._app.client.chat_delete.assert_not_awaited()
 
-    async def test_a_new_turn_never_edits_a_message_kept_from_an_earlier_one(
-        self, frontend
+    @pytest.mark.parametrize("succeeded", [True, False])
+    async def test_a_new_turn_never_appends_to_an_earlier_turn_message(
+        self, frontend, succeeded
     ):
+        """Every turn keeps its message now, so this holds on both outcomes: one
+        turn's timeline must not grow a later turn's narration onto its end."""
         session_id = _seed_progress_route(frontend)
         client = frontend._app.client
         await frontend.send_progress(session_id, "turn one")
-        await frontend.end_progress(session_id, succeeded=False)
+        await frontend.end_progress(session_id, succeeded=succeeded)
 
         await frontend.send_progress(session_id, "turn two")
 
         client.chat_update.assert_not_awaited()
         assert client.chat_postMessage.await_count == 2
+        assert "turn one" not in client.chat_postMessage.await_args.kwargs["text"]
 
     async def test_end_progress_without_a_message_does_nothing(self, frontend):
         session_id = _seed_progress_route(frontend)
@@ -1422,18 +1499,6 @@ class TestSendProgress:
         await frontend.end_progress(session_id, succeeded=True)
 
         frontend._app.client.chat_delete.assert_not_awaited()
-
-    async def test_a_failed_delete_is_logged_not_raised(self, frontend, caplog):
-        session_id = _seed_progress_route(frontend)
-        await frontend.send_progress(session_id, "working")
-        frontend._app.client.chat_delete.side_effect = SlackApiError(
-            "nope", {"ok": False, "error": "cant_delete_message"}
-        )
-
-        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
-            await frontend.end_progress(session_id, succeeded=True)
-
-        assert "could not delete" in caplog.text
 
     async def test_a_not_ok_response_records_nothing(self, frontend):
         session_id = _seed_progress_route(frontend)

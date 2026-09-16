@@ -916,6 +916,42 @@ def _fit_block(text: str) -> str:
     return f"{text[:_BLOCK_TEXT_LIMIT]}\n[{dropped} more characters, see the log]"
 
 
+def _fit_progress_chunk(text: str) -> str:
+    """One chunk, small enough to be a whole progress message on its own.
+
+    Both caps, because a chunk that clears neither has nowhere to go. A body that
+    outgrows its message rolls into a NEW one carrying just the newest chunk, so
+    an unbounded chunk would arrive over the cap there too and roll again on
+    every later chunk — a message per gap, which is the behavior appending exists
+    to replace. `_fit_block` alone does not bound it: 2900 CJK characters clear
+    its character cap and are 8700 bytes, more than twice the byte one.
+    """
+    return fit_text_field(_fit_block(text))
+
+
+def _progress_blocks(text: str) -> list[dict]:
+    """The turn's progress message as Slack blocks: one context block."""
+    return [{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}]
+
+
+def _progress_fits(text: str) -> bool:
+    """Whether a grown progress body can still be sent as one edit.
+
+    Two ceilings in two different units, and a body has to clear BOTH: a context
+    block's text is capped in characters, and the `text` field the same request
+    carries is capped in bytes. Which one binds depends on the script — 2900 CJK
+    characters clear the character cap and are 8700 bytes, well over the byte one.
+    Checking only bytes (what this did when a message was replaced rather than
+    grown) would let `_fit_block` silently cut the tail of a body that is over the
+    character cap, and the tail of an append-only timeline is the newest chunk in
+    it: the one thing somebody watching a running turn is reading.
+    """
+    return (
+        len(text) <= _BLOCK_TEXT_LIMIT
+        and len(text.encode("utf-8")) <= SLACK_TEXT_FIELD_BYTES
+    )
+
+
 def _approval_headline(request: ApprovalRequest) -> str:
     """The card's first line.
 
@@ -1312,11 +1348,14 @@ class SlackFrontend(Frontend):
         self._spent_menus: dict[tuple[str, str], None] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
-        # session -> (channel, ts) of the running turn's progress messages, oldest
-        # first. `send_progress` edits the last one in place. `end_progress` pops
-        # them at the end of every turn, so a later turn never edits a message an
-        # earlier one kept.
-        self._progress_messages: dict[int, list[tuple[str, str]]] = {}
+        # session -> (channel, ts, body) of the running turn's progress messages,
+        # oldest first. `send_progress` appends each chunk to the last one, so the body
+        # it already holds is carried here beside its ts: Slack has no "append"
+        # call, only `chat.update` with a whole new body, so the adapter is the
+        # only place that can know what that body currently is. `end_progress`
+        # pops them at the end of every turn, so a later turn never edits a
+        # message an earlier one left behind.
+        self._progress_messages: dict[int, list[tuple[str, str, str]]] = {}
         # session -> turns handed to the agent. Counted at dispatch (`_charge_turn`)
         # rather than at the reply, so the gate reads a count that already
         # includes every message queued ahead of the one it is looking at.
@@ -3351,13 +3390,14 @@ class SlackFrontend(Frontend):
             logger.error("post_ephemeral_notice: failed to post %r: %s", text, exc)
 
     async def send_progress(self, chat_id: int, text: str) -> None:
-        """Show the turn's progress in one message in the thread the turn runs in.
+        """Append one chunk of the turn's progress to its message in the thread.
 
-        The first call posts the message and later calls edit it, so a long turn
-        leaves one message behind rather than one per gap. An update too big for
-        `chat.update` starts a new message instead of losing its tail, and so does
-        an edit that fails (the message is gone, or Slack refuses the edit). Later
-        calls edit the newest message.
+        The first call posts the message and later calls edit it with everything
+        it already held plus the new chunk, so a long turn leaves behind a
+        timeline of itself rather than a snapshot of its last moment or one
+        message per gap. A chunk that no longer fits starts a new message and
+        carries only itself, and so does an edit that fails (the message is gone,
+        or Slack refuses the edit). Later calls append to the newest message.
 
         Its own `chat_postMessage` rather than `send()`, for two reasons that are
         both about not spending the user's allowance: a progress line is a context
@@ -3391,31 +3431,35 @@ class SlackFrontend(Frontend):
             logger.debug("progress: omitted outside a DM/group DM in %s", channel)
             return
         logger.info("slack %s/%s ~> %s", channel, thread_ts, logs.redact(text))
-        rendered = f"{INTERIM_PREFIX} {_fit_block(to_mrkdwn(text))}"
-        blocks = [
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": rendered}]}
-        ]
+        chunk = _fit_progress_chunk(f"{INTERIM_PREFIX} {to_mrkdwn(text)}")
         messages = self._progress_messages.get(chat_id)
-        if messages and len(rendered.encode("utf-8")) > SLACK_TEXT_FIELD_BYTES:
-            logger.info(
-                "progress: update is over the edit size limit, posting a new message"
-            )
-        elif messages:
-            edit_channel, edit_ts = messages[-1]
-            try:
-                await self._app.client.chat_update(
-                    channel=edit_channel, ts=edit_ts, text=rendered, blocks=blocks
-                )
-                return
-            except Exception as exc:
-                logger.warning(
-                    "progress: could not edit %s, posting a new message: %s",
-                    edit_ts,
-                    exc,
-                )
+        if messages:
+            edit_channel, edit_ts, body = messages[-1]
+            grown = f"{body}\n{chunk}"
+            if not _progress_fits(grown):
+                logger.info("progress: message is full, starting a new one")
+            else:
+                try:
+                    await self._app.client.chat_update(
+                        channel=edit_channel,
+                        ts=edit_ts,
+                        text=grown,
+                        blocks=_progress_blocks(grown),
+                    )
+                    messages[-1] = (edit_channel, edit_ts, grown)
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "progress: could not edit %s, posting a new message: %s",
+                        edit_ts,
+                        exc,
+                    )
         try:
             resp = await self._app.client.chat_postMessage(
-                channel=channel, text=rendered, blocks=blocks, thread_ts=thread_ts
+                channel=channel,
+                text=chunk,
+                blocks=_progress_blocks(chunk),
+                thread_ts=thread_ts,
             )
         except Exception as exc:
             logger.error("progress: failed to post: %s", exc)
@@ -3423,23 +3467,20 @@ class SlackFrontend(Frontend):
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
             self._progress_messages.setdefault(chat_id, []).append(
-                (channel, resp["ts"])
+                (channel, resp["ts"], chunk)
             )
 
     async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
-        """Forget the turn's progress messages, and delete them if the turn succeeded.
+        """Forget the turn's progress messages, and leave them in the thread.
 
-        A failed or stopped turn keeps them: they are the last record of what the
-        agent was doing. Deleting our own message needs only `chat:write`.
+        Kept whatever the outcome, `succeeded` included. They were deleted on a
+        successful turn while each one was a snapshot of the turn's last moment,
+        which the reply then said better. They are now a timeline of how the turn
+        reached that reply — which tools ran, what was retried, where a long turn
+        spent its time — and the reply says none of that. Deleting it would throw
+        away the only record anybody outside the host can read.
         """
-        messages = self._progress_messages.pop(chat_id, [])
-        if not succeeded:
-            return
-        for channel, ts in messages:
-            try:
-                await self._app.client.chat_delete(channel=channel, ts=ts)
-            except Exception as exc:
-                logger.warning("progress: could not delete %s: %s", ts, exc)
+        self._progress_messages.pop(chat_id, None)
 
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload
