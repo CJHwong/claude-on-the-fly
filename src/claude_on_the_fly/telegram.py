@@ -134,6 +134,19 @@ class TelegramFrontend(Frontend):
         # the same directory, with the same files and the same workspace memory.
         return f"telegram/{chat_id}"
 
+    def display_label(self, chat_id: int) -> str:
+        """`telegram/12345 hoss` — the chat id plus who is talking in it.
+
+        The id stays in front: it keys the workspace directory and the tmux
+        session, so the dashboard row still matches the rest of the dashboard.
+        A chat the bot has not seen a message from yet has no name to add, and
+        a person with neither a username nor a first name has their own chat id
+        stored as the name, which is not worth printing twice.
+        """
+        name = self.workspace_name(chat_id)
+        sender = self._chat_names.get(chat_id, "")
+        return f"{name} {sender}" if sender and sender != str(chat_id) else name
+
     def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
         """The `<chat_id>-<token>` directory a `/new` session used to get.
 

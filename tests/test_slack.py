@@ -331,6 +331,37 @@ class TestMetadataAccessors:
         assert fe.workspace_name(42) == "slack/dm-user-123"
 
     @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_names_a_channel(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "channel/C1"
+        fe._channel_names[42] = "general"
+        assert fe.display_label(42) == "slack/channel/C1 #general"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_names_the_person_in_a_dm(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "dm/U9"
+        fe._sender_names[42] = "hoss"
+        assert fe.display_label(42) == "slack/dm/U9 hoss"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_falls_back_to_the_id_alone(self, mock_app_cls):
+        """A DM before the message path has learned who is talking, and a
+        channel whose name lookup failed (the id is stored as the name)."""
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[1] = "dm/U9"
+        fe._workspace_names[2] = "channel/C99"
+        fe._channel_names[2] = "C99"
+        assert fe.display_label(1) == "slack/dm/U9"
+        assert fe.display_label(2) == "slack/channel/C99"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_labels_a_group_dm_by_kind(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "mpim/G1"
+        assert fe.display_label(42) == "slack/mpim/G1 group-dm"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
     def test_sender_name_default(self, mock_app_cls):
         fe = SlackFrontend("xapp", "xoxp", "U1")
         assert fe.sender_name(999) == "unknown"

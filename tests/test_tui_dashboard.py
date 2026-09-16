@@ -2190,6 +2190,40 @@ class TestChatStrip:
         assert screen._job_sessions
         assert screen._chat_workspaces
 
+    async def test_the_row_shows_the_label_when_the_frontend_sends_one(self, isolated):
+        """Slack resolves its ids to names; the row shows both."""
+        from claude_on_the_fly.tui.state import FrontendStatus
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._chat_selected_idx = 0
+            by_name = {
+                "slack": FrontendStatus(
+                    name="slack",
+                    state="running",
+                    extra={
+                        "running_jobs": [
+                            {
+                                "identifier": "slack/channel/C1",
+                                "label": "slack/channel/C1 #general",
+                                "chat_id": "C1",
+                                "session_uuid": "s-1",
+                                "uptime_s": 12,
+                            }
+                        ]
+                    },
+                ),
+                "telegram": self._status("telegram", "stopped"),
+            }
+            screen._refresh_chat_strip(by_name)
+            await pilot.pause()
+            table = app.screen.query_one("#chat-strip", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert "slack/channel/C1 #general" in row
+        # The live view still keys off the identifier, not the label.
+        assert "slack/channel/C1" in screen._chat_workspaces.values()
+
     async def test_an_idle_running_daemon_says_idle(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:

@@ -1043,6 +1043,9 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=hang)
+            # The dashboard row reads the frontend's label, not the workspace
+            # name, so a Slack row can name the channel behind the id.
+            frontend.display_label = lambda chat_id: f"test/{chat_id} #general"
             task = asyncio.create_task(orch._process(9, Turn("hi")))
             # Yield until the orchestrator has registered the in-flight slot.
             for _ in range(20):
@@ -1054,6 +1057,7 @@ class TestEventEmission:
             assert len(extra["running_jobs"]) == 1
             job = extra["running_jobs"][0]
             assert job["identifier"] == "test/9"
+            assert job["label"] == "test/9 #general"
             assert job["chat_id"] == 9
             assert "session_uuid" in job
 

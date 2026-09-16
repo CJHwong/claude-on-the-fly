@@ -1455,6 +1455,27 @@ class SlackFrontend(Frontend):
     def workspace_name(self, chat_id: int) -> str:
         return f"slack/{self._workspace_names.get(chat_id, str(chat_id))}"
 
+    def display_label(self, chat_id: int) -> str:
+        """`slack/channel/C09AB… #general`, `slack/dm/U012… Hoss Huang`.
+
+        The id stays in front: it keys the workspace directory and the tmux
+        session, so the cell still matches what the rest of the dashboard
+        shows. A group DM has no name of its own, so it is labelled by kind.
+        A channel whose `conversations_info` call failed has its own id stored
+        as the name, and printing that twice tells the operator nothing.
+        """
+        name = self.workspace_name(chat_id)
+        kind = self._workspace_names.get(chat_id, "").split("/", 1)[0]
+        if kind == "dm":
+            sender = self._sender_names.get(chat_id, "")
+            return f"{name} {sender}" if sender else name
+        if kind == "mpim":
+            return f"{name} group-dm"
+        channel_name = self._channel_names.get(chat_id, "")
+        if channel_name and not name.endswith(channel_name):
+            return f"{name} #{channel_name}"
+        return name
+
     def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
         name = self._legacy_workspace_names.get(chat_id)
         if name is None:
