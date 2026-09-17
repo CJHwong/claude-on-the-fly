@@ -2548,6 +2548,73 @@ class TestMentionNotice:
         assert (session_id, "U_ALLOWED") in frontend._mention_notices
         frontend._cancel_mention_notice(session_id, "U_ALLOWED")
 
+    async def test_the_notice_carries_a_button_for_this_thread(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+
+        sent = frontend._app.client.chat_postEphemeral.call_args[1]
+        section, actions = sent["blocks"]
+        # Slack stops rendering `text` once blocks are present.
+        assert section["text"]["text"] == sent["text"]
+        button = actions["elements"][0]
+        assert button["action_id"] == slack_mod.REPLAY_ACTION_ID
+        assert slack_mod._parse_continue_value(button["value"]) == ("C1", "t1")
+
+    async def test_untagged_messages_are_held_until_a_tag(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+        key = (session_id, "U_ALLOWED")
+
+        await frontend._ingest_event(self._event("t2", "first"))
+        await frontend._ingest_event(self._event("t3", "second"))
+        # A reconnect's catch-up hands the same message back.
+        await frontend._ingest_event(self._event("t3", "second"))
+        assert [e["ts"] for e in frontend._untagged_msgs[key]] == ["t2", "t3"]
+
+        await frontend._ingest_event(self._event("t4", "<@U_SELF> tagged now"))
+        assert key not in frontend._untagged_msgs
+
+    async def test_the_held_backlog_is_capped(self, frontend, monkeypatch, caplog):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        monkeypatch.setattr(slack_mod, "GATED_MSG_BACKLOG_MAX", 2)
+        session_id = self._live_thread(frontend)
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            for ts in ("t2", "t3", "t4"):
+                await frontend._ingest_event(self._event(ts))
+
+        held = frontend._untagged_msgs[session_id, "U_ALLOWED"]
+        assert [e["ts"] for e in held] == ["t3", "t4"]
+        assert "dropped the oldest (t2)" in caplog.text
+        frontend._cancel_mention_notice(session_id, "U_ALLOWED")
+
+    async def test_a_disabled_notice_holds_nothing(self, frontend):
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+
+        assert not frontend._untagged_msgs
+        assert session_id in frontend._sessions
+
+    async def test_forgetting_the_thread_drops_the_held_messages(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+        frontend._untagged_msgs[_session_key("C9", "t9"), "U_ALLOWED"] = []
+
+        await frontend._ingest_event(self._event("t2"))
+        frontend._forget_session(session_id)
+
+        assert list(frontend._untagged_msgs) == [
+            (_session_key("C9", "t9"), "U_ALLOWED")
+        ]
+
     async def test_forgetting_the_thread_drops_the_tagger(self, frontend):
         session_id = self._live_thread(frontend)
 
@@ -3282,6 +3349,7 @@ class TestStartGatesOnToken:
         which both installs receive."""
         frontend._on_suggestion_action = AsyncMock()
         frontend._on_continue_action = AsyncMock()
+        frontend._on_replay_action = AsyncMock()
         with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
             handler_cls.return_value.start_async = AsyncMock()
             await frontend.start(AsyncMock())
@@ -3290,12 +3358,13 @@ class TestStartGatesOnToken:
         ]
         assert r"^cotf-sugg:" in patterns
         assert r"^cotf-continue$" in patterns
+        assert r"^cotf-replay$" in patterns
         action_cbs = [
             call.args[0]
             for call in frontend._app.action.return_value.call_args_list
             if not isinstance(call.args[0], MagicMock)
         ]
-        assert len(action_cbs) == 2
+        assert len(action_cbs) == 3
         ack = AsyncMock()
         await action_cbs[0](ack, {"user": {"id": "U_ALLOWED"}})
         assert ack.await_count == 1
@@ -3303,6 +3372,9 @@ class TestStartGatesOnToken:
         await action_cbs[1](ack, {"user": {"id": "U_ALLOWED"}})
         assert ack.await_count == 2
         frontend._on_continue_action.assert_awaited_once()
+        await action_cbs[2](ack, {"user": {"id": "U_ALLOWED"}})
+        assert ack.await_count == 3
+        frontend._on_replay_action.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -5155,6 +5227,127 @@ class TestContinueAction:
         frontend._delete_ephemeral = AsyncMock()
 
         await frontend._on_continue_action({"user": {"id": "U_ALLOWED"}})
+
+        frontend._delete_ephemeral.assert_not_awaited()
+
+
+class TestReplayAction:
+    """The mention notice's button. It runs what the sender forgot to tag, so
+    they never retype it."""
+
+    @staticmethod
+    def _tap(value: str = "C1|t1", user_id: str = "U_ALLOWED") -> dict:
+        return {
+            "user": {"id": user_id, "name": "hoss"},
+            "response_url": "https://hooks.slack.test/actions/2",
+            "actions": [{"action_id": slack_mod.REPLAY_ACTION_ID, "value": value}],
+        }
+
+    @staticmethod
+    def _untagged(ts: str, text: str) -> dict:
+        return {
+            "ts": ts,
+            "thread_ts": "t1",
+            "text": text,
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+    def _hold(self, frontend, *events: dict, user: str = "U_ALLOWED") -> tuple:
+        key = (_session_key("C1", "t1"), user)
+        frontend._untagged_msgs[key] = list(events)
+        frontend._delete_ephemeral = AsyncMock()
+        return key
+
+    async def test_a_burst_replays_in_order_with_the_tag(self, frontend):
+        """The tag is added to every replay, not only the first: a replayed
+        message goes back through the mention gate like a live one."""
+        stored = self._untagged("90.0", "first")
+        key = self._hold(frontend, stored, self._untagged("90.1", "second"))
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_replay_action(self._tap())
+
+        assert [c.args[0]["text"] for c in frontend._ingest_event.await_args_list] == [
+            "<@U_SELF> first",
+            "<@U_SELF> second",
+        ]
+        assert stored["text"] == "first"  # a copy was replayed, not the stored event
+        assert key not in frontend._untagged_msgs
+        frontend._delete_ephemeral.assert_awaited_once_with(
+            "https://hooks.slack.test/actions/2"
+        )
+
+    async def test_every_message_reaches_the_agent(self, frontend, monkeypatch):
+        """End to end through the real `_ingest_event`: each replay has to pass
+        every gate the live path applies, or the card goes and nothing runs."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        await frontend._ingest_event(self._untagged("t1", "<@U_SELF> have a look"))
+        await frontend._ingest_event(self._untagged("t2", "do the first thing"))
+        await frontend._ingest_event(self._untagged("t3", "and the second"))
+        pending = frontend._mention_notices[session_id, "U_ALLOWED"]
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._on_replay_action(self._tap())
+
+        prompts = [c.args[1] for c in frontend._on_message.await_args_list]
+        assert len(prompts) == 3
+        assert "do the first thing" in prompts[1]
+        assert "and the second" in prompts[2]
+        assert "<@U_SELF>" not in prompts[2]
+        # The replay is a tag, so the still-pending notice goes too.
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        await frontend._on_replay_action(self._tap())
+        assert frontend._on_message.await_count == 3  # a second tap runs nothing
+
+    async def test_a_tap_only_replays_the_tappers_own_messages(self, frontend):
+        """Keyed by who pressed, so a forged payload cannot run somebody else's."""
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_OTHER"}
+        key = self._hold(frontend, self._untagged("90.0", "mine"))
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_replay_action(self._tap(user_id="U_OTHER"))
+
+        frontend._ingest_event.assert_not_awaited()
+        assert key in frontend._untagged_msgs
+
+    async def test_tap_after_a_restart_only_removes_the_card(self, frontend, caplog):
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._ingest_event = AsyncMock()
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_replay_action(self._tap())
+
+        frontend._ingest_event.assert_not_awaited()
+        frontend._delete_ephemeral.assert_awaited_once()
+        assert "found no untagged messages" in caplog.text
+
+    async def test_unauthorized_tap_changes_nothing(self, frontend):
+        key = self._hold(frontend, self._untagged("90.0", "mine"), user="U_STRANGER")
+
+        await frontend._on_replay_action(self._tap(user_id="U_STRANGER"))
+
+        assert key in frontend._untagged_msgs
+        frontend._delete_ephemeral.assert_not_awaited()
+
+    async def test_malformed_value_is_dropped(self, frontend, caplog):
+        frontend._delete_ephemeral = AsyncMock()
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_replay_action(self._tap(value="C1|t1|extra"))
+
+        assert "unusable routing" in caplog.text
+        frontend._delete_ephemeral.assert_not_awaited()
+
+    async def test_a_payload_with_no_actions_is_ignored(self, frontend):
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._on_replay_action({"user": {"id": "U_ALLOWED"}})
 
         frontend._delete_ephemeral.assert_not_awaited()
 

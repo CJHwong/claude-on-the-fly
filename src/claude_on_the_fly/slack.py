@@ -79,7 +79,8 @@ DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 0.0
 # replays that backlog in order, so the events have to be held somewhere, and
 # this bounds what one thread can pin on somebody who keeps typing past the gate.
 # Past the cap the oldest gated message is dropped and never runs. Not an
-# operator setting: a card that replays fifty turns is not a resume.
+# operator setting: a card that replays fifty turns is not a resume. The mention
+# notice's replay backlog uses the same cap, for the same reason.
 GATED_MSG_BACKLOG_MAX = 50
 # Ceiling on the debounce above, timed from the first gated message. Somebody
 # firing a message every three seconds would otherwise defer the notice for as
@@ -846,6 +847,35 @@ def _reply_limit_blocks(note: str, channel: str, thread_ts: str | None) -> list[
     ]
 
 
+REPLAY_ACTION_ID = "cotf-replay"
+
+
+def _mention_notice_blocks(
+    note: str, channel: str, thread_ts: str | None
+) -> list[dict]:
+    """The forgot-to-tag notice: what happened, then one button that runs the
+    untagged messages as if they had carried the tag.
+
+    Same shape as `_reply_limit_blocks`, and the note is in a `section` for the
+    same reason. The routing is the thread only: the sender is whoever taps, and
+    the card reaches nobody else.
+    """
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": note}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Pick it up"},
+                    "action_id": REPLAY_ACTION_ID,
+                    "value": _continue_button_value(channel, thread_ts),
+                }
+            ],
+        },
+    ]
+
+
 def _retire_suggestion_block(blocks: list[dict], label: str) -> list[dict]:
     """Rebuild message blocks with the suggestion menu collapsed to a status line.
 
@@ -1380,6 +1410,11 @@ class SlackFrontend(Frontend):
         # (session, user) -> that person's reminder waiting out its delay. Keyed
         # per person because two of them can be pending in one thread at once.
         self._mention_notices: dict[tuple[int, str], asyncio.Task[None]] = {}
+        # (session, user) -> that person's untagged messages since their last tag,
+        # oldest first, held as the events so the notice's button can replay them.
+        # Kept apart from `_mention_notices` because a new untagged message
+        # restarts the notice but must not lose the earlier messages.
+        self._untagged_msgs: dict[tuple[int, str], list[dict]] = {}
         # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
         # button's `value` stays opaque and a subject never has to be encoded
         # into a client-supplied field.
@@ -1732,6 +1767,8 @@ class SlackFrontend(Frontend):
         self._cancel_gate_notice(session_id)
         self._cancel_thread_mention_notices(session_id)
         self._mention_taggers.pop(session_id, None)
+        for key in [key for key in self._untagged_msgs if key[0] == session_id]:
+            self._untagged_msgs.pop(key)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
         self._in_flight.pop(session_id, None)
@@ -1766,6 +1803,12 @@ class SlackFrontend(Frontend):
         async def handle_continue_action(ack, body):
             await ack()
             await self._on_continue_action(body)
+
+        # The mention notice's button. Ephemeral too, so registered for both.
+        @self._app.action(re.compile(r"^cotf-replay$"))
+        async def handle_replay_action(ack, body):
+            await ack()
+            await self._on_replay_action(body)
 
         if self._is_bot_token:
             self._register_app_interactions()
@@ -2121,6 +2164,55 @@ class SlackFrontend(Frontend):
             await self._replay_gated(channel, gated)
         # Last, and never fatal: the thread is resumed by this point, and a card
         # that will not go away must not take that back.
+        await self._delete_ephemeral(body.get("response_url", ""))
+
+    async def _on_replay_action(self, body: dict) -> None:
+        """Run the untagged messages from the mention notice's button, as if each
+        had tagged the bot.
+
+        The backlog is the tapper's own, keyed by who pressed rather than by a
+        sender carried in the value: the card only reaches the person who forgot,
+        and keying by the tapper means a forged payload can only replay the
+        forger's own messages. The allowlist is still checked, because the
+        payload is client-supplied.
+
+        The backlog is popped, so a second tap is a no-op even when a replay was
+        refused on the way through and so never reached the tag that clears it.
+        """
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        sender_id = (body.get("user") or {}).get("id", "")
+        if not self._is_allowed(sender_id):
+            logger.warning("slack: ignoring replay click from %s", sender_id)
+            return
+        routing = _parse_continue_value(actions[0].get("value", ""))
+        if routing is None:
+            logger.info("slack: replay click with unusable routing, dropping")
+            return
+        channel, thread_ts = routing
+        events = self._untagged_msgs.pop(
+            (_session_key(channel, thread_ts), sender_id), []
+        )
+        mention = f"<@{self._user_id}>"
+        for event in events:
+            replay = dict(event)
+            replay["text"] = f"{mention} {event.get('text') or ''}".strip()
+            await self._ingest_event(replay)
+            ts = str(event.get("ts") or "")
+            logger.info(
+                "replay: ran untagged message %s from %s (dispatched=%s)",
+                ts,
+                channel,
+                ts in self._processed_ts,
+            )
+        if not events:
+            logger.info(
+                "slack %s/%s: replay click found no untagged messages from %s",
+                channel,
+                thread_ts,
+                sender_id,
+            )
         await self._delete_ephemeral(body.get("response_url", ""))
 
     async def _replay_gated(self, channel: str, events: list[dict]) -> None:
@@ -2568,7 +2660,9 @@ class SlackFrontend(Frontend):
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
                     logger.debug("skipped: no mention of %s in text", self._user_id)
-                    await self._hint_mention_required(channel, thread_ts, sender_id)
+                    await self._hint_mention_required(
+                        channel, thread_ts, sender_id, event
+                    )
                     return
                 # Remember who tagged, so a later untagged message can be matched
                 # against them rather than nudging whoever happened to speak next.
@@ -2600,6 +2694,9 @@ class SlackFrontend(Frontend):
         # they have already corrected. Only theirs. Somebody else in the thread who
         # forgot still has, and this message does nothing to fix that.
         self._cancel_mention_notice(session_id, sender_id)
+        # And their untagged messages with it: the button replays what they sent
+        # since their last tag, and this is that tag.
+        self._untagged_msgs.pop((session_id, sender_id), None)
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
@@ -3150,7 +3247,7 @@ class SlackFrontend(Frontend):
         await self._warn_reply_limit(channel, thread_ts, sender_id)
 
     async def _hint_mention_required(
-        self, channel: str, thread_ts: str | None, sender_id: str
+        self, channel: str, thread_ts: str | None, sender_id: str, event: dict
     ) -> None:
         """Say, in a thread the bot is already in, that a channel message without
         a tag is invisible to it.
@@ -3212,10 +3309,33 @@ class SlackFrontend(Frontend):
                 thread_ts,
             )
             return
+        self._hold_untagged(session_id, sender_id, event)
         self._cancel_mention_notice(session_id, sender_id)
         self._mention_notices[(session_id, sender_id)] = asyncio.create_task(
             self._notice_mention_later(session_id, channel, thread_ts, sender_id, delay)
         )
+
+    def _hold_untagged(self, session_id: int, user: str, event: dict) -> None:
+        """Keep an untagged message so the notice's button can replay it.
+
+        Deduplicated by `ts` for the reason `_mark_gated` gives: a skipped message
+        is never marked processed, so `_catchup` can hand it back after a
+        reconnect, and one entry per message stops the button running it twice.
+        """
+        backlog = self._untagged_msgs.setdefault((session_id, user), [])
+        if any(stored.get("ts") == event.get("ts") for stored in backlog):
+            logger.debug("slack: untagged message %s is already held", event.get("ts"))
+            return
+        backlog.append(event)
+        if len(backlog) > GATED_MSG_BACKLOG_MAX:
+            dropped = backlog.pop(0)
+            logger.warning(
+                "slack %s/%s: untagged backlog over %d, dropped the oldest (%s)",
+                event.get("channel"),
+                event.get("thread_ts"),
+                GATED_MSG_BACKLOG_MAX,
+                dropped.get("ts"),
+            )
 
     def _cancel_mention_notice(self, session_id: int, user: str) -> None:
         """Drop one person's notice in one thread, if it has not fired yet."""
@@ -3256,12 +3376,16 @@ class SlackFrontend(Frontend):
         # has no `ts` and never enters channel history, so nothing can ping. It
         # stays because it renders as a normal mention and marks at a glance who
         # the bot is answering.
+        note = (
+            f"<@{sender_id}> I only see messages in a channel that tag me. "
+            f"Add <@{self._user_id}> and I'll pick it up."
+        )
         await self._post_ephemeral_notice(
             channel,
             thread_ts,
             sender_id,
-            f"<@{sender_id}> I only see messages in a channel that tag me. "
-            f"Add <@{self._user_id}> and I'll pick it up.",
+            note,
+            blocks=_mention_notice_blocks(note, channel, thread_ts),
         )
 
     async def _warn_reply_limit(
