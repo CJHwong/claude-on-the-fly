@@ -1294,11 +1294,18 @@ class CronDaemon:
         if not rows:
             return
         name_width = max(len(s.entry.name) for s in rows)
-        cron_width = max(len(s.entry.cron) for s in rows)
+
+        def schedule(entry: CronEntry) -> str:
+            # A one-shot has no cron expression; show its at-time instead, the
+            # same way the entry table in the docs shows both fields.
+            return entry.cron if entry.cron is not None else f"at {entry.at:%H:%M}"
+
+        sched_width = max(len(schedule(s.entry)) for s in rows)
         for state in rows:
+            sched = schedule(state.entry)
             print(
                 f"  {state.entry.name:<{name_width}}  "
-                f"{state.entry.cron:<{cron_width}}  "
+                f"{sched:<{sched_width}}  "
                 f"{state.entry.kind:<8}  next: {state.next_fire:%a %H:%M}",
                 file=sys.stderr,
             )

@@ -1913,6 +1913,25 @@ class TestSummary:
             lines[0].index("next:")
         ) == 2
 
+    async def test_a_one_shot_row_shows_its_at_time_not_cron(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """A one-shot carries no cron expression, so the startup table prints
+        its `at` time in the schedule column instead of crashing on len(None)."""
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {"name": "later", "at": "2099-01-01 09:00", "prompt": "x"},
+                {"name": "tick", "cron": "* * * * *", "prompt": "y"},
+            ),
+            FakeQueue(),
+        )
+        cron.reload()
+        cron._print_summary()
+        out = capsys.readouterr().err
+        assert "at 09:00" in out
+
 
 class TestSideEffectCommandFailures:
     async def test_a_command_that_cannot_start_is_logged_to_the_entry(
