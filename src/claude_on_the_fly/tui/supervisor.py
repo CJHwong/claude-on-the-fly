@@ -7,6 +7,10 @@ Liveness model:
   marker that lets the TUI claim ownership across restarts. Optional — if a
   daemon was started outside the TUI (e.g. `uv run claude-telegram` in a shell),
   there's no PID file but the heartbeat still works.
+- The handles of the daemons *this* process started are held in `_spawned`, and
+  `reap()` polls them. Only a parent can reap its own child, so this is the only
+  way an exited daemon stops being a zombie, and a zombie answers `os.kill(pid,
+  0)` as alive for every process on the machine. See `reap`.
 
 Spawn semantics: detached via os.setsid (subprocess.Popen start_new_session=True),
 stdout/stderr redirected to per-frontend log files so the child survives TUI
@@ -25,6 +29,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +62,19 @@ HEARTBEAT_FRESH_WINDOW_S = 30.0
 RESTART_COMMAND_SETTING = "COTF_DAEMONS_RESTART_COMMAND"
 # The one placeholder a restart command may carry.
 FRONTEND_PLACEHOLDER = "{frontend}"
+
+# Handles for the daemons this process started, so that it can reap them.
+#
+# Only a parent can. `os.kill(pid, 0)` is true for a zombie, so a daemon that
+# exited reads as alive to every process on the machine until its parent cleans
+# up, including a `claude-tui upgrade` running somewhere else, which then waits
+# out its whole grace on a daemon that is already gone. `_has_exited` cannot fix
+# that from the outside: `waitpid` refuses a process that is not its child. So
+# the parent keeps the handle and `reap()` polls it.
+#
+# A lock because `resume` spawns from a thread pool.
+_spawned: dict[int, subprocess.Popen] = {}
+_spawned_lock = threading.Lock()
 
 
 def _last_running_file() -> Path:
@@ -334,6 +352,35 @@ def _start_via_command(
                 return pid
         time.sleep(HEARTBEAT_POLL_INTERVAL_S)
     raise DaemonDidNotComeBack(frontend, command, timeout_s)
+
+
+def reap() -> int:
+    """Reap daemons this process started that have since exited. Returns the count.
+
+    The parent has to do this itself. Until it does, an exited daemon is a
+    zombie, and `os.kill(pid, 0)` reports a zombie as alive to everybody. That
+    is what makes a `claude-tui upgrade` in another process wait out its whole
+    grace on a daemon that has already gone: it is not the parent, so it cannot
+    reap, and the kernel will not tell it the truth.
+
+    Cheap enough for a tick: one `poll()` per daemon this process started and
+    has not yet reaped. Polling is also what reaps, so the entries clear
+    themselves.
+    """
+    with _spawned_lock:
+        handles = list(_spawned.items())
+
+    reaped = 0
+    for pid, proc in handles:
+        if proc.poll() is None:
+            continue
+        with _spawned_lock:
+            _spawned.pop(pid, None)
+        reaped += 1
+
+    if reaped:
+        logger.debug("reaped %d exited daemon(s)", reaped)
+    return reaped
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
@@ -627,6 +674,8 @@ def spawn(
         # The child inherits the fd via Popen; we can close ours.
         log_handle.close()
 
+    with _spawned_lock:
+        _spawned[proc.pid] = proc
     _write_pid(frontend, proc.pid)
     logger.info("spawned %s pid=%d", frontend, proc.pid)
 

@@ -3249,6 +3249,32 @@ class TestWatchJobs:
         assert screen._chat_workspaces == {"jobs:t1-abc": "abc"}
 
 
+class TestTheTickReaps:
+    """The dashboard reaps the daemons it started, on its own tick.
+
+    This is what makes a `claude-tui upgrade` running in another process fast.
+    That process is not the daemons' parent, so it cannot reap them, and while
+    the parent has not, they are zombies that `os.kill(pid, 0)` reports as
+    alive. The upgrade then waits out its whole grace on a daemon that already
+    exited, which on this host is the difference between a second and twenty.
+
+    Asserted as "it happens", not "it happens once": the 1s timer may fire
+    during the same yield, and a count would make this depend on timing.
+    """
+
+    async def test_refresh_reaps_the_daemons_it_started(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            calls: list[int] = []
+            monkeypatch.setattr(supervisor, "reap", lambda: (calls.append(1), 0)[1])
+
+            screen._refresh()
+            await pilot.pause()
+
+        assert calls, "the dashboard's refresh never reaped"
+
+
 class TestUpgradeAction:
     """[U] is the destructive one: it stops every daemon at once. So the modal
     has to come first, and only a confirmed run may touch anything."""
