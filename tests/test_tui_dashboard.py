@@ -3365,6 +3365,95 @@ class TestUpgradeAction:
         log = isolated / dash.logs.log_name("upgrade")
         assert "Updated 1 file" in log.read_text()
 
+    def _two_step_plan(self):
+        from claude_on_the_fly.upgrade import Plan
+
+        return Plan(
+            command="git merge --ff-only && uv sync",
+            source="test",
+            prepare="git fetch",
+        )
+
+    async def test_a_two_step_upgrade_fetches_before_it_stops_anything(
+        self, isolated, monkeypatch
+    ):
+        """The window is the whole point. Everything that can run while the
+        daemons still serve has to run before the first stop, or it is downtime
+        that bought nothing."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            order: list[str] = []
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_prepare_captured",
+                lambda _plan: (order.append("prepare"), (0, "Fetched 1 commit"))[1],
+            )
+            monkeypatch.setattr(
+                supervisor,
+                "stop_all",
+                lambda: (order.append("stop"), [("slack", 1)])[1],
+            )
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_captured",
+                lambda _plan: (order.append("activate"), (0, ""))[1],
+            )
+            monkeypatch.setattr(
+                supervisor, "resume", lambda: (order.append("resume"), [])[1]
+            )
+
+            await screen._upgrade(self._two_step_plan())
+            await pilot.pause()
+
+            assert order == ["prepare", "stop", "activate", "resume"]
+            assert app.relaunch_on_exit is True
+
+        # Both steps land in the one log file, so the operator can see what the
+        # fetch did as well as what the activate step did.
+        log = isolated / dash.logs.log_name("upgrade")
+        assert "=== git fetch ===" in log.read_text()
+        assert "Fetched 1 commit" in log.read_text()
+        assert "=== git merge --ff-only && uv sync ===" in log.read_text()
+
+    async def test_a_failed_fetch_leaves_every_daemon_running(
+        self, isolated, monkeypatch
+    ):
+        """A fetch that cannot reach the network used to surface only after
+        every daemon was already down. Now it costs an error message."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_prepare_captured",
+                lambda _plan: (3, "fatal: unable to access remote"),
+            )
+            stopped: list[str] = []
+            monkeypatch.setattr(
+                supervisor, "stop_all", lambda: (stopped.append("stop"), [])[1]
+            )
+            resumed: list[str] = []
+            monkeypatch.setattr(
+                supervisor, "resume", lambda: (resumed.append("resume"), [])[1]
+            )
+
+            await screen._upgrade(self._two_step_plan())
+            await pilot.pause()
+
+        assert stopped == []
+        assert resumed == []
+        # Nothing was stopped and there is no new code to show, so the TUI stays.
+        assert getattr(app, "relaunch_on_exit", False) is False
+        assert any(
+            "prepare failed" in msg and severity == "error" for msg, severity in notices
+        )
+
+        # The failed fetch is still on disk for the operator to read.
+        log = isolated / dash.logs.log_name("upgrade")
+        assert "unable to access remote" in log.read_text()
+
     async def test_a_failed_upgrade_restarts_the_daemons_and_does_not_hand_over(
         self, isolated, monkeypatch
     ):

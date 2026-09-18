@@ -165,6 +165,7 @@ FIELDS: dict[str, Field] = {
     "logs.host_tag": Field("COTF_HOST_TAG"),
     "suggestions.enabled": Field("COTF_SUGGESTIONS_ENABLED"),
     "upgrade.command": Field("COTF_UPGRADE_COMMAND"),
+    "upgrade.prepare_command": Field("COTF_UPGRADE_PREPARE_COMMAND"),
 }
 
 # Sections and fields that are read once, at startup, because acting on them means

@@ -8,7 +8,7 @@ Subcommands:
     claude-tui restart <frontend>    stop + spawn
     claude-tui stop-all              stop every running daemon
     claude-tui resume                respawn whatever stop-all stopped
-    claude-tui upgrade               stop, fetch new code, start again
+    claude-tui upgrade               fetch, stop, activate, start again
 
 Every stop reports what it is about to interrupt first, and gives the daemon
 long enough to tell whoever was waiting. `--force` is the old immediate kill.
@@ -158,10 +158,12 @@ def cmd_upgrade(
     do_resume: bool,
     reader=input,
 ) -> int:
-    """Stop the daemons, fetch new code, start them again.
+    """Fetch, stop the daemons, activate the new code, start them again.
 
-    The daemons come back even when the upgrade command failed: the alternative
-    is leaving an operator with everything down and old code still on disk.
+    The fetch runs before anything is stopped, so a network failure leaves the
+    old build serving instead of an outage that upgrades nothing. The daemons
+    come back even when the activate command failed: the alternative is leaving
+    an operator with everything down and old code still on disk.
     """
     try:
         plan = upgrade.resolve()
@@ -182,6 +184,16 @@ def cmd_upgrade(
         if not _confirm(question, reader):
             print("upgrade: cancelled, nothing was stopped")
             return 1
+
+    if plan.prepare:
+        prepare_rc = upgrade.run_prepare(plan)
+        if prepare_rc != 0:
+            print(
+                f"upgrade: prepare failed (exit {prepare_rc}), so "
+                "nothing was stopped. The old build is still serving.",
+                file=sys.stderr,
+            )
+            return prepare_rc
 
     for name, pid in supervisor.stop_all(grace_s=_grace(force)):
         print(f"stopped {name} (pid {pid})")

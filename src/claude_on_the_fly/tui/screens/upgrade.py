@@ -34,19 +34,41 @@ class UpgradeScreen(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="upgrade-modal"):
             yield Static(Text("Upgrade", style="bold"))
-            yield Static(Text(self._plan.command, style="bold"))
+            for line in self._step_lines():
+                yield Static(line)
             yield Static(Text(f"from: {self._plan.source}", style="dim"))
             yield Static(self._pending_text(), id="upgrade-pending")
-            yield Static(
-                Text(
-                    "Daemons stop, the command runs, then they start again. "
-                    "This TUI relaunches itself on the new code.",
-                    style="dim",
-                )
-            )
+            yield Static(Text(self._cost_text(), style="dim"))
             with Horizontal(id="upgrade-buttons"):
                 yield Button("Upgrade [y]", id="confirm", variant="primary")
                 yield Button("Cancel [n]", id="cancel")
+
+    def _step_lines(self) -> list[Text]:
+        """The commands in the order they run, each marked with what it costs.
+
+        An operator deciding whether to upgrade now needs to see which part
+        interrupts anyone. The prepare step runs with the daemons up, so only
+        the second one is a cost to whoever is waiting on an answer.
+        """
+        if not self._plan.prepare:
+            return [Text(self._plan.command, style="bold")]
+        return [
+            Text(f"1. {self._plan.prepare}", style="bold"),
+            Text("   daemons keep running", style="dim"),
+            Text(f"2. {self._plan.command}", style="bold"),
+            Text("   daemons stop for this one", style="dim"),
+        ]
+
+    def _cost_text(self) -> str:
+        if self._plan.prepare:
+            return (
+                "Step 1 runs live. Then the daemons stop, step 2 runs, and they "
+                "start again. This TUI relaunches itself on the new code."
+            )
+        return (
+            "Daemons stop, the command runs, then they start again. "
+            "This TUI relaunches itself on the new code."
+        )
 
     def _pending_text(self) -> Text:
         if not self._pending:

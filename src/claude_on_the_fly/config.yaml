@@ -519,12 +519,19 @@ logs:
   # can be parsed, so a complaint about the file needs somewhere to go.
 
 upgrade:
-  # The command `claude-tui upgrade` (and the dashboard's [U]) runs to fetch new
-  # code, after it has drained the daemons and before it brings them back. Run
-  # through a shell, from the checkout root when there is one.
+  # An upgrade is up to two commands, split by whether the daemons have to be
+  # down for them. `prepare_command` runs first, with every daemon still
+  # serving, so it is where the network round trip belongs. `command` replaces
+  # the code the daemons are running, so they stop for it and come back after.
   #
-  # Leave it out and the command is derived from how this copy was installed: a
-  # git checkout gets `git pull --ff-only && uv sync`, a `uv tool install` gets
-  # `uv tool upgrade <tool>`. Set it when neither applies, or when your
-  # deployment updates some other way (a container image, a pinned tag).
-  # command: git fetch --tags && git checkout v1.4.0 && uv sync
+  # Leave it out and the commands are derived from how this copy was installed:
+  # a git checkout gets `git fetch` then `git merge --ff-only && uv sync`, and a
+  # `uv tool install` gets `uv tool upgrade <tool>` in one step, since uv builds
+  # the replacement environment itself. Set them when neither applies, or when
+  # your deployment updates some other way (a container image, a pinned tag).
+  #
+  # Set `prepare_command` only when the split is safe for your command. Anything
+  # it changes, a daemon still serving will read, so a fetch is fine and a
+  # checkout is not.
+  # prepare_command: git fetch --tags
+  # command: git checkout v1.4.0 && uv sync

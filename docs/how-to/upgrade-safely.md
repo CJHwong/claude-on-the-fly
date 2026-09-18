@@ -1,9 +1,12 @@
 # Upgrade safely
 
-An upgrade stops every daemon. Chat turns, background jobs, and cron commands all come
-back by themselves afterwards. Warning: a turn an agent had already started is resumed
-with a note telling it to check what it already did, but a side effect it had completed
-before the stop cannot be undone.
+An upgrade fetches the new code while the daemons keep serving, then stops them, swaps the
+code, and starts them again. The daemons are down for the swap alone.
+
+Warning: a turn an agent had already started is resumed with a note telling it to check
+what it already did, but a side effect it had completed before the stop cannot be undone.
+
+Chat turns, background jobs, and cron commands all come back by themselves afterwards.
 
 ## Upgrade from the terminal
 
@@ -11,46 +14,66 @@ before the stop cannot be undone.
 claude-tui upgrade
 ```
 
-The command reports what it is about to interrupt, asks to continue, stops the daemons,
-runs the upgrade command, and starts them again:
+The command reports what it is about to interrupt, asks to continue, runs the prepare step
+with the daemons still up, stops them, runs the activate step, and starts them again:
 
 ```
-upgrade: git pull --ff-only && uv sync   [git checkout at /srv/cotf]
+upgrade: git fetch (daemons stay up), then git merge --ff-only && uv sync   [git checkout at /srv/cotf]
 pending work:
   slack: 1 running, 2 queued (lost, needs resending)
   jobs: 1 running, 3 queued (resumes after the restart)
 stop everything (3 unrecoverable) and upgrade? [y/N]
 ```
 
-All three are on disk and come back on their own. "Lost, needs resending" describes
-what a stop costs a chat *now*, before the resume; see the table below.
+A prepare step that fails stops the upgrade before anything is stopped, so a fetch that
+cannot reach the network costs an error message rather than an outage. Use `--yes` to skip
+the prompt in a script. Use `--no-resume` to leave the daemons stopped.
 
-Use `--yes` to skip the prompt in a script. Use `--no-resume` to leave the daemons
-stopped. The daemons start again even when the upgrade command fails, so a failed fetch
-leaves the old build running rather than nothing.
+The daemons start again even when the activate step fails, so a failed swap leaves the old
+build running rather than nothing.
+
+All of it is on disk and comes back on its own. "Lost, needs resending" describes what a
+stop costs a chat *now*, before the resume; see the table below.
 
 ## Upgrade from the dashboard
 
-Press `U`. The modal shows the same command and the same pending work. The dashboard
-relaunches itself on the new code once the daemons are back, and writes the command's
-output to `~/.claude-on-the-fly/logs/upgrade-<host>-<date>.log`.
+Press `U`. The modal shows the same commands, which step costs uptime, and the same pending
+work. The dashboard relaunches itself on the new code once the daemons are back, and writes
+both steps' output to `~/.claude-on-the-fly/logs/upgrade-<host>-<date>.log`.
 
-## Choose the command
+## The two steps
 
-Leave `upgrade.command` unset unless the derived command is wrong for your deployment:
+An upgrade is up to two commands, split by whether the daemons have to be down for them.
 
-| Install | Command |
-|---|---|
-| Git checkout | `git pull --ff-only && uv sync` |
-| `uv tool install` | `uv tool upgrade <tool>` |
-| Anything else | Refused; set `upgrade.command` |
+| Step | When it runs | What belongs in it |
+|---|---|---|
+| `prepare_command` | First, with every daemon serving | Work that changes nothing a running daemon reads. A fetch. |
+| `command` | Second, with the daemons stopped | Work that replaces the code underneath them. A merge, a checkout, a sync. |
+
+The split is what keeps the outage short. A command that changes files a daemon loads has to
+be in the second step; a command that only reaches the network belongs in the first one.
+
+## Choose the commands
+
+Leave both unset unless the derived commands are wrong for your deployment:
+
+| Install | Prepare | Activate |
+|---|---|---|
+| Git checkout | `git fetch` | `git merge --ff-only && uv sync` |
+| `uv tool install` | none | `uv tool upgrade <tool>` |
+| Anything else | none | Refused; set `upgrade.command` |
 
 A `uvx --from git+...` run needs no upgrade: it fetches the current code at every start.
 
 ```yaml
 upgrade:
-  command: git fetch --tags && git checkout v1.4.0 && uv sync
+  prepare_command: git fetch --tags
+  command: git checkout v1.4.0 && uv sync
 ```
+
+Set `prepare_command` only when the split is safe. Everything it changes is read by a daemon
+that is still serving, so a fetch is fine and a checkout is not. Setting `command` alone
+keeps the single-step behaviour, because an operator's own command is not split for them.
 
 ## What each daemon does when it stops
 

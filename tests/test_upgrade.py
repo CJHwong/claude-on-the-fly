@@ -35,7 +35,11 @@ class TestResolve:
         """An operator whose deployment updates some other way (an image, a
         pinned tag) must not have a `git pull` chosen for them."""
         monkeypatch.setattr(
-            upgrade.settings, "get", lambda _name, default="": "  make deploy  "
+            upgrade.settings,
+            "get",
+            lambda name, default="": (
+                "  make deploy  " if name == upgrade.COMMAND_VAR else default
+            ),
         )
         monkeypatch.setattr(upgrade, "_repo_root", lambda: _fake_repo(tmp_path))
 
@@ -44,13 +48,35 @@ class TestResolve:
         assert plan.command == "make deploy"
         assert plan.source == "upgrade.command"
         assert plan.cwd is None
+        # An opaque command is not split for them: only they can say which half
+        # is safe to run against live daemons.
+        assert plan.prepare is None
 
-    def test_a_git_checkout_pulls_and_syncs_from_the_repo_root(self, monkeypatch):
+    def test_a_configured_prepare_command_is_taken(self, monkeypatch, tmp_path):
+        def fake_get(name, default=""):
+            return {
+                upgrade.COMMAND_VAR: "make deploy",
+                upgrade.PREPARE_VAR: "  make fetch  ",
+            }.get(name, default)
+
+        monkeypatch.setattr(upgrade.settings, "get", fake_get)
+        monkeypatch.setattr(upgrade, "_repo_root", lambda: _fake_repo(tmp_path))
+
+        plan = upgrade.resolve()
+
+        assert plan.prepare == "make fetch"
+
+    def test_a_git_checkout_fetches_outside_the_window(self, monkeypatch):
+        """The fetch is the network round trip, and it changes only .git, which
+        no daemon reads. Leaving it inside the window is what made an upgrade
+        cost seconds it did not have to."""
         monkeypatch.setattr(upgrade, "_repo_root", lambda: Path("/src/cotf"))
 
         plan = upgrade.resolve()
 
-        assert plan.command == "git pull --ff-only && uv sync"
+        assert plan.prepare == "git fetch"
+        # The two steps together are what `git pull --ff-only && uv sync` did.
+        assert plan.command == "git merge --ff-only && uv sync"
         assert plan.cwd == Path("/src/cotf")
         assert "/src/cotf" in plan.source
 
@@ -62,6 +88,9 @@ class TestResolve:
 
         assert plan.command == "uv tool upgrade claude-on-the-fly"
         assert plan.cwd is None
+        # One step: uv builds the replacement environment itself, so there is
+        # no separate fetch to move out of the window.
+        assert plan.prepare is None
 
     def test_an_unrecognised_install_refuses_and_names_the_setting(self, monkeypatch):
         """The failure mode this prevents: a guessed command that exits 0 while
@@ -162,6 +191,54 @@ class TestRun:
 
         assert upgrade.run_captured(plan, runner=runner) == (0, "")
 
+    def test_prepare_runs_the_first_step_streaming(self):
+        plan = upgrade.Plan(
+            command="git merge --ff-only && uv sync",
+            source="test",
+            cwd=Path("/x"),
+            prepare="git fetch",
+        )
+        runner = MagicMock(return_value=subprocess.CompletedProcess([], 0))
+
+        assert upgrade.run_prepare(plan, runner=runner) == 0
+
+        args, kwargs = runner.call_args
+        assert args[0] == "git fetch"
+        assert kwargs["cwd"] == Path("/x")
+        assert kwargs["check"] is False
+        assert "capture_output" not in kwargs
+
+    def test_a_plan_with_no_prepare_runs_nothing(self):
+        """The uv-tool shape and an operator's own command have one step. The
+        runner must not be reached at all, rather than reached with ""."""
+        plan = upgrade.Plan(command="uv tool upgrade x", source="test")
+        runner = MagicMock()
+
+        assert upgrade.run_prepare(plan, runner=runner) == 0
+
+        runner.assert_not_called()
+
+    def test_prepare_returns_its_exit_code(self):
+        plan = upgrade.Plan(command="x", source="test", prepare="false")
+        runner = MagicMock(return_value=subprocess.CompletedProcess([], 4))
+
+        assert upgrade.run_prepare(plan, runner=runner) == 4
+
+    def test_captured_prepare_returns_code_and_output(self):
+        plan = upgrade.Plan(command="x", source="test", prepare="git fetch")
+        runner = MagicMock(
+            return_value=subprocess.CompletedProcess([], 1, "out\n", "err\n")
+        )
+
+        assert upgrade.run_prepare_captured(plan, runner=runner) == (1, "out\nerr\n")
+
+    def test_captured_prepare_with_no_step_returns_empty(self):
+        plan = upgrade.Plan(command="x", source="test")
+        runner = MagicMock()
+
+        assert upgrade.run_prepare_captured(plan, runner=runner) == (0, "")
+        runner.assert_not_called()
+
 
 class TestRelaunch:
     def test_the_argv_reruns_the_tui_module_with_the_same_arguments(self, monkeypatch):
@@ -180,3 +257,18 @@ def test_describe_names_the_command_and_where_it_came_from():
 
     assert "uv tool upgrade x" in described
     assert "uv tool install" in described
+
+
+def test_describe_says_which_step_costs_uptime():
+    """An operator reading the confirmation prompt has to be able to tell which
+    half of the upgrade interrupts whoever is waiting on an answer."""
+    plan = upgrade.Plan(
+        command="git merge --ff-only && uv sync",
+        source="git checkout at /src/cotf",
+        prepare="git fetch",
+    )
+
+    described = upgrade.describe(plan)
+
+    assert "git fetch (daemons stay up)" in described
+    assert "git merge --ff-only && uv sync" in described
