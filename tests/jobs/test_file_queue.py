@@ -8,7 +8,7 @@ import json
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from claude_on_the_fly.jobs import file_queue
@@ -1124,3 +1124,97 @@ def test_a_wrongly_typed_tool_call_floor_is_poison(tmp_path: Path) -> None:
 
     assert queue.claim() is None
     assert (tmp_path / "failed" / "1-a.json").is_file()
+
+
+class TestAvailableAt:
+    """The run-no-earlier-than moment travels in the payload, and `claim`
+    refuses to hand work over before it."""
+
+    def _enqueue_at(self, q: FileInboxQueue, job_id: str, at: datetime | None) -> None:
+        q.enqueue(
+            Job(id=job_id, prompt="do it", origin={"channel": "C1"}, available_at=at)
+        )
+
+    def test_a_future_job_is_not_claimed_before_its_time(self, tmp_path: Path) -> None:
+        q = FileInboxQueue(tmp_path / "jobs")
+        self._enqueue_at(
+            q, f"{time.time_ns()}-aaaaaaaa", datetime.now() + timedelta(hours=1)
+        )
+        assert q.claim() is None
+        # The job is still queued, not lost or claimed.
+        assert list((tmp_path / "jobs" / "new").glob("*.json"))
+
+    def test_a_due_job_is_claimed_normally(self, tmp_path: Path) -> None:
+        q = FileInboxQueue(tmp_path / "jobs")
+        self._enqueue_at(
+            q, f"{time.time_ns()}-aaaaaaaa", datetime.now() - timedelta(seconds=1)
+        )
+        job = q.claim()
+        assert job is not None
+        assert job.available_at is not None
+
+    def test_a_future_job_does_not_block_a_due_one(self, tmp_path: Path) -> None:
+        q = FileInboxQueue(tmp_path / "jobs")
+        future_id = f"{time.time_ns()}-aaaaaaaa"
+        self._enqueue_at(q, future_id, datetime.now() + timedelta(hours=1))
+        later_id = f"{time.time_ns() + 1}-bbbbbbbb"
+        self._enqueue_at(q, later_id, None)
+        job = q.claim()
+        assert job is not None and job.id == later_id
+
+    def test_available_at_survives_recover_stale(self, tmp_path: Path) -> None:
+        """A worker restart requeues in-flight work; a job not yet due must not
+        become claimable by that round trip."""
+        q = FileInboxQueue(tmp_path / "jobs")
+        at = datetime.now() + timedelta(hours=1)
+        self._enqueue_at(q, f"{time.time_ns()}-aaaaaaaa", at)
+        job = Job(
+            id=f"{time.time_ns() + 1}-bbbbbbbb", prompt="now", origin={"channel": "C1"}
+        )
+        q.enqueue(job)
+        claimed = q.claim()
+        assert claimed is not None and claimed.available_at is None
+        q.recover_stale(None)
+        assert q.claim().id == claimed.id  # type: ignore[union-attr]
+        assert q.claim() is None  # the future job stays put
+
+    def test_an_unparseable_available_at_is_poison(self, tmp_path: Path) -> None:
+        q = FileInboxQueue(tmp_path / "jobs")
+        self._enqueue_at(q, f"{time.time_ns()}-aaaaaaaa", datetime.now())
+        (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+        payload = json.loads(queued.read_text())
+        payload["available_at"] = "someday"
+        queued.write_text(json.dumps(payload))
+        assert q.claim() is None
+        assert list((tmp_path / "jobs" / "failed").glob("*.json"))
+
+    def test_an_offset_aware_available_at_is_poison(self, tmp_path: Path) -> None:
+        q = FileInboxQueue(tmp_path / "jobs")
+        self._enqueue_at(q, f"{time.time_ns()}-aaaaaaaa", None)
+        (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+        payload = json.loads(queued.read_text())
+        payload["available_at"] = "2026-09-19T09:00:00+08:00"
+        queued.write_text(json.dumps(payload))
+        assert q.claim() is None
+        assert list((tmp_path / "jobs" / "failed").glob("*.json"))
+
+    def test_an_old_worker_reads_as_immediately_due(self, tmp_path: Path) -> None:
+        """Mixed-version rollout: a worker older than the field ignores it and
+        runs the job now — the same downgrade direction as an unknown profile."""
+        q = FileInboxQueue(tmp_path / "jobs")
+        self._enqueue_at(
+            q, f"{time.time_ns()}-aaaaaaaa", datetime.now() + timedelta(hours=1)
+        )
+        (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+        payload = json.loads(queued.read_text())
+        del payload["available_at"]
+        queued.write_text(json.dumps(payload))
+        assert q.claim() is not None
+
+    def test_the_listing_carries_available_at(self, tmp_path: Path) -> None:
+        q = FileInboxQueue(tmp_path / "jobs")
+        at = datetime.now().replace(microsecond=0) + timedelta(minutes=22)
+        self._enqueue_at(q, f"{time.time_ns()}-aaaaaaaa", at)
+        (row,) = q.list_unfinished()
+        assert row.available_at == at
+        assert not row.in_flight

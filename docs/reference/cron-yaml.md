@@ -15,7 +15,8 @@ entries:
 | Key | Type / default | Constraints |
 |---|---|---|
 | `name` | string / required | Unique; letters, digits, `_`, and `-` |
-| `cron` | string / required | Standard five-field expression |
+| `cron` | string / required unless `at` | Standard five-field expression |
+| `at` | string / unset | One-shot fire time, in local time: ISO (`2026-09-19 09:00`, bare `2026-09-19`) or relative (`30m`, `2h`, `1d`). Mutually exclusive with `cron`; needs a `prompt` or `prompt_file` and no `command`. Fires once, then the entry is spent -- the fire is recorded durably, so a daemon restart cannot run it a second time. An `at` already in the past fires on the next loop tick (a daemon that was down at the fire time runs the work late rather than never). To run it again, set a new `at` |
 | `prompt` | non-empty string | Mutually exclusive with `prompt_file` |
 | `prompt_file` | path | Re-read every fire; relative to `cron.yaml` |
 | `command` | non-empty shell string | Producer when paired with a prompt; side effect otherwise |

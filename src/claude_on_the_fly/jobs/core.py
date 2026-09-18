@@ -14,9 +14,46 @@ timestamps) lives inside `origin` and is never named here. Protocol style mirror
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
+
+
+def parse_when(text: str, now: datetime | None = None) -> datetime:
+    """Parse a "no earlier than" time: absolute local, or relative to `now`.
+
+    Absolute is an ISO 8601 local datetime ("2026-09-19 09:00", "2026-09-19",
+    "2026-09-19T09:00:30" — the space form included, matching how an operator
+    writes it). Relative is `<n><unit>` ("45s", "30m", "2h", "1d"), resolved
+    against `now` (default: the current local time). Both produce a *naive*
+    datetime: every schedule in this daemon is naive local, so an offset-aware
+    value is refused rather than silently compared against the wrong clock.
+    Raises ValueError with the offending text for anything else.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("empty time (expected ISO local datetime or <n><unit>)")
+    relative = re.fullmatch(r"(\d+)\s*([smhd])", cleaned)
+    if relative is not None:
+        amount, unit = int(relative.group(1)), relative.group(2)
+        if amount == 0:
+            raise ValueError(f"a relative time of {cleaned!r} is zero")
+        seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        base = now if now is not None else datetime.now()
+        return base + timedelta(seconds=amount * seconds)
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError as exc:
+        raise ValueError(
+            f"cannot parse time {text!r} (expected ISO local datetime "
+            "like '2026-09-19 09:00', or relative like '30m')"
+        ) from exc
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"time {text!r} carries a timezone offset; write it in local time"
+        )
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -66,6 +103,11 @@ class Job:
     # for the reason `timeout` does: the worker runs several jobs concurrently in
     # one process, so a per-job setting has to travel as a value.
     min_tool_calls: int = 0
+    # Earliest claim time, in naive local time. None means "now". It rides on the
+    # job for the reason `timeout` does: the queue is durable across worker
+    # restarts, so the run-no-earlier-than moment has to travel with the work
+    # rather than live in one process's memory.
+    available_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +135,11 @@ class QueueRow:
     `origin` is the same opaque dict the producer attached; the core does not
     read it, but a caller that speaks the producer's vocabulary can (the Slack
     frontend filters a listing down to the channel that asked).
+
+    `available_at` is None unless the payload carries one: a queued row that is
+    waiting for its earliest claim time. `enqueued_at` (from the id) and
+    `available_at` (from the payload) are deliberately separate — one is when
+    the work was handed over, the other when it may start.
     """
 
     id: str
@@ -100,6 +147,7 @@ class QueueRow:
     origin: dict[str, Any]
     enqueued_at: datetime | None
     in_flight: bool
+    available_at: datetime | None = None
 
 
 @dataclass(frozen=True)

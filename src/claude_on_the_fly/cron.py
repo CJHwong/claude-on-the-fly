@@ -47,7 +47,7 @@ from liquid.exceptions import LiquidError, LiquidSyntaxError
 
 from claude_on_the_fly import agent, logs
 from claude_on_the_fly.agent import DATA_DIR
-from claude_on_the_fly.jobs.core import AlertSink, Job, JobQueue, Result
+from claude_on_the_fly.jobs.core import AlertSink, Job, JobQueue, Result, parse_when
 from claude_on_the_fly.jobs.key_state import (
     DEFAULT_MAX_FIRES,
     KeyStateStore,
@@ -55,6 +55,13 @@ from claude_on_the_fly.jobs.key_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Sentinel next_fire for a one-shot entry after its single attempt: never again
+# in this process, whatever the clock does.
+_NEVER_FIRE = datetime.max
+# Fingerprint every one-shot fire is recorded under, so `should_skip` sees an
+# unchanged item no matter how many times it fires.
+_ONE_SHOT_FINGERPRINT = "one-shot"
 
 LOG_DIR = DATA_DIR / "logs"
 DEFAULT_CONFIG = DATA_DIR / "cron.yaml"
@@ -184,7 +191,11 @@ entries: []  # add at least one entry - an empty list won't load
 @dataclass(frozen=True)
 class CronEntry:
     name: str
-    cron: str
+    cron: str | None = None
+    # One-shot fire time (naive local), mutually exclusive with `cron`. The
+    # entry runs once at this time and is then spent -- the fire is recorded in
+    # the key-state store, so a daemon restart cannot run it a second time.
+    at: datetime | None = None
     prompt: str | None = None
     prompt_file: Path | None = None
     command: str | None = None
@@ -300,6 +311,7 @@ ENTRY_KEYS = frozenset(
     {
         "name",
         "cron",
+        "at",
         "prompt",
         "prompt_file",
         "command",
@@ -345,11 +357,27 @@ def _validate_entry(
     seen.add(name)
     where = f"{where} ({name})"
 
-    cron_expr = _require_str(data, "cron", where)
-    try:
-        croniter(cron_expr, datetime.now())
-    except (ValueError, KeyError) as exc:
-        raise ValueError(f"{where}: invalid cron {cron_expr!r}: {exc}") from exc
+    # One-shot `at` or recurring `cron`: exactly one. Validated here so a
+    # mistyped time fails when the file is saved, not at the moment the entry
+    # should have fired.
+    at: datetime | None = None
+    raw_at = data.get("at")
+    if raw_at is not None:
+        if not isinstance(raw_at, str):
+            raise ValueError(f"{where}: 'at' must be a string")
+        try:
+            at = parse_when(raw_at)
+        except ValueError as exc:
+            raise ValueError(f"{where}: invalid 'at': {exc}") from exc
+    if at is not None and "cron" in data:
+        raise ValueError(f"{where}: specify 'cron' OR 'at', not both")
+    cron_expr: str | None = None
+    if at is None:
+        cron_expr = _require_str(data, "cron", where)
+        try:
+            croniter(cron_expr, datetime.now())
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"{where}: invalid cron {cron_expr!r}: {exc}") from exc
 
     data = _translate_legacy_entry(data, where)
     _reject_unknown_keys(data, where)
@@ -373,6 +401,12 @@ def _validate_entry(
             raise ValueError(f"{where}: prompt_file not found at {prompt_file}")
 
     command = _require_str(data, "command", where) if has_command else None
+    if at is not None and (has_command or not (has_prompt or has_file)):
+        # A one-shot entry runs an agent once at a set time; a shell command on
+        # it would have no schedule to recur against and nothing to fire it.
+        raise ValueError(
+            f"{where}: 'at' needs a 'prompt' or 'prompt_file' and no 'command'"
+        )
 
     timeout = _positive_int(data, "timeout", DEFAULT_TIMEOUT, where)
     if not 0 < timeout <= MAX_TIMEOUT:
@@ -420,6 +454,7 @@ def _validate_entry(
     entry = CronEntry(
         name=name,
         cron=cron_expr,
+        at=at,
         prompt=prompt,
         prompt_file=prompt_file,
         command=command,
@@ -771,16 +806,24 @@ class CronDaemon:
         fresh: dict[str, EntryState] = {}
         for entry in entries:
             previous = self._state.get(entry.name)
-            if previous is not None and previous.entry.cron == entry.cron:
+            if (
+                previous is not None
+                and previous.entry.cron == entry.cron
+                and previous.entry.at == entry.at
+            ):
                 # Keep the pending fire time so editing an unrelated field does
                 # not silently reschedule the entry.
                 fresh[entry.name] = EntryState(
                     entry=entry, next_fire=previous.next_fire
                 )
             else:
-                fresh[entry.name] = EntryState(
-                    entry=entry, next_fire=next_fire(entry.cron, now)
-                )
+                if entry.at is not None:
+                    first_fire = entry.at
+                else:
+                    # Validation guarantees a cron expression when 'at' is absent.
+                    assert entry.cron is not None
+                    first_fire = next_fire(entry.cron, now)
+                fresh[entry.name] = EntryState(entry=entry, next_fire=first_fire)
         added = set(fresh) - set(self._state)
         removed = set(self._state) - set(fresh)
         changed = {
@@ -822,7 +865,20 @@ class CronDaemon:
             await self._drain_triggers()
             now = datetime.now()
             for state in list(self._state.values()):
-                if state.next_fire <= now:
+                if state.next_fire > now:
+                    continue
+                if state.entry.at is not None:
+                    # One-shot: one attempt, then never again in this process.
+                    # Setting _NEVER_FIRE before the check keeps a spent entry
+                    # from re-entering here every minute after a restart.
+                    state.next_fire = _NEVER_FIRE
+                    if self._at_spent(state.entry):
+                        continue
+                    await self._fire(state.entry)
+                    self._key_state.record_fire(state.entry.name, _ONE_SHOT_FINGERPRINT)
+                else:
+                    # Validation guarantees a cron expression when 'at' is absent.
+                    assert state.entry.cron is not None
                     state.next_fire = next_fire(state.entry.cron, now)
                     await self._fire(state.entry)
 
@@ -935,6 +991,22 @@ class CronDaemon:
                 continue
             logger.info("cron: run-now firing %s", name)
             await self._fire(state.entry)
+
+    def _at_spent(self, entry: CronEntry) -> bool:
+        """Whether this one-shot entry already fired, per the key-state store.
+
+        The store is durable across restarts, which the in-memory `EntryState`
+        is not: without it, a daemon restart after the fire time would run the
+        entry a second time. The same store backs the producers' once-only
+        bookkeeping, so this adds no new state format.
+        """
+        reason = self._key_state.should_skip(
+            entry.name, _ONE_SHOT_FINGERPRINT, max_fires=1
+        )
+        if reason:
+            logger.info("cron %s: one-shot already fired (%s)", entry.name, reason)
+            return True
+        return False
 
     # --- firing ---
 
@@ -1226,11 +1298,18 @@ class CronDaemon:
         if not rows:
             return
         name_width = max(len(s.entry.name) for s in rows)
-        cron_width = max(len(s.entry.cron) for s in rows)
+
+        def schedule(entry: CronEntry) -> str:
+            # A one-shot has no cron expression; show its at-time instead, the
+            # same way the entry table in the docs shows both fields.
+            return entry.cron if entry.cron is not None else f"at {entry.at:%H:%M}"
+
+        sched_width = max(len(schedule(s.entry)) for s in rows)
         for state in rows:
+            sched = schedule(state.entry)
             print(
                 f"  {state.entry.name:<{name_width}}  "
-                f"{state.entry.cron:<{cron_width}}  "
+                f"{sched:<{sched_width}}  "
                 f"{state.entry.kind:<8}  next: {state.next_fire:%a %H:%M}",
                 file=sys.stderr,
             )
