@@ -903,19 +903,43 @@ class DashboardScreen(Screen):
         if confirmed:
             self.run_worker(self._upgrade(plan), exclusive=True)
 
-    async def _upgrade(self, plan: upgrade.Plan) -> None:
-        """Stop everything, run the command, start everything, hand over.
+    async def _prepare(self, plan: upgrade.Plan) -> bool:
+        """Run the prepare step, with every daemon still serving.
 
-        The daemons come back whether or not the command succeeded — the failure
-        case is old code running again, not a machine with nothing on it. Only a
-        success relaunches the TUI, because only then is there new code to show.
+        Returns whether the upgrade may continue. A fetch that fails here costs
+        an error message instead of an outage: nothing has stopped yet, so the
+        old build keeps answering.
+        """
+        if not plan.prepare:
+            return True
+        self._notify(f"{plan.prepare} (daemons stay up)", "information")
+        code, output = await asyncio.to_thread(upgrade.run_prepare_captured, plan)
+        log_path = self._write_upgrade_log(plan.prepare, output)
+        if code == 0:
+            return True
+        self._notify(
+            f"prepare failed (exit {code}), nothing was stopped, see {log_path}",
+            "error",
+        )
+        return False
+
+    async def _upgrade(self, plan: upgrade.Plan) -> None:
+        """Fetch, stop everything, activate, start everything, hand over.
+
+        The fetch runs first, while the daemons are still up, because it is the
+        network round trip and it needs nobody stopped. The daemons come back
+        whether or not the activate command succeeded: the failure case is old
+        code running again, not a machine with nothing on it. Only a success
+        relaunches the TUI, because only then is there new code to show.
         """
         self._set_busy("upgrading")
         try:
+            if not await self._prepare(plan):
+                return
             stopped = await asyncio.to_thread(supervisor.stop_all)
             self._notify(f"stopped {len(stopped)} daemon(s), upgrading", "information")
             code, output = await asyncio.to_thread(upgrade.run_captured, plan)
-            log_path = self._write_upgrade_log(plan, output)
+            log_path = self._write_upgrade_log(plan.command, output)
             results = await asyncio.to_thread(supervisor.resume)
             for name, _, exc in results:
                 if exc is not None:
@@ -930,18 +954,19 @@ class DashboardScreen(Screen):
         cast("ClaudeTuiApp", self.app).relaunch_on_exit = True
         self.app.exit()
 
-    def _write_upgrade_log(self, plan: upgrade.Plan, output: str) -> Path:
-        """Park the command's output where the operator can read it.
+    def _write_upgrade_log(self, command: str, output: str) -> Path:
+        """Park a command's output where the operator can read it.
 
         Captured rather than streamed, because git and uv writing to this
         terminal would land on top of the dashboard. Same `<role>-<host>-<date>`
-        naming as every other log here, so retention prunes it like the rest.
+        naming as every other log here, so retention prunes it like the rest,
+        and appended, so both steps of one upgrade land in the same file.
         """
         path = logs.log_file("upgrade", directory=LOG_DIR)
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
-                handle.write(f"=== {plan.command} ({plan.source}) ===\n{output}\n")
+                handle.write(f"=== {command} ===\n{output}\n")
         except OSError as exc:
             self._notify(f"could not write {path}: {exc}", "warning")
         return path

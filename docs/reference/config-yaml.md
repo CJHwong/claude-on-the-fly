@@ -296,9 +296,21 @@ A timeout carried by a cron job overrides the worker default for that job.
 
 | Key | Type / default | Effect | Lifecycle |
 |---|---|---|---|
-| `command` | string / derived from the install | Shell command `claude-tui upgrade` runs to fetch new code | Immediate |
+| `command` | string / derived from the install | Shell command `claude-tui upgrade` runs to activate new code | Immediate |
+| `prepare_command` | string / derived from the install | Shell command that runs first, with the daemons still serving | Immediate |
 
-Leave `command` unset and the command follows how the copy was installed: a git checkout
-runs `git pull --ff-only && uv sync` from the repository root, and a `uv tool install`
-runs `uv tool upgrade <tool>`. Any other shape refuses to guess and asks for this key.
+An upgrade is up to two commands, split by whether the daemons have to be down for them.
+`prepare_command` runs first, while every daemon still serves, so it is where the network
+round trip belongs. `command` replaces the code the daemons are running, so they stop for
+it and start again afterwards.
+
+Leave both unset and they follow how the copy was installed. A git checkout gets
+`git fetch` then `git merge --ff-only && uv sync`, from the repository root. A
+`uv tool install` gets `uv tool upgrade <tool>` in one step, because uv builds the
+replacement environment itself. Any other shape refuses to guess and asks for `command`.
+
+Set `prepare_command` only when the split is safe for your command. A daemon still serving
+reads whatever the prepare step changes, so a fetch is fine and a checkout is not. Setting
+`command` alone keeps the single-step behaviour: an opaque command is not split for you.
+
 See [Upgrade safely](../how-to/upgrade-safely.md).

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -229,6 +234,89 @@ class TestStop:
 
 
 # ---------------------------------------------------------------------------
+# reaping
+# ---------------------------------------------------------------------------
+
+
+class TestReaping:
+    """A child this process spawned stays a zombie until somebody reaps it, and
+    `os.kill(pid, 0)` is true for a zombie.
+
+    `spawn` handed its `Popen` to nobody, so nothing reaped ours: a stop spent
+    its whole grace polling a daemon that had already exited, then SIGKILLed the
+    corpse. An upgrade stops every frontend, which made that the larger part of
+    its downtime.
+    """
+
+    def test_waitpid_decides_without_asking_the_kernel_about_a_zombie(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(os, "waitpid", lambda pid, flags: (pid, 0))
+        asked = MagicMock(return_value=True)
+        monkeypatch.setattr(supervisor, "_process_exists", asked)
+
+        assert supervisor._has_exited(1234) is True
+        asked.assert_not_called()
+
+    def test_a_process_that_is_not_our_child_falls_back_to_the_kill_check(
+        self, monkeypatch
+    ):
+        def not_our_child(pid, flags):
+            raise ChildProcessError(10, "No child processes")
+
+        monkeypatch.setattr(os, "waitpid", not_our_child)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+        assert supervisor._has_exited(1234) is False
+
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        assert supervisor._has_exited(1234) is True
+
+    def test_a_child_that_exits_on_sigterm_is_not_force_killed(
+        self, isolated_state, monkeypatch
+    ):
+        """End to end, with a real child.
+
+        The point of the fix is that a stop waits for the shutdown rather than
+        for the grace to run out. A daemon that exits cleanly must not be
+        SIGKILLed, and must not cost the window its whole grace.
+        """
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+                "time.sleep(30)\n",
+            ]
+        )
+        real_kill = os.kill
+        try:
+            _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=child.pid)
+            (supervisor.STATE_DIR / "telegram.pid").write_text(str(child.pid))
+
+            signalled: list[int] = []
+            monkeypatch.setattr(
+                os,
+                "kill",
+                lambda pid, sig: signalled.append(sig) or real_kill(pid, sig),
+            )
+
+            started = time.monotonic()
+            stopped = supervisor.stop("telegram", grace_s=5.0)
+            elapsed = time.monotonic() - started
+
+            assert stopped == child.pid
+            assert signal.SIGKILL not in signalled
+            assert elapsed < 3.0, f"stop waited {elapsed:.1f}s on an exited child"
+        finally:
+            # real_kill, not child.kill: os.kill is still patched here, and a
+            # second recorded signal would be the test talking to itself.
+            with contextlib.suppress(ProcessLookupError):
+                real_kill(child.pid, signal.SIGKILL)
+            child.wait()
+
+
+# ---------------------------------------------------------------------------
 # restart
 # ---------------------------------------------------------------------------
 
@@ -431,6 +519,25 @@ class TestStopAll:
         names = {n for n, _ in stopped}
         assert names == {"telegram", "slack"}
 
+    def test_the_stops_overlap_instead_of_queueing(self, isolated_state, monkeypatch):
+        """Stopping in turn made the outage the *sum* of the shutdown times.
+        The barrier only clears if every worker is inside its own stop at once,
+        so a regression to sequential raises BrokenBarrierError here."""
+        for name, pid in (("telegram", 11), ("slack", 22), ("cron", 33)):
+            _write_heartbeat(supervisor.STATE_DIR, name, pid=pid)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+
+        barrier = threading.Barrier(3, timeout=5)
+
+        def fake_stop(name, *, grace_s):
+            barrier.wait()
+            return 1
+
+        monkeypatch.setattr(supervisor, "stop", fake_stop)
+
+        stopped = supervisor.stop_all()
+        assert {n for n, _ in stopped} == {"telegram", "slack", "cron"}
+
     def test_writes_last_running_file(self, isolated_state, monkeypatch):
         _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=11)
         liveness = {11: True}
@@ -481,6 +588,30 @@ class TestResume:
         assert name == "telegram"
         assert pid == 4242
         assert exc is None
+
+    def test_the_spawns_overlap_and_report_in_recorded_order(
+        self, isolated_state, monkeypatch
+    ):
+        """Two things at once: the spawns must overlap, because each one blocks
+        on its own heartbeat, and the results must come back in the recorded
+        order rather than the order they happened to finish."""
+        supervisor._write_last_running(["telegram", "slack", "cron"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        barrier = threading.Barrier(3, timeout=5)
+        pids = {"telegram": 1, "slack": 2, "cron": 3}
+
+        def fake_spawn(name, **_kwargs):
+            barrier.wait()
+            if name == "telegram":
+                time.sleep(0.05)  # slowest, so it finishes last
+            return pids[name]
+
+        monkeypatch.setattr(supervisor, "spawn", fake_spawn)
+
+        results = supervisor.resume()
+
+        assert [name for name, _, _ in results] == ["telegram", "slack", "cron"]
+        assert [pid for _, pid, _ in results] == [1, 2, 3]
 
     def test_skips_already_running(self, isolated_state, monkeypatch):
         supervisor._write_last_running(["telegram"])

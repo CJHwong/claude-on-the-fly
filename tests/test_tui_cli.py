@@ -324,6 +324,68 @@ class TestUpgrade:
     def _plan(self):
         return app.upgrade.Plan(command="git pull && uv sync", source="test")
 
+    def _plan_with_prepare(self):
+        return app.upgrade.Plan(
+            command="git merge --ff-only && uv sync",
+            source="test",
+            prepare="git fetch",
+        )
+
+    def test_the_fetch_runs_before_anything_is_stopped(self, capsys):
+        """The window is the point. Everything that can be done while the
+        daemons serve has to happen before the first stop, or it is downtime
+        for nothing."""
+        order: list[str] = []
+        with (
+            patch.object(
+                app.upgrade, "resolve", return_value=self._plan_with_prepare()
+            ),
+            patch.object(app.supervisor, "all_pending_work", return_value=[]),
+            patch.object(
+                app.upgrade,
+                "run_prepare",
+                side_effect=lambda _plan: (order.append("prepare"), 0)[1],
+            ),
+            patch.object(
+                app.supervisor,
+                "stop_all",
+                side_effect=lambda **_kw: (order.append("stop"), [])[1],
+            ),
+            patch.object(
+                app.upgrade,
+                "run",
+                side_effect=lambda _plan: (order.append("activate"), 0)[1],
+            ),
+            patch.object(app.supervisor, "resume", return_value=[]),
+        ):
+            assert (
+                app.cmd_upgrade(None, force=False, assume_yes=True, do_resume=True) == 0
+            )
+
+        assert order == ["prepare", "stop", "activate"]
+
+    def test_a_failed_prepare_leaves_everything_running(self, capsys):
+        """A fetch that cannot reach the network used to surface only after
+        every daemon was already down. Now it costs an error message."""
+        with (
+            patch.object(
+                app.upgrade, "resolve", return_value=self._plan_with_prepare()
+            ),
+            patch.object(app.supervisor, "all_pending_work", return_value=[]),
+            patch.object(app.upgrade, "run_prepare", return_value=3),
+            patch.object(app.supervisor, "stop_all") as stop_all,
+            patch.object(app.upgrade, "run") as run,
+            patch.object(app.supervisor, "resume") as resume,
+        ):
+            assert (
+                app.cmd_upgrade(None, force=False, assume_yes=True, do_resume=True) == 3
+            )
+
+        stop_all.assert_not_called()
+        run.assert_not_called()
+        resume.assert_not_called()
+        assert "nothing was stopped" in capsys.readouterr().err
+
     def test_the_happy_path_drains_upgrades_and_resumes(self, capsys):
         with (
             patch.object(app.upgrade, "resolve", return_value=self._plan()),

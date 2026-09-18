@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -208,6 +209,29 @@ def _remove_heartbeat(frontend: str) -> None:
     makes a stopped daemon read as stopped immediately."""
     with contextlib.suppress(FileNotFoundError):
         _heartbeat_file(frontend).unlink()
+
+
+def _has_exited(pid: int) -> bool:
+    """True when this pid is gone, reaping it first if it is our own child.
+
+    `os.kill(pid, 0)` is true for a child that exited and was never reaped, so a
+    daemon that shut down cleanly reads as alive for as long as it stays a
+    zombie. `spawn` hands its `Popen` to nobody, so nothing was reaping ours: a
+    `stop` spent its whole grace polling a process that was already gone, then
+    SIGKILLed the corpse. Measured on this machine, that turned a 1s shutdown
+    into a 22s stop, and an upgrade stops every frontend.
+
+    `waitpid` is the only call that can tell the truth about our own children,
+    and it is what reaps them. A daemon this process did not spawn raises
+    ChildProcessError, and `os.kill` is still the right answer for that one: it
+    was reparented, so its new parent reaps it.
+    """
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return True
+    except ChildProcessError:
+        pass
+    return not _process_exists(pid)
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
@@ -409,8 +433,15 @@ def all_pending_work() -> list[PendingWork]:
 
 
 def is_running(frontend: str) -> bool:
+    """Whether a live daemon answers for this frontend.
+
+    An exited child this process has not reaped reads as alive through
+    `os.kill`, so this asks `_has_exited` instead. `resume` skips anything that
+    reports running, and a zombie that reports running would keep a dead daemon
+    down for good.
+    """
     pid = _resolve_pid(frontend)
-    return pid is not None and _process_exists(pid)
+    return pid is not None and not _has_exited(pid)
 
 
 def read_pid(frontend: str) -> int | None:
@@ -447,7 +478,7 @@ def spawn(
         raise ValueError(f"unknown frontend: {frontend!r}")
 
     existing = _resolve_pid(frontend)
-    if existing is not None and _process_exists(existing):
+    if existing is not None and not _has_exited(existing):
         raise AlreadyRunning(frontend, existing)
 
     resolved_env: dict[str, str] = dict(env) if env is not None else _load_env(env_file)
@@ -520,7 +551,7 @@ def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
     Raises NotRunning if no daemon found.
     """
     pid = _resolve_pid(frontend)
-    if pid is None or not _process_exists(pid):
+    if pid is None or _has_exited(pid):
         _remove_pid(frontend)
         _remove_heartbeat(frontend)
         raise NotRunning(f"{frontend} is not running")
@@ -529,7 +560,7 @@ def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
 
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
-        if not _process_exists(pid):
+        if _has_exited(pid):
             _remove_pid(frontend)
             _remove_heartbeat(frontend)
             logger.info("%s pid=%d exited cleanly", frontend, pid)
@@ -542,7 +573,7 @@ def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
 
     # Best-effort second wait so callers don't race on file cleanup.
     for _ in range(20):
-        if not _process_exists(pid):
+        if _has_exited(pid):
             break
         time.sleep(KILL_POLL_INTERVAL_S)
 
@@ -621,19 +652,30 @@ def read_last_running() -> list[str]:
 def stop_all(*, grace_s: float = SAFE_GRACE_S) -> list[tuple[str, int]]:
     """Stop every currently-running daemon. Returns (frontend, pid) per stop.
 
-    Sequential (one at a time) so a single misbehaving daemon does not block
-    the others' grace windows. Records the list of stopped daemons to the
-    last_running file so `resume` can restore them.
+    Concurrent, one worker per frontend. Stopping them in turn made the outage
+    the *sum* of their shutdown times: four daemons that each take a second to
+    exit kept the first one down for four. Concurrently it is the *max*, and a
+    daemon that ignores its grace no longer delays the ones behind it.
+
+    Results come back in `SUPERVISABLE_FRONTENDS` order either way, so what a
+    caller prints does not depend on which daemon happened to exit first.
+    Records the stopped daemons to the last_running file so `resume` can
+    restore them.
     """
-    stopped: list[tuple[str, int]] = []
-    for name in checks.SUPERVISABLE_FRONTENDS:
-        if not is_running(name):
-            continue
+    running = [name for name in checks.SUPERVISABLE_FRONTENDS if is_running(name)]
+    if not running:
+        return []
+
+    def stop_one(name: str) -> tuple[str, int | None]:
         try:
-            pid = stop(name, grace_s=grace_s)
+            return name, stop(name, grace_s=grace_s)
         except NotRunning:
-            continue
-        stopped.append((name, pid))
+            return name, None
+
+    with ThreadPoolExecutor(max_workers=len(running)) as pool:
+        results = list(pool.map(stop_one, running))
+
+    stopped = [(name, pid) for name, pid in results if pid is not None]
     if stopped:
         _write_last_running([name for name, _ in stopped])
     return stopped
@@ -649,15 +691,21 @@ def resume(
 ) -> list[tuple[str, int | None, Exception | None]]:
     """Spawn every frontend recorded by the most recent stop_all().
 
+    Concurrent, for the same reason `stop_all` is: each spawn blocks until its
+    daemon writes a heartbeat, so starting them in turn makes the outage the
+    sum of the startup times instead of the longest one.
+
     Skips daemons that are already running. Returns (frontend, pid, error)
-    triples — error is None on success, the raised exception otherwise.
-    Per-frontend failures do not abort the rest.
+    triples in the order they were recorded, where error is None on success and
+    the raised exception otherwise. Per-frontend failures do not abort the rest.
     """
-    results: list[tuple[str, int | None, Exception | None]] = []
-    for name in read_last_running():
+    recorded = read_last_running()
+    if not recorded:
+        return []
+
+    def resume_one(name: str) -> tuple[str, int | None, Exception | None]:
         if is_running(name):
-            results.append((name, _resolve_pid(name), None))
-            continue
+            return name, _resolve_pid(name), None
         try:
             pid = spawn(
                 name,
@@ -667,7 +715,9 @@ def resume(
                 wait_for_heartbeat=wait_for_heartbeat,
                 spawn_timeout_s=spawn_timeout_s,
             )
-            results.append((name, pid, None))
+            return name, pid, None
         except Exception as exc:
-            results.append((name, None, exc))
-    return results
+            return name, None, exc
+
+    with ThreadPoolExecutor(max_workers=len(recorded)) as pool:
+        return list(pool.map(resume_one, recorded))
