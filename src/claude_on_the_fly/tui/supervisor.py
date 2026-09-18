@@ -54,6 +54,10 @@ KILL_POLL_INTERVAL_S = 0.1
 HEARTBEAT_POLL_INTERVAL_S = 0.1
 HEARTBEAT_FRESH_WINDOW_S = 30.0
 
+RESTART_COMMAND_SETTING = "COTF_DAEMONS_RESTART_COMMAND"
+# The one placeholder a restart command may carry.
+FRONTEND_PLACEHOLDER = "{frontend}"
+
 
 def _last_running_file() -> Path:
     """Resolved lazily so tests can monkeypatch STATE_DIR."""
@@ -144,6 +148,43 @@ class SpawnTimeout(SupervisorError):
         return "did not heartbeat within timeout"
 
 
+class RestartCommandFailed(SupervisorError):
+    """The operator's restart command exited non-zero.
+
+    Carries the tail of its output. The command is the operator's own, so the
+    reason it failed is only in there, and a bare exit code sends them to a
+    shell to reproduce it.
+    """
+
+    def __init__(
+        self, frontend: str, command: str, returncode: int, output: str
+    ) -> None:
+        tail = "\n".join(output.strip().splitlines()[-5:])
+        message = f"{frontend}: `{command}` failed (exit {returncode})"
+        if tail:
+            message += f"\n--- last lines ---\n{tail}"
+        super().__init__(message)
+        self.frontend = frontend
+        self.command = command
+        self.returncode = returncode
+
+
+class DaemonDidNotComeBack(SupervisorError):
+    """A restart command succeeded, but no new daemon wrote a heartbeat.
+
+    Nothing here owns the daemon's log, so this points at the service manager's
+    instead of carrying a tail the way SpawnTimeout does.
+    """
+
+    def __init__(self, frontend: str, command: str, timeout_s: float) -> None:
+        super().__init__(
+            f"{frontend}: `{command}` finished, but no heartbeat within "
+            f"{timeout_s:.0f}s. Read the service manager's log for that unit."
+        )
+        self.frontend = frontend
+        self.command = command
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -232,6 +273,67 @@ def _has_exited(pid: int) -> bool:
     except ChildProcessError:
         pass
     return not _process_exists(pid)
+
+
+def restart_command(frontend: str) -> str | None:
+    """The operator's command for bringing this frontend up, or None.
+
+    Set when a service manager owns the daemons rather than this process.
+    Stopping one works either way, because a service manager leaves a
+    deliberately stopped daemon alone. Starting one does not: without this, the
+    replacement is a child of whoever ran the upgrade, so the manager's unit
+    reads inactive while an unsupervised copy serves traffic. Measured on a
+    systemd host, the unit does not come back on its own either, because systemd
+    treats that external SIGTERM as a clean exit.
+
+    `{frontend}` is replaced with the frontend name, so one template covers
+    every unit. Nothing else about the deployment is assumed: systemd, launchd
+    and a container runtime are each just a command here.
+    """
+    template = settings.get(RESTART_COMMAND_SETTING, "").strip()
+    if not template:
+        return None
+    return template.replace(FRONTEND_PLACEHOLDER, frontend)
+
+
+def _start_via_command(
+    frontend: str,
+    command: str,
+    *,
+    timeout_s: float,
+    runner=subprocess.run,
+) -> int:
+    """Run a restart command and wait for the daemon it starts. Returns its pid.
+
+    Always waits, unlike the Popen path: the manager starts the daemon
+    asynchronously, so its pid is only knowable once it heartbeats, and a
+    `spawn` that returned earlier would report a start that has not happened.
+    The stale heartbeat goes first, or the outgoing daemon's file would read as
+    the new one.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        _heartbeat_file(frontend).unlink()
+
+    logger.info("%s: starting via %r", frontend, command)
+    completed = runner(command, shell=True, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RestartCommandFailed(
+            frontend,
+            command,
+            completed.returncode,
+            (completed.stdout or "") + (completed.stderr or ""),
+        )
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _heartbeat_fresh(frontend):
+            pid = _resolve_pid(frontend)
+            if pid is not None:
+                _write_pid(frontend, pid)
+                logger.info("%s: up as pid=%d via %r", frontend, pid, command)
+                return pid
+        time.sleep(HEARTBEAT_POLL_INTERVAL_S)
+    raise DaemonDidNotComeBack(frontend, command, timeout_s)
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
@@ -455,6 +557,7 @@ def spawn(
     env_file: Path | None = DEFAULT_ENV_FILE,
     env: Mapping[str, str] | None = None,
     popen_factory=subprocess.Popen,
+    runner=subprocess.run,
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
     preflighted: bool = False,
@@ -468,10 +571,16 @@ def spawn(
     exact env, as `restart` does: the probes write to disk, so running them
     twice per restart is a visible side effect, not just wasted work.
 
+    With `daemons.restart_command` set the daemon is started by that command
+    rather than by this process, and the wait is for the heartbeat it produces.
+    See `restart_command`.
+
     Raises:
         PreflightFailed: env checks failed.
         AlreadyRunning: a live daemon is already known.
         SpawnTimeout: daemon did not heartbeat in time.
+        RestartCommandFailed: the configured restart command exited non-zero.
+        DaemonDidNotComeBack: it finished, but nothing heartbeated after it.
         ValueError: unknown frontend name.
     """
     if frontend not in _FRONTEND_MODULE:
@@ -490,6 +599,17 @@ def spawn(
     # log "legacy env var wins" warnings about values it never asked for.
     if not preflighted:
         _spawn_preflight(frontend, resolved_env)
+
+    # A service manager owns this daemon, so it is the one to start it. Spawning
+    # a child here instead would put the replacement outside that manager while
+    # its unit read inactive. Every path that brings a frontend up comes through
+    # here, so `start`, `restart` and `resume` are all covered by this one
+    # branch.
+    command = restart_command(frontend)
+    if command is not None:
+        return _start_via_command(
+            frontend, command, timeout_s=spawn_timeout_s, runner=runner
+        )
 
     stdout = _stdout_file(frontend)
     log_handle = stdout.open("ab")
@@ -686,6 +806,7 @@ def resume(
     env_file: Path | None = DEFAULT_ENV_FILE,
     env: Mapping[str, str] | None = None,
     popen_factory=subprocess.Popen,
+    runner=subprocess.run,
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
 ) -> list[tuple[str, int | None, Exception | None]]:
@@ -712,6 +833,7 @@ def resume(
                 env_file=env_file,
                 env=env,
                 popen_factory=popen_factory,
+                runner=runner,
                 wait_for_heartbeat=wait_for_heartbeat,
                 spawn_timeout_s=spawn_timeout_s,
             )

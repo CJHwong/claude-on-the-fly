@@ -518,6 +518,26 @@ logs:
   # LOG_LEVEL stays an environment variable: logging is configured before this file
   # can be parsed, so a complaint about the file needs somewhere to go.
 
+daemons:
+  # How a frontend comes back up, when something other than this package owns
+  # it. Leave it out and the supervisor starts the daemon itself, as a child of
+  # whatever ran the command, which is right for a deployment you drive with
+  # `claude-tui start` and a terminal.
+  #
+  # Set it when a service manager owns the daemons, which is the usual shape on
+  # a server. Stopping works either way, because systemd and launchd leave a
+  # deliberately stopped service alone. Starting does not: without this,
+  # `claude-tui start`, `claude-tui restart` and the dashboard's upgrade would
+  # leave the service manager's unit inactive while an unsupervised copy served
+  # traffic. Nothing brings that unit back on its own, because the manager reads
+  # the external stop as a clean exit.
+  #
+  # `{frontend}` is replaced with the frontend name, so one template covers
+  # every unit. The command runs through a shell. After it returns, the
+  # supervisor waits for the daemon's heartbeat and reports its pid, so a
+  # command that prints nothing is fine.
+  # restart_command: systemctl --user restart cotf-{frontend}
+
 upgrade:
   # An upgrade is up to two commands, split by whether the daemons have to be
   # down for them. `prepare_command` runs first, with every daemon still

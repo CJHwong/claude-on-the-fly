@@ -75,6 +75,34 @@ Set `prepare_command` only when the split is safe. Everything it changes is read
 that is still serving, so a fetch is fine and a checkout is not. Setting `command` alone
 keeps the single-step behaviour, because an operator's own command is not split for them.
 
+## When a service manager owns the daemons
+
+On a server, systemd or launchd usually owns the daemons rather than the terminal that
+started them. Stopping them still works, because a service manager leaves a deliberately
+stopped service alone. Starting them does not: the supervisor would start a child of the
+process running the upgrade, so the manager's unit would read inactive while an
+unsupervised copy served traffic. Nothing brings the unit back on its own either, because
+the manager reads the external stop as a clean exit.
+
+Set `daemons.restart_command` and the supervisor asks the manager instead:
+
+```yaml
+daemons:
+  restart_command: systemctl --user restart cotf-{frontend}
+```
+
+`{frontend}` is the frontend name, so one template covers every unit. The supervisor runs
+the command and then waits for that daemon's heartbeat, so `claude-tui start`,
+`claude-tui restart` and the dashboard's `U` all put the daemon back where it belongs.
+
+To upgrade by hand on such a host, use the manager rather than `claude-tui upgrade`:
+
+```bash
+systemctl --user stop cotf-slack cotf-cron cotf-jobs
+uv tool upgrade claude-on-the-fly
+systemctl --user start cotf-slack cotf-cron cotf-jobs
+```
+
 ## What each daemon does when it stops
 
 | Daemon | Pending work | On stop |

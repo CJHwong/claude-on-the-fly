@@ -292,6 +292,31 @@ A timeout carried by a cron job overrides the worker default for that job.
 | `keep_days` | integer / `30` | Retention; `0` disables pruning, invalid uses default | Next prune/startup |
 | `host_tag` | string / short hostname | Host component in log filenames | Startup and daily rollover |
 
+## `daemons`
+
+| Key | Type / default | Effect | Lifecycle |
+|---|---|---|---|
+| `restart_command` | string / unset | Command that starts a frontend, when a service manager owns it | Immediate |
+
+Leave it unset and the supervisor starts each daemon itself, as a child of whatever ran
+the command. That is right for a deployment you drive with `claude-tui start` and a
+terminal.
+
+Set it when a service manager owns the daemons, which is the usual shape on a server.
+Stopping works either way, because systemd and launchd leave a deliberately stopped
+service alone. Starting does not: without this, `claude-tui start`, `claude-tui restart`
+and the dashboard's upgrade leave the manager's unit inactive while an unsupervised copy
+serves traffic.
+
+`{frontend}` is replaced with the frontend name, so one template covers every unit. The
+command runs through a shell, and the supervisor then waits for the daemon's heartbeat,
+so a command that prints nothing is fine.
+
+```yaml
+daemons:
+  restart_command: systemctl --user restart cotf-{frontend}
+```
+
 ## `upgrade`
 
 | Key | Type / default | Effect | Lifecycle |
