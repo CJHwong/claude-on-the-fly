@@ -2191,11 +2191,24 @@ class SlackFrontend(Frontend):
             logger.info("slack: replay click with unusable routing, dropping")
             return
         channel, thread_ts = routing
-        events = self._untagged_msgs.pop(
-            (_session_key(channel, thread_ts), sender_id), []
-        )
+        session_id = _session_key(channel, thread_ts)
+        events = self._untagged_msgs.pop((session_id, sender_id), [])
         mention = f"<@{self._user_id}>"
         for event in events:
+            # The reply budget is reset for every message, not once before the
+            # loop. Each replay charges a turn on its way to the agent, so a
+            # backlog longer than the limit would otherwise re-gate its own
+            # tail: the first message runs, the rest land in the reply gate's
+            # backlog, and this card is already spent. Somebody who has been
+            # typing untagged is often at the limit already, which makes that
+            # the common case rather than the corner.
+            #
+            # `_replay_gated` resets the same budget by prefixing every replay
+            # with `$continue`, and that prefix is not usable here: its branch
+            # also empties `_gated_msgs`, so borrowing it would make a tap on
+            # this card silently discard the tagged messages the reply card was
+            # still holding.
+            self._reply_counts[session_id] = 0
             replay = dict(event)
             replay["text"] = f"{mention} {event.get('text') or ''}".strip()
             await self._ingest_event(replay)
