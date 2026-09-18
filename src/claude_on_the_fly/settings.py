@@ -73,6 +73,7 @@ SECTIONS = (
     "agent",
     "interim",
     "watchdog",
+    "daemons",
     "slack",
     "telegram",
     "jobs",
@@ -138,6 +139,7 @@ FIELDS: dict[str, Field] = {
     # Read per tick by a one-shot process, so an edit lands on the next
     # scheduler run with nothing to restart.
     "watchdog.stale_seconds": Field("WATCHDOG_STALE_SECONDS"),
+    "daemons.restart_command": Field("COTF_DAEMONS_RESTART_COMMAND"),
     "interim.progress": Field("COTF_INTERIM_PROGRESS"),
     "interim.warmup_seconds": Field("COTF_INTERIM_WARMUP_SECONDS"),
     "interim.min_gap_seconds": Field("COTF_INTERIM_MIN_GAP_SECONDS"),

@@ -234,6 +234,215 @@ class TestStop:
 
 
 # ---------------------------------------------------------------------------
+# restart_command — a service manager starts the daemon, not this process
+# ---------------------------------------------------------------------------
+
+
+class TestRestartCommand:
+    """On a server the daemons belong to systemd or launchd, not to whoever ran
+    the upgrade. Stopping one works either way. Starting one does not: the
+    supervisor used to spawn a child of the upgrading process, which left the
+    manager's unit inactive while an unsupervised copy served traffic, and
+    nothing brought the unit back, because the manager reads the external stop
+    as a clean exit."""
+
+    COMMAND = "systemctl --user restart cotf-{frontend}"
+
+    def _configure(self, monkeypatch, command: str | None = COMMAND) -> None:
+        def fake_get(name, default=""):
+            if name == supervisor.RESTART_COMMAND_SETTING:
+                return command if command is not None else default
+            return default
+
+        monkeypatch.setattr(supervisor.settings, "get", fake_get)
+
+    def test_unset_means_the_supervisor_starts_it_itself(self, isolated_state):
+        assert supervisor.restart_command("slack") is None
+
+    def test_blank_is_unset(self, isolated_state, monkeypatch):
+        """An operator who cleared the key gets the default behaviour, not a
+        command that is the empty string."""
+        self._configure(monkeypatch, "   ")
+
+        assert supervisor.restart_command("slack") is None
+
+    def test_the_frontend_name_is_substituted(self, isolated_state, monkeypatch):
+        self._configure(monkeypatch)
+
+        assert (
+            supervisor.restart_command("slack") == "systemctl --user restart cotf-slack"
+        )
+
+    def test_a_template_without_the_placeholder_is_used_as_written(
+        self, isolated_state, monkeypatch
+    ):
+        """One command for every frontend is a legitimate answer. It must not be
+        mangled into something else."""
+        self._configure(monkeypatch, "systemctl --user restart cotf-all")
+
+        assert supervisor.restart_command("slack") == (
+            "systemctl --user restart cotf-all"
+        )
+
+    def test_spawn_runs_the_command_and_waits_for_the_new_pid(
+        self, isolated_state, monkeypatch
+    ):
+        self._configure(monkeypatch)
+        popen = MagicMock()
+        ran: list[str] = []
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: True)
+        monkeypatch.setattr(supervisor, "_resolve_pid", lambda _f: 4242)
+
+        def fake_runner(command, **_kwargs):
+            ran.append(command)
+            return subprocess.CompletedProcess([], 0)
+
+        pid = supervisor.spawn(
+            "telegram",
+            env=TELEGRAM_ENV,
+            popen_factory=popen,
+            runner=fake_runner,
+        )
+
+        assert pid == 4242
+        assert ran == ["systemctl --user restart cotf-telegram"]
+        # The whole point: no child of this process.
+        popen.assert_not_called()
+        # And the pid is recorded, so the dashboard and a later stop find it.
+        assert (supervisor.STATE_DIR / "telegram.pid").read_text() == "4242"
+
+    def test_a_stale_heartbeat_is_cleared_before_the_command(
+        self, isolated_state, monkeypatch
+    ):
+        """The outgoing daemon's file would otherwise read as the new one and
+        the wait would return its pid."""
+        self._configure(monkeypatch)
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1111)
+        seen: list[bool] = []
+        monkeypatch.setattr(
+            supervisor,
+            "_heartbeat_fresh",
+            lambda _f, **_kw: (
+                seen.append((supervisor.STATE_DIR / "telegram.json").exists()),
+                True,
+            )[1],
+        )
+        monkeypatch.setattr(supervisor, "_resolve_pid", lambda _f: 4242)
+
+        supervisor.spawn(
+            "telegram",
+            env=TELEGRAM_ENV,
+            popen_factory=MagicMock(),
+            runner=lambda command, **_kw: subprocess.CompletedProcess([], 0),
+        )
+
+        assert seen and seen[0] is False, "the stale heartbeat was not removed"
+
+    def test_a_failing_command_reports_its_output(self, isolated_state, monkeypatch):
+        """The command is the operator's own, so the reason it failed is only in
+        its output. A bare exit code sends them to a shell to reproduce it."""
+        self._configure(monkeypatch)
+        popen = MagicMock()
+
+        def fake_runner(_command, **_kwargs):
+            return subprocess.CompletedProcess(
+                [], 3, "", "Failed to restart cotf-telegram.service: not found\n"
+            )
+
+        with pytest.raises(supervisor.RestartCommandFailed) as caught:
+            supervisor.spawn(
+                "telegram", env=TELEGRAM_ENV, popen_factory=popen, runner=fake_runner
+            )
+
+        message = str(caught.value)
+        assert "exit 3" in message
+        assert "not found" in message
+        assert caught.value.returncode == 3
+        popen.assert_not_called()
+        # No pid file: nothing started, and a stale one would make `stop`
+        # signal a pid the OS has since recycled.
+        assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+
+    def test_a_command_that_starts_nothing_says_so(self, isolated_state, monkeypatch):
+        self._configure(monkeypatch)
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: False)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+
+        with pytest.raises(supervisor.DaemonDidNotComeBack) as caught:
+            supervisor.spawn(
+                "telegram",
+                env=TELEGRAM_ENV,
+                popen_factory=MagicMock(),
+                runner=lambda command, **_kw: subprocess.CompletedProcess([], 0),
+                spawn_timeout_s=0.01,
+            )
+
+        assert "no heartbeat within" in str(caught.value)
+        assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+
+    def test_the_frontends_own_command_is_used_not_a_shared_one(
+        self, isolated_state, monkeypatch
+    ):
+        self._configure(monkeypatch)
+
+        assert supervisor.restart_command("cron") == (
+            "systemctl --user restart cotf-cron"
+        )
+        assert supervisor.restart_command("jobs") == (
+            "systemctl --user restart cotf-jobs"
+        )
+
+    def test_resume_starts_through_the_command_too(self, isolated_state, monkeypatch):
+        """`resume` is what an upgrade calls, so it is the path that matters
+        most. It reaches the command by going through `spawn` like everything
+        else."""
+        self._configure(monkeypatch)
+        supervisor._write_last_running(["telegram"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda _p: False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "1")
+        ran: list[str] = []
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: True)
+        monkeypatch.setattr(supervisor, "_resolve_pid", lambda _f: 99)
+
+        def fake_runner(command, **_kwargs):
+            ran.append(command)
+            return subprocess.CompletedProcess([], 0)
+
+        results = supervisor.resume(
+            env_file=None, popen_factory=MagicMock(), runner=fake_runner
+        )
+
+        assert ran == ["systemctl --user restart cotf-telegram"]
+        assert results == [("telegram", 99, None)]
+
+    def test_a_broken_command_is_reported_by_resume_not_raised(
+        self, isolated_state, monkeypatch
+    ):
+        """One frontend failing must not abort the rest, which is the contract
+        `resume` already had for a failed spawn."""
+        self._configure(monkeypatch)
+        supervisor._write_last_running(["telegram"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda _p: False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "1")
+
+        results = supervisor.resume(
+            env_file=None,
+            popen_factory=MagicMock(),
+            runner=lambda command, **_kw: subprocess.CompletedProcess(
+                [], 1, "", "nope"
+            ),
+        )
+
+        assert len(results) == 1
+        name, pid, exc = results[0]
+        assert name == "telegram"
+        assert pid is None
+        assert isinstance(exc, supervisor.RestartCommandFailed)
+
+
+# ---------------------------------------------------------------------------
 # reaping
 # ---------------------------------------------------------------------------
 
