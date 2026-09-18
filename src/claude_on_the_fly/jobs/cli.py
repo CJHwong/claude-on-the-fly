@@ -45,6 +45,7 @@ from claude_on_the_fly.jobs.core import (
     JobQueue,
     Notifier,
     OutcomeRecorder,
+    parse_when,
 )
 from claude_on_the_fly.jobs.key_state import (
     KeyStateOutcomeRecorder,
@@ -388,14 +389,31 @@ def _cmd_doctor() -> int:
     return 0
 
 
-def _cmd_enqueue(prompt: str, channel: str | None, thread_ts: str | None) -> int:
+def _cmd_enqueue(
+    prompt: str,
+    channel: str | None,
+    thread_ts: str | None,
+    at: str | None,
+) -> int:
     """Drop one job into the shared queue without going through Slack — a smoke
     producer for testing the worker end to end."""
     queue = make_queue()
     job_id = f"{time.time_ns()}-{uuid4().hex[:8]}"
     origin = {"channel": channel or "", "thread_ts": thread_ts, "sender_id": "cli"}
-    queue.enqueue(Job(id=job_id, prompt=prompt, origin=origin))
-    sys.stdout.write(f"queued job {job_id}\n")
+    try:
+        available_at = parse_when(at) if at is not None else None
+    except ValueError as exc:
+        sys.stderr.write(f"claude-jobs enqueue: {exc}\n")
+        return 2
+    queue.enqueue(
+        Job(id=job_id, prompt=prompt, origin=origin, available_at=available_at)
+    )
+    when = (
+        f" (not before {available_at.isoformat(timespec='seconds')})"
+        if available_at
+        else ""
+    )
+    sys.stdout.write(f"queued job {job_id}{when}\n")
     return 0
 
 
@@ -411,6 +429,14 @@ def _build_parser() -> argparse.ArgumentParser:
     enq.add_argument("prompt", help="The task prompt to run")
     enq.add_argument("--channel", default=None, help="Slack channel id for the reply")
     enq.add_argument("--thread-ts", default=None, help="Slack thread ts for the reply")
+    enq.add_argument(
+        "--at",
+        default=None,
+        help=(
+            "Run no earlier than this local time: ISO 'YYYY-MM-DD HH:MM' "
+            "(or YYYY-MM-DD), or relative like '30m', '2h', '1d'"
+        ),
+    )
     return parser
 
 
@@ -431,7 +457,7 @@ def main() -> int:
     if args.cmd == "doctor":
         return _cmd_doctor()
     if args.cmd == "enqueue":
-        return _cmd_enqueue(args.prompt, args.channel, args.thread_ts)
+        return _cmd_enqueue(args.prompt, args.channel, args.thread_ts, args.at)
     return _cmd_run()
 
 

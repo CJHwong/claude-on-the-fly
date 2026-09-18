@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -17,11 +18,12 @@ from claude_on_the_fly.jobs.core import (
     Notifier,
     QueueRow,
     Result,
+    parse_when,
 )
 
 # Roots the clean core is allowed to import. Anything else — an I/O SDK, `agent`,
 # Slack — is a clean-arch leak and fails the gate below.
-_ALLOWED_CORE_ROOTS = {"__future__", "dataclasses", "datetime", "typing"}
+_ALLOWED_CORE_ROOTS = {"__future__", "dataclasses", "datetime", "re", "typing"}
 
 
 def _imported_modules(module_path: Path) -> set[str]:
@@ -139,3 +141,38 @@ def test_recover_stale_is_on_the_queue_port() -> None:
             return []
 
     assert not isinstance(_NoRecover(), JobQueue)
+
+
+class TestParseWhen:
+    def test_an_iso_datetime_with_a_space_parses(self) -> None:
+        assert parse_when("2026-09-19 09:00") == datetime(2026, 9, 19, 9, 0)
+
+    def test_an_iso_datetime_with_a_t_parses(self) -> None:
+        assert parse_when("2026-09-19T09:00:30") == datetime(2026, 9, 19, 9, 0, 30)
+
+    def test_a_bare_date_parses_to_midnight(self) -> None:
+        assert parse_when("2026-09-19") == datetime(2026, 9, 19)
+
+    def test_a_relative_time_resolves_against_now(self) -> None:
+        now = datetime(2026, 9, 18, 12, 0, 0)
+        assert parse_when("30m", now=now) == datetime(2026, 9, 18, 12, 30)
+        assert parse_when("45s", now=now) == datetime(2026, 9, 18, 12, 0, 45)
+        assert parse_when("2h", now=now) == datetime(2026, 9, 18, 14, 0)
+        assert parse_when("1d", now=now) == datetime(2026, 9, 19, 12, 0)
+
+    @pytest.mark.parametrize("text", ["2026-09-19T09:00+08:00", "2026-09-19Z"])
+    def test_a_timezone_annotated_time_is_refused(self, text: str) -> None:
+        """Every schedule here is naive local. An aware value compared against
+        the local clock raises TypeError mid-claim, which is worse than refusing
+        the text up front."""
+        with pytest.raises(ValueError):
+            parse_when(text)
+
+    @pytest.mark.parametrize("text", ["someday", "", "0m"])
+    def test_unparseable_or_zero_times_are_refused(self, text: str) -> None:
+        with pytest.raises(ValueError):
+            parse_when(text)
+
+    def test_a_timezone_offset_error_is_named(self) -> None:
+        with pytest.raises(ValueError, match="timezone offset"):
+            parse_when("2026-09-19T09:00+08:00")

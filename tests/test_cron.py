@@ -15,6 +15,7 @@ import yaml
 
 from claude_on_the_fly import cron as cron_mod
 from claude_on_the_fly.cron import (
+    _NEVER_FIRE,
     DEFAULT_MAX_FIRES,
     MAX_PRODUCER_TIMEOUT_S,
     PRODUCER_TIMEOUT_S,
@@ -2276,3 +2277,172 @@ class TestMinToolCalls:
         )
         (job,) = queue.jobs
         assert job.min_tool_calls == 2
+
+
+class TestOneShotAt:
+    """`at:` entries: one fire at a set local time, then spent — durably."""
+
+    def _at_entry(self, at: str = "2026-09-19 09:00") -> dict:
+        return {"name": "later", "at": at, "prompt": "hello"}
+
+    # --- config ---
+
+    def test_an_at_entry_loads_with_no_cron(self, tmp_path: Path) -> None:
+        (entry,) = load_config(cfg(tmp_path, self._at_entry()))
+        assert entry.at is not None
+        assert entry.cron is None
+        assert entry.kind == "prompt"
+
+    def test_cron_and_at_together_are_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not both"):
+            load_config(
+                cfg(
+                    tmp_path,
+                    {
+                        "name": "a",
+                        "cron": "0 9 * * *",
+                        "at": "2026-09-19 09:00",
+                        "prompt": "x",
+                    },
+                )
+            )
+
+    def test_an_at_entry_needs_a_prompt(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="needs 'prompt'"):
+            load_config(cfg(tmp_path, {"name": "a", "at": "2026-09-19 09:00"}))
+
+    def test_an_at_with_a_command_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'at' needs"):
+            load_config(
+                cfg(
+                    tmp_path, {"name": "a", "at": "2026-09-19 09:00", "command": "true"}
+                )
+            )
+
+    def test_an_invalid_at_fails_at_load(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="invalid 'at'"):
+            load_config(cfg(tmp_path, {"name": "a", "at": "someday", "prompt": "x"}))
+
+    def test_a_relative_at_resolves_at_load(self, tmp_path: Path) -> None:
+        entry = load_config(cfg(tmp_path, {"name": "a", "at": "30m", "prompt": "x"}))[0]
+        assert entry.at is not None
+        assert (entry.at - datetime.now()).total_seconds() >= 29 * 60
+
+    # --- reload ---
+
+    def test_an_unrelated_edit_keeps_the_one_shot_fire_time(
+        self, tmp_path: Path
+    ) -> None:
+        path = cfg(
+            tmp_path,
+            {"name": "a", "at": "2026-09-19 09:00", "prompt": "x", "timeout": 100},
+        )
+        cron = daemon(tmp_path, path)
+        cron.reload()
+
+        write_config(
+            path,
+            [{"name": "a", "at": "2026-09-19 09:00", "prompt": "x", "timeout": 200}],
+        )
+        cron.reload()
+
+        assert cron._state["a"].next_fire == datetime(2026, 9, 19, 9, 0)
+        assert cron._state["a"].entry.timeout == 200
+
+    def test_a_changed_at_reschedules(self, tmp_path: Path) -> None:
+        path = cfg(tmp_path, {"name": "a", "at": "2026-09-19 09:00", "prompt": "x"})
+        cron = daemon(tmp_path, path)
+        cron.reload()
+
+        write_config(path, [{"name": "a", "at": "2026-09-20 09:00", "prompt": "x"}])
+        cron.reload()
+
+        assert cron._state["a"].next_fire == datetime(2026, 9, 20, 9, 0)
+
+    # --- the loop ---
+
+    async def _run_one_tick(self, cron: CronDaemon) -> list[str]:
+        """One scan of the run loop, then stop.
+
+        The second sleep sets stop: a spent one-shot never calls `_fire`, so
+        nothing inside the scan ends the loop, and the patched sleep must.
+        (The real sleep blocks for the rest of the minute; only the patch can
+        spin, and only if it neither stops nor yields.)
+        """
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        ticks = 0
+
+        async def immediately():
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                cron._stop.set()
+
+        cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+
+        cron._fire = record  # type: ignore[method-assign]
+        await asyncio.wait_for(cron.run(), timeout=5)
+        return fired
+
+    async def test_a_due_one_shot_fires_once(self, tmp_path: Path) -> None:
+        """The fire lands on the key-state store, which is what makes it
+        exactly-once across restarts."""
+        cron = daemon(tmp_path, cfg(tmp_path, self._at_entry()), FakeQueue())
+        cron.reload()
+        cron._state["later"].next_fire = datetime(2000, 1, 1)
+        assert await self._run_one_tick(cron) == ["later"]
+        state = cron._key_state.load("later")
+        assert state.fires_since_change == 1
+
+    async def test_a_spent_one_shot_does_not_fire_after_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The fire record is durable, so a fresh daemon on the same state dir
+        cannot run the prompt a second time."""
+        path = cfg(tmp_path, self._at_entry())
+        first = daemon(tmp_path, path, FakeQueue())
+        first.reload()
+        first._state["later"].next_fire = datetime(2000, 1, 1)
+        assert await self._run_one_tick(first) == ["later"]
+
+        second = daemon(tmp_path, path, FakeQueue())
+        second.reload()
+        second._state["later"].next_fire = datetime(2000, 1, 1)
+        assert await self._run_one_tick(second) == []
+
+    async def test_a_spent_one_shot_is_marked_never_again_in_process(
+        self, tmp_path: Path
+    ) -> None:
+        """Even without a restart, the entry must not re-enter the fire branch
+        on a later tick."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path, self._at_entry()), queue)
+        cron.reload()
+        cron._state["later"].next_fire = datetime(2000, 1, 1)
+        await self._run_one_tick(cron)
+        assert cron._state["later"].next_fire == _NEVER_FIRE
+
+    async def test_a_future_one_shot_does_not_fire(self, tmp_path: Path) -> None:
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "later", "at": "2099-01-01 09:00", "prompt": "x"}),
+            queue,
+        )
+        cron.reload()
+        cron._state["later"].next_fire = datetime(2098, 1, 1)
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+
+        cron._fire = record  # type: ignore[method-assign]
+        cron._stop.set()
+        await asyncio.wait_for(cron.run(), timeout=5)
+        assert fired == []
+        assert cron._state["later"].next_fire == datetime(2098, 1, 1)

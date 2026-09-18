@@ -53,7 +53,9 @@ def test_enqueue_writes_job_to_queue(monkeypatch, tmp_path: Path, capsys) -> Non
     monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
     monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
 
-    rc = cli._cmd_enqueue("summarize the logs", channel="C1", thread_ts="1699.5")
+    rc = cli._cmd_enqueue(
+        "summarize the logs", channel="C1", thread_ts="1699.5", at=None
+    )
     assert rc == 0
 
     out = capsys.readouterr().out
@@ -264,6 +266,8 @@ class TestMainDispatch:
                 "C1",
                 "--thread-ts",
                 "1.1",
+                "--at",
+                "30m",
             ],
         )
         seen: list[tuple] = []
@@ -271,7 +275,7 @@ class TestMainDispatch:
             cli, "_cmd_enqueue", lambda *args: (seen.append(args), 0)[1]
         )
         assert cli.main() == 0
-        assert seen == [("do it", "C1", "1.1")]
+        assert seen == [("do it", "C1", "1.1", "30m")]
 
     def test_a_bare_invocation_runs_the_worker(self, monkeypatch) -> None:
         monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
@@ -598,3 +602,60 @@ def test_workspace_keep_days_falls_back_when_unparseable(monkeypatch) -> None:
     """A typo must not delete everything by resolving to 0, nor stop the worker."""
     monkeypatch.setenv("JOBS_WORKSPACE_KEEP_DAYS", "a month")
     assert cli._workspace_keep_days() == 30
+
+
+def test_enqueue_with_at_writes_available_at(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from claude_on_the_fly import agent
+
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+
+    rc = cli._cmd_enqueue(
+        "summarize the logs", channel="C1", thread_ts=None, at="2026-09-19 09:00"
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not before 2026-09-19T09:00:00" in out
+
+    (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+    payload = json.loads(queued.read_text())
+    assert payload["available_at"] == "2026-09-19T09:00:00"
+
+
+def test_enqueue_with_relative_at_resolves_against_now(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from datetime import datetime
+
+    from claude_on_the_fly import agent
+
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+
+    before = datetime.now()
+    rc = cli._cmd_enqueue("look again", channel="", thread_ts=None, at="30m")
+    after = datetime.now()
+    assert rc == 0
+    capsys.readouterr()
+
+    (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+    payload = json.loads(queued.read_text())
+    available = datetime.fromisoformat(payload["available_at"])
+    assert (available - before).total_seconds() >= 29 * 60
+    assert (available - after).total_seconds() <= 31 * 60
+
+
+def test_enqueue_with_a_bad_at_fails_without_queueing(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from claude_on_the_fly import agent
+
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+
+    rc = cli._cmd_enqueue("nope", channel="", thread_ts=None, at="someday")
+    assert rc == 2
+    assert "cannot parse time" in capsys.readouterr().err
+    assert list((tmp_path / "jobs" / "new").glob("*.json")) == []

@@ -63,6 +63,15 @@ the field ignores a `profile` it does not understand and runs the daemon default
 mixed-version rollout therefore downgrades the model rather than failing, which is
 worth knowing before you deploy one half of a pair.
 
+**A job payload can carry `available_at`.** A naive local ISO timestamp: the earliest
+moment `claim()` may hand the job over. `claim()` reads it before the rename and skips a
+job whose time has not come, so future work parks in `new/` instead of running — and the
+timestamp travels in the payload, so `recover_stale` and a restart both leave it intact.
+A worker older than the field ignores it and runs the job immediately, the same downgrade
+direction as `profile`. Unparseable or offset-carrying values are poison, not tolerated:
+a silently ignored "not before" runs early, which is the one failure this field exists
+to prevent.
+
 **Delivery is tracked separately from completion.** `complete()` archives the result, and a `<id>.delivered.json` marker is written only once a notifier returns. A result with no marker is a reply somebody is still waiting for — the worker was cancelled between finishing and posting, or the post failed — and `redeliver_pending` re-posts it at the next start, before claiming new work. Only the *reply* is retried: the job's agent run already happened, and re-running it would repeat every side effect it had. Bounded by `DELIVERY_RETRY_WINDOW_S` (24h), so a permanently undeliverable result is not retried on every start until the archive prunes it.
 
 That is why `Notifier.notify` **raises** on a failed post rather than swallowing it: returning normally is what marks a result delivered, so an adapter that hides a failure turns a retryable miss into a reply nobody ever receives.
