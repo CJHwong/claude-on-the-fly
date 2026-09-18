@@ -5305,6 +5305,47 @@ class TestReplayAction:
         await frontend._on_replay_action(self._tap())
         assert frontend._on_message.await_count == 3  # a second tap runs nothing
 
+    async def test_a_replay_is_not_re_gated_by_the_reply_limit(
+        self, frontend, monkeypatch
+    ):
+        """Somebody who has been typing untagged is often at the reply limit
+        already. Each replay charges a turn on its way to the agent, so without
+        a reset the first message runs and the rest land in the reply gate's
+        backlog, with this card already spent and nothing left to tap."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        await frontend._ingest_event(self._untagged("t1", "<@U_SELF> have a look"))
+        await frontend._ingest_event(self._untagged("t2", "do the first thing"))
+        await frontend._ingest_event(self._untagged("t3", "and the second"))
+        frontend._delete_ephemeral = AsyncMock()
+        # The thread is already at its budget when the card is tapped.
+        frontend._reply_counts[session_id] = slack_mod.reply_soft_limit()
+
+        await frontend._on_replay_action(self._tap())
+
+        prompts = [c.args[1] for c in frontend._on_message.await_args_list]
+        assert len(prompts) == 3
+        assert "do the first thing" in prompts[1]
+        assert "and the second" in prompts[2]
+        # Nothing was pushed back into the reply gate on the way through.
+        assert session_id not in frontend._gated_msgs
+
+    async def test_a_replay_leaves_the_reply_gates_backlog_alone(self, frontend):
+        """`_replay_gated` resets the same budget by prefixing `$continue`, and
+        that branch also empties `_gated_msgs`. Borrowing it here would make a
+        tap on this card silently discard the tagged messages the reply card was
+        still holding."""
+        session_id = _session_key("C1", "t1")
+        self._hold(frontend, self._untagged("90.0", "mine"))
+        frontend._ingest_event = AsyncMock()
+        gated = {"ts": "91.0", "channel": "C1", "thread_ts": "t1", "text": "budget"}
+        frontend._gated_msgs[session_id] = [gated]
+
+        await frontend._on_replay_action(self._tap())
+
+        assert frontend._gated_msgs[session_id] == [gated]
+
     async def test_a_tap_only_replays_the_tappers_own_messages(self, frontend):
         """Keyed by who pressed, so a forged payload cannot run somebody else's."""
         frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_OTHER"}
