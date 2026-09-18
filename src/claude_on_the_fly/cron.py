@@ -820,6 +820,8 @@ class CronDaemon:
                 if entry.at is not None:
                     first_fire = entry.at
                 else:
+                    # Validation guarantees a cron expression when 'at' is absent.
+                    assert entry.cron is not None
                     first_fire = next_fire(entry.cron, now)
                 fresh[entry.name] = EntryState(entry=entry, next_fire=first_fire)
         added = set(fresh) - set(self._state)
@@ -875,6 +877,8 @@ class CronDaemon:
                     await self._fire(state.entry)
                     self._key_state.record_fire(state.entry.name, _ONE_SHOT_FINGERPRINT)
                 else:
+                    # Validation guarantees a cron expression when 'at' is absent.
+                    assert state.entry.cron is not None
                     state.next_fire = next_fire(state.entry.cron, now)
                     await self._fire(state.entry)
 
