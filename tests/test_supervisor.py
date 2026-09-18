@@ -31,6 +31,9 @@ def isolated_state(tmp_path, monkeypatch):
     logs.mkdir()
     monkeypatch.setattr(supervisor, "STATE_DIR", state)
     monkeypatch.setattr(supervisor, "LOG_DIR", logs)
+    # The handles of daemons this process started. Module state, so one test's
+    # leftovers must not be visible to the next.
+    monkeypatch.setattr(supervisor, "_spawned", {})
     return tmp_path
 
 
@@ -523,6 +526,91 @@ class TestReaping:
             with contextlib.suppress(ProcessLookupError):
                 real_kill(child.pid, signal.SIGKILL)
             child.wait()
+
+
+class TestReap:
+    """The half of the reaping problem that `_has_exited` cannot reach.
+
+    Only a parent can reap its own child, so a `claude-tui upgrade` running in
+    another process cannot clean up a daemon the dashboard started. All it can do
+    is wait for the parent to. Until then the exited daemon is a zombie, and
+    `os.kill(pid, 0)` reports it alive to every process on the machine.
+    """
+
+    @staticmethod
+    def _exited_child() -> subprocess.Popen:
+        """A real child that has exited and has NOT been reaped.
+
+        The pipe is the signal, not a sleep: it reaches EOF the moment the child
+        exits, because the OS closes the child's copy. `wait()` and `poll()`
+        would both reap, which is the thing under test.
+        """
+        read_fd, write_fd = os.pipe()
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], pass_fds=(write_fd,))
+        os.close(write_fd)
+        assert os.read(read_fd, 1) == b"", "the child did not exit"
+        os.close(read_fd)
+        return proc
+
+    def test_nothing_to_reap_returns_zero(self, isolated_state):
+        assert supervisor.reap() == 0
+
+    def test_a_zombie_reads_as_alive_until_it_is_reaped(self, isolated_state):
+        """Pins the fact the whole mechanism exists for, so it cannot quietly
+        stop being true on a future platform."""
+        proc = self._exited_child()
+        try:
+            assert supervisor._process_exists(proc.pid), (
+                "an exited child nobody reaped must read as alive"
+            )
+            supervisor._spawned[proc.pid] = proc
+
+            assert supervisor.reap() == 1
+
+            assert not supervisor._process_exists(proc.pid)
+        finally:
+            proc.wait()
+
+    def test_the_handle_is_forgotten_once_it_is_reaped(self, isolated_state):
+        proc = self._exited_child()
+        try:
+            supervisor._spawned[proc.pid] = proc
+
+            supervisor.reap()
+
+            assert supervisor._spawned == {}
+            # And a second pass has nothing left to do.
+            assert supervisor.reap() == 0
+        finally:
+            proc.wait()
+
+    def test_a_running_daemon_is_left_alone(self, isolated_state):
+        """This runs on a one-second tick. Reaping a live child would take its
+        exit status away from whoever is waiting on it."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            supervisor._spawned[proc.pid] = proc
+
+            assert supervisor.reap() == 0
+
+            assert proc.pid in supervisor._spawned
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_spawn_remembers_the_handle(self, isolated_state):
+        """Without this the registry stays empty and the tick has nothing to
+        poll, which is the state the fix exists to end."""
+        popen = MagicMock(return_value=MagicMock(pid=4242))
+
+        supervisor.spawn(
+            "telegram",
+            env={"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALLOWED_USER_ID": "1"},
+            popen_factory=popen,
+            wait_for_heartbeat=False,
+        )
+
+        assert 4242 in supervisor._spawned
 
 
 # ---------------------------------------------------------------------------

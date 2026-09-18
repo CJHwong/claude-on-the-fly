@@ -1763,6 +1763,12 @@ class DashboardScreen(Screen):
     # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
+        # Before reading anything: a daemon this process started that has since
+        # exited is a zombie until we reap it, and a zombie reads as alive to
+        # every `os.kill(pid, 0)` on the machine. A `claude-tui upgrade` run
+        # from a shell while this dashboard is open is not the parent of these
+        # daemons, so this tick is what lets its stops finish promptly.
+        supervisor.reap()
         snap = state.snapshot()
         by_name = {f.name: f for f in snap.frontends}
         # Rebuilt every tick from the heartbeat; reset before repopulating.
