@@ -815,6 +815,26 @@ def write_mcp_config() -> Path:
     return path
 
 
+# Built-in agent-side scheduling tools. Every claude process here is
+# short-lived -- one process per turn, resumed from the transcript -- so
+# an in-process timer dies the moment the turn ends. These tools can
+# register a job and list it on later turns, but the turn that must fire
+# it is gone by then, so the scheduled work silently never runs. Scheduling
+# belongs to the resident cron daemon (claude-cron) instead.
+# Override with COTF_DISALLOWED_TOOLS (comma- or space-separated), or set
+# it empty to keep the tools.
+DEFAULT_DISALLOWED_TOOLS = ("CronCreate", "CronDelete", "CronList", "ScheduleWakeup")
+
+
+def disallowed_tools_argv() -> list[str]:
+    """The --disallowed-tools flag for built-in tools this runtime cannot honor."""
+    raw = os.environ.get("COTF_DISALLOWED_TOOLS", " ".join(DEFAULT_DISALLOWED_TOOLS))
+    tools = [t for t in re.split(r"[,\s]+", raw.strip()) if t]
+    if not tools:
+        return []
+    return ["--disallowed-tools", ",".join(tools)]
+
+
 def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> list[str]:
     """The claude flags that switch tool permissions on, or none when off.
 
@@ -830,10 +850,11 @@ def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> li
     start an MCP server nothing ever calls.
     """
     resolved = configured() if resolved is None else resolved
+    disallowed = disallowed_tools_argv()
     if resolved.enabled and pty:
-        return ["--permission-mode", resolved.claude_mode]
+        return ["--permission-mode", resolved.claude_mode, *disallowed]
     if not resolved.enabled:
-        return ["--permission-mode", "bypassPermissions"]
+        return ["--permission-mode", "bypassPermissions", *disallowed]
     return [
         "--permission-mode",
         resolved.claude_mode,
@@ -841,6 +862,7 @@ def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> li
         str(mcp_config_path()),
         "--permission-prompt-tool",
         PROMPT_TOOL,
+        *disallowed,
     ]
 
 

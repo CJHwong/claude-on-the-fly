@@ -631,12 +631,39 @@ async def test_stop_is_safe_before_start():
 # --- wiring a backend up ---
 
 
-def test_claude_argv_is_the_old_pair_when_off():
-    """The off path has to be byte-identical to the behaviour before this feature,
-    or enabling nothing still changes how every session is spawned."""
+def test_disallowed_tools_default_list():
+    """Short-lived turn processes cannot honor session-lifetime timers, so the
+    built-in scheduling tools ship disallowed by default."""
+    assert permissions.disallowed_tools_argv() == [
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
+    ]
+
+
+def test_disallowed_tools_override(monkeypatch):
+    monkeypatch.setenv("COTF_DISALLOWED_TOOLS", "CronCreate Monitor")
+    assert permissions.disallowed_tools_argv() == [
+        "--disallowed-tools",
+        "CronCreate,Monitor",
+    ]
+    monkeypatch.setenv("COTF_DISALLOWED_TOOLS", "")
+    assert permissions.disallowed_tools_argv() == []
+
+
+def test_claude_argv_is_the_old_pair_when_off(monkeypatch):
+    """The off path keeps the historical pair plus the disallowed-tools flag;
+    the flag itself is what keeps unrunnable in-process timers out."""
+    monkeypatch.setenv("COTF_DISALLOWED_TOOLS", "")
     assert permissions.claude_argv(permissions.Permissions()) == [
         "--permission-mode",
         "bypassPermissions",
+    ]
+    monkeypatch.delenv("COTF_DISALLOWED_TOOLS")
+    assert permissions.claude_argv(permissions.Permissions()) == [
+        "--permission-mode",
+        "bypassPermissions",
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
     ]
 
 
@@ -763,7 +790,12 @@ def test_pty_gets_the_permission_mode_but_not_the_prompt_tool():
     argv = permissions.claude_argv(
         permissions.Permissions(mode="ask", claude_mode="manual"), pty=True
     )
-    assert argv == ["--permission-mode", "manual"]
+    assert argv == [
+        "--permission-mode",
+        "manual",
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
+    ]
     assert "--permission-prompt-tool" not in argv
     assert "--mcp-config" not in argv
 
@@ -778,7 +810,12 @@ def test_native_still_gets_the_prompt_tool():
 def test_pty_with_approvals_off_is_silent(caplog):
     with caplog.at_level("WARNING", logger="claude_on_the_fly.permissions"):
         argv = permissions.claude_argv(permissions.Permissions(), pty=True)
-    assert argv == ["--permission-mode", "bypassPermissions"]
+    assert argv == [
+        "--permission-mode",
+        "bypassPermissions",
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
+    ]
     assert caplog.text == ""
 
 
