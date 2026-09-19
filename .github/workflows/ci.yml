@@ -37,9 +37,11 @@ jobs:
           uv tool install prek
           prek run --all-files || (git --no-pager diff && false)
 
+  # Deliberately not `needs: lint`. Nothing here consumes anything lint
+  # produces, so gating on it only added lint's wall clock to the front of every
+  # run. The two jobs now start together and the slower one sets the total.
   test:
     runs-on: ubuntu-latest
-    needs: lint
     timeout-minutes: 15
     steps:
       - name: checkout repo
@@ -109,6 +111,29 @@ jobs:
       #   faulthandler_timeout  dumps every thread's stack once a single test
       #                         passes 60s, which names the offender directly.
       #
-      # The suite runs in ~3 minutes, so neither bound is near normal operation.
+      # Neither bound is near normal operation.
+      #
+      # Split in two because the suite does not parallelise uniformly.
+      #
+      # A fixed `-n 4` rather than `auto`, so the worker count is a property of
+      # this file and not of whatever the runner happens to offer. `auto` would
+      # re-tune itself when the hosted runner's size changes, moving the
+      # baseline silently and with no commit to point at.
       - name: pytest
-        run: timeout 600 uv run --no-sync pytest -q -o faulthandler_timeout=60
+        run: |
+          timeout 600 uv run --no-sync pytest -q -n 4 \
+            --ignore=tests/test_sandbox.py -o faulthandler_timeout=60
+
+      # test_sandbox.py cannot run under xdist, and fails loudly rather than
+      # quietly when it tries -- which is the whole point of how those probes
+      # are written. They assert the jail *denies* a real path (~/.aws/
+      # credentials, ~/.codex, a real .env). Each xdist worker gets its own
+      # empty temp HOME, so those paths are merely absent there, the probe
+      # answers "absent" instead of "denied", and the boundary goes untested.
+      # Nine cases fail on that and fifteen more downgrade to skips.
+      #
+      # Serial it is 227 tests in about 2 seconds, so there is nothing to win by
+      # forcing it into a worker. A separate step, not appended to the command
+      # above, so a failure here names the boundary rather than the bulk suite.
+      - name: pytest (sandbox probes, serial)
+        run: timeout 300 uv run --no-sync pytest -q tests/test_sandbox.py -o faulthandler_timeout=60
