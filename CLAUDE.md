@@ -20,6 +20,7 @@ src/claude_on_the_fly/
   orchestrator.py      # Shared session/queue layer for chat frontends
   migration.py         # Folds a pre-shared-workspace thread directory into its workspace
   interim.py           # Mid-turn progress: coalescing + rate limiting for one turn
+  model_command.py     # The $model / /model command: grammar, catalogue checks, wording
   broker.py            # Loopback credential broker (keeps API keys out of the agent)
   egress.py            # CONNECT proxy gating outbound HTTPS by destination host
   commands.py          # Runs credentialed CLIs outside the sandbox via PATH shims

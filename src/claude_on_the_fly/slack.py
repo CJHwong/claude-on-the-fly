@@ -105,6 +105,13 @@ STOP_COMMAND = "$stop"
 # Same prefix rationale as $stop, and on by default for the same reason: a
 # long-running thread is exactly where nobody thinks to go looking for a setting.
 COMPACT_COMMAND = "$compact"
+# Pin this thread's conversation to another model or effort. A prefix rather
+# than an exact match, unlike the two above, because the argument is the command:
+# `$model opus` is the request. Same rationale as $stop for being plain text --
+# it has to work inside threads, where Slack blocks custom slash commands, and a
+# long thread is where the expensive model hurts most. Telegram spells the same
+# command `/model`, because it delivers slash commands in every chat.
+MODEL_COMMAND = "$model"
 # Background-job trigger. The message tail is queued as a job that survives this
 # chat turn — the worker (claude-jobs) runs it in a fresh session and replies
 # into this thread when done. A plain-text prefix, same rationale as $stop: it
@@ -2766,6 +2773,41 @@ class SlackFrontend(Frontend):
             self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
             self._pending_reply_suppressed.setdefault(session_id, deque()).append(False)
             await self._orchestrator.on_compact(session_id)
+            return
+
+        # $model pins this conversation to another model or effort. A prefix match
+        # rather than the exact equality the two above use, because the argument
+        # is the whole point of the command: `$model opus` is a request, and
+        # `$model the notes` is refused with the list of names that would work
+        # instead of being answered as a message about notes. Ahead of the job
+        # branch and the soft-limit gate for the reason the two above are: a
+        # thread over budget is exactly one somebody may want to move to a
+        # cheaper model. `checks._job_command_error` refuses a job trigger that
+        # would collide with this prefix, so the two cannot both claim it.
+        model_text = text.strip()
+        if model_text == MODEL_COMMAND or model_text.startswith(MODEL_COMMAND + " "):
+            logger.info("slack %s/%s: %s", channel, thread_ts, MODEL_COMMAND)
+            # This branch returns before the normal path's catch-up bookkeeping,
+            # so mirror it here or a reconnect re-ingests the command.
+            self._processed_ts.add(ts)
+            self._active_channels[channel] = ts
+            if channel_type:
+                self._channel_types[channel] = channel_type
+            if self._orchestrator is None:
+                await self._post_notice(
+                    channel, thread_ts, "Not connected to a session yet."
+                )
+                return
+            # No session identification here, unlike $compact: a pin is keyed by
+            # the conversation, not by its workspace, so nothing has to be
+            # resolved to record which model this thread runs on.
+            await self._post_notice(
+                channel,
+                thread_ts,
+                self._orchestrator.on_model(
+                    session_id, model_text[len(MODEL_COMMAND) :].split()
+                ),
+            )
             return
 
         # The job trigger queues a background job that outlives this chat turn;

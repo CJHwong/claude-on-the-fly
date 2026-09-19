@@ -3517,6 +3517,136 @@ class TestCompactPrefix:
 
 
 # ---------------------------------------------------------------------------
+# $model text prefix
+# ---------------------------------------------------------------------------
+
+
+class TestModelPrefix:
+    """The Slack half of the model command. The grammar is tested elsewhere;
+    what matters here is that the words reach the orchestrator and that the
+    command is never also sent to the agent as a prompt."""
+
+    async def test_posts_what_the_orchestrator_answers(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: opus. Effort: high.")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model opus high",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_called_once_with(
+            _session_key("D1", "9.0"), ["opus", "high"]
+        )
+        frontend._on_message.assert_not_awaited()
+        posted = frontend._app.client.chat_postMessage.await_args.kwargs["text"]
+        assert posted == "Model: opus. Effort: high."
+
+    async def test_a_bare_command_asks_for_the_report(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: sonnet. Effort: unset.")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_called_once_with(_session_key("D1", "9.0"), [])
+        frontend._on_message.assert_not_awaited()
+
+    async def test_targets_the_threads_own_session(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.9",
+            "thread_ts": "5.0",
+            "text": "$model opus",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_called_once_with(_session_key("D1", "5.0"), ["opus"])
+
+    async def test_a_refusal_still_does_not_reach_the_agent(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value='I do not know the model "sonet".')
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model sonet",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_awaited()
+
+    async def test_a_prefix_of_a_longer_word_is_an_ordinary_message(self, frontend):
+        """`$model2` and `$models` are not this command. Matched on the whole
+        first word, so a message that merely starts with the same letters is
+        still answered."""
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$models are expensive",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_not_called()
+        frontend._on_message.assert_awaited_once()
+
+    async def test_without_an_orchestrator_it_says_so(self, frontend):
+        frontend._orchestrator = None
+        event = {
+            "ts": "9.0",
+            "text": "$model opus",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_awaited()
+
+    async def test_the_command_is_marked_processed(self, frontend):
+        """A reconnect re-fetches the thread, so an unmarked command would run
+        twice."""
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model opus",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        assert "9.0" in frontend._processed_ts
+        assert frontend._active_channels["D1"] == "9.0"
+
+
+# ---------------------------------------------------------------------------
 # Message shortcut (thread-aware picker)
 # ---------------------------------------------------------------------------
 
