@@ -168,9 +168,18 @@ class TestModelPin:
     def test_default_goes_back_to_the_configured_agent(
         self, orch: Orchestrator, operator_settings
     ) -> None:
+        """Asserted on the store, not only on the resolved profile.
+
+        The first version of this test compared two profiles and nothing else,
+        and it passed on a machine whose configured effort happened to equal the
+        level it pinned (`CLAUDE_EFFORT=high` there). In CI that variable is
+        unset, the leftover effort pin stopped matching the configured value, and
+        the same assertion failed. The empty store is what actually says the
+        conversation is back on config."""
         orch.on_model(1, ["opus", "high"])
         orch.on_model(1, ["default"])
 
+        assert json.loads(orch._model_store.read_text()) == {}
         assert orch.current_profile(1) == agent_mod.resolve_profile()
 
     def test_a_refusal_changes_nothing(

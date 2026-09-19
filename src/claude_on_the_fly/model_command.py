@@ -104,6 +104,13 @@ def parse(tokens: list[str], profile: AgentProfile) -> Report | Change | Refusal
     the three namespaces. A third token is somebody writing a sentence, which
     this command cannot read: it is refused rather than guessed at, since
     guessing would silently pin the conversation to the wrong model.
+
+    A bare `default` is the whole conversation back on `config.yaml`: both
+    fields. As a second word it clears only the field it sits in, so
+    `$model default high` keeps the configured model at the effort asked for.
+    The distinction is the difference between "put this back how it was" and
+    "change one thing", and without the first there was no command that cleared
+    a pinned effort while leaving the model alone.
     """
     if not tokens:
         return Report()
@@ -111,6 +118,11 @@ def parse(tokens: list[str], profile: AgentProfile) -> Report | Change | Refusal
         return Refusal(
             "Too many words. Give a model name, then an optional effort level."
         )
+    if tokens == [DEFAULT_TOKEN]:
+        # Before any catalogue is read: a conversation returning to its
+        # configuration has nothing to validate, so this can never be refused
+        # because a model list went missing.
+        return Change({MODEL: None, EFFORT: None})
 
     catalogue = _catalogue(profile)
     model_token, effort_token = tokens[0], tokens[1] if len(tokens) > 1 else None

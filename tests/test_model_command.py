@@ -165,8 +165,20 @@ def test_parse_with_effort_default_clears_the_effort(claude_catalogue):
     assert result == mc.Change({"model": "opus", "effort": None})
 
 
-def test_parse_with_default_clears_the_model(claude_catalogue):
-    assert mc.parse(["default"], _profile()) == mc.Change({"model": None})
+def test_parse_with_a_bare_default_clears_both_fields(claude_catalogue):
+    assert mc.parse(["default"], _profile(effort="high")) == mc.Change(
+        {"model": None, "effort": None}
+    )
+
+
+def test_parse_with_a_bare_default_clears_a_pinned_effort(tmp_path, monkeypatch):
+    """The case the first version got wrong: it cleared the model and left the
+    effort pinned, so `default` did not put the conversation back on config."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "empty-config"))
+
+    assert mc.parse(["default"], _profile(model="opus", effort="high")) == mc.Change(
+        {"model": None, "effort": None}
+    )
 
 
 def test_parse_with_default_model_keeps_the_effort_the_person_asked_for(
