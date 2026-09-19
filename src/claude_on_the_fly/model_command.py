@@ -331,27 +331,37 @@ def _read_claude_catalogue(config_dir: Path) -> Catalogue | None:
             short = str(entry.get("short_name") or "").strip().lower()
             if short:
                 aliases[short] = model_id
-            effort[model_id] = _effort_from_thinking(entry.get("thinking"))
+            levels = _effort_from_thinking(entry.get("thinking"))
+            if levels is not None:
+                effort[model_id] = levels
         return Catalogue(
-            models=sorted(aliases) + [i for i in ids if i not in set(aliases.values())],
+            # Both spellings, because both are accepted: the id is the canonical
+            # name and the short name is what people type. Listing only the
+            # derived name made the catalogue refuse its own ids.
+            models=sorted(set(ids) | set(aliases)),
             aliases=aliases,
             effort=effort,
         )
     return None
 
 
-def _effort_from_thinking(thinking: object) -> list[str]:
-    """The levels one claude model accepts, from its catalogue entry.
+def _effort_from_thinking(thinking: object) -> list[str] | None:
+    """The levels one claude model accepts, or None when the entry does not say.
 
-    Empty means the model takes no effort at all (`claude-haiku-4-5` says
-    `thinking: none`), which is a refusal, not a missing answer: the CLI accepts
-    `--effort` on such a model and silently ignores it.
+    Empty is a real answer: the model takes no effort at all (`claude-haiku-4-5`
+    says `thinking: none`), and the CLI accepts `--effort` on it while silently
+    ignoring the value, so it has to be refused here or nowhere. None is the
+    entry staying quiet, which leaves the model out of the catalogue's effort
+    table and falls back to the backend's own set. Conflating the two made an
+    unannotated model refuse every level it was offered.
     """
     if not isinstance(thinking, dict):
+        return None
+    if thinking.get("type") == "none":
         return []
     options = thinking.get("effort_options")
     if not isinstance(options, list):
-        return []
+        return None
     levels: list[str] = []
     for option in options:
         # `option.get`, never `option["id"]`: a narrowed `dict` from an `object`
@@ -360,7 +370,7 @@ def _effort_from_thinking(thinking: object) -> list[str]:
         found = option.get("id") if isinstance(option, dict) else None
         if found:
             levels.append(str(found))
-    return levels
+    return levels or None
 
 
 def _codex_catalogue() -> Catalogue:
@@ -383,7 +393,13 @@ def _codex_catalogue() -> Catalogue:
                 continue
             slug = str(entry.get("slug"))
             slugs.add(slug)
-            effort[slug] = _codex_levels(entry.get("supported_reasoning_levels"))
+            levels = _codex_levels(entry.get("supported_reasoning_levels"))
+            if levels:
+                # Only when the cache actually says. An empty list is codex
+                # leaving the field unannotated, not a model that takes no
+                # effort (that is claude's `thinking: none`), so the model is
+                # left out and `_effort_options` falls back to codex's own set.
+                effort[slug] = levels
     if not slugs:
         return Catalogue(models=None, aliases={}, effort={})
     return Catalogue(models=sorted(slugs), aliases={}, effort=effort)
@@ -438,9 +454,18 @@ def _model_problem(
         return None
     if profile.mode == "ollama":
         # A remote model may be absent from `ollama list` and still work. Taken
-        # on faith for the reason `preflight.check_ollama_mode` gives.
+        # on faith for the reason `preflight.check_ollama_mode` gives, and it is
+        # the one carve-out that survives a readable list.
         if name.endswith(":cloud"):
             return None
+        return _unknown("model", name, options)
+    if catalogue.readable:
+        # A catalogue answered, so it is the authority, and a name it does not
+        # list is refused even when it looks exactly like a real id. That shape
+        # check belongs to the case below and nothing else: applied here it
+        # accepted `gpt-5.6-lunna` and `claude-opus-5` on a codex conversation
+        # whose catalogue listed neither, which is the silent typo this command
+        # exists to prevent.
         return _unknown("model", name, options)
     if FULL_ID.match(name):
         return None

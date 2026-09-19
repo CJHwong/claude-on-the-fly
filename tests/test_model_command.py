@@ -225,6 +225,40 @@ def test_parse_allows_a_model_change_on_pty():
 # --------------------------------------------------------------------------
 
 
+def test_parse_refuses_a_typo_that_looks_like_a_real_id(claude_catalogue):
+    """A readable catalogue is the authority, so the shape check must not be a
+    second way in. Applied to a readable catalogue it accepted `gpt-5.6-lunna`
+    and another vendor's `claude-opus-5` on a codex conversation, silently."""
+    result = mc.parse(["claude-opus-6"], _profile())
+
+    assert isinstance(result, mc.Refusal)
+    assert "claude-opus-6" in result.text
+
+
+def test_parse_refuses_another_vendors_model_when_it_is_not_listed(codex_cache):
+    profile = _profile(backend="codex", model="gpt-5.5")
+
+    result = mc.parse(["claude-opus-5"], profile)
+
+    assert isinstance(result, mc.Refusal)
+    assert "gpt-5.5" in result.text
+
+
+def test_parse_takes_a_catalogue_id_that_also_has_an_alias(claude_catalogue):
+    """Both spellings are valid, and listing only the derived one made the
+    catalogue refuse its own ids."""
+    assert mc.parse(["claude-opus-5"], _profile()) == mc.Change(
+        {"model": "claude-opus-5"}
+    )
+    assert mc.parse(["opus"], _profile()) == mc.Change({"model": "opus"})
+
+
+def test_describe_lists_both_spellings(claude_catalogue):
+    text = mc.describe(_profile(), pinned=False)
+
+    assert "claude-opus-5" in text and "opus" in text
+
+
 def test_parse_takes_a_catalogue_id(claude_catalogue):
     assert mc.parse(["claude-opus-5"], _profile()) == mc.Change(
         {"model": "claude-opus-5"}
@@ -332,9 +366,13 @@ def test_catalogue_ignores_an_entry_with_no_id(tmp_path, monkeypatch):
 
 
 def test_effort_from_thinking_tolerates_a_missing_block():
-    assert mc._effort_from_thinking(None) == []
+    """None is the entry staying quiet, which falls back to the backend's set.
+    Empty is a real answer: this model takes no effort."""
+    assert mc._effort_from_thinking(None) is None
     assert mc._effort_from_thinking({"type": "none"}) == []
-    assert mc._effort_from_thinking({"effort_options": ["not-a-mapping"]}) == []
+    assert mc._effort_from_thinking({"effort_options": ["not-a-mapping"]}) is None
+    assert mc._effort_from_thinking({"effort_options": []}) is None
+    assert mc._effort_from_thinking({"effort_options": "low"}) is None
 
 
 # --------------------------------------------------------------------------
@@ -430,14 +468,33 @@ def test_codex_accepts_a_level_that_model_has(codex_cache):
     )
 
 
-def test_codex_falls_back_to_the_backend_set_for_a_model_not_in_the_cache(
-    codex_cache,
+def test_codex_falls_back_to_the_backend_set_when_the_cache_stays_quiet(
+    tmp_path, monkeypatch
 ):
-    """A slug the cache has never heard of still gets the backend's levels."""
-    profile = _profile(backend="codex", model="gpt-5.5")
+    """A slug the cache lists but does not annotate still gets its levels.
 
-    assert mc.parse(["gpt-7-unknown", "max"], profile) == mc.Change(
-        {"model": "gpt-7-unknown", "effort": "max"}
+    `deepseek-v4.1-flash:cloud` arrives through codex's `model.json` with
+    `supported_reasoning_levels: []`, which is codex saying nothing, not a model
+    that takes no effort. Reading it as the latter refused every level it was
+    offered, with a message claiming no list could be read while the list was
+    right there.
+    """
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "gpt-quiet", "supported_reasoning_levels": []},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    profile = _profile(backend="codex", model="gpt-quiet")
+
+    assert mc.parse(["gpt-quiet", "max"], profile) == mc.Change(
+        {"model": "gpt-quiet", "effort": "max"}
     )
 
 
@@ -472,7 +529,8 @@ def test_codex_tolerates_a_cache_with_nothing_usable_in_it(tmp_path, monkeypatch
     catalogue = mc._codex_catalogue()
 
     assert catalogue.models == ["gpt-6-astra"]
-    assert catalogue.effort == {"gpt-6-astra": []}
+    # No entry: the cache listed no levels for it, so the backend's set answers.
+    assert catalogue.effort == {}
 
 
 def test_codex_without_a_cache_accepts_a_full_id(tmp_path, monkeypatch):
