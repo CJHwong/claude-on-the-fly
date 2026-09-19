@@ -1570,6 +1570,44 @@ class TestRunLoop:
         assert fired == ["a"]
         assert all(s.next_fire.year > 2000 for s in cron._state.values())
 
+    async def test_an_entry_whose_time_has_not_come_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """The scan walks every known entry each minute, so one whose time has
+        not come has to fall out before anything fires. Firing it early would
+        run a nightly job on the first tick after the daemon started."""
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {"name": "due", "cron": "* * * * *", "prompt": "x"},
+                {"name": "later", "cron": "* * * * *", "prompt": "x"},
+            ),
+            FakeQueue(),
+        )
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+            await cron.stop()
+
+        cron._fire = record  # type: ignore[method-assign]
+
+        async def immediately(self=cron):
+            return None
+
+        cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
+        cron.reload()
+        for state in cron._state.values():
+            state.next_fire = (
+                datetime(2000, 1, 1)
+                if state.entry.name == "due"
+                else datetime(2999, 1, 1)
+            )
+        await asyncio.wait_for(cron.run(), timeout=5)
+        assert fired == ["due"]
+
     async def test_a_stop_between_the_sleep_and_the_scan_ends_the_loop(
         self, tmp_path: Path
     ) -> None:
@@ -2341,6 +2379,14 @@ class TestOneShotAt:
     def test_an_invalid_at_fails_at_load(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="invalid 'at'"):
             load_config(cfg(tmp_path, {"name": "a", "at": "someday", "prompt": "x"}))
+
+    def test_a_non_string_at_fails_at_load(self, tmp_path: Path) -> None:
+        """YAML is untyped enough that `at: 2026-09-19` parses as a date and
+        `at: 300` as an int, so the type is checked rather than assumed. Without
+        that check the entry reaches `parse_when` and fails there with a message
+        about the wrong thing."""
+        with pytest.raises(ValueError, match="'at' must be a string"):
+            load_config(cfg(tmp_path, {"name": "a", "at": 300, "prompt": "x"}))
 
     def test_a_relative_at_resolves_at_load(self, tmp_path: Path) -> None:
         entry = load_config(cfg(tmp_path, {"name": "a", "at": "30m", "prompt": "x"}))[0]
