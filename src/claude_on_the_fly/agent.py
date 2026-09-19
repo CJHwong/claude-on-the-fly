@@ -20,7 +20,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -1583,6 +1583,32 @@ class AgentProfile:
         """
         model = self.model or ("default" if self.backend == "codex" else "")
         return f"{self.backend}:{self.mode}:{model}"
+
+
+# The fields one conversation may pin from chat, named once. The command
+# grammar, the file a daemon stores them in, and `apply_override` all have to
+# agree about these, and a key that is not here must never reach `replace`: a
+# stored file is edited by hand at least once, and `replace` would raise on the
+# typo, taking down the turn that read it.
+OVERRIDABLE_FIELDS = ("model", "effort")
+
+
+def apply_override(profile: AgentProfile, overrides: Mapping[str, str]) -> AgentProfile:
+    """`profile` with what one conversation pinned, or `profile` unchanged.
+
+    Applied to the *resolved* profile rather than to the settings, which is the
+    whole reason this is safe: the resolver has already routed each field out of
+    the right block for the mode, so a pinned value lands in the same field a
+    configured one would. Under ollama that means the shared ollama keys, and
+    nothing downstream has to know which block answered.
+
+    An unknown key is dropped rather than raising, for the reason
+    `OVERRIDABLE_FIELDS` gives.
+    """
+    pinned = {
+        key: value for key, value in overrides.items() if key in OVERRIDABLE_FIELDS
+    }
+    return replace(profile, **pinned) if pinned else profile
 
 
 def profile_names() -> list[str]:

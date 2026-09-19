@@ -328,6 +328,23 @@ def test_read_queue_rows_is_hard_capped(tmp_path: Path) -> None:
     assert read_queue_rows(root, limit=0) == []
 
 
+def test_read_queue_rows_degrades_an_unparseable_available_at(tmp_path: Path) -> None:
+    """Listing is a viewer, so one mangled field costs that cell, not the row
+    and not the whole listing. `claim` is where the same value becomes poison."""
+    root = tmp_path / "jobs"
+    q = FileInboxQueue(root)
+    q.enqueue(_job("100-a"))
+    (queued,) = (root / "new").glob("*.json")
+    payload = json.loads(queued.read_text())
+    payload["available_at"] = "someday"
+    queued.write_text(json.dumps(payload))
+
+    rows = read_queue_rows(root)
+
+    assert [r.id for r in rows] == ["100-a"]
+    assert rows[0].available_at is None
+
+
 def test_row_enqueued_at_comes_from_the_id_not_the_file(tmp_path: Path) -> None:
     """The age is derived from the id's leading time_ns, so touching the file
     (a backup, an rsync) cannot move it."""
@@ -1194,6 +1211,18 @@ class TestAvailableAt:
         (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
         payload = json.loads(queued.read_text())
         payload["available_at"] = "2026-09-19T09:00:00+08:00"
+        queued.write_text(json.dumps(payload))
+        assert q.claim() is None
+        assert list((tmp_path / "jobs" / "failed").glob("*.json"))
+
+    def test_a_non_string_available_at_is_poison(self, tmp_path: Path) -> None:
+        """A hand-edited record, or one written by something that never had the
+        field's type. Claiming it would compare an int against the local clock."""
+        q = FileInboxQueue(tmp_path / "jobs")
+        self._enqueue_at(q, f"{time.time_ns()}-aaaaaaaa", None)
+        (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+        payload = json.loads(queued.read_text())
+        payload["available_at"] = 123
         queued.write_text(json.dumps(payload))
         assert q.claim() is None
         assert list((tmp_path / "jobs" / "failed").glob("*.json"))

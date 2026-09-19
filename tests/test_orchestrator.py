@@ -122,6 +122,260 @@ def orch(frontend: StubFrontend, event_log: EventLog) -> Orchestrator:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# The model pin
+# ---------------------------------------------------------------------------
+
+
+class TestModelPin:
+    """`$model` from a frontend down to the run that honours it.
+
+    The grammar itself is tested in `test_model_command.py`. What is tested here
+    is the wiring: that a pin reaches the turn, the compaction and the rows a
+    dashboard reads, that it is per conversation, and that it survives a restart.
+    """
+
+    def test_the_resolved_profile_is_the_configured_one_with_nothing_pinned(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_pins_the_model_for_one_conversation_only(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus"])
+
+        assert orch.current_profile(1).model == "opus"
+        assert orch.current_profile(2).model != "opus"
+
+    def test_pins_the_effort_with_the_model(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+
+        assert orch.current_profile(1).model == "opus"
+        assert orch.current_profile(1).effort == "high"
+
+    def test_a_model_only_command_keeps_the_pinned_effort(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+        orch.on_model(1, ["sonnet"])
+
+        assert orch.current_profile(1).model == "sonnet"
+        assert orch.current_profile(1).effort == "high"
+
+    def test_default_goes_back_to_the_configured_agent(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """Asserted on the store, not only on the resolved profile.
+
+        The first version of this test compared two profiles and nothing else,
+        and it passed on a machine whose configured effort happened to equal the
+        level it pinned (`CLAUDE_EFFORT=high` there). In CI that variable is
+        unset, the leftover effort pin stopped matching the configured value, and
+        the same assertion failed. The empty store is what actually says the
+        conversation is back on config."""
+        orch.on_model(1, ["opus", "high"])
+        orch.on_model(1, ["default"])
+
+        assert json.loads(orch._model_store.read_text()) == {}
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_a_refusal_changes_nothing(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        text = orch.on_model(1, ["sonet"])
+
+        assert '"sonet"' in text
+        assert orch.current_profile(1).model != "sonet"
+
+    def test_a_bare_command_reports_the_state(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+
+        text = orch.on_model(1, [])
+
+        assert "Model: opus" in text
+        assert "Effort: high" in text
+
+    def test_the_report_says_when_a_conversation_is_pinned(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus"])
+
+        assert "(pinned)" in orch.on_model(1, [])
+
+    def test_an_unreadable_configuration_is_reported_not_raised(
+        self, orch: Orchestrator, monkeypatch
+    ) -> None:
+        def explode(profile=None):
+            raise ValueError("AGENT_BACKEND: nope")
+
+        monkeypatch.setattr(agent_mod, "resolve_profile", explode)
+
+        text = orch.on_model(1, ["opus"])
+
+        assert "I cannot read the agent configuration" in text
+        assert "AGENT_BACKEND: nope" in text
+
+    def test_a_pin_survives_a_restart(
+        self, orch: Orchestrator, frontend: StubFrontend, event_log: EventLog
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+
+        restarted = Orchestrator(frontend, "test", event_log=event_log)
+
+        assert restarted.current_profile(1).model == "opus"
+        assert restarted.current_profile(1).effort == "high"
+
+    def test_the_store_is_per_frontend(
+        self, orch: Orchestrator, frontend: StubFrontend, event_log: EventLog
+    ) -> None:
+        """Two daemons share a chat id space, so one table would collide."""
+        orch.on_model(1, ["opus"])
+
+        other = Orchestrator(frontend, "somewhere-else", event_log=event_log)
+
+        assert other.current_profile(1).model != "opus"
+
+    def test_clearing_a_pin_leaves_no_entry_behind(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus"])
+        orch.on_model(1, ["default"])
+
+        assert json.loads(orch._model_store.read_text()) == {}
+
+    def test_the_store_ignores_what_it_cannot_use(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """A hand-edited file must not take down the turn that reads it."""
+        store = orch._model_store
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps(
+                {
+                    "not-a-chat-id": {"model": "opus"},
+                    "2": "not-a-mapping",
+                    "3": {"nonsense": "opus"},
+                    "4": {"model": "opus", "nonsense": "x"},
+                }
+            )
+        )
+
+        assert orch.current_profile(4).model == "opus"
+        assert orch.current_profile(2) == agent_mod.resolve_profile()
+        assert orch.current_profile(3) == agent_mod.resolve_profile()
+
+    def test_a_store_that_is_not_a_mapping_is_ignored(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        store = orch._model_store
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("[1, 2, 3]")
+
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_a_store_that_is_not_json_is_ignored(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        store = orch._model_store
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("{ not json")
+
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_the_store_is_read_once_per_process(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """A second read cannot change the answer, so it is not paid for."""
+        orch.on_model(1, ["opus"])
+        orch._model_store.write_text("{}")
+
+        assert orch.current_profile(1).model == "opus"
+
+    def test_a_failed_write_is_logged_and_the_pin_still_applies(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path, caplog
+    ) -> None:
+        """A botched install, not a hypothetical: `state` exists as a file."""
+        (tmp_path / "state").write_text("not a directory")
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"):
+            text = orch.on_model(1, ["opus"])
+
+        assert "Model: opus" in text
+        assert orch.current_profile(1).model == "opus"
+        assert "could not write" in caplog.text
+
+    def test_a_model_change_drops_the_stale_context_reading(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """The reading describes the model's window, which just changed."""
+        orch._context[1] = (1000, 200_000)
+
+        orch.on_model(1, ["opus"])
+
+        assert 1 not in orch._context
+
+    def test_the_turn_runs_on_the_pinned_profile(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path
+    ) -> None:
+        orch.on_model(1, ["opus"])
+        run = AsyncMock(return_value=Response(body="answer"))
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "run", run),
+        ):
+            asyncio.run(orch._process(1, Turn("question")))
+
+        assert run.await_args.kwargs["profile"].model == "opus"
+
+    def test_the_compaction_runs_on_the_pinned_profile(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path
+    ) -> None:
+        orch.on_model(1, ["opus"])
+        compact = AsyncMock(return_value=None)
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "compact", compact),
+        ):
+            asyncio.run(orch._process(1, Turn("", compact=True)))
+
+        assert compact.await_args.kwargs["profile"].model == "opus"
+
+    def test_the_event_row_names_the_pinned_agent(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path
+    ) -> None:
+        orch.on_model(1, ["opus"])
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(
+                agent_mod, "run", AsyncMock(return_value=Response(body="answer"))
+            ),
+        ):
+            asyncio.run(orch._process(1, Turn("question")))
+
+        assert orch._event_log.tail(10)[-1]["backend"].endswith(":opus")
+
+    def test_the_heartbeat_row_names_the_pinned_agent(self, orch: Orchestrator) -> None:
+        orch._in_flight[1] = {
+            "identifier": "test/1",
+            "label": "a thread",
+            "started_at_monotonic": time.monotonic(),
+            "session_uuid": "u",
+            "backend": "claude:native:opus",
+        }
+
+        row = orch.heartbeat_extra()["running_jobs"][0]
+
+        assert row["backend"] == "claude:native:opus"
+
+
 class TestSessionUUID:
     def test_same_chat_id_returns_same_uuid(self, orch: Orchestrator) -> None:
         assert orch.session_uuid(1) == orch.session_uuid(1)
@@ -358,6 +612,9 @@ class TestProcess:
             channel_context="dm",
             timeout=None,
             nudge_prompt=None,
+            # The turn runs on the resolved profile, not on a fresh global read
+            # inside the backend: that is what lets one conversation pin a model.
+            profile=mock_agent.apply_override.return_value,
             facts={},
         )
 
