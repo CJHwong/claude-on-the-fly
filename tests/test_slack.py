@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
@@ -3083,6 +3084,56 @@ class TestReplySoftLimit:
         )
 
         assert frontend._reply_counts[session_id] == 1
+
+    async def test_a_suggestion_tap_writes_an_inbound_log_line(self, frontend, caplog):
+        """A tap leaves no Slack message, so this line is the only record that it
+        happened at all.
+
+        Without it a tap is indistinguishable from an answer nobody gave: on
+        2026-09-16 three of Gary's own answers were investigated as fabricated,
+        because searching Slack for them found nothing and there was nothing
+        else to consult.
+        """
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_ALLOWED", "name": "testuser"},
+                    "channel": {"id": "C1"},
+                    "message": {"ts": "300.0", "thread_ts": "t1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        lines = [r.getMessage() for r in caplog.records]
+        inbound = [ln for ln in lines if ln.startswith("slack C1/t1: ")]
+        assert inbound, f"no inbound line for the tap; got {lines}"
+        line = inbound[0]
+        # The same shape a typed message writes, so one grep finds both...
+        assert "U_ALLOWED" in line
+        assert "Do the thing" in line
+        # ...and a marker, so a reader never goes looking for a Slack message
+        # that a tap does not leave behind.
+        assert line.endswith("(button)"), line
+
+    async def test_a_dropped_tap_writes_no_inbound_line(self, frontend, caplog):
+        """Logged at dispatch, not on arrival: a tap from someone who may not
+        send never reached the agent, so it must not read as an inbound
+        message."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_NOT_ALLOWED", "name": "stranger"},
+                    "channel": {"id": "C1"},
+                    "message": {"ts": "300.0", "thread_ts": "t1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        assert not [r for r in caplog.records if r.getMessage().endswith("(button)")]
 
 
 # ---------------------------------------------------------------------------
