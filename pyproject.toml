@@ -31,6 +31,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
+    # Parallel test workers. The suite's cost is breadth -- 5000-odd tests at
+    # about 25ms each -- so workers are the only lever that moves it. See the
+    # pytest steps in .github/workflows/ci.yml for the one file that cannot run
+    # under them.
+    "pytest-xdist>=3.6",
     # Pinned to the same minor the pre-commit hook installs. Undeclared, `uv run
     # ruff` fell through to whatever ruff was on PATH, so a hand-run fix could
     # differ from what the gate applies.
