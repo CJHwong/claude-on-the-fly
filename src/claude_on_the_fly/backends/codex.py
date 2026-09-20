@@ -415,10 +415,15 @@ class _RolloutFollower:
         thread_id: str | None,
         emit: Callable[[str], None] | None,
         known_rollouts: frozenset[Path] = frozenset(),
+        on_resolved: Callable[[], None] | None = None,
     ) -> None:
         self._workspace = workspace
         self._thread_id = thread_id
         self._emit = emit
+        # Fired once, the moment this turn owns a rollout path. Discovery is the
+        # only part of a first turn that cannot run beside another one, so the
+        # caller uses this to stop serialising and let the next turn start.
+        self._on_resolved = on_resolved
         # A first turn finds its rollout by cwd, and the cwd is shared with every
         # other thread of the conversation. The rollouts that existed before this
         # turn spawned are theirs, whatever their mtime says.
@@ -474,6 +479,8 @@ class _RolloutFollower:
             # the current size can miss a few of this turn's opening records; it
             # cannot invent a finished turn.
             self._offset = 0 if not self._thread_id else rollout_size(found)
+            if self._on_resolved is not None:
+                self._on_resolved()
 
     def _drain(self) -> None:
         """Read new records once, feeding progress and completion. Never raises."""
@@ -744,28 +751,82 @@ def _write_pane_script(body: str, path: Path) -> Path:
 # needs them (see `tmux.argv_prefix`).
 _INHERITED_TMUX = frozenset({"TMUX", "TMUX_PANE"})
 
-# One lock per workspace directory, held for the length of a first turn.
+# One lock per workspace directory, held across a first turn's rollout discovery.
 #
 # A first turn has no thread id until codex has written its rollout, so the
 # follower finds the file by cwd, and the cwd is shared by every thread of the
 # conversation. Two first turns in one directory at once would race to claim the
 # same new rollout: the loser delivers the winner's reply and records the winner's
-# thread id as its own. Holding the lock for the whole turn is the simple version
-# of "until the rollout is identified"; a resumed turn takes no lock, because it
-# already holds the thread id and reads its own file by name.
+# thread id as its own. A resumed turn takes no lock, because it already holds the
+# thread id and reads its own file by name.
 _first_turn_locks: dict[str, asyncio.Lock] = {}
+
+
+class _FirstTurnGate:
+    """Serialise a first turn until it owns a rollout, then step aside.
+
+    The race above lasts from the spawn to the moment codex writes the file.
+    That is about a second. The turn behind it is the whole reply, which is
+    minutes. So this releases on `release()` -- the follower calls it the moment
+    it binds a path -- and again on exit, for a turn that never got that far.
+
+    Holding it for the whole turn instead is one line shorter and was what cotf
+    did. It cost real concurrency: three new threads in one Slack DM ran back to
+    back, 41m40s then 1m37s then the rest, and the two behind the first waited
+    36 and 32 minutes for a file that already existed one second in.
+
+    Releasing on exit as well is what removes the need for a discovery timeout.
+    A codex that dies without ever writing a rollout still ends its turn, and
+    the exit path frees the next one.
+    """
+
+    def __init__(self, lock: asyncio.Lock) -> None:
+        self._lock = lock
+        self._held = False
+
+    async def __aenter__(self) -> _FirstTurnGate:
+        await self._lock.acquire()
+        self._held = True
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.release()
+
+    def release(self) -> None:
+        """Let the next first turn in. Safe to call twice, and from the follower.
+
+        The `_held` flag is not decoration: `asyncio.Lock` has no notion of an
+        owner, so a second release would free whichever turn acquired it next.
+        """
+        if not self._held:
+            return
+        self._held = False
+        self._lock.release()
+
+
+class _ResumedTurnGate:
+    """The no-op gate a resumed turn gets. It races with nobody."""
+
+    async def __aenter__(self) -> _ResumedTurnGate:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    def release(self) -> None:
+        return None
 
 
 def _first_turn_guard(
     workspace: Path, thread_id: str | None
-) -> contextlib.AbstractAsyncContextManager:
+) -> _FirstTurnGate | _ResumedTurnGate:
     if thread_id:
-        return contextlib.nullcontext()
+        return _ResumedTurnGate()
     key = os.path.realpath(workspace)
     lock = _first_turn_locks.get(key)
     if lock is None:
         lock = _first_turn_locks[key] = asyncio.Lock()
-    return lock
+    return _FirstTurnGate(lock)
 
 
 class _PaneUnavailable(Exception):
@@ -977,6 +1038,7 @@ async def _run_codex_exec(
     timeout: float | None,
     thread_id: str | None = None,
     interactive: list[str] | None = None,
+    gate: _FirstTurnGate | _ResumedTurnGate | None = None,
 ) -> dict:
     """Run one codex turn and return its result. Raises RuntimeError on failure.
 
@@ -988,6 +1050,10 @@ async def _run_codex_exec(
 
     `thread_id` is codex's own id for a resumed thread, and only decides where
     the follower starts reading. A fresh thread has none until codex writes one.
+
+    `gate` is the caller's first-turn gate, released here rather than at the
+    call site: the rollout snapshot below has to be taken under it, and the
+    follower is the first thing that knows discovery is over.
 
     `interactive` is the argv for the hosted arm. It is a second argv rather than
     a flag because the two arms run different programs: `codex exec` for a plain
@@ -1029,8 +1095,17 @@ async def _run_codex_exec(
         "codex exec: %s",
         f"hosted in pane {pane.session}" if pane is not None else "not hosted",
     )
+    # Under the gate: a snapshot taken after another first turn's rollout landed
+    # would treat that file as pre-existing and skip past it, which is the race
+    # the gate exists to stop.
     known = frozenset() if thread_id else transcript.snapshot_rollouts()
-    follower = _RolloutFollower(workspace, thread_id, agent.progress_sink(), known)
+    follower = _RolloutFollower(
+        workspace,
+        thread_id,
+        agent.progress_sink(),
+        known,
+        on_resolved=gate.release if gate is not None else None,
+    )
     follower.start()
     try:
         hosted = pane is not None and interactive is not None
@@ -1291,7 +1366,7 @@ class CodexBackend:
         )
 
         started_at = time.monotonic()
-        async with _first_turn_guard(workspace, existing_thread):
+        async with _first_turn_guard(workspace, existing_thread) as gate:
             result = await _run_codex_exec(
                 workspace,
                 cmd,
@@ -1302,6 +1377,7 @@ class CodexBackend:
                     if self._pty
                     else None
                 ),
+                gate=gate,
             )
         duration = time.monotonic() - started_at
 

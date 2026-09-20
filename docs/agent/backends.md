@@ -54,9 +54,17 @@ so a workspace path no longer identifies a session. Three places used to assume 
 - **A codex first turn.** It has no thread id until codex writes the rollout, so the
   follower finds the file by cwd, and the cwd is shared. `_run_codex_exec` snapshots the
   rollouts on disk before the spawn and excludes them, and `CodexBackend.run` holds one
-  `asyncio.Lock` per directory for the length of a first turn, so the only new rollout with
-  that cwd is its own. A resumed turn takes no lock. Without both, the loser of two
-  concurrent first turns delivered the winner's reply and stored the winner's thread id.
+  `asyncio.Lock` per directory, so the only new rollout with that cwd is its own. A resumed
+  turn takes no lock. Without both, the loser of two concurrent first turns delivered the
+  winner's reply and stored the winner's thread id.
+
+  **The lock covers discovery, not the turn.** `_FirstTurnGate` is released by the follower
+  the moment it binds a path, which is about a second after the spawn, and again on exit for
+  a turn that never got a rollout at all. That second release is why there is no discovery
+  timeout. Holding it for the whole turn was the earlier rule and it serialised a whole
+  conversation: three new threads in one Slack DM ran back to back at 41m40s, 1m37s and the
+  rest, and the two behind the first waited 36 and 32 minutes for a file that already
+  existed. New threads in one DM now start together; only their first second overlaps.
 - **The outbox and the inbox.** A turn's outbox is `outbox/<session uuid>/`, created and
   retired by the orchestrator, so two threads' deliveries never mix; uploads land flat in
   `inbox/` with a numeric suffix on a clash. The workspace root is the conversation's own

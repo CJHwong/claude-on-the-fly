@@ -3050,7 +3050,9 @@ class TestCodexPtyMode:
     ):
         seen: dict = {}
 
-        async def record(workspace, cmd, timeout, thread_id=None, interactive=None):
+        async def record(
+            workspace, cmd, timeout, thread_id=None, interactive=None, **_kw
+        ):
             seen["interactive"] = interactive
             return _success_result()
 
@@ -3067,7 +3069,9 @@ class TestCodexPtyMode:
     ):
         seen: dict = {}
 
-        async def record(workspace, cmd, timeout, thread_id=None, interactive=None):
+        async def record(
+            workspace, cmd, timeout, thread_id=None, interactive=None, **_kw
+        ):
             seen["interactive"] = interactive
             return _success_result()
 
@@ -3392,22 +3396,20 @@ class TestSharedWorkspaceFirstTurns:
             tmp_path, ["codex", "exec", "p"], None, thread_id="t1"
         )
 
-    async def test_two_first_turns_in_one_workspace_run_one_at_a_time(
+    async def test_a_first_turn_waits_while_the_one_ahead_is_still_looking(
         self, tmp_path: Path, monkeypatch
     ):
+        """Discovery is the part that cannot overlap. Nothing is released yet."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         running: list[str] = []
-        overlap: list[bool] = []
         release = asyncio.Event()
 
         async def fake_exec(_ws, cmd, **_kw):
             # The prompt is the argv tail; a first turn's carries the system
             # prompt in front of the user's text.
             running.append(cmd[-1][-3:])
-            overlap.append(len(running) > 1)
             await release.wait()
-            running.remove(cmd[-1][-3:])
             return _success_result()
 
         monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
@@ -3421,7 +3423,101 @@ class TestSharedWorkspaceFirstTurns:
         assert running == ["one"]
         release.set()
         await asyncio.gather(first, second)
-        assert overlap == [False, False]
+
+    async def test_a_first_turn_starts_once_the_one_ahead_owns_its_rollout(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The reply is not the gated part, and it is all of the wall clock.
+
+        Measured before this: three new threads in one Slack DM ran back to
+        back, and the two behind the first waited 36 and 32 minutes for a file
+        the first had already written one second in.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        running: list[str] = []
+        release = asyncio.Event()
+
+        async def fake_exec(_ws, cmd, gate=None, **_kw):
+            # Stands in for the follower binding a path: discovery is over, the
+            # long tail of the turn is not.
+            if gate is not None:
+                gate.release()
+            running.append(cmd[-1][-3:])
+            await release.wait()
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
+        monkeypatch.setattr(
+            codex_mod.transcript, "prepend_latest_handoff", lambda _w, p, **_k: p
+        )
+        backend = CodexBackend()
+        first = asyncio.create_task(backend.run(workspace, "s1", "one", "slack"))
+        second = asyncio.create_task(backend.run(workspace, "s2", "two", "slack"))
+        await asyncio.sleep(0.05)
+        assert running == ["one", "two"]
+        release.set()
+        await asyncio.gather(first, second)
+
+    async def test_the_follower_releases_the_gate_when_it_binds_a_rollout(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The wiring, not a stand-in: a real gate, freed by a real resolve."""
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("")
+        gate = codex_mod._first_turn_guard(tmp_path, None)
+        held: list[bool] = []
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            held.append(gate._lock.locked())
+            follower._drain()
+            held.append(gate._lock.locked())
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(
+            codex_mod.transcript, "snapshot_rollouts", lambda: frozenset()
+        )
+        monkeypatch.setattr(
+            codex_mod.transcript,
+            "_find_codex_rollout_by_cwd",
+            lambda _cwd, **_kw: rollout,
+        )
+        async with gate:
+            await codex_mod._run_codex_exec(
+                tmp_path, ["codex", "exec", "p"], None, gate=gate
+            )
+        assert held == [True, False]
+
+    async def test_a_turn_that_never_finds_a_rollout_still_frees_the_next_one(
+        self, tmp_path: Path
+    ):
+        """Why there is no discovery timeout: the exit path is the backstop."""
+        gate = codex_mod._first_turn_guard(tmp_path, None)
+        async with gate:
+            assert gate._lock.locked()
+        assert not gate._lock.locked()
+
+    async def test_releasing_twice_does_not_free_another_turns_lock(
+        self, tmp_path: Path
+    ):
+        """`asyncio.Lock` has no owner, so a stray release would free the next turn."""
+        first = codex_mod._first_turn_guard(tmp_path, None)
+        async with first:
+            first.release()
+            second = codex_mod._first_turn_guard(tmp_path, None)
+            await second.__aenter__()
+        # The `async with` exit is the second release. It must not free `second`.
+        assert second._lock.locked()
+        second.release()
+
+    async def test_a_resumed_turn_gate_is_inert(self, tmp_path: Path):
+        gate = codex_mod._first_turn_guard(tmp_path, "thread-1")
+        async with gate as entered:
+            assert entered is gate
+        gate.release()
+        # It never touched the lock table, so it cannot hold anyone up.
+        assert os.path.realpath(tmp_path) not in codex_mod._first_turn_locks
 
     async def test_a_resumed_turn_is_not_held_behind_a_first_turn(
         self, tmp_path: Path, monkeypatch
