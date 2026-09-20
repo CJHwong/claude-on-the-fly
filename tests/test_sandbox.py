@@ -917,6 +917,15 @@ async def test_verify_denials_reports_each_probe(
         results = await sandbox.verify_denials(tmp_path)
     assert results, "expected at least one probe"
     assert sandbox.READABLE not in results.values(), f"leaked: {results}"
+    # A host that holds none of the probed credentials has no deny to prove, and
+    # `verify_denials` settles absent-versus-denied outside the jail, so it spawns
+    # nothing at all. That is a fact about the host, not about the profile. Seven
+    # sibling cases below already skip on the same reasoning ("no real ~/.codex on
+    # this machine to probe"); a CI runner is simply the first host where every
+    # probe lands that way at once. Asserting here instead would make the job red
+    # for having a clean home.
+    if all(outcome == sandbox.ABSENT for outcome in results.values()):
+        pytest.skip(f"no probed credential exists in this home: {sorted(results)}")
     # At least one real deny must have been exercised, or the run proved nothing.
     assert sandbox.DENIED in results.values(), f"nothing actually denied: {results}"
     logged = "\n".join(r.getMessage() for r in caplog.records)
