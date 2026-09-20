@@ -1027,6 +1027,41 @@ class TestFindCodexRolloutByCwd:
         monkeypatch.setattr(Path, "stat", stat_fails)
         assert transcript._find_codex_rollout_by_cwd("/ws") is None
 
+    def test_a_symlinked_workspace_matches_the_path_codex_recorded(
+        self, codex_sessions_dir, tmp_path
+    ):
+        """codex writes the `-C` argument back verbatim, so the recorded cwd and
+        the caller's own name can be two spellings of one directory. A string
+        equality missed that and the turn answered "No response" after codex had
+        already run the work and billed for it."""
+        real = tmp_path / "real_ws"
+        real.mkdir()
+        link = tmp_path / "link_ws"
+        link.symlink_to(real)
+        expected = self._rollout(codex_sessions_dir, "linked", str(link))
+
+        assert transcript._find_codex_rollout_by_cwd(str(real)) == expected
+        assert transcript._find_codex_rollout_by_cwd(str(link)) == expected
+
+    def test_two_different_directories_still_do_not_match(
+        self, codex_sessions_dir, tmp_path
+    ):
+        """Resolving both sides must not widen the match to anything else."""
+        mine = tmp_path / "mine"
+        mine.mkdir()
+        self._rollout(codex_sessions_dir, "theirs", str(tmp_path / "theirs"))
+
+        assert transcript._find_codex_rollout_by_cwd(str(mine)) is None
+
+    def test_a_recorded_cwd_that_is_not_a_string_is_refused(self, codex_sessions_dir):
+        """A rollout written by a future codex could hold anything there."""
+        rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-2026-07-30T12-00-00-x.jsonl").write_bytes(
+            json.dumps({"type": "session_meta", "payload": {"cwd": 7}}).encode() + b"\n"
+        )
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
     def test_a_first_line_that_is_not_session_meta_is_refused(self, codex_sessions_dir):
         rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
         rollout_dir.mkdir(parents=True)

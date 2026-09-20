@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -361,13 +362,30 @@ def _find_codex_rollout_by_cwd(
     if freshest is None:
         return None
     meta = _read_first_jsonl(freshest[1])
-    if (
-        meta is not None
-        and meta.get("type") == "session_meta"
-        and (meta.get("payload") or {}).get("cwd") == cwd
-    ):
+    if meta is None or meta.get("type") != "session_meta":
+        return None
+    recorded = (meta.get("payload") or {}).get("cwd")
+    if isinstance(recorded, str) and _same_dir(recorded, cwd):
         return freshest[1]
     return None
+
+
+def _same_dir(recorded: str, wanted: str) -> bool:
+    """Whether two cwd strings name the same directory, symlinks resolved.
+
+    A plain string equality was wrong in both directions, because codex writes
+    back the `-C` argument verbatim rather than a path it resolved. Measured on
+    codex-cli 0.155.1: a turn given `-C /private/tmp/x/link_ws`, where `link_ws`
+    is a symlink, records exactly that, so a caller comparing the resolved name
+    matched nothing and the turn returned "No response" -- after codex had run
+    the work and billed for it. The control through the real path answered
+    normally.
+
+    Resolving both sides is what makes the comparison independent of which form
+    the caller happened to hold. `realpath` needs no existing path: it resolves
+    the components that do exist and normalises the rest.
+    """
+    return os.path.realpath(recorded) == os.path.realpath(wanted)
 
 
 def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
