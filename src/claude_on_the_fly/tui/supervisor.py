@@ -475,10 +475,18 @@ def _tail_file(path: Path, n_lines: int = 25) -> str:
 class PendingWork:
     """What stopping one daemon costs, as an outside reader can see it.
 
-    `recoverable` is the whole point of showing this: a job re-runs and a cron
-    command re-fires, but a chat turn is gone and the only recovery is the
-    person sending it again. An operator deciding whether to upgrade now needs
-    those two told apart, not a single total.
+    `recoverable` is the whole point of showing this: a job re-runs, a cron
+    command re-fires, and a chat turn is journaled to `state/<platform>.turns.json`
+    before it runs, so it is replayed on the next start. An operator deciding
+    whether to upgrade now needs work that comes back told apart from work that
+    does not, rather than a single total.
+
+    Chat turns counted as recoverable because `turns.take()` replays both a
+    queued and a dispatched turn. Two narrow cases do not come back: a turn
+    already replayed `MAX_REPLAYS` times is parked, and one older than the TTL
+    is dropped. Neither is visible from the heartbeat this reads, and both mean
+    something is already wrong, so they do not change what the modal should say
+    about an ordinary upgrade.
     """
 
     frontend: str
@@ -545,7 +553,7 @@ def pending_work(frontend: str) -> PendingWork | None:
             frontend,
             running,
             queued if isinstance(queued, int) else 0,
-            recoverable=False,
+            recoverable=True,
         )
     if frontend == "cron":
         # A cancelled command re-fires on its own schedule, and a job it already

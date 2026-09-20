@@ -99,6 +99,7 @@ jobs:
           COTF_REQUIRE_JAIL: "1"
         run: |
           uv run --no-sync pytest \
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
             tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py -q -rs
 
       # A hung test must name itself. Left to the job's own `timeout-minutes`,
@@ -119,9 +120,20 @@ jobs:
       # this file and not of whatever the runner happens to offer. `auto` would
       # re-tune itself when the hosted runner's size changes, moving the
       # baseline silently and with no commit to point at.
+      #
+      # Coverage rides on the runs that already happen rather than repeating the
+      # suite: instrumenting costs seconds, a second full run costs minutes.
+      # `--cov-fail-under=0` overrides the 100 in pyproject on purpose. The
+      # number is reported, not enforced, so a drop is visible without a red
+      # tick blocking work that is otherwise fine.
+      #
+      # Every pytest step appends, including the first. Whichever runs first has
+      # no data to append to, and making one of them authoritative would mean a
+      # later reordering silently erases an earlier step's measurements.
       - name: pytest
         run: |
           timeout 600 uv run --no-sync pytest -q -n 4 \
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
             --ignore=tests/test_sandbox.py -o faulthandler_timeout=60
 
       # test_sandbox.py cannot run under xdist, and fails loudly rather than
@@ -136,4 +148,59 @@ jobs:
       # forcing it into a worker. A separate step, not appended to the command
       # above, so a failure here names the boundary rather than the bulk suite.
       - name: pytest (sandbox probes, serial)
-        run: timeout 300 uv run --no-sync pytest -q tests/test_sandbox.py -o faulthandler_timeout=60
+        run: |
+          timeout 300 uv run --no-sync pytest -q tests/test_sandbox.py \
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
+            -o faulthandler_timeout=60
+
+      # Reports, never blocks. The repo claims 100% of statements and enforces it
+      # in pyproject, but nothing ran that gate in CI, so `main` could fall below
+      # it silently -- and did read as covered while two tests were dying at the
+      # call, because coverage counts lines, not whether the test asserting them
+      # got that far. Saying the number out loud is what makes a drop visible.
+      #
+      # It reports the number and does NOT compare it to 100. This runner is
+      # Linux and the suite's macOS-only seatbelt cases skip here, so the ceiling
+      # reachable on this platform is below 100 by construction. Warning against
+      # 100 fired on every single run, and a warning that always fires is one
+      # nobody reads within a fortnight. The figure to watch is `missed`: it is
+      # stable for a given platform, so a diff in it is a real change.
+      #
+      # `continue-on-error` is deliberately not used: it would still paint the
+      # run with a red tick. The step exits 0 itself.
+      - name: Coverage (report only, does not fail the build)
+        run: |
+          uv run --no-sync coverage report --fail-under=0 \
+            --show-missing --skip-covered > coverage.txt || true
+          total="$(uv run --no-sync coverage report --fail-under=0 \
+            --format=total 2>/dev/null || echo unknown)"
+          # Scanned over the whole file, not its last line: `--skip-covered`
+          # prints "N files skipped due to complete coverage." after TOTAL, so
+          # a tail lands on the note rather than the numbers.
+          missed="$(awk '$1=="TOTAL" {print $3}' coverage.txt)"
+          if [ -z "$missed" ]; then missed="unknown"; fi
+          echo "::notice::coverage ${total}% on this runner, ${missed} statements missed"
+          {
+            echo "### Coverage: ${total}% (${missed} statements missed)"
+            echo ""
+            echo "Linux skips the macOS-only sandbox cases, so this is below the"
+            echo "100% a local run reports. Watch \`missed\` for movement."
+            echo ""
+            echo '```'
+            head -40 coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+          fi
+          if [ "$whole" -lt 100 ]; then
+            echo "::warning::coverage is ${total}%, below the 100% this repo claims"
+            {
+              echo ""
+              echo "Below the 100% \`fail_under\` in pyproject. Not blocking."
+              echo ""
+              echo '```'
+              head -40 coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0

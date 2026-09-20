@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from claude_on_the_fly import turns
 from claude_on_the_fly.tui import supervisor
 
 # ---------------------------------------------------------------------------
@@ -1434,9 +1435,14 @@ class TestPendingWork:
 
         assert supervisor.pending_work("slack") is None
 
-    def test_a_chat_daemons_turns_are_reported_as_unrecoverable(self, isolated_state):
-        """Nothing replays a chat turn, so this is the number that has to reach
-        the operator before they agree to a stop."""
+    def test_a_chat_daemons_turns_are_reported_as_recoverable(self, isolated_state):
+        """A chat turn is journaled before it runs and replayed on the next
+        start, so a stop delays it rather than destroying it.
+
+        This said the opposite, and the modal told an operator with three live
+        conversations that all three were lost. They were not: `turns.take()`
+        replays a queued turn and a dispatched one alike.
+        """
         _write_extra(
             isolated_state / "state",
             "slack",
@@ -1447,9 +1453,34 @@ class TestPendingWork:
 
         assert pending is not None
         assert (pending.running, pending.queued) == (1, 2)
-        assert pending.recoverable is False
-        assert pending.at_risk == 3
-        assert "lost, needs resending" in pending.describe()
+        assert pending.recoverable is True
+        assert pending.at_risk == 0
+        assert "resumes after the restart" in pending.describe()
+
+    def test_the_journal_really_does_replay_both_phases(self, tmp_path):
+        """The claim above, checked against the journal rather than restated.
+
+        `pending_work` cannot see the journal, so nothing else ties its verdict
+        to what recovery actually does. If `take()` ever stops replaying a
+        dispatched turn, this fails and the modal's wording is wrong again.
+        """
+        journal = turns.TurnJournal(tmp_path / "slack.turns.json")
+        for turn_id, phase in (("t1", turns.QUEUED), ("t2", turns.DISPATCHED)):
+            journal.record(
+                turns.PendingTurn(
+                    turn_id=turn_id,
+                    chat_id=1,
+                    text="hi",
+                    route={},
+                    phase=phase,
+                    recorded_at=time.time(),
+                )
+            )
+
+        replay, nudge = journal.take()
+
+        assert [entry.turn_id for entry in replay] == ["t1", "t2"]
+        assert nudge == []
 
     def test_a_heartbeat_without_extras_reads_as_idle(self, isolated_state):
         """An older daemon publishes no queued count. Absent is zero, not a crash."""

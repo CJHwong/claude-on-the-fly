@@ -192,6 +192,79 @@ def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     return turns or None
 
 
+def claude_session_size(workspace: Path, session_uuid: str) -> int:
+    """Bytes in this session's JSONL right now. 0 when the file does not exist.
+
+    Taken before a turn spawns so `extract_claude_turn_tokens` can tell this
+    turn's assistant records from every earlier turn's. A session that does not
+    exist yet reports 0, which makes a first turn read its whole file.
+    """
+    path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def extract_claude_turn_tokens(
+    workspace: Path, session_uuid: str, offset: int
+) -> tuple[int, int] | None:
+    """Sum `(tokens_in, tokens_out)` over assistant records written after
+    `offset`. None when the file is unreadable or added no priced record.
+
+    This exists because claude-pty's envelope cannot answer it. Its `usage` is
+    the last assistant message alone, and its `modelUsage` is pty's own pass
+    over the *whole session*, so a footer built from either is wrong in a
+    different direction: the first undercounts a multi-message turn, the second
+    reports every turn the session has ever run. A daemon thread footered
+    `up-arrow 990272` while its context read 8 percent, because the number was
+    the session's life story rather than the turn's cost.
+
+    Reading by byte offset rather than re-deriving pty's total is deliberate. It
+    needs no agreement with how pty defines its sum; it counts what this turn
+    appended, the same way the codex backend reads its rollout from a
+    pre-spawn size.
+    """
+    path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            raw = handle.read()
+    except OSError:
+        return None
+    tokens_in = 0
+    tokens_out = 0
+    found = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            # A seek into the middle of a line is the ordinary cause: the
+            # snapshot was taken while claude was mid-write. Skipping it loses
+            # one record's tokens, which beats discarding the turn's whole count.
+            logger.debug("transcript: skipping malformed line in %s", path)
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        usage = (record.get("message") or {}).get("usage")
+        if not isinstance(usage, dict):
+            continue
+        found = True
+        tokens_in += _as_int(usage.get("input_tokens")) + _as_int(
+            usage.get("cache_read_input_tokens")
+        )
+        tokens_out += _as_int(usage.get("output_tokens"))
+    return (tokens_in, tokens_out) if found else None
+
+
+def _as_int(value: object) -> int:
+    """Non-negative int, or 0. A transcript is another process's output."""
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
 def extract_claude_model(workspace: Path, session_uuid: str) -> str | None:
     """Return the model that produced the last assistant message, or None.
 

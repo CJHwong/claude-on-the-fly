@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from claude_on_the_fly import transcript
 from claude_on_the_fly.backends import claude as claude_mod
 
 
@@ -1068,3 +1069,72 @@ class TestPtySpawnTrustsItsWorkspace:
             await claude_mod._exec_pty(tmp_path / "ws", ["claude-pty"], timeout=None)
 
         assert events == ["trusted:ws", "spawned"]
+
+
+class TestPtyTokensAreThisTurnOnly:
+    """pty's envelope has no per-turn figure, so the turn is read off the file.
+
+    `modelUsage` is pty's own pass over the whole session. A footer built from
+    it grew monotonically across a conversation and reported `990272` in beside
+    a context reading of 8 percent: the session's running total, posted as one
+    turn's bill.
+    """
+
+    def _session(self, claude_projects_dir, workspace_slug, *lines) -> Path:
+        session_dir = claude_projects_dir / workspace_slug
+        session_dir.mkdir(exist_ok=True)
+        path = session_dir / "s1.jsonl"
+        path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
+        return path
+
+    def _priced(self, inp: int, out: int) -> dict:
+        return {
+            "type": "assistant",
+            "message": {"usage": {"input_tokens": inp, "output_tokens": out}},
+        }
+
+    # The envelope claims the whole session, which is what must NOT be used.
+    _SESSION_TOTAL = {
+        "modelUsage": {"m": {"inputTokens": 990_272, "outputTokens": 400}}
+    }
+
+    @staticmethod
+    def _pty_backend():
+        with patch(
+            "claude_on_the_fly.backends.claude.resolve_pty_binary",
+            return_value="/usr/bin/claude-pty",
+        ):
+            return claude_mod.ClaudeBackend(pty=True)
+
+    def test_the_turns_own_records_win_over_the_session_total(
+        self, claude_projects_dir
+    ):
+        workspace = Path("/private/tmp/ws-pty")
+        self._session(claude_projects_dir, "-private-tmp-ws-pty", self._priced(900, 90))
+        offset = transcript.claude_session_size(workspace, "s1")
+        path = claude_projects_dir / "-private-tmp-ws-pty" / "s1.jsonl"
+        with path.open("ab") as handle:
+            handle.write(json.dumps(self._priced(12, 3)).encode() + b"\n")
+
+        backend = self._pty_backend()
+        assert backend._extract_tokens(
+            self._SESSION_TOTAL, workspace, "s1", offset
+        ) == (12, 3)
+
+    def test_an_unreadable_transcript_falls_back_to_the_envelope(self):
+        """A number that is too large beats no number at all."""
+        backend = self._pty_backend()
+        assert backend._extract_tokens(
+            self._SESSION_TOTAL, Path("/private/tmp/nope"), "s1", 0
+        ) == (990_272, 400)
+
+    def test_native_mode_still_reads_the_envelope(self, claude_projects_dir):
+        """Native's top-level `usage` is already this turn's aggregate, so the
+        transcript detour must not apply to it."""
+        workspace = Path("/private/tmp/ws-native")
+        self._session(claude_projects_dir, "-private-tmp-ws-native", self._priced(1, 1))
+
+        backend = claude_mod.ClaudeBackend(pty=False)
+        assert backend._extract_tokens(
+            {"usage": {"input_tokens": 5, "output_tokens": 2}}, workspace, "s1", 0
+        ) == (5, 2)
