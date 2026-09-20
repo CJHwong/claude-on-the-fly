@@ -20,9 +20,9 @@ with the daemons still up, stops them, runs the activate step, and starts them a
 ```
 upgrade: git fetch (daemons stay up), then git merge --ff-only && uv sync   [git checkout at /srv/cotf]
 pending work:
-  slack: 1 running, 2 queued (lost, needs resending)
+  slack: 1 running, 2 queued (resumes after the restart)
   jobs: 1 running, 3 queued (resumes after the restart)
-stop everything (3 unrecoverable) and upgrade? [y/N]
+stop everything and upgrade? [y/N]
 ```
 
 A prepare step that fails stops the upgrade before anything is stopped, so a fetch that
@@ -32,8 +32,14 @@ the prompt in a script. Use `--no-resume` to leave the daemons stopped.
 The daemons start again even when the activate step fails, so a failed swap leaves the old
 build running rather than nothing.
 
-All of it is on disk and comes back on its own. "Lost, needs resending" describes what a
-stop costs a chat *now*, before the resume; see the table below.
+All of it is on disk and comes back on its own. A chat turn is written to
+`state/<platform>.turns.json` before it runs, so a stop delays it rather than destroying it:
+the daemon replays it on the next start, and tells the person it may be repeating itself.
+
+Two narrow cases do not come back, and the count cannot show them because the heartbeat it
+reads does not carry either one. A turn already replayed twice is parked rather than run a
+third time, and a turn older than the 30-minute TTL is dropped. Both mean something already
+went wrong before this upgrade.
 
 ## Upgrade from the dashboard
 

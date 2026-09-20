@@ -1,8 +1,9 @@
 """Modal shown before an upgrade — the command, what it interrupts, confirm.
 
-The confirmation is the point of the screen. An upgrade stops every daemon, and
-the chat turns it stops are not recoverable: the operator has to see how many
-before agreeing, not afterwards in a log line.
+The confirmation is the point of the screen. An upgrade stops every daemon, so
+the operator has to see what is in flight before agreeing, not afterwards in a
+log line. Chat turns are journaled before they run and replayed on the next
+start, so what the modal reports for them is a delay, not a loss.
 """
 
 from __future__ import annotations
