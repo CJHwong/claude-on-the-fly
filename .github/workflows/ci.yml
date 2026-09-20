@@ -65,6 +65,41 @@ jobs:
       - name: Sync dev env
         run: uv sync --locked
 
+      # Without this the runner's home is clean, so 16 boundary cases report
+      # "not present on this host" and prove nothing -- which is the exact
+      # failure this job was added to stop. The probe is `cat <path>` under the
+      # live profile, so only existence gates it and the content is irrelevant.
+      # Planting a file at each probed path turns every one of those skips into
+      # a real deny the profile has to enforce.
+      #
+      # Runner-only, and it refuses rather than overwrites: a developer machine
+      # already holds the real files, and this must never be the thing that
+      # clobbers one. Nothing here resembles a credential; a probe cannot tell
+      # the difference and a reader should not have to.
+      - name: Plant probe fixtures in the runner home
+        run: |
+          set -euo pipefail
+          plant() {
+            if [ -e "$1" ]; then
+              echo "refusing to overwrite existing $1" >&2
+              exit 1
+            fi
+            mkdir -p "$(dirname "$1")"
+            printf 'not-a-real-credential, planted by CI so the jail has something to deny\n' > "$1"
+            echo "planted $1"
+          }
+          plant "$HOME/.config/gh/hosts.yml"
+          plant "$HOME/.aws/credentials"
+          plant "$HOME/.ssh/id_rsa"
+          plant "$HOME/.docker/config.json"
+          plant "$HOME/.config/gcloud/credentials.db"
+          plant "$HOME/.sentryclirc"
+          plant "$HOME/.claude-on-the-fly/.env"
+          plant "$HOME/.claude/history.jsonl"
+          plant "$HOME/.codex/config.toml"
+          mkdir -p "$HOME/.claude/projects"
+          echo "planted $HOME/.claude/projects/"
+
       # Serial, for the same reason the Linux job runs this file serially: each
       # xdist worker gets its own empty temp HOME, so a probe asserting the jail
       # *denies* ~/.aws/credentials finds the path merely absent and the
