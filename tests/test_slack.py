@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
@@ -7222,3 +7223,39 @@ class TestInterruptedIsAReactionNotAMessage:
             slack_mod.INTERRUPTED_EMOJI,
         ]
         assert added == [slack_mod.INTERRUPTED_EMOJI, slack_mod.RUNNING_EMOJI]
+
+
+class TestRefusalsAreTraceable:
+    """A refused message has to leave a record a deployed daemon actually keeps.
+
+    Every branch that drops a message used to log at DEBUG, and this install
+    runs at INFO, so a message refused in production left nothing to read.
+    """
+
+    def test_a_refusal_that_can_eat_a_human_message_is_logged_at_info(self, caplog):
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(True, "sender %s in blocked_senders", "U123")
+
+        assert "skipped: sender U123 in blocked_senders" in caplog.text
+        assert [r.levelname for r in caplog.records] == ["INFO"]
+
+    def test_routine_refusals_stay_at_debug(self, caplog):
+        """An untrusted bot posted 88 times in one day on this install. At INFO
+        that volume would bury the refusals worth reading."""
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(False, "untrusted bot_message bot_id=%s", "B9")
+
+        assert caplog.records == []
+
+        with caplog.at_level(logging.DEBUG, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(False, "untrusted bot_message bot_id=%s", "B9")
+
+        assert "skipped: untrusted bot_message bot_id=B9" in caplog.text
+
+    def test_the_arguments_are_left_for_the_logger_to_interpolate(self, caplog):
+        """Not pre-formatted: a message body reaching a skip reason could carry
+        a stray `%s`, and eager formatting would raise inside the log call."""
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(True, "already processed ts=%s", "100%s.5")
+
+        assert "ts=100%s.5" in caplog.text
