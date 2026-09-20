@@ -348,6 +348,7 @@ class TestCheckSlack:
         assert slack.STOP_COMMAND == "$stop"
         assert slack.CONTINUE_COMMAND == "$continue"
         assert slack.COMPACT_COMMAND == "$compact"
+        assert slack.MODEL_COMMAND == "$model"
 
     def test_slack_token_user(self):
         results = check_slack({"SLACK_APP_TOKEN": "xapp-1", "SLACK_TOKEN": "xoxp-1"})
@@ -1338,6 +1339,22 @@ class TestJobTriggerCollidesWithCompact:
         from claude_on_the_fly.slack import COMPACT_COMMAND
 
         assert checks_mod._job_command_error(COMPACT_COMMAND) is not None
+
+
+class TestJobTriggerCollidesWithModel:
+    def test_a_model_trigger_is_refused(self):
+        """Worse than the exact-match collisions, because $model matches on a
+        prefix: a trigger equal to it swallows every message that opens with it,
+        so "$model do the thing" would be refused as a model name and never
+        queued as the job its author meant."""
+        status, why = checks_mod._job_command_error("$model")
+        assert status == "invalid"
+        assert "$model" in why
+
+    def test_the_model_prefix_matches_the_slack_constant(self):
+        from claude_on_the_fly.slack import MODEL_COMMAND
+
+        assert checks_mod._job_command_error(MODEL_COMMAND) is not None
 
 
 class TestPtySetupIsCheckedOnlyInPtyMode:

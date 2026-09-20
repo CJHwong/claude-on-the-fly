@@ -366,6 +366,13 @@ def _job_command_error(value: str) -> tuple[Status, str] | None:
         # Same shape as $stop: exact-match, intercepted before the job branch, so
         # a bare "$compact" compacts while "$compact <task>" queues a job.
         return "invalid", "collides with the $compact turn-control prefix"
+    if value == "$model":
+        # Worse than the two above, because $model matches on a prefix: a
+        # trigger equal to it is not merely shadowed for the bare word, it
+        # swallows every message that opens with it. "$model do the thing"
+        # would be read as a model change and refused, and the job its author
+        # meant to queue would never be queued at all.
+        return "invalid", "collides with the $model turn-control prefix"
     if value == "$continue":
         # Intercepted *after* the job branch, so a trigger equal to it shadows
         # the reply soft-limit reset entirely — a gated thread could never be

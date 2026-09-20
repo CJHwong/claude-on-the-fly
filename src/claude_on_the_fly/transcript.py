@@ -192,6 +192,34 @@ def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     return turns or None
 
 
+def extract_claude_model(workspace: Path, session_uuid: str) -> str | None:
+    """Return the model that produced the last assistant message, or None.
+
+    Only pty needs this. The native path reads the model off the stream it
+    already parses, but claude-pty's envelope carries no per-message model, so
+    the only name available there is `modelUsage`, which is keyed by every model
+    the turn touched in first-touched order. An auxiliary call that ran before
+    the answer therefore names itself: a daemon turn opus answered footered as
+    `claude-haiku-4-5-20251001`, and the session JSONL for the same second
+    recorded `claude-opus-5`.
+
+    The last assistant message is the one that produced the answer, so its own
+    `model` is the name to report. A long turn writes many assistant records,
+    so every one is read and the last named model wins.
+    """
+    session_path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    if not session_path.is_file():
+        return None
+    model: str | None = None
+    for msg in _iter_jsonl(session_path):
+        if msg.get("type") != "assistant":
+            continue
+        name = (msg.get("message") or {}).get("model")
+        if isinstance(name, str) and name:
+            model = name
+    return model
+
+
 def _find_codex_rollout(thread_id: str) -> Path | None:
     """Locate the codex session JSONL for a given thread_id (newest if multiple)."""
     if not thread_id:
@@ -308,17 +336,24 @@ def extract_codex_model(thread_id: str) -> str | None:
     session file as `turn_context.payload.model`. Needed because our backend
     can otherwise only label runs with whatever the user configured (which is
     blank in native mode without CODEX_MODEL).
+
+    The last `turn_context` wins, not the first. A resumed thread appends one
+    per turn, so the first records the model the thread opened with and keeps
+    naming it after a switch. That is not hypothetical: a thread started on
+    `gpt-5.6-luna` and moved to `gpt-5.6-terra` ran terra, by both its argv and
+    its own rollout, and every later footer still said luna.
     """
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
         return None
+    model: str | None = None
     for msg in _iter_jsonl(rollout):
         if msg.get("type") != "turn_context":
             continue
-        model = (msg.get("payload") or {}).get("model")
-        if isinstance(model, str) and model:
-            return model
-    return None
+        name = (msg.get("payload") or {}).get("model")
+        if isinstance(name, str) and name:
+            model = name
+    return model
 
 
 def codex_rollout_path(thread_id: str) -> Path | None:

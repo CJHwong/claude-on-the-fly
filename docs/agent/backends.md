@@ -170,14 +170,20 @@ jobs cannot read each other's. Any design that swapped process-global settings a
 the call would be a data race, which is why the profile is a value and not ambient
 state.
 
-**codex applies the effort in pty mode too.** `-c` is a global codex option, not an
-`exec` one, so both argv builders pass it and `_effort_args` resolves it once for both.
-Verified by driving the interactive TUI under tmux with `-c model_reasoning_effort="low"`
-against a `config.toml` saying `medium`: codex's own statusline read `gpt-5.6-luna low`,
-and a `resume` with `xhigh` on the same thread reported `xhigh`. Claude pty is the
-exception and stays one, for the reason at `backends/claude.py:541-544`: whether
-interactive claude honours `--effort` is untested, and a flag it silently ignores is
-worse than no flag.
+**Both backends apply the effort in pty mode.** For codex, `-c` is a global option,
+not an `exec` one, so both argv builders pass it and `_effort_args` resolves it once
+for both. Verified by driving the interactive TUI under tmux with
+`-c model_reasoning_effort="low"` against a `config.toml` saying `medium`: codex's own
+statusline read `gpt-5.6-luna low`, and a `resume` with `xhigh` on the same thread
+reported `xhigh`.
+
+Claude was an exception until the same method was applied to it. `--effort` is a
+session flag in claude's own help, not a `-p` one, and the interactive TUI acts on it:
+started under tmux with `--effort low` it banners `Opus 5 (1M context) with low
+effort`, with `--effort max` it banners `max`, and with no flag it banners the
+`effortLevel` from settings. The earlier carve-out rested on the flag being untested
+rather than on any measurement, and it had grown a `$model` refusal that dropped the
+model change along with the effort.
 
 `AgentProfile.key` is the `backend:mode:model` string that seeds session uuids. It is
 a wire format: codex substitutes `default` for an empty model and claude does not, and

@@ -72,11 +72,11 @@ def _result_line(**overrides) -> dict:
     return base
 
 
-def _assistant_line(*content_blocks: dict) -> dict:
-    return {
-        "type": "assistant",
-        "message": {"id": "msg_x", "content": list(content_blocks)},
-    }
+def _assistant_line(*content_blocks: dict, model: str | None = None) -> dict:
+    message: dict = {"id": "msg_x", "content": list(content_blocks)}
+    if model is not None:
+        message["model"] = model
+    return {"type": "assistant", "message": message}
 
 
 def _tool_use(name: str, **input_fields) -> dict:
@@ -1163,6 +1163,26 @@ class TestParseStream:
         out = parse_stream(stream)
         assert out["last_assistant_text"] == "the real summary"
 
+    def test_last_assistant_model_names_the_model_that_answered(self):
+        """`modelUsage` is keyed in first-touched order, so an auxiliary call
+        that ran first would name itself. The last assistant message is the one
+        that produced the answer."""
+        stream = _ndjson(
+            _assistant_line(_tool_use("Task"), model="claude-haiku-4-5-20251001"),
+            _assistant_line({"type": "text", "text": "391"}, model="claude-opus-5"),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_model"] == "claude-opus-5"
+
+    def test_last_assistant_model_is_empty_when_no_message_names_one(self):
+        stream = _ndjson(
+            _assistant_line({"type": "text", "text": "hi"}),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_model"] == ""
+
     def test_a_suggestions_only_message_does_not_count_as_text(self):
         stream = _ndjson(
             _assistant_line(
@@ -1275,6 +1295,15 @@ class TestMergeCliOutput:
         b = {"result": "done", "total_cost_usd": 0.02}
         assert _merge_cli_output(a, b)["result"] == "done"
 
+    def test_retry_model_wins_but_an_empty_retry_keeps_the_first(self):
+        """Same rule as `last_assistant_text`: the retry answered, so name its
+        model, but a retry that produced no assistant message must not blank
+        the name the first run established."""
+        a = {"last_assistant_model": "claude-opus-5"}
+        b = {"last_assistant_model": "claude-sonnet-5"}
+        assert _merge_cli_output(a, b)["last_assistant_model"] == "claude-sonnet-5"
+        assert _merge_cli_output(a, {})["last_assistant_model"] == "claude-opus-5"
+
     def test_cost_and_duration_summed(self):
         a = {"total_cost_usd": 0.10, "duration_ms": 1500}
         b = {"total_cost_usd": 0.25, "duration_ms": 2500}
@@ -1376,6 +1405,31 @@ class TestRun:
         assert resp.tokens_in == 150  # 100 + 50 cache_read
         assert resp.tokens_out == 200
         assert resp.model == "claude-sonnet-4-20250514"
+
+    async def test_answering_model_beats_the_first_modelUsage_key(self):
+        """`modelUsage` is keyed in first-touched order. When a turn touched an
+        auxiliary model first, the first key is not the model that answered."""
+        output = _cli_output(model="claude-haiku-4-5-20251001")
+        output["last_assistant_model"] = "claude-opus-5"
+
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hello", "telegram", "hoss")
+
+        assert resp.model == "claude-opus-5"
+
+    async def test_modelUsage_still_answers_when_no_assistant_model(self):
+        """An envelope with no assistant message keeps the old behaviour rather
+        than reporting nothing."""
+        output = _cli_output(model="claude-sonnet-5")
+
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hello", "telegram", "hoss")
+
+        assert resp.model == "claude-sonnet-5"
 
     async def test_session_not_found_falls_back_to_new(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -2875,13 +2929,11 @@ class TestClaudeBackendPty:
         assert "--resume" in cmd
         assert cmd[-1] == "hi"
 
-    async def test_effort_never_reaches_pty_argv(
-        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
+    async def test_effort_reaches_pty_argv(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
-        """pty resolves its own settings, and whether interactive claude honours
-        `--effort` is untested, so neither effort key applies here."""
-        monkeypatch.setenv("CLAUDE_EFFORT", "max")
-        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        """`--effort` is a session flag in claude's own help, not a -p flag, so
+        pty passes it exactly as it already passes `--model`."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
 
@@ -2896,9 +2948,102 @@ class TestClaudeBackendPty:
                 return_value=_pty_envelope(),
             ) as mock,
         ):
-            await ClaudeBackend(pty=True).run(workspace, "sess-1", "hi", "telegram")
+            await ClaudeBackend(pty=True, effort="max").run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        argv = mock.call_args[0][1]
+        assert argv[argv.index("--effort") + 1] == "max"
+
+    async def test_pty_skips_an_effort_claude_does_not_accept(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """The same validation the native argv applies. A typo in config.yaml
+        warns here rather than failing the turn inside the CLI."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(pty=True, effort="ludicrous").run(
+                workspace, "sess-1", "hi", "telegram"
+            )
 
         assert "--effort" not in mock.call_args[0][1]
+
+    async def test_pty_names_the_model_from_the_session_not_modelUsage(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """The bug as observed: the envelope's first `modelUsage` key was an
+        auxiliary haiku call while opus produced the answer. pty's envelope has
+        no per-message model, so the session claude wrote is the source."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-1.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "model": "claude-opus-5",
+                        "content": [{"type": "text", "text": "hi"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(model="claude-haiku-4-5-20251001"),
+            ),
+        ):
+            resp = await ClaudeBackend(pty=True).run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        assert resp.model == "claude-opus-5"
+
+    async def test_pty_falls_back_to_modelUsage_with_no_session_on_disk(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(model="claude-sonnet-5"),
+            ),
+        ):
+            resp = await ClaudeBackend(pty=True).run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        assert resp.model == "claude-sonnet-5"
 
     async def test_response_carries_rate_limits_and_context_window(self):
         envelope = _pty_envelope(

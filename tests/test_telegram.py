@@ -773,9 +773,9 @@ class TestStart:
 
         assert frontend._on_message is on_message
         assert frontend._app is mock_app
-        # 3 commands, 2 message handlers, 3 callback queries
+        # 5 commands, 2 message handlers, 3 callback queries
         # (approval + suggestion + spent-suggestion)
-        assert mock_app.add_handler.call_count == 8
+        assert mock_app.add_handler.call_count == 10
         mock_app.initialize.assert_awaited_once()
         mock_app.start.assert_awaited_once()
         mock_updater.start_polling.assert_awaited_once()
@@ -1373,7 +1373,139 @@ class TestCmdCompact:
             for call in mock_app.add_handler.call_args_list
             if getattr(call.args[0], "commands", None)
         }
-        assert registered == {"new", "status", "compact"}
+        assert registered == {"new", "status", "compact", "model", "stop"}
+
+
+# ============================================================
+# _cmd_model, _cmd_stop
+# ============================================================
+
+
+class TestCmdModel:
+    """The Telegram half of the model command: `/model` where Slack spells it
+    `$model`, with the same orchestrator call and the same grammar behind both."""
+
+    async def test_posts_what_the_orchestrator_answers(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: `opus`. Effort: `high`.")
+        frontend._orchestrator = orch
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        update = make_update(chat_id=5)
+        ctx = MagicMock()
+        ctx.args = ["opus", "high"]
+
+        await frontend._cmd_model(update, ctx)
+
+        orch.on_model.assert_called_once_with(5, ["opus", "high"])
+        # Through _send_msg, so the backticks the reply marks model names with
+        # reach Telegram as code rather than as literal characters.
+        frontend._app.bot.send_message.assert_called_once_with(
+            chat_id=5, text="Model: `opus`. Effort: `high`.", parse_mode="Markdown"
+        )
+
+    async def test_a_bare_command_asks_for_the_report(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: sonnet. Effort: unset.")
+        frontend._orchestrator = orch
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        update = make_update(chat_id=5)
+        ctx = MagicMock()
+        ctx.args = []
+
+        await frontend._cmd_model(update, ctx)
+
+        orch.on_model.assert_called_once_with(5, [])
+
+    async def test_a_missing_args_attribute_is_an_empty_request(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        """`CallbackContext.args` is None unless the handler parsed some."""
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        update = make_update(chat_id=5)
+        ctx = MagicMock()
+        ctx.args = None
+
+        await frontend._cmd_model(update, ctx)
+
+        orch.on_model.assert_called_once_with(5, [])
+
+    async def test_says_so_with_no_orchestrator(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._orchestrator = None
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_model(update, MagicMock())
+
+        update.message.reply_text.assert_awaited()
+
+    async def test_ignores_an_unauthorized_user(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+
+        await frontend._cmd_model(make_update(chat_id=5, user_id=999999), MagicMock())
+
+        orch.on_model.assert_not_called()
+
+
+class TestCmdStop:
+    """The other half of the parity with Slack's `$` prefixes. Telegram had no
+    way to cancel a turn before this, so the ack wording is Slack's own."""
+
+    async def test_stops_the_running_turn(self, frontend: TelegramFrontend) -> None:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        frontend._orchestrator = orch
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_stop(update, MagicMock())
+
+        orch.abort.assert_awaited_once_with(5)
+        update.message.reply_text.assert_awaited_once_with("Stopped the current turn.")
+
+    async def test_says_nothing_was_running(self, frontend: TelegramFrontend) -> None:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=False)
+        frontend._orchestrator = orch
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_stop(update, MagicMock())
+
+        update.message.reply_text.assert_awaited_once_with("Nothing was running.")
+
+    async def test_says_nothing_was_running_with_no_orchestrator(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._orchestrator = None
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_stop(update, MagicMock())
+
+        update.message.reply_text.assert_awaited_once_with("Nothing was running.")
+
+    async def test_ignores_an_unauthorized_user(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        frontend._orchestrator = orch
+
+        await frontend._cmd_stop(make_update(chat_id=5, user_id=999999), MagicMock())
+
+        orch.abort.assert_not_awaited()
 
 
 class TestApprovalLinkPreview:
