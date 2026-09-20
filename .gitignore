@@ -39,3 +39,4 @@ node_modules/
 # outputs are large. Only the redacted corpus under corpus/ is committed.
 evals/suggestions/raw/
 evals/suggestions/runs/
+coverage.txt
