@@ -387,6 +387,9 @@ class ClaudeBackend:
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )
+        # Before the spawn: everything already in the file belongs to earlier
+        # turns, so this is the line between them and what this turn writes.
+        usage_offset = transcript.claude_session_size(workspace, session_uuid)
         if _session_has_content(session_path):
             # Healthy resume: claude already persisted the system prompt into
             # the session, so don't re-send it (cuts tokens and stops every
@@ -463,7 +466,9 @@ class ClaudeBackend:
                 cli_output = agent._merge_cli_output(cli_output, retry_output)
             body = (cli_output.get("result") or "").strip() or "No response"
 
-        tokens_in, tokens_out = self._extract_tokens(cli_output)
+        tokens_in, tokens_out = self._extract_tokens(
+            cli_output, workspace, session_uuid, usage_offset
+        )
         # The model that produced the answer, which is the last assistant
         # message's own `model`. `modelUsage` cannot answer this: it is keyed by
         # every model the turn touched, in first-touched order, so an auxiliary
@@ -686,13 +691,26 @@ class ClaudeBackend:
             *self._effort_args(),
         ]
 
-    def _extract_tokens(self, cli_output: dict) -> tuple[int, int]:
-        """Return (tokens_in, tokens_out).
+    def _extract_tokens(
+        self,
+        cli_output: dict,
+        workspace: Path | None = None,
+        session_uuid: str = "",
+        usage_offset: int = 0,
+    ) -> tuple[int, int]:
+        """Return this turn's (tokens_in, tokens_out).
 
-        claude-pty's top-level `usage` is the last assistant message only, so for
-        multi-turn pty calls we'd undercount. `modelUsage` is aggregated
-        across every assistant record by pty's transcript pass, so it's the
-        truthful cross-turn total.
+        In pty mode neither figure in the envelope is the turn. `usage` is the
+        last assistant message alone, so a turn that wrote several undercounts.
+        `modelUsage` is pty's pass over the whole session, so it reports every
+        turn the session has ever run: footers grew to `up-arrow 990272` beside
+        a context reading of 8 percent, because they were quoting the session's
+        life story as if it were one turn's bill.
+
+        So pty reads the session transcript from the size it had before the
+        spawn, and counts only what this turn appended. `modelUsage` stays as
+        the fallback for a transcript that cannot be read, where a total too
+        large beats no number at all.
 
         Native/ollama stay on `usage`: the result envelope's top-level figure
         is already the whole turn's aggregate — every API call's input summed,
@@ -701,6 +719,12 @@ class ClaudeBackend:
         `last_assistant_usage` instead (see `_native_context_fields`).
         """
         if self.pty:
+            if workspace is not None:
+                measured = transcript.extract_claude_turn_tokens(
+                    workspace, session_uuid, usage_offset
+                )
+                if measured is not None:
+                    return measured
             mu = cli_output.get("modelUsage") or {}
             tokens_in = sum(
                 int(v.get("inputTokens", 0)) + int(v.get("cacheReadInputTokens", 0))

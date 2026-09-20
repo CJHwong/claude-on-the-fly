@@ -1577,3 +1577,152 @@ class TestExtractClaudeModel:
         session_dir.mkdir()
         (session_dir / "u1.jsonl").write_bytes(ndjson(_claude_user("only me")))
         assert extract_claude_model(workspace, "u1") is None
+
+
+# ---------------------------------------------------------------------------
+# Per-turn token accounting — claude_session_size / extract_claude_turn_tokens
+# ---------------------------------------------------------------------------
+
+
+def _claude_assistant_usage(inp: int, cache: int, out: int) -> dict:
+    """One priced assistant record, shaped like a real session JSONL line."""
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "usage": {
+                "input_tokens": inp,
+                "cache_read_input_tokens": cache,
+                "output_tokens": out,
+            },
+        },
+    }
+
+
+class TestClaudeTurnTokens:
+    """pty has no per-turn figure of its own, so the turn is read off the file.
+
+    `modelUsage` is pty's pass over the whole session. Quoting it in a footer
+    reported the session's running total as one turn's bill.
+    """
+
+    def _session(self, claude_projects_dir, ndjson, *records) -> Path:
+        session_dir = claude_projects_dir / "-private-tmp-ws-tok"
+        session_dir.mkdir(exist_ok=True)
+        path = session_dir / "s1.jsonl"
+        path.write_bytes(ndjson(*records))
+        return path
+
+    def test_a_first_turn_reads_its_whole_file(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-tok")
+        assert transcript.claude_session_size(workspace, "s1") == 0
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            _claude_assistant_usage(10, 5, 3),
+            _claude_assistant_usage(20, 1, 7),
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (36, 10)
+
+    def test_a_resumed_turn_excludes_every_earlier_turn(
+        self, claude_projects_dir, ndjson
+    ):
+        """The regression itself: without the offset this returns the total."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(claude_projects_dir, ndjson, _claude_assistant_usage(900, 0, 90))
+        offset = transcript.claude_session_size(workspace, "s1")
+        path = claude_projects_dir / "-private-tmp-ws-tok" / "s1.jsonl"
+        with path.open("ab") as handle:
+            handle.write(ndjson(_claude_assistant_usage(11, 4, 2)))
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", offset) == (15, 2)
+
+    def test_a_turn_that_added_no_priced_record_returns_none(
+        self, claude_projects_dir, ndjson
+    ):
+        """None, not (0, 0): the caller falls back rather than posting a zero."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(claude_projects_dir, ndjson, _claude_assistant_usage(5, 0, 1))
+        offset = transcript.claude_session_size(workspace, "s1")
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", offset) is None
+
+    def test_a_missing_session_returns_none(self, claude_projects_dir):
+        assert (
+            transcript.extract_claude_turn_tokens(Path("/private/tmp/nope"), "s1", 0)
+            is None
+        )
+
+    def test_a_half_written_line_is_skipped_not_fatal(
+        self, claude_projects_dir, ndjson
+    ):
+        """A snapshot taken mid-write lands inside a line. Lose that record's
+        tokens, not the turn's whole count."""
+        workspace = Path("/private/tmp/ws-tok")
+        path = self._session(
+            claude_projects_dir, ndjson, _claude_assistant_usage(100, 0, 10)
+        )
+        with path.open("ab") as handle:
+            handle.write(ndjson(_claude_assistant_usage(8, 2, 4)))
+
+        # Two bytes into the first record: its line is now unparseable.
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 2) == (10, 4)
+
+    def test_a_non_assistant_record_is_not_priced(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            {"type": "user", "message": {"usage": {"input_tokens": 999}}},
+            _claude_assistant_usage(3, 0, 1),
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (3, 1)
+
+    def test_a_blank_line_is_stepped_over(self, claude_projects_dir, ndjson):
+        """claude writes this file live, so a trailing or torn newline is normal."""
+        workspace = Path("/private/tmp/ws-tok")
+        path = self._session(
+            claude_projects_dir, ndjson, _claude_assistant_usage(6, 0, 2)
+        )
+        with path.open("ab") as handle:
+            handle.write(b"\n   \n")
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (6, 2)
+
+    def test_an_assistant_record_without_usage_is_not_priced(
+        self, claude_projects_dir, ndjson
+    ):
+        """Not every assistant record carries usage. It must not read as a zero
+        and it must not mark the turn as measured on its own."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            {"type": "assistant", "message": {"model": "claude-opus-5"}},
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) is None
+
+    def test_a_garbage_usage_value_counts_as_zero(self, claude_projects_dir, ndjson):
+        """Another process writes this file, so a negative or a string is
+        possible and must not propagate into a footer."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": -5,
+                        "cache_read_input_tokens": "lots",
+                        "output_tokens": 4,
+                    }
+                },
+            },
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (0, 4)
