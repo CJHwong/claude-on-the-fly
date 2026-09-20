@@ -84,6 +84,11 @@ class PendingTurn:
     compact: bool = False
     phase: str = QUEUED
     turn_id: str = ""
+    # The clock the TTL runs against, not a permanent record of arrival:
+    # `mark_dispatched` restarts it, so the gate measures how long this attempt
+    # has been unanswered rather than how long the person has been waiting.
+    # The JSON key is unchanged, so a journal written by an older build still
+    # loads and still ages out on its own acceptance time.
     recorded_at: float = 0.0
     replays: int = 0
 
@@ -226,15 +231,25 @@ class TurnJournal:
         entries[turn.turn_id] = turn
         self._write(list(entries.values()))
 
-    def mark_dispatched(self, turn_id: str) -> None:
+    def mark_dispatched(self, turn_id: str, now: float | None = None) -> None:
         """Note that an agent was started for this turn, so a resume of it has to
-        assume work may already have happened. Silent if the entry is gone."""
+        assume work may already have happened. Silent if the entry is gone.
+
+        This also restarts the TTL clock, because dispatch is the point the clock
+        is meant to measure from. It used to keep the acceptance time, and a turn
+        could then age out while it was running: accepted 29 minutes ago behind
+        other work in the same chat, dispatched a second ago, still going when
+        the daemon died -- and `take()` returned it in neither list, so it was
+        dropped and nobody was told. A queue that long is ordinary, since one
+        chat drains serially.
+        """
+        moment = time.time() if now is None else now
         entries = self._read()
         found = False
         updated = []
         for entry in entries:
             if entry.turn_id == turn_id and entry.phase != DISPATCHED:
-                updated.append(replace(entry, phase=DISPATCHED))
+                updated.append(replace(entry, phase=DISPATCHED, recorded_at=moment))
                 found = True
             else:
                 updated.append(entry)

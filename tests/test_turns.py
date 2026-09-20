@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,37 @@ class TestPhases:
 
         replay, _nudge = journal.take(now=1000.0)
         assert [t.phase for t in replay] == [DISPATCHED]
+
+    def test_dispatch_restarts_the_ttl_clock(self, journal):
+        """A turn that waited its way to the edge of the TTL, then ran, is still
+        owed an answer. Before the clock restarted, this exact shape -- accepted
+        29 minutes ago behind other work in the same chat, dispatched a moment
+        ago, interrupted while running -- came back in neither list and nobody
+        was told. One chat drains serially, so a queue that long is ordinary."""
+        accepted = 1000.0
+        journal.record(_turn(turn_id="t1", recorded_at=accepted))
+
+        journal.mark_dispatched("t1", now=accepted + 29 * 60)
+        replay, nudge = journal.take(ttl_s=30 * 60, now=accepted + 31 * 60)
+
+        assert [t.turn_id for t in replay] == ["t1"], (replay, nudge)
+
+    def test_a_turn_dispatched_long_ago_still_ages_out(self, journal):
+        """The clock restarts; it does not stop."""
+        journal.record(_turn(turn_id="t1", recorded_at=1000.0))
+        journal.mark_dispatched("t1", now=1000.0)
+
+        assert journal.take(ttl_s=60, now=1000.0 + 3600) == ([], [])
+
+    def test_the_wall_clock_is_used_when_no_moment_is_given(self, journal):
+        """The production callers pass nothing, so the default has to be the wall
+        clock. An hour-old acceptance, dispatched now, is inside a 60s TTL."""
+        journal.record(_turn(turn_id="t1", recorded_at=time.time() - 3600))
+        journal.mark_dispatched("t1")
+
+        replay, _nudge = journal.take(ttl_s=60)
+
+        assert [t.turn_id for t in replay] == ["t1"]
 
     def test_an_answered_turn_is_forgotten(self, journal):
         entry = _turn()
