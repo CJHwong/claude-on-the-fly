@@ -4616,3 +4616,47 @@ class TestOllamaContextWindowSetting:
 
     def test_positive_is_used(self):
         assert self._resolve("200000") == 200000
+
+
+class TestArgvForLog:
+    """The debug line that records what was actually spawned.
+
+    Its predecessor kept the first N tokens, which under a jail were all
+    wrapper, so the line named no binary and no flag. See `argv_for_log`.
+    """
+
+    def test_a_short_argv_is_unchanged(self):
+        assert agent_mod.argv_for_log(["claude", "--model", "opus"]) == (
+            "claude --model opus"
+        )
+
+    def test_a_long_token_is_elided_and_reports_its_length(self):
+        rendered = agent_mod.argv_for_log(["--system-prompt", "P" * 40000])
+        assert rendered.startswith("--system-prompt " + "P" * 60 + "...")
+        assert "[40000 chars]" in rendered
+        assert len(rendered) < 200, "the whole point is that the prompt stays out"
+
+    def test_the_flags_survive_a_jail_wrapper(self):
+        """The regression this replaced: every token below except the first four
+        was dropped, and the first four are seatbelt's."""
+        argv = [
+            "sandbox-exec",
+            "-f",
+            "/long/path/to/jail.sb",
+            "-D",
+            "_HOME=/Users/someone",
+            "claude-pty",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]
+        rendered = agent_mod.argv_for_log(argv)
+        for token in ("claude-pty", "--model", "opus", "--effort", "high"):
+            assert token in rendered, f"{token} missing from {rendered}"
+
+    def test_the_cap_is_adjustable(self):
+        assert agent_mod.argv_for_log(["abcdef"], cap=3) == "abc...[6 chars]"
+
+    def test_an_empty_argv_renders_empty(self):
+        assert agent_mod.argv_for_log([]) == ""
