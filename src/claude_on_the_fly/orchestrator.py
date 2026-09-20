@@ -24,6 +24,7 @@ from claude_on_the_fly import (
     egress,
     logs,
     migration,
+    model_command,
     permissions,
     sandbox,
     settings,
@@ -154,6 +155,40 @@ def _session_tag(value: int | str | None) -> str | None:
     if not value:
         return None
     return str(value)
+
+
+def _read_json_mapping(path: Path) -> dict:
+    """A JSON mapping from disk, or an empty one.
+
+    Never raises. The file is one an operator can hand-edit, and a typo in it
+    must not cost a turn: a conversation that cannot read its pin runs on the
+    configured agent, which is where it would have been anyway.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("model pins: %s is not a mapping", path)
+        return {}
+    return raw
+
+
+def _pinned_fields(value: object) -> dict[str, str]:
+    """The overridable fields of one stored entry, ignoring everything else.
+
+    Anything unknown is dropped rather than kept, so a hand-edited key cannot
+    reach `dataclasses.replace` and raise there, on the turn that read it.
+    """
+    if not isinstance(value, dict):
+        return {}
+    # `str(name)` rather than `name`: a dict narrowed from an `object` has no key
+    # type, so its items arrive as `object` and the return type would follow.
+    return {
+        str(name): str(pinned)
+        for name, pinned in value.items()
+        if name in agent.OVERRIDABLE_FIELDS
+    }
 
 
 def _resume_prompt(entry: PendingTurn) -> str:
@@ -492,6 +527,13 @@ class Orchestrator:
         # Either feeds session_uuid's `{chat_id}-{value}` tag.
         self._session_counters: dict[int, int | str] = {}
         self._queues: dict[int, asyncio.Queue[Turn]] = {}
+        # What a conversation pinned with `$model`: a field of `AgentProfile` to
+        # its value, for the fields that differ from config.yaml. Empty means the
+        # conversation runs on the configured agent. Read from disk on first use
+        # rather than here, for the reason `_journal` gives: DATA_DIR is a module
+        # constant, so a path read in `__init__` cannot see a later redirect.
+        self._model_overrides: dict[int, dict[str, str]] = {}
+        self._models_loaded = False
         # Last turn's prompt size and window per chat, for the auto-compact gate.
         # Only pty mode populates it; elsewhere the gate never has a reading and
         # so never fires.
@@ -634,6 +676,105 @@ class Orchestrator:
     async def on_compact(self, chat_id: int) -> None:
         """Queue a compaction for this chat. Runs in FIFO order like any turn."""
         await self._enqueue(chat_id, Turn("", compact=True))
+
+    def current_profile(self, chat_id: int) -> agent.AgentProfile:
+        """The agent configuration this conversation runs on.
+
+        The resolved global configuration with whatever this conversation pinned
+        on top, which is the one answer a turn, a compaction, and a `$model`
+        report all read. Raises ValueError on a configuration that does not
+        resolve, exactly as `agent.resolve_profile` does: the caller that can
+        tell somebody is the one that should catch it.
+        """
+        return agent.apply_override(agent.resolve_profile(), self._overrides(chat_id))
+
+    def on_model(self, chat_id: int, tokens: list[str]) -> str:
+        """Apply a `$model` request and return the reply to post for it.
+
+        Returns the text instead of sending it, because the frontends post it
+        differently and neither owns the grammar. A refusal changes nothing: the
+        reply says why, and the conversation keeps the model it had.
+        """
+        try:
+            profile = self.current_profile(chat_id)
+        except ValueError as exc:
+            return f"I cannot read the agent configuration, so I changed nothing: {exc}"
+
+        result = model_command.parse(tokens, profile)
+        if isinstance(result, model_command.Refusal):
+            return result.text
+        if isinstance(result, model_command.Report):
+            return model_command.describe(
+                profile, pinned=bool(self._overrides(chat_id))
+            )
+
+        self._apply_model_change(chat_id, result.values)
+        return model_command.ack(self.current_profile(chat_id), note=result.note)
+
+    def _apply_model_change(self, chat_id: int, values: dict[str, str | None]) -> None:
+        """Store one command's fields, and drop the reading they invalidate.
+
+        The cached context reading describes the model that produced it, and a
+        different model may have a different window. Dropping it is what stops
+        the auto-compact gate from thresholding against a window this model does
+        not have; `_run_compaction` drops it for the same reason.
+        """
+        overrides = self._overrides(chat_id)
+        for field, value in values.items():
+            if value is None:
+                overrides.pop(field, None)
+            else:
+                overrides[field] = value
+        if overrides:
+            self._model_overrides[chat_id] = overrides
+        else:
+            # Nothing is pinned any more, so the store keeps no empty entry that
+            # would claim otherwise.
+            self._model_overrides.pop(chat_id, None)
+        self._forget_context(chat_id)
+        self._save_model_overrides()
+
+    def _overrides(self, chat_id: int) -> dict[str, str]:
+        """This conversation's pinned fields, as a dict the caller may mutate."""
+        self._load_model_overrides()
+        return self._model_overrides.get(chat_id, {})
+
+    @property
+    def _model_store(self) -> Path:
+        """Where pins are kept. Resolved per call, for the reason `_journal` is."""
+        return DATA_DIR / "state" / f"{self._platform}.models.json"
+
+    def _load_model_overrides(self) -> None:
+        """Read the pins once for this process's lifetime.
+
+        Once, not per turn: only this process writes the file, so a read on every
+        turn would be a stat per message for an answer nothing else can change.
+        """
+        if self._models_loaded:
+            return
+        self._models_loaded = True
+        for key, value in _read_json_mapping(self._model_store).items():
+            fields = _pinned_fields(value)
+            if not fields:
+                continue
+            try:
+                self._model_overrides[int(key)] = fields
+            except (TypeError, ValueError):
+                logger.warning("model pins: %r is not a chat id", key)
+
+    def _save_model_overrides(self) -> None:
+        """Write the pins, best effort.
+
+        A conversation that cannot record its pin still runs on it for the rest
+        of this process's life, so a failed write is logged rather than raised:
+        it costs the pin at the next restart, not the turn that asked for it.
+        """
+        path = self._model_store
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._model_overrides, sort_keys=True))
+        except OSError:
+            logger.exception("model pins: could not write %s", path)
 
     def _journal_turn(self, chat_id: int, turn: Turn, *, replays: int = 0) -> Turn:
         """Record a turn as pending and return it carrying its journal id.
@@ -779,6 +920,13 @@ class Orchestrator:
         await self._report_config_restarts(chat_id)
         workspace = workspace_path(self._frontend.workspace_name(chat_id), DATA_DIR)
         session = self.session_uuid(chat_id)
+        # Resolved once per turn, before anything can report on it, so the event
+        # rows, the dashboard row, the approval check and the run itself cannot
+        # disagree about which agent this turn used. Resolving here rather than
+        # inside the try is deliberate: a configuration that does not resolve
+        # already failed on this line before this change, when the dispatch event
+        # called `current_backend_key()` for the same answer.
+        profile = self.current_profile(chat_id)
         self._fold_legacy_workspace(chat_id, workspace, session)
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / WORKSPACE_MEMORY_DIRNAME).mkdir(exist_ok=True)
@@ -795,13 +943,16 @@ class Orchestrator:
         self._event_log.append(
             EVENT_DISPATCHED,
             source=self._platform,
-            backend=current_backend_key(),
+            backend=current_backend_key(profile),
             identifier=identifier,
             workspace=workspace,
             session_uuid=session,
         )
         self._in_flight[chat_id] = {
             "identifier": identifier,
+            # The agent this turn runs on, so the dashboard row names the model a
+            # pinned conversation actually uses rather than the daemon's default.
+            "backend": current_backend_key(profile),
             # Same identifier with the conversation's human name on the end,
             # for the dashboard row. Resolved here rather than in the TUI,
             # which has no way to ask Slack what C09AB… is called.
@@ -882,7 +1033,11 @@ class Orchestrator:
             typing_task = asyncio.create_task(self._typing_loop(chat_id))
             if turn.compact:
                 response = await self._run_compaction(
-                    chat_id, workspace, session, self._frontend.timeout_for(chat_id)
+                    chat_id,
+                    workspace,
+                    session,
+                    self._frontend.timeout_for(chat_id),
+                    profile,
                 )
             else:
                 identity = getattr(self._frontend, "sender_identity", None)
@@ -918,6 +1073,7 @@ class Orchestrator:
                         channel_context=self._frontend.channel_context(chat_id),
                         timeout=self._frontend.timeout_for(chat_id),
                         nudge_prompt=nudge_prompt,
+                        profile=profile,
                         facts=self._frontend.session_facts(chat_id),
                     )
                 except asyncio.CancelledError:
@@ -960,9 +1116,7 @@ class Orchestrator:
                 # over. Reporting late beats not reporting: an ungated turn is
                 # exactly what an operator who enabled approvals must never
                 # discover by accident.
-                self._permissions.check_turn(
-                    chat_id, response, settings.get("AGENT_BACKEND", "claude")
-                )
+                self._permissions.check_turn(chat_id, response, profile.backend)
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
                 chat_id,
@@ -989,7 +1143,7 @@ class Orchestrator:
             self._event_log.append(
                 EVENT_WORKER_DONE,
                 source=self._platform,
-                backend=current_backend_key(),
+                backend=current_backend_key(profile),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -1012,7 +1166,7 @@ class Orchestrator:
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
-                backend=current_backend_key(),
+                backend=current_backend_key(profile),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -1028,7 +1182,7 @@ class Orchestrator:
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
-                backend=current_backend_key(),
+                backend=current_backend_key(profile),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -1095,15 +1249,27 @@ class Orchestrator:
         return InterimProgress(post)
 
     async def _run_compaction(
-        self, chat_id: int, workspace: Path, session: str, timeout: float | None
+        self,
+        chat_id: int,
+        workspace: Path,
+        session: str,
+        timeout: float | None,
+        profile: agent.AgentProfile,
     ) -> Response:
-        """Compact the session and render the outcome as this turn's reply."""
+        """Compact the session and render the outcome as this turn's reply.
+
+        Takes the conversation's profile, not the daemon's: a compaction that ran
+        under different settings than the turn it compacts would summarize with a
+        model the conversation never used and bill it for the privilege.
+        """
         # Whatever this chat was holding describes the pre-compaction prompt and
         # is stale the moment the compaction lands. Dropping it (rather than
         # guessing the new size) is what stops a manual `$compact` from being
         # followed straight away by an automatic one on the next message.
         self._context.pop(chat_id, None)
-        outcome = await agent.compact(workspace, session, timeout=timeout)
+        outcome = await agent.compact(
+            workspace, session, timeout=timeout, profile=profile
+        )
         if outcome is None:
             return Response(body="This backend can't compact a conversation.")
         return Response(body=outcome.summary(), compaction=outcome)
@@ -1122,6 +1288,11 @@ class Orchestrator:
                 "chat_id": chat_id,
                 "uptime_s": int(now - j["started_at_monotonic"]),
                 "session_uuid": j["session_uuid"],
+                # The turn's own agent, not the daemon's: a conversation pinned
+                # with `$model` runs a different model from the one the TUI's
+                # environment resolves, and the row would otherwise name the
+                # wrong one.
+                "backend": j.get("backend"),
             }
             for chat_id, j in self._in_flight.items()
         ]

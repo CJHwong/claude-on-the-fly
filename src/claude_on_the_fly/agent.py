@@ -20,7 +20,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -842,6 +842,7 @@ def _fold(
     compact: dict | None = None,
     last_usage: dict | None = None,
     last_text: dict | None = None,
+    last_model: dict | None = None,
 ) -> dict | None:
     """Apply one parsed stream-json message to running tallies.
 
@@ -856,6 +857,15 @@ def _fold(
     turn ends (see `_native_context_fields`); the last assistant message is
     the reading that reflects the context a compaction would actually see.
 
+    When last_model is given, it is replaced with each assistant message's
+    `model`, so the result line ends up naming the model that produced the
+    answer. The envelope's `modelUsage` cannot answer that: it is keyed by
+    every model the turn touched, in first-touched order, so a turn whose
+    first API call went to an auxiliary model names that one instead. A
+    measured two-model turn ordered it `['claude-sonnet-5',
+    'claude-haiku-4-5-20251001']`, and a daemon turn that opus answered
+    reported haiku.
+
     When last_text is given, it is replaced with each assistant message's
     text — but only when that text is real content, not a lone
     `<suggestions>` block. The final message of a turn is often just the
@@ -869,6 +879,10 @@ def _fold(
             usage = msg.get("message", {}).get("usage") or {}
             last_usage.clear()
             last_usage.update(usage)
+        if last_model is not None:
+            name = msg.get("message", {}).get("model")
+            if name:
+                last_model["model"] = name
         if last_text is not None:
             text = "".join(
                 block.get("text") or ""
@@ -920,6 +934,7 @@ def parse_stream(stdout: bytes) -> dict:
     compact: dict = {}
     last_usage: dict = {}
     last_text: dict = {}
+    last_model: dict = {}
     result: dict = {}
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -930,7 +945,9 @@ def parse_stream(stdout: bytes) -> dict:
         except json.JSONDecodeError:
             logger.warning("parse_stream: skipping malformed line: %s", line[:120])
             continue
-        r = _fold(msg, tool_counts, skill_counts, compact, last_usage, last_text)
+        r = _fold(
+            msg, tool_counts, skill_counts, compact, last_usage, last_text, last_model
+        )
         if r is not None:
             result = r
     if result:
@@ -938,6 +955,7 @@ def parse_stream(stdout: bytes) -> dict:
         result["skill_counts"] = skill_counts
         result["compact"] = compact
         result["last_assistant_text"] = last_text.get("text", "")
+        result["last_assistant_model"] = last_model.get("model", "")
     return result
 
 
@@ -1097,6 +1115,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     compact: dict = {}
     last_usage: dict = {}
     last_text: dict = {}
+    last_model: dict = {}
     result: dict = {}
     line_count = 0
     stdout_bytes = 0
@@ -1119,7 +1138,15 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
             except json.JSONDecodeError:
                 logger.warning("exec: skipping malformed line: %s", line[:120])
                 continue
-            r = _fold(msg, tool_counts, skill_counts, compact, last_usage, last_text)
+            r = _fold(
+                msg,
+                tool_counts,
+                skill_counts,
+                compact,
+                last_usage,
+                last_text,
+                last_model,
+            )
             if relay is not None:
                 try:
                     relay.feed(msg)
@@ -1157,6 +1184,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
         result["skill_counts"] = skill_counts
         result["compact"] = compact
         result["last_assistant_text"] = last_text.get("text", "")
+        result["last_assistant_model"] = last_model.get("model", "")
 
     if proc.returncode != 0:
         err_stderr = stderr_bytes.decode().strip()
@@ -1365,6 +1393,12 @@ def _merge_cli_output(first: dict, second: dict) -> dict:
     # nothing, and the retry's own body is what the merged result posts anyway.
     merged["last_assistant_text"] = second.get("last_assistant_text") or first.get(
         "last_assistant_text"
+    )
+    # `last_assistant_model` follows `last_assistant_text`, for the same reason:
+    # the retry answered, so the retry's model is the one to name, and a retry
+    # that produced no assistant message must not blank the first run's.
+    merged["last_assistant_model"] = second.get("last_assistant_model") or first.get(
+        "last_assistant_model"
     )
     return merged
 
@@ -1583,6 +1617,32 @@ class AgentProfile:
         """
         model = self.model or ("default" if self.backend == "codex" else "")
         return f"{self.backend}:{self.mode}:{model}"
+
+
+# The fields one conversation may pin from chat, named once. The command
+# grammar, the file a daemon stores them in, and `apply_override` all have to
+# agree about these, and a key that is not here must never reach `replace`: a
+# stored file is edited by hand at least once, and `replace` would raise on the
+# typo, taking down the turn that read it.
+OVERRIDABLE_FIELDS = ("model", "effort")
+
+
+def apply_override(profile: AgentProfile, overrides: Mapping[str, str]) -> AgentProfile:
+    """`profile` with what one conversation pinned, or `profile` unchanged.
+
+    Applied to the *resolved* profile rather than to the settings, which is the
+    whole reason this is safe: the resolver has already routed each field out of
+    the right block for the mode, so a pinned value lands in the same field a
+    configured one would. Under ollama that means the shared ollama keys, and
+    nothing downstream has to know which block answered.
+
+    An unknown key is dropped rather than raising, for the reason
+    `OVERRIDABLE_FIELDS` gives.
+    """
+    pinned = {
+        key: value for key, value in overrides.items() if key in OVERRIDABLE_FIELDS
+    }
+    return replace(profile, **pinned) if pinned else profile
 
 
 def profile_names() -> list[str]:

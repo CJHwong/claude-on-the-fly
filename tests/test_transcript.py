@@ -11,6 +11,7 @@ from claude_on_the_fly.transcript import (
     Turn,
     _workspace_to_claude_hash,
     extract_claude,
+    extract_claude_model,
     extract_codex,
     extract_codex_model,
     extract_codex_usage_events,
@@ -73,6 +74,14 @@ class TestWorkspaceToClaudeHash:
 
 def _claude_user(text: str) -> dict:
     return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+def _claude_assistant_with_model(model: str | None) -> dict:
+    """An assistant record carrying a `model`, the way claude writes one."""
+    message: dict = {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
+    if model is not None:
+        message["model"] = model
+    return {"type": "assistant", "message": message}
 
 
 def _claude_assistant_text(text: str) -> dict:
@@ -408,8 +417,10 @@ class TestExtractCodexModel:
         )
         assert extract_codex_model("thread-abc") == "gpt-4.1"
 
-    def test_returns_first_turn_context_model(self, codex_sessions_dir, ndjson):
-        """Codex emits turn_context per turn; the first hit is sufficient."""
+    def test_returns_last_turn_context_model(self, codex_sessions_dir, ndjson):
+        """Codex appends one turn_context per turn, so the last is the model
+        that answered. Reading the first kept naming the model a resumed thread
+        opened with, long after a switch moved it."""
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-x.jsonl"
@@ -419,7 +430,7 @@ class TestExtractCodexModel:
                 {"type": "turn_context", "payload": {"model": "second-model"}},
             )
         )
-        assert extract_codex_model("thread-x") == "first-model"
+        assert extract_codex_model("thread-x") == "second-model"
 
     def test_skips_non_string_model_values(self, codex_sessions_dir, ndjson):
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
@@ -1521,3 +1532,48 @@ class TestRolloutSnapshot:
             transcript._find_codex_rollout_by_cwd("/ws", exclude=frozenset({sibling}))
             == mine
         )
+
+
+class TestExtractClaudeModel:
+    """The model the footer names in pty mode.
+
+    pty's envelope has no per-message model, so the session claude wrote is the
+    only place the answering model appears.
+    """
+
+    def test_missing_file_returns_none(self, claude_projects_dir):
+        assert extract_claude_model(Path("/private/tmp/nope"), "uuid-x") is None
+
+    def test_returns_the_last_assistant_model(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-model-a")
+        session_dir = claude_projects_dir / "-private-tmp-ws-model-a"
+        session_dir.mkdir()
+        # The real shape of the bug: an auxiliary haiku record precedes the
+        # opus one that actually answered.
+        (session_dir / "u1.jsonl").write_bytes(
+            ndjson(
+                _claude_assistant_with_model("claude-haiku-4-5-20251001"),
+                _claude_user("go on"),
+                _claude_assistant_with_model("claude-opus-5"),
+            )
+        )
+        assert extract_claude_model(workspace, "u1") == "claude-opus-5"
+
+    def test_ignores_assistant_records_with_no_model(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-model-b")
+        session_dir = claude_projects_dir / "-private-tmp-ws-model-b"
+        session_dir.mkdir()
+        (session_dir / "u1.jsonl").write_bytes(
+            ndjson(
+                _claude_assistant_with_model("claude-sonnet-5"),
+                _claude_assistant_with_model(None),
+            )
+        )
+        assert extract_claude_model(workspace, "u1") == "claude-sonnet-5"
+
+    def test_no_assistant_record_returns_none(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-model-c")
+        session_dir = claude_projects_dir / "-private-tmp-ws-model-c"
+        session_dir.mkdir()
+        (session_dir / "u1.jsonl").write_bytes(ndjson(_claude_user("only me")))
+        assert extract_claude_model(workspace, "u1") is None

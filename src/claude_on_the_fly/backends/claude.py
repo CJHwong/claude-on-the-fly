@@ -28,6 +28,7 @@ from claude_on_the_fly.agent import (
 )
 from claude_on_the_fly.transcript import (
     _workspace_to_claude_hash,
+    extract_claude_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -463,7 +464,20 @@ class ClaudeBackend:
             body = (cli_output.get("result") or "").strip() or "No response"
 
         tokens_in, tokens_out = self._extract_tokens(cli_output)
-        model = next(iter(cli_output.get("modelUsage", {})), "")
+        # The model that produced the answer, which is the last assistant
+        # message's own `model`. `modelUsage` cannot answer this: it is keyed by
+        # every model the turn touched, in first-touched order, so an auxiliary
+        # call that ran before the answer names itself instead. That is not
+        # hypothetical -- a daemon turn opus answered footered as haiku. It stays
+        # as the fallback for an envelope that carries no assistant message.
+        model = cli_output.get("last_assistant_model") or ""
+        if not model and self.pty:
+            # pty's envelope carries no per-message model, so the name comes
+            # from the session claude just wrote. This is the mode the bug was
+            # observed in, so it is the one that has to be right.
+            model = extract_claude_model(workspace, session_uuid) or ""
+        if not model:
+            model = next(iter(cli_output.get("modelUsage", {})), "")
 
         # In ollama mode the claude CLI still computes total_cost_usd from
         # Anthropic's price table, which is meaningless when ollama is
@@ -544,24 +558,6 @@ class ClaudeBackend:
         # claude --model X` already pinned it.
         model = "" if self.launcher else self.model
         model_args = ["--model", model] if model else []
-        # Effort is unset by default: absent, no flag is passed and the CLI still
-        # reads effortLevel from ~/.claude/settings.json exactly as before. pty
-        # never reaches here (see `_pty_base_argv`) and deliberately gets no
-        # effort at all: it resolves its own settings, and whether interactive
-        # claude honours the flag is untested.
-        # Under ollama the value came from the shared `ollama.effort`, whose
-        # accepted levels differ from claude's (codex has no `max`), so a value
-        # claude doesn't accept is skipped rather than passed through to die in
-        # the CLI's own validation. A native value takes the same check: a typo
-        # in config.yaml should warn here rather than fail the turn.
-        effort = self.effort
-        if effort and effort not in _CLAUDE_EFFORT_LEVELS:
-            logger.warning(
-                "claude: ignoring unknown effort %r (low|medium|high|xhigh|max)",
-                effort,
-            )
-            effort = ""
-        effort_args = ["--effort", effort] if effort else []
         # Permission flags rather than a hardcoded bypassPermissions. With
         # approvals off this returns exactly the old pair, so argv is unchanged.
         return [
@@ -573,8 +569,30 @@ class ClaudeBackend:
             "--verbose",
             *permissions.claude_argv(),
             *model_args,
-            *effort_args,
+            *self._effort_args(),
         ]
+
+    def _effort_args(self) -> list[str]:
+        """`--effort <level>`, or [] when no effort is configured.
+
+        Unset means inherit: no flag is passed and the CLI reads effortLevel
+        from ~/.claude/settings.json exactly as it did before this setting
+        existed.
+
+        Under ollama the value came from the shared `ollama.effort`, whose
+        accepted levels differ from claude's (codex has no `max`), so a value
+        claude doesn't accept is skipped rather than passed through to die in
+        the CLI's own validation. A native value takes the same check: a typo
+        in config.yaml should warn here rather than fail the turn.
+        """
+        effort = self.effort
+        if effort and effort not in _CLAUDE_EFFORT_LEVELS:
+            logger.warning(
+                "claude: ignoring unknown effort %r (low|medium|high|xhigh|max)",
+                effort,
+            )
+            return []
+        return ["--effort", effort] if effort else []
 
     async def compact(
         self,
@@ -652,11 +670,20 @@ class ClaudeBackend:
         # works here. What differs is which of them claude honours: interactive
         # mode ignores --permission-prompt-tool and draws its own dialog instead,
         # which is why the pty path also installs the Notification relay.
+        #
+        # --effort is passed for the same reason --model is: both are session
+        # flags in claude's own help ("for the current session"), neither is
+        # gated on -p. Interactive claude honours it, measured by driving the
+        # TUI under tmux -- `--effort low` and `--effort max` each banner
+        # themselves as "with <level> effort", and no flag banners the
+        # settings default. A session file cannot confirm this, since it
+        # records the model per message but never the effort.
         return [
             self._pty_path,
             *permissions.claude_argv(pty=True),
             *permissions.pty_argv(),
             *model_args,
+            *self._effort_args(),
         ]
 
     def _extract_tokens(self, cli_output: dict) -> tuple[int, int]:

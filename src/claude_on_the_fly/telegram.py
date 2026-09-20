@@ -230,9 +230,15 @@ class TelegramFrontend(Frontend):
         self._app.add_handler(CommandHandler("status", self._cmd_status))
         # A real bot command rather than Slack's `$compact` text prefix: Telegram
         # delivers slash commands everywhere, so the `$` workaround Slack needs
-        # (its own slash commands are blocked inside threads) buys nothing here,
-        # and a command shows up in the client's command menu.
+        # (its own slash commands are blocked inside threads) buys nothing here.
+        # The client's command menu is not part of that and this does not provide
+        # it: the menu lists only what `setMyCommands` registered, and nothing in
+        # this code calls it, so every command here is typed rather than picked.
         self._app.add_handler(CommandHandler("compact", self._cmd_compact))
+        # Model and stop, the two commands Slack spells as `$` text prefixes. Real
+        # bot commands here for the reason directly above.
+        self._app.add_handler(CommandHandler("model", self._cmd_model))
+        self._app.add_handler(CommandHandler("stop", self._cmd_stop))
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.Document.ALL | filters.PHOTO)
@@ -730,6 +736,44 @@ class TelegramFrontend(Frontend):
             await update.message.reply_text("Not connected to a session yet.")
             return
         await self._orchestrator.on_compact(chat_id)
+
+    async def _cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Pin this conversation to another model or effort.
+
+        The grammar and every refusal live in `model_command`, shared with
+        Slack's `$model`, so the two frontends cannot drift. Nothing is resolved
+        here but the chat id: the orchestrator owns the pin, and it answers with
+        the text to post whether the request was accepted or refused.
+        """
+        if not self._allowed(update) or not update.message or not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        if not self._orchestrator:
+            await update.message.reply_text("Not connected to a session yet.")
+            return
+        # Through _send_msg rather than reply_text: the reply marks every model
+        # name as code, and _send_msg is the path that carries a parse_mode and
+        # retries without it when Telegram rejects the markup.
+        await self._send_msg(
+            chat_id, self._orchestrator.on_model(chat_id, list(ctx.args or []))
+        )
+
+    async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Abort the turn running in this chat, and drop what waits behind it.
+
+        The same two sentences Slack's `$stop` posts, because it is the same
+        action: a person who stopped a turn learns nothing extra from different
+        wording on one platform.
+        """
+        if not self._allowed(update) or not update.message or not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        stopped = False
+        if self._orchestrator:
+            stopped = await self._orchestrator.abort(chat_id)
+        await update.message.reply_text(
+            "Stopped the current turn." if stopped else "Nothing was running."
+        )
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:
