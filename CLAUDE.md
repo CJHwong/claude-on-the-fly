@@ -60,13 +60,18 @@ uv run prek run --all-files    # ruff + ruff-format + ty + gitleaks + sanity
 uv run pytest                  # tests in tests/
 ```
 
-Coverage is 100% of statements and is enforced (`fail_under = 100`). It is not in
-pytest's `addopts` because it adds about a minute to the suite's wall clock, so run
-it explicitly when you add or change code:
+Coverage is 100% of statements. `fail_under = 100` enforces it **locally**; CI measures
+it and reports the number without failing the build, so a drop is visible rather than
+blocking. Locally it is not in pytest's `addopts` because it adds about a minute to the
+suite's wall clock, so run it explicitly when you add or change code:
 
 ```bash
 uv run pytest --cov=claude_on_the_fly --cov-report=term-missing
 ```
+
+A green coverage number is not proof a test ran. It counts lines executed, not
+assertions reached, so a test that dies at the call still leaves its lines covered by
+somebody else's test. Read the counts line as well as the percentage.
 
 New code needs a test that fails without it. If a line genuinely cannot run under
 test, `# pragma: no cover` with a comment saying why is the escape hatch. There

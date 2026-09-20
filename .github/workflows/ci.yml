@@ -119,9 +119,16 @@ jobs:
       # this file and not of whatever the runner happens to offer. `auto` would
       # re-tune itself when the hosted runner's size changes, moving the
       # baseline silently and with no commit to point at.
+      #
+      # Coverage rides on the runs that already happen rather than repeating the
+      # suite: instrumenting costs seconds, a second full run costs minutes.
+      # `--cov-fail-under=0` overrides the 100 in pyproject on purpose. The
+      # number is reported, not enforced, so a drop is visible without a red
+      # tick blocking work that is otherwise fine.
       - name: pytest
         run: |
           timeout 600 uv run --no-sync pytest -q -n 4 \
+            --cov=claude_on_the_fly --cov-report= --cov-fail-under=0 \
             --ignore=tests/test_sandbox.py -o faulthandler_timeout=60
 
       # test_sandbox.py cannot run under xdist, and fails loudly rather than
@@ -136,4 +143,46 @@ jobs:
       # forcing it into a worker. A separate step, not appended to the command
       # above, so a failure here names the boundary rather than the bulk suite.
       - name: pytest (sandbox probes, serial)
-        run: timeout 300 uv run --no-sync pytest -q tests/test_sandbox.py -o faulthandler_timeout=60
+        run: |
+          timeout 300 uv run --no-sync pytest -q tests/test_sandbox.py \
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
+            -o faulthandler_timeout=60
+
+      # Reports, never blocks. The repo claims 100% of statements and enforces it
+      # in pyproject, but nothing ran that gate in CI, so `main` could fall below
+      # it silently -- and did read as covered while two tests were dying at the
+      # call, because coverage counts lines, not whether the test asserting them
+      # got that far. Saying the number out loud is what makes a drop visible.
+      #
+      # `continue-on-error` is not enough on its own: it still paints the run
+      # with a red tick. The step exits 0 itself and speaks through an
+      # annotation plus the job summary instead.
+      - name: Coverage (report only, does not fail the build)
+        run: |
+          uv run --no-sync coverage report --fail-under=0 \
+            --show-missing --skip-covered > coverage.txt || true
+          total="$(uv run --no-sync coverage report --fail-under=0 \
+            --format=total 2>/dev/null || echo unknown)"
+          echo "### Coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          # `--format=total` may carry decimals depending on the configured
+          # precision, and `[ -lt ]` errors on those. Truncating is the right
+          # rounding here anyway: 99.9% is below 100%.
+          whole="${total%%.*}"
+          case "$whole" in ''|*[!0-9]*) whole=unknown ;; esac
+          if [ "$whole" = "unknown" ]; then
+            echo "::warning::coverage could not be measured; see the pytest steps"
+            echo "coverage could not be measured" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$whole" -lt 100 ]; then
+            echo "::warning::coverage is ${total}%, below the 100% this repo claims"
+            {
+              echo ""
+              echo "Below the 100% \`fail_under\` in pyproject. Not blocking."
+              echo ""
+              echo '```'
+              head -40 coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
