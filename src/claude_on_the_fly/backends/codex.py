@@ -462,12 +462,13 @@ class _RolloutFollower:
         found = (
             transcript._find_codex_rollout(self._thread_id)
             if self._thread_id
-            # Resolved, because the comparison is a string equality against the
-            # cwd codex recorded, and codex records the path it resolved. On
-            # macOS a workspace under /tmp is written as /private/tmp/..., so the
-            # unresolved name matches nothing and the turn never resolves at all.
+            # The matcher resolves both sides, so either form works here. It
+            # did not always: codex writes back the `-C` argument verbatim, so
+            # comparing one resolved name against one unresolved one matched
+            # nothing and the turn returned "No response" with the work already
+            # done and billed.
             else transcript._find_codex_rollout_by_cwd(
-                os.path.realpath(self._workspace), exclude=self._known_rollouts
+                str(self._workspace), exclude=self._known_rollouts
             )
         )
         if found is not None:

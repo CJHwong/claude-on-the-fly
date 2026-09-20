@@ -3205,10 +3205,14 @@ class TestFollowerResolvesLate:
 
         assert parse_codex_rollout(follower.records)["body"] == "this turn"
 
-    def test_the_cwd_lookup_uses_the_path_codex_recorded(self, tmp_path: Path):
-        """The comparison is a string equality against codex's own resolved cwd,
-        so on macOS a /tmp workspace is written as /private/tmp/... and the
-        unresolved name matches nothing."""
+    def test_the_cwd_lookup_gets_the_workspace_as_the_caller_holds_it(
+        self, tmp_path: Path
+    ):
+        """Resolving belongs to the matcher, which resolves both sides, and not
+        to this caller. It used to resolve here, on the belief that codex wrote
+        back a path it had resolved. It does not: it records the `-C` argument
+        verbatim, so resolving one side only moved which spelling failed to
+        match."""
         seen: list[str] = []
         follower = codex_mod._RolloutFollower(Path("/tmp"), None, None)
         with patch.object(
@@ -3218,7 +3222,7 @@ class TestFollowerResolvesLate:
         ):
             follower._drain()
 
-        assert seen == [os.path.realpath("/tmp")]
+        assert seen == ["/tmp"]
 
 
 def test_an_unwritable_codex_home_costs_the_pane_not_the_turn(tmp_path: Path, caplog):
