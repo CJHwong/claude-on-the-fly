@@ -37,6 +37,55 @@ jobs:
           uv tool install prek
           prek run --all-files || (git --no-pager diff && false)
 
+  # The other half of the boundary suite. tests/test_sandbox.py holds 32 cases
+  # that spawn a real `sandbox-exec` against the real home, and they can only
+  # skip on Linux -- so until this job existed they ran on nobody's CI and the
+  # seatbelt profile was covered by argv assertions alone. Measured on the
+  # Linux job: 195 passed, 32 skipped.
+  #
+  # This file only, not the whole suite. The rest is platform-independent and
+  # already runs on Linux; repeating it here would buy a slower signal and
+  # nothing else.
+  macos-seatbelt:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0 # hatch-vcs derives the version from git tags
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Sync dev env
+        run: uv sync --locked
+
+      # Serial, for the same reason the Linux job runs this file serially: each
+      # xdist worker gets its own empty temp HOME, so a probe asserting the jail
+      # *denies* ~/.aws/credentials finds the path merely absent and the
+      # boundary goes untested.
+      #
+      # No `timeout 300` wrapper, unlike the Linux steps. `timeout` is GNU
+      # coreutils and macOS does not ship it, so the wrapper would fail as
+      # "command not found" rather than bound anything. `timeout-minutes` on the
+      # step is the portable equivalent, and faulthandler still names a case
+      # that stops making progress. The file runs serially in about 2 seconds.
+      - name: Seatbelt boundary contracts must actually run
+        timeout-minutes: 5
+        env:
+          # Turns "no sandbox-exec here" from 32 skips into a collection error.
+          # A skipped boundary case is indistinguishable from a passing one, and
+          # a macOS runner without seatbelt means the job is testing nothing.
+          COTF_REQUIRE_SEATBELT: "1"
+        run: |
+          uv run --no-sync pytest -q tests/test_sandbox.py -rs \
+            -o faulthandler_timeout=60
+
   # Deliberately not `needs: lint`. Nothing here consumes anything lint
   # produces, so gating on it only added lint's wall clock to the front of every
   # run. The two jobs now start together and the slower one sets the total.
@@ -190,17 +239,4 @@ jobs:
             head -40 coverage.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-          fi
-          if [ "$whole" -lt 100 ]; then
-            echo "::warning::coverage is ${total}%, below the 100% this repo claims"
-            {
-              echo ""
-              echo "Below the 100% \`fail_under\` in pyproject. Not blocking."
-              echo ""
-              echo '```'
-              head -40 coverage.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
           exit 0

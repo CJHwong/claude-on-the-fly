@@ -16,6 +16,20 @@ import pytest
 
 from claude_on_the_fly import agent, egress, sandbox, sandbox_macos
 
+# Set by the macOS CI job. The cases below run a real `sandbox-exec`, so off
+# macOS they can only skip -- and a skipped boundary case reads exactly like a
+# passing one. Where seatbelt is expected to be present, its absence has to fail
+# collection loudly instead. Same contract as COTF_REQUIRE_JAIL in
+# test_sandbox_jail_live.py; this is the other half of the pair.
+if os.environ.get("COTF_REQUIRE_SEATBELT") and not shutil.which("sandbox-exec"):
+    raise RuntimeError("COTF_REQUIRE_SEATBELT is set but sandbox-exec is not on PATH")
+
+
+def _seatbelt_or_skip() -> None:
+    """Guard for a case that spawns the real seatbelt, rather than asserting argv."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+
 
 def test_mode_defaults_off(monkeypatch):
     monkeypatch.delenv("COTF_SANDBOX", raising=False)
@@ -889,8 +903,7 @@ async def test_verify_denials_reports_each_probe(
     because the profile denies anything. So this one test reaches for the real
     home on purpose.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     # The write probe is isolated here on purpose. This suite's home lives under
@@ -939,8 +952,7 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     conftest's tmpdir HOME gives exactly that situation, so this asserts the
     honest outcome rather than a false pass.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     # The write probe is isolated here on purpose. This suite's home lives under
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
@@ -992,8 +1004,7 @@ async def test_broken_profile_is_not_reported_as_absent(
     The first version of verify_denials reported it as six "absent" paths, which
     reads as benign. Found by deliberately breaking the profile, not by review.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     broken = tmp_path / "broken.sb"
     broken.write_text("(version 1)\n(this-is-not-a-real-operation\n")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -1055,8 +1066,7 @@ def test_data_dir_param_is_realpathed(monkeypatch, tmp_path):
 async def test_credential_denies_fire_under_a_symlinked_home(monkeypatch, tmp_path):
     """End-to-end version of the above: a real sandbox-exec run proves the deny
     matches when home is reached through a symlink."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     real_home = Path(os.path.realpath(tmp_path)) / "home"
     (real_home / ".aws").mkdir(parents=True)
     (real_home / ".aws" / "credentials").write_text("CANARY\n")
@@ -1085,8 +1095,7 @@ async def test_daemon_env_file_is_denied_to_the_agent(monkeypatch, tmp_path):
     means answering its own approval prompts: the gate re-checks the sender, and
     the sender would have been legitimate.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     home = Path(os.path.realpath(tmp_path)) / "home"
     data = home / ".claude-on-the-fly"
     (data / "logs").mkdir(parents=True)
@@ -1360,8 +1369,7 @@ def test_memory_is_writable_under_the_jail(monkeypatch, tmp_path, fs_base):
     an explicit grant every memory write failed with "Operation not permitted" and
     the feature was silently off under `jail` — with nothing in the log, because
     macOS cannot report a seatbelt denial."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     memory = agent.MEMORY_DIR / "users" / "someone"
@@ -1402,8 +1410,7 @@ def test_the_daemons_own_env_file_is_unreadable_in_the_jail(
     """The live counterpart, against the real home so the deny is the reason the
     read fails rather than the file being absent. Reads only; never creates or
     modifies anything under the real home."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     secrets = original_home / ".claude-on-the-fly" / ".env"
     if not secrets.is_file():
         pytest.skip("no real .env on this machine to probe")
@@ -1599,8 +1606,7 @@ def test_codex_execution_control_paths_are_unwritable_in_the_jail(
     refusing to let codex invent a `rules/` is the same protection, and its own parent
     `~/.codex` does exist, so a refusal there is the deny talking.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     if not (original_home / ".codex").is_dir():
         pytest.skip("no real ~/.codex on this machine to probe")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -1631,8 +1637,7 @@ def test_codex_can_still_write_what_a_real_turn_needs(
     with CODEX_HOME redirected wrote its rollout under that directory, so the
     redirect is the mechanism and not an assumption.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     from claude_on_the_fly import codex_state
 
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -2110,8 +2115,7 @@ def test_the_running_threads_claude_session_dir_is_writable_under_the_jail(
     which both profiles grant wholesale, so a write there would pass for the wrong
     reason. Creates only its own session directory and removes it again.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     monkeypatch.setenv("HOME", str(original_home))
@@ -2150,8 +2154,7 @@ def test_another_threads_claude_session_file_is_unreadable_under_the_jail(
     needs it more: a tmpdir home would make the read succeed via the _TMPDIR grant
     and the assertion would be measuring nothing.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     monkeypatch.setenv("HOME", str(original_home))
@@ -2600,8 +2603,7 @@ def test_claude_instruction_paths_stay_unwritable_in_the_jail(
     """Live counterpart, against the real home so the deny is why the write fails
     rather than the path being absent. Never creates anything under the real home:
     a successful write is the failure this asserts against."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -2617,8 +2619,7 @@ def test_claude_instruction_dirs_stay_unwritable_in_the_jail(
 ):
     """A turn must not be able to drop a new command, skill, agent or plugin
     manifest, each of which the next invocation would load."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -2639,8 +2640,7 @@ def test_the_prompt_history_of_other_threads_is_unreadable_in_the_jail(
     """history.jsonl is every prompt typed in every project on the host, so it
     crosses threads the same way projects/ does. Read-only probe against the real
     file, so the deny is the reason it fails."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     history = original_home / ".claude" / "history.jsonl"
     if not history.is_file():
         pytest.skip("no real history.jsonl on this machine to probe")
@@ -3138,8 +3138,7 @@ def test_the_shared_codex_tree_stays_write_denied_without_scoped_sessions(
     says nothing about this deny. The probe is a file of its own with a unique name,
     never one of the operator's real files, and it is removed either way.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     codex = original_home / ".codex"
     if not codex.is_dir():
         pytest.skip("no real ~/.codex on this machine to probe")
@@ -3269,8 +3268,7 @@ def test_the_profile_dotenv_regexes_have_no_end_anchor():
 def test_deny_most_denies_a_dotenv_inside_an_operator_grant(monkeypatch, tmp_path):
     """An `sandbox.extra_paths` entry is a subpath allow, so without this the token
     file beside the files the operator wanted granted comes back readable."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     granted = tmp_path / "config-repo"
     (granted / "skills" / "tool").mkdir(parents=True)
     secret = granted / "skills" / "tool" / ".env"
