@@ -241,13 +241,20 @@ def _safe_iterdir(path: Path) -> list[Path]:
 
 
 def shared_link_targets(shared: Path | None = None) -> list[Path]:
-    """Resolved paths the per-thread home links to, for the Linux jail to mount.
+    """Resolved paths the per-thread home links to, for either jail to grant.
 
-    Seatbelt needs none of this: it matches the resolved path, and everything here
-    already sits under a granted subtree. A mount namespace has no such luck -- a
-    link into a directory nobody mounted dangles inside the jail, and codex reports
-    a missing file rather than a hidden one. `~/.codex/skills -> ~/.agents/skills`
-    is the shape that found this: outside every mount the profile lists.
+    A mount namespace needs them mounted: a link into a directory nobody mounted
+    dangles inside the jail, and codex reports a missing file rather than a hidden
+    one. `~/.codex/skills -> ~/.agents/skills` is the shape that found this.
+
+    Seatbelt needs them too, which this docstring used to deny on the grounds that
+    everything here already sits under a granted subtree. It does not. Seatbelt
+    matches the path the kernel resolves, so the grant on the codex home covers
+    the link and not the file behind it, and under `deny-most` a target elsewhere
+    under `$HOME` is opaque. Measured: codex exited 1 with "Operation not
+    permitted (os error 1)" and the kernel logged `deny(1) file-read-data
+    .../.agents/agents`. `sandbox._codex_link_read_paths` filters this list down
+    to what that base has to grant back.
     """
     from claude_on_the_fly import envfile
 

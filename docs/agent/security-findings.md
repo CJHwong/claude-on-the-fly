@@ -65,6 +65,8 @@ upgrade path, so none of that was covered by it.
 | The grant was the binary's parent directory, which misses a prefix-style install: the CLI sits in `<prefix>/bin` and its code in `<prefix>/lib/node_modules`, a sibling. codex started and then died on `Cannot read package config .../@openai/codex/package.json: operation not permitted` | `sandbox._install_library_dir` | Grant the `lib/` beside a `bin/` install, when there is one. `lib/` rather than the prefix on purpose: for `~/.local/bin/claude` the prefix is `~/.local`, one grant covering mise's installs, its state and every other tool kept there, to buy nothing -- claude's code is under `~/.local/share`. Asking for the directory that holds the code also makes it structurally impossible to hand back `$HOME` |
 | pty mode granted `argv[0]` only. `claude-pty` is a shell script that execs `claude` for the turn and `tmux` to host it, neither of them granted, so under `deny-most` it died `rc 127` -- which reads as "command not found" rather than as a jail | `sandbox._EXECS_BEHIND` | A wrapper now contributes the binaries it execs. With this, the ancestors and the `lib/` grant, a jailed `claude-pty` turn under `deny-most` answered `PASS 4s`, having previously produced no envelope at all |
 
+| Under `deny-most` codex could not start at all, on every mode: `Error: Operation not permitted (os error 1)`, naming no path. The read grant on the codex home covers the *links* inside it and not what they point at, because seatbelt matches the path the kernel resolves, so `~/.codex/agents -> ~/.agents/agents` was unreadable while the profile still read as granting it | `sandbox._codex_link_read_paths`, `seatbelt/fs-deny-most.sb` `_CODEX_LINK_*` | The kernel named it: `deny(1) file-read-data /Users/<user>/.agents/agents`, from `log stream` during a failing run. The Linux jail has mounted these targets read-only since the session boundary landed, so this is the macOS half of a grant that already existed rather than a new capability. Read only -- the write deny on the codex tree is still below it -- and a target that `sandbox.extra_paths` would refuse is refused here too, so a link at `$HOME` or into `~/.ssh` cannot reopen the home. Collapsed to shortest roots first, which took a real home from 54 targets to 3. Live: `codex-native PASS 7s`, `codex-pty PASS 8s` under `jail` + `deny-most` with no `extra_paths`, both `FAIL 1s` before |
+
 ## Open
 
 Ordered by severity against the threat model above.
@@ -181,9 +183,9 @@ still collide with a jailed turn during claude's one-second supervisor boot, and
 symptom is a hung TUI rather than an error. Accepted: it is strictly better than the
 turn never running, which is what Linux did before.
 
-**`sandbox.fs: deny-most` runs claude but not codex, and needs operator tuning for
-pty.** With the three grants above, `claude-native` and `claude-pty` both complete a
-real turn under `deny-most`. Two things remain.
+**`sandbox.fs: deny-most` completes a real turn on both backends, and needs operator
+tuning for pty hooks.** `codex-native`, `codex-pty` and `claude-native` all pass with no
+`extra_paths` at all. One thing remains.
 
 The pty turn needs `extra_paths` for wherever the operator's claude hooks live. On the
 machine this was measured on they sit under `~/.rhapsody/cache/pty/hooks`, and without
@@ -192,14 +194,17 @@ fails: `bash: .../stop_envelope.sh: Operation not permitted`. cotf cannot know t
 path, so this is the tuning surface working as designed rather than a defect -- but it
 fails in a way that names a hook rather than a sandbox, which is worth knowing.
 
-codex does not run at all when it is reached through a `mise` shim. mise reads
-`~/.config/mise/config.toml`, which `extra_paths` can grant, and then wants to write a
-tracking symlink under `~/.local/state/mise`, which it cannot: `extra_paths` grants
-reads only, and deliberately. Measured down to `mise WARN tracking config: failed to
-ln -sf`. The real codex binary behind the shim reaches config parsing under
-`deny-most`, so this is the launcher rather than codex. Options not taken: a write-side
-operator grant, or resolving a shim to the binary it execs. `deny-most` is opt-in and
-off by default.
+An earlier version of this entry said codex could not run when reached through a `mise`
+shim, and blamed a tracking symlink mise writes under `~/.local/state/mise`. That
+diagnosis was wrong and is removed. The `mise WARN tracking config: failed to ln -sf`
+line is real and non-fatal; running the cask binary directly, with no shim anywhere,
+failed identically. The actual cause was the symlinked `~/.codex` entry recorded in the
+Fixed table above, and the kernel log named it once it was asked.
+
+Two denials seen alongside it are benign and deliberately not granted:
+`file-read-data $HOME/.CFUserTextEncoding`, which every CoreFoundation process attempts,
+and `file-read-metadata $HOME/.git`, from codex walking up from the workspace looking
+for a repository. Granting `~/.agents` alone cleared the failure with both still denied.
 
 ### Cross-conversation writes
 

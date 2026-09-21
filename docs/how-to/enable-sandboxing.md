@@ -37,7 +37,10 @@ sandbox:
 
 `deny-most` hides most of `$HOME`. The agent binary is granted automatically, along
 with the interpreter behind it, the `lib/` beside a `bin/` install, and the binaries a
-wrapper execs. Add anything else the agent needs to read.
+wrapper execs. If an entry in your codex home is a symlink pointing elsewhere under
+`$HOME` -- one set of agents or skills shared between backends -- the target is granted
+too, since the grant on the home itself covers the link and not the file behind it. Add
+anything else the agent needs to read.
 
 If the agent works with git, add `~/.gitconfig` as well: git refuses to run when it cannot read its global config, and `deny-most` hides that file with the rest of the home.
 
@@ -46,10 +49,11 @@ cannot be read does not stop the turn: claude answers, then the hook fails, and 
 mode the failing hook is the one that writes the turn's envelope. The error names the
 script rather than the sandbox, so it is easy to misread.
 
-A toolchain shim needs more than a read grant and may not work at all. `mise` reads its
-own config, which a grant covers, and then writes a tracking symlink under
+A toolchain shim works, and logs one line that looks worse than it is. `mise` reads its
+own config, which a grant covers, and then tries to write a tracking symlink under
 `~/.local/state/mise`, which no `extra_paths` entry can permit: these grants are
-read-only by design. Point `PATH` at the real binary rather than the shim.
+read-only by design. It warns (`tracking config: failed to ln -sf`) and runs the tool
+anyway. Grant `~/.config/mise` if you want the config read to succeed as well.
 
 Name each directory, never `$HOME` itself. A grant is written after the profile's
 denies and wins over them, so `$HOME` gives the agent back `~/.ssh` and `~/.aws` in one

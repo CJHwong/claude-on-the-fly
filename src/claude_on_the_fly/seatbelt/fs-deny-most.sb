@@ -20,7 +20,8 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_16
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_16,
+;; _CODEX_LINK_1.._CODEX_LINK_8
 ;; and _ANCESTOR_1.._ANCESTOR_8
 ;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
@@ -77,6 +78,36 @@
 ;; can name an ancestor of these trees.
 ;; codex config, the same grant ~/.claude gets for the other backend.
 (allow file-read* (subpath (param "_CODEX_OPERATOR_HOME")))
+;; Where the operator's codex home links out to. The grant above covers that
+;; home, and a symlink inside it is resolved by the kernel before any rule is
+;; matched, so an entry pointing elsewhere under the opaque $HOME reads as
+;; missing while the profile still claims to grant it. Measured: `~/.codex/agents
+;; -> ~/.agents/agents` made codex exit 1 with "Operation not permitted (os error
+;; 1)", and the kernel logged `deny(1) file-read-data .../.agents/agents`. The
+;; Linux jail already mounts these targets read-only, so this is parity rather
+;; than a new capability. Read only -- the write deny on the codex tree is below
+;; and still wins -- and the caller refuses a target that is $HOME, an ancestor
+;; of it, or a credential store, so a link cannot be used to reopen the home.
+;; Unused slots point at _PROJECT_DIR, already allowed above.
+(allow file-read* (subpath (param "_CODEX_LINK_1")))
+(allow file-read* (subpath (param "_CODEX_LINK_2")))
+(allow file-read* (subpath (param "_CODEX_LINK_3")))
+(allow file-read* (subpath (param "_CODEX_LINK_4")))
+(allow file-read* (subpath (param "_CODEX_LINK_5")))
+(allow file-read* (subpath (param "_CODEX_LINK_6")))
+(allow file-read* (subpath (param "_CODEX_LINK_7")))
+(allow file-read* (subpath (param "_CODEX_LINK_8")))
+;; And metadata on the directories above each one, for the same reason the
+;; runtime slots below need it: a subpath grant says nothing about the parents
+;; that lead to it, and the opaque $HOME denies stat() on them.
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_1")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_2")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_3")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_4")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_5")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_6")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_7")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_8")))
 ;; Command-broker shims. Generated under DATA_DIR, which deny-most makes
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".

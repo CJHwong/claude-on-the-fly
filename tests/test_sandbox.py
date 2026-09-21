@@ -4161,6 +4161,202 @@ class TestTheLibraryDirBesideABinInstall:
         assert answer is None or not original_home.is_relative_to(answer)
 
 
+def test_every_codex_link_slot_gets_both_of_its_rules():
+    """Same pair as a runtime slot, for the same reason: the subpath read grants
+    the tree, and the metadata rule grants the walk down to it under an opaque
+    $HOME. A slot with only the read is reachable by name and not by path."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, sandbox_macos._CODEX_LINK_SLOTS + 1):
+        param = f'(param "_CODEX_LINK_{index}")'
+        assert f"(allow file-read* (subpath {param}))" in _live_rules(profile, param)
+        assert f"(allow file-read-metadata (path-ancestors {param}))" in _live_rules(
+            profile, param
+        )
+    reads = _live_rules(profile, '(allow file-read* (subpath (param "_CODEX_LINK_')
+    assert len(reads) == sandbox_macos._CODEX_LINK_SLOTS, "a slot with no rule is dead"
+
+
+def test_the_codex_link_grants_come_before_the_cross_thread_denies():
+    """SBPL is last-match-wins. A grant placed after the session-store denies
+    would reopen every other thread's transcripts whenever a link named an
+    ancestor of them, which is the one thing these grants must not be able to do."""
+    lines = [
+        line.strip()
+        for line in sandbox._DENY_MOST_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    grant = next(i for i, line in enumerate(lines) if "_CODEX_LINK_1" in line)
+    deny = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("(deny file-read*") and "_CODEX_SESSIONS" in line
+    )
+    assert grant < deny
+
+
+class TestWhereTheCodexHomeLinksOut:
+    """The codex home's read grant covers the links, never what is behind them.
+
+    Seatbelt matches the path the kernel resolves, so an entry symlinked
+    elsewhere under the opaque $HOME reads as missing while the profile still
+    looks like it granted it. Measured with `~/.codex/agents -> ~/.agents/agents`:
+    codex exited 1 with "Operation not permitted (os error 1)" and named no path,
+    and the kernel logged `deny(1) file-read-data .../.agents/agents`.
+    """
+
+    @pytest.fixture
+    def codex_home(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / ".codex").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+        return home / ".codex"
+
+    def test_a_link_out_of_the_codex_home_is_granted(self, codex_home, tmp_path):
+        shared = tmp_path / "home" / ".agents" / "agents"
+        shared.mkdir(parents=True)
+        (codex_home / "agents").symlink_to(shared)
+        assert sandbox._codex_link_read_paths() == [shared]
+
+    def test_an_entry_inside_the_codex_home_costs_no_slot(self, codex_home):
+        """The grant on that home already covers it, and a slot is scarce."""
+        (codex_home / "agents").mkdir()
+        assert sandbox._codex_link_read_paths() == []
+
+    def test_a_link_outside_the_home_costs_no_slot(self, codex_home, tmp_path):
+        """deny-most allows reads globally and carves out $HOME alone, so a
+        target anywhere else is readable without spending anything on it."""
+        outside = tmp_path / "opt" / "agents"
+        outside.mkdir(parents=True)
+        (codex_home / "agents").symlink_to(outside)
+        assert sandbox._codex_link_read_paths() == []
+
+    def test_children_collapse_into_the_root_that_covers_them(
+        self, codex_home, tmp_path
+    ):
+        """`skills/` is merged entry by entry, so every child resolves separately
+        and a real home produced 54 targets. A subpath grant on the parent covers
+        all of them, and eight slots do not survive being spent one per child."""
+        shared = tmp_path / "home" / ".agents" / "skills"
+        (shared / "one").mkdir(parents=True)
+        (shared / "two").mkdir()
+        (codex_home / "skills").symlink_to(shared)
+        assert sandbox._codex_link_read_paths() == [shared]
+
+    def test_a_link_at_the_home_itself_is_refused_and_logged(
+        self, codex_home, tmp_path, caplog
+    ):
+        """An operator who points an entry at `$HOME` would otherwise hand back
+        every read deny-most exists to make, through a rule that looks routine."""
+        (codex_home / "agents").symlink_to(tmp_path / "home")
+        with caplog.at_level(logging.ERROR):
+            assert sandbox._codex_link_read_paths() == []
+        assert "cannot be granted" in caplog.text
+
+    def test_a_link_into_a_credential_store_is_refused(
+        self, codex_home, tmp_path, caplog
+    ):
+        ssh = tmp_path / "home" / ".ssh"
+        ssh.mkdir(parents=True)
+        (codex_home / "agents").symlink_to(ssh)
+        with caplog.at_level(logging.ERROR):
+            assert sandbox._codex_link_read_paths() == []
+        assert ".ssh" in caplog.text
+
+
+class TestTheCodexLinkSlots:
+    def test_the_slots_carry_the_links_under_deny_most(self, tmp_path):
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=str(tmp_path),
+            data_dir=str(tmp_path / "data"),
+            project=str(tmp_path / "ws"),
+            tmpdir=str(tmp_path / "tmp"),
+            claude_config=str(tmp_path / ".claude"),
+            claude_projects=str(tmp_path / "projects"),
+            claude_project=str(tmp_path / "projects" / "one"),
+            codex_sessions=str(tmp_path / "sessions"),
+            codex_home=str(tmp_path / "codex"),
+            codex_operator_home=str(tmp_path / ".codex"),
+            pane_socket=str(tmp_path / "pane"),
+            base=sandbox_macos._DENY_MOST_PROFILE,
+            loopback=("localhost:1", "localhost:1", "localhost:1", "localhost:1"),
+            extra_paths=[],
+            codex_link_paths=[str(tmp_path / "shared")],
+        )
+        assert f"_CODEX_LINK_1={tmp_path / 'shared'}" in argv
+        # The rest pad to the project dir, which is already granted.
+        assert f"_CODEX_LINK_8={tmp_path / 'ws'}" in argv
+
+    def test_the_other_base_is_passed_none_of_them(self, tmp_path):
+        """fs-allow-reads.sb never names the parameter, and sandbox-exec refuses a
+        profile handed a -D it does not use."""
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=str(tmp_path),
+            data_dir=str(tmp_path / "data"),
+            project=str(tmp_path / "ws"),
+            tmpdir=str(tmp_path / "tmp"),
+            claude_config=str(tmp_path / ".claude"),
+            claude_projects=str(tmp_path / "projects"),
+            claude_project=str(tmp_path / "projects" / "one"),
+            codex_sessions=str(tmp_path / "sessions"),
+            codex_home=str(tmp_path / "codex"),
+            codex_operator_home=str(tmp_path / ".codex"),
+            pane_socket=str(tmp_path / "pane"),
+            base=sandbox_macos._BASE_PROFILE,
+            loopback=("localhost:1", "localhost:1", "localhost:1", "localhost:1"),
+            extra_paths=[],
+            codex_link_paths=[str(tmp_path / "shared")],
+        )
+        assert not [item for item in argv if item.startswith("_CODEX_LINK_")]
+
+    def test_an_overflow_warns_and_names_what_it_dropped(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """Dropping one silently hides an instruction file the operator believes
+        is in force, and codex reports it as missing rather than as denied."""
+        monkeypatch.setattr(sandbox_macos, "_CODEX_LINK_SLOTS", 2)
+        with caplog.at_level(logging.WARNING):
+            argv = sandbox_macos.jail_argv(
+                ["/bin/echo"],
+                home=str(tmp_path),
+                data_dir=str(tmp_path / "data"),
+                project=str(tmp_path / "ws"),
+                tmpdir=str(tmp_path / "tmp"),
+                claude_config=str(tmp_path / ".claude"),
+                claude_projects=str(tmp_path / "projects"),
+                claude_project=str(tmp_path / "projects" / "one"),
+                codex_sessions=str(tmp_path / "sessions"),
+                codex_home=str(tmp_path / "codex"),
+                codex_operator_home=str(tmp_path / ".codex"),
+                pane_socket=str(tmp_path / "pane"),
+                base=sandbox_macos._DENY_MOST_PROFILE,
+                loopback=("localhost:1", "localhost:1", "localhost:1", "localhost:1"),
+                extra_paths=[],
+                codex_link_paths=["/a", "/b", "/dropped"],
+            )
+        assert "/dropped" in caplog.text
+        assert "/dropped" not in argv
+
+
+class TestCollapsingToTheShortestRoots:
+    def test_a_child_of_a_kept_root_is_dropped(self, tmp_path):
+        parent = tmp_path / "skills"
+        assert sandbox._shortest_roots([parent / "one", parent, parent / "two"]) == [
+            parent
+        ]
+
+    def test_unrelated_roots_all_survive(self, tmp_path):
+        roots = [tmp_path / "a", tmp_path / "b"]
+        assert sorted(sandbox._shortest_roots(roots)) == sorted(roots)
+
+    def test_the_same_path_twice_costs_one_slot(self, tmp_path):
+        assert sandbox._shortest_roots([tmp_path / "a", tmp_path / "a"]) == [
+            tmp_path / "a"
+        ]
+
+
 class TestTheBinariesAWrapperExecs:
     def test_claude_pty_contributes_claude_and_tmux(self, monkeypatch, tmp_path):
         """`argv[0]` is the wrapper, a shell script. Under deny-most neither the

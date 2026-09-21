@@ -67,6 +67,18 @@ _RUNTIME_SLOTS = 16
 # with room for a data dir a few levels deeper; a longer chain is truncated from
 # the top and logged, since every link is needed for the walk to succeed.
 _ANCESTOR_SLOTS = 8
+# Read slots for what the operator's codex home links *out* to. A grant on that
+# home covers the links themselves and nothing behind them, because seatbelt
+# matches the path the kernel resolves, so an entry symlinked elsewhere under the
+# opaque $HOME is unreadable while the profile still claims to grant it. The
+# Linux jail has always mounted these targets read-only; this is the macOS half
+# of the same grant. Measured on a real home where `~/.codex/agents` points at
+# `~/.agents/agents`: codex exited 1 with "Operation not permitted (os error 1)"
+# and the kernel logged `deny(1) file-read-data /Users/<user>/.agents/agents`.
+# Eight because the list is collapsed to its shortest roots first, which took a
+# home with 54 link targets down to 3; the rest is headroom, and an overflow
+# warns and names what it dropped.
+_CODEX_LINK_SLOTS = 8
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -130,6 +142,7 @@ def jail_argv(
     base: Path,
     loopback: tuple[str, str, str, str],
     extra_paths: list[str],
+    codex_link_paths: list[str] | None = None,
     runtime_paths: list[str] | None = None,
     ancestor_paths: list[str] | None = None,
     profile: Path | None = None,
@@ -199,6 +212,24 @@ def jail_argv(
         extra += [str(project)] * (_MAX_EXTRA_PATHS - len(extra))
         for index, path in enumerate(extra, start=1):
             params += ["-D", f"_EXTRA_{index}={path}"]
+        # Where the operator's codex home links out to. Caller-filtered and
+        # caller-collapsed, so a full list here is a real layout rather than
+        # noise, and dropping one hides an instruction file the operator
+        # believes is in force.
+        links = [*(codex_link_paths or [])]
+        if len(links) > _CODEX_LINK_SLOTS:
+            logger.warning(
+                "sandbox: the codex home links out to %d places but there are "
+                "only %d slots; dropping %s. codex will report those as missing "
+                "rather than as denied. Name them in sandbox.extra_paths",
+                len(links),
+                _CODEX_LINK_SLOTS,
+                links[_CODEX_LINK_SLOTS:],
+            )
+        links = links[:_CODEX_LINK_SLOTS]
+        links += [str(project)] * (_CODEX_LINK_SLOTS - len(links))
+        for index, path in enumerate(links, start=1):
+            params += ["-D", f"_CODEX_LINK_{index}={path}"]
         # Without these the profile cannot exec a backend or interpreter living
         # under the opaque $HOME, which is where npm globals and uv virtualenvs
         # normally are. The set is caller-supplied and fixed, unlike operator

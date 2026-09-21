@@ -824,6 +824,72 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     return granted
 
 
+def _shortest_roots(paths: list[Path]) -> list[Path]:
+    """`paths` with every entry that sits under another entry removed.
+
+    A seatbelt subpath grant already covers everything below it, so keeping a
+    child as well spends a slot on a rule that changes nothing. Shallowest first,
+    so a parent is always seen before the children it absorbs.
+    """
+    ordered = sorted({str(p): p for p in paths}.values(), key=lambda p: len(p.parts))
+    roots: list[Path] = []
+    for path in ordered:
+        if not any(path.is_relative_to(root) for root in roots):
+            roots.append(path)
+    return roots
+
+
+def _codex_link_read_paths() -> list[Path]:
+    """Resolved link targets of the operator's codex home that deny-most hides.
+
+    The read grant on that home covers the links and not what they point at:
+    seatbelt matches the path the kernel resolves, so an entry symlinked
+    elsewhere under the opaque $HOME is unreadable while the profile still reads
+    as though it were granted. Sharing one set of agents, skills or instructions
+    between backends is the ordinary way to get there -- `~/.codex/agents ->
+    ~/.agents/agents` is what found this, and codex exited 1 with "Operation not
+    permitted (os error 1)" with no path in the message. The kernel named it:
+    `deny(1) file-read-data /Users/<user>/.agents/agents`.
+
+    The Linux jail has mounted these targets read-only since the session
+    boundary landed, for the same reason in mount terms. This is the macOS half.
+
+    Three filters, in order of how much they remove. A target outside $HOME needs
+    nothing, since deny-most allows reads globally and only carves the home out.
+    A target inside the codex home or the claude config dir is already granted by
+    the rule for that tree. And a target `sandbox.extra_paths` would refuse is
+    refused here too: an operator who links `~/.codex/agents` at `$HOME` or at
+    `~/.ssh` gets a logged refusal rather than a profile that re-opens the home.
+    """
+    from claude_on_the_fly import codex_state, envfile
+
+    home = Path(os.path.realpath(Path.home()))
+    operator = _codex_operator_home()
+    granted = [
+        operator,
+        Path(os.path.realpath(envfile.claude_config_dir())),
+        home / ".claude",
+    ]
+    kept: list[Path] = []
+    for target in codex_state.shared_link_targets(operator):
+        if not target.is_relative_to(home):
+            continue
+        if any(target.is_relative_to(tree) for tree in granted):
+            continue
+        refusal = _extra_path_refusal(target)
+        if refusal is not None:
+            logger.error(
+                "sandbox: the codex home links to %s, which cannot be granted "
+                "because %s. codex will report it as missing. Repoint the link "
+                "or move the content out of that tree",
+                target,
+                refusal,
+            )
+            continue
+        kept.append(target)
+    return _shortest_roots(kept)
+
+
 def _deny_most_in_force() -> bool:
     """Whether the least-privilege filesystem shape applies.
 
@@ -1798,6 +1864,14 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
+        # Only under deny-most. The other base allows reads across $HOME, so
+        # every one of these is already reachable and computing them would buy a
+        # directory walk per spawn for nothing.
+        codex_link_paths=(
+            [str(path) for path in _codex_link_read_paths()]
+            if base == _DENY_MOST_PROFILE
+            else []
+        ),
         ancestor_paths=sandbox_macos.home_ancestors(
             resolved["project"], resolved["home"]
         ),
