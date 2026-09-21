@@ -967,6 +967,38 @@ def agent_guidance(workspace: Path | None = None) -> str:
 _RUNTIME_SLOTS = 5
 
 
+# The binaries a wrapper execs, which `argv[0]` alone never names. claude-pty is
+# a shell script: it runs `claude` for the turn and `tmux` to host it in a pane.
+# Under deny-most neither is granted, so the script dies rc 127 before it does
+# anything, and the failure reads as "command not found" rather than as a denial.
+_EXECS_BEHIND = {"claude-pty": ("claude", "tmux")}
+
+
+def _install_library_dir(binary: Path) -> Path | None:
+    """The `lib/` beside a `<prefix>/bin/<name>` install, when there is one.
+
+    A CLI in `bin/` keeps its code in a sibling rather than beside itself: node
+    puts it in `<prefix>/lib/node_modules`, so granting `bin/` alone leaves the
+    package unreadable. Measured under deny-most: "Cannot read package config
+    .../@openai/codex/package.json: operation not permitted", after the binary
+    had already started.
+
+    `lib/` and not the prefix. The prefix is whatever the installer chose, and
+    for `~/.local/bin/claude` that is `~/.local` -- one grant covering mise's
+    installs, its state and every other tool the operator keeps there, to buy
+    nothing, because claude's code is under `~/.local/share` rather than in a
+    sibling `lib/`. Asking for the directory that actually holds the code keeps
+    the grant the size of the problem.
+
+    None when it does not exist, so a layout that keeps its code elsewhere costs
+    no slot at all.
+    """
+    if binary.parent.name != "bin":
+        return None
+    library = binary.parent.parent / "lib"
+    return library if library.is_dir() else None
+
+
 def _runtime_read_paths(argv: list[str]) -> list[Path]:
     """Directories the jail must read to run the thing it is jailing.
 
@@ -988,10 +1020,19 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     SIGABRT before running a line -- which under `deny-most` made the egress
     preflight inconclusive and refused to start *any* turn, on the project's own
     documented install method.
+
+    A wrapper contributes the binaries it execs as well as itself, and a
+    `<prefix>/bin/<name>` install contributes the `lib/` beside it. See `_EXECS_BEHIND` and
+    `_install_library_dir` for what each is worth and how far each reaches.
     """
     paths: list[Path] = []
-    binary = shutil.which(argv[0]) if argv else None
-    if binary:
+    names = list(argv[:1])
+    if names:
+        names += _EXECS_BEHIND.get(Path(names[0]).name, ())
+    for name in names:
+        binary = shutil.which(name)
+        if binary is None:
+            continue
         # Two directories, because a launcher and the code it runs need not share
         # one. `claude` installs as a symlink in ~/.local/bin pointing into
         # ~/.local/share/claude/versions/<v>, and granting only the resolved
@@ -1004,8 +1045,11 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
         # The parent in each case, not the file: an npm-installed CLI is a shim
         # beside the package tree it loads. Read-only, and they hold executables
         # rather than secrets.
-        paths.append(Path(binary).parent)
-        paths.append(Path(os.path.realpath(binary)).parent)
+        for candidate in (Path(binary), Path(os.path.realpath(binary))):
+            paths.append(candidate.parent)
+            library = _install_library_dir(candidate)
+            if library is not None:
+                paths.append(library)
     paths += [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
     seen: dict[str, Path] = {}
     for path in paths:

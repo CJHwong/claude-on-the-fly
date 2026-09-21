@@ -35,10 +35,21 @@ sandbox:
   broker_only_loopback: true
 ```
 
-`deny-most` hides most of `$HOME`. Add the directories containing interpreters and
-package managers. The directory holding the agent binary is granted automatically.
+`deny-most` hides most of `$HOME`. The agent binary is granted automatically, along
+with the interpreter behind it, the `lib/` beside a `bin/` install, and the binaries a
+wrapper execs. Add anything else the agent needs to read.
 
 If the agent works with git, add `~/.gitconfig` as well: git refuses to run when it cannot read its global config, and `deny-most` hides that file with the rest of the home.
+
+If you run claude with hooks, add the directory holding the hook scripts. A hook that
+cannot be read does not stop the turn: claude answers, then the hook fails, and in pty
+mode the failing hook is the one that writes the turn's envelope. The error names the
+script rather than the sandbox, so it is easy to misread.
+
+A toolchain shim needs more than a read grant and may not work at all. `mise` reads its
+own config, which a grant covers, and then writes a tracking symlink under
+`~/.local/state/mise`, which no `extra_paths` entry can permit: these grants are
+read-only by design. Point `PATH` at the real binary rather than the shim.
 
 Name each directory, never `$HOME` itself. A grant is written after the profile's
 denies and wins over them, so `$HOME` gives the agent back `~/.ssh` and `~/.aws` in one

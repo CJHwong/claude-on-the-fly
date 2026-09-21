@@ -4022,17 +4022,39 @@ def test_a_symlinked_interpreter_prefix_is_granted_by_its_resolved_name(
     assert str(real) in paths, "the resolved name is what the kernel matches"
 
 
-def test_there_are_enough_runtime_slots_for_both_names(monkeypatch, tmp_path):
-    """Five slots truncated silently, and a dropped grant surfaces as a dead
-    interpreter rather than as a denial. Two entries for the binary plus two each
-    for sys.prefix, sys.base_prefix and the package directory is eight."""
-    assert sandbox_macos._RUNTIME_SLOTS >= 8
-    live = [
-        line
-        for line in sandbox._DENY_MOST_PROFILE.read_text().splitlines()
-        if not line.strip().startswith(";;") and "_RUNTIME_" in line
+def _live_rules(profile, needle):
+    return [
+        line.strip()
+        for line in profile.read_text().splitlines()
+        if not line.strip().startswith(";;") and needle in line
     ]
-    assert len(live) == sandbox_macos._RUNTIME_SLOTS
+
+
+def test_every_runtime_slot_gets_both_of_its_rules():
+    """Each slot needs two: the subpath read, and metadata on the directories
+    above it. A slot with only the read is the node failure -- the binary's own
+    directory granted and `lstat '/Users/hoss/.local'` refused on the way to it."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, sandbox_macos._RUNTIME_SLOTS + 1):
+        param = f'(param "_RUNTIME_{index}")'
+        assert f"(allow file-read* (subpath {param}))" in _live_rules(profile, param)
+        assert f"(allow file-read-metadata (path-ancestors {param}))" in _live_rules(
+            profile, param
+        )
+    reads = _live_rules(profile, '(allow file-read* (subpath (param "_RUNTIME_')
+    assert len(reads) == sandbox_macos._RUNTIME_SLOTS, "a slot with no rule is dead"
+
+
+def test_operator_grants_get_ancestor_metadata_too():
+    """`extra_paths` is the remedy an agent is told to ask for when a read is
+    blocked, so it has to actually work. A grant on a deep directory under the
+    opaque home is unreachable without metadata on the path down to it."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, 4):
+        param = f'(param "_EXTRA_{index}")'
+        assert f"(allow file-read-metadata (path-ancestors {param}))" in _live_rules(
+            profile, param
+        )
 
 
 def test_linux_drops_the_symlinked_form_of_a_runtime_path(linux, tmp_path, monkeypatch):
@@ -4103,3 +4125,65 @@ def test_runtime_paths_past_the_slot_count_are_reported(caplog, tmp_path):
     assert overflow[-1] in caplog.text
     granted = {arg for arg in argv if arg.startswith("_RUNTIME_")}
     assert len(granted) == sandbox_macos._RUNTIME_SLOTS
+
+
+# --- what a runtime grant reaches beyond the binary's own directory ---
+
+
+class TestTheLibraryDirBesideABinInstall:
+    """A CLI in `bin/` keeps its code in a sibling, not beside itself."""
+
+    def test_a_bin_install_contributes_its_sibling_lib(self, tmp_path):
+        """Measured before this: codex started and then died with "Cannot read
+        package config .../@openai/codex/package.json: operation not permitted",
+        because node keeps the package under `<prefix>/lib/node_modules`."""
+        prefix = tmp_path / "node" / "20.18.1"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "lib").mkdir()
+        assert sandbox._install_library_dir(prefix / "bin" / "codex") == prefix / "lib"
+
+    def test_a_layout_with_no_sibling_lib_costs_no_slot(self, tmp_path):
+        prefix = tmp_path / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        assert sandbox._install_library_dir(prefix / "bin" / "agent") is None
+
+    def test_a_binary_outside_a_bin_directory_is_left_alone(self, tmp_path):
+        (tmp_path / "lib").mkdir()
+        assert sandbox._install_library_dir(tmp_path / "sbin" / "agent") is None
+
+    def test_it_never_hands_back_the_home_directory(self, original_home, monkeypatch):
+        """`~/bin/agent` would make the prefix `$HOME` itself. Asking for `lib/`
+        rather than the prefix is what makes that structurally impossible, so this
+        pins the property rather than a guard that could be deleted."""
+        monkeypatch.setenv("HOME", str(original_home))
+        answer = sandbox._install_library_dir(original_home / "bin" / "agent")
+        assert answer != original_home
+        assert answer is None or not original_home.is_relative_to(answer)
+
+
+class TestTheBinariesAWrapperExecs:
+    def test_claude_pty_contributes_claude_and_tmux(self, monkeypatch, tmp_path):
+        """`argv[0]` is the wrapper, a shell script. Under deny-most neither the
+        claude it runs nor the tmux it hosts the turn in was granted, and the
+        script died rc 127 -- which reads as "command not found", not as a jail."""
+        seen: list[str] = []
+
+        def fake_which(name):
+            seen.append(name)
+            return str(tmp_path / "bin" / name)
+
+        (tmp_path / "bin").mkdir()
+        monkeypatch.setattr(shutil, "which", fake_which)
+        sandbox._runtime_read_paths(["/somewhere/bin/claude-pty"])
+        assert "claude" in seen and "tmux" in seen
+
+    def test_a_plain_binary_brings_nothing_extra(self, monkeypatch, tmp_path):
+        seen: list[str] = []
+
+        def fake_which(name):
+            seen.append(name)
+            return str(tmp_path / name)
+
+        monkeypatch.setattr(shutil, "which", fake_which)
+        sandbox._runtime_read_paths(["codex"])
+        assert seen == ["codex"]

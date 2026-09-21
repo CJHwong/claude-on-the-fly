@@ -61,6 +61,9 @@ upgrade path, so none of that was covered by it.
 | The Linux jail aborted outright on any merged-usr distribution: `bwrap: Can't mount on symlink destination /bin`. Debian, Ubuntu and Fedora all ship `/bin` and `/lib` as symlinks, so this is the normal layout rather than an exotic one | `sandbox._linux_wrap` | bwrap mounts rather than matches, and refuses a symlink destination by aborting the whole jail rather than dropping one grant. The Linux plan now takes the resolved form only, which the entry above already puts in the list. Measured in a container on the real `_linux_grants` output. This had been hiding behind the parity suite: with the jail aborting, every probe failed, and a failed read is what the contract reads as `deny`. Five parity cases that expect `allow` failed on `origin/main` and pass here, and the dotenv case that expects `deny` passed there for no reason at all |
 | Handing a jailed claude its keychain credential crashed every jailed turn on Linux. `read_keychain` shells out to `security`, which only macOS has, and `_claude_oauth_token` caught `KeyError` but not the `FileNotFoundError` a missing binary raises | `sandbox._claude_oauth_token` | Guarded on platform and on `OSError`. Introduced earlier on this same branch and caught before merge by running the Linux jail in a container -- reading the code had not found it in two passes |
 | Jailed `claude-pty` could not run on Linux at all: the startup lock is a `mkdir` in the claude config directory, which the Linux jail mounts read-only | `sandbox.claude_pty_startup_is_delegated`, `backends/claude._hold_pty_startup_gate` | A writable mount over the lock is not a fix -- the `mkdir` then fails with `EEXIST` and the script's recovery only reclaims a lock whose pid file names a dead process, so it spins identically. An overlay is not a fix either: a private one per turn makes the lock succeed while serializing nothing, a shared one hands two threads a writable directory they both see. So the daemon takes the script's documented `CLAUDE_PTY_NO_LOCK=1` and holds the boot window itself. Measured in a container both ways: 0.1s with the fix, and `lock wait timeout after 8s (holder pid=unknown)` with the variable removed and nothing else changed |
+| A runtime read grant reached the binary's own directory and nothing above it. Anything that canonicalizes its own path then died before running: node resolves its main module with `realpath`, which `lstat`s every ancestor, and the opaque `$HOME` refused `lstat '/Users/hoss/.local'` | `seatbelt/fs-deny-most.sb` | Metadata on the whole chain via seatbelt's own `(path-ancestors ...)` filter, for every `_RUNTIME_*` and `_EXTRA_*` slot. Metadata only -- the name and mode of each directory on the way down, never its listing and never its siblings. The `_ANCESTOR_*` literals predate the filter and still serve the project dir; one job, two mechanisms, worth collapsing later |
+| The grant was the binary's parent directory, which misses a prefix-style install: the CLI sits in `<prefix>/bin` and its code in `<prefix>/lib/node_modules`, a sibling. codex started and then died on `Cannot read package config .../@openai/codex/package.json: operation not permitted` | `sandbox._install_library_dir` | Grant the `lib/` beside a `bin/` install, when there is one. `lib/` rather than the prefix on purpose: for `~/.local/bin/claude` the prefix is `~/.local`, one grant covering mise's installs, its state and every other tool kept there, to buy nothing -- claude's code is under `~/.local/share`. Asking for the directory that holds the code also makes it structurally impossible to hand back `$HOME` |
+| pty mode granted `argv[0]` only. `claude-pty` is a shell script that execs `claude` for the turn and `tmux` to host it, neither of them granted, so under `deny-most` it died `rc 127` -- which reads as "command not found" rather than as a jail | `sandbox._EXECS_BEHIND` | A wrapper now contributes the binaries it execs. With this, the ancestors and the `lib/` grant, a jailed `claude-pty` turn under `deny-most` answered `PASS 4s`, having previously produced no envelope at all |
 
 ## Open
 
@@ -178,15 +181,25 @@ still collide with a jailed turn during claude's one-second supervisor boot, and
 symptom is a hung TUI rather than an error. Accepted: it is strictly better than the
 turn never running, which is what Linux did before.
 
-**`sandbox.fs: deny-most` still cannot complete a codex or a pty turn on macOS.** The
-preflight fix above got `deny-most` as far as starting turns, and `claude-native`
-completes one (`PASS 8s`). The other three do not. codex stops on
-`Error: Operation not permitted (os error 1)`, whose backtrace names
-`std::fs::File::set_times`, so something it touches is denied a `utimes()` that
-`allow-reads` permits; `claude-pty` produces no envelope. `deny-most` is documented as
-needing operator `extra_paths` tuning, and `/opt/homebrew` plus the mise install tree
-did not change any of the three, so at least part of this is a real gap rather than
-configuration. Not chased further. `deny-most` is opt-in and off by default.
+**`sandbox.fs: deny-most` runs claude but not codex, and needs operator tuning for
+pty.** With the three grants above, `claude-native` and `claude-pty` both complete a
+real turn under `deny-most`. Two things remain.
+
+The pty turn needs `extra_paths` for wherever the operator's claude hooks live. On the
+machine this was measured on they sit under `~/.rhapsody/cache/pty/hooks`, and without
+the grant claude answers correctly and then the Stop hook that writes the envelope
+fails: `bash: .../stop_envelope.sh: Operation not permitted`. cotf cannot know that
+path, so this is the tuning surface working as designed rather than a defect -- but it
+fails in a way that names a hook rather than a sandbox, which is worth knowing.
+
+codex does not run at all when it is reached through a `mise` shim. mise reads
+`~/.config/mise/config.toml`, which `extra_paths` can grant, and then wants to write a
+tracking symlink under `~/.local/state/mise`, which it cannot: `extra_paths` grants
+reads only, and deliberately. Measured down to `mise WARN tracking config: failed to
+ln -sf`. The real codex binary behind the shim reaches config parsing under
+`deny-most`, so this is the launcher rather than codex. Options not taken: a write-side
+operator grant, or resolving a shim to the binary it execs. `deny-most` is opt-in and
+off by default.
 
 ### Cross-conversation writes
 

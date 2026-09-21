@@ -49,12 +49,14 @@ _LOOPBACK_SLOTS = 4
 # binary's directory, sys.prefix, sys.base_prefix, package dir. Five because a
 # launcher and the code it runs need not share a directory: `claude` is a symlink
 # in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>.
-# Eight, not five: every runtime path is granted as written and as resolved, and
-# five silently truncated the list. A dropped grant reads as a missing binary or
-# a dead interpreter, never as a denial, so the ceiling has to clear the worst
-# case rather than the common one. Two entries for the binary plus two each for
-# sys.prefix, sys.base_prefix and the package directory is eight.
-_RUNTIME_SLOTS = 8
+# Sixteen. Five silently truncated the list, and a dropped grant reads as a
+# missing binary or a dead interpreter rather than as a denial, so the ceiling
+# has to clear the worst case rather than the common one. Measured on the widest
+# real argv, `claude-pty`, which contributes itself plus the `claude` and `tmux`
+# it execs, each as written and as resolved, each with the `lib/` beside it, plus
+# sys.prefix, sys.base_prefix and the package directory: eleven. The rest is
+# headroom for a deeper layout, and the overflow still warns.
+_RUNTIME_SLOTS = 16
 # Metadata slots for the directories between $HOME and the project dir. A read
 # grant on the project subpath says nothing about its parents, and an opaque
 # $HOME denies even stat() on them, which breaks any tool that canonicalizes its

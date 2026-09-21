@@ -20,7 +20,7 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_8
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_16
 ;; and _ANCESTOR_1.._ANCESTOR_8
 ;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
@@ -123,11 +123,47 @@
 (allow file-read* (subpath (param "_RUNTIME_6")))
 (allow file-read* (subpath (param "_RUNTIME_7")))
 (allow file-read* (subpath (param "_RUNTIME_8")))
+(allow file-read* (subpath (param "_RUNTIME_9")))
+(allow file-read* (subpath (param "_RUNTIME_10")))
+(allow file-read* (subpath (param "_RUNTIME_11")))
+(allow file-read* (subpath (param "_RUNTIME_12")))
+(allow file-read* (subpath (param "_RUNTIME_13")))
+(allow file-read* (subpath (param "_RUNTIME_14")))
+(allow file-read* (subpath (param "_RUNTIME_15")))
+(allow file-read* (subpath (param "_RUNTIME_16")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
 ;; at _PROJECT_DIR, already allowed above, so they add nothing.
 (allow file-read* (subpath (param "_EXTRA_1")))
 (allow file-read* (subpath (param "_EXTRA_2")))
 (allow file-read* (subpath (param "_EXTRA_3")))
+;; Metadata on every directory above a runtime or operator grant. A subpath
+;; grant says nothing about the parents that lead to it, and the opaque $HOME
+;; denies stat() on them, so anything that canonicalizes its own path dies
+;; before it runs: node resolves its main module with realpath() and failed on
+;; `lstat '/Users/hoss/.local'` with the binary's own directory already
+;; granted. `path-ancestors` is seatbelt's own filter for this and needs no
+;; slot arithmetic, unlike the _ANCESTOR_* literals below, which predate it
+;; and still serve the project dir. Metadata only: the name and mode of each
+;; directory on the way down, never its listing and never its siblings.
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_1")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_2")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_3")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_4")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_5")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_6")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_7")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_8")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_9")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_10")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_11")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_12")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_13")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_14")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_15")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_16")))
+(allow file-read-metadata (path-ancestors (param "_EXTRA_1")))
+(allow file-read-metadata (path-ancestors (param "_EXTRA_2")))
+(allow file-read-metadata (path-ancestors (param "_EXTRA_3")))
 ;; Metadata on the directories between $HOME and the project dir. The subpath
 ;; grant on _PROJECT_DIR does not reach its parents, and the opaque $HOME denies
 ;; stat() on them, so a tool that canonicalizes its cwd fails before it starts:
