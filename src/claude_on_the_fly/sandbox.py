@@ -119,9 +119,16 @@ def _claude_oauth_token() -> str | None:
     """
     from claude_on_the_fly import broker
 
+    # The login keychain is a macOS store, and `read_keychain` shells out to
+    # `security`, which no other platform has. Without this guard the missing
+    # binary raises FileNotFoundError out of agent_env and takes down every
+    # jailed turn on Linux -- caught by running the Linux jail in a container,
+    # not by reading the code.
+    if _platform() != "darwin":
+        return None
     try:
         raw = broker.read_keychain(_CLAUDE_KEYCHAIN_SERVICE)
-    except KeyError:
+    except (KeyError, OSError):
         return None
     try:
         oauth = json.loads(raw)["claudeAiOauth"]
@@ -147,6 +154,30 @@ def _claude_oauth_token() -> str | None:
             "authenticate"
         )
     return token
+
+
+def claude_pty_startup_is_delegated() -> bool:
+    """True when the daemon has to serialize claude-pty's startup itself.
+
+    claude-pty gates claude's supervisor boot with `mkdir <config>/.pty-lock`,
+    because two TUIs entering that boot window together leave one hung. The Linux
+    jail mounts the config directory read-only, so the mkdir fails and the script
+    spins to its timeout. Measured in a container: "mkdir: cannot create
+    directory '/root/.claude/.pty-lock': Read-only file system".
+
+    A writable mount over the lock is not the fix. The mkdir then fails with
+    EEXIST, and the script's recovery only reclaims a lock whose pid file names a
+    dead process, so an always-present directory spins exactly the same way. An
+    overlay is not the fix either: a private one per turn makes the lock succeed
+    while serializing nothing, which is worse than not locking, and a shared one
+    gives two threads a writable directory they can both see.
+
+    So on Linux the daemon takes the escape hatch the script documents,
+    CLAUDE_PTY_NO_LOCK=1, and holds the gate itself. Say the narrower guarantee
+    out loud: this covers the turns this daemon starts, not a claude the operator
+    runs in their own terminal on the same host.
+    """
+    return mode() == "jail" and _platform() == "linux"
 
 
 _PROXY_VARS = frozenset(
@@ -480,6 +511,10 @@ def agent_env() -> dict[str, str] | None:
     # setdefault, not assignment: the key is a passthrough one, so an operator who
     # set it in the daemon environment has already said what they want.
     env.setdefault("CLAUDE_PTY_LOCK_WAIT_SEC", _PTY_LOCK_WAIT_SECONDS)
+    # Assignment, not setdefault: where the lock cannot be taken at all, an
+    # operator who set this to 0 would be asking for a turn that always spins.
+    if claude_pty_startup_is_delegated():
+        env["CLAUDE_PTY_NO_LOCK"] = "1"
     # Only on this branch, never when the sandbox is off: an environment token
     # shadows the CLI's stored credential, so setting it on a turn that can reach
     # the keychain would change how an unjailed turn authenticates for no reason.
@@ -943,6 +978,16 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     needed, and outside one they collapse to the same path harmlessly. The
     package directory is listed separately because an editable install leaves it
     outside either prefix, and the Linux relay launcher imports from it.
+
+    Every entry is listed twice, as written and as resolved, because seatbelt
+    matches the path the kernel arrives at and a grant naming a symlink covers
+    nothing. uv is the case this was measured on: `sys.base_prefix` is
+    `.../uv/python/cpython-3.12-macos-aarch64-none`, a symlink to the same name
+    carrying the patch version. The grant matched nothing, dyld could not load
+    `lib/libpython3.12.dylib` from the resolved tree, and the interpreter died on
+    SIGABRT before running a line -- which under `deny-most` made the egress
+    preflight inconclusive and refused to start *any* turn, on the project's own
+    documented install method.
     """
     paths: list[Path] = []
     binary = shutil.which(argv[0]) if argv else None
@@ -965,6 +1010,8 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     seen: dict[str, Path] = {}
     for path in paths:
         seen.setdefault(str(path), path)
+        resolved = Path(os.path.realpath(path))
+        seen.setdefault(str(resolved), resolved)
     return list(seen.values())
 
 
@@ -1557,7 +1604,19 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # The parent directory rather than the file: an npm-installed CLI is a shim
     # next to the package tree it loads. Read-only, and it holds executables
     # rather than secrets.
-    grants["read_only"] += _runtime_read_paths(argv)
+    #
+    # Resolved form only. bwrap mounts rather than matches, and it refuses a
+    # symlink destination outright -- "Can't mount on symlink destination /bin",
+    # which aborts the whole jail rather than dropping one grant. Merged-usr is
+    # the normal layout on Debian, Ubuntu and Fedora, so `/bin` and `/lib` are
+    # symlinks on most Linux hosts. `_runtime_read_paths` lists every entry both
+    # as written and as resolved for seatbelt's sake, so dropping the symlink
+    # form here costs nothing: the twin it resolves to is already in the list.
+    grants["read_only"] += [
+        path
+        for path in _runtime_read_paths(argv)
+        if str(path) == os.path.realpath(path)
+    ]
     # Same reason `ensure_write_deny_targets` materialises its targets: a mount
     # source has to exist on the host, because bwrap cannot create one inside the
     # read-only root. Both are this turn's own session directories, so creating
@@ -1936,10 +1995,20 @@ _EGRESS_PROBE = (
 
 
 async def _run_jailed(argv: list[str], workspace: Path, timeout: int = 20):
-    """Run argv under the live jail. Returns (returncode, combined output)."""
+    """Run argv under the live jail. Returns (returncode, combined output).
+
+    In the workspace, because the child otherwise inherits whatever directory the
+    daemon was started from and `deny-most` grants no such thing. Measured: the
+    egress probe died on `getcwd()` before importing `socket`, since python
+    resolves the empty `sys.path` entry against the cwd. The failure names no
+    path and no rule -- `PermissionError: [Errno 1] Operation not permitted` out
+    of `importlib` -- and it made every turn refuse to start on a daemon launched
+    from an ungranted directory.
+    """
     proc = await asyncio.create_subprocess_exec(
         *wrap(argv, workspace),
         env=agent_env() or {},
+        cwd=workspace,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

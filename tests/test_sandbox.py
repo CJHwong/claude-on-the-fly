@@ -2642,6 +2642,13 @@ class TestTheJailedAgentGetsClaudesOwnCredential:
         {"claudeAiOauth": {"accessToken": "tok-abc", "expiresAt": 9_999_999_999_000}}
     )
 
+    @pytest.fixture(autouse=True)
+    def _on_macos(self, monkeypatch):
+        """The hand-off is a macOS keychain concept and is skipped everywhere else,
+        so these cases have to name the platform rather than inherit the runner's.
+        Without this the whole class passes on macOS and fails on Linux."""
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+
     @staticmethod
     def _keychain(monkeypatch, value):
         """Stand in for the keychain, raising KeyError the way read_keychain does."""
@@ -3214,6 +3221,23 @@ class TestSymlinkedExecutionControlPathsOnMacos:
     for their own reasons -- so it cried wolf on every start, which is how an
     operator learns to ignore the case that matters.
     """
+
+    @pytest.fixture(autouse=True)
+    def _on_macos(self, monkeypatch):
+        """The class name is the contract: this branch is seatbelt's. Linux answers
+        from the mount layout without spawning a probe, so these cases have to name
+        the platform rather than inherit the runner's. `sandbox-exec` too: on a
+        host that does not have it, `wrap` refuses before the probe it is here to
+        exercise ever runs."""
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+        real_which = shutil.which
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name: (
+                "/usr/bin/sandbox-exec" if name == "sandbox-exec" else real_which(name)
+            ),
+        )
 
     @staticmethod
     def _linked_home(monkeypatch, tmp_path):
@@ -3890,3 +3914,192 @@ async def test_the_relocated_codex_grant_keeps_the_history_deny_below_it(
     history.write_text("every prompt ever typed into codex\n")
     done = _run_jailed(["/bin/cat", str(history)], tmp_path)
     assert done.returncode != 0, f"codex prompt history was readable: {done.stdout!r}"
+
+
+# --- the claude-pty startup gate on Linux ---
+
+
+def test_linux_hands_the_pty_startup_lock_to_the_daemon(linux):
+    """claude-pty's lock is a mkdir in the config directory, which the Linux jail
+    mounts read-only. Measured in a container: "mkdir: cannot create directory
+    '/root/.claude/.pty-lock': Read-only file system", then a spin to the wait
+    timeout. So the daemon takes the script's documented escape hatch."""
+    assert sandbox.claude_pty_startup_is_delegated() is True
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["CLAUDE_PTY_NO_LOCK"] == "1"
+
+
+def test_macos_leaves_the_pty_startup_lock_where_it_is(monkeypatch):
+    """The seatbelt profiles grant the lock directory, so the script keeps its own
+    machine-wide lock there. Delegating on macOS too would narrow the guarantee to
+    this daemon's turns for nothing."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    assert sandbox.claude_pty_startup_is_delegated() is False
+    env = sandbox.agent_env()
+    assert env is not None
+    assert "CLAUDE_PTY_NO_LOCK" not in env
+
+
+def test_the_gate_is_not_delegated_when_there_is_no_jail(monkeypatch):
+    """Unjailed, the config directory is the operator's own and the mkdir works."""
+    monkeypatch.setenv("COTF_SANDBOX", "off")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    assert sandbox.claude_pty_startup_is_delegated() is False
+
+
+async def test_the_daemon_side_gate_serializes_the_boot_window(monkeypatch):
+    """What replaces the lock has to actually exclude. Released on a timer rather
+    than by the caller, because a turn outlives the race by minutes."""
+    from claude_on_the_fly.backends import claude as claude_backend
+
+    monkeypatch.setattr(claude_backend, "_PTY_STARTUP_WINDOW_SECONDS", 0.05)
+    monkeypatch.setattr(claude_backend, "_PTY_STARTUP_GATE", asyncio.Lock())
+    await claude_backend._hold_pty_startup_gate()
+    assert claude_backend._PTY_STARTUP_GATE.locked()
+    second = asyncio.ensure_future(claude_backend._hold_pty_startup_gate())
+    await asyncio.sleep(0)
+    assert not second.done(), "the second boot was not held back"
+    await asyncio.wait_for(second, timeout=2)
+    assert claude_backend._PTY_STARTUP_GATE.locked()
+    await asyncio.sleep(0.1)
+    assert not claude_backend._PTY_STARTUP_GATE.locked(), "the gate never reopened"
+
+
+# --- the credential hand-off is a macOS concept ---
+
+
+def test_the_keychain_is_never_consulted_off_macos(linux, monkeypatch):
+    """`read_keychain` shells out to `security`, which only macOS has. Without the
+    platform guard the missing binary raises FileNotFoundError out of agent_env and
+    takes down every jailed turn on Linux. Found by running the Linux jail in a
+    container, not by reading the code."""
+    from claude_on_the_fly import broker
+
+    def explode(_service):
+        raise FileNotFoundError(2, "No such file or directory", "security")
+
+    monkeypatch.setattr(broker, "read_keychain", explode)
+    assert sandbox._claude_oauth_token() is None
+    env = sandbox.agent_env()
+    assert env is not None
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+def test_a_keychain_that_cannot_be_read_is_not_fatal(monkeypatch):
+    """Same shape on macOS: an OSError from the `security` call is a missing
+    credential, not a reason to fail the daemon."""
+    from claude_on_the_fly import broker
+
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    monkeypatch.setattr(
+        broker, "read_keychain", lambda _s: (_ for _ in ()).throw(OSError("nope"))
+    )
+    assert sandbox._claude_oauth_token() is None
+
+
+# --- runtime read paths are granted as written and as resolved ---
+
+
+def test_a_symlinked_interpreter_prefix_is_granted_by_its_resolved_name(
+    monkeypatch, tmp_path
+):
+    """seatbelt matches the path the kernel arrives at, so a grant naming a symlink
+    covers nothing. uv is the measured case: sys.base_prefix is
+    `.../cpython-3.12-macos-aarch64-none`, a symlink to the same name with the
+    patch version, and the interpreter died on SIGABRT unable to load its own
+    libpython."""
+    import sys as sys_module
+
+    real = tmp_path / "cpython-3.12.9"
+    (real / "lib").mkdir(parents=True)
+    link = tmp_path / "cpython-3.12"
+    link.symlink_to(real)
+    monkeypatch.setattr(sys_module, "base_prefix", str(link))
+    paths = {str(path) for path in sandbox._runtime_read_paths(["/bin/echo"])}
+    assert str(link) in paths, "the name as written is still needed for execvp"
+    assert str(real) in paths, "the resolved name is what the kernel matches"
+
+
+def test_there_are_enough_runtime_slots_for_both_names(monkeypatch, tmp_path):
+    """Five slots truncated silently, and a dropped grant surfaces as a dead
+    interpreter rather than as a denial. Two entries for the binary plus two each
+    for sys.prefix, sys.base_prefix and the package directory is eight."""
+    assert sandbox_macos._RUNTIME_SLOTS >= 8
+    live = [
+        line
+        for line in sandbox._DENY_MOST_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;") and "_RUNTIME_" in line
+    ]
+    assert len(live) == sandbox_macos._RUNTIME_SLOTS
+
+
+def test_linux_drops_the_symlinked_form_of_a_runtime_path(linux, tmp_path, monkeypatch):
+    """bwrap mounts rather than matches, and refuses a symlink destination
+    outright: "Can't mount on symlink destination /bin", which aborts the whole
+    jail rather than dropping one grant. Merged-usr makes /bin a symlink on most
+    Linux hosts, so this is the normal layout and not an exotic one."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    real = tmp_path / "real-bin"
+    real.mkdir()
+    link = tmp_path / "link-bin"
+    link.symlink_to(real)
+    monkeypatch.setattr(shutil, "which", lambda name: str(link / name))
+    argv = sandbox._linux_wrap(["agent"], workspace)
+    mounted = {
+        argv[index + 1]
+        for index, item in enumerate(argv)
+        if item in ("--ro-bind", "--ro-bind-try")
+    }
+    assert str(link) not in mounted, "bwrap cannot mount on a symlink destination"
+    assert str(real) in mounted, "the resolved twin has to be granted instead"
+
+
+async def test_a_jailed_probe_runs_in_the_workspace_it_was_granted(tmp_path):
+    """`_run_jailed` used to inherit whatever directory the daemon was started
+    from, which `deny-most` grants no more than any other home path. Measured: the
+    egress probe died on `getcwd()` before importing `socket`, because python
+    resolves the empty sys.path entry against the cwd, and the error named neither
+    a path nor a rule -- `PermissionError: [Errno 1] Operation not permitted` out
+    of importlib. Every turn then refused to start."""
+    _seatbelt_or_skip()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    # sandbox._run_jailed, not the synchronous helper in this file: the cwd is
+    # the product's, and only the real one carries it.
+    code, out = await sandbox._run_jailed(["/bin/pwd"], workspace)
+    assert code == 0, out
+    assert out.strip() == os.path.realpath(workspace)
+
+
+def test_runtime_paths_past_the_slot_count_are_reported(caplog, tmp_path):
+    """A dropped grant surfaces as a dead interpreter rather than as a denial, so
+    silence here is the expensive kind. Warn, naming what was dropped."""
+    overflow = [
+        str(tmp_path / f"r{index}") for index in range(sandbox_macos._RUNTIME_SLOTS + 1)
+    ]
+    with caplog.at_level(logging.WARNING):
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=tmp_path,
+            data_dir=tmp_path / "d",
+            project=tmp_path / "p",
+            tmpdir=tmp_path / "t",
+            claude_config=tmp_path / "c",
+            claude_projects=tmp_path / "c/projects",
+            claude_project=tmp_path / "c/projects/x",
+            codex_sessions=tmp_path / "codex/sessions",
+            codex_home=tmp_path / "codex",
+            codex_operator_home=tmp_path / "codex",
+            pane_socket=tmp_path / "panes/tmux-501/default",
+            base=sandbox_macos._DENY_MOST_PROFILE,
+            loopback=("a", "b", "c", "d"),
+            extra_paths=[],
+            runtime_paths=overflow,
+        )
+    assert "runtime paths but only" in caplog.text
+    assert overflow[-1] in caplog.text
+    granted = {arg for arg in argv if arg.startswith("_RUNTIME_")}
+    assert len(granted) == sandbox_macos._RUNTIME_SLOTS

@@ -49,7 +49,12 @@ _LOOPBACK_SLOTS = 4
 # binary's directory, sys.prefix, sys.base_prefix, package dir. Five because a
 # launcher and the code it runs need not share a directory: `claude` is a symlink
 # in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>.
-_RUNTIME_SLOTS = 5
+# Eight, not five: every runtime path is granted as written and as resolved, and
+# five silently truncated the list. A dropped grant reads as a missing binary or
+# a dead interpreter, never as a denial, so the ceiling has to clear the worst
+# case rather than the common one. Two entries for the binary plus two each for
+# sys.prefix, sys.base_prefix and the package directory is eight.
+_RUNTIME_SLOTS = 8
 # Metadata slots for the directories between $HOME and the project dir. A read
 # grant on the project subpath says nothing about its parents, and an opaque
 # $HOME denies even stat() on them, which breaks any tool that canonicalizes its
@@ -194,8 +199,20 @@ def jail_argv(
             params += ["-D", f"_EXTRA_{index}={path}"]
         # Without these the profile cannot exec a backend or interpreter living
         # under the opaque $HOME, which is where npm globals and uv virtualenvs
-        # normally are. Truncated rather than warned on: the caller supplies a
-        # fixed, known set, unlike operator-supplied extra paths.
+        # normally are. The set is caller-supplied and fixed, unlike operator
+        # extra paths, but it is not fixed in *size*: a symlinked install
+        # contributes two entries where a plain one contributes one. Silence here
+        # cost a day, because a dropped grant surfaces as a dead interpreter
+        # rather than as a denial.
+        if len(runtime_paths or []) > _RUNTIME_SLOTS:
+            logger.warning(
+                "sandbox: %d runtime paths but only %d slots; dropping %s. The "
+                "backend or its interpreter may fail to start with an error that "
+                "does not name the sandbox",
+                len(runtime_paths or []),
+                _RUNTIME_SLOTS,
+                [str(path) for path in (runtime_paths or [])[_RUNTIME_SLOTS:]],
+            )
         runtime = [*(runtime_paths or [])][:_RUNTIME_SLOTS]
         runtime += [str(project)] * (_RUNTIME_SLOTS - len(runtime))
         for index, path in enumerate(runtime, start=1):

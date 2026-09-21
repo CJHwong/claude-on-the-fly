@@ -56,6 +56,11 @@ upgrade path, so none of that was covered by it.
 | The profiles named `$HOME/.codex` literally in 25 rules, so a deployment that moved `CODEX_HOME` matched none of them: the denies protected a directory codex no longer used, and under `deny-most` codex could not read its own `config.toml` | `seatbelt/fs-deny-most.sb`, `seatbelt/fs-allow-reads.sb`, `sandbox._codex_operator_home` | All 25 rewritten against a new `_CODEX_OPERATOR_HOME` param, resolved through the operator's `CODEX_HOME`. Live under both bases with the home relocated outside `$HOME`: `config.toml` readable, `history.jsonl` still refused, which is what proves the grant is scoped rather than blanket |
 | codex's `history.jsonl` -- every prompt the operator ever typed into codex on this host -- was readable by a jailed turn, while claude's identical file had been denied since the start | `seatbelt/*.sb` `_CODEX_OPERATOR_HOME/history.jsonl` | Denied in both profiles, written after the codex read grant so last-match-wins keeps it. Live probe against the real file refuses under both bases; a structural test pins the ordering. This is what made prompt-history protection symmetric across the two backends |
 | Every jailed `claude-pty` turn still burned its whole timeout after the lock fix, parked on claude's first-run theme picker with nobody able to press a key | `sandbox.agent_env` | `agent_env` exported `CLAUDE_CONFIG_DIR` unconditionally, defaulting it to `~/.claude` under a comment claiming that is what the CLI would have done anyway. It is not: the default *directory* is `~/.claude`, but the default settings *file* is `~/.claude.json` at home root, and naming the directory moves it to `~/.claude/.claude.json` -- a different file, with no `hasCompletedOnboarding`. A `-p` turn does not care; a pty turn runs the real TUI and opens the wizard. The variable is now forwarded only when the daemon actually has one. Measured: `PASS 4s` with it absent, 150s timeout with it set to the default |
+| `sandbox.fs: deny-most` refused to start *any* turn on macOS, every backend and mode, in 0s at the egress preflight. Two causes in one path: `sys.base_prefix` names a uv symlink (`cpython-3.12-...` -> `cpython-3.12.9-...`) and seatbelt matches the path the kernel resolves, so the grant covered nothing and dyld could not load `libpython`; and the five runtime slots truncated the list silently | `sandbox._runtime_read_paths`, `sandbox_macos._RUNTIME_SLOTS` | Every runtime path is now granted as written and as resolved, the ceiling is eight, and an overflow warns naming what it dropped. Measured before: `dyld: Library not loaded: @executable_path/../lib/libpython3.12.dylib ... (blocked by sandbox)`, SIGABRT before the interpreter ran a line. Reproduced on `origin/main` in a scratch worktree, so it predates this branch |
+| A jailed probe inherited whatever directory the daemon was started from, which `deny-most` grants no more than any other home path | `sandbox._run_jailed` | Runs in the workspace it just granted. Measured before: the egress probe died on `getcwd()` before importing `socket`, because python resolves the empty `sys.path` entry against the cwd. The error named neither a path nor a rule -- `PermissionError: [Errno 1] Operation not permitted` out of `importlib` -- and every turn refused to start |
+| The Linux jail aborted outright on any merged-usr distribution: `bwrap: Can't mount on symlink destination /bin`. Debian, Ubuntu and Fedora all ship `/bin` and `/lib` as symlinks, so this is the normal layout rather than an exotic one | `sandbox._linux_wrap` | bwrap mounts rather than matches, and refuses a symlink destination by aborting the whole jail rather than dropping one grant. The Linux plan now takes the resolved form only, which the entry above already puts in the list. Measured in a container on the real `_linux_grants` output. This had been hiding behind the parity suite: with the jail aborting, every probe failed, and a failed read is what the contract reads as `deny`. Five parity cases that expect `allow` failed on `origin/main` and pass here, and the dotenv case that expects `deny` passed there for no reason at all |
+| Handing a jailed claude its keychain credential crashed every jailed turn on Linux. `read_keychain` shells out to `security`, which only macOS has, and `_claude_oauth_token` caught `KeyError` but not the `FileNotFoundError` a missing binary raises | `sandbox._claude_oauth_token` | Guarded on platform and on `OSError`. Introduced earlier on this same branch and caught before merge by running the Linux jail in a container -- reading the code had not found it in two passes |
+| Jailed `claude-pty` could not run on Linux at all: the startup lock is a `mkdir` in the claude config directory, which the Linux jail mounts read-only | `sandbox.claude_pty_startup_is_delegated`, `backends/claude._hold_pty_startup_gate` | A writable mount over the lock is not a fix -- the `mkdir` then fails with `EEXIST` and the script's recovery only reclaims a lock whose pid file names a dead process, so it spins identically. An overlay is not a fix either: a private one per turn makes the lock succeed while serializing nothing, a shared one hands two threads a writable directory they both see. So the daemon takes the script's documented `CLAUDE_PTY_NO_LOCK=1` and holds the boot window itself. Measured in a container both ways: 0.1s with the fix, and `lock wait timeout after 8s (holder pid=unknown)` with the variable removed and nothing else changed |
 
 ## Open
 
@@ -165,13 +170,23 @@ through the shared workspace. The narrower shape is one server per thread, which
 a tmux process per concurrent turn and loses the single `tmux attach` an operator uses
 today. Not measured.
 
-**The Linux jail still cannot take the claude-pty startup lock.** The seatbelt fix is a
-grant; bubblewrap has no equivalent. `~/.claude` is mounted read-only, so the `mkdir`
-fails there too, and pre-creating `.pty-lock` as a mount source would make it fail with
-`EEXIST` instead, which spins identically. So the cross-platform half is
-`CLAUDE_PTY_LOCK_WAIT_SEC`, capped below a turn in `sandbox.agent_env`: Linux still
-cannot run jailed `claude-pty`, but it now fails in a minute naming the holder instead
-of burning the turn in silence. Not measured on Linux; no host to measure on.
+**The daemon's claude-pty gate on Linux is narrower than the script's.** The lock it
+replaces is a directory in the claude config dir, so it excludes every claude-pty on
+the host. The daemon's gate is an in-process lock, so it excludes only the turns this
+daemon starts. A claude the operator runs in their own terminal at the same moment can
+still collide with a jailed turn during claude's one-second supervisor boot, and the
+symptom is a hung TUI rather than an error. Accepted: it is strictly better than the
+turn never running, which is what Linux did before.
+
+**`sandbox.fs: deny-most` still cannot complete a codex or a pty turn on macOS.** The
+preflight fix above got `deny-most` as far as starting turns, and `claude-native`
+completes one (`PASS 8s`). The other three do not. codex stops on
+`Error: Operation not permitted (os error 1)`, whose backtrace names
+`std::fs::File::set_times`, so something it touches is denied a `utimes()` that
+`allow-reads` permits; `claude-pty` produces no envelope. `deny-most` is documented as
+needing operator `extra_paths` tuning, and `/opt/homebrew` plus the mise install tree
+did not change any of the three, so at least part of this is a real gap rather than
+configuration. Not chased further. `deny-most` is opt-in and off by default.
 
 ### Cross-conversation writes
 

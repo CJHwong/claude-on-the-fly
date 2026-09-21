@@ -20,7 +20,7 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_5
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_8
 ;; and _ANCESTOR_1.._ANCESTOR_8
 ;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
@@ -120,6 +120,9 @@
 (allow file-read* (subpath (param "_RUNTIME_3")))
 (allow file-read* (subpath (param "_RUNTIME_4")))
 (allow file-read* (subpath (param "_RUNTIME_5")))
+(allow file-read* (subpath (param "_RUNTIME_6")))
+(allow file-read* (subpath (param "_RUNTIME_7")))
+(allow file-read* (subpath (param "_RUNTIME_8")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
 ;; at _PROJECT_DIR, already allowed above, so they add nothing.
 (allow file-read* (subpath (param "_EXTRA_1")))
