@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -2591,6 +2592,113 @@ def test_the_claude_runtime_writes_are_granted_against_the_config_param(profile)
         rule = f'(allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/{name}")))'
         assert rule in text, f"{name} is not granted"
     assert '(deny file-write* (subpath (param "_CLAUDE_CONFIG")))' in text
+
+
+class TestTheJailedAgentGetsClaudesOwnCredential:
+    """claude keeps its OAuth token in the login keychain, which the jail denies.
+
+    The deny cannot be narrowed to one item -- seatbelt matches file paths and every
+    secret lives in one database, so allowing claude's credential allows the ssh
+    passphrases and the broker's own API key with it. The daemon is outside the jail,
+    so it reads that one item and passes the one value. Without this a jailed claude
+    turn fails with "Not logged in" before it makes any network call.
+    """
+
+    CREDENTIAL = json.dumps(
+        {"claudeAiOauth": {"accessToken": "tok-abc", "expiresAt": 9_999_999_999_000}}
+    )
+
+    @staticmethod
+    def _keychain(monkeypatch, value):
+        """Stand in for the keychain, raising KeyError the way read_keychain does."""
+        from claude_on_the_fly import broker
+
+        def read(service):
+            if value is None:
+                raise KeyError(service)
+            return value
+
+        monkeypatch.setattr(broker, "read_keychain", read)
+
+    def test_the_token_reaches_a_jailed_turn(self, monkeypatch):
+        self._keychain(monkeypatch, self.CREDENTIAL)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        env = sandbox.agent_env()
+        assert env is not None
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "tok-abc"
+
+    def test_an_unjailed_turn_is_left_alone(self, monkeypatch):
+        """An environment token shadows the CLI's stored credential. A turn that can
+        reach the keychain itself must keep authenticating the way it always did."""
+        self._keychain(monkeypatch, self.CREDENTIAL)
+        monkeypatch.setenv("COTF_SANDBOX", "off")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        token = sandbox.session_env({"COTF_APPROVE_URL": "http://127.0.0.1:1"})
+        try:
+            env = sandbox.agent_env()
+        finally:
+            sandbox.reset_session_env(token)
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    def test_no_keychain_item_is_not_an_error(self, monkeypatch):
+        """A host that never ran the claude CLI. The turn still fails, but with the
+        CLI's own "Not logged in" rather than a daemon traceback."""
+        self._keychain(monkeypatch, None)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        env = sandbox.agent_env()
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    @pytest.mark.parametrize(
+        "value",
+        ["not json at all", json.dumps({"other": 1}), json.dumps({"claudeAiOauth": 7})],
+    )
+    def test_an_unexpected_shape_warns_and_yields_nothing(
+        self, monkeypatch, caplog, value
+    ):
+        """The CLI owns this format and can change it. A shape this does not know
+        must degrade to the old behaviour, and say so, rather than raise."""
+        self._keychain(monkeypatch, value)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level(logging.WARNING):
+            env = sandbox.agent_env()
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+        assert "not the shape" in caplog.text
+
+    def test_an_empty_token_yields_nothing(self, monkeypatch):
+        self._keychain(monkeypatch, json.dumps({"claudeAiOauth": {"accessToken": ""}}))
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        env = sandbox.agent_env()
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    def test_an_expired_token_is_passed_with_a_warning(self, monkeypatch, caplog):
+        """Passed, not withheld: an expired token fails the turn with an auth error
+        naming the cause, where withholding it says "Not logged in" and blames the
+        wrong thing. Nothing here can refresh it -- a refresh rotates the credential
+        the operator's own CLI is using."""
+        self._keychain(
+            monkeypatch,
+            json.dumps({"claudeAiOauth": {"accessToken": "old", "expiresAt": 1000}}),
+        )
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level(logging.WARNING):
+            env = sandbox.agent_env()
+        assert env is not None
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "old"
+        assert "expired" in caplog.text
+
+    def test_the_token_is_never_logged(self, monkeypatch, caplog):
+        """agent_env logs variable names and a dropped count on purpose, because it
+        is the record that a secret did not reach the agent. It must not become the
+        leak itself."""
+        self._keychain(monkeypatch, self.CREDENTIAL)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level(logging.DEBUG):
+            sandbox.agent_env()
+        assert "tok-abc" not in caplog.text
 
 
 @pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])

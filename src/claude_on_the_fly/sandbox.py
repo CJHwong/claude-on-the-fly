@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
 import sys
+import time
 from collections.abc import Iterable
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -90,6 +92,63 @@ _PASSTHROUGH_PTY = frozenset(
 # which names the holder. Kept generous enough for the contended case it exists
 # for: a real hold is released the moment the statusline sidecar appears, ~500ms.
 _PTY_LOCK_WAIT_SECONDS = "60"
+# claude keeps its own OAuth credential in the login keychain, which jail.sb denies
+# by design. That deny cannot be narrowed to one item: seatbelt matches file paths
+# and every secret on the machine lives inside one database, so allowing claude's
+# credential allows all of them. Measured, with an unrelated item planted to check:
+# dropping the deny exposed that item too, and it would expose the broker's own
+# cotf-anthropic key -- the agent reading the key the broker exists to hide.
+#
+# The daemon runs outside the jail, so it can read that one item and pass the agent
+# the single value it needs. Same posture fs-allow-reads.sb already takes for the
+# other backend, whose own auth.json stays readable because the agent process must
+# read it to authenticate.
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _claude_oauth_token() -> str | None:
+    """The claude CLI's own OAuth access token, or None when there is not one.
+
+    None rather than an exception for every failure shape -- no keychain item, a
+    value that is not the JSON the CLI writes, a missing field. A jailed turn
+    without this fails with "Not logged in", which is exactly what happened before
+    this existed, so an unreadable credential must not take the daemon down.
+
+    Never logged, and never returned anywhere that logs its values: agent_env
+    reports variable names and a dropped count, never contents.
+    """
+    from claude_on_the_fly import broker
+
+    try:
+        raw = broker.read_keychain(_CLAUDE_KEYCHAIN_SERVICE)
+    except KeyError:
+        return None
+    try:
+        oauth = json.loads(raw)["claudeAiOauth"]
+        token = oauth["accessToken"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        logger.warning(
+            "sandbox: the %s keychain item is not the shape the claude CLI writes, "
+            "so a jailed claude turn will report 'Not logged in'",
+            _CLAUDE_KEYCHAIN_SERVICE,
+        )
+        return None
+    if not isinstance(token, str) or not token:
+        return None
+    # Warn rather than withhold: an expired token fails the turn with an auth error
+    # naming the cause, where withholding it fails with "Not logged in" and blames
+    # the wrong thing. The CLI refreshes the item itself; nothing here can, because
+    # a refresh rotates the credential the operator's own CLI is using.
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
+        logger.warning(
+            "sandbox: the claude credential expired; run any claude command "
+            "outside the jail to refresh it, or a jailed turn will fail to "
+            "authenticate"
+        )
+    return token
+
+
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -409,6 +468,12 @@ def agent_env() -> dict[str, str] | None:
     # setdefault, not assignment: the key is a passthrough one, so an operator who
     # set it in the daemon environment has already said what they want.
     env.setdefault("CLAUDE_PTY_LOCK_WAIT_SEC", _PTY_LOCK_WAIT_SECONDS)
+    # Only on this branch, never when the sandbox is off: an environment token
+    # shadows the CLI's stored credential, so setting it on a turn that can reach
+    # the keychain would change how an unjailed turn authenticates for no reason.
+    claude_token = _claude_oauth_token()
+    if claude_token is not None:
+        env["ANTHROPIC_AUTH_TOKEN"] = claude_token
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
