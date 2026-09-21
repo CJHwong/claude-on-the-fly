@@ -55,10 +55,18 @@ from rich.text import Text
 
 logger = logging.getLogger(__name__)
 
-# Where a run's socket directory lives. Under DATA_DIR because the jail already
-# grants that subtree for writing (`sandbox.py`), so a jailed agent can create its
-# own server there with no profile change, and because a socket under TMPDIR would
-# be swept by the OS while a long turn is still running.
+# Where a run's socket directory lives. Under DATA_DIR because a socket under
+# TMPDIR would be swept by the OS while a long turn is still running.
+#
+# This used to claim the jail grants the subtree, so a jailed agent could create
+# its own server here with no profile change. It does not, and granting it does
+# not help: measured under the jail, a write into panes/ succeeds once granted
+# while `tmux new-session` still fails with "error connecting to ... (Operation
+# not permitted)". tmux is a unix-socket client and jail.sb denies unix sockets
+# outright, because the only filter that works is `(remote unix)` and it cannot be
+# scoped to a path -- see the note above `(deny network-outbound)` there. So a
+# jailed turn runs unmirrored and claude-pty takes its `script` fallback, and
+# nothing short of opening every unix socket on the machine changes that.
 PANES_DIRNAME = "panes"
 
 # Session name for a background job's pane. Chat turns are named by

@@ -147,6 +147,18 @@ which execs a different binary plus tmux, and the five slots are already full. U
 `deny-most` `$HOME` is opaque, so `claude` is invisible and `execvp` fails. The natural
 operator remedy is a wide `extra_paths` entry, which is the finding above.
 
+**A jailed turn cannot use cotf's tmux server, so it runs unmirrored and claude-pty
+falls back to `script`.** `tmux.py` claimed the jail granted `DATA_DIR/panes` for
+writing; no profile ever did. Granting it does not fix it either: measured under the
+jail, a write into `panes/` succeeds once granted while `tmux new-session` still fails
+with `error connecting to .../tmux-501/default (Operation not permitted)`. tmux is a
+unix-socket client, and `jail.sb` denies unix sockets outright because the only filter
+that works, `(remote unix)`, cannot be scoped to a path and would open the Docker socket
+and ssh-agent. The grant was written, measured, and reverted for delivering no capability
+at the cost of surface; the false comment is corrected instead. Cost: no live pane view
+under `jail`, and `claude-pty` loses the transcript flush its usage numbers come from.
+Not a credential or egress weakening.
+
 **The Linux jail still cannot take the claude-pty startup lock.** The seatbelt fix is a
 grant; bubblewrap has no equivalent. `~/.claude` is mounted read-only, so the `mkdir`
 fails there too, and pre-creating `.pty-lock` as a mount source would make it fail with
