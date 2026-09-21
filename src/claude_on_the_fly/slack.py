@@ -2082,15 +2082,6 @@ class SlackFrontend(Frontend):
         # message writes one: at dispatch, so a tap the gate above dropped leaves
         # no line, exactly as a dropped message leaves none.
         #
-        # Its absence was a real cost, not a tidiness point. A tap leaves NO
-        # message in Slack -- it retires the menu to a checkmark instead -- so
-        # without a line here there was no record of it anywhere. On 2026-09-16
-        # three answers Gary had genuinely given were investigated as fabricated
-        # replies, and one ticket was reopened on that belief, because every
-        # check for "did he say this" searched Slack, found nothing, and had
-        # nothing else to consult. The inbound log was the one place that could
-        # have answered, and it was silent for this path only.
-        #
         # `(button)` is load-bearing rather than decoration: a tap has no Slack
         # message behind it, so a line that looked exactly like a typed one would
         # send the next reader to a permalink that does not exist. It goes last

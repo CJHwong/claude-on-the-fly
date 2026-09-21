@@ -3020,13 +3020,7 @@ class TestReplySoftLimit:
 
     async def test_a_suggestion_tap_writes_an_inbound_log_line(self, frontend, caplog):
         """A tap leaves no Slack message, so this line is the only record that it
-        happened at all.
-
-        Without it a tap is indistinguishable from an answer nobody gave: on
-        2026-09-16 three of Gary's own answers were investigated as fabricated,
-        because searching Slack for them found nothing and there was nothing
-        else to consult.
-        """
+        happened at all."""
         frontend._app.client.reactions_add = AsyncMock()
 
         with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
