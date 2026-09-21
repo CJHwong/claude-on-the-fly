@@ -1961,9 +1961,13 @@ async def preflight() -> None:
     if mode() != "jail":
         return
     _log_inert_settings()
-    # First, and before anything is spawned: this is a layout problem, so paying
-    # for two jail probes to discover it afterwards is waste.
-    _preflight_protected_symlinks()
+    # First: on Linux this is a layout problem the mount namespace refuses, and it
+    # answers without spawning anything, so the turn fails before the jail probes
+    # rather than after them. On macOS it does spawn, one probe per symlink, because
+    # whether a link is a hole depends on where it points and that is not knowable
+    # from the layout alone. A probe that cannot run reports the link as reachable,
+    # so a jail too broken to spawn warns here and then fails on the echo below.
+    await _preflight_protected_symlinks()
     workspace = _probe_workspace()
     try:
         code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
@@ -2003,7 +2007,38 @@ async def preflight() -> None:
     )
 
 
-def _preflight_protected_symlinks() -> None:
+async def _symlink_target_is_writable(target: Path, workspace: Path) -> bool:
+    """Whether a jailed process can open `target` for writing.
+
+    Opens for append and writes nothing, so a target that turns out to be
+    reachable is reported without being modified. Seatbelt refuses at open(),
+    which is what makes the empty open a sufficient question. `>>` would create an
+    absent file, so the caller only probes targets that already exist.
+
+    A probe that cannot run answers True: this decides whether to warn, and the
+    safe direction is to warn.
+    """
+    argv = wrap(["/bin/sh", "-c", f"exec 3>> '{target}'"], workspace)
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            *argv,
+            env=agent_env() or {},
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(probe.wait(), timeout=15)
+    except (OSError, TimeoutError) as exc:
+        logger.warning(
+            "sandbox: could not test whether %s is writable in the jail (%s); "
+            "treating it as reachable",
+            target,
+            exc,
+        )
+        return True
+    return probe.returncode == 0
+
+
+async def _preflight_protected_symlinks() -> None:
     """Report execution-control paths that are symlinks, before a turn hits them.
 
     These are the entries the jail protects because they decide what the agent
@@ -2036,13 +2071,41 @@ def _preflight_protected_symlinks() -> None:
             "Replace each with a real file or directory, or move the content and "
             "drop the link, then restart."
         )
+    # Whether the link is a hole depends entirely on where it points, so ask
+    # rather than assume. A link into a tree the profile already denies for its
+    # own reasons -- ~/.claude, say -- is covered, and warning about it every
+    # start trains an operator to ignore the one case that is not covered.
+    workspace = _probe_workspace()
+    reachable = [
+        path
+        for path, writable in zip(
+            linked,
+            await asyncio.gather(
+                *(
+                    _symlink_target_is_writable(Path(os.path.realpath(path)), workspace)
+                    for path in linked
+                )
+            ),
+            strict=True,
+        )
+        if writable
+    ]
+    if not reachable:
+        logger.info(
+            "sandbox: %d execution-control path(s) are symlinks (%s), and each "
+            "target is denied by another rule, so they are covered",
+            len(linked),
+            names,
+        )
+        return
     logger.warning(
-        "sandbox: %d execution-control path(s) are symlinks: %s. Seatbelt matches "
-        "the resolved path, so each write deny protects the link and not the file "
-        "behind it, and a jailed turn could rewrite instructions the next run "
-        "reads. Replace them with real files to close that.",
-        len(linked),
-        names,
+        "sandbox: %d execution-control path(s) are symlinks whose target a jailed "
+        "turn can write: %s. Seatbelt matches the resolved path, so the write deny "
+        "protects the link and not the file behind it, and a turn could rewrite "
+        "instructions the next run reads. Replace them with real files, or point "
+        "them at a path the profile already denies.",
+        len(reachable),
+        ", ".join(f"{path} -> {os.path.realpath(path)}" for path in reachable),
     )
 
 

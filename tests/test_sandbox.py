@@ -1363,6 +1363,15 @@ def test_an_unreadable_shim_dir_leaves_path_alone(monkeypatch, tmp_path):
 # --- the agent's own memory has to survive the jail ---
 
 
+def _always(answer: bool):
+    """An awaitable stand-in for the symlink write probe."""
+
+    async def probe(*_args, **_kwargs):
+        return answer
+
+    return probe
+
+
 def _run_jailed(argv: list[str], workspace: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         sandbox.wrap(argv, workspace),
@@ -2701,6 +2710,56 @@ class TestTheJailedAgentGetsClaudesOwnCredential:
         assert "tok-abc" not in caplog.text
 
 
+def test_deny_most_grants_reads_against_the_resolved_config_dir():
+    """The read grant was written against _HOME/.claude while every write re-grant
+    on the same tree uses _CLAUDE_CONFIG. CLAUDE_CONFIG_DIR can move the tree
+    outside $HOME, where a _HOME-derived rule matches nothing -- so a relocated
+    config directory was invisible and the CLI could not read its own settings."""
+    text = sandbox._DENY_MOST_PROFILE.read_text()
+    live = [ln for ln in text.splitlines() if not ln.strip().startswith(";;")]
+    assert any(
+        '(allow file-read* (subpath (param "_CLAUDE_CONFIG")))' in ln for ln in live
+    )
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_a_relocated_config_dir_is_readable_under_the_jail(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir
+):
+    """Live counterpart. Measured failing under deny-most before the grant:
+    "Operation not permitted" on <config>/settings.json."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    settings_file = config_dir_outside_tmpdir / "settings.json"
+    settings_file.write_text('{"probe": true}\n')
+    done = _run_jailed(["/bin/cat", str(settings_file)], tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "probe" in done.stdout
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_the_relocated_config_grant_keeps_the_denies_below_it(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir, scoped_sessions
+):
+    """What makes the grant a capability rather than a hole. SBPL is last-match-wins
+    and both denies are written after it, so they still win: history.jsonl is every
+    prompt typed in every project, and projects/ is another conversation."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    history = config_dir_outside_tmpdir / "history.jsonl"
+    history.write_text("every prompt ever typed\n")
+    other = config_dir_outside_tmpdir / "projects" / "another-thread"
+    other.mkdir(parents=True)
+    (other / "x.jsonl").write_text("another conversation\n")
+    for target in (history, other / "x.jsonl"):
+        done = _run_jailed(["/bin/cat", str(target)], tmp_path)
+        assert done.returncode != 0, f"{target.name} was readable: {done.stdout!r}"
+
+
 @pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
 def test_the_pty_startup_lock_is_granted(profile):
     """claude-pty mkdir's this directory to serialize claude's supervisor boot, and
@@ -2724,7 +2783,7 @@ def test_the_pty_startup_lock_is_granted(profile):
 
 
 @pytest.fixture
-def config_dir_outside_tmpdir(original_home):
+def config_dir_outside_tmpdir(original_home, monkeypatch):
     """A claude config directory the profile does not already grant.
 
     Not pytest's tmp_path, and not the suite's redirected HOME either: both sit
@@ -2737,6 +2796,11 @@ def config_dir_outside_tmpdir(original_home):
     fresh name rather than the real ~/.claude, because taking that lock for real
     would collide with a claude-pty the operator is running right now.
     """
+    # HOME too, not just the path: the suite redirects HOME into a tmpdir, so
+    # _HOME would name the fake home and `deny file-read* (subpath _HOME)` would
+    # leave the real one wide open under the global read allow. A test written
+    # without this passed with the grant it was testing deleted.
+    monkeypatch.setenv("HOME", str(original_home))
     config = original_home / f"cotf-test-claude-config-{os.getpid()}"
     config.mkdir(parents=True)
     yield config
@@ -3088,14 +3152,17 @@ def test_the_runtime_slot_count_covers_every_path_the_wrapper_supplies(tmp_path)
     )
 
 
-def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
+async def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
     monkeypatch, tmp_path
 ):
     """A mount namespace cannot mount read-only over a symlink: bwrap reports
     "Can't create file at <path>: No such file or directory" and the turn dies,
     which reads like a missing file rather than a layout it refuses. Measured with
     ~/.codex/AGENTS.md symlinked to ~/.claude/CLAUDE.md, which is an ordinary way
-    to keep one set of instructions for both backends."""
+    to keep one set of instructions for both backends.
+
+    Answered from the layout alone, without spawning: on Linux the turn would fail
+    anyway, so it must not pay for a probe first."""
     home = tmp_path / "home"
     (home / ".codex").mkdir(parents=True)
     target = home / "shared-instructions.md"
@@ -3103,42 +3170,127 @@ def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
     (home / ".codex" / "AGENTS.md").symlink_to(target)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+
+    async def must_not_probe(*_args, **_kwargs):  # pragma: no cover - asserts absence
+        raise AssertionError("Linux answered from the layout; it must not spawn")
+
+    monkeypatch.setattr(sandbox, "_symlink_target_is_writable", must_not_probe)
     with pytest.raises(sandbox.SandboxBoundaryError, match="cannot mount read-only"):
-        sandbox._preflight_protected_symlinks()
+        await sandbox._preflight_protected_symlinks()
 
 
-def test_a_symlinked_execution_control_path_warns_on_macos(
+class TestSymlinkedExecutionControlPathsOnMacos:
+    """Seatbelt matches the resolved path, so a deny written against the link covers
+    the link and not the file behind it.
+
+    Whether that is a hole depends entirely on where the link points, which is why
+    this asks instead of assuming. The first version warned about every symlink,
+    and on a real machine both links pointed into trees the profile already denies
+    for their own reasons -- so it cried wolf on every start, which is how an
+    operator learns to ignore the case that matters.
+    """
+
+    @staticmethod
+    def _linked_home(monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        (home / ".codex").mkdir(parents=True)
+        target = home / "shared-instructions.md"
+        target.write_text("be helpful\n")
+        (home / ".codex" / "AGENTS.md").symlink_to(target)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+        return target
+
+    async def test_a_reachable_target_warns_and_names_what_it_resolves_to(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The operator has to fix the target, so the message has to name it. The
+        link alone does not say where the writable file actually is."""
+        self._linked_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(sandbox, "_symlink_target_is_writable", _always(True))
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+            await sandbox._preflight_protected_symlinks()
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert "AGENTS.md" in message
+        assert "shared-instructions.md" in message
+        assert "protects the link and not the file behind it" in message
+
+    async def test_a_covered_target_does_not_warn(self, monkeypatch, tmp_path, caplog):
+        """A link into a tree the profile already denies is not a hole. Measured on
+        a real machine: ~/.codex/AGENTS.md -> ~/.claude/CLAUDE.md is covered by the
+        _CLAUDE_CONFIG write deny, and the old warning fired on it every start."""
+        self._linked_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(sandbox, "_symlink_target_is_writable", _always(False))
+        with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+            await sandbox._preflight_protected_symlinks()
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "covered" in message
+
+    async def test_a_probe_that_cannot_run_is_treated_as_reachable(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """This decides whether to warn, so an unanswerable question warns. A jail
+        too broken to spawn fails on the echo probe straight afterwards anyway."""
+        self._linked_home(monkeypatch, tmp_path)
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("no such binary")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+            await sandbox._preflight_protected_symlinks()
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert "treating it as reachable" in message
+        assert "protects the link and not the file behind it" in message
+
+
+async def test_no_warning_when_the_protected_paths_are_real(
     monkeypatch, tmp_path, caplog
 ):
-    """Seatbelt matches the resolved path, so a deny written against the link covers
-    the link and not the file behind it: the profile loads, the log says jailed, and
-    the target stays writable. Warned rather than refused, because this is an
-    established layout and refusing would stop a deployment that has been working.
-    """
-    home = tmp_path / "home"
-    (home / ".codex").mkdir(parents=True)
-    target = home / "shared-instructions.md"
-    target.write_text("be helpful\n")
-    (home / ".codex" / "AGENTS.md").symlink_to(target)
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        sandbox._preflight_protected_symlinks()
-    message = "\n".join(r.getMessage() for r in caplog.records)
-    assert "AGENTS.md" in message and "are symlinks" in message
-    assert "protects the link and not the file behind it" in message
-
-
-def test_no_warning_when_the_protected_paths_are_real(monkeypatch, tmp_path, caplog):
     """The common case must stay silent, or the warning becomes noise nobody reads."""
     home = tmp_path / "home"
     (home / ".codex").mkdir(parents=True)
     (home / ".codex" / "AGENTS.md").write_text("be helpful\n")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        sandbox._preflight_protected_symlinks()
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        await sandbox._preflight_protected_symlinks()
     assert "symlink" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestTheSymlinkTargetProbeIsLive:
+    """The probe itself, against the real jail rather than a stand-in.
+
+    The mocked tests above fix the *policy*; these fix the *question*. A probe that
+    always answered one way would make every one of them pass while telling the
+    operator nothing.
+    """
+
+    async def test_a_target_in_a_granted_tree_reads_as_writable(
+        self, monkeypatch, tmp_path
+    ):
+        _seatbelt_or_skip()
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        target = tmp_path / "reachable.md"
+        target.write_text("standing orders\n")
+        assert await sandbox._symlink_target_is_writable(target, tmp_path) is True
+
+    async def test_a_target_in_a_denied_tree_reads_as_covered(
+        self, monkeypatch, tmp_path, original_home
+    ):
+        """Against the real home, so the deny is why it fails rather than the path
+        being absent. Opens for append and writes nothing, so nothing is modified
+        even on the branch where the answer is "writable"."""
+        _seatbelt_or_skip()
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        target = original_home / ".claude" / "CLAUDE.md"
+        if not target.is_file():
+            pytest.skip("no ~/.claude/CLAUDE.md on this host")
+        before = target.read_bytes()
+        assert await sandbox._symlink_target_is_writable(target, tmp_path) is False
+        assert target.read_bytes() == before
 
 
 # --- the write probe: state/ must not be writable from inside the jail ---

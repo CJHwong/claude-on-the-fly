@@ -51,6 +51,16 @@
 (deny file-read* (subpath (param "_HOME")))
 (allow file-read* (subpath (param "_PROJECT_DIR")))
 (allow file-read* (subpath (string-append (param "_HOME") "/.claude")))
+;; The same grant against the resolved config directory, because CLAUDE_CONFIG_DIR
+;; can move the tree outside $HOME where the rule above reaches nothing. Every
+;; claude *write* re-grant is already written against this param for that reason;
+;; the read was not, so a relocated config directory was invisible to a jailed
+;; agent and the CLI could not read its own settings. Measured under this base:
+;; "Operation not permitted" on <config>/settings.json before the line below.
+;; Position matters -- the cross-thread projects/ deny and the history.jsonl deny
+;; both come after this and still win, which is what keeps this a capability grant
+;; rather than a hole.
+(allow file-read* (subpath (param "_CLAUDE_CONFIG")))
 (allow file-read* (literal (string-append (param "_HOME") "/.claude.json")))
 ;; claude keeps one directory of session JSONL per workspace, and a workspace is
 ;; one chat thread. The grant above reaches all of them, so a jailed turn could
