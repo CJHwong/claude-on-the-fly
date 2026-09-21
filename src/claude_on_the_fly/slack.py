@@ -2147,6 +2147,21 @@ class SlackFrontend(Frontend):
         self._pending_msg.setdefault(chat_id, deque()).append((channel, ts))
         self._pending_reply_suppressed.setdefault(chat_id, deque()).append(False)
         display = (body.get("user") or {}).get("name", "")
+        # THE INBOUND LOG LINE, in the same shape and at the same moment a typed
+        # message writes one: at dispatch, so a tap the gate above dropped leaves
+        # no line, exactly as a dropped message leaves none.
+        #
+        # `(button)` is load-bearing rather than decoration: a tap has no Slack
+        # message behind it, so a line that looked exactly like a typed one would
+        # send the next reader to a permalink that does not exist. It goes last
+        # because the typed path already puts its own suffix there.
+        logger.info(
+            "slack %s/%s: %s %s (button)",
+            channel,
+            thread_ts or ts,
+            sender_marker(sender_id, display),
+            label[:80],
+        )
         # Same sender marker a typed message carries, so the agent sees who
         # pressed the button. A tap is a turn like any other, so it pays the
         # thread's budget the same way, and is charged at the same point: a tap
