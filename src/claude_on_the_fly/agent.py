@@ -1782,6 +1782,27 @@ def get_backend(profile: AgentProfile | None = None) -> AgentBackend:
     return _build_codex_backend(resolved)
 
 
+def argv_for_log(argv: list[str], cap: int = 60) -> str:
+    """Render an argv for a debug line: every token kept, long ones elided.
+
+    Capping the *list* was the old approach and it hid the whole command. Under
+    a jail the wrapper comes first, so `argv[:4]` on a macOS seatbelt spawn was
+    `sandbox-exec -f <profile> -D` and the 33 tokens after it -- the binary,
+    `--model`, `--effort` -- never appeared. A model-switching bug is exactly
+    when someone reads this line, and it answered nothing.
+
+    Capping each *token* keeps the shape of the command instead. The cap is not
+    cosmetic: `--system-prompt` carries the whole system prompt as one argument,
+    tens of thousands of characters, and that is what the original truncation
+    was really protecting the log from. Eliding by token keeps it out while
+    still naming the flag it belongs to.
+    """
+    return " ".join(
+        token if len(token) <= cap else f"{token[:cap]}...[{len(token)} chars]"
+        for token in argv
+    )
+
+
 def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
     """Locate a job's session JSONL across every backend, not just the current
     one.

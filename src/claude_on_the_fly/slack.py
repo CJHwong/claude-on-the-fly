@@ -1429,6 +1429,25 @@ class SlackFrontend(Frontend):
         self._status_started: dict[int, float] = {}  # session -> turn start (mono)
         self._status_verbs: dict[int, list[str]] = {}  # session -> shuffled verbs
 
+    @staticmethod
+    def _skip(loud: bool, reason: str, *args: object) -> None:
+        """Record a message the frontend will not act on.
+
+        Ten branches in `_handle_message` can refuse a message, and every one
+        of them logged at DEBUG. A deployed daemon runs at INFO -- measured on
+        this install's own log, 0 DEBUG records in a full day -- so a message
+        that was silently refused left no record at all, and "it never answered
+        me" had nothing to read back. That is why the dedupe path could never
+        be traced.
+
+        `loud` marks the refusals that can swallow something a person
+        deliberately sent, and those go to INFO. The routine ones stay at
+        DEBUG: our own replies come back on every turn, and an untrusted bot
+        posted 88 times in one day here. Promoting those too would bury the
+        five that matter, and a log nobody can skim is the same as no log.
+        """
+        logger.log(logging.INFO if loud else logging.DEBUG, "skipped: " + reason, *args)
+
     def _senders(self, key: str, pinned: set[str] | None) -> set[str]:
         """One sender set: the pinned override, else the current config.
 
@@ -2576,10 +2595,10 @@ class SlackFrontend(Frontend):
         )
         if subtype == "bot_message":
             if not is_trusted_bot:
-                logger.debug("skipped: untrusted bot_message bot_id=%s", bot_id)
+                self._skip(False, "untrusted bot_message bot_id=%s", bot_id)
                 return
         elif subtype and subtype not in _ALLOWED_SUBTYPES:
-            logger.debug("skipped: subtype=%s", subtype)
+            self._skip(False, "subtype=%s", subtype)
             return
         ts = event.get("ts", "")
         # A trusted bot post carries no `user`, so its bot id is the sender:
@@ -2589,15 +2608,15 @@ class SlackFrontend(Frontend):
         # chat id.
         sender_id = event.get("user") or bot_id
         if ts in self._our_sent_timestamps:
-            logger.debug("skipped: our own message ts=%s", ts)
+            self._skip(False, "our own message ts=%s", ts)
             return
         if ts in self._processed_ts:
-            logger.debug("skipped: already processed ts=%s", ts)
+            self._skip(True, "already processed ts=%s", ts)
             return
         text = event.get("text", "")
         channel: str = event.get("channel", "")
         if not channel:
-            logger.debug("skipped: no channel in event")
+            self._skip(True, "no channel in event")
             return
         thread_ts: str = event.get("thread_ts") or ts
         channel_type: str = event.get("channel_type") or self._channel_types.get(
@@ -2667,19 +2686,19 @@ class SlackFrontend(Frontend):
             # so only humans reach the allow/block and @mention gates below.
             # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
             if sender_id in self._blocked_senders:
-                logger.debug("skipped: sender %s in blocked_senders", sender_id)
+                self._skip(True, "sender %s in blocked_senders", sender_id)
                 return
 
             # Allowlist applies to all channel types, including DMs and group DMs.
             if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
-                logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
+                self._skip(True, "sender %s not in allowed_user_ids", sender_id)
                 return
 
             # Channels and groups additionally require an @mention.
             if channel_type in TAG_REQUIRED_CHANNEL_TYPES:
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
-                    logger.debug("skipped: no mention of %s in text", self._user_id)
+                    self._skip(False, "no mention of %s in text", self._user_id)
                     await self._hint_mention_required(
                         channel, thread_ts, sender_id, event
                     )
@@ -2702,7 +2721,7 @@ class SlackFrontend(Frontend):
                 and channel_type in ("im", "mpim")
                 and not await self._is_bot_conversation(channel)
             ):
-                logger.debug("skipped: %s is not a DM the bot is in", channel)
+                self._skip(False, "%s is not a DM the bot is in", channel)
                 return
 
         session_id = _session_key(channel, thread_ts)
@@ -2934,7 +2953,7 @@ class SlackFrontend(Frontend):
             file_lines = await self._save_files(session_id, files)
 
         if not text and not forwards and not file_lines and not extra_content:
-            logger.debug("skipped: empty text after processing")
+            self._skip(True, "empty text after processing")
             return
 
         self._session_sender_ids[session_id] = sender_id

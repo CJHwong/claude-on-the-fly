@@ -1068,7 +1068,7 @@ async def _run_codex_exec(
     # rollout into the shared tree that the jail no longer grants.
     codex_home = codex_state.ensure_home(workspace)
     wrapped = sandbox.wrap(cmd, workspace)
-    logger.debug("codex exec: cwd=%s cmd=%s", workspace, " ".join(wrapped[:8]) + "...")
+    logger.debug("codex exec: cwd=%s cmd=%s", workspace, agent.argv_for_log(wrapped))
     curated = sandbox.agent_env()
     # `TMUX` names a server, and a tmux client obeys it over every other hint. A
     # daemon started from inside the operator's tmux carries it into every child,

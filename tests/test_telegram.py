@@ -520,10 +520,30 @@ class TestExtractFile:
 
 
 class TestEnqueueMediaGroup:
+    @staticmethod
+    def _dropped_task():
+        """A `create_task` stand-in that closes the coroutine it is handed.
+
+        Patching `create_task` with a bare mock leaves the coroutine built and
+        never run, which Python reports as "coroutine ... was never awaited" --
+        against whichever test happens to be running when the collector gets to
+        it, not this one. Closing it is what a real scheduler's absence should
+        look like, and it keeps the warning from masking a genuine leak later.
+        """
+
+        def close_it(coro):
+            coro.close()
+            return MagicMock()
+
+        return close_it
+
     def test_first_file_creates_group_and_schedules_flush(
         self, frontend: TelegramFrontend
     ) -> None:
-        with patch("claude_on_the_fly.telegram.asyncio.create_task") as mock_task:
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ) as mock_task:
             frontend._enqueue_media_group("grp1", 1, "fid1", "a.jpg", "caption")
 
         assert "grp1" in frontend._media_groups
@@ -533,18 +553,27 @@ class TestEnqueueMediaGroup:
         mock_task.assert_called_once()
 
     def test_subsequent_files_append(self, frontend: TelegramFrontend) -> None:
-        with patch("claude_on_the_fly.telegram.asyncio.create_task"):
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ):
             frontend._enqueue_media_group("grp1", 1, "fid1", "a.jpg", "cap")
 
         # Second file should not create_task again
-        with patch("claude_on_the_fly.telegram.asyncio.create_task") as mock_task:
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ) as mock_task:
             frontend._enqueue_media_group("grp1", 1, "fid2", "b.jpg", "")
 
         mock_task.assert_not_called()
         assert len(frontend._media_groups["grp1"]["files"]) == 2
 
     def test_caption_captured_from_any_file(self, frontend: TelegramFrontend) -> None:
-        with patch("claude_on_the_fly.telegram.asyncio.create_task"):
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ):
             frontend._enqueue_media_group("grp1", 1, "fid1", "a.jpg", "")
             frontend._enqueue_media_group("grp1", 1, "fid2", "b.jpg", "late caption")
 
@@ -1254,13 +1283,24 @@ class TestFlushMediaGroup:
         }
 
         with (
-            patch.object(frontend, "_save_file", new_callable=AsyncMock),
+            # A real path, not a bare AsyncMock. Without a return value the await
+            # hands back an AsyncMock child, and `saved.relative_to(...)` in the
+            # code under test then builds a coroutine nobody awaits -- so the
+            # "[File saved: ...]" half of the message was a coroutine repr and
+            # this case only ever checked the caption fallback.
+            patch.object(
+                frontend,
+                "_save_file",
+                new_callable=AsyncMock,
+                side_effect=lambda _chat, _fid, name: Path("/ws/inbox") / name,
+            ),
             patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
         ):
             await frontend._flush_media_group("grp2")
 
         call_text = frontend._on_message.call_args[0][1]
         assert "Please review the uploaded files." in call_text
+        assert "[File saved: inbox/a.jpg]" in call_text
 
     async def test_noop_when_group_missing(self, frontend: TelegramFrontend) -> None:
         frontend._on_message = AsyncMock()

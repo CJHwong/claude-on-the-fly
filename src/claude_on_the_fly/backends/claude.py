@@ -828,7 +828,7 @@ async def _exec_pty(
     logger.debug(
         "exec_pty: cwd=%s cmd=%s timeout=%s",
         workspace,
-        " ".join(cmd[:4]) + "...",
+        agent.argv_for_log(cmd),
         timeout,
     )
     proc = await asyncio.create_subprocess_exec(
