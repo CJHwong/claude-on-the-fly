@@ -67,6 +67,8 @@ upgrade path, so none of that was covered by it.
 
 | Under `deny-most` codex could not start at all, on every mode: `Error: Operation not permitted (os error 1)`, naming no path. The read grant on the codex home covers the *links* inside it and not what they point at, because seatbelt matches the path the kernel resolves, so `~/.codex/agents -> ~/.agents/agents` was unreadable while the profile still read as granting it | `sandbox._codex_link_read_paths`, `seatbelt/fs-deny-most.sb` `_CODEX_LINK_*` | The kernel named it: `deny(1) file-read-data /Users/<user>/.agents/agents`, from `log stream` during a failing run. The Linux jail has mounted these targets read-only since the session boundary landed, so this is the macOS half of a grant that already existed rather than a new capability. Read only -- the write deny on the codex tree is still below it -- and a target that `sandbox.extra_paths` would refuse is refused here too, so a link at `$HOME` or into `~/.ssh` cannot reopen the home. Collapsed to shortest roots first, which took a real home from 54 targets to 3. Live: `codex-native PASS 7s`, `codex-pty PASS 8s` under `jail` + `deny-most` with no `extra_paths`, both `FAIL 1s` before |
 
+| The codex link grant re-opened a dotenv inside the tree it named, the same way an operator grant would. Measured on a real home: granting `~/.agents/skills` for `~/.codex/skills` made `~/.agents/skills/<skill>/.env` -- a live API token -- readable to a jailed turn | `seatbelt/fs-deny-most.sb` `_CODEX_LINK_*`, `sandbox._linux_masked` | Introduced by the row above and caught before merge by probing what the grant exposed rather than what it was meant to expose. The same unanchored `\\.env` regex the `_EXTRA_*` slots get, one per slot, written after the grants so last-match-wins keeps them; Linux resolves the files and masks them, having no patterns. Probed live: the dotenv denied, `SKILL.md` beside it still readable, so the grant still works |
+
 ## Open
 
 Ordered by severity against the threat model above.
@@ -205,6 +207,17 @@ Two denials seen alongside it are benign and deliberately not granted:
 `file-read-data $HOME/.CFUserTextEncoding`, which every CoreFoundation process attempts,
 and `file-read-metadata $HOME/.git`, from codex walking up from the workspace looking
 for a repository. Granting `~/.agents` alone cleared the failure with both still denied.
+
+**A dotenv inside `~/.claude` or `~/.codex` is readable under `deny-most`.** Both trees
+get a blanket subpath read grant, and neither has the dotenv regex the `_EXTRA_*` and
+`_CODEX_LINK_*` slots carry. Probed live on a real home: a jailed turn read
+`~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/services/<svc>/.env`
+and the identical file under `~/.claude/plugins/`. A plugin marketplace is a normal place
+for a service env file to land, so this is not an exotic layout. Predates the link grants
+-- it is the config-tree grant itself -- and the remedy is the same two lines each: a
+`\\.env` deny after the `_CLAUDE_CONFIG` and `_CODEX_OPERATOR_HOME` allows, plus the
+resolved files in the Linux mask. Not done here: it is a separate grant from the one this
+branch changed.
 
 ### Cross-conversation writes
 

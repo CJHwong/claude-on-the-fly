@@ -273,6 +273,20 @@
 (deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_1")) "/(.*/)?\\.env")))
 (deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_2")) "/(.*/)?\\.env")))
 (deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_3")) "/(.*/)?\\.env")))
+;; The same rule for the codex link grants, which are a subpath allow over a tree
+;; cotf did not choose either -- the operator did, by pointing an entry of their
+;; codex home at it. A shared skills tree is exactly the shape that holds a token
+;; file beside the skill that uses it: measured on a real home, the grant made
+;; `~/.agents/skills/<skill>/.env` readable to a jailed turn. Same unanchored
+;; regex as above, and for the same reasons.
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_1")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_2")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_3")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_4")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_5")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_6")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_7")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_8")) "/(.*/)?\\.env")))
 
 ;; -- Writes: identical allowlist to fs-allow-reads.sb --
 ;; Global Claude settings/hooks/plugins are read by future invocations, so a

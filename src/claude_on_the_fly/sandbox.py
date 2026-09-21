@@ -1576,8 +1576,8 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
 def _linux_masked(data_dir: Path) -> list[Path]:
     """Paths a coarser grant would otherwise expose, named individually.
 
-    Two of them, and neither has a macOS counterpart because seatbelt expresses
-    both with a rule rather than a mount.
+    None of them has a macOS counterpart, because seatbelt expresses each with a
+    rule rather than a mount.
 
     The ssh-agent socket is the sharper one. `SSH_AUTH_SOCK` is forwarded to the
     agent on both platforms, and on macOS the socket behind it is unusable
@@ -1603,6 +1603,8 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     that check mirrors the profile's own read denies, which had no rule for a
     dotenv outside the data dir.
     """
+    from claude_on_the_fly import codex_state
+
     masked: list[Path] = []
     auth_sock = os.environ.get("SSH_AUTH_SOCK")
     if auth_sock:
@@ -1612,6 +1614,16 @@ def _linux_masked(data_dir: Path) -> list[Path]:
         if base.is_dir():
             masked += sorted(base.rglob(".env*"))
     masked += _dotenvs_under(Path(p) for p in _extra_read_paths(cap=None))
+    # And the trees the operator's codex home links out to, which `_linux_grants`
+    # mounts read-only for the same reason it mounts an operator grant: cotf did
+    # not choose the tree, the operator did. A shared skills directory is exactly
+    # where a token file sits beside the skill that uses it -- measured on a real
+    # home, `~/.agents/skills/<skill>/.env`. macOS covers this with a regex per
+    # `_CODEX_LINK_*` slot; a mount namespace has no patterns, so the files are
+    # resolved now.
+    masked += _dotenvs_under(
+        codex_state.shared_link_targets(), source="the codex home's links"
+    )
     return masked
 
 
@@ -1626,7 +1638,9 @@ _SWEEP_PRUNED = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 _MAX_SWEPT_DOTENVS = 64
 
 
-def _dotenvs_under(roots: Iterable[Path]) -> list[Path]:
+def _dotenvs_under(
+    roots: Iterable[Path], source: str = "sandbox.extra_paths"
+) -> list[Path]:
     """Every `.env*` file beneath these trees, for masking on Linux.
 
     `rglob` is not used here, unlike the data-dir sweep above: that walks a tree
@@ -1648,10 +1662,10 @@ def _dotenvs_under(roots: Iterable[Path]) -> list[Path]:
             ]
             if len(found) > _MAX_SWEPT_DOTENVS:
                 logger.error(
-                    "sandbox.extra_paths sweep found more than %d dotenv files under "
-                    "%s; refusing to mask a partial list, so the grant is not safe to "
-                    "use as written. Narrow the entry to the directory the agent "
-                    "actually needs.",
+                    "%s sweep found more than %d dotenv files under %s; refusing to "
+                    "mask a partial list, so the grant is not safe to use as written. "
+                    "Narrow the entry to the directory the agent actually needs.",
+                    source,
                     _MAX_SWEPT_DOTENVS,
                     root,
                 )

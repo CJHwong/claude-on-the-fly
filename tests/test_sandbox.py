@@ -3748,6 +3748,96 @@ def test_dotenv_sweep_refuses_a_grant_it_cannot_cover(tmp_path, caplog):
     assert "refusing to mask a partial list" in caplog.text
 
 
+def test_deny_most_denies_a_dotenv_behind_a_codex_link(monkeypatch, tmp_path):
+    """The codex link grant is a subpath allow over a tree cotf did not choose, so
+    it needs the same dotenv deny an operator grant gets.
+
+    Measured on a real home before this: granting `~/.agents/skills` for
+    `~/.codex/skills` made `~/.agents/skills/<skill>/.env` -- a live API token --
+    readable to a jailed turn.
+    """
+    _seatbelt_or_skip()
+    home = tmp_path / "home"
+    codex = home / ".codex"
+    codex.mkdir(parents=True)
+    shared = home / ".agents" / "skills"
+    (shared / "tool").mkdir(parents=True)
+    secret = shared / "tool" / ".env"
+    secret.write_text("TOKEN=placeholder")
+    variant = shared / "tool" / ".env.local"
+    variant.write_text("TOKEN=placeholder")
+    ordinary = shared / "tool" / "SKILL.md"
+    ordinary.write_text("# skill")
+    (codex / "skills").symlink_to(shared)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    workspace = home / "ws"
+    workspace.mkdir()
+
+    def read(path):
+        argv = sandbox.wrap(["/bin/cat", str(path)], workspace)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+    assert read(secret).returncode != 0, "the dotenv was readable behind the link"
+    assert read(variant).returncode != 0, ".env.local was readable behind the link"
+    # The control: without it, a denied read proves nothing about the deny.
+    assert read(ordinary).returncode == 0, "the codex link grant itself did not apply"
+
+
+def test_linux_masked_covers_dotenvs_behind_a_codex_link(monkeypatch, tmp_path):
+    """The Linux half of the case above. `_linux_grants` mounts every link target
+    read-only, so a dotenv inside one needs a mask the same way an operator grant
+    does. A mount namespace has no patterns, so the file is named."""
+    home = tmp_path / "home"
+    codex = home / ".codex"
+    codex.mkdir(parents=True)
+    shared = home / ".agents" / "skills"
+    shared.mkdir(parents=True)
+    secret = shared / ".env"
+    secret.write_text("TOKEN=placeholder")
+    (codex / "skills").symlink_to(shared)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    assert secret in sandbox._linux_masked(tmp_path / "data")
+
+
+def test_every_codex_link_slot_gets_its_dotenv_deny():
+    """A slot with a read grant and no dotenv deny is the hole this closes, and it
+    would be invisible until someone kept a token beside a shared skill."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, sandbox_macos._CODEX_LINK_SLOTS + 1):
+        param = f"_CODEX_LINK_{index}"
+        denies = [
+            line
+            for line in _live_rules(profile, param)
+            if line.startswith("(deny file-read*") and "\\.env" in line
+        ]
+        assert denies, f"{param} has a read grant and no dotenv deny"
+
+
+def test_the_codex_link_dotenv_denies_come_after_their_grants():
+    """SBPL is last-match-wins, so a deny placed above its grant does nothing."""
+    lines = [
+        line.strip()
+        for line in sandbox._DENY_MOST_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    grant = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("(allow file-read* (subpath") and "_CODEX_LINK_1" in line
+    )
+    deny = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("(deny file-read*") and "_CODEX_LINK_1" in line
+    )
+    assert grant < deny
+
+
 def test_linux_masked_covers_dotenvs_under_an_operator_grant(monkeypatch, tmp_path):
     granted = tmp_path / "config-repo"
     granted.mkdir()
