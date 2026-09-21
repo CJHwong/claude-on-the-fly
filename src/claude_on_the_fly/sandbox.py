@@ -71,7 +71,25 @@ _PASSTHROUGH_ENDPOINTS = frozenset(
 # claude-pty reads this for its tmux session name. The daemon sets it so it knows
 # which pane to type an approval into; claude-pty's own default is PID-based and
 # therefore unpredictable from outside.
-_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION", "CLAUDE_PTY_NO_TMUX"})
+# CLAUDE_PTY_LOCK_WAIT_SEC is here so an operator can raise it; agent_env lowers
+# the default below a turn, see _PTY_LOCK_WAIT_SECONDS.
+_PASSTHROUGH_PTY = frozenset(
+    {
+        "CLAUDE_PTY_TMUX_SESSION",
+        "CLAUDE_PTY_NO_TMUX",
+        "CLAUDE_PTY_LOCK_WAIT_SEC",
+    }
+)
+
+# How long a spawned claude-pty waits for its startup lock before giving up.
+# claude-pty's own default is 600s, which is longer than every turn timeout cotf
+# uses, so a lock it cannot take costs the whole turn and explains nothing: the
+# turn dies on cotf's timeout while the script is still spinning, and the reason
+# never reaches a log. Below a turn instead, the script loses the race on its own
+# terms and prints "claude-pty: lock wait timeout after Ns (holder pid=...)",
+# which names the holder. Kept generous enough for the contended case it exists
+# for: a real hold is released the moment the statusline sidecar appears, ~500ms.
+_PTY_LOCK_WAIT_SECONDS = "60"
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -388,6 +406,9 @@ def agent_env() -> dict[str, str] | None:
     # resolves the operator's cache and the write deny costs capability instead of
     # buying isolation.
     env["UV_CACHE_DIR"] = str(uv_cache_dir())
+    # setdefault, not assignment: the key is a passthrough one, so an operator who
+    # set it in the daemon environment has already said what they want.
+    env.setdefault("CLAUDE_PTY_LOCK_WAIT_SEC", _PTY_LOCK_WAIT_SECONDS)
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not

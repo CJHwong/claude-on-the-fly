@@ -2593,6 +2593,116 @@ def test_the_claude_runtime_writes_are_granted_against_the_config_param(profile)
     assert '(deny file-write* (subpath (param "_CLAUDE_CONFIG")))' in text
 
 
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_pty_startup_lock_is_granted(profile):
+    """claude-pty mkdir's this directory to serialize claude's supervisor boot, and
+    its stale-lock recovery reads a pid file *inside* it. So a denied mkdir is the
+    one failure the script cannot recover from: no directory means no pid to find
+    dead, and it spins until CLAUDE_PTY_LOCK_WAIT_SEC. Measured before the grant:
+    every jailed claude-pty turn burned its whole timeout with an empty pane."""
+    rule = (
+        '(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") '
+        '"/.pty-lock")))'
+    )
+    # Live lines only. `rule in text` also matches the rule quoted inside a
+    # comment, so the first version of this test passed against a grant that had
+    # been commented out -- caught by running it that way.
+    live = [
+        line
+        for line in profile.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    assert any(rule in line for line in live)
+
+
+@pytest.fixture
+def config_dir_outside_tmpdir(original_home):
+    """A claude config directory the profile does not already grant.
+
+    Not pytest's tmp_path, and not the suite's redirected HOME either: both sit
+    under TMPDIR, which the profile grants wholesale, so a write in them succeeds
+    whatever the claude rules say. The first two versions of the test below passed
+    for exactly that reason and proved nothing.
+
+    Under the developer's real home instead, where the deny-default posture holds,
+    so the only thing that can make a write succeed is the rule under test. A
+    fresh name rather than the real ~/.claude, because taking that lock for real
+    would collide with a claude-pty the operator is running right now.
+    """
+    config = original_home / f"cotf-test-claude-config-{os.getpid()}"
+    config.mkdir(parents=True)
+    yield config
+    shutil.rmtree(config, ignore_errors=True)
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_pty_startup_lock_can_be_taken_under_the_jail(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir
+):
+    """The live counterpart, and the one that actually failed. A structural check
+    cannot catch this: the profile loads either way and macOS reports no denial, so
+    the symptom was a turn that hung rather than an error anyone could read.
+
+    Takes the lock the way claude-pty does, mkdir plus a pid file, because the
+    mkdir is the step that was denied and the pid file is what its stale-lock
+    recovery goes looking for afterwards."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    lock = config_dir_outside_tmpdir / ".pty-lock"
+    done = _run_jailed(
+        ["/bin/sh", "-c", f"mkdir {lock} && echo $$ > {lock}/pid && cat {lock}/pid"],
+        tmp_path,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip().isdigit()
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_pty_lock_grant_did_not_reopen_the_config_directory(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir
+):
+    """The grant is a subpath, so what makes it safe is that its siblings stay
+    denied. settings.json and hooks/ decide what the agent executes and is told,
+    and they sit one level up from the directory just opened."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    for sibling in ("settings.json", "hooks/on-stop.sh"):
+        target = config_dir_outside_tmpdir / sibling
+        done = _run_jailed(
+            ["/bin/sh", "-c", f"mkdir -p {target.parent} && echo pwned > {target}"],
+            tmp_path,
+        )
+        assert done.returncode != 0, f"{sibling} became writable: {done.stdout}"
+        assert not target.exists()
+
+
+def test_the_pty_lock_wait_is_capped_below_a_turn(monkeypatch):
+    """claude-pty's own default is 600s, longer than every turn timeout cotf uses,
+    so a lock it cannot take costs the whole turn and explains nothing: cotf's
+    timeout fires while the script is still spinning. Below a turn instead, the
+    script loses on its own terms and names the holder in its own error."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("CLAUDE_PTY_LOCK_WAIT_SEC", raising=False)
+    env = sandbox.agent_env()
+    assert env is not None
+    assert int(env["CLAUDE_PTY_LOCK_WAIT_SEC"]) < 600
+
+
+def test_an_operator_can_still_raise_the_pty_lock_wait(monkeypatch):
+    """setdefault rather than assignment: the key is a passthrough one, so an
+    operator who set it in the daemon environment has already said what they want.
+    A deployment running many concurrent chats is the case that needs it."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("CLAUDE_PTY_LOCK_WAIT_SEC", "900")
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["CLAUDE_PTY_LOCK_WAIT_SEC"] == "900"
+
+
 def test_the_runtime_write_list_holds_nothing_instruction_bearing():
     """The line that makes the grants safe. Anything here is read on a later
     invocation, so a turn that could write it would leave itself standing orders,

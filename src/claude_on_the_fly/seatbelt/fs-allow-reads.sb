@@ -271,6 +271,18 @@
 (allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/sessions")))
 (allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/plugins/cache")))
 (allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/policy-limits.json")))
+;; claude-pty's startup lock. It serializes claude's supervisor boot race by
+;; mkdir'ing this directory, and its stale-lock recovery reads a pid file *inside*
+;; it -- so a denied mkdir is not recoverable: there is no directory, therefore no
+;; pid to find dead, and the script spins until CLAUDE_PTY_LOCK_WAIT_SEC. Measured
+;; under the jail: every jailed claude-pty turn hung for its whole timeout with an
+;; empty pane, because "mkdir: Operation not permitted" is swallowed by 2>/dev/null.
+;; Not instruction-bearing -- it holds one pid file, read only by claude-pty
+;; itself -- so it sits with the runtime scratch above rather than with hooks and
+;; settings.json. The Linux jail cannot take this fix: a pre-created bind mount
+;; would make the mkdir fail with EEXIST instead, which spins identically. See
+;; CLAUDE_PTY_LOCK_WAIT_SEC in sandbox.agent_env for the cross-platform half.
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/.pty-lock")))
 ;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
 ;; dies at startup with "failed to initialize in-process app-server client:
 ;; Operation not permitted" before it makes any network call, because its

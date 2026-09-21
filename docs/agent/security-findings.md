@@ -48,6 +48,7 @@ upgrade path, so none of that was covered by it.
 | The NaN/Infinity clamp on `recorded_at` missed the huge-integer shape: a raw integer literal past ~1.8e308 is valid JSON, passes the `isinstance(int)` check, and `float()` raises `OverflowError` on it, which propagated through `take()` and crashed the daemon at startup | `turns._as_float` | Reproduced live with a 400-digit `recorded_at` (`CRASH: OverflowError int too large to convert to float`), then caught: `OverflowError` returns `None` and the entry is dropped the way a NaN is. `from_dict` is now total, so the journal read path cannot raise. `test_a_recorded_at_too_large_for_a_float_is_dropped` fails without the change |
 | `sandbox.extra_paths` could re-open a *file*-level credential deny: the docstring claimed the home rule covered them, but an entry naming `~/.netrc` itself is neither the home nor an ancestor nor inside a listed store, so it was granted and re-opened exactly one denied file | `sandbox._CREDENTIAL_FILES`, `sandbox._extra_path_refusal` | 21 file-level paths mirrored 1:1 from the profile's literal denies, checked bidirectionally like the stores. `~/.netrc`, `~/.cargo`, `~/.config/hub` refused while `/opt/homebrew`, `/usr/local`, `/tmp` still granted. `test_every_file_level_credential_is_out_of_reach_of_extra_paths` walks the list and fails without the change |
 | The Linux jail left `~/.codex/prompts` and `~/.codex/auth.json` writable: `_CODEX_PROTECTED` omitted them, so a turn could plant standing instructions codex reads on every run, or swap the operator's OAuth token | `sandbox._CODEX_PROTECTED` | `prompts` and `auth.json` added to the write-deny list, `prompts` to the dirs. `skills` deliberately not added: codex writes its own tree inside it (measured: 242 touches and a `skills/.system/` tree per turn), so a read-only mount there breaks codex. `test_linux_write_denies_cover_codex_prompts_and_auth` fails without the change |
+| Every jailed `claude-pty` turn hung for its whole timeout: the startup lock is a `mkdir` under the deny-default config directory, and its stale-lock recovery reads a pid file *inside* the directory, so a denied `mkdir` is unrecoverable rather than slow | `seatbelt/*.sb` `_CLAUDE_CONFIG/.pty-lock`, `sandbox.agent_env` | Reproduced live under the jail (`mkdir: Operation not permitted`, then 150s of silent spin at 50ms a tick); `CLAUDE_PTY_NO_LOCK=1` got the same turn out to the network, which is what identified the lock as the blocker. `test_the_pty_startup_lock_can_be_taken_under_the_jail` fails without the grant under both bases. Capability, not a weakening: the directory holds one pid file read only by claude-pty, and the sibling test proves `settings.json` and `hooks/` stayed denied |
 
 ## Open
 
@@ -145,6 +146,14 @@ purpose.
 which execs a different binary plus tmux, and the five slots are already full. Under
 `deny-most` `$HOME` is opaque, so `claude` is invisible and `execvp` fails. The natural
 operator remedy is a wide `extra_paths` entry, which is the finding above.
+
+**The Linux jail still cannot take the claude-pty startup lock.** The seatbelt fix is a
+grant; bubblewrap has no equivalent. `~/.claude` is mounted read-only, so the `mkdir`
+fails there too, and pre-creating `.pty-lock` as a mount source would make it fail with
+`EEXIST` instead, which spins identically. So the cross-platform half is
+`CLAUDE_PTY_LOCK_WAIT_SEC`, capped below a turn in `sandbox.agent_env`: Linux still
+cannot run jailed `claude-pty`, but it now fails in a minute naming the holder instead
+of burning the turn in silence. Not measured on Linux; no host to measure on.
 
 ### Cross-conversation writes
 
