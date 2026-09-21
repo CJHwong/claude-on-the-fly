@@ -1478,36 +1478,54 @@ _CODEX_MUST_NOT_WRITE = (
 def test_the_cotf_env_deny_covers_any_depth(profile):
     """The tokens must not be readable from a copy one directory down.
 
-    `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and memory
-    live under it -- so the tokens are covered by a regex rather than a subpath deny.
-    The regex used to be anchored at the directory root, which left
-    `pre-migration-backup-*/.env` and a syncer's `sub/.env` readable while the file an
-    operator actually thinks about was protected. Asserted on the profile text because
-    the suite's HOME is a tmpdir the profile grants wholesale, so a live read there
-    would succeed for the wrong reason.
+    `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and
+    memory live under it -- so the tokens are covered by a regex rather than a
+    subpath deny. That regex used to be anchored at the directory root, which left
+    `pre-migration-backup-*/.env` and a syncer's `sub/.env` readable while the file
+    an operator actually thinks about was protected. One global rule now covers
+    every directory in both profiles, so the property is asserted on it. Asserted
+    on the profile text because the suite's HOME is a tmpdir the profile grants
+    wholesale, so a live read there would succeed for the wrong reason.
     """
-    text = profile.read_text()
-    if profile == sandbox._BASE_PROFILE:
-        # The default location's own deny lives only in allow-reads; deny-most
-        # covers the default location through its blanket _HOME opacity.
-        default_rule = next(
-            line
-            for line in text.splitlines()
-            if "deny file-read*" in line
-            and "claude-on-the-fly" in line
-            and ".env" in line
-        )
-        assert "(.*/)?" in default_rule, default_rule
-    # A redirected data dir (COTF_DATA_DIR) is covered by the same-shaped rule
-    # scoped to _DATA_DIR in both profiles, so a second daemon's .env is denied
-    # wherever the dir sits -- under _HOME, where deny-most is opaque anyway,
-    # or outside it, where only this deny reaches.
-    data_rule = next(
-        line
-        for line in text.splitlines()
-        if "deny file-read*" in line and "_DATA_DIR" in line and ".env" in line
+    rule = next(
+        line.strip()
+        for line in profile.read_text().splitlines()
+        if line.strip().startswith("(deny file-read*") and "\\.env" in line
     )
-    assert "(.*/)?" in data_rule, data_rule
+    assert "(.*/)?" in rule, rule
+    assert '"^' not in rule, f"a root anchor would miss every other tree: {rule}"
+    assert "\\.env$" not in rule, f"an end anchor would miss .env.local: {rule}"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_dotenv_deny_is_the_last_word_on_reads(profile):
+    """It only holds because nothing re-allows a read after it. SBPL is
+    last-match-wins, so a grant added below would reopen every dotenv it covers,
+    and nothing in the rule itself would look wrong."""
+    lines = [
+        line.strip()
+        for line in profile.read_text().splitlines()
+        if not line.strip().startswith(";;") and line.strip()
+    ]
+    deny = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("(deny file-read*") and "\\.env" in line
+    )
+    later = [line for line in lines[deny + 1 :] if line.startswith("(allow file-read")]
+    assert not later, f"a read allow after the dotenv deny reopens it: {later}"
+
+
+def test_jail_sb_adds_no_read_allow_after_importing_the_base():
+    """The base is imported first, so a read allow in jail.sb would sit after the
+    dotenv deny and win over it. Pins the assumption the test above rests on."""
+    lines = [
+        line.strip()
+        for line in sandbox._JAIL_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;") and line.strip()
+    ]
+    allows = [line for line in lines if line.startswith("(allow file-read")]
+    assert not allows, f"jail.sb re-allows reads after the base: {allows}"
 
 
 def test_the_cotf_env_is_a_verified_denial():
@@ -3804,38 +3822,20 @@ def test_linux_masked_covers_dotenvs_behind_a_codex_link(monkeypatch, tmp_path):
     assert secret in sandbox._linux_masked(tmp_path / "data")
 
 
-def test_every_codex_link_slot_gets_its_dotenv_deny():
-    """A slot with a read grant and no dotenv deny is the hole this closes, and it
-    would be invisible until someone kept a token beside a shared skill."""
-    profile = sandbox._DENY_MOST_PROFILE
-    for index in range(1, sandbox_macos._CODEX_LINK_SLOTS + 1):
-        param = f"_CODEX_LINK_{index}"
-        denies = [
-            line
-            for line in _live_rules(profile, param)
-            if line.startswith("(deny file-read*") and "\\.env" in line
-        ]
-        assert denies, f"{param} has a read grant and no dotenv deny"
-
-
-def test_the_codex_link_dotenv_denies_come_after_their_grants():
-    """SBPL is last-match-wins, so a deny placed above its grant does nothing."""
-    lines = [
+def test_one_rule_covers_every_read_grant_in_the_profile():
+    """Each grant used to carry its own dotenv deny, which meant a tree nobody
+    thought to name kept its tokens readable -- measured on `~/.claude` and
+    `~/.codex`, both of which get a blanket subpath grant. Pinning that the
+    per-grant rules did not come back, because adding one would read as
+    thoroughness while leaving the gap it replaced."""
+    text = sandbox._DENY_MOST_PROFILE.read_text()
+    denies = [
         line.strip()
-        for line in sandbox._DENY_MOST_PROFILE.read_text().splitlines()
-        if not line.strip().startswith(";;")
+        for line in text.splitlines()
+        if line.strip().startswith("(deny file-read*") and "\\.env" in line
     ]
-    grant = next(
-        i
-        for i, line in enumerate(lines)
-        if line.startswith("(allow file-read* (subpath") and "_CODEX_LINK_1" in line
-    )
-    deny = next(
-        i
-        for i, line in enumerate(lines)
-        if line.startswith("(deny file-read*") and "_CODEX_LINK_1" in line
-    )
-    assert grant < deny
+    assert len(denies) == 1, f"the dotenv deny is meant to be one rule: {denies}"
+    assert "param" not in denies[0], f"a scoped rule covers one tree only: {denies[0]}"
 
 
 def test_linux_masked_covers_dotenvs_under_an_operator_grant(monkeypatch, tmp_path):

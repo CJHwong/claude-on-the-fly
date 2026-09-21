@@ -69,6 +69,8 @@ upgrade path, so none of that was covered by it.
 
 | The codex link grant re-opened a dotenv inside the tree it named, the same way an operator grant would. Measured on a real home: granting `~/.agents/skills` for `~/.codex/skills` made `~/.agents/skills/<skill>/.env` -- a live API token -- readable to a jailed turn | `seatbelt/fs-deny-most.sb` `_CODEX_LINK_*`, `sandbox._linux_masked` | Introduced by the row above and caught before merge by probing what the grant exposed rather than what it was meant to expose. The same unanchored `\\.env` regex the `_EXTRA_*` slots get, one per slot, written after the grants so last-match-wins keeps them; Linux resolves the files and masks them, having no patterns. Probed live: the dotenv denied, `SKILL.md` beside it still readable, so the grant still works |
 
+| A dotenv was readable anywhere the jail granted a tree but nobody had written a matching deny. Each grant carried its own scoped rule, so `~/.claude` and `~/.codex` -- which get a blanket subpath grant -- kept theirs readable, and under the read-permissive base so did every dotenv on the machine | `seatbelt/fs-deny-most.sb`, `seatbelt/fs-allow-reads.sb`, `sandbox._linux_masked` | One `(deny file-read* (regex "(.*/)?\\.env"))` at the end of each profile, replacing the fourteen scoped rules it subsumes; nothing re-allows a read after it, and a test pins that plus jail.sb adding no read allow after the import. The scoped form's stated reason for not doing this -- `.env.example` in the workspace -- was already false: a workspace is always `DATA_DIR/workspaces/<name>` and the data-dir rule already denied it, measured. Linux names each file instead, and the sweep cap now applies only to `sandbox.extra_paths`, where "narrow the entry" is advice an operator can act on; a config tree cotf must mount is masked whole (`~/.codex` holds 132, which is 17KB of argv). Probed live on both bases: every dotenv denied, `SKILL.md` beside one still readable. All eight jail cells still pass. Cost, measured and accepted: a file named `.env*` the agent writes in its own temp dir is no longer readable back |
+
 ## Open
 
 Ordered by severity against the threat model above.
@@ -207,17 +209,6 @@ Two denials seen alongside it are benign and deliberately not granted:
 `file-read-data $HOME/.CFUserTextEncoding`, which every CoreFoundation process attempts,
 and `file-read-metadata $HOME/.git`, from codex walking up from the workspace looking
 for a repository. Granting `~/.agents` alone cleared the failure with both still denied.
-
-**A dotenv inside `~/.claude` or `~/.codex` is readable under `deny-most`.** Both trees
-get a blanket subpath read grant, and neither has the dotenv regex the `_EXTRA_*` and
-`_CODEX_LINK_*` slots carry. Probed live on a real home: a jailed turn read
-`~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/services/<svc>/.env`
-and the identical file under `~/.claude/plugins/`. A plugin marketplace is a normal place
-for a service env file to land, so this is not an exotic layout. Predates the link grants
--- it is the config-tree grant itself -- and the remedy is the same two lines each: a
-`\\.env` deny after the `_CLAUDE_CONFIG` and `_CODEX_OPERATOR_HOME` allows, plus the
-resolved files in the Linux mask. Not done here: it is a separate grant from the one this
-branch changed.
 
 ### Cross-conversation writes
 

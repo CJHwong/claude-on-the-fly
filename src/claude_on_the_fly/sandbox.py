@@ -1603,7 +1603,7 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     that check mirrors the profile's own read denies, which had no rule for a
     dotenv outside the data dir.
     """
-    from claude_on_the_fly import codex_state
+    from claude_on_the_fly import codex_state, envfile
 
     masked: list[Path] = []
     auth_sock = os.environ.get("SSH_AUTH_SOCK")
@@ -1622,7 +1622,19 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     # `_CODEX_LINK_*` slot; a mount namespace has no patterns, so the files are
     # resolved now.
     masked += _dotenvs_under(
-        codex_state.shared_link_targets(), source="the codex home's links"
+        codex_state.shared_link_targets(),
+        source="the codex home's links",
+        cap=None,
+    )
+    # And the two config trees, which are mounted read-only wholesale. macOS
+    # covers every one of these with a single regex at the end of the profile;
+    # a mount namespace has no patterns, so each file is named. Measured on a
+    # real home: a plugin marketplace keeps a service `.env` inside its cache,
+    # under both `~/.claude/plugins` and `~/.codex/plugins`.
+    masked += _dotenvs_under(
+        [envfile.claude_config_dir(), _codex_operator_home()],
+        source="the claude and codex config trees",
+        cap=None,
     )
     return masked
 
@@ -1639,9 +1651,21 @@ _MAX_SWEPT_DOTENVS = 64
 
 
 def _dotenvs_under(
-    roots: Iterable[Path], source: str = "sandbox.extra_paths"
+    roots: Iterable[Path],
+    source: str = "sandbox.extra_paths",
+    cap: int | None = _MAX_SWEPT_DOTENVS,
 ) -> list[Path]:
     """Every `.env*` file beneath these trees, for masking on Linux.
+
+    `cap` refuses a tree holding more dotenvs than it will mask, and only
+    `sandbox.extra_paths` passes one. That check means "this grant is too broad
+    to be safe, narrow it", which is advice only an operator who wrote the entry
+    can act on. The trees cotf mounts itself -- the two config directories, and
+    whatever the codex home links out to -- have no such remedy: refusing them
+    does not narrow a grant, it stops the daemon serving. There the whole list is
+    masked however long it runs. Measured on a real home: `~/.codex` holds 132
+    dotenvs across its plugin caches, which is 17KB of bwrap argv and far under
+    any limit, so the cap was bounding correctness rather than work.
 
     `rglob` is not used here, unlike the data-dir sweep above: that walks a tree
     cotf owns and keeps small, while these are the operator's own and can be a
@@ -1660,13 +1684,13 @@ def _dotenvs_under(
             found += [
                 Path(parent) / name for name in filenames if name.startswith(".env")
             ]
-            if len(found) > _MAX_SWEPT_DOTENVS:
+            if cap is not None and len(found) > cap:
                 logger.error(
                     "%s sweep found more than %d dotenv files under %s; refusing to "
                     "mask a partial list, so the grant is not safe to use as written. "
                     "Narrow the entry to the directory the agent actually needs.",
                     source,
-                    _MAX_SWEPT_DOTENVS,
+                    cap,
                     root,
                 )
                 raise _SweepTooBroad(str(root))

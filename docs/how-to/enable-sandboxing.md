@@ -55,6 +55,16 @@ own config, which a grant covers, and then tries to write a tracking symlink und
 read-only by design. It warns (`tracking config: failed to ln -sf`) and runs the tool
 anyway. Grant `~/.config/mise` if you want the config read to succeed as well.
 
+A `.env` file is never readable, under either `sandbox.fs` value and at any depth. One
+rule at the end of each profile covers every tree the jail grants, so a grant you add
+here cannot re-open a token file sitting beside the files you wanted. This is why a
+credentialed CLI fails on its own config inside the jail, and why a read grant is the
+wrong remedy for it: granting the path would hand the token to the session. Put the tool
+in the `commands:` section instead, so it runs outside the sandbox with your credentials
+and the agent only ever sees its output. The shim matches on PATH, so the agent has to
+invoke the tool by bare name -- an absolute path runs the real binary inside the jail,
+where it starts but finds no credential.
+
 Name each directory, never `$HOME` itself. A grant is written after the profile's
 denies and wins over them, so `$HOME` gives the agent back `~/.ssh` and `~/.aws` in one
 line. The daemon refuses such an entry: the home directory, any ancestor of it, and any

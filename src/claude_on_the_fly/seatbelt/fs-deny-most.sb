@@ -247,46 +247,13 @@
 ;; bases. After the grant above, because SBPL is last-match-wins and the codex
 ;; home allow would otherwise re-open it.
 (deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/history.jsonl")))
-;; The daemon's own .env and logs stay denied even outside _HOME: deny-most only
+;; The daemon's own logs stay denied even outside _HOME: deny-most only
 ;; makes $HOME opaque, and COTF_DATA_DIR can point the data dir anywhere -- at a
 ;; redirected directory outside $HOME every rule above would leave the tokens
 ;; readable. Same shape as fs-allow-reads.sb's rules, so a redirected daemon gets
 ;; the same boundary in both profiles. Last in this section so they win over the
 ;; _TMPDIR / _EXTRA_* allows above if the data dir ever sits under those.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
 (deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
-;; An operator grant is a subpath allow, so it re-opens any dotenv inside the tree
-;; it names. `_extra_path_refusal` cannot catch this: it mirrors the profile's own
-;; read denies, and until now the profile had no rule for a dotenv outside the data
-;; dir. A directory an operator adds for real reasons (a config repo, a skills
-;; tree) is exactly where a token file sits beside the files they wanted granted.
-;;
-;; Scoped to the three grants rather than applied globally on purpose: a global
-;; dotenv deny would also cover `.env.example` and `.env.template` in the
-;; workspace, which are checked-in files a turn has every reason to read.
-;;
-;; The regex has no end anchor, and that is deliberate: it matches `.env` and
-;; everything that starts with it -- `.env.local`, `.env.backup`, and whatever a
-;; syncer drops beside it (`.env.sync-conflict-...`). Verified with sandbox-exec,
-;; and pinned by a test, because adding `$` here would look like tidying and would
-;; silently narrow every dotenv deny in both profiles.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_1")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_2")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_3")) "/(.*/)?\\.env")))
-;; The same rule for the codex link grants, which are a subpath allow over a tree
-;; cotf did not choose either -- the operator did, by pointing an entry of their
-;; codex home at it. A shared skills tree is exactly the shape that holds a token
-;; file beside the skill that uses it: measured on a real home, the grant made
-;; `~/.agents/skills/<skill>/.env` readable to a jailed turn. Same unanchored
-;; regex as above, and for the same reasons.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_1")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_2")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_3")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_4")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_5")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_6")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_7")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_CODEX_LINK_8")) "/(.*/)?\\.env")))
 
 ;; -- Writes: identical allowlist to fs-allow-reads.sb --
 ;; Global Claude settings/hooks/plugins are read by future invocations, so a
@@ -406,3 +373,31 @@
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.vscode")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.idea")))
+
+;; ---------------------------------------------------------------------------
+;; -- Every dotenv, everywhere --
+;; ---------------------------------------------------------------------------
+;; One rule, last in the file, so it wins over every read allow above it and
+;; over any allow a future edit adds in the middle. It replaces the per-grant
+;; denies that used to sit beside `_EXTRA_*`, `_CODEX_LINK_*` and the data dir:
+;; each of those covered one tree, and a tree nobody thought to name kept its
+;; tokens readable. Measured holes it closes: a dotenv under `~/.claude` or
+;; `~/.codex` (both get a blanket subpath grant), and under the read-permissive
+;; base every dotenv on the machine.
+;;
+;; The scoped form carried a reason for not doing this -- that a global deny
+;; would also cover `.env.example` in the workspace, a checked-in file a turn has
+;; every reason to read. That reason was already false. A workspace is always
+;; `DATA_DIR/workspaces/<name>` (agent.py builds it, and it is not configurable),
+;; and the data-dir dotenv deny already covered it on both bases. Measured before
+;; this change: `<workspace>/.env.example` was denied. The fence guarded nothing.
+;;
+;; What it does cost: a file literally named `.env*` that the agent writes in its
+;; own temp dir stops being readable back to it. Measured, and accepted -- the
+;; workspace, where the agent actually works, has behaved that way all along.
+;;
+;; No `^`, so it matches at any depth; `(.*/)?` still pins `.env` to the start of
+;; a path component, so `/opt/my.env-tool/bin` is untouched. No end anchor, so it
+;; covers `.env.local`, `.env.bak` and whatever a syncer drops beside them.
+;; Adding either anchor would look like tidying and would silently narrow it.
+(deny file-read* (regex "(.*/)?\\.env"))

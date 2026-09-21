@@ -187,8 +187,8 @@
 ;; denied even when this daemon runs on a redirected data dir (COTF_DATA_DIR),
 ;; because the default directory then holds *another daemon's* tokens and
 ;; conversation logs. The _DATA_DIR rules cover the redirected directory itself.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.claude-on-the-fly/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
+;; The dotenv half of this pair is gone: the global deny at the end of the file
+;; covers both directories, and every other one too.
 (deny file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/logs")))
 (deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
 ;; The daemons' own bookkeeping: heartbeats, pids, the event log, the Telegram
@@ -408,3 +408,31 @@
 ;; the agent schedules for itself past any approval the operator set.
 (deny file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/state")))
 (deny file-write* (subpath (string-append (param "_DATA_DIR") "/state")))
+
+;; ---------------------------------------------------------------------------
+;; -- Every dotenv, everywhere --
+;; ---------------------------------------------------------------------------
+;; One rule, last in the file, so it wins over every read allow above it and
+;; over any allow a future edit adds in the middle. It replaces the per-grant
+;; denies that used to sit beside `_EXTRA_*`, `_CODEX_LINK_*` and the data dir:
+;; each of those covered one tree, and a tree nobody thought to name kept its
+;; tokens readable. Measured holes it closes: a dotenv under `~/.claude` or
+;; `~/.codex` (both get a blanket subpath grant), and under the read-permissive
+;; base every dotenv on the machine.
+;;
+;; The scoped form carried a reason for not doing this -- that a global deny
+;; would also cover `.env.example` in the workspace, a checked-in file a turn has
+;; every reason to read. That reason was already false. A workspace is always
+;; `DATA_DIR/workspaces/<name>` (agent.py builds it, and it is not configurable),
+;; and the data-dir dotenv deny already covered it on both bases. Measured before
+;; this change: `<workspace>/.env.example` was denied. The fence guarded nothing.
+;;
+;; What it does cost: a file literally named `.env*` that the agent writes in its
+;; own temp dir stops being readable back to it. Measured, and accepted -- the
+;; workspace, where the agent actually works, has behaved that way all along.
+;;
+;; No `^`, so it matches at any depth; `(.*/)?` still pins `.env` to the start of
+;; a path component, so `/opt/my.env-tool/bin` is untouched. No end anchor, so it
+;; covers `.env.local`, `.env.bak` and whatever a syncer drops beside them.
+;; Adding either anchor would look like tidying and would silently narrow it.
+(deny file-read* (regex "(.*/)?\\.env"))
