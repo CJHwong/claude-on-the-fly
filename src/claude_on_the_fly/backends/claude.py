@@ -809,6 +809,33 @@ def _statusline_response_fields(statusline: dict) -> dict:
     return out
 
 
+# claude's TUI races on a singleton supervisor lock for roughly the first second
+# of boot, and two starting together leave one hung. claude-pty normally gates
+# that with a lock directory in the claude config dir; the Linux jail mounts that
+# directory read-only, so the daemon holds the gate instead. See
+# sandbox.claude_pty_startup_is_delegated for why the mount cannot be the fix.
+_PTY_STARTUP_GATE = asyncio.Lock()
+
+# Three seconds, between the ~1s race the script documents and the 10s cap it
+# falls back to when its own release signal never arrives. cotf cannot see that
+# signal -- it is a file inside the wrapper's private temp dir -- so this is a
+# fixed window rather than an early release.
+_PTY_STARTUP_WINDOW_SECONDS = 3.0
+
+
+async def _hold_pty_startup_gate() -> None:
+    """Take the startup gate and give it up again after the boot window.
+
+    Released on a timer rather than by the caller, because the turn outlives the
+    race by minutes: releasing at the end of the turn would serialize whole turns
+    instead of the one second that needs it.
+    """
+    await _PTY_STARTUP_GATE.acquire()
+    asyncio.get_running_loop().call_later(
+        _PTY_STARTUP_WINDOW_SECONDS, _PTY_STARTUP_GATE.release
+    )
+
+
 async def _exec_pty(
     workspace: Path, cmd: list[str], timeout: float | None = None
 ) -> dict:
@@ -831,6 +858,8 @@ async def _exec_pty(
         agent.argv_for_log(cmd),
         timeout,
     )
+    if sandbox.claude_pty_startup_is_delegated():
+        await _hold_pty_startup_gate()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,

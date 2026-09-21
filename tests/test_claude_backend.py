@@ -1138,3 +1138,43 @@ class TestPtyTokensAreThisTurnOnly:
         assert backend._extract_tokens(
             {"usage": {"input_tokens": 5, "output_tokens": 2}}, workspace, "s1", 0
         ) == (5, 2)
+
+
+class TestTheDelegatedPtyStartupGate:
+    """On Linux the config dir is a read-only mount, so claude-pty cannot take its
+    own startup lock and the daemon holds the equivalent gate around the spawn."""
+
+    def _proc(self) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b'{"result": "hi"}', b""))
+        return proc
+
+    async def _run(self, monkeypatch, delegated: bool) -> list[str]:
+        taken: list[str] = []
+
+        async def record() -> None:
+            taken.append("held")
+
+        monkeypatch.setattr(
+            claude_mod.sandbox, "claude_pty_startup_is_delegated", lambda: delegated
+        )
+        monkeypatch.setattr(claude_mod, "_hold_pty_startup_gate", record)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=self._proc()),
+            patch.object(
+                claude_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ),
+        ):
+            await claude_mod._exec_pty(Path("/tmp"), ["claude-pty"])
+        return taken
+
+    async def test_the_gate_is_taken_when_the_lock_is_delegated(
+        self, monkeypatch
+    ) -> None:
+        assert await self._run(monkeypatch, delegated=True) == ["held"]
+
+    async def test_the_gate_is_left_alone_when_claude_pty_locks_for_itself(
+        self, monkeypatch
+    ) -> None:
+        assert await self._run(monkeypatch, delegated=False) == []

@@ -55,10 +55,18 @@ from rich.text import Text
 
 logger = logging.getLogger(__name__)
 
-# Where a run's socket directory lives. Under DATA_DIR because the jail already
-# grants that subtree for writing (`sandbox.py`), so a jailed agent can create its
-# own server there with no profile change, and because a socket under TMPDIR would
-# be swept by the OS while a long turn is still running.
+# Where a run's socket directory lives. Under DATA_DIR because a socket under
+# TMPDIR would be swept by the OS while a long turn is still running.
+#
+# The jail grants this subtree for reading and writing, and grants the socket
+# inside it as a single `network-outbound` literal. Both halves are needed and
+# neither is sufficient: tmux is a unix-socket client, so with the files alone
+# `tmux new-session` still answers "error connecting to ... (Operation not
+# permitted)", and with the socket alone it has nowhere to put the server's
+# directory. With both, a jailed turn reaches this server and gets a real pane.
+# An earlier note here said the opposite, on the profile's own claim that a unix
+# socket allow cannot be scoped to a path. It can -- see the note above
+# `(deny network-outbound)` in jail.sb for the measurement.
 PANES_DIRNAME = "panes"
 
 # Session name for a background job's pane. Chat turns are named by

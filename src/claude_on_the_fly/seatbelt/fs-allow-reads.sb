@@ -187,8 +187,8 @@
 ;; denied even when this daemon runs on a redirected data dir (COTF_DATA_DIR),
 ;; because the default directory then holds *another daemon's* tokens and
 ;; conversation logs. The _DATA_DIR rules cover the redirected directory itself.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.claude-on-the-fly/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
+;; The dotenv half of this pair is gone: the global deny at the end of the file
+;; covers both directories, and every other one too.
 (deny file-read* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/logs")))
 (deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
 ;; The daemons' own bookkeeping: heartbeats, pids, the event log, the Telegram
@@ -231,6 +231,12 @@
 ;; CODEX_HOME and only its own rollouts are in it.
 (deny file-read* (subpath (param "_CODEX_SESSIONS")))
 (allow file-read* (subpath (param "_CODEX_HOME")))
+;; codex's prompt history, denied the way claude's history.jsonl is. Same data --
+;; every prompt typed in every project, so it crosses threads exactly as claude's
+;; does -- and it was readable while claude's was denied. Measured under both fs
+;; bases. After the grant above, because SBPL is last-match-wins and the codex
+;; home allow would otherwise re-open it.
+(deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/history.jsonl")))
 
 ;; -- macOS Sensitive Data --
 ;; Allowed to enable macOS Security framework (Keychain) for tool authentication (e.g., Claude login)
@@ -271,6 +277,18 @@
 (allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/sessions")))
 (allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/plugins/cache")))
 (allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/policy-limits.json")))
+;; claude-pty's startup lock. It serializes claude's supervisor boot race by
+;; mkdir'ing this directory, and its stale-lock recovery reads a pid file *inside*
+;; it -- so a denied mkdir is not recoverable: there is no directory, therefore no
+;; pid to find dead, and the script spins until CLAUDE_PTY_LOCK_WAIT_SEC. Measured
+;; under the jail: every jailed claude-pty turn hung for its whole timeout with an
+;; empty pane, because "mkdir: Operation not permitted" is swallowed by 2>/dev/null.
+;; Not instruction-bearing -- it holds one pid file, read only by claude-pty
+;; itself -- so it sits with the runtime scratch above rather than with hooks and
+;; settings.json. The Linux jail cannot take this fix: a pre-created bind mount
+;; would make the mkdir fail with EEXIST instead, which spins identically. See
+;; CLAUDE_PTY_LOCK_WAIT_SEC in sandbox.agent_env for the cross-platform half.
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/.pty-lock")))
 ;; codex: the same grant ~/.claude gets, for the other backend. Without it codex
 ;; dies at startup with "failed to initialize in-process app-server client:
 ;; Operation not permitted" before it makes any network call, because its
@@ -293,34 +311,34 @@
 ;;   shell_snapshots/  a shell script codex writes and then sources
 ;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
 ;;                     manifest at the plugins/ root stays denied
-(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
+(deny file-write* (subpath (param "_CODEX_OPERATOR_HOME")))
 ;; Rollouts land in this thread's own CODEX_HOME now, so the shared tree stops
 ;; being writable. Deliberately fail-closed: if the redirect ever did not reach the
 ;; child, codex would write here and then be refused the read back, and a resume
 ;; that silently forgets the conversation is the failure this whole change exists
 ;; to remove. Denied both ways, it fails at startup instead.
 (allow file-write* (subpath (param "_CODEX_HOME")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/tmp")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/log")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/shell_snapshots")))
 ;; Per-thread writer lock directory, added by a codex release after this list
 ;; was measured. Without it codex 0.147 exits before any network call with
 ;; "Operation not permitted": it cannot create the coordination lock and so
 ;; cannot initialise thread persistence, which is what session resume needs.
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/thread-writer-locks")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/thread-writer-locks")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/cache")))
 (allow file-write*
-  (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/models_cache.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/version.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/installation_id")))
+  (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/.remote-plugin-install-staging")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/models_cache.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/version.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/installation_id")))
 ;; The agent's own OAuth credential. Denying the *write* protects nothing: the read
 ;; is already permitted by design (see "Deliberately NOT denied" above), so an agent
 ;; that wanted the token already has it. What denying would cost is token refresh --
 ;; codex persists a refreshed ChatGPT token here, and a deployment that cannot would
 ;; break the first time one expired.
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/auth.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/auth.json")))
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
@@ -342,6 +360,9 @@
 ;; Scoped to memory/ on purpose: the sibling .env and logs/ stay unreadable.
 ;; Resolved from _DATA_DIR so a redirected data dir keeps its own memory writable.
 (allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
+;; The pane socket, see the read grant. tmux writes to the socket file and creates
+;; its lock beside it, so read alone leaves the pane unreachable.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/panes")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))
@@ -387,3 +408,31 @@
 ;; the agent schedules for itself past any approval the operator set.
 (deny file-write* (subpath (string-append (param "_HOME") "/.claude-on-the-fly/state")))
 (deny file-write* (subpath (string-append (param "_DATA_DIR") "/state")))
+
+;; ---------------------------------------------------------------------------
+;; -- Every dotenv, everywhere --
+;; ---------------------------------------------------------------------------
+;; One rule, last in the file, so it wins over every read allow above it and
+;; over any allow a future edit adds in the middle. It replaces the per-grant
+;; denies that used to sit beside `_EXTRA_*`, `_CODEX_LINK_*` and the data dir:
+;; each of those covered one tree, and a tree nobody thought to name kept its
+;; tokens readable. Measured holes it closes: a dotenv under `~/.claude` or
+;; `~/.codex` (both get a blanket subpath grant), and under the read-permissive
+;; base every dotenv on the machine.
+;;
+;; The scoped form carried a reason for not doing this -- that a global deny
+;; would also cover `.env.example` in the workspace, a checked-in file a turn has
+;; every reason to read. That reason was already false. A workspace is always
+;; `DATA_DIR/workspaces/<name>` (agent.py builds it, and it is not configurable),
+;; and the data-dir dotenv deny already covered it on both bases. Measured before
+;; this change: `<workspace>/.env.example` was denied. The fence guarded nothing.
+;;
+;; What it does cost: a file literally named `.env*` that the agent writes in its
+;; own temp dir stops being readable back to it. Measured, and accepted -- the
+;; workspace, where the agent actually works, has behaved that way all along.
+;;
+;; No `^`, so it matches at any depth; `(.*/)?` still pins `.env` to the start of
+;; a path component, so `/opt/my.env-tool/bin` is untouched. No end anchor, so it
+;; covers `.env.local`, `.env.bak` and whatever a syncer drops beside them.
+;; Adding either anchor would look like tidying and would silently narrow it.
+(deny file-read* (regex "(.*/)?\\.env"))

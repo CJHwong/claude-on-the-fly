@@ -20,7 +20,8 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_5
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_16,
+;; _CODEX_LINK_1.._CODEX_LINK_8
 ;; and _ANCESTOR_1.._ANCESTOR_8
 ;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
 
@@ -51,6 +52,16 @@
 (deny file-read* (subpath (param "_HOME")))
 (allow file-read* (subpath (param "_PROJECT_DIR")))
 (allow file-read* (subpath (string-append (param "_HOME") "/.claude")))
+;; The same grant against the resolved config directory, because CLAUDE_CONFIG_DIR
+;; can move the tree outside $HOME where the rule above reaches nothing. Every
+;; claude *write* re-grant is already written against this param for that reason;
+;; the read was not, so a relocated config directory was invisible to a jailed
+;; agent and the CLI could not read its own settings. Measured under this base:
+;; "Operation not permitted" on <config>/settings.json before the line below.
+;; Position matters -- the cross-thread projects/ deny and the history.jsonl deny
+;; both come after this and still win, which is what keeps this a capability grant
+;; rather than a hole.
+(allow file-read* (subpath (param "_CLAUDE_CONFIG")))
 (allow file-read* (literal (string-append (param "_HOME") "/.claude.json")))
 ;; claude keeps one directory of session JSONL per workspace, and a workspace is
 ;; one chat thread. The grant above reaches all of them, so a jailed turn could
@@ -66,7 +77,37 @@
 ;; below. It has to come after the operator and runtime allows, because either one
 ;; can name an ancestor of these trees.
 ;; codex config, the same grant ~/.claude gets for the other backend.
-(allow file-read* (subpath (string-append (param "_HOME") "/.codex")))
+(allow file-read* (subpath (param "_CODEX_OPERATOR_HOME")))
+;; Where the operator's codex home links out to. The grant above covers that
+;; home, and a symlink inside it is resolved by the kernel before any rule is
+;; matched, so an entry pointing elsewhere under the opaque $HOME reads as
+;; missing while the profile still claims to grant it. Measured: `~/.codex/agents
+;; -> ~/.agents/agents` made codex exit 1 with "Operation not permitted (os error
+;; 1)", and the kernel logged `deny(1) file-read-data .../.agents/agents`. The
+;; Linux jail already mounts these targets read-only, so this is parity rather
+;; than a new capability. Read only -- the write deny on the codex tree is below
+;; and still wins -- and the caller refuses a target that is $HOME, an ancestor
+;; of it, or a credential store, so a link cannot be used to reopen the home.
+;; Unused slots point at _PROJECT_DIR, already allowed above.
+(allow file-read* (subpath (param "_CODEX_LINK_1")))
+(allow file-read* (subpath (param "_CODEX_LINK_2")))
+(allow file-read* (subpath (param "_CODEX_LINK_3")))
+(allow file-read* (subpath (param "_CODEX_LINK_4")))
+(allow file-read* (subpath (param "_CODEX_LINK_5")))
+(allow file-read* (subpath (param "_CODEX_LINK_6")))
+(allow file-read* (subpath (param "_CODEX_LINK_7")))
+(allow file-read* (subpath (param "_CODEX_LINK_8")))
+;; And metadata on the directories above each one, for the same reason the
+;; runtime slots below need it: a subpath grant says nothing about the parents
+;; that lead to it, and the opaque $HOME denies stat() on them.
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_1")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_2")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_3")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_4")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_5")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_6")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_7")))
+(allow file-read-metadata (path-ancestors (param "_CODEX_LINK_8")))
 ;; Command-broker shims. Generated under DATA_DIR, which deny-most makes
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".
@@ -80,6 +121,12 @@
 ;; lives under the data dir this profile makes opaque. See the write grant below
 ;; for why it is not the operator's cache.
 (allow file-read* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
+;; cotf's tmux socket directory. A hosted turn's pane lives on that server and
+;; claude-pty is pointed at it through TMUX_TMPDIR, so the agent's tmux has to
+;; reach the address the daemon created. The connect itself is gated separately
+;; and much more narrowly, by the one literal in jail.sb -- this only makes the
+;; socket file reachable, which on its own opens no session.
+(allow file-read* (subpath (string-append (param "_DATA_DIR") "/panes")))
 ;; The operator's cache, read-only. uv is pointed elsewhere for writes, and a
 ;; downloaded wheel is not a secret, so reading a warm cache costs nothing.
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
@@ -104,11 +151,50 @@
 (allow file-read* (subpath (param "_RUNTIME_3")))
 (allow file-read* (subpath (param "_RUNTIME_4")))
 (allow file-read* (subpath (param "_RUNTIME_5")))
+(allow file-read* (subpath (param "_RUNTIME_6")))
+(allow file-read* (subpath (param "_RUNTIME_7")))
+(allow file-read* (subpath (param "_RUNTIME_8")))
+(allow file-read* (subpath (param "_RUNTIME_9")))
+(allow file-read* (subpath (param "_RUNTIME_10")))
+(allow file-read* (subpath (param "_RUNTIME_11")))
+(allow file-read* (subpath (param "_RUNTIME_12")))
+(allow file-read* (subpath (param "_RUNTIME_13")))
+(allow file-read* (subpath (param "_RUNTIME_14")))
+(allow file-read* (subpath (param "_RUNTIME_15")))
+(allow file-read* (subpath (param "_RUNTIME_16")))
 ;; Operator grants (COTF_SANDBOX_EXTRA_PATHS, capped at 3). Unused slots point
 ;; at _PROJECT_DIR, already allowed above, so they add nothing.
 (allow file-read* (subpath (param "_EXTRA_1")))
 (allow file-read* (subpath (param "_EXTRA_2")))
 (allow file-read* (subpath (param "_EXTRA_3")))
+;; Metadata on every directory above a runtime or operator grant. A subpath
+;; grant says nothing about the parents that lead to it, and the opaque $HOME
+;; denies stat() on them, so anything that canonicalizes its own path dies
+;; before it runs: node resolves its main module with realpath() and failed on
+;; `lstat '/Users/hoss/.local'` with the binary's own directory already
+;; granted. `path-ancestors` is seatbelt's own filter for this and needs no
+;; slot arithmetic, unlike the _ANCESTOR_* literals below, which predate it
+;; and still serve the project dir. Metadata only: the name and mode of each
+;; directory on the way down, never its listing and never its siblings.
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_1")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_2")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_3")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_4")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_5")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_6")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_7")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_8")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_9")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_10")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_11")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_12")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_13")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_14")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_15")))
+(allow file-read-metadata (path-ancestors (param "_RUNTIME_16")))
+(allow file-read-metadata (path-ancestors (param "_EXTRA_1")))
+(allow file-read-metadata (path-ancestors (param "_EXTRA_2")))
+(allow file-read-metadata (path-ancestors (param "_EXTRA_3")))
 ;; Metadata on the directories between $HOME and the project dir. The subpath
 ;; grant on _PROJECT_DIR does not reach its parents, and the opaque $HOME denies
 ;; stat() on them, so a tool that canonicalizes its cwd fails before it starts:
@@ -155,32 +241,19 @@
 ;; jailed turn still read 91855 bytes of another thread's rollout.
 (deny file-read* (subpath (param "_CODEX_SESSIONS")))
 (allow file-read* (subpath (param "_CODEX_HOME")))
-;; The daemon's own .env and logs stay denied even outside _HOME: deny-most only
+;; codex's prompt history, denied the way claude's history.jsonl is. Same data --
+;; every prompt typed in every project, so it crosses threads exactly as claude's
+;; does -- and it was readable while claude's was denied. Measured under both fs
+;; bases. After the grant above, because SBPL is last-match-wins and the codex
+;; home allow would otherwise re-open it.
+(deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/history.jsonl")))
+;; The daemon's own logs stay denied even outside _HOME: deny-most only
 ;; makes $HOME opaque, and COTF_DATA_DIR can point the data dir anywhere -- at a
 ;; redirected directory outside $HOME every rule above would leave the tokens
 ;; readable. Same shape as fs-allow-reads.sb's rules, so a redirected daemon gets
 ;; the same boundary in both profiles. Last in this section so they win over the
 ;; _TMPDIR / _EXTRA_* allows above if the data dir ever sits under those.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
 (deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
-;; An operator grant is a subpath allow, so it re-opens any dotenv inside the tree
-;; it names. `_extra_path_refusal` cannot catch this: it mirrors the profile's own
-;; read denies, and until now the profile had no rule for a dotenv outside the data
-;; dir. A directory an operator adds for real reasons (a config repo, a skills
-;; tree) is exactly where a token file sits beside the files they wanted granted.
-;;
-;; Scoped to the three grants rather than applied globally on purpose: a global
-;; dotenv deny would also cover `.env.example` and `.env.template` in the
-;; workspace, which are checked-in files a turn has every reason to read.
-;;
-;; The regex has no end anchor, and that is deliberate: it matches `.env` and
-;; everything that starts with it -- `.env.local`, `.env.backup`, and whatever a
-;; syncer drops beside it (`.env.sync-conflict-...`). Verified with sandbox-exec,
-;; and pinned by a test, because adding `$` here would look like tidying and would
-;; silently narrow every dotenv deny in both profiles.
-(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_1")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_2")) "/(.*/)?\\.env")))
-(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_3")) "/(.*/)?\\.env")))
 
 ;; -- Writes: identical allowlist to fs-allow-reads.sb --
 ;; Global Claude settings/hooks/plugins are read by future invocations, so a
@@ -209,6 +282,18 @@
 (allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/sessions")))
 (allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/plugins/cache")))
 (allow file-write* (literal (string-append (param "_CLAUDE_CONFIG") "/policy-limits.json")))
+;; claude-pty's startup lock. It serializes claude's supervisor boot race by
+;; mkdir'ing this directory, and its stale-lock recovery reads a pid file *inside*
+;; it -- so a denied mkdir is not recoverable: there is no directory, therefore no
+;; pid to find dead, and the script spins until CLAUDE_PTY_LOCK_WAIT_SEC. Measured
+;; under the jail: every jailed claude-pty turn hung for its whole timeout with an
+;; empty pane, because "mkdir: Operation not permitted" is swallowed by 2>/dev/null.
+;; Not instruction-bearing -- it holds one pid file, read only by claude-pty
+;; itself -- so it sits with the runtime scratch above rather than with hooks and
+;; settings.json. The Linux jail cannot take this fix: a pre-created bind mount
+;; would make the mkdir fail with EEXIST instead, which spins identically. See
+;; CLAUDE_PTY_LOCK_WAIT_SEC in sandbox.agent_env for the cross-platform half.
+(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") "/.pty-lock")))
 ;; codex needs this to start at all; see the note in fs-allow-reads.sb.
 ;; codex needs to write under ~/.codex or it will not start, but the directory also
 ;; holds everything that decides what codex *executes* and what it is *told*. So this
@@ -227,33 +312,33 @@
 ;;   shell_snapshots/  a shell script codex writes and then sources
 ;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
 ;;                     manifest at the plugins/ root stays denied
-(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
+(deny file-write* (subpath (param "_CODEX_OPERATOR_HOME")))
 ;; Rollouts go to this thread's own CODEX_HOME now, so the shared tree no longer
 ;; needs to be writable. Everything codex writes that is not a rollout -- the
 ;; sqlite state, the caches, the shell snapshot it sources, the writer lock --
 ;; lands inside _CODEX_HOME, which the grant below covers wholesale.
 (allow file-write* (subpath (param "_CODEX_HOME")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/tmp")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/log")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/shell_snapshots")))
 ;; Per-thread writer lock directory, added by a codex release after this list
 ;; was measured. Without it codex 0.147 exits before any network call with
 ;; "Operation not permitted": it cannot create the coordination lock and so
 ;; cannot initialise thread persistence, which is what session resume needs.
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/thread-writer-locks")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/thread-writer-locks")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/cache")))
 (allow file-write*
-  (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/models_cache.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/version.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/installation_id")))
+  (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/.remote-plugin-install-staging")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/models_cache.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/version.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/installation_id")))
 ;; The agent's own OAuth credential. Denying the *write* protects nothing: the read
 ;; is already permitted by design (see "Deliberately NOT denied" above), so an agent
 ;; that wanted the token already has it. What denying would cost is token refresh --
 ;; codex persists a refreshed ChatGPT token here, and a deployment that cannot would
 ;; break the first time one expired.
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/auth.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/auth.json")))
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
@@ -266,6 +351,9 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
 (allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
+;; The pane socket, see the read grant. tmux writes to the socket file and creates
+;; its lock beside it, so read alone leaves the pane unreachable.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/panes")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))
@@ -285,3 +373,31 @@
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.vscode")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.idea")))
+
+;; ---------------------------------------------------------------------------
+;; -- Every dotenv, everywhere --
+;; ---------------------------------------------------------------------------
+;; One rule, last in the file, so it wins over every read allow above it and
+;; over any allow a future edit adds in the middle. It replaces the per-grant
+;; denies that used to sit beside `_EXTRA_*`, `_CODEX_LINK_*` and the data dir:
+;; each of those covered one tree, and a tree nobody thought to name kept its
+;; tokens readable. Measured holes it closes: a dotenv under `~/.claude` or
+;; `~/.codex` (both get a blanket subpath grant), and under the read-permissive
+;; base every dotenv on the machine.
+;;
+;; The scoped form carried a reason for not doing this -- that a global deny
+;; would also cover `.env.example` in the workspace, a checked-in file a turn has
+;; every reason to read. That reason was already false. A workspace is always
+;; `DATA_DIR/workspaces/<name>` (agent.py builds it, and it is not configurable),
+;; and the data-dir dotenv deny already covered it on both bases. Measured before
+;; this change: `<workspace>/.env.example` was denied. The fence guarded nothing.
+;;
+;; What it does cost: a file literally named `.env*` that the agent writes in its
+;; own temp dir stops being readable back to it. Measured, and accepted -- the
+;; workspace, where the agent actually works, has behaved that way all along.
+;;
+;; No `^`, so it matches at any depth; `(.*/)?` still pins `.env` to the start of
+;; a path component, so `/opt/my.env-tool/bin` is untouched. No end anchor, so it
+;; covers `.env.local`, `.env.bak` and whatever a syncer drops beside them.
+;; Adding either anchor would look like tidying and would silently narrow it.
+(deny file-read* (regex "(.*/)?\\.env"))

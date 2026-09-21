@@ -3482,7 +3482,7 @@ class TestResolveSessionLog:
 
 
 class TestKillProcessTree:
-    async def test_reaps_grandchild(self):
+    async def test_reaps_grandchild(self, process_gone):
         import os
 
         from claude_on_the_fly.agent import _kill_process_tree
@@ -3505,14 +3505,9 @@ class TestKillProcessTree:
 
         await _kill_process_tree(proc)
 
-        for _ in range(30):
-            try:
-                os.kill(grandchild, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail("grandchild survived the process-tree kill")
+        assert await process_gone(grandchild), (
+            "grandchild survived the process-tree kill"
+        )
 
     async def test_noop_on_exited_process(self):
         from claude_on_the_fly.agent import _kill_process_tree

@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
 import sys
+import time
 from collections.abc import Iterable
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -71,7 +73,113 @@ _PASSTHROUGH_ENDPOINTS = frozenset(
 # claude-pty reads this for its tmux session name. The daemon sets it so it knows
 # which pane to type an approval into; claude-pty's own default is PID-based and
 # therefore unpredictable from outside.
-_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION", "CLAUDE_PTY_NO_TMUX"})
+# CLAUDE_PTY_LOCK_WAIT_SEC is here so an operator can raise it; agent_env lowers
+# the default below a turn, see _PTY_LOCK_WAIT_SECONDS.
+_PASSTHROUGH_PTY = frozenset(
+    {
+        "CLAUDE_PTY_TMUX_SESSION",
+        "CLAUDE_PTY_NO_TMUX",
+        "CLAUDE_PTY_LOCK_WAIT_SEC",
+    }
+)
+
+# How long a spawned claude-pty waits for its startup lock before giving up.
+# claude-pty's own default is 600s, which is longer than every turn timeout cotf
+# uses, so a lock it cannot take costs the whole turn and explains nothing: the
+# turn dies on cotf's timeout while the script is still spinning, and the reason
+# never reaches a log. Below a turn instead, the script loses the race on its own
+# terms and prints "claude-pty: lock wait timeout after Ns (holder pid=...)",
+# which names the holder. Kept generous enough for the contended case it exists
+# for: a real hold is released the moment the statusline sidecar appears, ~500ms.
+_PTY_LOCK_WAIT_SECONDS = "60"
+# claude keeps its own OAuth credential in the login keychain, which jail.sb denies
+# by design. That deny cannot be narrowed to one item: seatbelt matches file paths
+# and every secret on the machine lives inside one database, so allowing claude's
+# credential allows all of them. Measured, with an unrelated item planted to check:
+# dropping the deny exposed that item too, and it would expose the broker's own
+# cotf-anthropic key -- the agent reading the key the broker exists to hide.
+#
+# The daemon runs outside the jail, so it can read that one item and pass the agent
+# the single value it needs. Same posture fs-allow-reads.sb already takes for the
+# other backend, whose own auth.json stays readable because the agent process must
+# read it to authenticate.
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _claude_oauth_token() -> str | None:
+    """The claude CLI's own OAuth access token, or None when there is not one.
+
+    None rather than an exception for every failure shape -- no keychain item, a
+    value that is not the JSON the CLI writes, a missing field. A jailed turn
+    without this fails with "Not logged in", which is exactly what happened before
+    this existed, so an unreadable credential must not take the daemon down.
+
+    Never logged, and never returned anywhere that logs its values: agent_env
+    reports variable names and a dropped count, never contents.
+    """
+    from claude_on_the_fly import broker
+
+    # The login keychain is a macOS store, and `read_keychain` shells out to
+    # `security`, which no other platform has. Without this guard the missing
+    # binary raises FileNotFoundError out of agent_env and takes down every
+    # jailed turn on Linux -- caught by running the Linux jail in a container,
+    # not by reading the code.
+    if _platform() != "darwin":
+        return None
+    try:
+        raw = broker.read_keychain(_CLAUDE_KEYCHAIN_SERVICE)
+    except (KeyError, OSError):
+        return None
+    try:
+        oauth = json.loads(raw)["claudeAiOauth"]
+        token = oauth["accessToken"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        logger.warning(
+            "sandbox: the %s keychain item is not the shape the claude CLI writes, "
+            "so a jailed claude turn will report 'Not logged in'",
+            _CLAUDE_KEYCHAIN_SERVICE,
+        )
+        return None
+    if not isinstance(token, str) or not token:
+        return None
+    # Warn rather than withhold: an expired token fails the turn with an auth error
+    # naming the cause, where withholding it fails with "Not logged in" and blames
+    # the wrong thing. The CLI refreshes the item itself; nothing here can, because
+    # a refresh rotates the credential the operator's own CLI is using.
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
+        logger.warning(
+            "sandbox: the claude credential expired; run any claude command "
+            "outside the jail to refresh it, or a jailed turn will fail to "
+            "authenticate"
+        )
+    return token
+
+
+def claude_pty_startup_is_delegated() -> bool:
+    """True when the daemon has to serialize claude-pty's startup itself.
+
+    claude-pty gates claude's supervisor boot with `mkdir <config>/.pty-lock`,
+    because two TUIs entering that boot window together leave one hung. The Linux
+    jail mounts the config directory read-only, so the mkdir fails and the script
+    spins to its timeout. Measured in a container: "mkdir: cannot create
+    directory '/root/.claude/.pty-lock': Read-only file system".
+
+    A writable mount over the lock is not the fix. The mkdir then fails with
+    EEXIST, and the script's recovery only reclaims a lock whose pid file names a
+    dead process, so an always-present directory spins exactly the same way. An
+    overlay is not the fix either: a private one per turn makes the lock succeed
+    while serializing nothing, which is worse than not locking, and a shared one
+    gives two threads a writable directory they can both see.
+
+    So on Linux the daemon takes the escape hatch the script documents,
+    CLAUDE_PTY_NO_LOCK=1, and holds the gate itself. Say the narrower guarantee
+    out loud: this covers the turns this daemon starts, not a claude the operator
+    runs in their own terminal on the same host.
+    """
+    return mode() == "jail" and _platform() == "linux"
+
+
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -378,16 +486,41 @@ def agent_env() -> dict[str, str] | None:
     # key, so a deployment that sets it in DATA_DIR/.env had the daemon pointing
     # one way and the spawned CLI defaulting to ~/.claude -- which would leave the
     # grant on a directory the CLI never writes, and the session unpersisted with
-    # nothing in the log. Stated explicitly so the two cannot disagree. Resolving
-    # to claude's own default when unset is what the CLI would have done anyway.
+    # nothing in the log. Forward it so the two cannot disagree.
+    #
+    # Only when the daemon actually has one. Setting it to claude's default is
+    # not the no-op it reads as: the default *directory* is ~/.claude, but the
+    # default settings *file* is ~/.claude.json at home root, and naming the
+    # directory moves that file to ~/.claude/.claude.json. On an install that
+    # never set the variable those two files differ, and the one the variable
+    # selects has no `hasCompletedOnboarding`. A -p turn does not care. A pty
+    # turn runs the real TUI, which then opens the first-run theme picker and
+    # waits for a keypress no one can send, so the turn burns its whole timeout
+    # parked on a wizard. Measured: claude-pty passed in 4s with the variable
+    # absent and timed out at 150s with it set to the default.
     from claude_on_the_fly import envfile
 
-    env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
+    configured_claude_config = envfile.daemon_environment().get("CLAUDE_CONFIG_DIR")
+    if configured_claude_config:
+        env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
     # Stated for the reason the profiles no longer grant writes to ~/.cache/uv:
     # see uv_cache_dir(). HOME is a passthrough key, so without this the child
     # resolves the operator's cache and the write deny costs capability instead of
     # buying isolation.
     env["UV_CACHE_DIR"] = str(uv_cache_dir())
+    # setdefault, not assignment: the key is a passthrough one, so an operator who
+    # set it in the daemon environment has already said what they want.
+    env.setdefault("CLAUDE_PTY_LOCK_WAIT_SEC", _PTY_LOCK_WAIT_SECONDS)
+    # Assignment, not setdefault: where the lock cannot be taken at all, an
+    # operator who set this to 0 would be asking for a turn that always spins.
+    if claude_pty_startup_is_delegated():
+        env["CLAUDE_PTY_NO_LOCK"] = "1"
+    # Only on this branch, never when the sandbox is off: an environment token
+    # shadows the CLI's stored credential, so setting it on a turn that can reach
+    # the keychain would change how an unjailed turn authenticates for no reason.
+    claude_token = _claude_oauth_token()
+    if claude_token is not None:
+        env["ANTHROPIC_AUTH_TOKEN"] = claude_token
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
@@ -691,6 +824,72 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     return granted
 
 
+def _shortest_roots(paths: list[Path]) -> list[Path]:
+    """`paths` with every entry that sits under another entry removed.
+
+    A seatbelt subpath grant already covers everything below it, so keeping a
+    child as well spends a slot on a rule that changes nothing. Shallowest first,
+    so a parent is always seen before the children it absorbs.
+    """
+    ordered = sorted({str(p): p for p in paths}.values(), key=lambda p: len(p.parts))
+    roots: list[Path] = []
+    for path in ordered:
+        if not any(path.is_relative_to(root) for root in roots):
+            roots.append(path)
+    return roots
+
+
+def _codex_link_read_paths() -> list[Path]:
+    """Resolved link targets of the operator's codex home that deny-most hides.
+
+    The read grant on that home covers the links and not what they point at:
+    seatbelt matches the path the kernel resolves, so an entry symlinked
+    elsewhere under the opaque $HOME is unreadable while the profile still reads
+    as though it were granted. Sharing one set of agents, skills or instructions
+    between backends is the ordinary way to get there -- `~/.codex/agents ->
+    ~/.agents/agents` is what found this, and codex exited 1 with "Operation not
+    permitted (os error 1)" with no path in the message. The kernel named it:
+    `deny(1) file-read-data /Users/<user>/.agents/agents`.
+
+    The Linux jail has mounted these targets read-only since the session
+    boundary landed, for the same reason in mount terms. This is the macOS half.
+
+    Three filters, in order of how much they remove. A target outside $HOME needs
+    nothing, since deny-most allows reads globally and only carves the home out.
+    A target inside the codex home or the claude config dir is already granted by
+    the rule for that tree. And a target `sandbox.extra_paths` would refuse is
+    refused here too: an operator who links `~/.codex/agents` at `$HOME` or at
+    `~/.ssh` gets a logged refusal rather than a profile that re-opens the home.
+    """
+    from claude_on_the_fly import codex_state, envfile
+
+    home = Path(os.path.realpath(Path.home()))
+    operator = _codex_operator_home()
+    granted = [
+        operator,
+        Path(os.path.realpath(envfile.claude_config_dir())),
+        home / ".claude",
+    ]
+    kept: list[Path] = []
+    for target in codex_state.shared_link_targets(operator):
+        if not target.is_relative_to(home):
+            continue
+        if any(target.is_relative_to(tree) for tree in granted):
+            continue
+        refusal = _extra_path_refusal(target)
+        if refusal is not None:
+            logger.error(
+                "sandbox: the codex home links to %s, which cannot be granted "
+                "because %s. codex will report it as missing. Repoint the link "
+                "or move the content out of that tree",
+                target,
+                refusal,
+            )
+            continue
+        kept.append(target)
+    return _shortest_roots(kept)
+
+
 def _deny_most_in_force() -> bool:
     """Whether the least-privilege filesystem shape applies.
 
@@ -831,7 +1030,36 @@ def agent_guidance(workspace: Path | None = None) -> str:
     )
 
 
-_RUNTIME_SLOTS = 5
+# The binaries a wrapper execs, which `argv[0]` alone never names. claude-pty is
+# a shell script: it runs `claude` for the turn and `tmux` to host it in a pane.
+# Under deny-most neither is granted, so the script dies rc 127 before it does
+# anything, and the failure reads as "command not found" rather than as a denial.
+_EXECS_BEHIND = {"claude-pty": ("claude", "tmux")}
+
+
+def _install_library_dir(binary: Path) -> Path | None:
+    """The `lib/` beside a `<prefix>/bin/<name>` install, when there is one.
+
+    A CLI in `bin/` keeps its code in a sibling rather than beside itself: node
+    puts it in `<prefix>/lib/node_modules`, so granting `bin/` alone leaves the
+    package unreadable. Measured under deny-most: "Cannot read package config
+    .../@openai/codex/package.json: operation not permitted", after the binary
+    had already started.
+
+    `lib/` and not the prefix. The prefix is whatever the installer chose, and
+    for `~/.local/bin/claude` that is `~/.local` -- one grant covering mise's
+    installs, its state and every other tool the operator keeps there, to buy
+    nothing, because claude's code is under `~/.local/share` rather than in a
+    sibling `lib/`. Asking for the directory that actually holds the code keeps
+    the grant the size of the problem.
+
+    None when it does not exist, so a layout that keeps its code elsewhere costs
+    no slot at all.
+    """
+    if binary.parent.name != "bin":
+        return None
+    library = binary.parent.parent / "lib"
+    return library if library.is_dir() else None
 
 
 def _runtime_read_paths(argv: list[str]) -> list[Path]:
@@ -845,10 +1073,29 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     needed, and outside one they collapse to the same path harmlessly. The
     package directory is listed separately because an editable install leaves it
     outside either prefix, and the Linux relay launcher imports from it.
+
+    Every entry is listed twice, as written and as resolved, because seatbelt
+    matches the path the kernel arrives at and a grant naming a symlink covers
+    nothing. uv is the case this was measured on: `sys.base_prefix` is
+    `.../uv/python/cpython-3.12-macos-aarch64-none`, a symlink to the same name
+    carrying the patch version. The grant matched nothing, dyld could not load
+    `lib/libpython3.12.dylib` from the resolved tree, and the interpreter died on
+    SIGABRT before running a line -- which under `deny-most` made the egress
+    preflight inconclusive and refused to start *any* turn, on the project's own
+    documented install method.
+
+    A wrapper contributes the binaries it execs as well as itself, and a
+    `<prefix>/bin/<name>` install contributes the `lib/` beside it. See `_EXECS_BEHIND` and
+    `_install_library_dir` for what each is worth and how far each reaches.
     """
     paths: list[Path] = []
-    binary = shutil.which(argv[0]) if argv else None
-    if binary:
+    names = list(argv[:1])
+    if names:
+        names += _EXECS_BEHIND.get(Path(names[0]).name, ())
+    for name in names:
+        binary = shutil.which(name)
+        if binary is None:
+            continue
         # Two directories, because a launcher and the code it runs need not share
         # one. `claude` installs as a symlink in ~/.local/bin pointing into
         # ~/.local/share/claude/versions/<v>, and granting only the resolved
@@ -861,12 +1108,17 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
         # The parent in each case, not the file: an npm-installed CLI is a shim
         # beside the package tree it loads. Read-only, and they hold executables
         # rather than secrets.
-        paths.append(Path(binary).parent)
-        paths.append(Path(os.path.realpath(binary)).parent)
+        for candidate in (Path(binary), Path(os.path.realpath(binary))):
+            paths.append(candidate.parent)
+            library = _install_library_dir(candidate)
+            if library is not None:
+                paths.append(library)
     paths += [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
     seen: dict[str, Path] = {}
     for path in paths:
         seen.setdefault(str(path), path)
+        resolved = Path(os.path.realpath(path))
+        seen.setdefault(str(resolved), resolved)
     return list(seen.values())
 
 
@@ -927,6 +1179,49 @@ def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
         else projects
     )
     return (Path(os.path.realpath(envfile.claude_config_dir())), projects, thread)
+
+
+def _codex_operator_home() -> Path:
+    """The codex home the operator configured, which `CODEX_HOME` can move.
+
+    Distinct from `_CODEX_HOME`, which names the *running thread's* home and is
+    narrowed to `sessions/` when the session boundary is off. The rules that
+    protect what codex executes and is told -- config.toml, AGENTS.md, hooks.json,
+    prompts -- have to name the operator's tree instead, and they used to spell it
+    `$HOME/.codex` literally. A relocated CODEX_HOME then matched none of them:
+    measured, its config.toml was unreadable under deny-most, so codex could not
+    read its own settings, and its protection came only from the blanket $HOME
+    deny rather than from any rule that knew what the file was.
+
+    Resolves to `~/.codex` when CODEX_HOME is unset, so a deployment that never
+    set it keeps exactly the rules it had.
+    """
+    from claude_on_the_fly import envfile
+
+    return Path(os.path.realpath(envfile.codex_home()))
+
+
+def _pane_socket() -> Path:
+    """cotf's tmux socket, as one literal path the jail may connect to.
+
+    A jailed `claude-pty` hosts its turn in a tmux session, and tmux reaches its
+    server over a unix socket. The profile denies network-outbound, which on macOS
+    covers AF_UNIX connect, so without this every jailed pty turn lost its pane.
+
+    The comment this replaces said unix sockets could not be scoped to a path and
+    that only `(remote unix)` worked, which would have meant opening the Docker
+    socket and ssh-agent to get a pane. That is wrong, and was measured: a profile
+    carrying `(allow network-outbound (literal <socket>))` loads and lets tmux
+    connect, while the same profile without the line answers "Operation not
+    permitted" on the same socket. One literal path, so no other socket is opened.
+
+    Resolved, like every other param: seatbelt matches the resolved path, and a
+    data dir behind a symlink would otherwise leave this matching nothing while
+    the profile still loaded.
+    """
+    from claude_on_the_fly import tmux
+
+    return Path(os.path.realpath(tmux.socket_path()))
 
 
 def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
@@ -1278,8 +1573,8 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
 def _linux_masked(data_dir: Path) -> list[Path]:
     """Paths a coarser grant would otherwise expose, named individually.
 
-    Two of them, and neither has a macOS counterpart because seatbelt expresses
-    both with a rule rather than a mount.
+    None of them has a macOS counterpart, because seatbelt expresses each with a
+    rule rather than a mount.
 
     The ssh-agent socket is the sharper one. `SSH_AUTH_SOCK` is forwarded to the
     agent on both platforms, and on macOS the socket behind it is unusable
@@ -1305,6 +1600,8 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     that check mirrors the profile's own read denies, which had no rule for a
     dotenv outside the data dir.
     """
+    from claude_on_the_fly import codex_state, envfile
+
     masked: list[Path] = []
     auth_sock = os.environ.get("SSH_AUTH_SOCK")
     if auth_sock:
@@ -1314,6 +1611,28 @@ def _linux_masked(data_dir: Path) -> list[Path]:
         if base.is_dir():
             masked += sorted(base.rglob(".env*"))
     masked += _dotenvs_under(Path(p) for p in _extra_read_paths(cap=None))
+    # And the trees the operator's codex home links out to, which `_linux_grants`
+    # mounts read-only for the same reason it mounts an operator grant: cotf did
+    # not choose the tree, the operator did. A shared skills directory is exactly
+    # where a token file sits beside the skill that uses it -- measured on a real
+    # home, `~/.agents/skills/<skill>/.env`. macOS covers this with a regex per
+    # `_CODEX_LINK_*` slot; a mount namespace has no patterns, so the files are
+    # resolved now.
+    masked += _dotenvs_under(
+        codex_state.shared_link_targets(),
+        source="the codex home's links",
+        cap=None,
+    )
+    # And the two config trees, which are mounted read-only wholesale. macOS
+    # covers every one of these with a single regex at the end of the profile;
+    # a mount namespace has no patterns, so each file is named. Measured on a
+    # real home: a plugin marketplace keeps a service `.env` inside its cache,
+    # under both `~/.claude/plugins` and `~/.codex/plugins`.
+    masked += _dotenvs_under(
+        [envfile.claude_config_dir(), _codex_operator_home()],
+        source="the claude and codex config trees",
+        cap=None,
+    )
     return masked
 
 
@@ -1328,8 +1647,22 @@ _SWEEP_PRUNED = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 _MAX_SWEPT_DOTENVS = 64
 
 
-def _dotenvs_under(roots: Iterable[Path]) -> list[Path]:
+def _dotenvs_under(
+    roots: Iterable[Path],
+    source: str = "sandbox.extra_paths",
+    cap: int | None = _MAX_SWEPT_DOTENVS,
+) -> list[Path]:
     """Every `.env*` file beneath these trees, for masking on Linux.
+
+    `cap` refuses a tree holding more dotenvs than it will mask, and only
+    `sandbox.extra_paths` passes one. That check means "this grant is too broad
+    to be safe, narrow it", which is advice only an operator who wrote the entry
+    can act on. The trees cotf mounts itself -- the two config directories, and
+    whatever the codex home links out to -- have no such remedy: refusing them
+    does not narrow a grant, it stops the daemon serving. There the whole list is
+    masked however long it runs. Measured on a real home: `~/.codex` holds 132
+    dotenvs across its plugin caches, which is 17KB of bwrap argv and far under
+    any limit, so the cap was bounding correctness rather than work.
 
     `rglob` is not used here, unlike the data-dir sweep above: that walks a tree
     cotf owns and keeps small, while these are the operator's own and can be a
@@ -1348,13 +1681,13 @@ def _dotenvs_under(roots: Iterable[Path]) -> list[Path]:
             found += [
                 Path(parent) / name for name in filenames if name.startswith(".env")
             ]
-            if len(found) > _MAX_SWEPT_DOTENVS:
+            if cap is not None and len(found) > cap:
                 logger.error(
-                    "sandbox.extra_paths sweep found more than %d dotenv files under "
-                    "%s; refusing to mask a partial list, so the grant is not safe to "
-                    "use as written. Narrow the entry to the directory the agent "
-                    "actually needs.",
-                    _MAX_SWEPT_DOTENVS,
+                    "%s sweep found more than %d dotenv files under %s; refusing to "
+                    "mask a partial list, so the grant is not safe to use as written. "
+                    "Narrow the entry to the directory the agent actually needs.",
+                    source,
+                    cap,
                     root,
                 )
                 raise _SweepTooBroad(str(root))
@@ -1416,7 +1749,19 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # The parent directory rather than the file: an npm-installed CLI is a shim
     # next to the package tree it loads. Read-only, and it holds executables
     # rather than secrets.
-    grants["read_only"] += _runtime_read_paths(argv)
+    #
+    # Resolved form only. bwrap mounts rather than matches, and it refuses a
+    # symlink destination outright -- "Can't mount on symlink destination /bin",
+    # which aborts the whole jail rather than dropping one grant. Merged-usr is
+    # the normal layout on Debian, Ubuntu and Fedora, so `/bin` and `/lib` are
+    # symlinks on most Linux hosts. `_runtime_read_paths` lists every entry both
+    # as written and as resolved for seatbelt's sake, so dropping the symlink
+    # form here costs nothing: the twin it resolves to is already in the list.
+    grants["read_only"] += [
+        path
+        for path in _runtime_read_paths(argv)
+        if str(path) == os.path.realpath(path)
+    ]
     # Same reason `ensure_write_deny_targets` materialises its targets: a mount
     # source has to exist on the host, because bwrap cannot create one inside the
     # read-only root. Both are this turn's own session directories, so creating
@@ -1547,11 +1892,21 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         claude_project=claude_project,
         codex_sessions=codex_sessions,
         codex_home=codex_write,
+        codex_operator_home=_codex_operator_home(),
+        pane_socket=_pane_socket(),
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
+        # Only under deny-most. The other base allows reads across $HOME, so
+        # every one of these is already reachable and computing them would buy a
+        # directory walk per spawn for nothing.
+        codex_link_paths=(
+            [str(path) for path in _codex_link_read_paths()]
+            if base == _DENY_MOST_PROFILE
+            else []
+        ),
         ancestor_paths=sandbox_macos.home_ancestors(
             resolved["project"], resolved["home"]
         ),
@@ -1793,10 +2148,20 @@ _EGRESS_PROBE = (
 
 
 async def _run_jailed(argv: list[str], workspace: Path, timeout: int = 20):
-    """Run argv under the live jail. Returns (returncode, combined output)."""
+    """Run argv under the live jail. Returns (returncode, combined output).
+
+    In the workspace, because the child otherwise inherits whatever directory the
+    daemon was started from and `deny-most` grants no such thing. Measured: the
+    egress probe died on `getcwd()` before importing `socket`, since python
+    resolves the empty `sys.path` entry against the cwd. The failure names no
+    path and no rule -- `PermissionError: [Errno 1] Operation not permitted` out
+    of `importlib` -- and it made every turn refuse to start on a daemon launched
+    from an ungranted directory.
+    """
     proc = await asyncio.create_subprocess_exec(
         *wrap(argv, workspace),
         env=agent_env() or {},
+        cwd=workspace,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1875,9 +2240,13 @@ async def preflight() -> None:
     if mode() != "jail":
         return
     _log_inert_settings()
-    # First, and before anything is spawned: this is a layout problem, so paying
-    # for two jail probes to discover it afterwards is waste.
-    _preflight_protected_symlinks()
+    # First: on Linux this is a layout problem the mount namespace refuses, and it
+    # answers without spawning anything, so the turn fails before the jail probes
+    # rather than after them. On macOS it does spawn, one probe per symlink, because
+    # whether a link is a hole depends on where it points and that is not knowable
+    # from the layout alone. A probe that cannot run reports the link as reachable,
+    # so a jail too broken to spawn warns here and then fails on the echo below.
+    await _preflight_protected_symlinks()
     workspace = _probe_workspace()
     try:
         code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
@@ -1917,7 +2286,38 @@ async def preflight() -> None:
     )
 
 
-def _preflight_protected_symlinks() -> None:
+async def _symlink_target_is_writable(target: Path, workspace: Path) -> bool:
+    """Whether a jailed process can open `target` for writing.
+
+    Opens for append and writes nothing, so a target that turns out to be
+    reachable is reported without being modified. Seatbelt refuses at open(),
+    which is what makes the empty open a sufficient question. `>>` would create an
+    absent file, so the caller only probes targets that already exist.
+
+    A probe that cannot run answers True: this decides whether to warn, and the
+    safe direction is to warn.
+    """
+    argv = wrap(["/bin/sh", "-c", f"exec 3>> '{target}'"], workspace)
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            *argv,
+            env=agent_env() or {},
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(probe.wait(), timeout=15)
+    except (OSError, TimeoutError) as exc:
+        logger.warning(
+            "sandbox: could not test whether %s is writable in the jail (%s); "
+            "treating it as reachable",
+            target,
+            exc,
+        )
+        return True
+    return probe.returncode == 0
+
+
+async def _preflight_protected_symlinks() -> None:
     """Report execution-control paths that are symlinks, before a turn hits them.
 
     These are the entries the jail protects because they decide what the agent
@@ -1950,13 +2350,41 @@ def _preflight_protected_symlinks() -> None:
             "Replace each with a real file or directory, or move the content and "
             "drop the link, then restart."
         )
+    # Whether the link is a hole depends entirely on where it points, so ask
+    # rather than assume. A link into a tree the profile already denies for its
+    # own reasons -- ~/.claude, say -- is covered, and warning about it every
+    # start trains an operator to ignore the one case that is not covered.
+    workspace = _probe_workspace()
+    reachable = [
+        path
+        for path, writable in zip(
+            linked,
+            await asyncio.gather(
+                *(
+                    _symlink_target_is_writable(Path(os.path.realpath(path)), workspace)
+                    for path in linked
+                )
+            ),
+            strict=True,
+        )
+        if writable
+    ]
+    if not reachable:
+        logger.info(
+            "sandbox: %d execution-control path(s) are symlinks (%s), and each "
+            "target is denied by another rule, so they are covered",
+            len(linked),
+            names,
+        )
+        return
     logger.warning(
-        "sandbox: %d execution-control path(s) are symlinks: %s. Seatbelt matches "
-        "the resolved path, so each write deny protects the link and not the file "
-        "behind it, and a jailed turn could rewrite instructions the next run "
-        "reads. Replace them with real files to close that.",
-        len(linked),
-        names,
+        "sandbox: %d execution-control path(s) are symlinks whose target a jailed "
+        "turn can write: %s. Seatbelt matches the resolved path, so the write deny "
+        "protects the link and not the file behind it, and a turn could rewrite "
+        "instructions the next run reads. Replace them with real files, or point "
+        "them at a path the profile already denies.",
+        len(reachable),
+        ", ".join(f"{path} -> {os.path.realpath(path)}" for path in reachable),
     )
 
 

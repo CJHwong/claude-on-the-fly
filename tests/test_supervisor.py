@@ -542,16 +542,30 @@ class TestReap:
     def _exited_child() -> subprocess.Popen:
         """A real child that has exited and has NOT been reaped.
 
-        The pipe is the signal, not a sleep: it reaches EOF the moment the child
-        exits, because the OS closes the child's copy. `wait()` and `poll()`
-        would both reap, which is the thing under test.
+        Waiting on the process state rather than on a pipe. A pipe reaches EOF
+        when the kernel closes the child's descriptors, which happens *during*
+        exit, before the child becomes waitable by its parent -- so `poll()`
+        straight afterwards can still answer None and `reap()` correctly reports
+        nothing to reap. Measured on macOS: 9 of 300 rounds, and rarely enough on
+        a loaded ubuntu runner to read as a random CI failure rather than a race.
+
+        `ps` because neither portable alternative works. `poll()` and `wait()`
+        both reap, which is the state under test, and `os.waitid` with WNOWAIT
+        would be exactly right but CPython does not expose it on macOS.
         """
-        read_fd, write_fd = os.pipe()
-        proc = subprocess.Popen([sys.executable, "-c", "pass"], pass_fds=(write_fd,))
-        os.close(write_fd)
-        assert os.read(read_fd, 1) == b"", "the child did not exit"
-        os.close(read_fd)
-        return proc
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(proc.pid)],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if state.startswith("Z"):
+                return proc
+        proc.kill()
+        proc.wait()
+        raise AssertionError("the child never became an unreaped zombie")
 
     def test_nothing_to_reap_returns_zero(self, isolated_state):
         assert supervisor.reap() == 0

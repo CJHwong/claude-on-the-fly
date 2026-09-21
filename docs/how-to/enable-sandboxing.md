@@ -35,10 +35,35 @@ sandbox:
   broker_only_loopback: true
 ```
 
-`deny-most` hides most of `$HOME`. Add the directories containing interpreters and
-package managers. The directory holding the agent binary is granted automatically.
+`deny-most` hides most of `$HOME`. The agent binary is granted automatically, along
+with the interpreter behind it, the `lib/` beside a `bin/` install, and the binaries a
+wrapper execs. If an entry in your codex home is a symlink pointing elsewhere under
+`$HOME` -- one set of agents or skills shared between backends -- the target is granted
+too, since the grant on the home itself covers the link and not the file behind it. Add
+anything else the agent needs to read.
 
 If the agent works with git, add `~/.gitconfig` as well: git refuses to run when it cannot read its global config, and `deny-most` hides that file with the rest of the home.
+
+If you run claude with hooks, add the directory holding the hook scripts. A hook that
+cannot be read does not stop the turn: claude answers, then the hook fails, and in pty
+mode the failing hook is the one that writes the turn's envelope. The error names the
+script rather than the sandbox, so it is easy to misread.
+
+A toolchain shim works, and logs one line that looks worse than it is. `mise` reads its
+own config, which a grant covers, and then tries to write a tracking symlink under
+`~/.local/state/mise`, which no `extra_paths` entry can permit: these grants are
+read-only by design. It warns (`tracking config: failed to ln -sf`) and runs the tool
+anyway. Grant `~/.config/mise` if you want the config read to succeed as well.
+
+A `.env` file is never readable, under either `sandbox.fs` value and at any depth. One
+rule at the end of each profile covers every tree the jail grants, so a grant you add
+here cannot re-open a token file sitting beside the files you wanted. This is why a
+credentialed CLI fails on its own config inside the jail, and why a read grant is the
+wrong remedy for it: granting the path would hand the token to the session. Put the tool
+in the `commands:` section instead, so it runs outside the sandbox with your credentials
+and the agent only ever sees its output. The shim matches on PATH, so the agent has to
+invoke the tool by bare name -- an absolute path runs the real binary inside the jail,
+where it starts but finds no credential.
 
 Name each directory, never `$HOME` itself. A grant is written after the profile's
 denies and wins over them, so `$HOME` gives the agent back `~/.ssh` and `~/.aws` in one

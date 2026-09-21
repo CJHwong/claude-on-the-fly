@@ -389,3 +389,43 @@ def test_the_jail_can_run_the_interpreter_it_was_started_from(world):
         timeout=60,
     )
     assert "INTERPRETER_RAN" in proc.stdout, proc.stderr[:300]
+
+
+def test_an_entry_the_codex_home_links_out_to_is_readable(world, monkeypatch):
+    """Sharing one set of skills between backends is done with a symlink out of
+    ~/.codex, and both jails have to see through it.
+
+    Neither does so for free. Seatbelt matches the path the kernel resolves, so
+    the grant on the codex home covers the link and not the file; bubblewrap
+    mounts, so the target dangles unless it is mounted too. Both report the file
+    as missing rather than as denied, which is how this survived two readings of
+    the profile. Measured before the fix: codex exited 1 with "Operation not
+    permitted (os error 1)" naming no path, and the kernel logged
+    `deny(1) file-read-data .../.agents/agents`.
+
+    `skills` rather than `agents`, though `agents` is what found it. A protected
+    entry cannot be a symlink on Linux at all -- bwrap answers "Can't mount on
+    symlink destination" and the preflight refuses the layout outright, which is
+    a deliberate platform difference and has its own test. `skills` is not
+    protected (codex writes its own tree inside it), so it is the entry where
+    both platforms promise the same thing.
+    """
+    home, project = world["home"], world["project"]
+    shared = home / ".agents" / "skills"
+    shared.mkdir(parents=True)
+    (shared / "review.md").write_text("how to review\n")
+    # Same parent, not linked from the codex home. The grant is for what the
+    # operator wired in, not for the tree that happens to contain it.
+    beside = home / ".agents" / "private"
+    beside.mkdir()
+    (beside / "secret.txt").write_text("PARITY\n")
+    codex = home / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    (codex / "skills").symlink_to(shared)
+    # conftest pins CODEX_HOME at its own tmp home so no test can touch the real
+    # ~/.codex, and that pin wins over the redirected HOME. Point it at this
+    # world's copy, or the grant is computed for a directory nothing here made.
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+
+    assert _can_read(str(shared / "review.md"), project)
+    assert not _can_read(str(beside / "secret.txt"), project)
