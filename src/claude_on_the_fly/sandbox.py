@@ -1030,9 +1030,6 @@ def agent_guidance(workspace: Path | None = None) -> str:
     )
 
 
-_RUNTIME_SLOTS = 5
-
-
 # The binaries a wrapper execs, which `argv[0]` alone never names. claude-pty is
 # a shell script: it runs `claude` for the turn and `tmux` to host it in a pane.
 # Under deny-most neither is granted, so the script dies rc 127 before it does

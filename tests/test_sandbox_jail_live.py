@@ -223,7 +223,7 @@ async def test_verify_denials_reports_denied_not_absent(jail, monkeypatch):
 
 
 async def test_the_group_kill_still_reaches_the_agent_through_the_jail(
-    jail, monkeypatch
+    jail, monkeypatch, process_gone
 ):
     """Security finding `normal-exit-descendant-survival`: an agent process group
     must be reaped whole, so no descendant outlives the turn.
@@ -264,9 +264,7 @@ async def test_the_group_kill_still_reaches_the_agent_through_the_jail(
             os.kill(inner_pid, 0)  # raises if the agent never came up
 
             await agent._kill_process_tree(proc)
-            await asyncio.sleep(0.5)
-            with pytest.raises(ProcessLookupError):
-                os.kill(inner_pid, 0)
+            assert await process_gone(inner_pid), "the agent outlived the group kill"
         finally:
             sandbox._SESSION_SOCKETS.reset(token)
             await relay.stop()
