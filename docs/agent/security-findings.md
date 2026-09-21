@@ -52,6 +52,10 @@ upgrade path, so none of that was covered by it.
 | The symlink preflight warned on every start about links whose target another rule already denies, so the one case that matters was buried in noise | `sandbox._preflight_protected_symlinks` | It now probes each resolved target under the live jail and warns only about the reachable ones, naming what the link resolves to. The probe opens for append and writes nothing, so a reachable target is reported without being modified. Measured on a real home: both `~/.codex` links resolve into denied trees and the warning is gone. A probe that cannot run counts as reachable, because this decides whether to warn |
 | A jailed claude turn could not authenticate at all: `jail.sb` denies the login keychain, which is where the CLI keeps its OAuth credential, so every jailed `claude-native` turn failed with `Not logged in` before making a network call | `sandbox._claude_oauth_token`, `sandbox.agent_env` | The daemon runs outside the jail, so it reads that one item and passes the one value as `ANTHROPIC_AUTH_TOKEN`; the keychain deny is untouched. Narrowing the deny instead was measured and rejected: seatbelt matches file paths and every secret lives in one database, so dropping it exposed an unrelated planted item too, and would expose the broker's own `cotf-anthropic` key. Live jailed turn: `PASS 5s body='PONG'`. Cost: the agent can read its own credential out of its environment, the posture `fs-allow-reads.sb` already takes for codex's `auth.json`. A broker route would close that too and is the stricter option if it is ever wanted |
 | Every jailed `claude-pty` turn hung for its whole timeout: the startup lock is a `mkdir` under the deny-default config directory, and its stale-lock recovery reads a pid file *inside* the directory, so a denied `mkdir` is unrecoverable rather than slow | `seatbelt/*.sb` `_CLAUDE_CONFIG/.pty-lock`, `sandbox.agent_env` | Reproduced live under the jail (`mkdir: Operation not permitted`, then 150s of silent spin at 50ms a tick); `CLAUDE_PTY_NO_LOCK=1` got the same turn out to the network, which is what identified the lock as the blocker. `test_the_pty_startup_lock_can_be_taken_under_the_jail` fails without the grant under both bases. Capability, not a weakening: the directory holds one pid file read only by claude-pty, and the sibling test proves `settings.json` and `hooks/` stayed denied |
+| A jailed turn could not reach cotf's tmux server, so `claude-pty` fell back to `script` and no jailed pty turn ever got a live pane. The profile's own comment said a unix-socket allow was all-or-nothing, because only `(remote unix)` works and it cannot be scoped | `seatbelt/jail.sb` `_PANE_SOCKET` | The comment was wrong. Measured on macOS 26: `sandbox-exec` accepts `(allow network-outbound (literal <socket>))`, and with it a jailed `tmux` lists cotf's real sessions; with that one line removed and nothing else changed it answers `error connecting ... (Operation not permitted)`. Being a literal, the Docker socket and ssh-agent stay denied, and a test asserts it is the only non-IP outbound allow. End to end: `claude-pty` under the jail went from a 150s timeout to `PASS 5s` |
+| The profiles named `$HOME/.codex` literally in 25 rules, so a deployment that moved `CODEX_HOME` matched none of them: the denies protected a directory codex no longer used, and under `deny-most` codex could not read its own `config.toml` | `seatbelt/fs-deny-most.sb`, `seatbelt/fs-allow-reads.sb`, `sandbox._codex_operator_home` | All 25 rewritten against a new `_CODEX_OPERATOR_HOME` param, resolved through the operator's `CODEX_HOME`. Live under both bases with the home relocated outside `$HOME`: `config.toml` readable, `history.jsonl` still refused, which is what proves the grant is scoped rather than blanket |
+| codex's `history.jsonl` -- every prompt the operator ever typed into codex on this host -- was readable by a jailed turn, while claude's identical file had been denied since the start | `seatbelt/*.sb` `_CODEX_OPERATOR_HOME/history.jsonl` | Denied in both profiles, written after the codex read grant so last-match-wins keeps it. Live probe against the real file refuses under both bases; a structural test pins the ordering. This is what made prompt-history protection symmetric across the two backends |
+| Every jailed `claude-pty` turn still burned its whole timeout after the lock fix, parked on claude's first-run theme picker with nobody able to press a key | `sandbox.agent_env` | `agent_env` exported `CLAUDE_CONFIG_DIR` unconditionally, defaulting it to `~/.claude` under a comment claiming that is what the CLI would have done anyway. It is not: the default *directory* is `~/.claude`, but the default settings *file* is `~/.claude.json` at home root, and naming the directory moves it to `~/.claude/.claude.json` -- a different file, with no `hasCompletedOnboarding`. A `-p` turn does not care; a pty turn runs the real TUI and opens the wizard. The variable is now forwarded only when the daemon actually has one. Measured: `PASS 4s` with it absent, 150s timeout with it set to the default |
 
 ## Open
 
@@ -150,17 +154,16 @@ which execs a different binary plus tmux, and the five slots are already full. U
 `deny-most` `$HOME` is opaque, so `claude` is invisible and `execvp` fails. The natural
 operator remedy is a wide `extra_paths` entry, which is the finding above.
 
-**A jailed turn cannot use cotf's tmux server, so it runs unmirrored and claude-pty
-falls back to `script`.** `tmux.py` claimed the jail granted `DATA_DIR/panes` for
-writing; no profile ever did. Granting it does not fix it either: measured under the
-jail, a write into `panes/` succeeds once granted while `tmux new-session` still fails
-with `error connecting to .../tmux-501/default (Operation not permitted)`. tmux is a
-unix-socket client, and `jail.sb` denies unix sockets outright because the only filter
-that works, `(remote unix)`, cannot be scoped to a path and would open the Docker socket
-and ssh-agent. The grant was written, measured, and reverted for delivering no capability
-at the cost of surface; the false comment is corrected instead. Cost: no live pane view
-under `jail`, and `claude-pty` loses the transcript flush its usage numbers come from.
-Not a credential or egress weakening.
+**A jailed turn's pane runs on a server the operator can attach to.** The
+`_PANE_SOCKET` allow above is what makes a jailed pty turn visible, and visibility is
+the point of the pane -- but it is also a channel. The socket is cotf's own tmux
+server, so an operator who attaches sees the turn, and a turn that can talk to the
+server can also address *other* sessions on it: `tmux send-keys -t <other>` reaches
+another thread's pane. Accepted for now, because every session on that server belongs
+to this daemon and a turn that wanted to influence another thread has cheaper routes
+through the shared workspace. The narrower shape is one server per thread, which costs
+a tmux process per concurrent turn and loses the single `tmux attach` an operator uses
+today. Not measured.
 
 **The Linux jail still cannot take the claude-pty startup lock.** The seatbelt fix is a
 grant; bubblewrap has no equivalent. `~/.claude` is mounted read-only, so the `mkdir`

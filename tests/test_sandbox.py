@@ -367,6 +367,8 @@ def test_jail_argv_keeps_the_deepest_ancestors_when_the_chain_overflows(
             claude_project="/h/.claude/projects/x",
             codex_sessions="/h/.codex/sessions",
             codex_home="/h/.codex",
+            codex_operator_home="/h/.codex",
+            pane_socket="/h/d/panes/tmux-501/default",
             base=sandbox_macos._DENY_MOST_PROFILE,
             loopback=("a", "b", "c", "d"),
             extra_paths=[],
@@ -1415,7 +1417,7 @@ def test_memory_grant_is_scoped_to_memory_not_the_whole_data_dir(profile):
     grants = re.findall(
         r'\(allow file-(?:read|write)\*.*?\(param "_DATA_DIR"\) "([^"]*)"', text
     )
-    scoped = ("/memory", "/shims", "/uv-cache")
+    scoped = ("/memory", "/shims", "/uv-cache", "/panes")
     assert grants, "expected at least one data-dir grant"
     for suffix in grants:
         assert suffix.startswith(scoped), (
@@ -1448,13 +1450,15 @@ _CODEX_MUST_WRITE = (
     # CODEX_HOME, so the shared tree is denied both ways on purpose: it held every
     # other thread's verbatim turns, and leaving it writable while denying the read
     # would mean codex could write a rollout it cannot then resume from.
-    "/.codex/tmp",
-    "/.codex/cache",
-    "/.codex/log",
-    "/.codex/shell_snapshots",
-    "/.codex/plugins/cache",
-    "/.codex/models_cache.json",
-    "/.codex/auth.json",
+    # Relative to _CODEX_OPERATOR_HOME, not to $HOME: CODEX_HOME can move the tree,
+    # and a rule spelled "$HOME/.codex" matched nothing when it did.
+    "/tmp",
+    "/cache",
+    "/log",
+    "/shell_snapshots",
+    "/plugins/cache",
+    "/models_cache.json",
+    "/auth.json",
 )
 
 # Files that decide what codex executes, or what it is told to do. None was written by
@@ -1548,20 +1552,23 @@ def test_the_codex_directory_is_deny_default_not_a_denylist(profile):
     live counterpart is below.
     """
     text = profile.read_text()
-    assert (
-        '(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))' in text
-    ), "the ~/.codex write policy is no longer deny-default"
+    assert '(deny file-write* (subpath (param "_CODEX_OPERATOR_HOME")))' in text, (
+        "the ~/.codex write policy is no longer deny-default"
+    )
     granted = set(
         re.findall(
             r"\(allow file-write\*\s*\n?\s*\((?:subpath|literal) "
-            r'\(string-append \(param "_HOME"\) "([^"]+)"',
+            r'\(string-append \(param "_CODEX_OPERATOR_HOME"\) "([^"]+)"',
             text,
         )
     )
     for path in _CODEX_MUST_WRITE:
         assert path in granted, f"{path} is not granted; codex cannot run without it"
     # The re-grants must not reach back up to the whole directory.
-    assert "/.codex" not in granted, "the blanket ~/.codex grant is back"
+    # A bare re-grant of the home itself would take the whole tree back.
+    assert '(allow file-write* (subpath (param "_CODEX_OPERATOR_HOME")))' not in text, (
+        "the blanket ~/.codex grant is back"
+    )
 
 
 def _grant_covers(kind: str, granted: str, target: str) -> bool:
@@ -2231,6 +2238,8 @@ def test_both_profiles_receive_the_session_grant_params(tmp_path):
             claude_project=tmp_path / "projects" / "thread",
             codex_sessions=tmp_path / "codex" / "sessions",
             codex_home=tmp_path / "codex-homes" / "thread",
+            codex_operator_home=tmp_path / "codex",
+            pane_socket=tmp_path / "panes" / "tmux-501" / "default",
             base=base,
             loopback=("localhost:*",) * 4,
             extra_paths=[],
@@ -2348,6 +2357,22 @@ def test_the_spawned_agent_is_told_which_config_dir_the_daemon_resolved(
     env = sandbox.agent_env()
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "elsewhere")
+
+
+def test_a_daemon_without_a_config_dir_does_not_invent_one(monkeypatch):
+    """Naming claude's default directory is not the no-op it reads as. The default
+    *directory* is ~/.claude, but the default settings *file* is ~/.claude.json at
+    home root, and setting the variable moves that file to ~/.claude/.claude.json.
+    On an install that never set the variable those are two different files, and
+    the one the variable selects has no `hasCompletedOnboarding`. A -p turn does
+    not care; a pty turn runs the real TUI, opens the first-run theme picker, and
+    waits for a keypress nobody can send. Measured: claude-pty passed in 4s with
+    the variable absent and timed out at 150s with it set to the default."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    env = sandbox.agent_env()
+    assert env is not None
+    assert "CLAUDE_CONFIG_DIR" not in env
 
 
 def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(
@@ -3725,3 +3750,143 @@ def test_linux_masked_skips_a_single_file_grant(monkeypatch, tmp_path):
 
     assert secret in masked
     assert tool not in masked
+
+
+# --- the pane socket is the one unix socket a jailed turn may reach ---
+
+
+def test_the_only_unix_socket_allow_is_cotfs_own_pane_socket():
+    """`(deny network-outbound)` covers unix sockets as well as IP, so a pty turn
+    could not reach cotf's tmux server and silently fell back to `script`. The
+    remedy has to stay a single literal: `(remote unix)` would re-open the docker
+    socket and the ssh-agent, both of which are a jail escape."""
+    lines = [
+        line.strip()
+        for line in sandbox._JAIL_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    socket_allows = [
+        line
+        for line in lines
+        if line.startswith("(allow network-outbound") and "remote ip" not in line
+    ]
+    assert socket_allows == [
+        '(allow network-outbound (literal (param "_PANE_SOCKET")))'
+    ]
+
+
+def test_the_pane_socket_allow_comes_after_the_outbound_deny():
+    """SBPL is last-match-wins, so an allow written above the blanket deny buys
+    nothing. Stated as a test because the deny reads like a header and invites a
+    later rule being tucked in above it."""
+    profile = sandbox._JAIL_PROFILE
+    deny = _rule_index(profile, "(deny network-outbound)")
+    allow = _rule_index(
+        profile, '(allow network-outbound (literal (param "_PANE_SOCKET")))'
+    )
+    assert deny > 0 and allow > deny
+
+
+def test_the_pane_socket_param_names_the_server_tmux_actually_uses(monkeypatch):
+    """A literal allow is only as good as the path in it. The jail resolves symlinks
+    on every other path it names, so this one does too -- a DATA_DIR reached through
+    a symlink would otherwise be granted under a name the kernel never sees."""
+    from claude_on_the_fly import tmux
+
+    assert sandbox._pane_socket() == Path(os.path.realpath(tmux.socket_path()))
+
+
+# --- codex's prompt history is denied the way claude's is ---
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_codex_history_deny_comes_after_the_codex_read_grant(profile):
+    """history.jsonl is every prompt the operator typed into codex on this host, the
+    same data claude's own history.jsonl holds. The read grant on the codex home is a
+    subpath, so ordering is what makes the file-level deny hold."""
+    if profile is sandbox._DENY_MOST_PROFILE:
+        allow = _rule_index(
+            profile, '(allow file-read* (subpath (param "_CODEX_HOME")))'
+        )
+        assert allow > 0
+    deny = _rule_index(
+        profile,
+        '(deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") '
+        '"/history.jsonl")))',
+    )
+    assert deny > 0
+    if profile is sandbox._DENY_MOST_PROFILE:
+        assert deny > allow
+
+
+def test_the_codex_operator_home_follows_a_relocated_codex_home(monkeypatch, tmp_path):
+    """The profiles used to name `$HOME/.codex` literally in 25 places, so a
+    deployment that moved CODEX_HOME matched none of them: the denies protected a
+    directory codex no longer used, and the reads it did need were refused."""
+    relocated = tmp_path / "elsewhere" / "codex"
+    relocated.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(relocated))
+    assert sandbox._codex_operator_home() == Path(os.path.realpath(relocated))
+
+
+def test_the_operators_codex_prompt_history_is_unreadable_in_the_jail(
+    monkeypatch, tmp_path, original_home
+):
+    """The codex half of the claude history probe. Live read against the real file,
+    so the deny is the reason it fails and not an absent path."""
+    _seatbelt_or_skip()
+    history = original_home / ".codex" / "history.jsonl"
+    if not history.is_file():
+        pytest.skip("no real codex history.jsonl on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    done = _run_jailed(["/bin/cat", str(history)], tmp_path)
+    assert done.returncode != 0, "the operator's codex prompt history was readable"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+
+
+@pytest.fixture
+def codex_home_outside_tmpdir(original_home, monkeypatch):
+    """The codex twin of `config_dir_outside_tmpdir`, and for the same reason: a
+    directory under TMPDIR is granted wholesale, so a probe there proves nothing."""
+    monkeypatch.setenv("HOME", str(original_home))
+    home = original_home / f"cotf-test-codex-home-{os.getpid()}"
+    home.mkdir(parents=True)
+    yield home
+    shutil.rmtree(home, ignore_errors=True)
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_a_relocated_codex_home_is_readable_under_the_jail(
+    monkeypatch, tmp_path, fs_base, codex_home_outside_tmpdir
+):
+    """The profiles named `$HOME/.codex` literally, so a deployment that moved
+    CODEX_HOME matched none of those rules. Under deny-most that left codex unable
+    to read its own config. Measured failing before `_CODEX_OPERATOR_HOME`:
+    "Operation not permitted" on <codex-home>/config.toml."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    config = codex_home_outside_tmpdir / "config.toml"
+    config.write_text("probe = true\n")
+    done = _run_jailed(["/bin/cat", str(config)], tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "probe" in done.stdout
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_the_relocated_codex_grant_keeps_the_history_deny_below_it(
+    monkeypatch, tmp_path, fs_base, codex_home_outside_tmpdir
+):
+    """What makes that grant a capability rather than a hole: the prompt history
+    moves with CODEX_HOME too, and its deny is written after the read grant."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    history = codex_home_outside_tmpdir / "history.jsonl"
+    history.write_text("every prompt ever typed into codex\n")
+    done = _run_jailed(["/bin/cat", str(history)], tmp_path)
+    assert done.returncode != 0, f"codex prompt history was readable: {done.stdout!r}"

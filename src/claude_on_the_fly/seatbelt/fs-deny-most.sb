@@ -76,7 +76,7 @@
 ;; below. It has to come after the operator and runtime allows, because either one
 ;; can name an ancestor of these trees.
 ;; codex config, the same grant ~/.claude gets for the other backend.
-(allow file-read* (subpath (string-append (param "_HOME") "/.codex")))
+(allow file-read* (subpath (param "_CODEX_OPERATOR_HOME")))
 ;; Command-broker shims. Generated under DATA_DIR, which deny-most makes
 ;; opaque along with the rest of $HOME, so grant it back or every shimmed
 ;; tool becomes "command not found".
@@ -90,6 +90,12 @@
 ;; lives under the data dir this profile makes opaque. See the write grant below
 ;; for why it is not the operator's cache.
 (allow file-read* (subpath (string-append (param "_DATA_DIR") "/uv-cache")))
+;; cotf's tmux socket directory. A hosted turn's pane lives on that server and
+;; claude-pty is pointed at it through TMUX_TMPDIR, so the agent's tmux has to
+;; reach the address the daemon created. The connect itself is gated separately
+;; and much more narrowly, by the one literal in jail.sb -- this only makes the
+;; socket file reachable, which on its own opens no session.
+(allow file-read* (subpath (string-append (param "_DATA_DIR") "/panes")))
 ;; The operator's cache, read-only. uv is pointed elsewhere for writes, and a
 ;; downloaded wheel is not a secret, so reading a warm cache costs nothing.
 (allow file-read* (subpath (string-append (param "_HOME") "/.cache/uv")))
@@ -165,6 +171,12 @@
 ;; jailed turn still read 91855 bytes of another thread's rollout.
 (deny file-read* (subpath (param "_CODEX_SESSIONS")))
 (allow file-read* (subpath (param "_CODEX_HOME")))
+;; codex's prompt history, denied the way claude's history.jsonl is. Same data --
+;; every prompt typed in every project, so it crosses threads exactly as claude's
+;; does -- and it was readable while claude's was denied. Measured under both fs
+;; bases. After the grant above, because SBPL is last-match-wins and the codex
+;; home allow would otherwise re-open it.
+(deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/history.jsonl")))
 ;; The daemon's own .env and logs stay denied even outside _HOME: deny-most only
 ;; makes $HOME opaque, and COTF_DATA_DIR can point the data dir anywhere -- at a
 ;; redirected directory outside $HOME every rule above would leave the tokens
@@ -249,33 +261,33 @@
 ;;   shell_snapshots/  a shell script codex writes and then sources
 ;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
 ;;                     manifest at the plugins/ root stays denied
-(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
+(deny file-write* (subpath (param "_CODEX_OPERATOR_HOME")))
 ;; Rollouts go to this thread's own CODEX_HOME now, so the shared tree no longer
 ;; needs to be writable. Everything codex writes that is not a rollout -- the
 ;; sqlite state, the caches, the shell snapshot it sources, the writer lock --
 ;; lands inside _CODEX_HOME, which the grant below covers wholesale.
 (allow file-write* (subpath (param "_CODEX_HOME")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/tmp")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/log")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/shell_snapshots")))
 ;; Per-thread writer lock directory, added by a codex release after this list
 ;; was measured. Without it codex 0.147 exits before any network call with
 ;; "Operation not permitted": it cannot create the coordination lock and so
 ;; cannot initialise thread persistence, which is what session resume needs.
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/thread-writer-locks")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/thread-writer-locks")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/cache")))
 (allow file-write*
-  (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/models_cache.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/version.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/installation_id")))
+  (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/.remote-plugin-install-staging")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/models_cache.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/version.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/installation_id")))
 ;; The agent's own OAuth credential. Denying the *write* protects nothing: the read
 ;; is already permitted by design (see "Deliberately NOT denied" above), so an agent
 ;; that wanted the token already has it. What denying would cost is token refresh --
 ;; codex persists a refreshed ChatGPT token here, and a deployment that cannot would
 ;; break the first time one expired.
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/auth.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/auth.json")))
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
@@ -288,6 +300,9 @@
 (allow file-write* (subpath (string-append (param "_HOME") "/.ollama")))
 (allow file-write* (subpath (string-append (param "_HOME") "/.Trash")))
 (allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
+;; The pane socket, see the read grant. tmux writes to the socket file and creates
+;; its lock beside it, so read alone leaves the pane unreachable.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/panes")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))

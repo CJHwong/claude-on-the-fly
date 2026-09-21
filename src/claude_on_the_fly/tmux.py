@@ -58,15 +58,15 @@ logger = logging.getLogger(__name__)
 # Where a run's socket directory lives. Under DATA_DIR because a socket under
 # TMPDIR would be swept by the OS while a long turn is still running.
 #
-# This used to claim the jail grants the subtree, so a jailed agent could create
-# its own server here with no profile change. It does not, and granting it does
-# not help: measured under the jail, a write into panes/ succeeds once granted
-# while `tmux new-session` still fails with "error connecting to ... (Operation
-# not permitted)". tmux is a unix-socket client and jail.sb denies unix sockets
-# outright, because the only filter that works is `(remote unix)` and it cannot be
-# scoped to a path -- see the note above `(deny network-outbound)` there. So a
-# jailed turn runs unmirrored and claude-pty takes its `script` fallback, and
-# nothing short of opening every unix socket on the machine changes that.
+# The jail grants this subtree for reading and writing, and grants the socket
+# inside it as a single `network-outbound` literal. Both halves are needed and
+# neither is sufficient: tmux is a unix-socket client, so with the files alone
+# `tmux new-session` still answers "error connecting to ... (Operation not
+# permitted)", and with the socket alone it has nowhere to put the server's
+# directory. With both, a jailed turn reaches this server and gets a real pane.
+# An earlier note here said the opposite, on the profile's own claim that a unix
+# socket allow cannot be scoped to a path. It can -- see the note above
+# `(deny network-outbound)` in jail.sb for the measurement.
 PANES_DIRNAME = "panes"
 
 # Session name for a background job's pane. Chat turns are named by

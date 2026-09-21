@@ -38,12 +38,16 @@
 ;; Three params rather than one list because SBPL has no arrays. Spare slots
 ;; repeat the first port, which is a harmless duplicate allow.
 ;;
-;; Unix sockets are deliberately NOT permitted here. Verified against real
-;; sandbox-exec runs: of every candidate filter, only `(remote unix)` works, and
-;; it is not path-scoped -- it would open every unix socket on the machine,
-;; including the Docker socket and the ssh-agent this profile otherwise protects.
-;; A loopback port is scopeable; a unix socket allow is all-or-nothing.
+;; Unix sockets are denied except cotf's own tmux socket, named as one literal
+;; path. An earlier comment here claimed a unix socket allow was all-or-nothing,
+;; because only `(remote unix)` worked and it could not be scoped. That is wrong,
+;; and the cost of believing it was that no jailed pty turn ever got a pane.
+;; Measured both ways on macOS 26: with `(allow network-outbound (literal <sock>))`
+;; a jailed tmux connects and prints the session list; with the line removed and
+;; nothing else changed it answers "error connecting ... (Operation not
+;; permitted)". Being a literal, the Docker socket and the ssh-agent stay denied.
 (deny network-outbound)
+(allow network-outbound (literal (param "_PANE_SOCKET")))
 (allow network-outbound (remote ip (param "_LOOPBACK")))
 (allow network-outbound (remote ip (param "_LOOPBACK_ALT")))
 (allow network-outbound (remote ip (param "_LOOPBACK_ALT2")))

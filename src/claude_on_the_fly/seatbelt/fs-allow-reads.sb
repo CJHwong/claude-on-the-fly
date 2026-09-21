@@ -231,6 +231,12 @@
 ;; CODEX_HOME and only its own rollouts are in it.
 (deny file-read* (subpath (param "_CODEX_SESSIONS")))
 (allow file-read* (subpath (param "_CODEX_HOME")))
+;; codex's prompt history, denied the way claude's history.jsonl is. Same data --
+;; every prompt typed in every project, so it crosses threads exactly as claude's
+;; does -- and it was readable while claude's was denied. Measured under both fs
+;; bases. After the grant above, because SBPL is last-match-wins and the codex
+;; home allow would otherwise re-open it.
+(deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/history.jsonl")))
 
 ;; -- macOS Sensitive Data --
 ;; Allowed to enable macOS Security framework (Keychain) for tool authentication (e.g., Claude login)
@@ -305,34 +311,34 @@
 ;;   shell_snapshots/  a shell script codex writes and then sources
 ;;   plugins/cache/    plugin payloads, scoped to cache/ and the staging dir so a
 ;;                     manifest at the plugins/ root stays denied
-(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))
+(deny file-write* (subpath (param "_CODEX_OPERATOR_HOME")))
 ;; Rollouts land in this thread's own CODEX_HOME now, so the shared tree stops
 ;; being writable. Deliberately fail-closed: if the redirect ever did not reach the
 ;; child, codex would write here and then be refused the read back, and a resume
 ;; that silently forgets the conversation is the failure this whole change exists
 ;; to remove. Denied both ways, it fails at startup instead.
 (allow file-write* (subpath (param "_CODEX_HOME")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/tmp")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/cache")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/log")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/shell_snapshots")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/tmp")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/log")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/shell_snapshots")))
 ;; Per-thread writer lock directory, added by a codex release after this list
 ;; was measured. Without it codex 0.147 exits before any network call with
 ;; "Operation not permitted": it cannot create the coordination lock and so
 ;; cannot initialise thread persistence, which is what session resume needs.
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/thread-writer-locks")))
-(allow file-write* (subpath (string-append (param "_HOME") "/.codex/plugins/cache")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/thread-writer-locks")))
+(allow file-write* (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/cache")))
 (allow file-write*
-  (subpath (string-append (param "_HOME") "/.codex/plugins/.remote-plugin-install-staging")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/models_cache.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/version.json")))
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/installation_id")))
+  (subpath (string-append (param "_CODEX_OPERATOR_HOME") "/plugins/.remote-plugin-install-staging")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/models_cache.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/version.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/installation_id")))
 ;; The agent's own OAuth credential. Denying the *write* protects nothing: the read
 ;; is already permitted by design (see "Deliberately NOT denied" above), so an agent
 ;; that wanted the token already has it. What denying would cost is token refresh --
 ;; codex persists a refreshed ChatGPT token here, and a deployment that cannot would
 ;; break the first time one expired.
-(allow file-write* (literal (string-append (param "_HOME") "/.codex/auth.json")))
+(allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/auth.json")))
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*
   (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
@@ -354,6 +360,9 @@
 ;; Scoped to memory/ on purpose: the sibling .env and logs/ stay unreadable.
 ;; Resolved from _DATA_DIR so a redirected data dir keeps its own memory writable.
 (allow file-write* (subpath (string-append (param "_DATA_DIR") "/memory")))
+;; The pane socket, see the read grant. tmux writes to the socket file and creates
+;; its lock beside it, so read alone leaves the pane unreachable.
+(allow file-write* (subpath (string-append (param "_DATA_DIR") "/panes")))
 (allow file-write* (subpath (param "_PROJECT_DIR")))
 (allow file-write* (subpath (param "_TMPDIR")))
 (allow file-write* (subpath "/private/var/folders/"))

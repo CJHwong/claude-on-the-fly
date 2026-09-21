@@ -455,11 +455,23 @@ def agent_env() -> dict[str, str] | None:
     # key, so a deployment that sets it in DATA_DIR/.env had the daemon pointing
     # one way and the spawned CLI defaulting to ~/.claude -- which would leave the
     # grant on a directory the CLI never writes, and the session unpersisted with
-    # nothing in the log. Stated explicitly so the two cannot disagree. Resolving
-    # to claude's own default when unset is what the CLI would have done anyway.
+    # nothing in the log. Forward it so the two cannot disagree.
+    #
+    # Only when the daemon actually has one. Setting it to claude's default is
+    # not the no-op it reads as: the default *directory* is ~/.claude, but the
+    # default settings *file* is ~/.claude.json at home root, and naming the
+    # directory moves that file to ~/.claude/.claude.json. On an install that
+    # never set the variable those two files differ, and the one the variable
+    # selects has no `hasCompletedOnboarding`. A -p turn does not care. A pty
+    # turn runs the real TUI, which then opens the first-run theme picker and
+    # waits for a keypress no one can send, so the turn burns its whole timeout
+    # parked on a wizard. Measured: claude-pty passed in 4s with the variable
+    # absent and timed out at 150s with it set to the default.
     from claude_on_the_fly import envfile
 
-    env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
+    configured_claude_config = envfile.daemon_environment().get("CLAUDE_CONFIG_DIR")
+    if configured_claude_config:
+        env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
     # Stated for the reason the profiles no longer grant writes to ~/.cache/uv:
     # see uv_cache_dir(). HOME is a passthrough key, so without this the child
     # resolves the operator's cache and the write deny costs capability instead of
@@ -1013,6 +1025,49 @@ def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
         else projects
     )
     return (Path(os.path.realpath(envfile.claude_config_dir())), projects, thread)
+
+
+def _codex_operator_home() -> Path:
+    """The codex home the operator configured, which `CODEX_HOME` can move.
+
+    Distinct from `_CODEX_HOME`, which names the *running thread's* home and is
+    narrowed to `sessions/` when the session boundary is off. The rules that
+    protect what codex executes and is told -- config.toml, AGENTS.md, hooks.json,
+    prompts -- have to name the operator's tree instead, and they used to spell it
+    `$HOME/.codex` literally. A relocated CODEX_HOME then matched none of them:
+    measured, its config.toml was unreadable under deny-most, so codex could not
+    read its own settings, and its protection came only from the blanket $HOME
+    deny rather than from any rule that knew what the file was.
+
+    Resolves to `~/.codex` when CODEX_HOME is unset, so a deployment that never
+    set it keeps exactly the rules it had.
+    """
+    from claude_on_the_fly import envfile
+
+    return Path(os.path.realpath(envfile.codex_home()))
+
+
+def _pane_socket() -> Path:
+    """cotf's tmux socket, as one literal path the jail may connect to.
+
+    A jailed `claude-pty` hosts its turn in a tmux session, and tmux reaches its
+    server over a unix socket. The profile denies network-outbound, which on macOS
+    covers AF_UNIX connect, so without this every jailed pty turn lost its pane.
+
+    The comment this replaces said unix sockets could not be scoped to a path and
+    that only `(remote unix)` worked, which would have meant opening the Docker
+    socket and ssh-agent to get a pane. That is wrong, and was measured: a profile
+    carrying `(allow network-outbound (literal <socket>))` loads and lets tmux
+    connect, while the same profile without the line answers "Operation not
+    permitted" on the same socket. One literal path, so no other socket is opened.
+
+    Resolved, like every other param: seatbelt matches the resolved path, and a
+    data dir behind a symlink would otherwise leave this matching nothing while
+    the profile still loaded.
+    """
+    from claude_on_the_fly import tmux
+
+    return Path(os.path.realpath(tmux.socket_path()))
 
 
 def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
@@ -1633,6 +1688,8 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         claude_project=claude_project,
         codex_sessions=codex_sessions,
         codex_home=codex_write,
+        codex_operator_home=_codex_operator_home(),
+        pane_socket=_pane_socket(),
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
