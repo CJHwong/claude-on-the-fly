@@ -107,6 +107,12 @@ class ShimmedTool:
     :param env_passthrough: extra parent env names the real binary needs beyond
         the shared essentials. Kept narrow so the subprocess does not inherit
         every secret the daemon happens to hold.
+    :param allow_read_only: prefixes that may run only when the invocation asks
+        the server to read. For a subcommand that is a whole REST API behind one
+        word, `allow` is all-or-nothing: `gh api` covers reading a file and
+        rewriting a repository's settings. Listing it here admits the reads and
+        refuses the writes. An empty tuple keeps the previous behaviour exactly,
+        so this is opt-in per tool.
     """
 
     name: str
@@ -114,6 +120,7 @@ class ShimmedTool:
     readback_flags: frozenset[str] = frozenset()
     env_passthrough: frozenset[str] = frozenset()
     allow: tuple[tuple[str, ...], ...] = ()
+    allow_read_only: tuple[tuple[str, ...], ...] = ()
 
 
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
@@ -159,6 +166,7 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
         readback_flags=names(entry.get("readback_flags"), "readback_flags"),
         env_passthrough=names(entry.get("env_passthrough"), "env_passthrough"),
         allow=words(entry.get("allow"), "allow"),
+        allow_read_only=words(entry.get("allow_read_only"), "allow_read_only"),
     )
 
 
@@ -399,6 +407,58 @@ def refuses_readback(tool: ShimmedTool, argv: list[str]) -> bool:
     )
 
 
+# How a CLI says which HTTP method it wants. `-X` is the convention curl set and
+# gh, hub and http share; gh spells the long form `--method`.
+_METHOD_FLAGS = ("-X", "--method")
+
+# Flags that add request parameters. These matter because of a behaviour that is
+# easy to miss: `gh api --help` states "The default HTTP request method is GET
+# normally and POST if any parameters were added", and again under `-f`, "adding
+# request parameters will automatically switch the request method to POST". So a
+# gate that reads only `--method` would pass `gh api repos/o/r -f a=b` as a read
+# while gh performs a POST. Taken from the installed binary's own help, not from
+# memory of the documentation.
+_PARAMETER_FLAGS = ("-f", "--raw-field", "-F", "--field")
+
+# HEAD is included because it is a read that returns no body. Everything else,
+# including an unrecognised or absent value, is treated as a write.
+_READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+def _flag_value(argv: list[str], flags: tuple[str, ...]) -> str | None:
+    """The last value given to any of ``flags``, or None if none was given.
+
+    Both spellings are read, `-X GET` and `--method=GET`. The last one wins
+    because that is what an argument parser does with a repeated flag. A flag
+    that ends the argv has no value, and returns the empty string rather than
+    None so the caller can tell "malformed" from "absent" and refuse it.
+    """
+    found: str | None = None
+    for index, token in enumerate(argv):
+        for flag in flags:
+            if token == flag:
+                found = argv[index + 1] if index + 1 < len(argv) else ""
+            elif token.startswith(f"{flag}="):
+                found = token[len(flag) + 1 :]
+    return found
+
+
+def requests_read_only(argv: list[str]) -> bool:
+    """Whether this invocation asks the server only to read.
+
+    An explicit method decides on its own. Without one, a parameter flag means
+    the CLI will POST, so only a parameter-free invocation is a read.
+    """
+    method = _flag_value(argv, _METHOD_FLAGS)
+    if method is not None:
+        return method.strip().upper() in _READ_METHODS
+    return not any(
+        token == flag or token.startswith(f"{flag}=")
+        for token in argv
+        for flag in _PARAMETER_FLAGS
+    )
+
+
 def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     """Return whether ``argv`` starts with one configured safe subcommand.
 
@@ -406,11 +466,29 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     options may appear before or after a vetted prefix. This is deliberately not
     a full CLI parser; a tool with no entries is deny-by-default and provider-side
     credential scope remains necessary.
+
+    A prefix on `allow_read_only` additionally has to ask for a read. `allow` is
+    checked first, so a prefix listed on both is allowed outright.
     """
-    if not tool.allow:
+    tokens = leading_tokens(argv)
+    if any(tokens[: len(prefix)] == prefix for prefix in tool.allow):
+        return True
+    if any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only):
+        return requests_read_only(argv)
+    return False
+
+
+def refused_as_write(tool: ShimmedTool, argv: list[str]) -> bool:
+    """True when the prefix is admitted for reads but this invocation writes.
+
+    Only used to choose the refusal wording. "this subcommand is not
+    allowlisted" sends the agent to ask for a prefix that is already configured,
+    and it retries or works around instead of dropping the write.
+    """
+    if allowed_command(tool, argv):
         return False
     tokens = leading_tokens(argv)
-    return any(tokens[: len(prefix)] == prefix for prefix in tool.allow)
+    return any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only)
 
 
 def _path_candidates(item: str) -> list[str]:
@@ -772,10 +850,23 @@ class CommandBroker:
     ) -> CommandResult:
         if not allowed_command(tool, argv):
             logger.warning(
-                "commands: REFUSE %s %s (not in the configured command allowlist)",
+                "commands: REFUSE %s %s (%s)",
                 tool.name,
                 logs.redact_argv(argv),
+                "write on a read-only subcommand"
+                if refused_as_write(tool, argv)
+                else "not in the configured command allowlist",
             )
+            if refused_as_write(tool, argv):
+                return CommandResult(
+                    stderr=(
+                        f"[sandbox] {tool.name} may run this subcommand to read, "
+                        "but this invocation asks the server to write. Re-run it "
+                        "as a read, or ask the operator to do the write.\n"
+                    ),
+                    rc=126,
+                    refused=True,
+                )
             return CommandResult(
                 stderr=(
                     f"[sandbox] {tool.name} subcommand is not allowlisted. "

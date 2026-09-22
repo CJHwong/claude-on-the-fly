@@ -30,6 +30,28 @@ Before adding a tool:
 6. Restart the chat daemon so shims are rebuilt.
 7. Test one allowed command, one rejected command, and every readback refusal.
 
+## Admit a REST subcommand for reads only
+
+Some CLIs put an entire API behind one word. `gh api` fetches a file and also rewrites
+repository settings, so `allow` is all-or-nothing for it. List such a prefix under
+`allow_read_only` instead, and the broker admits the reads and refuses the writes:
+
+```yaml
+      allow_read_only:
+        - api
+```
+
+An explicit `--method` or `-X` decides. Without one, a parameter flag (`-f`, `-F`,
+`--field`, `--raw-field`) counts as a write, because gh switches to POST as soon as a
+parameter is added. Send parameters on a read with `--method GET`, which gh turns into a
+query string. `graphql` is always a POST, so the gate refuses it.
+
+A refused write says so, rather than reporting a missing allowlist entry. That matters:
+the generic wording tells the agent to ask you for a prefix you have already configured.
+
+Omit the key to leave a tool exactly as it was. The gate is opt-in per tool, and a
+prefix on both lists is allowed outright.
+
 The broker checks the configured leading prefix, rejects absolute or workspace-escaping
 path arguments, and runs each turn only from its authenticated workspace. Arguments and
 flags after an allowed prefix are still passed to the real CLI, so provider-side token
