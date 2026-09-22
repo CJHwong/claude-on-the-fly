@@ -150,14 +150,35 @@ commands:
         - auth token
       readback_flags:
         - --show-token
+      # Reads only. Left out on purpose: `api` (all-or-nothing; see
+      # allow_read_only), `pr checkout` and the `download` subcommands (they write
+      # files), `gist`, `secret`, `variable`, and anything that mutates.
       allow:
+        # pull requests
         - pr list
         - pr view
-        - repo view
+        - pr diff
+        - pr checks
+        - pr status
+        # issues and repositories
         - issue list
         - issue view
+        - issue status
+        - repo view
+        - label list
+        # CI
         - run list
         - run view
+        - workflow list
+        - workflow view
+        # releases
+        - release list
+        - release view
+        # discovery
+        - search issues
+        - search prs
+        - search repos
+        - search code
       env_passthrough: [GH_HOST, GH_REPO, GH_PAGER, NO_COLOR]
 
     - name: acli

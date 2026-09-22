@@ -825,6 +825,40 @@ def test_bundled_config_parses_and_ships_gh_and_acli():
     assert ("auth", "token") in tools["gh"].readback
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "diff", "12", "--name-only"],
+        ["pr", "checks", "12"],
+        ["pr", "status"],
+        ["issue", "status"],
+        ["label", "list"],
+        ["workflow", "view", "ci.yml", "--yaml"],
+        ["release", "view", "v1.0"],
+        ["search", "code", "func main", "--repo", "o/r"],
+    ],
+)
+def test_bundled_gh_allows_common_reads(argv):
+    gh = {t.name: t for t in commands.load_tools()}["gh"]
+    assert allowed_command(gh, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "checkout", "12"],
+        ["run", "download", "1"],
+        ["release", "download", "v1.0"],
+        ["release", "create", "v1.0"],
+        ["api", "repos/o/r"],
+        ["secret", "list"],
+    ],
+)
+def test_bundled_gh_still_refuses_writes_and_api(argv):
+    gh = {t.name: t for t in commands.load_tools()}["gh"]
+    assert not allowed_command(gh, argv)
+
+
 def test_readback_is_written_as_words_not_nested_lists(operator_settings):
     """ "auth token" is far easier to get right than [[auth, token]] in a file
     whose whole job is refusing the correct commands."""
