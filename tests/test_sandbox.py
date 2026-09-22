@@ -4534,3 +4534,244 @@ class TestTheBinariesAWrapperExecs:
         monkeypatch.setattr(shutil, "which", fake_which)
         sandbox._runtime_read_paths(["codex"])
         assert seen == ["codex"]
+
+
+# --------------------------------------------------------------------------
+# sandbox.write_paths
+# --------------------------------------------------------------------------
+
+
+def test_write_paths_grants_a_plain_directory(monkeypatch):
+    """The setting's actual job: one tree the agent may change."""
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", "/opt/notes:/usr/local/share")
+    assert sandbox._extra_write_paths() == [
+        os.path.realpath("/opt/notes"),
+        os.path.realpath("/usr/local/share"),
+    ]
+
+
+def test_write_paths_are_absent_by_default(monkeypatch):
+    """An operator who never sets it keeps exactly the previous write set, so
+    this cannot widen an existing deployment on upgrade."""
+    monkeypatch.delenv("COTF_SANDBOX_WRITE_PATHS", raising=False)
+    assert sandbox._extra_write_paths() == []
+
+
+@pytest.mark.parametrize("entry", ["~", "~/.ssh", "~/.aws", "~/.netrc"])
+def test_write_paths_refuse_everything_a_read_grant_refuses(monkeypatch, caplog, entry):
+    """A write grant is strictly more dangerous than a read grant, so every
+    refusal on the read side has to hold here. Asserted through the same helper
+    rather than restated, so the two cannot drift apart."""
+    resolved = os.path.expanduser(entry)
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{resolved}:/opt/notes")
+    with caplog.at_level("ERROR"):
+        granted = sandbox._extra_write_paths()
+    assert granted == [os.path.realpath("/opt/notes")]
+    assert resolved in caplog.text
+
+
+@pytest.mark.parametrize("entry", sandbox._WRITE_ESCAPE_PATHS)
+def test_write_paths_refuse_every_escape_path(entry):
+    """These are the paths that turn a contained write into host execution: a
+    shell rc the operator's next login sources, a unit init starts, a name on
+    PATH, a hook an agent runs. None of them is a credential store, so the read
+    check passes them and only this one stops them. Checked both directions, the
+    same way the credential lists are."""
+    resolved = Path(os.path.realpath(Path(entry).expanduser()))
+    assert sandbox._write_path_refusal(resolved) is not None, entry
+    assert sandbox._write_path_refusal(resolved.parent) is not None, entry
+
+
+def test_write_paths_refuse_a_symlink_to_an_escape_path(monkeypatch, caplog, tmp_path):
+    """Resolved before judging, for the same reason the read grant resolves: a
+    link is the ordinary case, and judging the unresolved name is how one gets
+    used to smuggle a grant past the check."""
+    link = tmp_path / "looks-harmless"
+    link.symlink_to(Path.home() / ".claude")
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(link))
+    with caplog.at_level("ERROR"):
+        assert sandbox._extra_write_paths() == []
+    assert str(link) in caplog.text
+
+
+def test_write_paths_are_uncapped_on_linux(monkeypatch):
+    """Same reasoning as the read grant: the cap is a seatbelt artifact."""
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", "/a:/b:/c:/d:/e")
+    assert len(sandbox._extra_write_paths(cap=None)) == 5
+    assert len(sandbox._extra_write_paths()) == sandbox._MAX_EXTRA_PATHS
+
+
+def test_linux_grants_include_the_operator_write_paths(monkeypatch, tmp_path):
+    """The whole point: a granted tree lands in the read-write mount list, which
+    is what bwrap turns into a writable bind."""
+    granted = tmp_path / "soul"
+    granted.mkdir()
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    assert Path(os.path.realpath(granted)) in grants["read_write"]
+
+
+def test_a_refused_write_path_never_reaches_the_linux_mount_list(
+    monkeypatch, tmp_path, caplog
+):
+    """The refusal has to hold where it matters -- in the mounts -- not only in
+    the helper that computes them."""
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(Path.home() / ".claude"))
+    with caplog.at_level("ERROR"):
+        grants = sandbox._linux_grants(tmp_path / "ws")
+    assert Path(os.path.realpath(Path.home() / ".claude")) not in grants["read_write"]
+
+
+def test_the_dotenv_sweep_follows_a_symlinked_directory(tmp_path):
+    """`--ro-bind / /` exposes a link's target whatever the link is called, so a
+    sweep that stops at the link reports a tree as covered while its token file
+    stays readable. Measured on a real home: `~/.claude/skills` is a symlink to a
+    skills repository, and one skill keeps its token in a `.env` beside itself."""
+    real = tmp_path / "repo" / "skills" / "slacker"
+    real.mkdir(parents=True)
+    (real / ".env").write_text("TOKEN=x\n")
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "skills").symlink_to(tmp_path / "repo" / "skills")
+
+    swept = sandbox._dotenvs_under([config], cap=None)
+
+    # The real name, not the link's: a mask is a bind mount over a path, so
+    # covering the link leaves the same file readable under its real name.
+    assert swept == [Path(os.path.realpath(real / ".env"))]
+
+
+def test_the_dotenv_sweep_survives_a_symlink_loop(tmp_path):
+    """Following links makes a cycle possible, so the visited set has to end the
+    walk rather than the walk ending the spawn."""
+    root = tmp_path / "tree"
+    (root / "inner").mkdir(parents=True)
+    (root / "inner" / ".env").write_text("TOKEN=x\n")
+    (root / "inner" / "back").symlink_to(root)
+
+    swept = sandbox._dotenvs_under([root], cap=None)
+
+    assert swept == [Path(os.path.realpath(root / "inner" / ".env"))]
+
+
+def test_unused_write_slots_do_not_re_open_the_project_write_denies(
+    monkeypatch, tmp_path
+):
+    """The `_WRITE_*` allows sit below the project write denies, so padding an
+    unused slot with `_PROJECT_DIR` -- which is what every other slot pads with --
+    re-opens `.git/hooks`, `.mcp.json` and the shell rc files. That is the
+    `_CODEX_HOME` finding a second time, so the padding value is asserted rather
+    than left to a comment."""
+    monkeypatch.delenv("COTF_SANDBOX_WRITE_PATHS", raising=False)
+    project = tmp_path / "ws"
+    project.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    argv = sandbox_macos.jail_argv(
+        ["/bin/true"],
+        home=tmp_path / "home",
+        data_dir=tmp_path / "data",
+        project=project,
+        tmpdir=tmpdir,
+        claude_config=tmp_path / "home/.claude",
+        claude_projects=tmp_path / "home/.claude/projects",
+        claude_project=tmp_path / "home/.claude/projects/ws",
+        codex_sessions=tmp_path / "home/.codex/sessions",
+        codex_home=tmp_path / "data/codex",
+        codex_operator_home=tmp_path / "home/.codex",
+        pane_socket=tmp_path / "pane.sock",
+        base=sandbox._DENY_MOST_PROFILE,
+        loopback=sandbox_macos._loopback_specs((1, 2, 3, 4)),
+        extra_paths=[],
+        write_paths=[],
+    )
+    slots = [arg for arg in argv if arg.startswith("_WRITE_")]
+    assert slots, "the write slots must be passed to the profile"
+    for slot in slots:
+        padded = Path(slot.split("=", 1)[1])
+        assert padded != project, slot
+        # Nor any real directory. The slots also carry a scoped `.env` write deny,
+        # so padding with something writable applies that deny to all of it --
+        # measured with TMPDIR, where creating a `.env` in a workspace under it
+        # was refused.
+        assert not padded.exists(), slot
+
+
+def test_a_write_grant_that_merely_contains_an_escape_path_is_refused(
+    monkeypatch, tmp_path
+):
+    """The bidirectional half of the check. Granting a parent of a shell rc is the
+    same escape as granting the file, written one directory up.
+
+    The escape list is monkeypatched because every real entry's parent is already
+    refused by the read check for a different reason -- `~/.local` contains a
+    credential store, `~/bin`'s parent is the home -- so no real path reaches this
+    branch and the escape it guards would go untested."""
+    escape = tmp_path / "somewhere" / "bin"
+    escape.mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "_WRITE_ESCAPE_PATHS", (str(escape),))
+
+    refusal = sandbox._write_path_refusal(
+        Path(os.path.realpath(tmp_path / "somewhere"))
+    )
+
+    assert refusal is not None
+    assert "contains" in refusal
+
+
+def test_a_write_grant_does_not_re_open_a_masked_dotenv(monkeypatch, tmp_path):
+    """The grant and the mask overlap on purpose: the tree an operator grants is
+    exactly where a skill keeps its token beside itself. The mask is deeper, so it
+    must still win. Measured on a real Linux host before this was asserted -- with
+    the whole tree granted, the token stayed unreadable and unwritable."""
+    granted = tmp_path / "soul"
+    (granted / "skills" / "slacker").mkdir(parents=True)
+    token = granted / "skills" / "slacker" / ".env"
+    token.write_text("TOKEN=x\n")
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+    # Deliberately NOT in extra_paths. The write list is swept on its own, and
+    # asserting through a read grant would pass while a write-only grant leaked.
+    monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
+
+    grants = sandbox._linux_grants(tmp_path / "ws")
+
+    assert Path(os.path.realpath(granted)) in grants["read_write"]
+    assert Path(os.path.realpath(token)) in grants["masked"]
+
+
+def test_a_redirected_claude_config_dir_is_still_an_escape_path(monkeypatch, tmp_path):
+    """`_WRITE_ESCAPE_PATHS` names `~/.claude`, which is where that tree is by
+    default and not where it has to be. The profile write-denies the configured
+    directory, and the `_WRITE_*` allows are written after those denies, so a
+    redirected tree missing from the escape list is a grant that re-opens its own
+    deny."""
+    redirected = tmp_path / "elsewhere" / "claude-config"
+    redirected.mkdir(parents=True)
+    monkeypatch.setattr(
+        "claude_on_the_fly.envfile.claude_config_dir", lambda: redirected
+    )
+
+    refusal = sandbox._write_path_refusal(Path(os.path.realpath(redirected)))
+
+    assert refusal is not None
+    assert "runs outside the sandbox" in refusal
+
+
+def test_the_write_grant_sweep_does_not_follow_a_planted_symlink(monkeypatch, tmp_path):
+    """A write grant is the one swept tree the agent can write, so a link it
+    plants pointing at `/` would make every later spawn walk the whole filesystem
+    before the agent starts, permanently. Not following costs nothing: the target
+    is reached by its own path, and under deny-most `$HOME` is an opaque tmpfs, so
+    a link into it resolves to nothing inside the namespace."""
+    granted = tmp_path / "notes"
+    outside = tmp_path / "outside"
+    granted.mkdir()
+    outside.mkdir()
+    (outside / ".env").write_text("TOKEN=x\n")
+    (granted / "everything").symlink_to(outside)
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+    monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
+
+    grants = sandbox._linux_grants(tmp_path / "ws")
+
+    assert Path(os.path.realpath(outside / ".env")) not in grants["masked"]

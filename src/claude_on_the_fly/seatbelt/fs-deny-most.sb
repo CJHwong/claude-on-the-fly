@@ -12,7 +12,9 @@
 ;;
 ;; This is coarser than fs-allow-reads.sb by design: an agent that reads dotfiles outside
 ;; the re-granted set (e.g. ~/.gitconfig, ~/.npmrc) will be denied. Grant those
-;; explicitly via COTF_SANDBOX_EXTRA_PATHS if a run needs them.
+;; explicitly via COTF_SANDBOX_EXTRA_PATHS if a run needs them. That setting
+;; grants reads only; COTF_SANDBOX_WRITE_PATHS is the separate one for writes,
+;; and it refuses more than the read list does -- see `_WRITE_ESCAPE_PATHS`.
 ;;
 ;; cotf's own data-dir re-grants (shims/ and memory/) are scoped to _DATA_DIR,
 ;; which the wrapper resolves from the daemon's data directory (COTF_DATA_DIR
@@ -20,10 +22,13 @@
 ;; redirected daemon's data dir lives under _HOME and stays opaque like the rest.
 ;;
 ;; Parameters (injected by the wrapper): _HOME, _DATA_DIR, _PROJECT_DIR, _TMPDIR,
-;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _RUNTIME_1.._RUNTIME_16,
+;; _CLAUDE_PROJECTS, _CLAUDE_PROJECT, _EXTRA_1.._EXTRA_3, _WRITE_1.._WRITE_3,
+;; _RUNTIME_1.._RUNTIME_16,
 ;; _CODEX_LINK_1.._CODEX_LINK_8
 ;; and _ANCESTOR_1.._ANCESTOR_8
-;; (unused slots resolve to _PROJECT_DIR, a harmless no-op).
+;; (unused read slots resolve to _PROJECT_DIR, a harmless no-op; the _WRITE_*
+;; slots pad with a non-existent name under it, because a write allow of
+;; _PROJECT_DIR would re-open the project write denies below).
 
 (version 1)
 (deny default)
@@ -373,6 +378,48 @@
 (deny file-write* (literal (string-append (param "_PROJECT_DIR") "/.mcp.json")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.vscode")))
 (deny file-write* (subpath (string-append (param "_PROJECT_DIR") "/.idea")))
+
+;; ---------------------------------------------------------------------------
+;; -- Operator write grants (COTF_SANDBOX_WRITE_PATHS, capped at 3) --
+;; ---------------------------------------------------------------------------
+;; Read as well as write: a path the agent can write but cannot stat is not a
+;; capability anyone asked for, and on Linux the bind grants both, so granting
+;; both here is what keeps one setting from meaning two things per platform.
+;;
+;; Placed after every write deny above so an entry is not silently narrowed by
+;; one of them, and before the dotenv deny below so that rule still wins. That
+;; ordering is safe rather than lucky: `_write_path_refusal` rejects any entry
+;; reaching a credential store, and the data dir is one, so no entry can name a
+;; path inside the workspace whose `.git/hooks` deny sits above.
+;;
+;; Unused slots point at a name under _PROJECT_DIR that does not exist, not at
+;; _PROJECT_DIR itself the way every read slot pads, and not at a real directory.
+;; These are write allows sitting below the project write denies, so padding with
+;; the project dir re-opens `.git/hooks`, `.mcp.json`, `.vscode` and the shell rc
+;; files. Padding with a real writable directory is wrong too, because the slots
+;; also carry a scoped `.env` write deny below, which would then apply to all of
+;; it. A path that does not exist is inert for both halves.
+(allow file-write* (subpath (param "_WRITE_1")))
+(allow file-write* (subpath (param "_WRITE_2")))
+(allow file-write* (subpath (param "_WRITE_3")))
+(allow file-read* (subpath (param "_WRITE_1")))
+(allow file-read* (subpath (param "_WRITE_2")))
+(allow file-read* (subpath (param "_WRITE_3")))
+;; Without the ancestor metadata the agent cannot resolve its way down to the
+;; grant, and the write fails with ENOENT rather than a denial.
+(allow file-read-metadata (path-ancestors (param "_WRITE_1")))
+(allow file-read-metadata (path-ancestors (param "_WRITE_2")))
+(allow file-read-metadata (path-ancestors (param "_WRITE_3")))
+;; A dotenv inside a write grant stays unwritable, not merely unreadable. The
+;; read deny at the end of this file already hides it; without these, a turn
+;; could still truncate or overwrite the operator's token file in a tree they
+;; granted for other reasons. Scoped with require-all rather than written as
+;; another global rule, so the agent can still create a `.env` in its own
+;; workspace -- which is what the Linux mask does, since that one binds the files
+;; found at spawn and leaves new ones alone.
+(deny file-write* (require-all (subpath (param "_WRITE_1")) (regex "(.*/)?\\.env")))
+(deny file-write* (require-all (subpath (param "_WRITE_2")) (regex "(.*/)?\\.env")))
+(deny file-write* (require-all (subpath (param "_WRITE_3")) (regex "(.*/)?\\.env")))
 
 ;; ---------------------------------------------------------------------------
 ;; -- Every dotenv, everywhere --

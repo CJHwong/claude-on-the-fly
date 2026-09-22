@@ -273,13 +273,26 @@ sandbox:
   # jail mode only. deny-most makes $HOME opaque; grant the agent's own interpreter
   # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3
   # on macOS only, because SBPL has no arrays; Linux takes a list of any length.
-  # Entries are granted read-only -- there is no write grant.
+  # Entries are granted read-only; `write_paths` below is the one that grants
+  # writes.
   # Name a directory, not $HOME: a grant is written after the profile's denies and
   # wins over them. An entry that is the home, an ancestor of it, or a path reaching
   # a credential store or file the profile denies is logged at ERROR and dropped.
   # fs: deny-most
   # extra_paths:
   #   - /opt/homebrew
+
+  # jail mode only. Paths the agent may write as well as read. Same shape and same
+  # caps as extra_paths, and every entry extra_paths would refuse is refused here
+  # too. A write grant refuses more, because it can leave something behind that
+  # runs later outside the jail: an entry reaching a shell rc, a git config, a
+  # systemd or autostart unit, a LaunchAgent, a directory on the daemon's PATH, or
+  # an agent config tree (~/.claude, ~/.codex, ~/.agents) is logged at ERROR and
+  # dropped. That list catches the common mistakes and is not a boundary.
+  # Grant the narrowest tree that works. This is the setting that decides what a
+  # turn can still change after it ends.
+  # write_paths:
+  #   - ~/notes
 
   # Narrow egress to the broker's loopback port and the egress proxy's, nothing else.
   # broker_only_loopback: true
