@@ -20,6 +20,7 @@ import logging
 import os
 import secrets
 import subprocess
+import sys
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -119,12 +120,35 @@ class Route:
     allowed_tails: frozenset[str] = frozenset()
 
 
+def has_keychain() -> bool:
+    """Whether this host has a macOS login keychain to consult.
+
+    `security` ships with macOS and nowhere else, so on Linux `subprocess`
+    raises FileNotFoundError naming a binary the operator has never heard of.
+    That took the whole daemon down at startup for any Linux deployment that
+    turned the sandbox on, because `routes_from_keychain` runs before anything
+    is serving.
+
+    The guard lives here rather than at each call site. It was already written
+    once, inline, in `sandbox._claude_oauth_from_keychain`, and the identical
+    crash survived one function call away in the broker's own startup path.
+    A second copy is how that happens again.
+
+    There is no keychain on Linux, so "no item" is the honest answer rather
+    than an error: the operator provisions credentials another way, and the
+    broker starts with whatever routes it has.
+    """
+    return sys.platform == "darwin"
+
+
 def read_keychain(service: str) -> str:
     """Read a generic-password value from the macOS keychain. Never logged.
 
     Raises KeyError if the item is absent so misconfiguration fails loudly at
     broker start rather than on the first agent request.
     """
+    if not has_keychain():
+        raise KeyError(f"no keychain on this platform: service={service!r}")
     proc = subprocess.run(
         ["security", "find-generic-password", "-s", service, "-w"],
         capture_output=True,
@@ -137,6 +161,8 @@ def read_keychain(service: str) -> str:
 
 def keychain_exists(service: str) -> bool:
     """True if a generic-password item exists, without reading its value."""
+    if not has_keychain():
+        return False
     proc = subprocess.run(
         ["security", "find-generic-password", "-s", service],
         capture_output=True,
