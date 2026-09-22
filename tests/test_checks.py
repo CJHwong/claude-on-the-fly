@@ -707,6 +707,7 @@ class TestAggregators:
             "jobs",
             "backend",
             "binaries",
+            "commands",
         }
 
     def test_check_all_uses_os_environ_by_default(self, monkeypatch):
@@ -1526,3 +1527,104 @@ class TestFixHint:
         results = checks_mod.check_telegram({"TELEGRAM_BOT_TOKEN": "t"})
         missing = [r for r in results if r.name == "TELEGRAM_ALLOWED_USER_ID"]
         assert missing and "telegram.allowed_user_id" in (missing[0].fix_hint or "")
+
+
+class TestCheckCommands:
+    """`commands:` is the section whose mistakes are invisible at runtime.
+
+    Each case here is a failure the daemon currently absorbs: it keeps running,
+    the operator's tools are quietly absent or quietly unguarded, and the only
+    trace is a log line nobody reads until something has already gone wrong.
+    """
+
+    @staticmethod
+    def _on_path(monkeypatch, *names: str) -> None:
+        monkeypatch.setattr(
+            checks_mod.shutil,
+            "which",
+            lambda binary: f"/usr/bin/{binary}" if binary in names else None,
+        )
+
+    def test_no_operator_section_reports_nothing(self, operator_settings):
+        """Bundled tools are the maintainer's problem, not the operator's."""
+        assert checks_mod.check_commands() == []
+
+    def test_malformed_section_is_invalid_and_names_the_fallback(
+        self, operator_settings
+    ):
+        """The dangerous case: the daemon starts, and every added tool is gone."""
+        operator_settings.write_text(
+            'commands:\n  tools:\n    - name: aws\n      allow: "s3 ls"\n'
+        )
+        results = checks_mod.check_commands()
+        assert len(results) == 1
+        assert results[0].status == "invalid"
+        assert checks_mod.is_blocking(results[0])
+        assert "unavailable" in results[0].detail
+
+    def test_tool_not_on_path_warns_without_blocking(
+        self, operator_settings, monkeypatch
+    ):
+        """Skipping an absent binary is deliberate, so this is advice, not an
+        outage -- but an operator who just added the entry cannot see it."""
+        self._on_path(monkeypatch)
+        operator_settings.write_text(
+            "commands:\n  tools:\n    - name: kubectl\n      allow:\n        - get\n"
+        )
+        results = checks_mod.check_commands()
+        assert [r.status for r in results] == ["warn"]
+        assert not checks_mod.is_blocking(results[0])
+        assert "not on PATH" in results[0].detail
+
+    def test_added_tool_without_allow_warns(self, operator_settings, monkeypatch):
+        """Deny-by-default means an empty allow refuses every invocation, which
+        nobody types on purpose for a tool they just added."""
+        self._on_path(monkeypatch, "kubectl")
+        operator_settings.write_text("commands:\n  tools:\n    - name: kubectl\n")
+        results = checks_mod.check_commands()
+        assert [r.status for r in results] == ["warn"]
+        assert "every invocation is refused" in results[0].detail
+
+    def test_override_without_allow_is_the_documented_way_to_disable(
+        self, operator_settings, monkeypatch
+    ):
+        """Same empty list, opposite intent: on a bundled entry it is how the
+        docs tell you to turn the tool off, so it must not nag."""
+        self._on_path(monkeypatch, "gh")
+        operator_settings.write_text(
+            "commands:\n  tools:\n    - name: gh\n"
+            "      readback:\n        - auth token\n"
+            "      readback_flags:\n        - --show-token\n"
+        )
+        results = checks_mod.check_commands()
+        assert [r.status for r in results] == ["ok"]
+        assert "disabled" in results[0].detail
+
+    def test_override_dropping_a_readback_warns(self, operator_settings, monkeypatch):
+        """The one edit in this section that can hand the agent a credential."""
+        self._on_path(monkeypatch, "gh")
+        operator_settings.write_text(
+            "commands:\n  tools:\n    - name: gh\n      allow:\n        - pr list\n"
+        )
+        results = checks_mod.check_commands()
+        lost = [r for r in results if "no longer refuses" in r.detail]
+        assert lost and lost[0].status == "warn"
+        assert "auth token" in lost[0].detail
+        assert "--show-token" in lost[0].detail
+
+    def test_healthy_tool_reports_its_prefix_count(
+        self, operator_settings, monkeypatch
+    ):
+        self._on_path(monkeypatch, "aws")
+        operator_settings.write_text(
+            "commands:\n  tools:\n    - name: aws\n      allow:\n"
+            "        - sts get-caller-identity\n        - s3 ls\n"
+        )
+        results = checks_mod.check_commands()
+        assert [r.status for r in results] == ["ok"]
+        assert "2 allowed prefixes" in results[0].detail
+
+    def test_doctor_runs_the_group(self, operator_settings):
+        """check_all is what the doctor screen renders, so the group has to be in
+        it -- a checker nothing calls is the same as no checker."""
+        assert "commands" in checks_mod.check_all({})

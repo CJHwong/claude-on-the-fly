@@ -216,6 +216,125 @@ def check_config_file(frontend: str) -> list[CheckResult]:
     ]
 
 
+def check_commands() -> list[CheckResult]:
+    """Validate the operator's `commands:` section the way the broker reads it.
+
+    Every failure this catches is silent at runtime, which is why doctor is where
+    it has to surface. A malformed section does not stop a daemon: `load_tools`
+    logs an ERROR, falls back to the bundled tools, and every tool the operator
+    added is simply absent -- the agent then meets an unshimmed binary and fails
+    on its own credential store, which reads as a broken tool rather than as a
+    config error. A tool that is not on PATH is skipped just as quietly, and
+    deliberately so (shimming an absent binary would turn "command not found"
+    into a confusing broker error), but an operator who just added it reads that
+    silence as "configured". And an override that drops a bundled readback
+    refusal is the one edit in this section that can hand the agent a credential.
+
+    Takes no env: what the broker will do is decided by the file and by PATH.
+    """
+    # Deferred like the import in `fix_hint`: commands reaches agent through
+    # logs, and checks is imported at TUI startup, where that chain is dead
+    # weight for every screen that never opens doctor.
+    from claude_on_the_fly import commands, settings
+
+    raw = settings.operator("commands")
+    if not raw:
+        return []
+
+    path = settings.operator_settings()
+    try:
+        tools = commands.parse_tools(raw, source=str(path))
+    except ValueError as exc:
+        return [
+            CheckResult(
+                name="commands",
+                status="invalid",
+                detail=(
+                    f"{exc}; the broker falls back to the bundled tools, so every "
+                    "tool added here is unavailable"
+                ),
+                fix_hint=f"fix the commands: section in {path}",
+            )
+        ]
+
+    bundled_tools = {
+        tool.name: tool
+        for tool in commands.parse_tools(settings.bundled("commands"), source="bundled")
+    }
+
+    results: list[CheckResult] = []
+    for tool in tools:
+        base = bundled_tools.get(tool.name)
+        if shutil.which(tool.name) is None:
+            results.append(
+                CheckResult(
+                    name=tool.name,
+                    status="warn",
+                    detail="not on PATH, so it is skipped and never shimmed",
+                    fix_hint=(
+                        f"install {tool.name} on the daemon's PATH, or drop it "
+                        "from commands.tools"
+                    ),
+                )
+            )
+        elif not tool.allow:
+            # An override with no `allow` is the documented way to disable a
+            # packaged tool, so it is only worth a warning when the operator
+            # added the entry themselves and cannot have meant "refuse always".
+            if base is not None:
+                results.append(
+                    CheckResult(
+                        name=tool.name,
+                        status="ok",
+                        detail="bundled tool disabled by an override with no allow",
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        name=tool.name,
+                        status="warn",
+                        detail="allow is empty, so every invocation is refused",
+                        fix_hint=(
+                            "list the safe leading subcommands under "
+                            f"commands.tools.allow in {path}"
+                        ),
+                    )
+                )
+        else:
+            plural = "" if len(tool.allow) == 1 else "es"
+            results.append(
+                CheckResult(
+                    name=tool.name,
+                    status="ok",
+                    detail=f"shimmed, {len(tool.allow)} allowed prefix{plural}",
+                )
+            )
+
+        if base is None:
+            continue
+        lost = (base.readback - tool.readback) | {
+            (flag,) for flag in base.readback_flags - tool.readback_flags
+        }
+        if lost:
+            names = ", ".join(sorted(" ".join(item) for item in lost))
+            results.append(
+                CheckResult(
+                    name=tool.name,
+                    status="warn",
+                    detail=(
+                        f"the override no longer refuses {names}, which the "
+                        "bundled entry kept out of the sandbox"
+                    ),
+                    fix_hint=(
+                        f"restore the readback refusal for {tool.name} in {path} "
+                        "unless you meant to forward the credential"
+                    ),
+                )
+            )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1268,6 +1387,7 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
         **{name: check_frontend(name, e) for name in SUPERVISABLE_FRONTENDS},
         "backend": check_backend(e) + check_backend_runtime_access(e),
         "binaries": check_binaries(e),
+        "commands": check_commands(),
     }
 
 
