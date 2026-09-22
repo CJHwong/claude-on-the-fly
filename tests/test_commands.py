@@ -23,6 +23,7 @@ from claude_on_the_fly.commands import (
     ShimmedTool,
     allowed_command,
     leading_tokens,
+    refused_as_write,
     refuses_readback,
 )
 
@@ -94,6 +95,105 @@ def test_bundled_gh_allowlist_blocks_alias_api_and_unknown_commands():
     assert not allowed_command(GH, ["alias", "set", "x", "!cat /etc/passwd"])
     assert not allowed_command(GH, ["api", "--method", "DELETE", "/repos/x"])
     assert not allowed_command(GH, ["arbitrary-alias"])
+
+
+# --- the read-only method gate ---
+
+# `gh api` is one prefix covering the whole REST API, so an operator who wants
+# the reads cannot have them without the writes. This tool opts `api` into the
+# gate and leaves `pr view` on the ordinary allowlist, which is the shape the
+# feature exists for.
+REST = ShimmedTool(name="gh", allow=(("pr", "view"),), allow_read_only=(("api",),))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["api", "repos/o/r"], id="bare-endpoint-defaults-to-get"),
+        pytest.param(
+            ["api", "repos/o/r/contents/x", "--jq", ".content"], id="read-a-file"
+        ),
+        pytest.param(
+            ["api", "--method", "GET", "search/repositories", "-f", "q=x"],
+            id="explicit-get-keeps-its-parameters",
+        ),
+        pytest.param(["api", "--method=get", "repos/o/r"], id="lowercase-equals-form"),
+        pytest.param(["api", "-X", "HEAD", "repos/o/r"], id="head-is-a-read"),
+    ],
+)
+def test_a_read_only_prefix_allows_a_read(argv):
+    assert allowed_command(REST, argv)
+    assert not refused_as_write(REST, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(
+            [
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/r",
+                "-f",
+                "security_and_analysis[secret_scanning_push_protection][status]=enabled",
+            ],
+            id="the-real-patch-from-the-transcripts",
+        ),
+        pytest.param(["api", "--method", "DELETE", "/repos/x"], id="explicit-delete"),
+        pytest.param(["api", "--method=post", "repos/o/r"], id="equals-form-post"),
+        # gh's own help: "The default HTTP request method is GET normally and
+        # POST if any parameters were added." A gate that only reads --method
+        # would wave this through as a read.
+        pytest.param(["api", "repos/o/r", "-f", "a=b"], id="parameters-imply-post"),
+        pytest.param(["api", "repos/o/r", "--field", "a=b"], id="long-field-form"),
+        pytest.param(["api", "repos/o/r", "-F", "a=@f"], id="short-typed-field"),
+        pytest.param(
+            ["api", "graphql", "-f", "query=mutation{}"], id="graphql-is-a-post"
+        ),
+        # A flag with no value is a malformed invocation, not a read.
+        pytest.param(["api", "repos/o/r", "-X"], id="method-flag-without-a-value"),
+    ],
+)
+def test_a_read_only_prefix_refuses_a_write(argv):
+    assert not allowed_command(REST, argv)
+    assert refused_as_write(REST, argv)
+
+
+def test_the_gate_does_not_widen_the_ordinary_allowlist():
+    assert allowed_command(REST, ["pr", "view", "1"])
+    # `pr view` is on `allow`, so the method is irrelevant to it.
+    assert allowed_command(REST, ["pr", "view", "-X", "DELETE"])
+    assert not allowed_command(REST, ["repo", "delete", "o/r"])
+    assert not refused_as_write(REST, ["repo", "delete", "o/r"])
+
+
+def test_a_tool_without_the_gate_is_unchanged():
+    plain = ShimmedTool(name="gh", allow=(("api",),))
+    assert allowed_command(plain, ["api", "-X", "DELETE", "repos/o/r"])
+    assert not refused_as_write(plain, ["api", "-X", "DELETE", "repos/o/r"])
+
+
+def test_the_gate_alone_is_enough_to_admit_a_command():
+    only = ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert allowed_command(only, ["api", "repos/o/r"])
+    assert not allowed_command(only, ["pr", "view"])
+
+
+def test_allow_read_only_is_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {"tools": [{"name": "gh", "allow_read_only": ["api", "gist view"]}]},
+        source="test",
+    )
+    assert tool.allow_read_only == (("api",), ("gist", "view"))
+    assert tool.allow == ()
+
+
+def test_a_malformed_allow_read_only_is_refused():
+    with pytest.raises(ValueError, match="allow_read_only"):
+        commands.parse_tools(
+            {"tools": [{"name": "gh", "allow_read_only": "api"}]}, source="test"
+        )
 
 
 # --- broker lifecycle and dispatch ---
@@ -253,6 +353,29 @@ async def test_command_allowlist_denies_unlisted_subcommands(tmp_path):
         assert allowed["rc"] == 0
         assert denied["rc"] == 126
         assert denied["refused"] is True
+    finally:
+        await broker.stop()
+
+
+async def test_the_broker_says_why_it_refused_a_write(tmp_path):
+    """A refused write must not read as a missing allowlist entry.
+
+    The generic wording sends the agent to ask for a prefix the operator has
+    already configured, which is a question nobody can act on.
+    """
+    tool = ShimmedTool(name="echo", allow_read_only=(("api",),))
+    broker, _port = await start(tmp_path, (tool,))
+    try:
+        read = await post(broker, {"tool": "echo", "argv": ["api", "repos/o/r"]})
+        write = await post(
+            broker, {"tool": "echo", "argv": ["api", "repos/o/r", "-X", "PATCH"]}
+        )
+        unlisted = await post(broker, {"tool": "echo", "argv": ["gist", "create"]})
+        assert read["rc"] == 0
+        assert write["rc"] == 126 and write["refused"] is True
+        assert "asks the server to write" in write["stderr"]
+        assert unlisted["rc"] == 126
+        assert "not allowlisted" in unlisted["stderr"]
     finally:
         await broker.stop()
 

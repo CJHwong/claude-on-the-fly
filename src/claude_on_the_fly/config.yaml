@@ -115,6 +115,16 @@ commands:
   #                    broker runs unjailed, so anything not listed stays out of
   #                    the subprocess.
   #
+  #   allow_read_only   prefixes allowed only when the invocation asks the
+  #                     server to read. For a subcommand that is an entire REST
+  #                     API behind one word, `allow` is all-or-nothing: `gh api`
+  #                     reads a file and also rewrites repository settings.
+  #                     Listing it here admits the reads and refuses the writes.
+  #                     An explicit `--method`/`-X` decides; without one, a
+  #                     parameter flag (`-f`, `-F`) counts as a write, because
+  #                     gh switches to POST as soon as a parameter is added.
+  #                     Omit the key to keep a tool exactly as it was.
+  #
   #   allow             safe leading subcommands. The list is deny-by-default;
   #                    flags and arguments may follow the listed words. A
   #                    credentialed CLI is not a general shell, so `gh api`,
