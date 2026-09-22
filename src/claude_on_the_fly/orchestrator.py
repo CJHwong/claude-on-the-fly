@@ -1527,6 +1527,10 @@ async def _start_sandbox(
         permissions.write_pty_settings()
     if not sandbox.enabled():
         return None, None, None
+    # Resolved before anything binds a socket. It refuses jail+off, and a refusal
+    # raised after the broker started would leave a credential-holding proxy
+    # listening for a daemon already on its way out.
+    gate_egress = sandbox.egress_gated()
     broker_instance = None
     command_broker = None
     try:
@@ -1566,10 +1570,13 @@ async def _start_sandbox(
         if broker_instance is not None:
             await broker_instance.stop()
         raise
+    # Built before the log line so the line reports what was actually started.
+    session_egress = SessionEgress(frontend) if gate_egress else None
     logger.info(
-        "sandbox: mode=%s broker=%s egress=per-session commands=%s content_log=%s",
+        "sandbox: mode=%s broker=%s egress=%s commands=%s content_log=%s",
         sandbox.mode(),
         "on" if broker_instance else "none",
+        "per-session" if session_egress else "ungated",
         ",".join(command_broker.shimmed) or "none",
         "on" if logs.log_content() else "redacted",
     )
@@ -1581,7 +1588,7 @@ async def _start_sandbox(
     # runs the same gate from its own composition root, so the sequence lives in
     # sandbox.verify_boundary rather than being repeated per daemon.
     await sandbox.verify_boundary()
-    return broker_instance, SessionEgress(frontend), command_broker
+    return broker_instance, session_egress, command_broker
 
 
 async def run(frontend: Frontend, platform: str) -> None:

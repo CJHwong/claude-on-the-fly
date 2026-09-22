@@ -39,6 +39,7 @@ falls back for that section without discarding unrelated sections.
 | Setting | Restart | Reason |
 |---|---|---|
 | `sandbox.mode` | Chat daemon | Broker, proxy, and jail posture are constructed together |
+| `sandbox.egress` | Chat daemon | Decides whether the per-session egress proxy is constructed |
 | `commands` | Chat daemon | PATH shims and command broker are constructed once |
 | `permissions.mode` | Chat daemon | Approval service and backend artifacts are constructed once |
 | `slack.slash_command` | Slack daemon | Registered with Slack at startup |

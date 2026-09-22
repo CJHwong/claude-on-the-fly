@@ -103,6 +103,33 @@ Persist it in `/etc/sysctl.d/` if you want it across reboots. Startup preflight
 detects this specific case and prints the same remedy. The daemon refuses to start
 with `jail` when the mechanism is unusable rather than running a turn unsandboxed.
 
+## 2b. Decide whether to gate egress
+
+Both modes start a per-session egress proxy, which gates outbound HTTPS by
+destination host and asks you to approve a host that `egress.allow` does not list.
+Keep that. It is the default and it is the point.
+
+Turn it off when your agent browses the open web. `egress.allow` matches host names
+exactly, with no wildcard and no suffix match, so an agent that reads news links or
+follows search results reaches a new host almost every turn. Each one pauses the call
+to ask you, and the approval rate limit then starts auto-denying.
+
+```yaml
+sandbox:
+  mode: env
+  egress: "off"
+```
+
+Quote it. YAML reads a bare `off` as a boolean. This setting accepts that spelling
+too, so both forms work, but the quoted one is what it says.
+
+The agent still holds no credential, and the command shims still run credentialed
+CLIs outside the sandbox on your behalf. Only the destination gate is gone.
+
+`egress: off` is refused under `mode: jail`. The jail unshares the network, so the
+proxy is the agent's only route out; removing it would leave no network at all rather
+than a looser policy. The daemon says so and refuses to start.
+
 ## 3. Verify
 
 Run doctor and inspect startup logs for the selected mode, broker endpoints, curated
@@ -114,5 +141,5 @@ one that was never requested. Startup also proves two things before accepting wo
 that the jail runs a trivial command, and that a jailed process cannot reach the
 internet directly.
 
-Changing `sandbox.mode` requires another restart. The other sandbox fields apply to
-the next spawned turn.
+Changing `sandbox.mode` or `sandbox.egress` requires another restart. The other
+sandbox fields apply to the next spawned turn.

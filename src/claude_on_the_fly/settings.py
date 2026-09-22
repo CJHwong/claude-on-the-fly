@@ -112,6 +112,7 @@ class Field:
 # YAML path -> the environment variable it replaces. Read by `get`.
 FIELDS: dict[str, Field] = {
     "sandbox.mode": Field("COTF_SANDBOX"),
+    "sandbox.egress": Field("COTF_SANDBOX_EGRESS"),
     "sandbox.fs": Field("COTF_SANDBOX_FS"),
     "sandbox.extra_paths": Field("COTF_SANDBOX_EXTRA_PATHS", sep=":"),
     "sandbox.broker_only_loopback": Field("COTF_SANDBOX_BROKER_ONLY_LOOPBACK"),
@@ -179,6 +180,8 @@ RESTART_REQUIRED = (
     # The spawn path must keep using the mode whose broker/proxy/jail services
     # were constructed at startup.
     "sandbox.mode",
+    # Decides whether the per-session egress proxy is constructed at all.
+    "sandbox.egress",
     # PATH shims, written once into the agent's environment.
     "commands",
     # Decides whether the approval service is constructed at all, and whether the

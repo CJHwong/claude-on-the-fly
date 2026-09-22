@@ -438,6 +438,62 @@ def enabled() -> bool:
     return mode() != "off"
 
 
+_EGRESS_MODES = ("gated", "off")
+
+
+def egress_mode() -> str:
+    """Resolved `sandbox.egress`: 'gated' (default) or 'off'.
+
+    Two settings rather than one because they answer different questions.
+    `sandbox.mode` decides whether the agent ever holds a credential; this
+    decides whether its outbound HTTPS is gated by destination. A deployment
+    whose agent browses the open web reaches hundreds of one-off hosts, and
+    `egress.allow` matches exactly -- no wildcard, no suffix -- so every one of
+    them becomes an operator prompt, and the approval rate limit starts
+    auto-denying. Turning the gate off keeps the credential broker and the
+    command shims, which is the part that was actually wanted.
+
+    'off' is refused under `jail`, where it would not be a looser policy but a
+    broken one: the jail unshares the network unconditionally, so the proxy is
+    the only route out and removing it leaves the agent with no network at all.
+
+    Read at startup, like `mode`: the proxy is constructed once, so the spawn
+    boundary must keep answering with the mode those services were built for.
+    """
+    raw = settings.startup_value("sandbox.egress", "gated")
+    # YAML 1.1 reads a bare `off` as the boolean False, and `on` as True, so an
+    # operator who writes the documented value unquoted never reaches the string
+    # branch at all. Both spellings are accepted rather than answering "'False'
+    # is not one of ['gated', 'off']" to somebody who wrote exactly what the
+    # template shows. Found by running a real config file through startup; no
+    # amount of COTF_SANDBOX_EGRESS monkeypatching reproduces it, because the
+    # environment variable is always a string.
+    if isinstance(raw, bool):
+        value = "gated" if raw else "off"
+    else:
+        value = str(raw).strip().lower() or "gated"
+    if value not in _EGRESS_MODES:
+        raise SandboxModeError(
+            f"sandbox.egress={raw!r} is not one of {list(_EGRESS_MODES)}. Fix the "
+            f"value in {settings.operator_settings()}, or drop the key to keep "
+            f"egress gated."
+        )
+    if value == "off" and mode() == "jail":
+        raise SandboxModeError(
+            "sandbox.egress=off cannot be combined with sandbox.mode=jail: the "
+            "jail unshares the network, so the egress proxy is the agent's only "
+            "route out and turning it off leaves no network at all. Use "
+            "sandbox.mode=env to keep the credential broker and the command "
+            "shims without gating egress."
+        )
+    return value
+
+
+def egress_gated() -> bool:
+    """Whether outbound HTTPS is gated by destination host."""
+    return egress_mode() == "gated"
+
+
 def _is_passthrough(key: str) -> bool:
     return (
         key in _PASSTHROUGH

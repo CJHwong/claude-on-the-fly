@@ -2123,6 +2123,67 @@ class TestStartSandbox:
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
 
+    async def test_egress_off_keeps_the_brokers_and_skips_the_proxy(
+        self, frontend: StubFrontend, monkeypatch, operator_settings, caplog
+    ) -> None:
+        """The setting exists for a deployment whose agent browses the open web:
+        `egress.allow` matches exactly, so every new host would be a prompt. What
+        it must not do is weaken the part that keeps credentials out of the agent,
+        so the credential broker and the command shims are asserted here too."""
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+        credential_broker = MagicMock()
+        credential_broker.stop = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.broker,
+            "start_default_broker",
+            AsyncMock(return_value=credential_broker),
+        )
+        command_broker = MagicMock()
+        command_broker.start = AsyncMock()
+        command_broker.stop = AsyncMock()
+        command_broker.shimmed = ["gh"]
+        command_broker.agent_env = lambda: {
+            "COTF_COMMAND_ENDPOINT": "http://127.0.0.1:1"
+        }
+        monkeypatch.setattr(
+            orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+        )
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+            (
+                got_broker,
+                egress_manager,
+                got_commands,
+            ) = await orchestrator_mod._start_sandbox(frontend)
+        try:
+            assert egress_manager is None
+            assert got_broker is credential_broker
+            assert got_commands is command_broker
+            assert "egress=ungated" in "\n".join(r.getMessage() for r in caplog.records)
+        finally:
+            os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_a_refused_egress_setting_starts_nothing(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """Resolved before the first bind. A refusal raised afterwards would leave
+        a credential-holding broker listening for a daemon already exiting."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+        start_broker = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.broker, "start_default_broker", start_broker
+        )
+
+        with pytest.raises(orchestrator_mod.sandbox.SandboxModeError):
+            await orchestrator_mod._start_sandbox(frontend)
+
+        start_broker.assert_not_awaited()
+
     async def test_start_sandbox_no_longer_seeds_the_policy_file(
         self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:
