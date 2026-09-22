@@ -668,7 +668,55 @@ def test_body_cap_is_explicit_and_above_the_documented_provider_limit():
 # --- keychain access ---
 
 
-def test_read_keychain_returns_the_value_without_its_trailing_newline(monkeypatch):
+@pytest.fixture
+def on_macos(monkeypatch):
+    """Pin the platform for the cases that exercise the `security` subprocess.
+
+    Without this they pass on a developer mac and fail on the Linux runner,
+    because the guard short-circuits before the patched `subprocess.run`. The
+    subprocess path is macOS-only by definition, so saying so is the point.
+    """
+    monkeypatch.setattr(broker.sys, "platform", "darwin")
+
+
+def test_a_host_without_a_keychain_reports_no_item_instead_of_crashing(monkeypatch):
+    """The `security` binary is macOS-only, so on Linux `subprocess` raised
+    FileNotFoundError and took the daemon down at startup, before anything was
+    serving -- for every Linux deployment that turned the sandbox on. Observed
+    on a real host: `FileNotFoundError: [Errno 2] No such file or directory:
+    'security'` out of `routes_from_keychain`."""
+
+    def never(*_a, **_kw):
+        raise AssertionError("must not shell out where there is no keychain")
+
+    monkeypatch.setattr(broker.sys, "platform", "linux")
+    monkeypatch.setattr(broker.subprocess, "run", never)
+
+    assert broker.has_keychain() is False
+    assert broker.keychain_exists("cotf-anthropic") is False
+    with pytest.raises(KeyError, match="no keychain on this platform"):
+        broker.read_keychain("cotf-anthropic")
+
+
+def test_routes_are_dropped_rather_than_raising_where_there_is_no_keychain(
+    monkeypatch, caplog
+):
+    """The startup path that actually crashed. It must reach its own "nothing
+    provisioned" branch instead of propagating an OSError."""
+    monkeypatch.setattr(broker.sys, "platform", "linux")
+    monkeypatch.setattr(
+        broker.subprocess,
+        "run",
+        lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("security")),
+    )
+    with caplog.at_level("INFO", logger="claude_on_the_fly.broker"):
+        assert broker.routes_from_keychain(broker.DEFAULT_ROUTES) == []
+    assert "absent" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_read_keychain_returns_the_value_without_its_trailing_newline(
+    monkeypatch, on_macos
+):
     """`security` prints a trailing newline, which would travel into the
     Authorization header and be rejected upstream."""
     monkeypatch.setattr(
@@ -679,7 +727,7 @@ def test_read_keychain_returns_the_value_without_its_trailing_newline(monkeypatc
     assert broker.read_keychain("cotf-anthropic") == "secret-value"
 
 
-def test_read_keychain_raises_keyerror_when_the_item_is_absent(monkeypatch):
+def test_read_keychain_raises_keyerror_when_the_item_is_absent(monkeypatch, on_macos):
     """Loudly at broker start rather than on the agent's first request."""
     monkeypatch.setattr(
         broker.subprocess,
@@ -690,7 +738,9 @@ def test_read_keychain_raises_keyerror_when_the_item_is_absent(monkeypatch):
         broker.read_keychain("cotf-missing")
 
 
-def test_keychain_exists_reports_presence_without_reading_the_value(monkeypatch):
+def test_keychain_exists_reports_presence_without_reading_the_value(
+    monkeypatch, on_macos
+):
     """The probe must not pass `-w`, or a presence check would pull the secret
     into this process for no reason."""
     seen: list[list[str]] = []
@@ -704,7 +754,7 @@ def test_keychain_exists_reports_presence_without_reading_the_value(monkeypatch)
     assert "-w" not in seen[0]
 
 
-def test_keychain_exists_is_false_for_a_missing_item(monkeypatch):
+def test_keychain_exists_is_false_for_a_missing_item(monkeypatch, on_macos):
     monkeypatch.setattr(
         broker.subprocess,
         "run",

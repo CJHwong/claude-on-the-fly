@@ -120,10 +120,9 @@ def _claude_oauth_token() -> str | None:
     from claude_on_the_fly import broker
 
     # The login keychain is a macOS store, and `read_keychain` shells out to
-    # `security`, which no other platform has. Without this guard the missing
-    # binary raises FileNotFoundError out of agent_env and takes down every
-    # jailed turn on Linux -- caught by running the Linux jail in a container,
-    # not by reading the code.
+    # `security`, which no other platform has. `broker.has_keychain` now refuses
+    # that call too, so this is the outer of two guards rather than the only one
+    # -- it stays because it is the one the tests drive, through `_platform`.
     if _platform() != "darwin":
         return None
     try:
