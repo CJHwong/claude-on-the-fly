@@ -142,6 +142,7 @@ def jail_argv(
     base: Path,
     loopback: tuple[str, str, str, str],
     extra_paths: list[str],
+    write_paths: list[str] | None = None,
     codex_link_paths: list[str] | None = None,
     runtime_paths: list[str] | None = None,
     ancestor_paths: list[str] | None = None,
@@ -212,6 +213,30 @@ def jail_argv(
         extra += [str(project)] * (_MAX_EXTRA_PATHS - len(extra))
         for index, path in enumerate(extra, start=1):
             params += ["-D", f"_EXTRA_{index}={path}"]
+        # Operator write grants (COTF_SANDBOX_WRITE_PATHS). Same fixed-slot trade
+        # as _EXTRA_*, but padded with a name under the project rather than the
+        # project itself, and not with a real directory either. Both of the
+        # obvious pads are wrong, and each was measured wrong:
+        #
+        #   _PROJECT_DIR, which every read slot pads with, is a *write* allow here
+        #   sitting below the project write denies, so it re-opens `.git/hooks`,
+        #   `.mcp.json`, `.vscode` and the shell rc files. That is the
+        #   `_CODEX_HOME` bug in docs/agent/security-findings.md a second time;
+        #   tests/test_sandbox_parity.py fails on all seven denies.
+        #
+        #   _TMPDIR looks inert because it is already writable, but the slots now
+        #   carry a scoped `.env` write deny as well as an allow, and that deny
+        #   then applies to the whole temp directory. Measured: creating a `.env`
+        #   in a workspace under TMPDIR was refused.
+        #
+        # A path that does not exist is inert for both halves, and keeping it
+        # under the project means it is inside an already-writable tree if the
+        # agent ever creates it.
+        writes = [*(write_paths or [])]
+        unused = str(Path(project) / ".cotf-unused-write-slot")
+        writes += [unused] * (_MAX_EXTRA_PATHS - len(writes))
+        for index, path in enumerate(writes, start=1):
+            params += ["-D", f"_WRITE_{index}={path}"]
         # Where the operator's codex home links out to. Caller-filtered and
         # caller-collapsed, so a full list here is a real layout rather than
         # noise, and dropping one hides an instruction file the operator

@@ -60,3 +60,43 @@ scope remains the reliable boundary for what the tool can ultimately do.
 Operator entries override packaged tools by name. Dropping a packaged readback refusal
 is legal but produces a warning. An override that omits `allow` intentionally disables
 the packaged tool rather than inheriting its safe command list.
+
+## Let a tool read a file outside the workspace
+
+The broker refuses every absolute path argument. That is right for a credentialed
+CLI, which is not a file-read primitive, and wrong for one whose job is to read a
+file the agent names.
+
+Two things changed that, and only one of them needs configuration.
+
+An absolute path that lands inside the session workspace is allowed with no key at
+all. The relative spelling of that same file was always allowed, so refusing the
+long form guarded nothing.
+
+For a tree outside the workspace, name it:
+
+```yaml
+commands:
+  tools:
+    - name: slacker.sh
+      allow: [send, read-channel]
+      allow_paths:
+        - /tmp
+```
+
+Now `slacker.sh send '#chan' --file /tmp/report.md` runs, while `--file /etc/passwd` is
+still refused.
+
+The guard reads a bare argument and the value of a `-o`/`--opt=` flag. It does not know
+a CLI's own path syntax, so a tool that takes `@/etc/passwd` or `file:///etc/passwd`
+hands the broker a token the guard reads as ordinary text. Check what path shapes a tool
+accepts before you broker it.
+
+Keep the roots narrow. The broker runs the real binary **outside** the sandbox with
+the operator's real credential, so a root here is a sharper grant than the same path
+in `sandbox.extra_paths`: the file is read as the operator, not as the agent. An
+entry reaching a credential store is logged at ERROR and dropped, and the remaining
+entries still apply.
+
+Containment is checked after resolving, so a symlink planted inside an allowed root
+cannot lead out of it.

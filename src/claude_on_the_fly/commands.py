@@ -48,6 +48,7 @@ import shutil
 import signal
 import stat
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, cast
@@ -113,6 +114,11 @@ class ShimmedTool:
         rewriting a repository's settings. Listing it here admits the reads and
         refuses the writes. An empty tuple keeps the previous behaviour exactly,
         so this is opt-in per tool.
+    :param allow_paths: trees outside the session workspace this tool may be
+        given absolute path arguments for. The guard otherwise refuses every
+        absolute path, which is right for a credentialed CLI and wrong for one
+        whose job is to read a file the agent names. An entry reaching a
+        credential store is refused; see `allowed_roots`. Empty by default.
     """
 
     name: str
@@ -121,6 +127,7 @@ class ShimmedTool:
     env_passthrough: frozenset[str] = frozenset()
     allow: tuple[tuple[str, ...], ...] = ()
     allow_read_only: tuple[tuple[str, ...], ...] = ()
+    allow_paths: frozenset[str] = frozenset()
 
 
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
@@ -167,6 +174,7 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
         env_passthrough=names(entry.get("env_passthrough"), "env_passthrough"),
         allow=words(entry.get("allow"), "allow"),
         allow_read_only=words(entry.get("allow_read_only"), "allow_read_only"),
+        allow_paths=names(entry.get("allow_paths"), "allow_paths"),
     )
 
 
@@ -515,13 +523,64 @@ def _path_candidates(item: str) -> list[str]:
     return candidates
 
 
-def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None:
+def allowed_roots(tool: ShimmedTool) -> list[Path]:
+    """`tool.allow_paths`, resolved, minus every entry that is refused.
+
+    Validated against the sandbox's own refusal list rather than a second copy of
+    it. A broker root is a sharper grant than a jail grant, not a softer one: the
+    broker runs the real binary *outside* the sandbox holding the operator's real
+    credential, so a root reaching `~/.ssh` hands the agent that key through a
+    CLI that was only meant to read pull requests. Sharing the list is what keeps
+    a credential added there from staying reachable here.
+
+    A refused root is dropped and the rest are kept, matching `sandbox.extra_paths`
+    for the reason recorded there: one typo should not cost an operator the roots
+    that make the tool usable.
+    """
+    from claude_on_the_fly import sandbox
+
+    roots: list[Path] = []
+    for entry in tool.allow_paths:
+        resolved = sandbox.resolve_grant_entry(entry)
+        refusal = sandbox._extra_path_refusal(resolved)
+        if refusal is not None:
+            logger.error(
+                "commands: %s allow_paths entry %r (resolved to %s) is refused: "
+                "%s. The broker runs outside the sandbox with a real credential, "
+                "so this root would be readable with the operator's identity.",
+                tool.name,
+                entry,
+                resolved,
+                refusal,
+            )
+            continue
+        roots.append(resolved)
+    return roots
+
+
+def _unsafe_path_argument(
+    argv: list[str], cwd: str | None = None, allow_roots: Iterable[Path] = ()
+) -> str | None:
     """Return the first absolute/traversing/escaping argument, or ``None``.
 
     The broker is not a file-transfer channel. Relative paths are still allowed
     for a vetted command and are resolved by the CLI from the session workspace;
     host-absolute and escaping paths are refused before process creation. The
     Windows check matters when a cross-platform config is exercised on macOS.
+
+    An absolute path is judged by where it lands, not by its leading slash. One
+    that resolves inside a root is the session's own workspace written the long
+    way, and refusing it while allowing the relative spelling of the same file
+    guarded nothing -- it only taught the agent to rewrite the argument.
+
+    `allow_roots` carries every tree an absolute argument may land in: the
+    operator's `allow_paths` entries, and the session workspace itself when the
+    caller has one. The workspace is passed in rather than taken from `cwd`,
+    because `cwd` is only vetted against a workspace when there is one to vet it
+    against. With none, `_workspace_cwd` accepts whatever the client said, and
+    treating that as a root would make a declared cwd of `/` admit every absolute
+    path on the host. Containment is checked after resolving, so a symlink planted
+    in the workspace cannot point into a root and then out the other side.
 
     With ``cwd``, each candidate is also resolved against it and required to stay
     inside. That is the only reading that catches a relative path through a
@@ -536,11 +595,16 @@ def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None
     rather than restating it.
     """
     root = Path(cwd).resolve(strict=False) if cwd else None
+    permitted = [Path(entry).resolve(strict=False) for entry in allow_roots]
     for item in argv:
         for candidate in _path_candidates(item):
             if not candidate or candidate == ".":
                 continue
-            if candidate == ".." or candidate.startswith(("/", "~/", "~\\")):
+            if candidate.startswith(("/", "~/", "~\\")):
+                if _within_any(candidate, permitted):
+                    continue
+                return item
+            if candidate == "..":
                 return item
             if (
                 PureWindowsPath(candidate).is_absolute()
@@ -550,6 +614,24 @@ def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None
             if root is not None and not _contained(root, candidate):
                 return item
     return None
+
+
+def _within_any(candidate: str, allow_roots: Iterable[Path]) -> bool:
+    """Whether an absolute candidate resolves inside one of the allowed roots.
+
+    Resolved first, so `~` and a symlink are judged by where they land. A
+    candidate that resolves nowhere is not inside anything and is refused, which
+    is the opposite of `_contained`'s reading: there an unresolvable path was
+    already relative and confined, here it is the agent naming a host path that
+    does not exist yet, and a write would create it.
+    """
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):  # pragma: no cover - resolve is lexical here
+        return False
+    return any(
+        resolved == root or resolved.is_relative_to(root) for root in allow_roots
+    )
 
 
 def _contained(root: Path, candidate: str) -> bool:
@@ -904,7 +986,14 @@ class CommandBroker:
                 refused=True,
             )
 
-        unsafe_path = _unsafe_path_argument(argv, cwd)
+        # The workspace joins the operator's roots here rather than being taken
+        # from `cwd` inside the guard: `cwd` is only vetted when there is a
+        # workspace to vet it against, so a session without one must not have its
+        # client-declared cwd promoted to an allow root.
+        roots = allowed_roots(tool)
+        if workspace is not None:
+            roots.append(Path(cwd))
+        unsafe_path = _unsafe_path_argument(argv, cwd, roots)
         if unsafe_path is not None:
             logger.warning(
                 "commands: REFUSE %s %s (absolute or escaping path argument)",

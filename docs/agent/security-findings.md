@@ -29,6 +29,7 @@ upgrade path, so none of that was covered by it.
 
 | Finding | Where | Evidence |
 |---|---|---|
+| The Linux dotenv mask swept with `followlinks=False`, so a symlinked directory inside a granted config tree was never descended into and the token file beneath it stayed readable inside the jail. The mask list also held the walked path rather than the real one, and a mask is a bind mount over a path, so even a found file stayed readable under its real name. macOS was never affected: one unanchored regex matches either path | `sandbox._dotenvs_under`, `sandbox._linux_masked` | Measured on a real Linux host where `~/.claude/skills` is a symlink to a skills repository: `cat` of that skill's `.env` inside the jail returned the token before the change and is refused after it. The sweep now follows directory symlinks with a visited set of realpaths to break loops, and masks realpaths. Both halves fail without the change |
 | A workspace name reached `_PROJECT_DIR` unsanitized, so a traversal made the data dir agent-writable, and `cron.yaml` from there is unjailed shell with the daemon's environment | `agent.workspace_path` | Traversal reproduced, then contained; regression tests for both the Slack and journal entry points |
 | `_CODEX_HOME` collapsed onto `~/.codex` with `scope_sessions` off, so the write allow nullified the deny above it and `config.toml`, `AGENTS.md`, `hooks.json` became agent-writable | `sandbox._macos_wrap` | Live jailed write into a real `~/.codex`, refused after the fix and succeeding with the one line reverted, under both profiles |
 | An unrecognised `sandbox.mode` resolved to `off`, and both startup gates return early unless the mode is `jail`, so a typo produced the posture the operator was avoiding | `sandbox.mode` | All six mode values probed |
@@ -76,6 +77,18 @@ upgrade path, so none of that was covered by it.
 Ordered by severity against the threat model above.
 
 ### Credential reach
+
+**The broker path guard does not know a CLI's own path syntax.** `_path_candidates`
+reads a bare argument and the value after `=` on a flag. It does not look inside
+`@/etc/passwd`, `file:///etc/passwd`, or a `key=@path` value on a bare token, all of
+which some CLIs accept as file references. Measured: `gh api -F body=@/etc/passwd`
+arrives as the single token `body=@/etc/passwd` and is read as a relative path inside
+the workspace. Pre-existing, and not closed by `commands.allow_paths`. It matters only
+for a tool an operator has already allowlisted, so the remedy documented in
+`docs/how-to/broker-a-command.md` is to check what path shapes a tool accepts before
+brokering it. A general fix needs a per-tool argument grammar, which the broker
+deliberately does not have.
+
 
 **`fs: allow-reads` leaves credential stores readable.** Measured on a real home: the
 Firefox profile tree (holding `logins.json` and `key4.db`) and `~/Library/Messages/chat.db`.

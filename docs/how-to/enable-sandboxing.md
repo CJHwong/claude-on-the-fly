@@ -51,9 +51,44 @@ script rather than the sandbox, so it is easy to misread.
 
 A toolchain shim works, and logs one line that looks worse than it is. `mise` reads its
 own config, which a grant covers, and then tries to write a tracking symlink under
-`~/.local/state/mise`, which no `extra_paths` entry can permit: these grants are
-read-only by design. It warns (`tracking config: failed to ln -sf`) and runs the tool
-anyway. Grant `~/.config/mise` if you want the config read to succeed as well.
+`~/.local/state/mise`, which no `extra_paths` entry can permit: those grants are
+read-only. It warns (`tracking config: failed to ln -sf`) and runs the tool anyway.
+Grant `~/.config/mise` if you want the config read to succeed as well, and
+`~/.local/state/mise` under `write_paths` if you want the warning to stop.
+
+## Let the agent write outside its workspace
+
+`extra_paths` grants reads. `write_paths` is the separate setting for writes, and an
+entry there is readable as well:
+
+```yaml
+sandbox:
+  write_paths:
+    - ~/notes
+```
+
+Use it when the agent's real job lives outside the workspace -- a notes tree, a
+generated site, a scratch area a later turn reads back.
+
+Grant the narrowest tree that works. This is the setting that decides what a turn can
+still change after it ends, so a broad entry gives back most of what the jail is for.
+
+`write_paths` refuses everything `extra_paths` refuses, and then refuses more. A write
+grant can leave behind something that runs later, *outside* the jail:
+
+- a shell rc the next login sources
+- a git config, where `core.hooksPath` and a `!`-prefixed alias are both executables
+- a systemd unit, an autostart entry or a LaunchAgent that init starts
+- a directory on the daemon's PATH, where a name collision is enough
+- a hook under `~/.claude`, `~/.codex` or `~/.agents`
+
+An entry reaching any of those is logged at ERROR and dropped, and the other entries
+still apply.
+
+Treat that as a guard against the common mistakes, not as a boundary. The PATH
+directories are read from the daemon's own environment, so a directory that is only on
+your interactive PATH is not covered. Granting the narrowest tree that works is what
+actually keeps the jail meaningful.
 
 A `.env` file is never readable, under either `sandbox.fs` value and at any depth. One
 rule at the end of each profile covers every tree the jail grants, so a grant you add

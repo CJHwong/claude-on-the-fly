@@ -817,6 +817,24 @@ def _extra_path_files() -> list[Path]:
     ]
 
 
+def resolve_grant_entry(entry: str) -> Path:
+    """One operator path entry, expanded and resolved, ready to be judged.
+
+    `~` is expanded first. Without that, `~/notes` resolves against the daemon's
+    working directory into a path that does not exist, so the grant silently does
+    nothing: it is not refused, nothing is logged, and the operator's next move is
+    to widen the entry until something works. Measured before this existed --
+    `sandbox.extra_paths: [~/.gitconfig]`, which `docs/how-to/enable-sandboxing.md`
+    has recommended verbatim, produced `<cwd>/~/.gitconfig`.
+
+    Shared by `sandbox.extra_paths`, `sandbox.write_paths` and the command
+    broker's `allow_paths` so one syntax cannot mean three things. The refusal
+    checks run on what this returns, so expanding here is also what makes
+    `~/.ssh` reach the credential comparison at all.
+    """
+    return Path(os.path.realpath(Path(entry).expanduser()))
+
+
 def _extra_path_refusal(resolved: Path) -> str | None:
     """Why this resolved `sandbox.extra_paths` entry cannot be granted, or None.
 
@@ -870,7 +888,7 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     paths = [p for p in settings.get("COTF_SANDBOX_EXTRA_PATHS").split(":") if p]
     granted: list[str] = []
     for entry in paths:
-        resolved = Path(os.path.realpath(entry))
+        resolved = resolve_grant_entry(entry)
         refusal = _extra_path_refusal(resolved)
         if refusal is not None:
             logger.error(
@@ -886,6 +904,145 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     if cap is not None and len(granted) > cap:
         logger.warning(
             "sandbox.extra_paths has %d granted entries; granting only the first "
+            "%d (seatbelt has no arrays)",
+            len(granted),
+            cap,
+        )
+        granted = granted[:cap]
+    return granted
+
+
+# Paths a `sandbox.write_paths` entry must not reach, on top of every refusal a
+# read grant already carries. A write grant is not a bigger read grant: it hands
+# the agent the ability to leave something behind that *runs later, outside the
+# jail*. A shell rc is sourced by the operator's next login, a systemd unit or a
+# LaunchAgent is started by init, a file dropped on PATH is executed by the next
+# person who types its name, and a hook under an agent's config tree runs on the
+# host the next time that agent starts. None of those are credential stores, so
+# `_extra_path_refusal` passes them, and each one turns a contained write into
+# host execution.
+#
+# Directories and files together, checked the same way the credential lists are:
+# an entry inside one is an escape outright, and an entry that merely contains
+# one re-opens it.
+_WRITE_ESCAPE_PATHS = (
+    # Sourced by the operator's next interactive shell.
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.profile",
+    "~/.zshrc",
+    "~/.zshenv",
+    "~/.zprofile",
+    # Started by init, with no shell involved.
+    "~/.config/systemd",
+    "~/.config/autostart",
+    "~/Library/LaunchAgents",
+    # On PATH, so a name collision is enough; nobody has to open the file. The
+    # live PATH is added to these by `_write_escape_paths`; the two literals stay
+    # because a deployment whose daemon PATH omits them is still a deployment
+    # whose operator has them in an interactive shell.
+    "~/.local/bin",
+    "~/bin",
+    # git runs what its config tells it to: `core.hooksPath` points at a hook
+    # directory, and an alias beginning `!` is a shell command. Both execute on
+    # the operator's next git invocation, outside the jail, and the command
+    # broker itself shells out to credentialed CLIs.
+    "~/.gitconfig",
+    "~/.config/git",
+    # systemd reads user units from either location, so naming only the first
+    # leaves the second as an equivalent way in.
+    "~/.local/share/systemd",
+    "~/.config/environment.d",
+    # Agent config trees. Their hooks and instruction files run on the host, and
+    # both are mounted read-only inside the jail precisely so a turn cannot edit
+    # them. A write grant here would undo that from the other direction.
+    "~/.claude",
+    "~/.codex",
+    "~/.agents",
+)
+
+
+def _write_escape_paths() -> list[Path]:
+    """`_WRITE_ESCAPE_PATHS`, realpath'd, plus the config trees this deployment
+    actually uses.
+
+    The literals name `~/.claude` and `~/.codex`, which is where those trees are
+    by default and not where they have to be: `CLAUDE_CONFIG_DIR` moves one of
+    them anywhere. Both are write-denied by the profile, and the `_WRITE_*` allows
+    are written *after* those denies, so a redirected tree missing from this list
+    is a grant that re-opens its own deny. Appended rather than listed for the
+    same reason `_extra_path_stores` appends DATA_DIR: the path is resolved per
+    deployment, so a literal cannot carry it.
+    """
+    from claude_on_the_fly import envfile
+
+    paths = [Path(path).expanduser() for path in _WRITE_ESCAPE_PATHS]
+    paths.append(envfile.claude_config_dir())
+    paths.append(_codex_operator_home())
+    # Every directory on the daemon's PATH, derived rather than listed. A literal
+    # list goes stale the moment a deployment uses a different toolchain: measured
+    # against a real PATH, `/opt/homebrew/bin`, `~/go/bin`, `~/.cargo/bin` and a
+    # mise shim directory were all grantable while the comment above claimed PATH
+    # directories were covered. `/opt/homebrew` is the example `extra_paths` value
+    # in the shipped template, so copying it into `write_paths` was the likely
+    # first mistake. An empty entry means the working directory, which is not a
+    # path anyone meant to name, so it is skipped rather than resolved.
+    paths += [
+        Path(entry) for entry in os.environ.get("PATH", "").split(os.pathsep) if entry
+    ]
+    return [Path(os.path.realpath(path)) for path in paths]
+
+
+def _write_path_refusal(resolved: Path) -> str | None:
+    """Why this resolved `sandbox.write_paths` entry cannot be granted, or None.
+
+    Every reason a read grant is refused refuses a write grant too, so the read
+    check runs first and its wording is reused. The escape list is the part that
+    is specific to writing.
+    """
+    refusal = _extra_path_refusal(resolved)
+    if refusal is not None:
+        return refusal
+    for escape in _write_escape_paths():
+        if resolved.is_relative_to(escape):
+            return f"it resolves inside {escape}, which runs outside the sandbox"
+        if escape.is_relative_to(resolved):
+            return f"it contains {escape}, which runs outside the sandbox"
+    return None
+
+
+def _extra_write_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
+    """Operator write grants for deny-most, from `sandbox.write_paths`, realpath'd.
+
+    Shaped exactly like `_extra_read_paths`, including dropping a refused entry
+    and granting the rest: the reasoning there about failing closed applies here
+    unchanged, and an operator who has to debug both should not find two
+    different behaviours.
+
+    A granted entry is writable *and* readable. Writing to a path the profile
+    will not let the agent stat is not a capability anyone asked for, and on
+    Linux the read follows from the bind anyway, so making macOS agree is what
+    keeps one setting from meaning two things.
+    """
+    entries = [p for p in settings.get("COTF_SANDBOX_WRITE_PATHS").split(":") if p]
+    granted: list[str] = []
+    for entry in entries:
+        resolved = resolve_grant_entry(entry)
+        refusal = _write_path_refusal(resolved)
+        if refusal is not None:
+            logger.error(
+                "sandbox.write_paths entry %r (resolved to %s) is refused: %s. "
+                "Granting the rest and continuing; name a narrower path in %s.",
+                entry,
+                resolved,
+                refusal,
+                settings.operator_settings(),
+            )
+            continue
+        granted.append(str(resolved))
+    if cap is not None and len(granted) > cap:
+        logger.warning(
+            "sandbox.write_paths has %d granted entries; granting only the first "
             "%d (seatbelt has no arrays)",
             len(granted),
             cap,
@@ -1572,6 +1729,10 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # the data dir, which is opaque, so without this the directory the backend
         # just pointed the child at would not exist inside the namespace.
         codex_home,
+        # Operator write grants. Last so a narrower entry cannot be shadowed by
+        # one of the fixed grants above; bwrap applies these by depth, not by
+        # argv order, so position here is for the reader rather than the kernel.
+        *(Path(p) for p in _extra_write_paths(cap=None)),
     ]
     return {
         # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
@@ -1679,8 +1840,28 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     for granted in ("memory", "shims"):
         base = data_dir / granted
         if base.is_dir():
-            masked += sorted(base.rglob(".env*"))
+            # Realpath for the same reason the sweep below uses it: `memory` is
+            # commonly a symlink into the operator's own notes repository, and a
+            # mask over the link's name leaves the file readable under its real
+            # one.
+            masked += sorted(
+                Path(os.path.realpath(found)) for found in base.rglob(".env*")
+            )
     masked += _dotenvs_under(Path(p) for p in _extra_read_paths(cap=None))
+    # And the write grants, for the same reason and one sharper. A read grant
+    # leaks a token; a write grant also lets a turn rewrite one, so a token
+    # left unmasked here can be replaced rather than merely read. The two are
+    # swept separately because an operator names them separately: a tree can be
+    # writable without being listed in `sandbox.extra_paths`, and sweeping only
+    # the read list would cover that tree solely by luck -- measured on a real
+    # host, where the granted tree happened to also be reachable through a
+    # symlink inside the claude config directory.
+    masked += _dotenvs_under(
+        (Path(p) for p in _extra_write_paths(cap=None)),
+        source="sandbox.write_paths",
+        cap=None,
+        follow=False,
+    )
     # And the trees the operator's codex home links out to, which `_linux_grants`
     # mounts read-only for the same reason it mounts an operator grant: cotf did
     # not choose the tree, the operator did. A shared skills directory is exactly
@@ -1721,6 +1902,7 @@ def _dotenvs_under(
     roots: Iterable[Path],
     source: str = "sandbox.extra_paths",
     cap: int | None = _MAX_SWEPT_DOTENVS,
+    follow: bool = True,
 ) -> list[Path]:
     """Every `.env*` file beneath these trees, for masking on Linux.
 
@@ -1738,18 +1920,48 @@ def _dotenvs_under(
     cotf owns and keeps small, while these are the operator's own and can be a
     whole repository. `os.walk` is pruned in place instead.
 
-    Symlinks are not followed. A grant is already realpath'd by `_extra_read_paths`,
-    and following links inside it would let one loop or wander back out of the tree
-    the operator actually named.
+    Symlinked directories *are* followed, and a visited set of realpaths breaks the
+    loops that makes possible. Not following them was a hole rather than a
+    safeguard: the sweep exists because `--ro-bind / /` makes the link's target
+    readable whatever the link is called, so stopping at the link leaves the file
+    exposed under its real name while the mask list says it is covered. Measured on
+    a real home: `~/.claude/skills` is a symlink to a skills repository, and the
+    token file one skill keeps beside itself stayed readable inside the jail.
+    macOS never had this hole, because one unanchored regex matches the real path
+    too -- so following links here is what makes the two platforms agree.
+
+    `follow` is False for one caller: the write grants. Every other tree swept here
+    is mounted read-only, so only the operator can put a link in it. A write grant
+    is the one tree the agent itself can write, and a link it plants pointing at
+    `/` would make each later spawn walk the whole filesystem before the agent
+    starts. Not following costs nothing there, because a link out of the tree
+    exposes nothing new: the target is reached by its own path, and under
+    deny-most `$HOME` is an opaque tmpfs, so a link into it resolves to nothing
+    inside the namespace.
     """
     found: list[Path] = []
+    visited: set[str] = set()
     for root in roots:
         if not root.is_dir():
             continue
-        for parent, dirnames, filenames in os.walk(root, followlinks=False):
+        for parent, dirnames, filenames in os.walk(root, followlinks=follow):
+            # Realpath rather than the walked path: two links to one directory are
+            # the same tree, and the second visit is what would loop forever.
+            real = os.path.realpath(parent)
+            if real in visited:
+                dirnames[:] = []
+                continue
+            visited.add(real)
             dirnames[:] = [name for name in dirnames if name not in _SWEEP_PRUNED]
+            # The realpath, not the walked path. A mask is a bind mount over a
+            # path, so covering `~/.claude/skills/x/.env` does nothing for the
+            # same file reached as `~/repo/skills/x/.env`, which `--ro-bind / /`
+            # also exposes. Masking the real name covers both, since a read
+            # through the link resolves to it.
             found += [
-                Path(parent) / name for name in filenames if name.startswith(".env")
+                Path(os.path.realpath(Path(parent) / name))
+                for name in filenames
+                if name.startswith(".env")
             ]
             if cap is not None and len(found) > cap:
                 logger.error(
@@ -1761,7 +1973,7 @@ def _dotenvs_under(
                     root,
                 )
                 raise _SweepTooBroad(str(root))
-    return sorted(found)
+    return sorted(set(found))
 
 
 class _SweepTooBroad(RuntimeError):
@@ -1969,6 +2181,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
+        write_paths=_extra_write_paths() if base == _DENY_MOST_PROFILE else [],
         # Only under deny-most. The other base allows reads across $HOME, so
         # every one of these is already reachable and computing them would buy a
         # directory walk per spawn for nothing.
