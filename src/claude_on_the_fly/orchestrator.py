@@ -332,8 +332,12 @@ class SessionEgress:
     the previous session's grants rather than inheriting them.
     """
 
-    def __init__(self, frontend: Frontend) -> None:
+    def __init__(self, frontend: Frontend, *, ask: bool = True) -> None:
         self._frontend = frontend
+        # False under `sandbox.egress: open`. Held here rather than read per
+        # session because it is startup-fixed, like the decision to build this
+        # object at all.
+        self._ask = ask
         self._proxies: dict[int, tuple[str, egress.EgressProxy]] = {}
 
     async def env_for(self, chat_id: int, session: str) -> dict[str, str]:
@@ -355,7 +359,7 @@ class SessionEgress:
             policy=approvals_mod.ApprovalPolicy(never_ask=egress.never_ask_subjects()),
             label=label,
         )
-        proxy = egress.EgressProxy(approvals, label=label)
+        proxy = egress.EgressProxy(approvals, label=label, ask=self._ask)
         await proxy.start()
         self._proxies[chat_id] = (session, proxy)
         logger.info(
@@ -1527,10 +1531,9 @@ async def _start_sandbox(
         permissions.write_pty_settings()
     if not sandbox.enabled():
         return None, None, None
-    # Resolved before anything binds a socket. It refuses jail+off, and a refusal
-    # raised after the broker started would leave a credential-holding proxy
-    # listening for a daemon already on its way out.
-    gate_egress = sandbox.egress_gated()
+    # Resolved before anything binds a socket, so a bad value is reported by a
+    # daemon that has started nothing rather than by one already tearing down.
+    egress_mode = sandbox.egress_mode()
     broker_instance = None
     command_broker = None
     try:
@@ -1571,12 +1574,16 @@ async def _start_sandbox(
             await broker_instance.stop()
         raise
     # Built before the log line so the line reports what was actually started.
-    session_egress = SessionEgress(frontend) if gate_egress else None
+    session_egress = (
+        SessionEgress(frontend, ask=sandbox.egress_asks())
+        if sandbox.egress_proxy_enabled()
+        else None
+    )
     logger.info(
         "sandbox: mode=%s broker=%s egress=%s commands=%s content_log=%s",
         sandbox.mode(),
         "on" if broker_instance else "none",
-        "per-session" if session_egress else "ungated",
+        egress_mode,
         ",".join(command_broker.shimmed) or "none",
         "on" if logs.log_content() else "redacted",
     )

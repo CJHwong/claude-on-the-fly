@@ -268,3 +268,69 @@ async def test_the_group_kill_still_reaches_the_agent_through_the_jail(
         finally:
             sandbox._SESSION_SOCKETS.reset(token)
             await relay.stop()
+
+
+async def test_ungated_egress_reaches_an_unapproved_host_through_the_jail(jail):
+    """`sandbox.egress: open`, end to end through a real namespace.
+
+    The pieces have unit tests. What only this can answer is whether they
+    compose: the namespace has no route of its own, the relay carries the
+    proxy's port in, and the proxy tunnels a host that is in no allowlist
+    without consulting an operator who would have said no.
+
+    The refusals that are not allowlist decisions are asserted in the same run,
+    because "open" would be worth nothing if it had quietly dropped those too.
+    """
+    from claude_on_the_fly.approvals import ApprovalBroker
+    from claude_on_the_fly.egress import EgressProxy
+
+    asked: list[str] = []
+
+    class RefusingGate:
+        async def ask(self, request):
+            asked.append(request.subject)
+            return False
+
+    async def handle(reader, writer):
+        await reader.read(1)
+        writer.write(b"REACHED")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream = server.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(ApprovalBroker(RefusingGate()), ask=False)
+
+    async def resolve_public(host, port, **_kw):
+        # The host is a name in no allowlist; resolution pins it to loopback so
+        # the connect lands on the local server, which is why the CONNECT target
+        # below carries that server's port. Without this the case would need
+        # real DNS in CI.
+        return "127.0.0.1"
+
+    proxy._resolve_public = resolve_public  # type: ignore[method-assign]
+    port = await proxy.start()
+
+    probe = (
+        "import socket,sys\n"
+        f"s=socket.create_connection(('127.0.0.1',{port}),10)\n"
+        f"s.sendall(b'CONNECT unapproved.example:{upstream} HTTP/1.1\\r\\n\\r\\n')\n"
+        "head=s.recv(64)\n"
+        "sys.stdout.write(head.split(b' ')[1].decode())\n"
+        "s.sendall(b'x'); sys.stdout.write(s.recv(16).decode())\n"
+    )
+    with tempfile.TemporaryDirectory(dir="/tmp") as short:
+        relay = netns_relay.LoopbackRelay(Path(short))
+        sockets = await relay.start([port])
+        try:
+            jail["grants"]["read_only"].append(Path(sys.prefix))
+            out = await run_async(
+                jail, f'{sys.executable} -c "{probe}"', sockets=sockets
+            )
+            assert "200REACHED" in out, out
+            assert asked == [], "ungated egress must not reach the operator"
+        finally:
+            await relay.stop()
+            await proxy.stop()
+            server.close()

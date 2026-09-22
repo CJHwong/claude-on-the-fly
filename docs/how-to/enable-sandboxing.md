@@ -103,32 +103,49 @@ Persist it in `/etc/sysctl.d/` if you want it across reboots. Startup preflight
 detects this specific case and prints the same remedy. The daemon refuses to start
 with `jail` when the mechanism is unusable rather than running a turn unsandboxed.
 
-## 2b. Decide whether to gate egress
+## 2b. Choose an egress posture
 
-Both modes start a per-session egress proxy, which gates outbound HTTPS by
-destination host and asks you to approve a host that `egress.allow` does not list.
-Keep that. It is the default and it is the point.
+`sandbox.egress` decides what happens to the agent's outbound HTTPS. It is a
+separate axis from `sandbox.mode`, which decides whether the agent holds a
+credential.
 
-Turn it off when your agent browses the open web. `egress.allow` matches host names
-exactly, with no wildcard and no suffix match, so an agent that reads news links or
-follows search results reaches a new host almost every turn. Each one pauses the call
-to ask you, and the approval rate limit then starts auto-denying.
+| Value | Proxy | Host outside `egress.allow` |
+|---|---|---|
+| `gated` (default) | runs | asks you |
+| `open` | runs | tunnels without asking |
+| `off` | not started | no outbound HTTPS at all |
+
+Keep `gated` unless the agent's job is reading the web. `egress.allow` matches
+host names exactly, with no wildcard and no suffix match, so an agent that follows
+news links or search results reaches a new host most turns. Each one pauses the
+call to ask you, and the approval rate limit then starts auto-denying.
 
 ```yaml
 sandbox:
-  mode: env
-  egress: "off"
+  mode: jail
+  egress: open
 ```
 
-Quote it. YAML reads a bare `off` as a boolean. This setting accepts that spelling
-too, so both forms work, but the quoted one is what it says.
+`open` drops one question, not the protections. A malformed host name, a
+`never_ask` metadata endpoint, and an address that resolves private or loopback
+without `egress.private_allow` are all refused exactly as under `gated`. The
+proxy still resolves and pins the address before connecting.
 
-The agent still holds no credential, and the command shims still run credentialed
-CLIs outside the sandbox on your behalf. Only the destination gate is gone.
+What it gives up is inspection. The tunnel is not read (no TLS interception), so
+a host reached this way is a covert channel. Pair it with `mode: jail` and that
+is the intended trade: the filesystem denies decide what the agent can read, and
+this decides who it can talk to.
 
-`egress: off` is refused under `mode: jail`. The jail unshares the network, so the
-proxy is the agent's only route out; removing it would leave no network at all rather
-than a looser policy. The daemon says so and refuses to start.
+Prefer `open` over dropping the network jail. Both let the agent reach the web,
+but `open` keeps the namespace free of the host's own loopback services, which on
+Linux is the property that makes `broker_only_loopback` unnecessary.
+
+`off` is a lockdown rather than a mistake, including under `jail`. The relay still
+bridges whatever brokered loopback ports the turn has, so model calls keep working
+through the credential broker and the agent has no internet.
+
+Quote the value if you write `off`. YAML reads a bare `off` as a boolean; the
+setting accepts that spelling too, but the quoted one is what it says.
 
 ## 3. Verify
 

@@ -342,6 +342,66 @@ async def test_denied_host_gets_403_with_actionable_body():
         await proxy.stop()
 
 
+async def test_ungated_tunnels_an_unknown_host_without_asking(monkeypatch):
+    """`sandbox.egress: open`. The host is in no allowlist and the operator is
+    never consulted, yet the tunnel opens and carries bytes."""
+    echo_port, echo = await start_echo_server()
+    pin_public_resolution(monkeypatch, echo_port)
+    gate = RecordingGate(default=False)
+    proxy = EgressProxy(ApprovalBroker(gate), ask=False)
+    port = await proxy.start()
+    try:
+        status, body = await connect_through(
+            port, f"never.seen.example:{echo_port}", b"ungated"
+        )
+        assert status.startswith(b"HTTP/1.1 200")
+        assert body == b"UNGATED"
+        assert gate.seen == [], "ungated egress must not reach the operator"
+    finally:
+        await proxy.stop()
+        echo.close()
+
+
+async def test_ungated_still_refuses_a_metadata_endpoint():
+    """`open` drops the allowlist question and nothing else. An instance
+    metadata endpoint hands credentials to whatever can reach it, and no
+    legitimate task needs one, so it is not a question the operator was
+    answering in the first place."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)), ask=False)
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "metadata.google.internal:80")
+        assert status.startswith(b"HTTP/1.1 403")
+    finally:
+        await proxy.stop()
+
+
+async def test_ungated_still_refuses_a_private_address():
+    """The SSRF guard is not an allowlist decision either. Without this, `open`
+    would hand the agent the operator's whole loopback and LAN."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)), ask=False)
+    port = await proxy.start()
+    try:
+        assert (await connect_through(port, "169.254.169.254:80"))[0].startswith(
+            b"HTTP/1.1 403"
+        )
+        assert (await connect_through(port, "192.168.1.10:443"))[0].startswith(
+            b"HTTP/1.1 403"
+        )
+    finally:
+        await proxy.stop()
+
+
+async def test_ungated_still_refuses_a_malformed_host():
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)), ask=False)
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "evil.com%2e.ok.com:443")
+        assert status.startswith(b"HTTP/1.1 403")
+    finally:
+        await proxy.stop()
+
+
 async def test_never_ask_host_is_refused_without_asking():
     gate = RecordingGate(default=True)
     proxy = EgressProxy(ApprovalBroker(gate))
