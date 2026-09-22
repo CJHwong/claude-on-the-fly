@@ -78,6 +78,17 @@ Ordered by severity against the threat model above.
 
 ### Credential reach
 
+**The broker path guard does not know a CLI's own path syntax.** `_path_candidates`
+reads a bare argument and the value after `=` on a flag. It does not look inside
+`@/etc/passwd`, `file:///etc/passwd`, or a `key=@path` value on a bare token, all of
+which some CLIs accept as file references. Measured: `gh api -F body=@/etc/passwd`
+arrives as the single token `body=@/etc/passwd` and is read as a relative path inside
+the workspace. Pre-existing, and not closed by `commands.allow_paths`. It matters only
+for a tool an operator has already allowlisted, so the remedy documented in
+`docs/how-to/broker-a-command.md` is to check what path shapes a tool accepts before
+brokering it. A general fix needs a per-tool argument grammar, which the broker
+deliberately does not have.
+
 
 **`fs: allow-reads` leaves credential stores readable.** Measured on a real home: the
 Firefox profile tree (holding `logins.json` and `key4.db`) and `~/Library/Messages/chat.db`.

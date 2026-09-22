@@ -1231,3 +1231,105 @@ class TestTerminateAlwaysReaps:
         monkeypatch.setattr(type(proc), "kill", lambda self: killed.__setitem__("n", 1))
         await commands._terminate(proc)
         assert killed["n"] == 0
+
+
+# --------------------------------------------------------------------------
+# allow_paths: broker roots outside the workspace
+# --------------------------------------------------------------------------
+
+
+def test_an_absolute_path_inside_the_workspace_is_allowed(tmp_path):
+    """Judged by where it lands, not by its leading slash. The relative spelling
+    of this exact file was always allowed, so refusing the absolute one guarded
+    nothing and only taught the agent to rewrite the argument."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("x\n")
+    argv = [str(workspace / "notes.md")]
+    assert commands._unsafe_path_argument(argv, str(workspace), [workspace]) is None
+
+
+def test_a_client_declared_cwd_is_not_an_allow_root(tmp_path):
+    """`_workspace_cwd` only vets the cwd when there is a workspace to vet it
+    against. Without one it accepts whatever the client said, so promoting that to
+    a root would make a declared cwd of `/` admit every absolute path on the host.
+    The workspace is passed in explicitly for exactly this reason."""
+    assert commands._unsafe_path_argument(["/etc/passwd"], "/") == "/etc/passwd"
+
+
+def test_an_absolute_path_outside_the_workspace_still_needs_a_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    argv = [str(outside / "secret.txt")]
+    assert commands._unsafe_path_argument(argv, str(workspace)) == argv[0]
+    assert (
+        commands._unsafe_path_argument(argv, str(workspace), [outside.resolve()])
+        is None
+    )
+
+
+def test_a_root_does_not_admit_its_sibling(tmp_path):
+    """Containment, not prefix matching: `/tmp/a` must not admit `/tmp/ab`."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "ab").mkdir()
+    argv = [str(tmp_path / "ab" / "f.txt")]
+    assert (
+        commands._unsafe_path_argument(
+            argv, str(workspace), [(tmp_path / "a").resolve()]
+        )
+        == argv[0]
+    )
+
+
+def test_a_symlink_cannot_lead_out_of_an_allowed_root(tmp_path):
+    """The agent's workspace is writable, so it can plant a link. Containment is
+    checked after resolving for exactly this reason."""
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "root"
+    secret = tmp_path / "secret"
+    workspace.mkdir()
+    root.mkdir()
+    secret.mkdir()
+    (secret / "token").write_text("x\n")
+    (root / "escape").symlink_to(secret)
+    argv = [str(root / "escape" / "token")]
+    assert (
+        commands._unsafe_path_argument(argv, str(workspace), [root.resolve()])
+        == argv[0]
+    )
+
+
+def test_allowed_roots_refuses_a_credential_store(caplog, tmp_path):
+    """The broker runs outside the sandbox with the operator's real credential, so
+    a root reaching a key store is sharper here than the same entry would be in
+    `sandbox.extra_paths`. Checked against that same list rather than a copy.
+
+    The surviving root is a `tmp_path` child rather than `/tmp` itself: the suite
+    puts its fake home under the system temp directory, so `/tmp` contains that
+    home and is refused for a real reason. Naming it here made the test pass on
+    macOS, where TMPDIR is elsewhere, and fail on Linux CI.
+    """
+    keep = tmp_path / "reports"
+    keep.mkdir()
+    tool = ShimmedTool(name="gh", allow_paths=frozenset({"~/.ssh", str(keep)}))
+    with caplog.at_level("ERROR"):
+        roots = commands.allowed_roots(tool)
+    assert roots == [Path(os.path.realpath(keep))]
+    assert ".ssh" in caplog.text
+
+
+def test_allowed_roots_is_empty_without_configuration():
+    """Absent the key, the guard behaves exactly as it did before."""
+    assert commands.allowed_roots(ShimmedTool(name="gh")) == []
+
+
+def test_allow_paths_is_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {"tools": [{"name": "gh", "allow": ["pr view"], "allow_paths": ["/tmp"]}]},
+        source="test",
+    )
+    assert tool.allow_paths == frozenset({"/tmp"})

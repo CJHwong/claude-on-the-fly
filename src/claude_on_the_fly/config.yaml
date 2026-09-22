@@ -125,6 +125,15 @@ commands:
   #                     gh switches to POST as soon as a parameter is added.
   #                     Omit the key to keep a tool exactly as it was.
   #
+  #   allow_paths       trees outside the session workspace this tool may be
+  #                     given absolute path arguments for. Every absolute path is
+  #                     refused by default, which is right for a credentialed CLI
+  #                     and wrong for one whose job is to read a file the agent
+  #                     names. An absolute path that lands inside the session
+  #                     workspace never needed this key. The broker runs outside
+  #                     the sandbox with the real credential, so an entry that
+  #                     reaches a credential store is logged at ERROR and dropped.
+  #
   #   allow             safe leading subcommands. The list is deny-by-default;
   #                    flags and arguments may follow the listed words. A
   #                    credentialed CLI is not a general shell, so `gh api`,
