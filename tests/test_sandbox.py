@@ -51,6 +51,59 @@ def test_enabled_modes(monkeypatch, value):
     assert sandbox.enabled() is True
 
 
+def test_egress_defaults_to_gated(monkeypatch):
+    monkeypatch.delenv("COTF_SANDBOX_EGRESS", raising=False)
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    assert sandbox.egress_mode() == "gated"
+    assert sandbox.egress_gated() is True
+
+
+def test_an_emptied_egress_key_reads_as_gated(monkeypatch):
+    """Commenting the key out must not silently drop the gate."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "  ")
+    assert sandbox.egress_mode() == "gated"
+
+
+def test_egress_off_under_env_drops_the_gate(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+    assert sandbox.egress_mode() == "off"
+    assert sandbox.egress_gated() is False
+
+
+@pytest.mark.parametrize(("yaml_value", "expected"), [(False, "off"), (True, "gated")])
+def test_the_yaml_boolean_spelling_is_accepted(monkeypatch, yaml_value, expected):
+    """YAML 1.1 reads a bare `off` as False, so an operator copying the template
+    value without quotes hands this a bool. Refusing it would answer "'False' is
+    not one of [...]" to somebody who wrote the documented value."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setattr(
+        sandbox.settings,
+        "startup_value",
+        lambda path, default=None: yaml_value if path == "sandbox.egress" else "env",
+    )
+    assert sandbox.egress_mode() == expected
+
+
+def test_unknown_egress_value_refuses(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "banana")
+    with pytest.raises(sandbox.SandboxModeError) as excinfo:
+        sandbox.egress_mode()
+    assert "sandbox.egress='banana'" in str(excinfo.value)
+
+
+def test_egress_off_is_refused_under_the_jail(monkeypatch):
+    """Not a looser policy: the jail unshares the network, so with no proxy the
+    agent has no route out at all. Refuse rather than serve a netless agent."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+    with pytest.raises(sandbox.SandboxModeError) as excinfo:
+        sandbox.egress_mode()
+    assert "sandbox.mode=env" in str(excinfo.value)
+
+
 def test_agent_env_none_when_off(monkeypatch):
     monkeypatch.delenv("COTF_SANDBOX", raising=False)
     # None => create_subprocess_exec inherits the parent env (current behavior).
