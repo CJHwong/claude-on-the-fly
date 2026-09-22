@@ -1333,3 +1333,193 @@ def test_allow_paths_is_parsed_from_configuration():
         source="test",
     )
     assert tool.allow_paths == frozenset({"/tmp"})
+
+
+# --------------------------------------------------------------------------
+# path introducers: @file and file:// URLs
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["@/etc/passwd"], id="curl-style @file"),
+        pytest.param(["file:///etc/passwd"], id="file URL"),
+        pytest.param(["-F", "body=@/etc/passwd"], id="typed field on a bare token"),
+        pytest.param(["--field=body=@/etc/passwd"], id="typed field inside a flag"),
+        pytest.param(["body=@file:///etc/passwd"], id="both forms nested"),
+        pytest.param(["file://localhost/etc/passwd"], id="file URL with an authority"),
+        pytest.param(["file://./etc/passwd"], id="file URL with a dot authority"),
+        pytest.param(["@file://localhost/etc/passwd"], id="authority behind an @"),
+        pytest.param(["@~/.ssh/id_rsa"], id="@ with a home-relative path"),
+        pytest.param(["@../../etc/passwd"], id="@ with a traversal"),
+    ],
+)
+def test_a_path_behind_an_introducer_is_refused(tmp_path, argv):
+    """`@` and `file://` mean "what follows is a file" to curl, gh, http and jq,
+    and neither makes the argument start with `/`. Before this, `gh api -F
+    body=@/etc/passwd` arrived as one token that read as an ordinary relative
+    name inside the workspace, so the guard passed it."""
+    assert commands._unsafe_path_argument(argv, str(tmp_path)) == argv[-1]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["--from", "@alice"], id="a slack handle"),
+        pytest.param(["whois", "@carol"], id="a handle as a subcommand argument"),
+        pytest.param(["--to", "a@b.com"], id="an email address"),
+        pytest.param(["@notes.md"], id="@ with a workspace-relative file"),
+        pytest.param(["send", "#chan", "text with an @ in it"], id="prose"),
+    ],
+)
+def test_an_introducer_does_not_refuse_an_ordinary_argument(tmp_path, argv):
+    """Emitting an extra candidate rather than refusing the argument is what
+    keeps this cheap to be wrong about: the extra form only matters when it is
+    absolute or traversing, so a handle yields a relative name and is allowed."""
+    assert commands._unsafe_path_argument(argv, str(tmp_path)) is None
+
+
+def test_a_file_url_authority_does_not_hide_the_path(tmp_path):
+    """RFC 8089 makes `file://localhost/etc/passwd` mean `/etc/passwd`, and curl
+    reads it -- measured against a real file. Stripping only the scheme leaves
+    `localhost/etc/passwd`, which is relative, so the guard passed it."""
+    assert commands._introduced_paths("file://localhost/etc/passwd") == [
+        "file://localhost/etc/passwd",
+        "localhost/etc/passwd",
+        "/etc/passwd",
+    ]
+
+
+def test_an_introduced_path_inside_an_allowed_root_still_runs(tmp_path):
+    """The introducer changes what the guard *sees*, not what it permits: a root
+    the operator granted still admits the file behind an `@`."""
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "shared"
+    workspace.mkdir()
+    root.mkdir()
+    argv = ["--file", "@" + str(root / "report.md")]
+    assert commands._unsafe_path_argument(argv, str(workspace)) == argv[-1]
+    assert commands._unsafe_path_argument(argv, str(workspace), [root]) is None
+
+
+# --------------------------------------------------------------------------
+# attached short-flag values, and the spellings a parser accepts for a flag
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["api", "repos/o/r", "-X", "POST"], id="separated method"),
+        pytest.param(["api", "repos/o/r", "-X=POST"], id="equals method"),
+        pytest.param(["api", "repos/o/r", "-XPOST"], id="attached method"),
+        pytest.param(["api", "repos/o/r", "-f", "name=x"], id="separated field"),
+        pytest.param(["api", "repos/o/r", "-fname=x"], id="attached raw field"),
+        pytest.param(["api", "repos/o/r", "-F", "name=x"], id="separated typed field"),
+        pytest.param(["api", "repos/o/r", "-Fname=x"], id="attached typed field"),
+        pytest.param(["api", "repos/o/r", "--input", "/dev/null"], id="input file"),
+        pytest.param(["api", "repos/o/r", "--input=/dev/null"], id="input file equals"),
+        pytest.param(["api", "repos/o/r", "--raw-field=name=x"], id="raw field equals"),
+    ],
+)
+def test_a_write_is_refused_in_every_spelling_gh_accepts(argv):
+    """Each of these makes real gh send POST, measured against gh 2.100.0 pointed
+    at a local server that reports the method it received. Reading only the
+    separated spellings let `-XPOST` and `-fname=x` through a read-only
+    allowlist, which is a write performed with the operator's credential."""
+    tool = commands.ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert commands.allowed_command(tool, argv) is False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["api", "repos/o/r"], id="no flags"),
+        pytest.param(["api", "repos/o/r", "-i"], id="include headers"),
+        pytest.param(["api", "repos/o/r", "--paginate"], id="paginate"),
+        pytest.param(["api", "repos/o/r", "-q", ".name"], id="jq filter, short"),
+        pytest.param(["api", "repos/o/r", "--jq", ".name"], id="jq filter, long"),
+        pytest.param(["api", "repos/o/r", "-X", "GET"], id="explicit GET"),
+        pytest.param(["api", "repos/o/r", "-XGET"], id="attached explicit GET"),
+    ],
+)
+def test_a_read_still_runs(argv):
+    """Measured as GET by the same harness. A guard that refuses these is broken,
+    not secure."""
+    tool = commands.ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert commands.allowed_command(tool, argv) is True
+
+
+def test_an_attached_value_is_only_read_off_a_short_flag():
+    """A long flag never carries its value glued on, so reading `--methodological`
+    as `--method` with the value `ological` would invent a flag gh does not have."""
+    assert commands._attached_short_value("-XPOST", "-X") == "POST"
+    assert commands._attached_short_value("-X", "-X") is None
+    assert commands._attached_short_value("--methodological", "--method") is None
+    assert commands._attached_short_value("-YPOST", "-X") is None
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("--show-token", id="bare"),
+        pytest.param("--show-token=true", id="equals true"),
+        pytest.param("--show-token=false", id="equals false"),
+    ],
+)
+def test_a_readback_flag_is_refused_in_every_spelling(token):
+    """Real gh accepts `--show-token=true`: checked against gh 2.100.0, which
+    rejects an invented flag but takes this one. Matching the bare token only let
+    the credential-printing flag through under the spelling nobody wrote down."""
+    tool = commands.ShimmedTool(name="gh", readback_flags=(token.split("=")[0],))
+    assert commands.refuses_readback(tool, ["pr", "list", token]) is True
+
+
+def test_an_ordinary_flag_is_not_read_as_a_readback_flag():
+    tool = commands.ShimmedTool(name="gh", readback_flags=("--show-token",))
+    assert commands.refuses_readback(tool, ["pr", "list", "--json", "number"]) is False
+
+
+# --------------------------------------------------------------------------
+# file URL parsing: scheme case, and percent-decoding
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        pytest.param("FILE:///etc/passwd", id="uppercase scheme"),
+        pytest.param("FiLe:///etc/passwd", id="mixed-case scheme"),
+        pytest.param("@FILE:///etc/passwd", id="uppercase behind an @"),
+        pytest.param("FILE://localhost/etc/passwd", id="uppercase with an authority"),
+    ],
+)
+def test_a_url_scheme_is_matched_whatever_its_case(tmp_path, argument):
+    """RFC 3986 makes a scheme case-insensitive and curl honours it: measured,
+    `curl FILE:///tmp/x` reads the file. Matching only lowercase meant one shift
+    key walked past the guard."""
+    assert commands._unsafe_path_argument([argument], str(tmp_path)) == argument
+
+
+def test_a_percent_encoded_traversal_cannot_leave_the_workspace(tmp_path):
+    """curl percent-decodes a file URL's path, measured: `%2e%2e` becomes `..`.
+    Undecoded, `file://<workspace>/%2e%2e/%2e%2e/etc/passwd` is lexically inside
+    the workspace, so the guard allowed it and curl then read `/etc/passwd`."""
+    argument = f"file://{tmp_path}/%2e%2e/%2e%2e/etc/passwd"
+    assert commands._unsafe_path_argument([argument], str(tmp_path)) == argument
+
+
+def test_decoding_runs_to_a_fixed_point(tmp_path):
+    """A decoded form no longer starts with `file://`, so it would never re-enter
+    the decode branch and a doubly-encoded path would stop one step short of
+    `..`. Past what curl itself does, and taken because over-refusing is the
+    trade this guard makes everywhere."""
+    assert commands._fully_decoded("%252e%252e") == ".."
+    argument = f"file://{tmp_path}/%252e%252e/%252e%252e/etc/passwd"
+    assert commands._unsafe_path_argument([argument], str(tmp_path)) == argument
+
+
+def test_an_ordinary_percent_in_a_name_is_not_a_traversal(tmp_path):
+    assert commands._unsafe_path_argument(["100%-done.md"], str(tmp_path)) is None
+    assert commands._unsafe_path_argument(["report%20final.md"], str(tmp_path)) is None

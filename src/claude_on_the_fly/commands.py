@@ -48,6 +48,7 @@ import shutil
 import signal
 import stat
 import sys
+import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -399,8 +400,15 @@ def refuses_readback(tool: ShimmedTool, argv: list[str]) -> bool:
     bypass of the one refusal this broker has. Over-refusing the mirror case
     costs an invocation whose flag value happens to spell a refused subcommand,
     which is not a command anyone runs on purpose.
+
+    A readback flag is matched in every spelling its parser accepts, not just the
+    bare one. `gh auth status --show-token=true` is accepted by real gh, checked
+    against gh 2.100.0, so an exact-token match let the credential-printing flag
+    through under the one spelling nobody thought to write down.
     """
-    if any(flag in tool.readback_flags for flag in argv):
+    if any(
+        _carries_flag(token, flag) for token in argv for flag in tool.readback_flags
+    ):
         return True
     if not tool.readback:
         return False
@@ -426,7 +434,11 @@ _METHOD_FLAGS = ("-X", "--method")
 # gate that reads only `--method` would pass `gh api repos/o/r -f a=b` as a read
 # while gh performs a POST. Taken from the installed binary's own help, not from
 # memory of the documentation.
-_PARAMETER_FLAGS = ("-f", "--raw-field", "-F", "--field")
+# `--input` is here for the same reason, and was missed for longer: it supplies
+# the request body from a file (or stdin with `-`), and gh POSTs when it is
+# given. Measured against gh 2.100.0 pointed at a local server: `gh api repos/o/r
+# --input /dev/null` sends POST.
+_PARAMETER_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
 
 # HEAD is included because it is a read that returns no body. Everything else,
 # including an unrecognised or absent value, is treated as a write.
@@ -436,10 +448,16 @@ _READ_METHODS = frozenset({"GET", "HEAD"})
 def _flag_value(argv: list[str], flags: tuple[str, ...]) -> str | None:
     """The last value given to any of ``flags``, or None if none was given.
 
-    Both spellings are read, `-X GET` and `--method=GET`. The last one wins
-    because that is what an argument parser does with a repeated flag. A flag
-    that ends the argv has no value, and returns the empty string rather than
-    None so the caller can tell "malformed" from "absent" and refuse it.
+    Three spellings are read, `-X GET`, `--method=GET` and the attached short
+    form `-XGET`. The last one wins because that is what an argument parser does
+    with a repeated flag. A flag that ends the argv has no value, and returns the
+    empty string rather than None so the caller can tell "malformed" from
+    "absent" and refuse it.
+
+    The attached form is not a nicety. gh's parser accepts it, so `gh api
+    repos/o/r -XPOST` performs a POST while a gate reading only the separated
+    spellings called it a read -- measured against gh 2.100.0 pointed at a local
+    server, which reports the method it chose.
     """
     found: str | None = None
     for index, token in enumerate(argv):
@@ -448,7 +466,36 @@ def _flag_value(argv: list[str], flags: tuple[str, ...]) -> str | None:
                 found = argv[index + 1] if index + 1 < len(argv) else ""
             elif token.startswith(f"{flag}="):
                 found = token[len(flag) + 1 :]
+            elif (attached := _attached_short_value(token, flag)) is not None:
+                found = attached
     return found
+
+
+def _carries_flag(token: str, flag: str) -> bool:
+    """Whether ``token`` is ``flag``, in any spelling a parser accepts.
+
+    The bare flag, the `=value` form a boolean flag still takes (`--show-token=true`),
+    and a value glued onto a short flag.
+    """
+    return (
+        token == flag
+        or token.startswith(f"{flag}=")
+        or _attached_short_value(token, flag) is not None
+    )
+
+
+def _attached_short_value(token: str, flag: str) -> str | None:
+    """The value glued onto a short flag, as in `-XPOST`, or None.
+
+    Only for a real short flag, `-` plus one character. A long flag never carries
+    its value this way, and treating `--methodological` as `--method` with the
+    value `ological` would invent a flag the CLI does not have.
+    """
+    if len(flag) != 2 or flag.startswith("--") or not flag.startswith("-"):
+        return None
+    if not token.startswith(flag) or len(token) <= len(flag):
+        return None
+    return token[len(flag) :]
 
 
 def requests_read_only(argv: list[str]) -> bool:
@@ -461,9 +508,7 @@ def requests_read_only(argv: list[str]) -> bool:
     if method is not None:
         return method.strip().upper() in _READ_METHODS
     return not any(
-        token == flag or token.startswith(f"{flag}=")
-        for token in argv
-        for flag in _PARAMETER_FLAGS
+        _carries_flag(token, flag) for token in argv for flag in _PARAMETER_FLAGS
     )
 
 
@@ -515,12 +560,108 @@ def _path_candidates(item: str) -> list[str]:
     the tail of a boolean cluster as a path over-refuses at worst: `-abc` is
     checked as the relative path `bc`, which is inside the workspace and allowed.
     """
-    if not item.startswith("-"):
-        return [item]
-    candidates = item.split("=")[1:]
-    if not item.startswith("--"):
-        candidates.append(item[2:])
-    return candidates
+    if item.startswith("-"):
+        candidates = item.split("=")[1:]
+        if not item.startswith("--"):
+            candidates.append(item[2:])
+    else:
+        # A bare `key=value` token carries a path in its value for any CLI that
+        # takes typed fields: `gh api -F body=@/etc/passwd` arrives as the single
+        # token `body=@/etc/passwd`, which is not a flag, so splitting only flags
+        # read the whole thing as one relative path inside the workspace.
+        candidates = [item, *item.split("=")[1:]]
+    return [form for candidate in candidates for form in _introduced_paths(candidate)]
+
+
+# How an argument says "what follows is a file". `@` is the convention curl set
+# and gh, http and jq share; `file://` is the URL spelling of the same thing.
+# Neither makes the argument start with `/`, so without this a path behind one
+# reads as an ordinary relative name and the guard lets it through.
+#
+# Matched case-insensitively, because RFC 3986 makes a URL scheme
+# case-insensitive and curl honours that: `FILE:///etc/passwd` reads the file,
+# measured. The `@` is unaffected by case, so one rule covers both.
+_PATH_INTRODUCERS = ("@", "file://")
+_URL_INTRODUCER = "file://"
+
+
+def _introduced_paths(candidate: str) -> list[str]:
+    """`candidate`, plus whatever it carries after a path introducer.
+
+    Applied repeatedly, because the forms nest: `body=@file:///etc/passwd` has to
+    shed the `@` and then the scheme before the absolute path is visible.
+
+    Emitting rather than refusing keeps this cheap to be wrong about. An extra
+    candidate only matters if it is absolute or traversing, so the ordinary Slack
+    and GitHub arguments that begin with `@` cost nothing: `@alice` yields the
+    extra candidate `alice`, which is relative and inside the workspace, exactly
+    like the argument it came from.
+    """
+    forms = [candidate]
+    seen = {candidate}
+    queue = [candidate]
+    while queue:
+        current = queue.pop()
+        for introducer in _PATH_INTRODUCERS:
+            if current[: len(introducer)].lower() != introducer:
+                continue
+            rest = current[len(introducer) :]
+            for form in (rest, *_url_forms(introducer, rest)):
+                if form and form not in seen:
+                    seen.add(form)
+                    forms.append(form)
+                    queue.append(form)
+    return forms
+
+
+def _url_forms(introducer: str, rest: str) -> tuple[str, ...]:
+    """The other readings of a `file://` URL's tail: authority dropped, decoded.
+
+    Two things a URL does that a filename does not, both measured against real
+    curl rather than read from a document:
+
+    - RFC 8089 makes `file://localhost/etc/passwd` mean `/etc/passwd`. Stripping
+      only the scheme leaves `localhost/etc/passwd`, which is relative, so the
+      guard would pass it. The authority is not parsed, because nothing here
+      needs to know what a valid one looks like -- everything from the first
+      slash is the path either way.
+    - The path is percent-decoded, so `%2e%2e` is `..` and `%2f` is `/`. Without
+      decoding, `file://<workspace>/%2e%2e/%2e%2e/etc/passwd` is lexically inside
+      the workspace and allowed, and curl then reads `/etc/passwd`.
+
+    Decoding runs to a fixed point rather than once. The caller re-queues what
+    this returns, but a decoded form no longer starts with `file://`, so it would
+    never re-enter this branch and `%252e%252e` would stop one step short of
+    `..`. curl decodes once, so that step is past what curl itself does; it is
+    taken anyway because over-refusing is the trade this guard makes everywhere,
+    and the only thing it costs is a filename whose literal name contains `%25`.
+    """
+    if introducer != _URL_INTRODUCER:
+        return ()
+    slash = rest.find("/")
+    forms = [rest[slash:]] if slash > 0 else []
+    return tuple(
+        decoded for form in (rest, *forms) if (decoded := _fully_decoded(form)) != form
+    ) + tuple(forms)
+
+
+# Enough for any real argument; a doubly-encoded path needs two.
+_MAX_DECODE_PASSES = 8
+
+
+def _fully_decoded(value: str) -> str:
+    """`value` percent-decoded until it stops changing.
+
+    Terminates because a decode either shortens the string (`%2e` -> `.`) or
+    leaves it alone, and the cap is belt-and-braces against a decoder that ever
+    stops being true.
+    """
+    for _ in range(_MAX_DECODE_PASSES):
+        decoded = urllib.parse.unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value
 
 
 def allowed_roots(tool: ShimmedTool) -> list[Path]:

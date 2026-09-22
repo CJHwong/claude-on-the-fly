@@ -72,23 +72,35 @@ upgrade path, so none of that was covered by it.
 
 | A dotenv was readable anywhere the jail granted a tree but nobody had written a matching deny. Each grant carried its own scoped rule, so `~/.claude` and `~/.codex` -- which get a blanket subpath grant -- kept theirs readable, and under the read-permissive base so did every dotenv on the machine | `seatbelt/fs-deny-most.sb`, `seatbelt/fs-allow-reads.sb`, `sandbox._linux_masked` | One `(deny file-read* (regex "(.*/)?\\.env"))` at the end of each profile, replacing the fourteen scoped rules it subsumes; nothing re-allows a read after it, and a test pins that plus jail.sb adding no read allow after the import. The scoped form's stated reason for not doing this -- `.env.example` in the workspace -- was already false: a workspace is always `DATA_DIR/workspaces/<name>` and the data-dir rule already denied it, measured. Linux names each file instead, and the sweep cap now applies only to `sandbox.extra_paths`, where "narrow the entry" is advice an operator can act on; a config tree cotf must mount is masked whole (`~/.codex` holds 132, which is 17KB of argv). Probed live on both bases: every dotenv denied, `SKILL.md` beside one still readable. All eight jail cells still pass. Cost, measured and accepted: a file named `.env*` the agent writes in its own temp dir is no longer readable back |
 
+| The broker path guard did not know a CLI's own path syntax, so an allowlisted tool could read any file the operator could. `_path_candidates` read a bare argument and the value after `=` on a flag, and looked inside neither `@/etc/passwd`, `file:///etc/passwd`, nor a `key=@path` value on a bare token. Measured: `gh api -F body=@/etc/passwd` arrived as the single token `body=@/etc/passwd` and read as a relative path inside the workspace, so the guard passed it and the broker ran it outside the sandbox with the real credential | `commands._path_candidates`, `commands._introduced_paths` | The two introducers every one of these CLIs shares, `@` and `file://`, stripped repeatedly so the nested forms unwrap, with each intermediate form kept as its own candidate, plus everything from the first slash of a `file://` URL that carries an authority -- RFC 8089 makes `file://localhost/etc/passwd` mean `/etc/passwd` and curl reads it, measured, so stripping only the scheme left a relative-looking `localhost/etc/passwd` that the guard passed. Emitting a candidate rather than refusing the argument is what makes this safe to over-apply: an extra form only matters when it is absolute or traversing, so a Slack handle or an email address is unaffected. A per-tool argument grammar is still deliberately absent, so a tool with a path syntax outside these two shapes remains the operator's check |
+
+| A `file://` URL had two readings the guard did not take, both found by running a real exfiltration probe against the broker rather than by reading the code. RFC 3986 makes a scheme case-insensitive, so `FILE:///etc/passwd` walked past a lowercase-only match; and curl percent-decodes a URL path, so `file://<workspace>/%2e%2e/%2e%2e/etc/passwd` was lexically inside the workspace, passed the guard, and curl then read `/etc/passwd`. Both measured against real curl on a canary file. The second needs no `allow_paths` at all: the workspace is always an allowed root, so it escaped the default configuration | `commands._PATH_INTRODUCERS`, `commands._url_forms`, `commands._fully_decoded` | The introducer is matched case-insensitively, and a `file://` tail contributes its percent-decoded form as another candidate. Decoding runs to a fixed point, which is one step past curl: a decoded form no longer starts with `file://` so it would never decode again, and `%252e%252e` would stop short of `..`. That over-refuses a filename containing a literal `%25` and is taken anyway, matching the trade the rest of this guard makes. Verified by the probe described under "How these were found": 30 spellings, 0 leaks, and 13 ordinary arguments still run |
+
+| A write ran through a read-only allowlist, with the operator's real GitHub credential. `requests_read_only` read `-X POST` and `--method=POST` but not the attached short form gh's parser also accepts, and did not know `--input` supplies a request body at all. Measured against gh 2.100.0 pointed at a local server that reports the method it received: `-XPOST`, `-fname=x`, `-Fname=x`, `--input <file>` and `--input=<file>` all send POST, and all five were admitted as reads. Live on the deployed host, which carries `gh api` under `allow_read_only` | `commands._flag_value`, `commands._attached_short_value`, `commands._PARAMETER_FLAGS` | A short flag's value is read whether it is separated, joined by `=`, or glued on, and `--input` joins the parameter flags. Only a real short flag (`-` plus one character) takes the glued reading, so `--methodological` is not read as `--method`. Verified: all ten measured write spellings refused, all seven measured read spellings still allowed |
+
+| A readback flag was matched only as a bare token, so `--show-token=true` was not refused. Real gh accepts that spelling, checked against gh 2.100.0, which rejects an invented flag but takes this one. This is the one refusal the broker exists for -- it is what keeps the credential out of the sandbox | `commands.refuses_readback`, `commands._carries_flag` | Every flag is now matched in each spelling a parser accepts: bare, `=value`, and glued onto a short flag. `--show-token=false` is refused too, which is over-refusal in the safe direction |
+
 ## Open
 
 Ordered by severity against the threat model above.
 
 ### Credential reach
 
-**The broker path guard does not know a CLI's own path syntax.** `_path_candidates`
-reads a bare argument and the value after `=` on a flag. It does not look inside
-`@/etc/passwd`, `file:///etc/passwd`, or a `key=@path` value on a bare token, all of
-which some CLIs accept as file references. Measured: `gh api -F body=@/etc/passwd`
-arrives as the single token `body=@/etc/passwd` and is read as a relative path inside
-the workspace. Pre-existing, and not closed by `commands.allow_paths`. It matters only
-for a tool an operator has already allowlisted, so the remedy documented in
-`docs/how-to/broker-a-command.md` is to check what path shapes a tool accepts before
-brokering it. A general fix needs a per-tool argument grammar, which the broker
-deliberately does not have.
+**The path guard cannot see inside a structured argument.** It reads a token as a
+path, so a path carried inside JSON is invisible to it: `--params
+'{"body":"/etc/passwd"}'` is one token with no leading slash and no `..` component,
+and it is allowed. This is the same class as the `@file` finding above and it has no
+general fix for the same reason -- separating a path from a value needs the per-tool
+argument grammar the broker deliberately does not have.
 
+It matters for a tool whose arguments are JSON. The deployed host brokers `gws`, which
+takes `--params '{...}'` and is allowlisted at whole-service granularity (`drive`,
+`gmail`, `docs`). Not demonstrated: `gws` resolves only on the daemon's PATH, so it was
+not introspected here rather than guessed at. The check an operator can run is whether
+any allowlisted `gws` subcommand accepts a *local* file path inside `--params` or on a
+flag -- a media upload is the shape to look for. If one does, the broker will read that
+file as the operator. Narrow the `gws` allowlist to the subcommands actually used before
+relying on the guard here.
 
 **`fs: allow-reads` leaves credential stores readable.** Measured on a real home: the
 Firefox profile tree (holding `logins.json` and `key4.db`) and `~/Library/Messages/chat.db`.
@@ -381,3 +393,44 @@ replay from a partial journal record; submodules and the checkout's own `.git/ho
   only the platform mechanism differs.
 - Six TUI modules read by diff only, not line by line: `state.py`, `screens/config_picker.py`,
   `screens/doctor.py`, `screens/history.py`, `env_editor.py`, `supervisor.py`.
+
+## How these were found
+
+Reading the code found none of them. Each came from a real run: a probe that
+starts the actual `CommandBroker`, lets it write its real shims, and invokes
+those shims the way a sandboxed agent does -- over loopback HTTP, with a real
+per-workspace token, spawning a real subprocess. The brokered binary is a CLI
+written to be exactly as permissive as curl and no more, so a spelling that
+prints the canary is a spelling curl would have read too.
+
+Two habits did the work and are worth repeating on the next change here:
+
+1. **Ask what the real CLI does, never what it ought to do.** Every claim above
+   was settled by running `curl` or `gh` and watching what came back -- the
+   method on the wire, the file on stdout. `gh` was pointed at a local server,
+   so nothing reached GitHub and nothing was mutated.
+2. **Probe the negative case as well.** The probe carries a set of ordinary
+   arguments that must keep working. A guard that refuses `@alice` or
+   `report.md` is broken, not secure, and only that half catches it.
+
+One property is worth stating because it surprises people rather than because it is
+wrong: a `commands.allow_paths` root grants writing as well as reading. The guard asks
+where a path lands, not what the tool does with it, and it has no per-tool flag table
+that could separate an output flag from an input one. Measured: with `/tmp/shared`
+granted, `-o /tmp/shared/new.txt` is admitted. Documented in
+`docs/how-to/broker-a-command.md` rather than changed, because the alternative is the
+per-tool argument grammar this broker deliberately does not have.
+
+Three properties were tested and held, so they need no fix:
+
+- **argv alone cannot point `gh` at a host the agent chooses.** `gh api
+  http://127.0.0.1:<port>/steal` reaches the server with no `Authorization`
+  header, and `--hostname` rejects an `address:port`. The credential is scoped to
+  hosts gh already knows.
+- **A per-turn token is bound to its workspace.** Driven directly against the
+  endpoint: the issuing workspace runs, while another workspace, the parent
+  directory and `/` are each refused with "only runs inside this session's
+  workspace", and a forged token gets 403.
+- **The agent cannot choose the subprocess environment.** `_subprocess_env`
+  copies from the daemon's own environment, so an `env_passthrough` name such as
+  `GH_HOST` carries the operator's value and nothing the agent set.

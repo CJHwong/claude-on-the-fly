@@ -41,10 +41,17 @@ repository settings, so `allow` is all-or-nothing for it. List such a prefix und
         - api
 ```
 
-An explicit `--method` or `-X` decides. Without one, a parameter flag (`-f`, `-F`,
-`--field`, `--raw-field`) counts as a write, because gh switches to POST as soon as a
-parameter is added. Send parameters on a read with `--method GET`, which gh turns into a
-query string. `graphql` is always a POST, so the gate refuses it.
+An explicit `--method` or `-X` decides. Without one, a parameter flag counts as a write,
+because gh switches to POST as soon as a parameter is added. That is `-f`/`--raw-field`,
+`-F`/`--field` and `--input`, which is gh's whole list of body-supplying flags, taken
+from its own `--help`. Each is read in every spelling gh's parser accepts, including the
+attached short form: `-XPOST` and `-fname=x` are a method and a parameter just as much as
+`-X POST` and `-f name=x`. Send parameters on a read with `--method GET`, which gh turns
+into a query string.
+
+`gh api graphql` with no parameters is a GET and is admitted; measured, not assumed. A
+GraphQL mutation needs its query passed in, and every way of passing one is a parameter
+flag, so the gate refuses it on that path rather than on the subcommand name.
 
 A refused write says so, rather than reporting a missing allowlist entry. That matters:
 the generic wording tells the agent to ask you for a prefix you have already configured.
@@ -87,14 +94,29 @@ commands:
 Now `slacker.sh send '#chan' --file /tmp/report.md` runs, while `--file /etc/passwd` is
 still refused.
 
-The guard reads a bare argument and the value of a `-o`/`--opt=` flag. It does not know
-a CLI's own path syntax, so a tool that takes `@/etc/passwd` or `file:///etc/passwd`
-hands the broker a token the guard reads as ordinary text. Check what path shapes a tool
-accepts before you broker it.
+The guard reads a bare argument, the value of a `-o`/`--opt=` flag, and the value of a
+bare `key=value` token. It also looks behind the two path introducers CLIs share: `@`,
+the convention curl set and `gh`, `http` and `jq` follow, and a `file://` URL. Those
+nest, so `gh api -F body=@file:///etc/passwd` is read down to the absolute path and
+refused. A `file://` URL is read the way a URL parser reads it: the scheme matches in
+any case (`FILE://` too), an authority is dropped, because RFC 8089 makes
+`file://localhost/etc/passwd` mean `/etc/passwd` and curl reads it, and the path is
+percent-decoded, so `%2e%2e` cannot smuggle a `..` past the check.
+
+An introducer is not a claim about the tool's grammar, so an argument that merely starts
+with `@` costs nothing: `send @alice` yields the extra candidate `alice`, which is
+relative and inside the workspace, exactly like the argument it came from. A tool with a
+path syntax outside these shapes still hands the guard a token it reads as ordinary
+text, so check what path shapes a tool accepts before you broker it.
 
 Keep the roots narrow. The broker runs the real binary **outside** the sandbox with
 the operator's real credential, so a root here is a sharper grant than the same path
-in `sandbox.extra_paths`: the file is read as the operator, not as the agent. An
+in `sandbox.extra_paths`: the file is read as the operator, not as the agent.
+
+**A root grants writing as well as reading.** The guard asks where a path lands, not
+what the tool will do when it gets there, and it has no per-tool flag table that could
+tell an output flag from an input one. Measured: with `/tmp/shared` granted,
+`-o /tmp/shared/new.txt` is admitted. Grant a tree you would let the tool overwrite. An
 entry reaching a credential store is logged at ERROR and dropped, and the remaining
 entries still apply.
 
