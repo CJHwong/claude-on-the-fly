@@ -13,9 +13,10 @@ import stat
 from pathlib import Path
 
 import pytest
+import yaml
 from aiohttp import ClientSession
 
-from claude_on_the_fly import commands, logs
+from claude_on_the_fly import commands, logs, settings
 from claude_on_the_fly.commands import (
     ENDPOINT_ENV,
     MAX_STREAM_BYTES,
@@ -857,6 +858,66 @@ def test_bundled_gh_allows_common_reads(argv):
 def test_bundled_gh_still_refuses_writes_and_api(argv):
     gh = {t.name: t for t in commands.load_tools()}["gh"]
     assert not allowed_command(gh, argv)
+
+
+def _commented_aws_example() -> ShimmedTool:
+    """The aws entry the template ships commented out, uncommented and parsed.
+
+    Nothing loads a comment, so without this the example could rot into
+    something that fails to parse the moment an operator uncomments it.
+    """
+    lines = settings.BUNDLED_SETTINGS.read_text().splitlines()
+    start = lines.index("    # - name: aws")
+    block = []
+    for line in lines[start:]:
+        if not line.startswith("    # "):
+            break
+        block.append(line.removeprefix("    # "))
+    (tool,) = commands.parse_tools(
+        {"tools": yaml.safe_load("\n".join(block))}, source="example"
+    )
+    return tool
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sts", "get-caller-identity"],
+        ["s3", "ls", "s3://bucket/prefix/"],
+        ["--profile", "prod", "logs", "tail", "/aws/lambda/fn", "--since", "1h"],
+        ["ecs", "describe-services", "--cluster", "c", "--services", "s"],
+        ["cloudformation", "describe-stack-events", "--stack-name", "s"],
+    ],
+)
+def test_aws_example_allows_reads(argv):
+    assert allowed_command(_commented_aws_example(), argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["s3", "cp", "s3://bucket/key", "."],
+        ["lambda", "get-function-configuration", "--function-name", "fn"],
+        ["secretsmanager", "get-secret-value", "--secret-id", "x"],
+        ["ssm", "get-parameter", "--name", "x", "--with-decryption"],
+        ["ec2", "terminate-instances", "--instance-ids", "i-1"],
+    ],
+)
+def test_aws_example_refuses_writes_and_secret_reads(argv):
+    assert not allowed_command(_commented_aws_example(), argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["configure", "export-credentials"],
+        ["--profile", "prod", "sts", "get-session-token"],
+        ["--debug", "ecr", "get-login-password"],
+        ["eks", "get-token", "--cluster-name", "c"],
+    ],
+)
+def test_aws_example_refuses_credential_readback(argv):
+    assert refuses_readback(_commented_aws_example(), argv)
 
 
 def test_readback_is_written_as_words_not_nested_lists(operator_settings):
