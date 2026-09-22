@@ -163,7 +163,11 @@ async def connect_through(
 async def test_preapproved_host_tunnels_bytes_end_to_end():
     echo_port, echo = await start_echo_server()
     approvals = ApprovalBroker(RecordingGate(default=False))
-    proxy = EgressProxy(approvals, allowed_hosts=frozenset({"127.0.0.1"}))
+    proxy = EgressProxy(
+        approvals,
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
+    )
     port = await proxy.start()
     try:
         status, body = await connect_through(
@@ -471,6 +475,7 @@ async def test_unreachable_upstream_gets_502_after_approval():
     proxy = EgressProxy(
         ApprovalBroker(RecordingGate(default=True)),
         allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
     )
     port = await proxy.start()
     try:
@@ -572,7 +577,9 @@ async def test_stop_does_not_hang_on_an_open_tunnel():
     quiet = await asyncio.start_server(silent, "127.0.0.1", 0)
     quiet_port = quiet.sockets[0].getsockname()[1]
     proxy = EgressProxy(
-        ApprovalBroker(RecordingGate()), allowed_hosts=frozenset({"127.0.0.1"})
+        ApprovalBroker(RecordingGate()),
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
     )
     port = await proxy.start()
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -1211,3 +1218,56 @@ class TestExplicitPrivateAddress:
     )
     def test_classification(self, address, expected):
         assert egress._explicit_private_address(address) is expected
+
+
+async def test_the_plain_allowlist_is_not_an_ssrf_exception(monkeypatch):
+    """`egress.allow` says the operator will talk to a name. It does not say the
+    name may resolve to the internal network -- that is `egress.private_allow`,
+    and the shipped `config.yaml` promises the two are separate opt-ins.
+
+    Folding `allowed_hosts` into the private set made every ordinary allowlist
+    entry a DNS-rebinding exception. Measured against the real proxy with
+    `localtest.me`, a public name that resolves to 127.0.0.1: on `allow` alone
+    the CONNECT was permitted and dialled loopback, while the same name off the
+    list was refused "no usable public address".
+    """
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=True)),
+        allowed_hosts=frozenset({"rebound.example"}),
+        ask=False,
+    )
+
+    async def resolves_to_loopback(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "getaddrinfo", resolves_to_loopback, raising=False
+    )
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "rebound.example:443")
+        assert status.startswith(b"HTTP/1.1 403")
+        assert b"no usable public address" in status
+    finally:
+        await proxy.stop()
+
+
+async def test_private_allow_is_what_admits_a_private_address(monkeypatch):
+    """The opt-in still works, so the fix above narrows rather than removes."""
+    echo_port, echo = await start_echo_server()
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=True)),
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
+        ask=False,
+    )
+    port = await proxy.start()
+    try:
+        status, body = await connect_through(
+            port, f"127.0.0.1:{echo_port}", b"opted in"
+        )
+        assert status.startswith(b"HTTP/1.1 200")
+        assert body == b"OPTED IN"
+    finally:
+        await proxy.stop()
+        echo.close()

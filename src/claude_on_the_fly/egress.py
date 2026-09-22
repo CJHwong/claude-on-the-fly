@@ -348,8 +348,18 @@ class EgressProxy:
         self._front_loaded_allowed = frozenset(
             canonical_host(host) for host in allowed_hosts
         )
+        # `allowed_hosts` is deliberately NOT folded in here. Answering the
+        # allowlist question is not answering the SSRF one: `egress.allow` says
+        # the operator is willing to talk to a name, while reaching a private or
+        # loopback address behind that name is what `egress.private_allow` is
+        # for. Unioning them made every ordinary allowlist entry a rebinding
+        # exception, which is the opposite of what `_permitted`, the shipped
+        # `config.yaml` comment and this feature's own commit message all
+        # promise. Measured: with `localtest.me` (a public name that resolves to
+        # 127.0.0.1) on `allow` alone, the CONNECT was permitted and dialled
+        # loopback; off it, the same name is refused "no usable public address".
         self._front_loaded_private = frozenset(
-            canonical_host(host) for host in (*private_allowed_hosts, *allowed_hosts)
+            canonical_host(host) for host in private_allowed_hosts
         )
         self._allowed = self._front_loaded_allowed | default_allowed_hosts()
         # None rather than a frozenset default so the settings file is read per

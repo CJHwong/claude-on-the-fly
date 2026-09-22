@@ -80,6 +80,8 @@ upgrade path, so none of that was covered by it.
 
 | A readback flag was matched only as a bare token, so `--show-token=true` was not refused. Real gh accepts that spelling, checked against gh 2.100.0, which rejects an invented flag but takes this one. This is the one refusal the broker exists for -- it is what keeps the credential out of the sandbox | `commands.refuses_readback`, `commands._carries_flag` | Every flag is now matched in each spelling a parser accepts: bare, `=value`, and glued onto a short flag. `--show-token=false` is refused too, which is over-refusal in the safe direction |
 
+| `egress.allow` silently disabled DNS-rebinding protection for every host on it. The constructor folded `allowed_hosts` into the private-address set, so an allowlisted name that resolved to a private or loopback address was tunnelled instead of refused. That is SSRF reachable through the ordinary, documented action of adding a host to the allowlist: the operator answers "yes, talk to this name" and gets "and the internal network behind it". Three sources say it was never intended -- `_permitted`'s own docstring ("`egress.allow` alone is never an SSRF exception"), the shipped `config.yaml` comment ("adding a name to the normal allowlist never disables DNS-rebinding/SSRF protection"), and the commit that introduced it, whose subject is "explicit private-host opt-in" | `egress.EgressProxy.__init__` | `allowed_hosts` is no longer folded into the private set, restoring the two-opt-in contract the documentation already promised. Measured against the real proxy with `localtest.me`, a public name that genuinely resolves to 127.0.0.1: before, on `allow` alone, the CONNECT was permitted and dialled loopback (502 from the upstream, not a 403 from the gate); after, it is refused "no usable public address", while `example.com` still tunnels 200 and an explicit `private_allow` still admits loopback. The three tests that broke were harness conveniences reaching a local echo server through `allow`; they now name the `private_allow` opt-in an operator would really need |
+
 ## Open
 
 Ordered by severity against the threat model above.
@@ -396,7 +398,10 @@ replay from a partial journal record; submodules and the checkout's own `.git/ho
 
 ## How these were found
 
-Reading the code found none of them. Each came from a real run: a probe that
+Reading the code found none of them -- with one exception, the egress row above,
+which a *contradiction* found: the constructor and the docstring three lines away
+could not both be true, and a real CONNECT settled which. Each of the rest came
+from a real run: a probe that
 starts the actual `CommandBroker`, lets it write its real shims, and invokes
 those shims the way a sandboxed agent does -- over loopback HTTP, with a real
 per-workspace token, spawning a real subprocess. The brokered binary is a CLI
@@ -431,6 +436,12 @@ Three properties were tested and held, so they need no fix:
   endpoint: the issuing workspace runs, while another workspace, the parent
   directory and `/` are each refused with "only runs inside this session's
   workspace", and a forged token gets 403.
+- **A broker route's upstream host cannot be moved by the path.** The tail after
+  the prefix is `lstrip("/")`-ed and appended, and no spelling relocates the
+  host: `//evil.com/x`, `@evil.com/x`, `../../x`, `..%2f..%2fx` and
+  `\\evil.com/x` all still resolve to the route's own upstream. `_match` also
+  requires an exact prefix or a `/` boundary, so `/anthropicEVIL` does not match
+  `/anthropic`.
 - **The agent cannot choose the subprocess environment.** `_subprocess_env`
   copies from the daemon's own environment, so an `env_passthrough` name such as
   `GH_HOST` carries the operator's value and nothing the agent set.
