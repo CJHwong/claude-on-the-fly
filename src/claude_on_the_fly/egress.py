@@ -326,8 +326,17 @@ class EgressProxy:
         private_allowed_hosts: frozenset[str] = frozenset(),
         grant_ttl_seconds: float = 3600.0,
         label: str = "",
+        ask: bool = True,
     ) -> None:
         self._approvals = approvals
+        # False under `sandbox.egress: open`: tunnel any public host without
+        # asking. Only the allowlist step goes -- a malformed name, a never-ask
+        # metadata endpoint and a private or loopback address are refused the
+        # same way, because those are not questions the operator was answering.
+        # Passed in rather than read here so this module stays free of a sandbox
+        # import, and because the value is startup-fixed while the host lists it
+        # sits beside are re-read per CONNECT.
+        self._ask = ask
         # Which session this proxy serves. Proxies are per-session, so this is
         # the only thing that attributes a CONNECT to a conversation: the
         # protocol carries a hostname and nothing else, and two chats reaching
@@ -568,6 +577,8 @@ class EgressProxy:
             return _Decision(None, "no usable public address", _NO_PUBLIC_ADDRESS)
         if lowered in self._allowed:
             return _Decision(pinned, "pre-approved host")
+        if not self._ask:
+            return _Decision(pinned, "ungated egress")
         subject = f"{lowered}:{port}"
         # Asked before deciding so the log distinguishes a standing grant from a
         # fresh operator decision; check() itself cannot report which it was.

@@ -2123,15 +2123,8 @@ class TestStartSandbox:
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
 
-    async def test_egress_off_keeps_the_brokers_and_skips_the_proxy(
-        self, frontend: StubFrontend, monkeypatch, operator_settings, caplog
-    ) -> None:
-        """The setting exists for a deployment whose agent browses the open web:
-        `egress.allow` matches exactly, so every new host would be a prompt. What
-        it must not do is weaken the part that keeps credentials out of the agent,
-        so the credential broker and the command shims are asserted here too."""
-        monkeypatch.setenv("COTF_SANDBOX", "env")
-        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+    async def _start_with(self, frontend, monkeypatch):
+        """Start the sandbox with both brokers stubbed. Returns the triple."""
         credential_broker = MagicMock()
         credential_broker.stop = AsyncMock()
         monkeypatch.setattr(
@@ -2152,20 +2145,61 @@ class TestStartSandbox:
         monkeypatch.setattr(
             orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
         )
+        return await orchestrator_mod._start_sandbox(frontend)
 
+    async def test_egress_off_keeps_the_brokers_and_skips_the_proxy(
+        self, frontend: StubFrontend, monkeypatch, operator_settings, caplog
+    ) -> None:
+        """What it must not do is weaken the part that keeps credentials out of
+        the agent, so the credential broker and the shims are asserted here."""
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
         with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
-            (
-                got_broker,
-                egress_manager,
-                got_commands,
-            ) = await orchestrator_mod._start_sandbox(frontend)
+            got_broker, egress_manager, got_commands = await self._start_with(
+                frontend, monkeypatch
+            )
         try:
             assert egress_manager is None
-            assert got_broker is credential_broker
-            assert got_commands is command_broker
-            assert "egress=ungated" in "\n".join(r.getMessage() for r in caplog.records)
+            assert got_broker is not None
+            assert got_commands is not None
+            assert "egress=off" in "\n".join(r.getMessage() for r in caplog.records)
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_egress_open_builds_a_proxy_that_does_not_ask(
+        self, frontend: StubFrontend, monkeypatch, operator_settings, caplog
+    ) -> None:
+        """The proxy must still be built -- that is what keeps the jail's
+        namespace free of the host's loopback services -- with its question off."""
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "open")
+        with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+            _, egress_manager, _ = await self._start_with(frontend, monkeypatch)
+        try:
+            assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
+            proxy_env = await egress_manager.env_for(1, "sess")
+            assert "HTTPS_PROXY" in proxy_env
+            assert egress_manager._proxies[1][1]._ask is False
+            assert "egress=open" in "\n".join(r.getMessage() for r in caplog.records)
+            await egress_manager.close_all()
+        finally:
+            os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_the_jail_accepts_every_egress_posture(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """`off` under the jail is broker-only, not broken: the relay still
+        bridges the credential broker. An earlier version refused it outright."""
+        for value, wants_proxy in (("gated", True), ("open", True), ("off", False)):
+            monkeypatch.setenv("COTF_SANDBOX", "jail")
+            monkeypatch.setenv("COTF_SANDBOX_EGRESS", value)
+            _, egress_manager, _ = await self._start_with(frontend, monkeypatch)
+            try:
+                assert (egress_manager is not None) is wants_proxy, value
+                if egress_manager is not None:
+                    await egress_manager.close_all()
+            finally:
+                os.environ.pop("COTF_COMMAND_ENDPOINT", None)
 
     async def test_a_refused_egress_setting_starts_nothing(
         self, frontend: StubFrontend, monkeypatch, operator_settings
@@ -2173,7 +2207,7 @@ class TestStartSandbox:
         """Resolved before the first bind. A refusal raised afterwards would leave
         a credential-holding broker listening for a daemon already exiting."""
         monkeypatch.setenv("COTF_SANDBOX", "jail")
-        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "banana")
         start_broker = AsyncMock()
         monkeypatch.setattr(
             orchestrator_mod.broker, "start_default_broker", start_broker

@@ -238,21 +238,32 @@ sandbox:
   #   jail          as env, plus a seatbelt denying egress and keychain reads (macOS)
   # mode: "off"
 
-  # Whether outbound HTTPS is gated by destination host. Needs a chat-daemon
-  # restart: it decides whether the proxy is constructed at all.
-  #   gated (default) every host goes through the egress proxy; a host outside
-  #                   `egress.allow` pauses the call to ask the operator
-  #   off             no proxy. The credential broker and the command shims are
-  #                   unaffected, so the agent still holds no credential
+  # What happens to the agent's outbound HTTPS. Needs a chat-daemon restart: it
+  # decides whether the proxy is constructed at all.
+  #   gated (default) the proxy asks you about any host outside `egress.allow`
+  #   open            the proxy tunnels any public host without asking
+  #   off             no proxy
+  # Quote the value. YAML reads a bare `off` as a boolean; both spellings work.
+  #
   # `egress.allow` matches host names exactly, with no wildcard and no suffix
-  # match, so an agent that browses the open web turns every new host into a
-  # prompt and then hits the approval rate limit. `off` is the setting for that
-  # deployment. It is refused under `mode: jail`, where the network namespace
-  # makes the proxy the only route out and removing it leaves no network at all.
-  # egress: "off"
+  # match, so an agent that reads the open web reaches a new host most turns and
+  # gating turns nearly every turn into a prompt. `open` is the setting for that
+  # agent. It drops only the allowlist question: a malformed name, a `never_ask`
+  # metadata endpoint, and an address resolving private or loopback without
+  # `egress.private_allow` are refused exactly as before. What it gives up is
+  # inspection -- the tunnel is not read, so a host reached this way is a covert
+  # channel. Under `mode: jail` that is the intended pairing: the filesystem
+  # denies decide what the agent can read, this decides who it can talk to.
+  #
+  # `off` under `mode: jail` is a lockdown, not a mistake. The relay still
+  # bridges the credential broker, so model calls work and the agent has no
+  # internet.
+  # egress: gated
 
   # jail mode only. deny-most makes $HOME opaque; grant the agent's own interpreter
-  # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3.
+  # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3
+  # on macOS only, because SBPL has no arrays; Linux takes a list of any length.
+  # Entries are granted read-only -- there is no write grant.
   # Name a directory, not $HOME: a grant is written after the profile's denies and
   # wins over them. An entry that is the home, an ancestor of it, or a path reaching
   # a credential store or file the profile denies is logged at ERROR and dropped.

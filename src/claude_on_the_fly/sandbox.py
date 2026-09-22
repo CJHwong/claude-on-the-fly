@@ -437,24 +437,42 @@ def enabled() -> bool:
     return mode() != "off"
 
 
-_EGRESS_MODES = ("gated", "off")
+_EGRESS_MODES = ("gated", "open", "off")
 
 
 def egress_mode() -> str:
-    """Resolved `sandbox.egress`: 'gated' (default) or 'off'.
+    """Resolved `sandbox.egress`: 'gated' (default), 'open', or 'off'.
 
-    Two settings rather than one because they answer different questions.
-    `sandbox.mode` decides whether the agent ever holds a credential; this
-    decides whether its outbound HTTPS is gated by destination. A deployment
-    whose agent browses the open web reaches hundreds of one-off hosts, and
-    `egress.allow` matches exactly -- no wildcard, no suffix -- so every one of
-    them becomes an operator prompt, and the approval rate limit starts
-    auto-denying. Turning the gate off keeps the credential broker and the
-    command shims, which is the part that was actually wanted.
+    A separate setting from `sandbox.mode` because they answer different
+    questions. `sandbox.mode` decides whether the agent ever holds a credential.
+    This decides what happens to its outbound HTTPS, along two axes that are not
+    the same axis:
 
-    'off' is refused under `jail`, where it would not be a looser policy but a
-    broken one: the jail unshares the network unconditionally, so the proxy is
-    the only route out and removing it leaves the agent with no network at all.
+    - 'gated'  the proxy runs and asks the operator about any host outside
+               `egress.allow`.
+    - 'open'   the proxy runs and tunnels any public host without asking. The
+               refusals that are not about allowlisting still apply: a malformed
+               name, a `never_ask` metadata endpoint, and an address that
+               resolves private or loopback without `egress.private_allow`.
+    - 'off'    no proxy at all.
+
+    'open' exists because `egress.allow` matches host names exactly, with no
+    wildcard and no suffix match. An agent that reads the open web reaches a new
+    host most turns -- measured on one deployment, 420 distinct hosts in 35 days
+    -- so gating turns nearly every turn into a prompt and then hits the approval
+    rate limit. It is the setting for an agent whose job is reading the web.
+
+    What 'open' buys over simply not jailing the network: the proxy still pins
+    the resolved address, still refuses a metadata endpoint, and still keeps the
+    namespace free of the host's loopback services. What it costs: the tunnel is
+    not inspected, so an approved-by-default host is a covert channel. Paired
+    with the jail's filesystem denies that is the intended trade -- the agent
+    cannot reach the operator's credentials, and it can still read the web.
+
+    'off' is legal under `jail` and means exactly what it says: the relay bridges
+    whatever brokered loopback ports the turn has, so model calls still work
+    through the credential broker, and the agent has no internet. That is a
+    deliberate lockdown posture rather than a broken one.
 
     Read at startup, like `mode`: the proxy is constructed once, so the spawn
     boundary must keep answering with the mode those services were built for.
@@ -463,10 +481,10 @@ def egress_mode() -> str:
     # YAML 1.1 reads a bare `off` as the boolean False, and `on` as True, so an
     # operator who writes the documented value unquoted never reaches the string
     # branch at all. Both spellings are accepted rather than answering "'False'
-    # is not one of ['gated', 'off']" to somebody who wrote exactly what the
-    # template shows. Found by running a real config file through startup; no
-    # amount of COTF_SANDBOX_EGRESS monkeypatching reproduces it, because the
-    # environment variable is always a string.
+    # is not one of [...]" to somebody who wrote exactly what the template
+    # shows. Found by running a real config file through startup; no amount of
+    # COTF_SANDBOX_EGRESS monkeypatching reproduces it, because the environment
+    # variable is always a string.
     if isinstance(raw, bool):
         value = "gated" if raw else "off"
     else:
@@ -477,19 +495,16 @@ def egress_mode() -> str:
             f"value in {settings.operator_settings()}, or drop the key to keep "
             f"egress gated."
         )
-    if value == "off" and mode() == "jail":
-        raise SandboxModeError(
-            "sandbox.egress=off cannot be combined with sandbox.mode=jail: the "
-            "jail unshares the network, so the egress proxy is the agent's only "
-            "route out and turning it off leaves no network at all. Use "
-            "sandbox.mode=env to keep the credential broker and the command "
-            "shims without gating egress."
-        )
     return value
 
 
-def egress_gated() -> bool:
-    """Whether outbound HTTPS is gated by destination host."""
+def egress_proxy_enabled() -> bool:
+    """Whether a per-session egress proxy is constructed at all."""
+    return egress_mode() != "off"
+
+
+def egress_asks() -> bool:
+    """Whether the proxy asks the operator about a host outside the allowlist."""
     return egress_mode() == "gated"
 
 

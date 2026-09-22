@@ -55,7 +55,8 @@ def test_egress_defaults_to_gated(monkeypatch):
     monkeypatch.delenv("COTF_SANDBOX_EGRESS", raising=False)
     monkeypatch.setenv("COTF_SANDBOX", "env")
     assert sandbox.egress_mode() == "gated"
-    assert sandbox.egress_gated() is True
+    assert sandbox.egress_proxy_enabled() is True
+    assert sandbox.egress_asks() is True
 
 
 def test_an_emptied_egress_key_reads_as_gated(monkeypatch):
@@ -65,11 +66,27 @@ def test_an_emptied_egress_key_reads_as_gated(monkeypatch):
     assert sandbox.egress_mode() == "gated"
 
 
-def test_egress_off_under_env_drops_the_gate(monkeypatch):
-    monkeypatch.setenv("COTF_SANDBOX", "env")
+@pytest.mark.parametrize("sandbox_mode", ["env", "jail"])
+def test_egress_open_runs_the_proxy_without_asking(monkeypatch, sandbox_mode):
+    """The posture for an agent that reads the web. The proxy still runs -- that
+    is what keeps the jail's namespace free of the host's loopback services --
+    it just stops asking about the allowlist."""
+    monkeypatch.setenv("COTF_SANDBOX", sandbox_mode)
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "open")
+    assert sandbox.egress_mode() == "open"
+    assert sandbox.egress_proxy_enabled() is True
+    assert sandbox.egress_asks() is False
+
+
+@pytest.mark.parametrize("sandbox_mode", ["env", "jail"])
+def test_egress_off_starts_no_proxy_in_either_mode(monkeypatch, sandbox_mode):
+    """Legal under the jail too, where it means broker-only: the relay still
+    bridges the credential broker, so model calls work and the agent has no
+    internet. That is a lockdown, not a broken configuration."""
+    monkeypatch.setenv("COTF_SANDBOX", sandbox_mode)
     monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
     assert sandbox.egress_mode() == "off"
-    assert sandbox.egress_gated() is False
+    assert sandbox.egress_proxy_enabled() is False
 
 
 @pytest.mark.parametrize(("yaml_value", "expected"), [(False, "off"), (True, "gated")])
@@ -92,16 +109,7 @@ def test_unknown_egress_value_refuses(monkeypatch):
     with pytest.raises(sandbox.SandboxModeError) as excinfo:
         sandbox.egress_mode()
     assert "sandbox.egress='banana'" in str(excinfo.value)
-
-
-def test_egress_off_is_refused_under_the_jail(monkeypatch):
-    """Not a looser policy: the jail unshares the network, so with no proxy the
-    agent has no route out at all. Refuse rather than serve a netless agent."""
-    monkeypatch.setenv("COTF_SANDBOX", "jail")
-    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
-    with pytest.raises(sandbox.SandboxModeError) as excinfo:
-        sandbox.egress_mode()
-    assert "sandbox.mode=env" in str(excinfo.value)
+    assert "open" in str(excinfo.value)
 
 
 def test_agent_env_none_when_off(monkeypatch):
