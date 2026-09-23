@@ -86,8 +86,47 @@ def _without_heredocs(script: str) -> list[str]:
     return kept
 
 
+def _quote_left_open(line: str, quote: str) -> str:
+    """The quote still open at the end of `line`, given the one open at its start.
+
+    "" means none. A `#` that starts a word outside quotes ends the scan, so the
+    apostrophe in `# don't` does not open one.
+    """
+    escaped = False
+    previous = " "
+    for char in line:
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and previous.isspace():
+            return ""
+        previous = char
+    return quote
+
+
 def _logical_lines(script: str) -> list[str]:
-    return "\n".join(_without_heredocs(script)).replace("\\\n", " ").splitlines()
+    """The script's lines, with a quoted argument that spans lines kept whole.
+
+    Split at every newline, the body of `python3 -c "..."` read as commands.
+    """
+    text = "\n".join(_without_heredocs(script)).replace("\\\n", " ")
+    lines: list[str] = []
+    pending: list[str] = []
+    quote = ""
+    for line in text.splitlines():
+        pending.append(line)
+        quote = _quote_left_open(line, quote)
+        if not quote:
+            lines.append("\n".join(pending))
+            pending = []
+    if pending:
+        lines.append("\n".join(pending))
+    return lines
 
 
 def _tokens(line: str) -> list[str]:

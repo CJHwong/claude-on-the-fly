@@ -79,6 +79,10 @@ _ANCESTOR_SLOTS = 8
 # home with 54 link targets down to 3; the rest is headroom, and an overflow
 # warns and names what it dropped.
 _CODEX_LINK_SLOTS = 8
+
+# The data dir's `cron.yaml` and `config.yaml`, when either is a link into a
+# write grant. One slot each, so this never overflows.
+_PROTECT_SLOTS = 2
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -143,6 +147,8 @@ def jail_argv(
     loopback: tuple[str, str, str, str, str],
     extra_paths: list[str],
     write_paths: list[str] | None = None,
+    protect_paths: list[str] | None = None,
+    unprotect_paths: list[str] | None = None,
     codex_link_paths: list[str] | None = None,
     runtime_paths: list[str] | None = None,
     ancestor_paths: list[str] | None = None,
@@ -239,6 +245,19 @@ def jail_argv(
         writes += [unused] * (_MAX_EXTRA_PATHS - len(writes))
         for index, path in enumerate(writes, start=1):
             params += ["-D", f"_WRITE_{index}={path}"]
+        # Unprotect pads with the same inert name. `_UNPROTECT_*` are write allows after
+        # every deny, so a real directory there would be a grant nobody made.
+        # Capped like the write slots they re-open a part of.
+        # The protect pad is off the project: the profile denies its ancestors
+        # as nodes too, and every ancestor of `/x` is `/`, already unwritable.
+        protects = [*(protect_paths or [])]
+        protects += ["/.cotf-unused-protect-slot"] * (_PROTECT_SLOTS - len(protects))
+        for index, path in enumerate(protects, start=1):
+            params += ["-D", f"_PROTECT_{index}={path}"]
+        unprotects = [*(unprotect_paths or [])][:_MAX_EXTRA_PATHS]
+        unprotects += [unused] * (_MAX_EXTRA_PATHS - len(unprotects))
+        for index, path in enumerate(unprotects, start=1):
+            params += ["-D", f"_UNPROTECT_{index}={path}"]
         # Where the operator's codex home links out to. Caller-filtered and
         # caller-collapsed, so a full list here is a real layout rather than
         # noise, and dropping one hides an instruction file the operator
@@ -246,9 +265,10 @@ def jail_argv(
         links = [*(codex_link_paths or [])]
         if len(links) > _CODEX_LINK_SLOTS:
             logger.warning(
-                "sandbox: the codex home links out to %d places but there are "
-                "only %d slots; dropping %s. codex will report those as missing "
-                "rather than as denied. Name them in sandbox.extra_paths",
+                "sandbox: the codex home and claude config link out to %d places "
+                "but there are only %d slots; dropping %s. The backend will report "
+                "those as missing rather than as denied. Name them in "
+                "sandbox.extra_paths",
                 len(links),
                 _CODEX_LINK_SLOTS,
                 links[_CODEX_LINK_SLOTS:],

@@ -83,8 +83,8 @@
 ;; can name an ancestor of these trees.
 ;; codex config, the same grant ~/.claude gets for the other backend.
 (allow file-read* (subpath (param "_CODEX_OPERATOR_HOME")))
-;; Where the operator's codex home links out to. The grant above covers that
-;; home, and a symlink inside it is resolved by the kernel before any rule is
+;; Where the operator's codex home and claude config dir link out to. The
+;; grants cover those trees, and a symlink inside it is resolved by the kernel before any rule is
 ;; matched, so an entry pointing elsewhere under the opaque $HOME reads as
 ;; missing while the profile still claims to grant it. Measured: `~/.codex/agents
 ;; -> ~/.agents/agents` made codex exit 1 with "Operation not permitted (os error
@@ -413,6 +413,28 @@
 (allow file-read-metadata (path-ancestors (param "_WRITE_1")))
 (allow file-read-metadata (path-ancestors (param "_WRITE_2")))
 (allow file-read-metadata (path-ancestors (param "_WRITE_3")))
+;; git runs the hooks and honours the config of any repository in a grant on
+;; the operator's next command there, outside the jail. The workspace denies
+;; the same two above; these cover the operator's own trees, at any depth. The
+;; `.git` node itself is in the pattern because renaming it away, editing the
+;; config under the new name and renaming it back would not match either path.
+;; `git init` inside a grant fails on the config write; that is the trade.
+(deny file-write* (require-all (subpath (param "_WRITE_1")) (regex "/\\.git(/hooks(/|$)|/config$|$)")))
+(deny file-write* (require-all (subpath (param "_WRITE_2")) (regex "/\\.git(/hooks(/|$)|/config$|$)")))
+(deny file-write* (require-all (subpath (param "_WRITE_3")) (regex "/\\.git(/hooks(/|$)|/config$|$)")))
+;; The data dir's `cron.yaml` and `config.yaml` when they link into a grant: the
+;; cron daemon runs one unjailed and the broker obeys the other. The ancestors
+;; are denied as nodes, which blocks renaming a parent away and back; creating
+;; a file inside one is a write to that file's path, not to the directory.
+(deny file-write* (literal (param "_PROTECT_1")))
+(deny file-write* (literal (param "_PROTECT_2")))
+(deny file-write* (path-ancestors (param "_PROTECT_1")))
+(deny file-write* (path-ancestors (param "_PROTECT_2")))
+;; An entry in sandbox.write_paths that names a protected path itself is the
+;; operator's consent. Re-allowed after the denies above, before the dotenv one.
+(allow file-write* (subpath (param "_UNPROTECT_1")))
+(allow file-write* (subpath (param "_UNPROTECT_2")))
+(allow file-write* (subpath (param "_UNPROTECT_3")))
 ;; A dotenv inside a write grant stays unwritable, not merely unreadable. The
 ;; read deny at the end of this file already hides it; without these, a turn
 ;; could still truncate or overwrite the operator's token file in a tree they

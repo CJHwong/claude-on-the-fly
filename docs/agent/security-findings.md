@@ -57,6 +57,9 @@ upgrade path, so none of that was covered by it.
 | Every jailed `claude-pty` turn hung for its whole timeout: the startup lock is a `mkdir` under the deny-default config directory, and its stale-lock recovery reads a pid file *inside* the directory, so a denied `mkdir` is unrecoverable rather than slow | `seatbelt/*.sb` `_CLAUDE_CONFIG/.pty-lock`, `sandbox.agent_env` | Reproduced live under the jail (`mkdir: Operation not permitted`, then 150s of silent spin at 50ms a tick); `CLAUDE_PTY_NO_LOCK=1` got the same turn out to the network, which is what identified the lock as the blocker. `test_the_pty_startup_lock_can_be_taken_under_the_jail` fails without the grant under both bases. Capability, not a weakening: the directory holds one pid file read only by claude-pty, and the sibling test proves `settings.json` and `hooks/` stayed denied |
 | A jailed turn could not reach cotf's tmux server, so `claude-pty` fell back to `script` and no jailed pty turn ever got a live pane. The profile's own comment said a unix-socket allow was all-or-nothing, because only `(remote unix)` works and it cannot be scoped | `seatbelt/jail.sb` `_PANE_SOCKET` | The comment was wrong. Measured on macOS 26: `sandbox-exec` accepts `(allow network-outbound (literal <socket>))`, and with it a jailed `tmux` lists cotf's real sessions; with that one line removed and nothing else changed it answers `error connecting ... (Operation not permitted)`. Being a literal, the Docker socket and ssh-agent stay denied, and a test asserts it is the only non-IP outbound allow. End to end: `claude-pty` under the jail went from a 150s timeout to `PASS 5s` |
 | The profiles named `$HOME/.codex` literally in 25 rules, so a deployment that moved `CODEX_HOME` matched none of them: the denies protected a directory codex no longer used, and under `deny-most` codex could not read its own `config.toml` | `seatbelt/fs-deny-most.sb`, `seatbelt/fs-allow-reads.sb`, `sandbox._codex_operator_home` | All 25 rewritten against a new `_CODEX_OPERATOR_HOME` param, resolved through the operator's `CODEX_HOME`. Live under both bases with the home relocated outside `$HOME`: `config.toml` readable, `history.jsonl` still refused, which is what proves the grant is scoped rather than blanket |
+| A write grant exposed what runs outside the jail: git runs a granted repository's `.git/hooks` and honours its `.git/config` on the operator's next command, and `DATA_DIR/cron.yaml` or `config.yaml` can be a link into the granted tree, which the unjailed cron daemon and the broker read | `sandbox._write_grant_protected`, `sandbox._rename_pins`, `sandbox._macos_write_protection`, `seatbelt/fs-deny-most.sb` `_PROTECT_*` `_UNPROTECT_*` | Linux binds each one read-only, for a repository at the grant or one level down. A read-only bind moves with its parent: measured under bwrap, `mv .git moved` succeeded, and a fresh `.git/hooks` would then be the one git runs. So each directory between the grant and a protected path is bound onto itself, and a mount point refuses rename with EBUSY. macOS denies `.git`, `.git/hooks` and `.git/config` by pattern at any depth, and the link targets with their ancestors. The parity suite runs five rename attacks on both platforms. Removing the pins, the `.git` node deny, or the ancestor deny each makes a case fail. Naming a protected path in `sandbox.write_paths` leaves that one path writable |
+| The macOS `deny-most` profile did not grant what `~/.claude` links out to, so a linked skills tree read as missing while the same layout worked on Linux | `sandbox._codex_link_read_paths` | The claude config dir's link targets now share the codex home's link read slots and filters. A parity test reads a linked skill and cannot read a file beside it, and fails without the change |
+| `blocked_host` compared an IPv6 address against IPv4 ranges, so `::ffff:127.0.0.1` and `::ffff:169.254.169.254` passed, and `0.0.0.0` was in no range at all. Measured on macOS and Linux: a connect to either spelling reaches a listener on 127.0.0.1 | `broker.blocked_host`, `egress._explicit_private_address` | A mapped address is judged as its IPv4 address, and `0.0.0.0/8` and `::/128` are blocked. A proxy test CONNECTs to both spellings with real resolution against a real listener and gets 403 with no prompt. Accepting IP literals in a CONNECT had turned the mapped form from a DNS answer into one request |
 | codex's `history.jsonl` -- every prompt the operator ever typed into codex on this host -- was readable by a jailed turn, while claude's identical file had been denied since the start | `seatbelt/*.sb` `_CODEX_OPERATOR_HOME/history.jsonl` | Denied in both profiles, written after the codex read grant so last-match-wins keeps it. Live probe against the real file refuses under both bases; a structural test pins the ordering. This is what made prompt-history protection symmetric across the two backends |
 | Every jailed `claude-pty` turn still burned its whole timeout after the lock fix, parked on claude's first-run theme picker with nobody able to press a key | `sandbox.agent_env` | `agent_env` exported `CLAUDE_CONFIG_DIR` unconditionally, defaulting it to `~/.claude` under a comment claiming that is what the CLI would have done anyway. It is not: the default *directory* is `~/.claude`, but the default settings *file* is `~/.claude.json` at home root, and naming the directory moves it to `~/.claude/.claude.json` -- a different file, with no `hasCompletedOnboarding`. A `-p` turn does not care; a pty turn runs the real TUI and opens the wizard. The variable is now forwarded only when the daemon actually has one. Measured: `PASS 4s` with it absent, 150s timeout with it set to the default |
 | `sandbox.fs: deny-most` refused to start *any* turn on macOS, every backend and mode, in 0s at the egress preflight. Two causes in one path: `sys.base_prefix` names a uv symlink (`cpython-3.12-...` -> `cpython-3.12.9-...`) and seatbelt matches the path the kernel resolves, so the grant covered nothing and dyld could not load `libpython`; and the five runtime slots truncated the list silently | `sandbox._runtime_read_paths`, `sandbox_macos._RUNTIME_SLOTS` | Every runtime path is now granted as written and as resolved, the ceiling is eight, and an overflow warns naming what it dropped. Measured before: `dyld: Library not loaded: @executable_path/../lib/libpython3.12.dylib ... (blocked by sandbox)`, SIGABRT before the interpreter ran a line. Reproduced on `origin/main` in a scratch worktree, so it predates this branch |
@@ -102,6 +105,12 @@ symlink's target. On Linux `_ensure_session_mount_sources` also `mkdir`s through
 unjailed daemon. `_preflight_protected_symlinks` checks only the six `_codex_protected`
 entries.
 
+**A command `allow` entry is a prefix match on leading tokens.** Measured: the entry
+`restart cotf-ptt-daemon.service` admitted `restart cotf-ptt-daemon.service
+cotf-slack.service`, so an entry meant for one unit restarts any unit named after it. It
+is harmless today, because no deployment writes per-target entries. An exact-match form
+of entry would close it.
+
 ### Egress
 
 **`network-bind` and `network-inbound` are not denied.** `jail.sb` denies outbound only.
@@ -134,13 +143,6 @@ subcommand accepts `-w/--web`, the allowlist is a leading-prefix gate, and the b
 unjailed. The URL is attacker-chosen, so data can ride in the query string. Bounded to
 github.com and the configured Atlassian site.
 
-**A `sandbox.write_paths` entry can contain a link target the refusal list does not know.**
-`_write_path_refusal` refuses an entry that contains a config dir or a PATH dir, as
-written. It does not follow the links inside the data dir, so when `DATA_DIR/cron.yaml`
-is a link into a repository and that repository is granted, the agent can edit the file
-the unjailed cron daemon runs. The repository's `.git/hooks` are writable too. Closes by
-resolving the data dir's own links into the refusal list.
-
 ### Execution that outlives the turn
 
 **`~/.claude/shell-snapshots` is writable and the CLI sources it** on a later Bash tool
@@ -172,14 +174,18 @@ backend runs unjailed. Matters most in the documented default posture, `sandbox.
 where an already-compromised turn's file writes become code the operator later runs on
 purpose.
 
-**The macOS profiles do not grant the targets of `~/.claude` links.** The Linux half is
-fixed above. Under `deny-most` a linked skills tree is unreadable, and the operator's
-remedy is an `extra_paths` entry naming the target.
-
 **codex under the jail has no credential handoff.** The daemon hands claude its token
 through the environment. The obvious codex equivalent, `CODEX_ACCESS_TOKEN`, expects an
 agent identity JWT and rejects the ChatGPT access token in `auth.json` (measured: "agent
 identity JWT payload is not valid JSON"). So a jailed codex still reads `auth.json`.
+
+A broker route is the likely way out, and half of it is measured. codex 0.156 with no
+`auth.json` sends every model call to a loopback base URL when given a custom
+`model_providers` entry with `requires_openai_auth=false`, placeholder `Authorization`
+and `ChatGPT-Account-Id` headers, and `chatgpt_base_url` pointed at the same port: all 30
+`POST /backend-api/codex/responses` of one turn arrived there. Not measured: whether
+chatgpt.com accepts the brokered request, and whether the request body differs from the
+built-in provider's. The broker would also own the token refresh codex does today.
 
 ### The self-test
 

@@ -90,6 +90,26 @@ grant can leave behind something that runs later, *outside* the jail:
 An entry reaching any of those is logged at ERROR and dropped, and the other entries
 still apply.
 
+A granted tree can also hold something that runs outside the jail. Those stay read-only
+inside the grant, and the rest of the tree is writable:
+
+- a repository's `.git/hooks` and `.git/config`. Linux checks a repository at the grant
+  and one level below it. macOS checks every depth.
+- the file behind `cron.yaml` or `config.yaml` in the data directory, when either one is
+  a link into the grant
+
+To let the agent write one of them anyway, add that path to `write_paths` as its own
+entry. Only that path opens:
+
+```yaml
+sandbox:
+  write_paths:
+    - ~/soul
+    - ~/soul/.git/hooks
+```
+
+On macOS the named path uses one of the three entries.
+
 Treat that as a guard against the common mistakes, not as a boundary. The PATH
 directories are read from the daemon's own environment, so a directory that is only on
 your interactive PATH is not covered. Granting the narrowest tree that works is what
