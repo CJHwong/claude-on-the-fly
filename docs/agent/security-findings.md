@@ -102,6 +102,12 @@ symlink's target. On Linux `_ensure_session_mount_sources` also `mkdir`s through
 unjailed daemon. `_preflight_protected_symlinks` checks only the six `_codex_protected`
 entries.
 
+**A command `allow` entry is a prefix match on leading tokens.** Measured: the entry
+`restart cotf-ptt-daemon.service` admitted `restart cotf-ptt-daemon.service
+cotf-slack.service`, so an entry meant for one unit restarts any unit named after it. It
+is harmless today, because no deployment writes per-target entries. An exact-match form
+of entry would close it.
+
 ### Egress
 
 **`network-bind` and `network-inbound` are not denied.** `jail.sb` denies outbound only.
