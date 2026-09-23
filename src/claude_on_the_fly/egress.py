@@ -330,6 +330,8 @@ def _explicit_private_address(address: str) -> bool:
         parsed = ipaddress.ip_address(address)
     except ValueError:
         return False
+    # Judged as the IPv4 address the kernel connects to, as `blocked_host` does.
+    parsed = getattr(parsed, "ipv4_mapped", None) or parsed
     return (parsed.is_private or parsed.is_loopback) and not parsed.is_link_local
 
 

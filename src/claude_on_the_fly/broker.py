@@ -68,6 +68,10 @@ _HOP_BY_HOP = frozenset(
 _BLOCKED_NETS = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
+        # The unspecified address. A connect to it reaches the local host on
+        # macOS and Linux, measured against a listener on 127.0.0.1.
+        "0.0.0.0/8",
+        "::/128",
         "127.0.0.0/8",
         "10.0.0.0/8",
         "172.16.0.0/12",
@@ -181,6 +185,10 @@ def blocked_host(host: str) -> bool:
         addr = ipaddress.ip_address(host)
     except ValueError:
         return False
+    # `::ffff:127.0.0.1` is 127.0.0.1 to the kernel, but an IPv6Address is never
+    # inside an IPv4 network, so without this every range above has a second
+    # spelling that passes.
+    addr = getattr(addr, "ipv4_mapped", None) or addr
     return any(addr in net for net in _BLOCKED_NETS)
 
 

@@ -516,6 +516,19 @@ async def test_blocked_host_is_public_and_catches_metadata():
     assert blocked_host("api.anthropic.com") is False
 
 
+@pytest.mark.parametrize(
+    "address",
+    ["::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.1.2.3", "0.0.0.0", "::"],
+)
+async def test_blocked_host_catches_the_other_spellings_of_a_blocked_address(
+    address,
+):
+    """Measured on macOS and Linux: a connect to `::ffff:127.0.0.1` or to
+    `0.0.0.0` reaches a listener on 127.0.0.1. Neither is inside a listed range
+    as written, so both walked past this check."""
+    assert blocked_host(address) is True
+
+
 # --- diagnostic logging ---
 
 

@@ -323,6 +323,32 @@ async def test_hostname_resolving_to_loopback_is_refused_without_asking(monkeypa
         await proxy.stop()
 
 
+@pytest.mark.parametrize("spelling", ["[::ffff:127.0.0.1]", "0.0.0.0"])
+async def test_another_spelling_of_loopback_is_refused_without_asking(spelling):
+    """Real resolution, not a stub: both spellings reach a listener on
+    127.0.0.1, which is where the broker's own services are."""
+    gate = RecordingGate(default=True)
+    listener = await asyncio.start_server(
+        lambda reader, writer: writer.close(), "127.0.0.1", 0
+    )
+    target_port = listener.sockets[0].getsockname()[1]
+    proxy = EgressProxy(ApprovalBroker(gate))
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, f"{spelling}:{target_port}")
+        assert status.startswith(b"HTTP/1.1 403")
+        assert gate.seen == []
+    finally:
+        await proxy.stop()
+        listener.close()
+
+
+def test_a_mapped_metadata_address_is_not_an_explicit_private_one():
+    """`private_allow` never covers link-local, in either spelling."""
+    assert egress._explicit_private_address("::ffff:127.0.0.1")
+    assert not egress._explicit_private_address("::ffff:169.254.169.254")
+
+
 async def test_mixed_public_and_private_resolution_fails_closed(monkeypatch):
     gate = RecordingGate(default=True)
 
