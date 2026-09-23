@@ -1851,6 +1851,108 @@ def _safe_children(directory: Path) -> list[Path]:
         return []
 
 
+# Paths inside a repository that git acts on outside the jail: it runs the hooks
+# and honours the config (`core.hooksPath`, `core.fsmonitor`, aliases) on the
+# operator's next command there. The workspace denies the same two; a write
+# grant needs them too, because it is the operator's own tree.
+_GRANT_PROTECTED_NAMES = (".git/hooks", ".git/config")
+
+
+def _data_dir_link_targets() -> list[Path]:
+    """Where the data dir's `cron.yaml` and `config.yaml` live, when they are links.
+
+    The cron daemon runs `cron.yaml` unjailed and the broker obeys `config.yaml`,
+    so a write grant over the tree they point into would let a turn edit either.
+    The data dir itself is refused as a grant; its links are how the files end up
+    inside one. A plain file adds nothing: it is still under the refused data dir.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    targets: list[Path] = []
+    for name in ("cron.yaml", settings.FILENAME):
+        path = Path(DATA_DIR) / name
+        if path.is_symlink():
+            targets.append(Path(os.path.realpath(path)))
+    return targets
+
+
+def _write_grant_protected(granted: list[str]) -> list[Path]:
+    """The existing protected paths inside `granted`, minus any the operator named.
+
+    A repository at the grant or one level below it is checked; git has no
+    registry of the repositories under a tree, and a full walk per spawn is a
+    cost every turn would pay. Only paths that exist are returned: the workspace
+    gets placeholders for absent denies, and an operator's own tree must not.
+    Naming a protected path itself in `sandbox.write_paths` is the consent that
+    leaves it writable.
+    """
+    roots = [Path(path) for path in granted]
+    candidates = _data_dir_link_targets()
+    for root in roots:
+        children = [c for c in _safe_children(root) if not c.is_symlink()]
+        for repo in (root, *(c for c in children if c.is_dir())):
+            candidates += [repo / name for name in _GRANT_PROTECTED_NAMES]
+    protected: list[Path] = []
+    for path in candidates:
+        if path in roots or path in protected or not path.exists():
+            continue
+        if any(path.is_relative_to(root) for root in roots):
+            protected.append(path)
+    return protected
+
+
+def _rename_pins(protected: list[Path], granted: list[str]) -> list[Path]:
+    """The directories between a grant and each protected path inside it.
+
+    A read-only bind moves with its parent: measured under bwrap, `mv .git
+    moved` succeeds, and a fresh `.git/hooks` is then the one git runs. The
+    kernel refuses to rename a mount point (EBUSY), so each of these is bound
+    onto itself read-write. Writes inside them are unchanged.
+    """
+    roots = [Path(path) for path in granted]
+    pins: list[Path] = []
+    for path in protected:
+        # The deepest grant, so a nested grant is not bound a second time.
+        inside = [root for root in roots if path.is_relative_to(root)]
+        root = max(inside, key=lambda root: len(root.parts))
+        for parent in path.parents:
+            if parent == root or not parent.is_relative_to(root):
+                break
+            if parent not in pins:
+                pins.append(parent)
+    return pins
+
+
+def _macos_write_protection(granted: list[str]) -> tuple[list[str], list[str]]:
+    """The seatbelt half of the write-grant protection: (protect, unprotect).
+
+    The profile denies `.git`, `.git/hooks` and `.git/config` under every write
+    slot by pattern, at any depth, so git needs nothing from here. Seatbelt
+    matches paths rather than following a mount, so a renamed parent does not
+    carry a deny away the way it does under bwrap; the `.git` node itself is
+    denied because moving it would.
+
+    `protect` is the data dir's link targets inside a grant; the profile denies
+    each and its ancestors. `unprotect` is every entry naming a protected path,
+    re-allowed after the denies, which is the consent `_write_grant_protected`
+    reads the same way.
+    """
+    roots = [Path(path) for path in granted]
+    protect = [
+        str(target)
+        for target in _data_dir_link_targets()
+        if any(target.is_relative_to(root) and target != root for root in roots)
+    ]
+    unprotect = [
+        path
+        for path in granted
+        if "/.git/hooks/" in f"{path}/"
+        or path.endswith("/.git/config")
+        or any(Path(path).is_relative_to(target) for target in protect)
+    ]
+    return protect, unprotect
+
+
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
     from claude_on_the_fly import codex_state
@@ -1863,6 +1965,8 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     codex = home / ".codex"
     claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
+    granted_writes = _extra_write_paths(cap=None)
+    protected = _write_grant_protected(granted_writes)
     read_write = [
         project,
         Path(os.path.realpath(MEMORY_DIR)),
@@ -1898,7 +2002,8 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # Operator write grants. Last so a narrower entry cannot be shadowed by
         # one of the fixed grants above; bwrap applies these by depth, not by
         # argv order, so position here is for the reader rather than the kernel.
-        *(Path(p) for p in _extra_write_paths(cap=None)),
+        *(Path(p) for p in granted_writes),
+        *_rename_pins(protected, granted_writes),
     ]
     return {
         # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
@@ -1948,6 +2053,7 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         "write_denied": [
             *_project_write_denies(project, _PROJECT_WRITE_DENIES),
             *_codex_protected(codex),
+            *protected,
         ],
         "write_denied_dirs": [
             *_project_write_denies(project, _PROJECT_WRITE_DENY_DIRS),
@@ -2344,6 +2450,8 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     # instruction files read-only there either way.
     codex_write = codex_home if scoped_sessions() else codex_sessions
     resolved = sandbox_macos.realpaths(workspace, DATA_DIR)
+    granted_writes = _extra_write_paths() if base == _DENY_MOST_PROFILE else []
+    protect, unprotect = _macos_write_protection(granted_writes)
     return sandbox_macos.jail_argv(
         argv,
         **resolved,
@@ -2359,7 +2467,9 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
-        write_paths=_extra_write_paths() if base == _DENY_MOST_PROFILE else [],
+        write_paths=granted_writes,
+        protect_paths=protect,
+        unprotect_paths=unprotect,
         # Only under deny-most. The other base allows reads across $HOME, so
         # every one of these is already reachable and computing them would buy a
         # directory walk per spawn for nothing.

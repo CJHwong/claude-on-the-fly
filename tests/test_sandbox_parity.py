@@ -429,3 +429,104 @@ def test_an_entry_the_codex_home_links_out_to_is_readable(world, monkeypatch):
 
     assert _can_read(str(shared / "review.md"), project)
     assert not _can_read(str(beside / "secret.txt"), project)
+
+
+def _grant_with_a_repo(world, monkeypatch) -> dict[str, Path]:
+    """A write grant laid out the way a deployment keeps one: a repository at
+    the grant, another one level down, and the data dir's schedule linked into
+    it."""
+    home, data = world["home"], world["data"]
+    soul = home / "soul"
+    for repo in (soul, soul / "tool"):
+        (repo / ".git" / "hooks").mkdir(parents=True)
+        (repo / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+        (repo / ".git" / "config").write_text("[core]\n")
+    (soul / "config").mkdir()
+    schedule = soul / "config" / "cotf-cron.yaml"
+    schedule.write_text("jobs: []\n")
+    (data / "cron.yaml").symlink_to(schedule)
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(soul))
+    return {"soul": soul, "tool": soul / "tool", "schedule": schedule}
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "{soul}/.git/hooks/pre-commit",
+        "{soul}/.git/hooks/post-checkout",
+        "{soul}/.git/config",
+        "{tool}/.git/hooks/pre-commit",
+        "{tool}/.git/config",
+        "{schedule}",
+    ],
+)
+def test_a_write_grant_keeps_what_runs_outside_the_jail(target, world, monkeypatch):
+    """git runs a granted repository's hooks and honours its config on the
+    operator's next command, and the cron daemon runs the linked schedule. All
+    of them outside the jail."""
+    paths = _grant_with_a_repo(world, monkeypatch)
+    path = target.format(**{k: str(v) for k, v in paths.items()})
+    project = world["project"]
+    assert _can_read(path, project) or not Path(path).exists()
+    assert not _can_write(path, project), f"{path} is writable"
+
+
+def test_a_write_grant_still_takes_ordinary_writes(world, monkeypatch):
+    """The denies are narrow: a note, a new file beside the schedule, and git's
+    own objects under `.git` are what the grant is for."""
+    paths = _grant_with_a_repo(world, monkeypatch)
+    soul, project = paths["soul"], world["project"]
+    for path in (
+        soul / "notes.md",
+        soul / "config" / "other.yaml",
+        soul / ".git" / "HEAD",
+        paths["tool"] / ".git" / "index",
+    ):
+        assert _can_write(str(path), project), f"{path} is not writable"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Move the parent aside, edit the file there, move it back.
+        "mv {soul}/.git {soul}/moved && echo x >> {soul}/moved/config"
+        " && mv {soul}/moved {soul}/.git",
+        "mv {tool} {soul}/moved && echo x >> {soul}/moved/.git/hooks/pre-commit"
+        " && mv {soul}/moved {tool}",
+        "mv {soul}/config {soul}/moved && echo x >> {soul}/moved/cotf-cron.yaml"
+        " && mv {soul}/moved {soul}/config",
+        # Move the parent aside and put a fresh one where it was.
+        "mv {soul}/.git {soul}/moved && mkdir -p {soul}/.git/hooks"
+        " && echo x > {soul}/.git/hooks/pre-commit",
+        "mv {soul}/config {soul}/moved && mkdir {soul}/config && echo x > {schedule}",
+    ],
+    ids=["git-dir", "repo-dir", "schedule-dir", "fresh-git-dir", "fresh-schedule"],
+)
+def test_a_rename_does_not_carry_the_protection_away(script, world, monkeypatch):
+    """A bind moves with its parent under bwrap, so renaming the parent and
+    putting a fresh file where the protected one was is the obvious way round.
+    Seatbelt matches paths, so the shape to defeat there is renaming the parent
+    out of the pattern and back."""
+    paths = _grant_with_a_repo(world, monkeypatch)
+    command = script.format(**{k: str(v) for k, v in paths.items()})
+    assert _run(["/bin/sh", "-c", command], world["project"]) != 0
+    # Whichever step refused, nothing at a path git or cron reads holds the
+    # agent's content. Seatbelt lets a whole repository move, which is harmless:
+    # its hooks go with it and stay under the pattern, and a fresh `.git` at the
+    # old path is refused.
+    for path in (
+        paths["soul"] / ".git" / "config",
+        paths["soul"] / ".git" / "hooks" / "pre-commit",
+        paths["tool"] / ".git" / "hooks" / "pre-commit",
+        paths["schedule"],
+    ):
+        assert not path.exists() or "x" not in path.read_text(), path
+
+
+def test_naming_a_protected_path_opens_only_that_path(world, monkeypatch):
+    paths = _grant_with_a_repo(world, monkeypatch)
+    soul, project = paths["soul"], world["project"]
+    hooks = soul / ".git" / "hooks"
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{soul}:{hooks}")
+    assert _can_write(str(hooks / "pre-commit"), project)
+    assert not _can_write(str(soul / ".git" / "config"), project)

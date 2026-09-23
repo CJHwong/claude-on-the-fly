@@ -5120,6 +5120,226 @@ def test_a_write_grant_does_not_re_open_a_masked_dotenv(monkeypatch, tmp_path):
     assert Path(os.path.realpath(token)) in grants["masked"]
 
 
+class TestWriteGrantProtection:
+    """A write grant keeps what runs outside the jail read-only. git runs the
+    hooks and honours the config of any repo in the grant, and the unjailed cron
+    daemon and broker read the data dir's `cron.yaml` and `config.yaml`, which a
+    deployment can keep as links into the granted tree."""
+
+    @staticmethod
+    def _repo(path: Path) -> Path:
+        (path / ".git" / "hooks").mkdir(parents=True)
+        (path / ".git" / "config").write_text("[core]\n")
+        return Path(os.path.realpath(path))
+
+    def test_a_granted_repo_keeps_its_hooks_and_config(self, monkeypatch, tmp_path):
+        repo = self._repo(tmp_path / "soul")
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(repo))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert repo in grants["read_write"]
+        assert repo / ".git" / "hooks" in grants["write_denied"]
+        assert repo / ".git" / "config" in grants["write_denied"]
+
+    def test_a_repo_one_level_down_is_covered(self, monkeypatch, tmp_path):
+        """A grant can be a folder of repositories rather than one."""
+        repo = self._repo(tmp_path / "projects" / "tool")
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(tmp_path / "projects"))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert repo / ".git" / "hooks" in grants["write_denied"]
+
+    def test_nothing_is_invented_inside_the_operators_tree(self, monkeypatch, tmp_path):
+        """The workspace gets placeholders for absent denies; an operator's own
+        tree must not collect them, so only paths that exist are protected."""
+        plain = tmp_path / "notes"
+        plain.mkdir()
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(plain))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        resolved = Path(os.path.realpath(plain))
+        assert not any(p.is_relative_to(resolved) for p in grants["write_denied"])
+
+    def test_a_linked_cron_file_inside_the_grant_stays_read_only(
+        self, monkeypatch, tmp_path
+    ):
+        soul = tmp_path / "soul"
+        (soul / "config").mkdir(parents=True)
+        schedule = soul / "config" / "cotf-cron.yaml"
+        schedule.write_text("jobs: []\n")
+        settings_file = soul / "config" / "cotf.yaml"
+        settings_file.write_text("sandbox: {}\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        (data / "config.yaml").symlink_to(settings_file)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(soul))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert Path(os.path.realpath(schedule)) in grants["write_denied"]
+        assert Path(os.path.realpath(settings_file)) in grants["write_denied"]
+
+    def test_a_data_dir_file_that_is_not_a_link_adds_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").write_text("jobs: []\n")
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        assert sandbox._data_dir_link_targets() == []
+
+    def test_naming_a_protected_path_allows_it(self, monkeypatch, tmp_path):
+        """Naming the path itself is the operator's consent; the rest of the
+        repo's protection stays."""
+        repo = self._repo(tmp_path / "soul")
+        hooks = repo / ".git" / "hooks"
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{repo}:{hooks}")
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert hooks in grants["read_write"]
+        assert hooks not in grants["write_denied"]
+        assert repo / ".git" / "config" in grants["write_denied"]
+
+    def test_the_directories_above_a_protected_path_cannot_be_renamed(
+        self, monkeypatch, tmp_path
+    ):
+        """A read-only bind moves with its parent. Measured under bwrap: `mv
+        .git moved` succeeded, and a fresh `.git/hooks` would then be the one
+        git runs. A mount point refuses rename with EBUSY, so every directory
+        between the grant and a protected path is bound onto itself."""
+        repo = self._repo(tmp_path / "projects" / "tool")
+        projects = Path(os.path.realpath(tmp_path / "projects"))
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(projects))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert repo in grants["read_write"]
+        assert repo / ".git" in grants["read_write"]
+        assert grants["read_write"].count(repo / ".git") == 1
+
+    def test_a_nested_grant_is_not_bound_twice(self, monkeypatch, tmp_path):
+        repo = self._repo(tmp_path / "projects" / "tool")
+        projects = Path(os.path.realpath(tmp_path / "projects"))
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{projects}:{repo}")
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert grants["read_write"].count(repo) == 1
+        assert repo / ".git" in grants["read_write"]
+
+    def test_a_linked_repo_inside_the_grant_is_not_swept(self, monkeypatch, tmp_path):
+        """A link is reached by its own path. Binding through it would mount
+        over wherever it points, which is not inside the grant."""
+        repo = self._repo(tmp_path / "elsewhere")
+        granted = tmp_path / "notes"
+        granted.mkdir()
+        (granted / "tool").symlink_to(repo)
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        resolved = Path(os.path.realpath(granted))
+        assert not any(p.is_relative_to(resolved) for p in grants["write_denied"])
+
+
+class TestMacosWriteProtection:
+    """The seatbelt half. The profile denies `.git`, `.git/hooks` and
+    `.git/config` under every write slot by pattern, so only the data dir's link
+    targets and the operator's own consent are computed here."""
+
+    def test_a_link_target_inside_a_grant_is_protected(self, monkeypatch, tmp_path):
+        soul = tmp_path / "soul"
+        soul.mkdir()
+        schedule = soul / "cron.yaml"
+        schedule.write_text("jobs: []\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        granted = str(Path(os.path.realpath(soul)))
+        protect, unprotect = sandbox._macos_write_protection([granted])
+        assert protect == [str(Path(os.path.realpath(schedule)))]
+        assert unprotect == []
+
+    def test_a_link_target_outside_every_grant_is_left_alone(
+        self, monkeypatch, tmp_path
+    ):
+        """Outside a grant it is not writable anyway, and the profile denies the
+        target's ancestors too, which is only sound inside a tree the operator
+        handed over."""
+        schedule = tmp_path / "elsewhere" / "cron.yaml"
+        schedule.parent.mkdir()
+        schedule.write_text("jobs: []\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        notes = tmp_path / "notes"
+        notes.mkdir()
+        protect, _ = sandbox._macos_write_protection([str(notes)])
+        assert protect == []
+
+    def test_naming_a_protected_path_re_opens_it(self, monkeypatch, tmp_path):
+        data = tmp_path / "data"
+        data.mkdir()
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        repo = tmp_path / "soul"
+        granted = [str(repo), str(repo / ".git" / "hooks"), str(repo / "notes")]
+        _, unprotect = sandbox._macos_write_protection(granted)
+        assert unprotect == [str(repo / ".git" / "hooks")]
+
+    def test_naming_the_link_target_re_opens_it(self, monkeypatch, tmp_path):
+        soul = tmp_path / "soul"
+        soul.mkdir()
+        schedule = soul / "cron.yaml"
+        schedule.write_text("jobs: []\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        real = str(Path(os.path.realpath(schedule)))
+        granted = [str(Path(os.path.realpath(soul))), real]
+        protect, unprotect = sandbox._macos_write_protection(granted)
+        assert unprotect == [real]
+        # Still passed: its ancestors stay pinned against a rename either way.
+        assert protect == [real]
+
+    def test_the_protection_reaches_the_profile(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+        monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+        repo = tmp_path / "soul"
+        (repo / ".git" / "hooks").mkdir(parents=True)
+        hooks = Path(os.path.realpath(repo / ".git" / "hooks"))
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{repo}:{hooks}")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        argv = sandbox.wrap(["/bin/true"], workspace)
+        assert f"_UNPROTECT_1={hooks}" in argv
+
+
+def test_unused_protect_slots_are_inert(tmp_path):
+    """`_UNPROTECT_*` are write allows after every deny in the file, so a pad
+    that exists would be a write grant nobody made."""
+    project = tmp_path / "ws"
+    project.mkdir()
+    argv = sandbox_macos.jail_argv(
+        ["/bin/true"],
+        home=tmp_path / "home",
+        data_dir=tmp_path / "data",
+        project=project,
+        tmpdir=tmp_path,
+        claude_config=tmp_path / "home/.claude",
+        claude_projects=tmp_path / "home/.claude/projects",
+        claude_project=tmp_path / "home/.claude/projects/ws",
+        codex_sessions=tmp_path / "home/.codex/sessions",
+        codex_home=tmp_path / "data/codex",
+        codex_operator_home=tmp_path / "home/.codex",
+        pane_socket=tmp_path / "pane.sock",
+        base=sandbox._DENY_MOST_PROFILE,
+        loopback=sandbox_macos._loopback_specs(["1", "2", "3", "4", "5"]),
+        extra_paths=[],
+        write_paths=[],
+        protect_paths=["/soul/cron.yaml"],
+    )
+    slots = [a for a in argv if a.startswith(("_PROTECT_", "_UNPROTECT_"))]
+    assert "_PROTECT_1=/soul/cron.yaml" in slots
+    assert len(slots) == sandbox_macos._PROTECT_SLOTS + sandbox_macos._MAX_EXTRA_PATHS
+    for slot in slots[1:]:
+        assert not Path(slot.split("=", 1)[1]).exists(), slot
+
+
 def test_a_redirected_claude_config_dir_is_still_an_escape_path(monkeypatch, tmp_path):
     """`_WRITE_ESCAPE_PATHS` names `~/.claude`, which is where that tree is by
     default and not where it has to be. The profile write-denies the configured
