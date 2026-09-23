@@ -59,6 +59,38 @@ def test_an_apostrophe_in_a_comment_does_not_open_a_quote(audit):
     ]
 
 
+@pytest.mark.parametrize(
+    ("script", "argv", "writes"),
+    [
+        # bash starts a comment only where a word starts. shlex cut the line at
+        # any `#`, so the redirect after a URL fragment was never counted.
+        (
+            "curl -o out.html https://a.com/p#frag > /tmp/y",
+            ["curl", "-o", "out.html", "https://a.com/p#frag"],
+            ["/tmp/y"],
+        ),
+        ("echo it#s > /etc/x", ["echo", "it#s"], ["/etc/x"]),
+        ("echo '# not a comment' > f", ["echo", "# not a comment"], ["f"]),
+        ("echo a;# comment > f", ["echo", "a"], []),
+        ("echo a # comment > f", ["echo", "a"], []),
+    ],
+)
+def test_a_hash_starts_a_comment_only_at_the_start_of_a_word(
+    audit, script, argv, writes
+):
+    calls = [c for c in audit.commands_in(script) if c.argv]
+    assert [c.argv for c in calls] == [argv]
+    assert calls[0].writes == writes
+
+
+def test_a_comment_ends_at_the_newline(audit):
+    script = "gh pr list # first\ngh run list"
+    assert [c.argv for c in audit.commands_in(script)] == [
+        ["gh", "pr", "list"],
+        ["gh", "run", "list"],
+    ]
+
+
 def test_an_assignment_is_not_a_call(audit):
     """`basename("SLACKER=/path/slacker.sh")` is `slacker.sh`, which is how an
     earlier replay counted 121 assignments as invocations."""
