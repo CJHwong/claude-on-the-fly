@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -606,6 +607,7 @@ def _clear_loopback_env(monkeypatch):
         "OPENAI_BASE_URL",
         "HTTPS_PROXY",
         "COTF_CMD_ENDPOINT",
+        "OLLAMA_HOST",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -720,6 +722,46 @@ def test_loopback_ports_reads_any_base_url(monkeypatch):
     _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9911/openai")
     assert sandbox._loopback_ports() == ["9911"]
+
+
+def test_loopback_ports_read_the_ollama_host(monkeypatch):
+    """Ollama mode publishes no base URL, so nothing bridged 11434 into a Linux
+    jail and a jailed `ollama launch` answered "could not connect to ollama
+    server"."""
+    _clear_loopback_env(monkeypatch)
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    assert sandbox._loopback_ports() == ["11434"]
+
+
+class TestModelEndpointEnv:
+    def test_an_ollama_turn_under_the_jail_names_its_server(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        assert sandbox.model_endpoint_env("ollama") == {
+            "OLLAMA_HOST": "http://127.0.0.1:11434"
+        }
+
+    def test_the_operators_port_is_kept(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("OLLAMA_HOST", "localhost:11500")
+        assert sandbox.model_endpoint_env("ollama") == {
+            "OLLAMA_HOST": "http://127.0.0.1:11500"
+        }
+
+    def test_a_remote_server_has_nothing_to_bridge(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("OLLAMA_HOST", "https://ollama.example:443")
+        assert sandbox.model_endpoint_env("ollama") == {}
+
+    def test_other_modes_get_nothing(self, monkeypatch):
+        """Only an ollama turn gets the port: the ollama API has no auth, so a
+        native turn handed it could pull or delete models."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        assert sandbox.model_endpoint_env("native") == {}
+
+    def test_nothing_changes_outside_the_jail(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        assert sandbox.model_endpoint_env("ollama") == {}
 
 
 def test_session_env_layers_over_the_allowlist(monkeypatch):
@@ -2172,6 +2214,75 @@ def test_runtime_read_paths_cover_the_binary_and_its_interpreter(monkeypatch, tm
     assert len(paths) == len({str(p) for p in paths}), "duplicates waste fixed slots"
 
 
+def _uv_style_interpreter(root: Path) -> tuple[Path, Path, Path]:
+    """A venv python behind uv's minor-version link: (venv python, link, install)."""
+    install = root / "uv" / "python" / "cpython-3.13.13-linux"
+    (install / "bin").mkdir(parents=True)
+    (install / "bin" / "python3.13").write_text("")
+    link = root / "uv" / "python" / "cpython-3.13-linux"
+    link.symlink_to(install)
+    venv_python = root / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(link / "bin" / "python3.13")
+    return venv_python, link, install
+
+
+def test_runtime_read_paths_recreate_the_interpreter_link(monkeypatch, tmp_path):
+    """A uv venv's python points through `cpython-3.X-*`, a symlink to the patch
+    directory. The jail's $HOME is a tmpfs, so a link nobody granted does not
+    exist inside it, and exec failed on a path that looked granted. Measured on
+    Linux: "bwrap: execvp .venv/bin/python: No such file or directory", which
+    failed the preflight and every shim."""
+    venv_python, link, install = _uv_style_interpreter(tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(sys, "prefix", str(venv_python.parent.parent))
+    monkeypatch.setattr(sys, "base_prefix", str(install))
+    assert link in sandbox._runtime_read_paths([])
+
+
+def test_the_linux_jail_recreates_the_interpreter_link(monkeypatch, tmp_path):
+    """Binding the link is not an option: bwrap refuses a symlink destination,
+    which is why the Linux wrap drops the as-written twin. Dropping it cost the
+    path itself, so it comes back as a link."""
+    venv_python, link, install = _uv_style_interpreter(tmp_path)
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(sys, "prefix", str(venv_python.parent.parent))
+    monkeypatch.setattr(sys, "base_prefix", str(install))
+    out = sandbox.wrap(["true"], tmp_path / "ws")
+    at = out.index("--symlink")
+    assert out[at + 1 : at + 3] == [str(install), str(link)]
+
+
+def test_runtime_read_paths_add_no_link_to_an_ungranted_target(monkeypatch, tmp_path):
+    """Recreating a link must not widen the grant. `/tmp` on macOS is a link to
+    `/private/tmp`, and following it blindly would grant the whole of it."""
+    venv_python, link, _install = _uv_style_interpreter(tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(sys, "prefix", str(venv_python.parent.parent))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "elsewhere"))
+    assert link not in sandbox._runtime_read_paths([])
+
+
+def test_runtime_read_paths_cover_what_ollama_launches(monkeypatch, tmp_path):
+    """`ollama launch claude` execs claude, which `argv[0]` never names. Under
+    the jail the launcher then answered "claude is not installed"."""
+    bins = {}
+    for name in ("ollama", "claude", "codex"):
+        binary = tmp_path / name / "bin" / name
+        binary.parent.mkdir(parents=True)
+        binary.write_text("")
+        bins[name] = binary
+    monkeypatch.setattr(shutil, "which", lambda name: str(bins.get(name, "")) or None)
+    paths = sandbox._runtime_read_paths(["ollama", "launch", "claude"])
+    assert bins["claude"].parent in paths
+    assert bins["codex"].parent in paths
+
+
 def test_runtime_read_paths_tolerate_an_unresolvable_binary(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     assert sandbox._runtime_read_paths([]) == sandbox._runtime_read_paths(["nope"])
@@ -2199,10 +2310,10 @@ def test_allow_reads_does_not_pass_runtime_slots(monkeypatch, tmp_path):
 
 
 def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog):
-    """The jobs daemon spawns without opening a relay, because it runs as its own
-    process and builds no broker. The namespace then reaches nothing on the host.
-    macOS is in the same position for the same reason, so this is not a Linux
-    regression -- but there it merely fails, where here it would look like a hang."""
+    """A spawn with no relay open reaches nothing on the host from inside the
+    namespace. macOS is in the same position for the same reason, so this is not
+    a Linux regression -- but there it merely fails, where here it would look like
+    a hang."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -2210,7 +2321,7 @@ def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog)
         sandbox.wrap(["codex", "exec"], tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "no brokered loopback port" in logged
-    assert "jobs daemon" in logged
+    assert "this spawn did not" in logged
 
 
 # --- one thread's transcripts must not be another thread's to read ---

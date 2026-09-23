@@ -608,6 +608,7 @@ def test_path_untouched_when_no_shims_exist(monkeypatch, tmp_path):
 
     monkeypatch.setenv("COTF_SANDBOX", "env")
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(ENDPOINT_ENV, "http://127.0.0.1:9999")
     monkeypatch.setattr(sandbox, "shim_dir", lambda: tmp_path / "absent")
     assert (sandbox.agent_env() or {})["PATH"] == "/usr/bin"
 
@@ -626,7 +627,7 @@ def test_path_gets_the_shim_dir_when_populated(monkeypatch, tmp_path):
 
 
 def test_a_daemon_without_a_broker_gets_the_real_binaries(monkeypatch, tmp_path):
-    """The jobs daemon shares the shim dir but runs no broker."""
+    """A daemon that shares the shim dir but runs no broker."""
     from claude_on_the_fly import sandbox
 
     shims = tmp_path / "shims"
@@ -1108,6 +1109,29 @@ async def test_a_directory_in_the_shim_dir_is_left_alone(tmp_path, echo_tool):
     (shim_dir / "operator-notes").mkdir()
     CommandBroker(shim_dir, (echo_tool,)).write_shims()
     assert (shim_dir / "operator-notes").is_dir()
+
+
+async def test_a_shim_is_replaced_not_rewritten_in_place(tmp_path, echo_tool):
+    """The chat and jobs daemons share this directory and both write it at
+    start. Rewriting in place lets an agent exec a half-written shim; a rename
+    hands every reader either the old file or the new one."""
+    shim_dir = tmp_path / "shims"
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    before = (shim_dir / "echo").stat().st_ino
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    assert (shim_dir / "echo").stat().st_ino != before
+    assert sorted(p.name for p in shim_dir.iterdir()) == ["echo"]
+
+
+async def test_the_sweep_spares_another_writers_temp_file(tmp_path, echo_tool):
+    """A temp file is not a tool. Sweeping one out from under the other daemon
+    fails its rename and its start."""
+    shim_dir = tmp_path / "shims"
+    shim_dir.mkdir()
+    in_flight = shim_dir / ".echo.4242.tmp"
+    in_flight.write_text("#!/bin/sh\n")
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    assert in_flight.is_file()
 
 
 # --- subprocess failure modes ---

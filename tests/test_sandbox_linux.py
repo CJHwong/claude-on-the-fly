@@ -227,6 +227,28 @@ def test_mount_order_is_depth_then_rank_for_every_pair(tmp_path, monkeypatch, sc
 # --- the fixed prefix and the trailing remount ---
 
 
+def test_links_are_recreated_after_the_mounts_and_before_the_remount(places):
+    """A link under the tmpfs $HOME does not exist inside the jail, and bwrap
+    refuses to bind onto a link, so it is recreated instead. After the mounts,
+    which make its parents; before the remount, which makes them read-only."""
+    home = Path("/home/me")
+    link = home / "uv" / "cpython-3.13"
+    out = sandbox_linux.jail_argv(
+        ["true"],
+        **_argv(opaque=[home], read_only=[home / "uv" / "cpython-3.13.13"]),
+        links={link: str(home / "uv" / "cpython-3.13.13")},
+        placeholders=places,
+    )
+    at = out.index("--symlink")
+    assert out[at : at + 3] == [
+        "--symlink",
+        str(home / "uv" / "cpython-3.13.13"),
+        str(link),
+    ]
+    assert at > out.index(str(home / "uv" / "cpython-3.13.13"))
+    assert at < out.index("--remount-ro")
+
+
 def test_opaque_paths_are_remounted_read_only_at_the_end(places):
     """A tmpfs is writable, so hiding $HOME behind one leaves everything under it
     writable -- ephemerally, but successfully, which contradicts what the agent is

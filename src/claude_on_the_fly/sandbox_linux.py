@@ -245,6 +245,7 @@ def jail_argv(
     sockets: Mapping[int, Path | str],
     placeholders: Placeholders,
     write_denied_dirs: Iterable[Path | str] = (),
+    links: Mapping[Path, str] | None = None,
     bwrap: str = "bwrap",
     python: str | None = None,
 ) -> list[str]:
@@ -276,6 +277,11 @@ def jail_argv(
         machine, and a mount namespace has no pattern matching, so both the
         forwarded ssh-agent and a `.env` sitting under a granted subtree need
         naming individually.
+
+    `links` maps a symlink's path to its target, recreated with `--symlink`
+    after the mounts and before the read-only remount. A link under an opaque
+    `$HOME` does not exist inside the jail, and bwrap refuses to bind onto a
+    link, so recreating it is the only way to keep a path that runs through one.
 
     Last come the relay sockets and `--unshare-net`. Those sit on `/run`, which
     no path rule touches, so they need no part in the depth ordering.
@@ -334,6 +340,12 @@ def jail_argv(
     # Sorted for the same reason the mounts are: the caller's list order must not
     # reach the argv, or the same contract emits two different jails and the
     # difference is invisible in review.
+    # After the mounts, which create a link's parents; before the remount, which
+    # would make them read-only. bwrap accepts a link that already exists with
+    # the same target, so one under a visible parent such as merged-usr `/bin`
+    # costs nothing (measured on the target kernel).
+    for path, target in sorted((links or {}).items(), key=lambda kv: Path(kv[0]).parts):
+        args += ["--symlink", target, str(path)]
     for path in sorted(opaque, key=lambda p: Path(p).parts):
         args += ["--remount-ro", str(path)]
     inner = list(argv)

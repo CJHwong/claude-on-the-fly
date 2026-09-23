@@ -7,7 +7,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -778,3 +778,111 @@ class TestMinToolCalls:
             result = await runner.run(_job("p", min_tool_calls=1))
         assert result.ok is False
         assert result.tool_calls == 0
+
+
+class _RecordingBrokers:
+    """Stands in for JobBrokers: hands over an env and records the release."""
+
+    def __init__(self) -> None:
+        self.entered: list[tuple[Path, str]] = []
+        self.model_envs: list[dict[str, str]] = []
+        self.released = 0
+
+    def for_job(self, workspace: Path, key: str, model_env=None):
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def scope():
+            self.entered.append((workspace, key))
+            self.model_envs.append(dict(model_env or {}))
+            try:
+                yield {"COTF_CMD_TOKEN": "job-token"}
+            finally:
+                self.released += 1
+
+        return scope()
+
+
+async def test_the_brokers_get_the_jobs_model_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolved from the job's own profile, before the relay opens. A job
+    running an ollama profile otherwise had no route to its model server."""
+    from claude_on_the_fly import sandbox
+
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    monkeypatch.setattr(
+        sandbox,
+        "model_endpoint_env",
+        lambda mode: {"OLLAMA_HOST": f"for-{mode}"},
+    )
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            AsyncMock(return_value=Response(body="ok")),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.resolve_profile",
+            return_value=MagicMock(mode="ollama"),
+        ),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:ollama:glm",
+        ),
+    ):
+        await runner.run(_job())
+
+    assert brokers.model_envs == [{"OLLAMA_HOST": "for-ollama"}]
+
+
+async def test_a_job_agent_runs_with_the_brokers_env(tmp_path: Path) -> None:
+    """The jobs daemon had no broker, so a job's agent found the shim and no
+    token. The env is layered for the run and released after it."""
+    from claude_on_the_fly import sandbox
+
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    seen: dict = {}
+
+    async def _fake_run(**kwargs):
+        seen["env"] = dict(sandbox._SESSION_ENV.get() or {})
+        seen["released_during_run"] = brokers.released
+        return Response(body="ok")
+
+    with (
+        patch("claude_on_the_fly.jobs.agent_runner.agent.run", side_effect=_fake_run),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        await runner.run(_job())
+
+    assert seen["env"]["COTF_CMD_TOKEN"] == "job-token"
+    assert seen["released_during_run"] == 0
+    assert brokers.released == 1
+    workspace, _key = brokers.entered[0]
+    assert workspace.parent == tmp_path / "workspaces" / "jobs" / "__runs"
+    assert not (sandbox._SESSION_ENV.get() or {})
+
+
+async def test_a_failed_job_still_releases_its_brokers(tmp_path: Path) -> None:
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            side_effect=ClaudeUnavailableError("down"),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        result = await runner.run(_job())
+    assert result.ok is False
+    assert brokers.released == 1
