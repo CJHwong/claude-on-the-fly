@@ -42,6 +42,11 @@ wrapper execs. If an entry in your codex home is a symlink pointing elsewhere un
 too, since the grant on the home itself covers the link and not the file behind it. Add
 anything else the agent needs to read.
 
+On Linux the same holds for links in `~/.claude` and in its `skills/`, `agents/` and
+`commands/`. A `DATA_DIR/memory` that is a link survives into the jail too, but its
+target needs a `write_paths` entry before the agent can write memory there. Before a
+long-running deployment switches to `jail`, [check what it would break](audit-before-jailing.md).
+
 If the agent works with git, add `~/.gitconfig` as well: git refuses to run when it cannot read its global config, and `deny-most` hides that file with the rest of the home.
 
 If you run claude with hooks, add the directory holding the hook scripts. A hook that

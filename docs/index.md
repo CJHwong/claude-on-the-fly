@@ -12,6 +12,7 @@ empty configuration and ends with a sandboxed agent whose tool calls require app
 - Set up [Slack](how-to/slack.md), [Telegram](how-to/telegram.md), or
   [scheduled work](how-to/cron.md).
 - [Enable sandboxing](how-to/enable-sandboxing.md).
+- [Check what a jail would break](how-to/audit-before-jailing.md).
 - [Enable tool approvals](how-to/enable-tool-approvals.md).
 - [Allow network access](how-to/manage-egress.md).
 - [Broker a credentialed CLI](how-to/broker-a-command.md).

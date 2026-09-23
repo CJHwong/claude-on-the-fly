@@ -1005,7 +1005,7 @@ class TestCodexBackendRun:
         assert 'model_reasoning_effort="high"' in cmd
 
     async def test_effort_omitted_without_setting(self, tmp_path, monkeypatch):
-        """Unset OLLAMA_EFFORT → no -c override even under the launcher."""
+        """Unset OLLAMA_EFFORT → no effort override even under the launcher."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         monkeypatch.delenv("OLLAMA_EFFORT", raising=False)
@@ -1018,7 +1018,7 @@ class TestCodexBackendRun:
             await CodexBackend(launcher=launcher).run(
                 workspace, "sess", "hi", "telegram"
             )
-        assert "-c" not in mock.call_args[0][1]
+        assert not any("model_reasoning_effort" in a for a in mock.call_args[0][1])
 
     async def test_effort_level_not_in_codex_set_skipped(self, tmp_path, caplog):
         """A level neither CLI accepts must be skipped rather than handed to
@@ -1034,7 +1034,7 @@ class TestCodexBackendRun:
             await CodexBackend(launcher=launcher, effort="colossal").run(
                 workspace, "sess", "hi", "telegram"
             )
-        assert "-c" not in mock.call_args[0][1]
+        assert not any("model_reasoning_effort" in a for a in mock.call_args[0][1])
         assert "ignoring unknown effort 'colossal'" in caplog.text
 
     async def test_max_is_a_codex_level_and_reaches_argv(self, tmp_path, caplog):
@@ -3292,6 +3292,22 @@ class TestEffortReachesTheInteractiveArgv:
         hosted_argv = backend._interactive_argv(tmp_path, None, "hi")
         flag = 'model_reasoning_effort="xhigh"'
         assert flag in exec_argv and flag in hosted_argv
+
+
+class TestOllamaWebSearch:
+    """ollama's Responses endpoint answers any request carrying the hosted
+    web_search tool with `the web_search tool is not supported`, and codex sends
+    it by default, so every ollama turn failed before its first token."""
+
+    def test_both_builders_turn_it_off_under_ollama(self, tmp_path: Path) -> None:
+        backend = CodexBackend(launcher=OllamaLauncher(model="glm-5.3-flash:cloud"))
+        flag = 'web_search="disabled"'
+        assert flag in backend._base_argv(tmp_path)
+        assert flag in backend._interactive_argv(tmp_path, None, "hi")
+
+    def test_a_native_turn_keeps_it(self, tmp_path: Path) -> None:
+        backend = CodexBackend(model="gpt-5")
+        assert not any("web_search" in part for part in backend._base_argv(tmp_path))
 
 
 class TestPlainDiagnosticCapture:

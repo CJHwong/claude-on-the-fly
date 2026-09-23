@@ -202,7 +202,7 @@ every session an earlier build wrote.
 
 ### ollama launch
 
-Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementation: `OllamaLauncher` at `src/claude_on_the_fly/agent.py:636`. Triggered by `agent.claude.mode: ollama` / `agent.codex.mode: ollama`. Requires `ollama` installed and target model pulled (`ollama pull <name>`). Session resume, tool use, and Skills behave identically to native mode — only the model provider changes. For claude, the footer cost reflects Ollama's billing (`:cloud` models) or `$0` (local).
+Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementation: `OllamaLauncher` at `src/claude_on_the_fly/agent.py:636`. Triggered by `agent.claude.mode: ollama` / `agent.codex.mode: ollama`. Requires `ollama` installed and target model pulled (`ollama pull <name>`). Session resume, tool use, and Skills behave identically to native mode — only the model provider changes. For claude, the footer cost reflects Ollama's billing (`:cloud` models) or `$0` (local). For codex, the argv also carries `-c web_search="disabled"`: codex sends its hosted web_search tool by default, and ollama's endpoint refuses the whole request over it (`the web_search tool is not supported`).
 
 ### pty (claude only)
 

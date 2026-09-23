@@ -38,13 +38,13 @@ _JAIL_PROFILE = _SEATBELT_DIR / "jail.sb"
 _MAX_EXTRA_PATHS = 3
 # Default loopback allow: every loopback port (agent dev servers/tests work).
 _DEFAULT_LOOPBACK = "localhost:*"
-# Fixed loopback allow slots in the jail profile, since SBPL has no arrays. Four
+# Fixed loopback allow slots in the jail profile, since SBPL has no arrays. Five
 # because each loopback grant is a separate parameter, so the profile has to
 # declare a fixed number of slots. The services are the credential broker, the
-# command broker, the CONNECT egress proxy, and -- when permissions mode is
-# `ask` -- the approval service the backends ask about tool calls. A fifth
-# service would need a fifth slot here and in both profiles.
-_LOOPBACK_SLOTS = 4
+# command broker, the CONNECT egress proxy, the approval service when
+# permissions mode is `ask`, and the ollama server for an ollama turn. A sixth
+# service would need a sixth slot here and in jail.sb.
+_LOOPBACK_SLOTS = 5
 # Runtime read slots in fs-deny-most.sb: the launcher's directory, the resolved
 # binary's directory, sys.prefix, sys.base_prefix, package dir. Five because a
 # launcher and the code it runs need not share a directory: `claude` is a symlink
@@ -90,7 +90,7 @@ def _fs_base_profile() -> Path:
     return _BASE_PROFILE
 
 
-def _loopback_specs(ports: list[str]) -> tuple[str, str, str, str]:
+def _loopback_specs(ports: list[str]) -> tuple[str, str, str, str, str]:
     """The remote-ip values for the jail's loopback allows, one per slot.
 
     Narrows to just the local services the agent was handed when
@@ -122,7 +122,7 @@ def _loopback_specs(ports: list[str]) -> tuple[str, str, str, str]:
         )
     specs = [f"localhost:{port}" for port in ports[:_LOOPBACK_SLOTS]]
     specs += [specs[0]] * (_LOOPBACK_SLOTS - len(specs))
-    return specs[0], specs[1], specs[2], specs[3]
+    return specs[0], specs[1], specs[2], specs[3], specs[4]
 
 
 def jail_argv(
@@ -140,7 +140,7 @@ def jail_argv(
     codex_operator_home: Path | str,
     pane_socket: Path | str,
     base: Path,
-    loopback: tuple[str, str, str, str],
+    loopback: tuple[str, str, str, str, str],
     extra_paths: list[str],
     write_paths: list[str] | None = None,
     codex_link_paths: list[str] | None = None,
@@ -167,7 +167,7 @@ def jail_argv(
     # leave this one pointing at the original and the substitution would silently
     # not happen.
     profile = profile or _JAIL_PROFILE
-    first, second, third, fourth = loopback
+    first, second, third, fourth, fifth = loopback
     params = [
         "-D",
         f"_HOME={home}",
@@ -205,6 +205,8 @@ def jail_argv(
         f"_LOOPBACK_ALT2={third}",
         "-D",
         f"_LOOPBACK_ALT3={fourth}",
+        "-D",
+        f"_LOOPBACK_ALT4={fifth}",
     ]
     # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
     # so only pass them there. Pad unused slots with the project dir (a no-op).

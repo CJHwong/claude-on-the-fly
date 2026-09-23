@@ -78,6 +78,9 @@ upgrade path, so none of that was covered by it.
 | An undeclared boolean flag hid a refused verb from the allowlist. The allowlist read a bare flag as taking the next token, so with `allow: [status]`, `systemctl --quiet stop status` matched `status`, and systemctl, which reads `--quiet` as boolean (measured on systemd 259), ran `stop`. `boolean_flags` closed it only for the flags an operator listed | `commands.allowed_command`, `commands.hidden_by_a_leading_flag` | A command now runs only when both flag readings admit it, the rule `refuses_readback` already applied. The cost is a value flag before the subcommand (`aws --profile prod logs tail`); the refusal names the fix, moving the flag after the subcommand, which aws, gh and systemctl accept. Moving it also exposes a hidden verb, so the hint is safe for an attack. A replay of 1896 real brokered calls from the deployed host's transcripts through the old and new guard with its live allowlist: none newly refused. Real run through the broker on that host: the leading-flag form refused with the hint, the reordered `stop` refused as unlisted, `is-active` ran |
 | The path guard could not see a path inside a JSON argument: `--params '{"body":"/etc/passwd"}'` was one relative-looking token. No brokered tool is known to open a file named this way, and gws 0.22.5 was measured not to (`--params @/x` fails as invalid JSON; its file flags are plain values the guard already saw) | `commands._json_strings`, `commands._path_candidates` | Every string literal in a token starting with `{` or `[` is a candidate, escapes decoded, found without parsing so deep nesting cannot make it give up. The value after the first `=` is also a candidate, since a JSON value can hold `=`. None of 675 real JSON arguments on the deployed host held a value it refuses. Real run through the broker against real gws: a plain and an escaped nested `/etc/passwd` refused, an ordinary `--params` listed Drive |
 | `~/.claude/.credentials.json`, refresh token included, was readable under the Linux jail, which re-exposes `~/.claude` read-only and masked only `history.jsonl`. macOS keeps the credential in the denied keychain, and had no deny for the file where it exists off the keychain: the live jail test read it before the rule was added | `sandbox._claude_credential_text`, `sandbox._CLAUDE_READ_DENIED`, `seatbelt/fs-*.sb` | Under `jail` on Linux the daemon reads the access token outside the jail and passes it as `ANTHROPIC_AUTH_TOKEN`, as macOS does from the keychain, and the file is masked; both macOS profiles deny it by name. Under `env` nothing changes, because the CLI can still refresh its own file. Real bubblewrap run on the deployed host with a placeholder credential: the file hidden, `history.jsonl` hidden, `settings.json` readable, the env holding the access token and not the refresh token, and `claude auth status` reporting `loggedIn: true, authMethod: oauth_token`. codex's `auth.json` stays readable with its refresh token, as recorded in the security model |
+| macOS `jail.sb` had four loopback slots and `_loopback_ports` can name five, so with `sandbox.broker_only_loopback` on, the ollama port an ollama turn gets as `OLLAMA_HOST` fell off the end and the overflow only warned | `sandbox_macos._LOOPBACK_SLOTS`, `seatbelt/jail.sb` `_LOOPBACK_ALT4` | A fifth slot. Live on macOS with `broker_only_loopback` on and five services named: all five reachable, the ollama slot included, and an unlisted sixth port refused |
+| The Linux jail mounts `~/.claude` read-only, but bwrap mounts the links inside it and not their targets, so a deployment that keeps `~/.claude/skills` (or a single skill) as a link into another repository gave the agent a skills tree it could not read | `sandbox._claude_link_targets` | The target of each link directly under `~/.claude` and under `skills/`, `agents/` and `commands/` is added read-only. A target `sandbox.extra_paths` would refuse is refused here too, so a link into `~/.ssh` or at `$HOME` reopens nothing. Covered on Linux only; the macOS half is open below |
+| A `DATA_DIR/memory` that is a link into another directory was a dangling link inside the jail: the tmpfs data dir holds the granted target but not the link, so every memory read and write failed | `sandbox._linux_wrap` | The link is recreated with `--symlink`, the same way the uv interpreter link is. The target still needs its own write grant; without one the link resolves and the write is refused, which is the intended result |
 
 ## Open
 
@@ -131,6 +134,13 @@ subcommand accepts `-w/--web`, the allowlist is a leading-prefix gate, and the b
 unjailed. The URL is attacker-chosen, so data can ride in the query string. Bounded to
 github.com and the configured Atlassian site.
 
+**A `sandbox.write_paths` entry can contain a link target the refusal list does not know.**
+`_write_path_refusal` refuses an entry that contains a config dir or a PATH dir, as
+written. It does not follow the links inside the data dir, so when `DATA_DIR/cron.yaml`
+is a link into a repository and that repository is granted, the agent can edit the file
+the unjailed cron daemon runs. The repository's `.git/hooks` are writable too. Closes by
+resolving the data dir's own links into the refusal list.
+
 ### Execution that outlives the turn
 
 **`~/.claude/shell-snapshots` is writable and the CLI sources it** on a later Bash tool
@@ -161,6 +171,15 @@ under `~/.codex` and adds the result to the Linux read-only set. An operator who
 backend runs unjailed. Matters most in the documented default posture, `sandbox.mode: off`,
 where an already-compromised turn's file writes become code the operator later runs on
 purpose.
+
+**The macOS profiles do not grant the targets of `~/.claude` links.** The Linux half is
+fixed above. Under `deny-most` a linked skills tree is unreadable, and the operator's
+remedy is an `extra_paths` entry naming the target.
+
+**codex under the jail has no credential handoff.** The daemon hands claude its token
+through the environment. The obvious codex equivalent, `CODEX_ACCESS_TOKEN`, expects an
+agent identity JWT and rejects the ChatGPT access token in `auth.json` (measured: "agent
+identity JWT payload is not valid JSON"). So a jailed codex still reads `auth.json`.
 
 ### The self-test
 
@@ -362,9 +381,6 @@ replay from a partial journal record; submodules and the checkout's own `.git/ho
   real turn.
 - A real `api.anthropic.com` leg for the claude backend under the jail. Every macOS
   validation used a loopback stub.
-- Codex through `ollama launch` under the Linux jail. Only claude was run.
-- `sandbox.broker_only_loopback` with an ollama turn on macOS: the ollama port can be the
-  fifth loopback service, past the four profile slots, and the overflow only warns.
 - Two concurrent jailed turns, so the per-turn `_SESSION_ENV` ContextVar is untested under
   real concurrency.
 - Codex under the macOS jail, and claude under the Linux jail. Both share the policy layer;
