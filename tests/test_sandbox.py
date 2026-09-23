@@ -272,7 +272,7 @@ def test_guidance_jail_covers_all_denial_scenarios(monkeypatch, tmp_path):
     assert (
         "sandbox.extra_paths" in text
     )  # file-read remedy, named as the operator sets it
-    assert "write profile" in text  # file-write remedy
+    assert "sandbox.write_paths" in text  # file-write remedy
     # Network remedy is now an approval, not a config change: the agent is told
     # the request pauses for the operator and that a 403 means they declined.
     assert "operator is asked" in text
@@ -2246,6 +2246,77 @@ def test_guidance_network_line_is_accurate_on_linux(monkeypatch, tmp_path):
     text = sandbox.agent_guidance(tmp_path)
     assert "no other port on the host is reachable" in text
     assert "external hosts are blocked" not in text
+
+
+def test_guidance_says_a_masked_credential_refuses_on_linux(monkeypatch, tmp_path):
+    """A mask is a mode-000 mount, so reading one fails with EACCES. The guidance
+    used to call every EACCES a genuine permission problem, which sent the agent
+    to fix file modes on a `.env` the jail refuses on purpose. Measured on a
+    deployed host: `cat .../.env: Permission denied`."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    text = sandbox.agent_guidance(tmp_path)
+    assert '"Permission denied" (EACCES) on a masked credential' in text
+    assert "`.env`" in text and ".credentials.json" in text
+
+
+def test_guidance_write_scope_names_the_operator_write_grants(monkeypatch, tmp_path):
+    """The read list came from the real grants; the write line was a fixed
+    sentence, so an agent granted `sandbox.write_paths` was told writing there
+    fails."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(notes))
+    for platform in ("linux", "darwin"):
+        monkeypatch.setattr(sandbox, "_platform", lambda platform=platform: platform)
+        writing = next(
+            line
+            for line in sandbox.agent_guidance(tmp_path / "ws").splitlines()
+            if line.startswith("- Writing:")
+        )
+        assert str(notes.resolve()) in writing, platform
+
+
+def test_guidance_write_remedy_names_the_setting(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    text = sandbox.agent_guidance(tmp_path)
+    assert "adds the path to `sandbox.write_paths`" in text
+    assert "write profile" not in text
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize(
+    ("egress", "present", "absent"),
+    [
+        (
+            "gated",
+            ["operator is asked", "refused at once", "egress.private_allow"],
+            ["no internet"],
+        ),
+        (
+            "open",
+            ["any public host", "egress.private_allow"],
+            ["operator is asked"],
+        ),
+        ("off", ["no internet"], ["operator is asked", "any public host"]),
+    ],
+)
+def test_guidance_network_follows_the_egress_mode(
+    monkeypatch, tmp_path, platform, egress, present, absent
+):
+    """The network lines used to describe `gated` whatever `sandbox.egress` said:
+    under `open` the agent was told an unknown host waits for approval, and
+    under `off` nothing said there is no internet at all."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", egress)
+    monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
+    monkeypatch.setattr(sandbox, "_platform", lambda: platform)
+    text = sandbox.agent_guidance(tmp_path)
+    for phrase in present:
+        assert phrase in text, phrase
+    for phrase in absent:
+        assert phrase not in text, phrase
 
 
 def test_inert_linux_settings_are_announced(monkeypatch, caplog):
