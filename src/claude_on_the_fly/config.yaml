@@ -157,14 +157,35 @@ commands:
         - auth token
       readback_flags:
         - --show-token
+      # Reads only. Left out on purpose: `api` (all-or-nothing; see
+      # allow_read_only), `pr checkout` and the `download` subcommands (they write
+      # files), `gist`, `secret`, `variable`, and anything that mutates.
       allow:
+        # pull requests
         - pr list
         - pr view
-        - repo view
+        - pr diff
+        - pr checks
+        - pr status
+        # issues and repositories
         - issue list
         - issue view
+        - issue status
+        - repo view
+        - label list
+        # CI
         - run list
         - run view
+        - workflow list
+        - workflow view
+        # releases
+        - release list
+        - release view
+        # discovery
+        - search issues
+        - search prs
+        - search repos
+        - search code
       env_passthrough: [GH_HOST, GH_REPO, GH_PAGER, NO_COLOR]
 
     - name: acli
@@ -182,6 +203,54 @@ commands:
         - jira workitem view
         - jira workitem get
       env_passthrough: [ACLI_SITE, NO_COLOR]
+
+    - name: aws
+      # AWS CLI. The credential is whatever ~/.aws and AWS_PROFILE resolve to,
+      # so give that profile read-only IAM permissions.
+      #
+      # Every `allow` entry is one read-only API call. Matching is by whole word,
+      # so there is no `describe-*`: each call is listed. Left out on purpose:
+      # anything returning environment variables (lambda get-function*, ecs
+      # describe-task-definition), secretsmanager, ssm get-parameter*, and s3 cp /
+      # sync, which move files. `readback` refuses the calls whose output is
+      # itself a credential, so widening `allow` later cannot leak one.
+      readback:
+        - configure get
+        - configure export-credentials
+        - sts get-session-token
+        - sts get-federation-token
+        - sts assume-role
+        - sts assume-role-with-saml
+        - sts assume-role-with-web-identity
+        - sso get-role-credentials
+        - ecr get-login-password
+        - ecr get-authorization-token
+        - eks get-token
+        - codeartifact get-authorization-token
+        - rds generate-db-auth-token
+      allow:
+        # identity
+        - sts get-caller-identity
+        # storage
+        - s3 ls
+        # logs and metrics. `logs tail --follow` never returns; leave it off.
+        - logs describe-log-groups
+        - logs filter-log-events
+        - logs tail
+        - cloudwatch describe-alarms
+        - cloudwatch get-metric-statistics
+        # compute
+        - ec2 describe-instances
+        - ecs list-clusters
+        - ecs list-services
+        - ecs describe-services
+        - ecs list-tasks
+        - ecs describe-tasks
+        - lambda list-functions
+        # deployments
+        - cloudformation describe-stacks
+        - cloudformation describe-stack-events
+      env_passthrough: [AWS_PROFILE, AWS_REGION, AWS_DEFAULT_REGION, AWS_PAGER, NO_COLOR]
 
 permissions:
   # Whether a tool call can reach you for approval. Changing mode needs a restart.

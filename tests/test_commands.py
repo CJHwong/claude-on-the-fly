@@ -28,6 +28,7 @@ from claude_on_the_fly.commands import (
 )
 
 GH = next(t for t in commands.load_tools() if t.name == "gh")
+AWS = next(t for t in commands.load_tools() if t.name == "aws")
 
 
 # --- argv parsing: the basis of every refusal ---
@@ -836,8 +837,83 @@ def test_acli_has_no_token_readback_because_none_exists():
 
 def test_bundled_config_parses_and_ships_gh_and_acli():
     tools = {t.name: t for t in commands.load_tools()}
-    assert "gh" in tools and "acli" in tools
+    assert "gh" in tools and "acli" in tools and "aws" in tools
     assert ("auth", "token") in tools["gh"].readback
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "diff", "12", "--name-only"],
+        ["pr", "checks", "12"],
+        ["pr", "status"],
+        ["issue", "status"],
+        ["label", "list"],
+        ["workflow", "view", "ci.yml", "--yaml"],
+        ["release", "view", "v1.0"],
+        ["search", "code", "func main", "--repo", "o/r"],
+    ],
+)
+def test_bundled_gh_allows_common_reads(argv):
+    gh = {t.name: t for t in commands.load_tools()}["gh"]
+    assert allowed_command(gh, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "checkout", "12"],
+        ["run", "download", "1"],
+        ["release", "download", "v1.0"],
+        ["release", "create", "v1.0"],
+        ["api", "repos/o/r"],
+        ["secret", "list"],
+    ],
+)
+def test_bundled_gh_still_refuses_writes_and_api(argv):
+    gh = {t.name: t for t in commands.load_tools()}["gh"]
+    assert not allowed_command(gh, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sts", "get-caller-identity"],
+        ["s3", "ls", "s3://bucket/prefix/"],
+        ["--profile", "prod", "logs", "tail", "/aws/lambda/fn", "--since", "1h"],
+        ["ecs", "describe-services", "--cluster", "c", "--services", "s"],
+        ["cloudformation", "describe-stack-events", "--stack-name", "s"],
+    ],
+)
+def test_bundled_aws_allows_reads(argv):
+    assert allowed_command(AWS, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["s3", "cp", "s3://bucket/key", "."],
+        ["lambda", "get-function-configuration", "--function-name", "fn"],
+        ["secretsmanager", "get-secret-value", "--secret-id", "x"],
+        ["ssm", "get-parameter", "--name", "x", "--with-decryption"],
+        ["ec2", "terminate-instances", "--instance-ids", "i-1"],
+    ],
+)
+def test_bundled_aws_refuses_writes_and_secret_reads(argv):
+    assert not allowed_command(AWS, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["configure", "export-credentials"],
+        ["--profile", "prod", "sts", "get-session-token"],
+        ["--debug", "ecr", "get-login-password"],
+        ["eks", "get-token", "--cluster-name", "c"],
+    ],
+)
+def test_bundled_aws_refuses_credential_readback(argv):
+    assert refuses_readback(AWS, argv)
 
 
 def test_readback_is_written_as_words_not_nested_lists(operator_settings):
