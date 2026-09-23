@@ -1615,10 +1615,10 @@ class TestCheckCommands:
     def test_healthy_tool_reports_its_prefix_count(
         self, operator_settings, monkeypatch
     ):
-        self._on_path(monkeypatch, "aws")
+        self._on_path(monkeypatch, "glab")
         operator_settings.write_text(
-            "commands:\n  tools:\n    - name: aws\n      allow:\n"
-            "        - sts get-caller-identity\n        - s3 ls\n"
+            "commands:\n  tools:\n    - name: glab\n      allow:\n"
+            "        - mr list\n        - mr view\n"
         )
         results = checks_mod.check_commands()
         assert [r.status for r in results] == ["ok"]
