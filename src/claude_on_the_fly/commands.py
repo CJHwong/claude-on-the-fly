@@ -1024,6 +1024,17 @@ class CommandBroker:
             self._session_workspaces[token] = workspace.resolve(strict=False)
         return {ENDPOINT_ENV: self.endpoint(), TOKEN_ENV: token}
 
+    def publish_endpoint(self) -> None:
+        """Put the endpoint, and only the endpoint, in this daemon's environment.
+
+        The endpoint is harmless daemon-wide, and `sandbox.agent_env` forwards it
+        to every spawn. The bearer token must be issued per turn and bound to that
+        turn's workspace, so the private base token is kept out of the environment
+        where agent_env could forward it by accident.
+        """
+        os.environ[ENDPOINT_ENV] = self.endpoint()
+        os.environ.pop(TOKEN_ENV, None)
+
     def revoke_token(self, token: str) -> None:
         """Revoke one per-turn workspace token after its agent is reaped."""
         self._session_workspaces.pop(token, None)
@@ -1083,11 +1094,19 @@ class CommandBroker:
                 # else under DATA_DIR, so it is the one place a sandboxed agent can
                 # exec a generated helper from.
                 continue
+            if stale.name.startswith("."):
+                # Another daemon's shim mid-write (see below). Both daemons
+                # write this directory, and sweeping the temp file fails that
+                # daemon's rename.
+                continue
             if stale.is_file() and stale.name not in self._tools:
                 logger.info("commands: removing stale shim %s", stale.name)
                 stale.unlink()
         for name in self._tools:
-            path = self._shim_dir / name
+            # Written aside and renamed over. The chat and jobs daemons both
+            # write here at start, and an agent may exec a shim at any moment;
+            # a rename hands it the old file or the new one, never half of one.
+            path = self._shim_dir / f".{name}.{os.getpid()}.tmp"
             path.write_text(
                 _SHIM_SOURCE.format(
                     interpreter=sys.executable,
@@ -1100,6 +1119,7 @@ class CommandBroker:
                 )
             )
             path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+            os.replace(path, self._shim_dir / name)
 
     async def _handle(self, request):
         from aiohttp import web
