@@ -32,6 +32,33 @@ def test_a_heredoc_body_is_not_a_command(audit):
     ]
 
 
+def test_a_multiline_quoted_argument_is_one_word(audit):
+    """Split at every newline, the body of `python3 -c "..."` came back as rows
+    like `= str`, `))` and `= /home/.../gws`."""
+    code = "\nimport json\nname = str(1)\nGWS = '/home/u/.local/bin/gws'\nprint(len(name))\n"
+    script = f'python3 -c "{code}" && gh pr list'
+    assert [c.argv for c in audit.commands_in(script)] == [
+        ["python3", "-c", code],
+        ["gh", "pr", "list"],
+    ]
+
+
+def test_a_single_quoted_body_and_an_escaped_quote_stay_in_one_word(audit):
+    script = 'python3 -c \'\nx = "a\\"b"\nprint((x))\n\'\necho \\"done'
+    assert [c.argv for c in audit.commands_in(script)] == [
+        ["python3", "-c", '\nx = "a\\"b"\nprint((x))\n'],
+        ["echo", '"done'],
+    ]
+
+
+def test_an_apostrophe_in_a_comment_does_not_open_a_quote(audit):
+    script = "# don't split here\ngh pr list  # isn't a quote\necho done"
+    assert [c.argv for c in audit.commands_in(script)] == [
+        ["gh", "pr", "list"],
+        ["echo", "done"],
+    ]
+
+
 def test_an_assignment_is_not_a_call(audit):
     """`basename("SLACKER=/path/slacker.sh")` is `slacker.sh`, which is how an
     earlier replay counted 121 assignments as invocations."""
