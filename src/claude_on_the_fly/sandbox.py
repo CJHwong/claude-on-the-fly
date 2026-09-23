@@ -1164,7 +1164,7 @@ def _shortest_roots(paths: list[Path]) -> list[Path]:
 
 
 def _codex_link_read_paths() -> list[Path]:
-    """Resolved link targets of the operator's codex home that deny-most hides.
+    """Resolved link targets of the codex home and claude config that deny-most hides.
 
     The read grant on that home covers the links and not what they point at:
     seatbelt matches the path the kernel resolves, so an entry symlinked
@@ -1195,7 +1195,11 @@ def _codex_link_read_paths() -> list[Path]:
         home / ".claude",
     ]
     kept: list[Path] = []
-    for target in codex_state.shared_link_targets(operator):
+    # The claude config dir's links too: the same trap, and Linux mounts those
+    # targets read-only already. `_claude_link_targets` has refused credential
+    # stores and the home by now, so the check below never fires for them.
+    targets = [*codex_state.shared_link_targets(operator), *_claude_link_targets()]
+    for target in targets:
         if not target.is_relative_to(home):
             continue
         if any(target.is_relative_to(tree) for tree in granted):

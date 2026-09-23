@@ -4766,6 +4766,20 @@ class TestWhereTheCodexHomeLinksOut:
         (codex_home / "agents").symlink_to(shared)
         assert sandbox._codex_link_read_paths() == [shared]
 
+    def test_a_link_out_of_the_claude_config_dir_is_granted_too(
+        self, codex_home, tmp_path, monkeypatch
+    ):
+        """The same trap one directory over. Linux mounts these targets read-only
+        already, so `~/.claude/skills -> ~/<repo>/skills` left a macOS turn
+        with no skills while the same layout worked on Linux."""
+        config = tmp_path / "home" / ".claude"
+        (config / "skills").mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        shared = tmp_path / "home" / "soul" / "skills" / "review"
+        shared.mkdir(parents=True)
+        (config / "skills" / "review").symlink_to(shared)
+        assert sandbox._codex_link_read_paths() == [shared]
+
     def test_an_entry_inside_the_codex_home_costs_no_slot(self, codex_home):
         """The grant on that home already covers it, and a slot is scarce."""
         (codex_home / "agents").mkdir()

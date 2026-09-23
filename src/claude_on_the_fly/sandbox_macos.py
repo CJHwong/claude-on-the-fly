@@ -265,9 +265,10 @@ def jail_argv(
         links = [*(codex_link_paths or [])]
         if len(links) > _CODEX_LINK_SLOTS:
             logger.warning(
-                "sandbox: the codex home links out to %d places but there are "
-                "only %d slots; dropping %s. codex will report those as missing "
-                "rather than as denied. Name them in sandbox.extra_paths",
+                "sandbox: the codex home and claude config link out to %d places "
+                "but there are only %d slots; dropping %s. The backend will report "
+                "those as missing rather than as denied. Name them in "
+                "sandbox.extra_paths",
                 len(links),
                 _CODEX_LINK_SLOTS,
                 links[_CODEX_LINK_SLOTS:],

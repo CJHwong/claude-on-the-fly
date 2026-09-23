@@ -530,3 +530,21 @@ def test_naming_a_protected_path_opens_only_that_path(world, monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{soul}:{hooks}")
     assert _can_write(str(hooks / "pre-commit"), project)
     assert not _can_write(str(soul / ".git" / "config"), project)
+
+
+def test_an_entry_the_claude_config_links_out_to_is_readable(world, monkeypatch):
+    """The claude side of the codex case above: a skill linked out of the claude
+    config dir. Linux mounts the target; seatbelt needs a read grant on it."""
+    home, project = world["home"], world["project"]
+    shared = home / "soul" / "skills" / "review"
+    shared.mkdir(parents=True)
+    (shared / "SKILL.md").write_text("how to review\n")
+    beside = home / "soul" / "private.md"
+    beside.write_text("PARITY\n")
+    config = home / ".claude"
+    (config / "skills").mkdir(parents=True, exist_ok=True)
+    (config / "skills" / "review").symlink_to(shared)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+    assert _can_read(str(config / "skills" / "review" / "SKILL.md"), project)
+    assert not _can_read(str(beside), project)

@@ -83,8 +83,8 @@
 ;; can name an ancestor of these trees.
 ;; codex config, the same grant ~/.claude gets for the other backend.
 (allow file-read* (subpath (param "_CODEX_OPERATOR_HOME")))
-;; Where the operator's codex home links out to. The grant above covers that
-;; home, and a symlink inside it is resolved by the kernel before any rule is
+;; Where the operator's codex home and claude config dir link out to. The
+;; grants cover those trees, and a symlink inside it is resolved by the kernel before any rule is
 ;; matched, so an entry pointing elsewhere under the opaque $HOME reads as
 ;; missing while the profile still claims to grant it. Measured: `~/.codex/agents
 ;; -> ~/.agents/agents` made codex exit 1 with "Operation not permitted (os error
