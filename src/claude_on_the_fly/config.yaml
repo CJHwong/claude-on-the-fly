@@ -376,6 +376,9 @@ sandbox:
   # systemd or autostart unit, a LaunchAgent, a directory on the daemon's PATH, or
   # an agent config tree (~/.claude, ~/.codex, ~/.agents) is logged at ERROR and
   # dropped. That list catches the common mistakes and is not a boundary.
+  # Inside a granted tree, a repository's .git/hooks and .git/config and the file
+  # behind a linked cron.yaml or config.yaml stay read-only. Name one of those as
+  # its own entry to make it writable.
   # Grant the narrowest tree that works. This is the setting that decides what a
   # turn can still change after it ends.
   # write_paths:
