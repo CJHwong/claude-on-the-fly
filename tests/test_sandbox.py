@@ -2480,6 +2480,22 @@ def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog)
     assert "this spawn did not" in logged
 
 
+def test_a_startup_probe_without_a_relay_is_debug_not_warning(monkeypatch, caplog):
+    """The startup probes spawn in the probe workspace with no relay on purpose,
+    eight or more per start. A WARNING each time buries the one a real turn logs."""
+    from claude_on_the_fly.agent import DATA_DIR
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    probe = DATA_DIR / "jail" / "probe"
+    probe.mkdir(parents=True, exist_ok=True)
+    with caplog.at_level("DEBUG", logger="claude_on_the_fly.sandbox"):
+        sandbox.wrap(["/bin/echo", "cotf"], probe)
+    relay = [r for r in caplog.records if "no brokered loopback port" in r.getMessage()]
+    assert [r.levelname for r in relay] == ["DEBUG"]
+
+
 # --- one thread's transcripts must not be another thread's to read ---
 
 

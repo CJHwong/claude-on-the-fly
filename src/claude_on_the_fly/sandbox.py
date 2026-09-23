@@ -2348,7 +2348,13 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
         # process is listening on loopback, and the profile denies the internet),
         # so this is not a Linux regression. It is only invisible there, which is
         # why it is said out loud here rather than left to look like a hang.
-        logger.warning(
+        # The startup probes spawn in the probe workspace with no relay by
+        # design, many times per start, so theirs stays at DEBUG.
+        probing = os.path.realpath(workspace) == os.path.realpath(
+            DATA_DIR / "jail" / "probe"
+        )
+        logger.log(
+            logging.DEBUG if probing else logging.WARNING,
             "sandbox: jailing %s with no brokered loopback port. Nothing on the "
             "host is reachable from inside the namespace, so a backend needing a "
             "model endpoint will fail. Chat turns and jobs open a relay; this "
