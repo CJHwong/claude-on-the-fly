@@ -44,9 +44,32 @@ logger = logging.getLogger(__name__)
 # forecloses a family of parser-differential attacks in one check rather than
 # blocklisting each: a NUL truncates in libc getaddrinfo but not in Python
 # str comparisons, percent-encoding decodes inconsistently between the client
-# and this gate, and CR/LF smuggles headers. IPv6 literals and non-punycode
-# IDNs are rejected as a documented consequence.
+# and this gate, and CR/LF smuggles headers. Non-punycode IDNs are rejected as
+# a documented consequence. IP literals go through `ip_literal` instead, which
+# admits only what `ipaddress` parses and refuses a zone id, the one IPv6 form
+# that would bring `%` back.
 _DNS_SAFE_HOST = re.compile(r"\A[A-Za-z0-9.\-]+\Z")
+
+# Entries already reported as dropped. The lists are re-read on every CONNECT,
+# so without this one typo logs an ERROR per request.
+_DROPPED_REPORTED: set[str] = set()
+
+
+def ip_literal(host: str) -> str | None:
+    """`host` as a canonical IPv4 or IPv6 literal, or None if it is not one.
+
+    Brackets are accepted and dropped, since that is how an IPv6 literal is
+    written in a URL or a CONNECT target. A zone id (`fe80::1%eth0`) is refused:
+    `ipaddress` parses it, but `%` is exactly the byte the hostname grammar
+    exists to keep out.
+    """
+    text = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    if "%" in text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return None
 
 
 def canonical_host(host: str) -> str:
@@ -63,15 +86,25 @@ def canonical_host(host: str) -> str:
     Applied to the CONNECT host and to every configured set, because a
     normalisation on one side of a comparison is the bug in a new place.
     """
-    return host.strip().lower().rstrip(".")
+    lowered = host.strip().lower().rstrip(".")
+    return ip_literal(lowered) or lowered
+
+
+def is_valid_host(host: str) -> bool:
+    """True for a DNS-safe name or a plain IP literal. See `ip_literal`."""
+    return is_dns_safe_host(host) or ip_literal(host) is not None
 
 
 def parse_hosts(section: object, key: str, *, source: str) -> frozenset[str]:
-    """One host list out of an `egress:` section, canonical. Raises ValueError.
+    """One host list out of an `egress:` section, canonical.
 
-    Hosts are validated here rather than at CONNECT time so a typo is a startup
-    error naming the file, not a silently dead entry that turns into an approval
-    prompt months later for a host the operator believes they already allowed.
+    Hosts are validated here rather than at CONNECT time so a typo is an ERROR
+    naming the file and the entry, not a silently dead entry that turns into an
+    approval prompt months later for a host the operator believes they already
+    allowed. Only that entry is dropped, as `sandbox.extra_paths` drops one: the
+    whole list used to go, taking every good entry beside the typo with it. A
+    section that is not a mapping, or a key that is not a list, still raises,
+    because then there is no entry to keep.
     """
     if not isinstance(section, Mapping):
         raise ValueError(f"{source}: the egress section must be a mapping")
@@ -84,8 +117,15 @@ def parse_hosts(section: object, key: str, *, source: str) -> frozenset[str]:
     hosts = set()
     for item in value:
         host = canonical_host(str(item))
-        if not is_dns_safe_host(host):
-            raise ValueError(f"{source}: egress.{key} entry {item!r} is not a hostname")
+        if not is_valid_host(host):
+            message = (
+                f"{source}: egress.{key} entry {item!r} is not a hostname or IP "
+                "address; dropped, the other entries still apply"
+            )
+            if message not in _DROPPED_REPORTED:
+                _DROPPED_REPORTED.add(message)
+                logger.error("egress: %s", message)
+            continue
         hosts.add(host)
     return frozenset(hosts)
 
@@ -299,8 +339,20 @@ def parse_connect_target(target: str) -> tuple[str, int] | None:
     A CONNECT target is always authority-form (`host:port`) per RFC 7231. The
     port is mandatory in practice and required here, because defaulting it would
     let a caller widen a grant scoped to one port.
+
+    An IPv6 literal must be bracketed (`[::1]:443`), as RFC 3986 writes it.
+    Unbracketed, `::1:443` has no one reading of where the port starts.
     """
-    host, separator, port_text = target.rpartition(":")
+    if target.startswith("["):
+        literal, bracket, rest = target.partition("]")
+        host = ip_literal(f"{literal}]") if bracket else None
+        separator, port_text = rest[:1], rest[1:]
+        if host is None or ":" not in host or separator != ":":
+            return None
+    else:
+        host, separator, port_text = target.rpartition(":")
+        if ":" in host:
+            return None
     if not separator or not host or not port_text.isdigit():
         return None
     port = int(port_text)
@@ -575,7 +627,7 @@ class EgressProxy:
         # of every decision below, so `metadata.google.internal.` must not be a
         # different name from `metadata.google.internal`.
         lowered = canonical_host(host)
-        if not is_dns_safe_host(lowered):
+        if not is_valid_host(lowered):
             logger.warning("%s: refuse %r (host is not DNS-safe)", self._tag, host)
             return _Decision(None, "host is not DNS-safe", _MALFORMED_HOST)
         if lowered in self._never_ask:

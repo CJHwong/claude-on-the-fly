@@ -152,12 +152,14 @@ appends to an earlier turn's.
 
 | Key | Type / default | Effect | Lifecycle |
 |---|---|---|---|
-| `allow` | list of hostnames / packaged list | Tunnel without asking | Immediate, next CONNECT |
-| `private_allow` | list of hostnames / empty | Permit explicitly listed names to resolve to private or loopback addresses | Immediate, next CONNECT |
-| `never_ask` | list of hostnames / packaged list | Refuse without offering approval | Immediate, next CONNECT |
+| `allow` | list of hostnames or IP addresses / packaged list | Tunnel without asking | Immediate, next CONNECT |
+| `private_allow` | list of hostnames or IP addresses / empty | Permit explicitly listed names to resolve to private or loopback addresses | Immediate, next CONNECT |
+| `never_ask` | list of hostnames or IP addresses / packaged list | Refuse without offering approval | Immediate, next CONNECT |
 
 Operator lists are unioned with packaged lists. They cannot subtract packaged model
-hosts or metadata denials. A malformed operator list falls back to packaged entries.
+hosts or metadata denials. An entry that is not a hostname or an IP address is dropped
+with an error naming it, and the rest of the list applies. A value that is not a list
+falls back to packaged entries. Link-local addresses stay refused even in `private_allow`.
 `allow` alone never bypasses public-address validation; use `private_allow` only for a
 known local service. Every hostname is resolved and pinned before tunnelling. An allowed
 host is a covert channel: TLS payloads are not inspected.
