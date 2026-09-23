@@ -179,13 +179,39 @@ through the environment. The obvious codex equivalent, `CODEX_ACCESS_TOKEN`, exp
 agent identity JWT and rejects the ChatGPT access token in `auth.json` (measured: "agent
 identity JWT payload is not valid JSON"). So a jailed codex still reads `auth.json`.
 
-A broker route is the likely way out, and half of it is measured. codex 0.156 with no
+A broker route is the likely way out, and most of it is measured. codex 0.156 with no
 `auth.json` sends every model call to a loopback base URL when given a custom
 `model_providers` entry with `requires_openai_auth=false`, placeholder `Authorization`
 and `ChatGPT-Account-Id` headers, and `chatgpt_base_url` pointed at the same port: all 30
-`POST /backend-api/codex/responses` of one turn arrived there. Not measured: whether
-chatgpt.com accepts the brokered request, and whether the request body differs from the
-built-in provider's. The broker would also own the token refresh codex does today.
+`POST /backend-api/codex/responses` of one turn arrived there.
+
+A throwaway relay on that port replaced both headers with the values from the
+operator's `auth.json` and forwarded to `https://chatgpt.com`. chatgpt.com answered 200
+every time. Measured through it, with no `auth.json` in the codex home:
+
+- a turn that ran a shell tool and wrote a file got the right answer;
+- `codex exec resume --last` continued the same session;
+- the same turn under the macOS `deny-most` jail completed, while a control read of
+  `~/.ssh/config` inside that jail was refused.
+
+In this mode codex made one side call (`GET /backend-api/plugins/featured`) besides the
+model calls. Logged in the ordinary way it made about fifty (`plugins`, `wham`,
+`analytics-events`), so a route can stay narrow.
+
+What a broker route needs that the current `Route` lacks: two injected headers rather
+than one, and a credential read per request rather than once at start, because the
+token rotates.
+
+Not measured:
+
+- **Token refresh.** Once no unjailed codex runs, nothing refreshes the token. The
+  broker would have to call the refresh endpoint itself, and that call is not verified.
+  This is the risk that decides whether the route is worth building.
+- **Request body parity.** The built-in provider refuses a plain-HTTP
+  `chatgpt_base_url` ("workspace backend must use an HTTPS origin without
+  credentials"), so its body could not be captured for comparison.
+- **Stability.** `/backend-api/` is not a public API. A codex release can change its
+  paths or headers, so each upgrade would need a re-run.
 
 ### The self-test
 
