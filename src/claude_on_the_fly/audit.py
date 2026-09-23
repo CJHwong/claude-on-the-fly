@@ -67,6 +67,8 @@ class Tally:
 
 # --- splitting a Bash call into commands ---
 
+_OPERATOR_CHARS = ";&|()<>"
+
 
 def _without_heredocs(script: str) -> list[str]:
     """The lines of `script` with every heredoc body removed.
@@ -86,16 +88,29 @@ def _without_heredocs(script: str) -> list[str]:
     return kept
 
 
-def _quote_left_open(line: str, quote: str) -> str:
-    """The quote still open at the end of `line`, given the one open at its start.
+def _starts_comment(char: str, previous: str) -> bool:
+    """bash reads `#` as a comment only where a word starts. `p#frag` is a word."""
+    return char == "#" and (previous.isspace() or previous in _OPERATOR_CHARS)
 
-    "" means none. A `#` that starts a word outside quotes ends the scan, so the
-    apostrophe in `# don't` does not open one.
+
+def _scan(line: str, quote: str) -> tuple[str, str]:
+    """`line` without its comments, and the quote still open at its end.
+
+    `quote` is the one open at its start ("" for none). A comment runs to the
+    newline, so the apostrophe in `# don't` opens nothing. shlex cut at any
+    unquoted `#`, so `curl https://a.com/p#frag > out` lost its redirect and the
+    write was never judged.
     """
+    kept: list[str] = []
     escaped = False
     previous = " "
+    in_comment = False
     for char in line:
-        if escaped:
+        if in_comment:
+            in_comment = char != "\n"
+            if in_comment:
+                continue
+        elif escaped:
             escaped = False
         elif char == "\\" and quote != "'":
             escaped = True
@@ -103,10 +118,12 @@ def _quote_left_open(line: str, quote: str) -> str:
             quote = "" if char == quote else quote
         elif char in "'\"":
             quote = char
-        elif char == "#" and previous.isspace():
-            return ""
+        elif _starts_comment(char, previous):
+            in_comment = True
+            continue
+        kept.append(char)
         previous = char
-    return quote
+    return "".join(kept), quote
 
 
 def _logical_lines(script: str) -> list[str]:
@@ -120,7 +137,7 @@ def _logical_lines(script: str) -> list[str]:
     quote = ""
     for line in text.splitlines():
         pending.append(line)
-        quote = _quote_left_open(line, quote)
+        quote = _scan(line, quote)[1]
         if not quote:
             lines.append("\n".join(pending))
             pending = []
@@ -130,8 +147,11 @@ def _logical_lines(script: str) -> list[str]:
 
 
 def _tokens(line: str) -> list[str]:
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()<>")
+    lexer = shlex.shlex(
+        _scan(line, "")[0], posix=True, punctuation_chars=_OPERATOR_CHARS
+    )
     lexer.whitespace_split = True
+    lexer.commenters = ""
     try:
         return list(lexer)
     except ValueError:
