@@ -46,13 +46,20 @@ flags prevent credential material crossing back. Tool entries merge by name; rem
 packaged refusals are warned. An operator override without `allow` therefore disables
 that tool until its safe subcommands are listed.
 
-Only the chat daemon runs a command broker, but the shim dir is shared under `DATA_DIR`.
-`sandbox._with_shims_on_path` therefore puts the shims on PATH only when the spawn env
-carries `COTF_CMD_ENDPOINT`. Without that check, an agent the jobs daemon starts found
-the shim, had no broker to reach, and every brokered tool failed. A job runs the real
-binary instead: that works under `mode: env` and fails on the denied credential under
-`jail`. A broker in the jobs daemon needs its own shim dir, because a second broker's
-`write_shims` removes shims the first one wrote.
+The chat and jobs daemons each run a command broker on the one shim dir under
+`DATA_DIR`. That is safe: a shim carries no endpoint and reads `COTF_CMD_ENDPOINT` and
+`COTF_CMD_TOKEN` from its environment, so two daemons with the same config write
+identical files. `write_shims` writes each shim aside and renames it over, and the stale
+sweep skips dot files, so neither daemon can hand an agent half a shim or sweep the
+other's temp file. `sandbox._with_shims_on_path` still puts the shims on PATH only when
+the spawn env carries `COTF_CMD_ENDPOINT`, so a daemon with no broker runs the real
+binary rather than a shim with nothing to reach.
+
+`jobs/brokers.JobBrokers` gives a job what a chat turn gets: the credential broker, the
+command broker, a per-job egress proxy, and the jail relay. The token is bound to the
+job's workspace and revoked when the job ends. Nobody can answer a prompt for a job, so
+every gate is `DenyAllGate`: a command off the allowlist, a host off the egress list,
+and a credential route that would ask are all refused, and the log says so.
 
 The broker does not parse arbitrary CLI semantics after an allowed prefix. Generic API
 subcommands remain unavailable unless explicitly listed, and provider-side credential

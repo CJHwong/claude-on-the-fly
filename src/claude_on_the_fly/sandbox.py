@@ -2089,10 +2089,11 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     )
     sockets = _SESSION_SOCKETS.get() or {}
     if not sockets:
-        # Reached by any caller that spawns without opening a relay first -- the
-        # jobs daemon is the live example, since it runs as its own process and
-        # builds no broker or proxy at all. The namespace then has no route to
-        # any host service, so the agent cannot reach a brokered model endpoint.
+        # Reached by any caller that spawns without opening a relay first. Chat
+        # turns and jobs both open one, so this is a caller that forgot, or a
+        # jobs daemon whose brokers did not start. The namespace then has no
+        # route to any host service, so the agent cannot reach a brokered model
+        # endpoint.
         #
         # macOS is in the same position for the same reason (nothing in that
         # process is listening on loopback, and the profile denies the internet),
@@ -2101,8 +2102,8 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
         logger.warning(
             "sandbox: jailing %s with no brokered loopback port. Nothing on the "
             "host is reachable from inside the namespace, so a backend needing a "
-            "model endpoint will fail. Chat turns open a relay; the jobs daemon "
-            "does not, and `sandbox.mode: jail` does not support it.",
+            "model endpoint will fail. Chat turns and jobs open a relay; this "
+            "spawn did not.",
             argv[0] if argv else "?",
         )
     jailed = sandbox_linux.jail_argv(

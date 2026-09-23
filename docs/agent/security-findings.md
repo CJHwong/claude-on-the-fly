@@ -267,6 +267,24 @@ brokers. A `/notify` loop drives Escape keystrokes into the operator's pty pane.
 **pty dialog grants use a 48-bit truncated digest** of wrap-damaged pane text, while the
 other two subjects were widened to the full digest.
 
+### Linux jail reach
+
+Both found on maoao while proving the jobs daemon's brokers under `jail`. Neither is
+specific to jobs; a chat turn hits them the same way.
+
+**The jail breaks uv's minor-version interpreter link.** A uv venv's `bin/python` points
+at `~/.local/share/uv/python/cpython-3.X-<platform>`, which is itself a symlink to the
+patch-level directory. The grant binds `sys.prefix` and the resolved `sys.base_prefix`,
+not the link between them, and `$HOME` is a tmpfs, so `execvp` of the venv's python fails
+inside the namespace. That fails the preflight (the daemon refuses to start) and every
+shim, whose shebang is that interpreter. The installed tool on maoao has this chain, so
+switching it to `jail` today stops every daemon at startup.
+
+**`claude.mode: ollama` cannot reach the ollama server from a Linux jail.** The relay
+bridges a published `*_BASE_URL`, the egress proxy, and the brokers. Ollama mode
+publishes no base URL, so port 11434 is never bridged and the jailed `ollama launch`
+answers "could not connect to ollama server".
+
 ## Considered while adding tmux panes
 
 Not a review's findings. What the pane work (`tmux.py`, `backends/codex.py`) changed
@@ -360,7 +378,8 @@ replay from a partial journal record; submodules and the checkout's own `.git/ho
   real turn.
 - A real `api.anthropic.com` leg for the claude backend under the jail. Every macOS
   validation used a loopback stub.
-- Jobs and cron under the jail. All validation went through a chat turn.
+- A full job agent run under the jail. The jobs brokers were proven on maoao by driving
+  them directly, because the ollama gap above stops the model from starting.
 - Two concurrent jailed turns, so the per-turn `_SESSION_ENV` ContextVar is untested under
   real concurrency.
 - Codex under the macOS jail, and claude under the Linux jail. Both share the policy layer;

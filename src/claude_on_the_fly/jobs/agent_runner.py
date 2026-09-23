@@ -39,6 +39,7 @@ stdin, and it may consume input meant for the shell. Run the worker detached
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import time
@@ -48,6 +49,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from claude_on_the_fly import agent, sandbox, settings, tmux, transcript
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
+from claude_on_the_fly.jobs.brokers import JobBrokers
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.keys import safe_segment
 from claude_on_the_fly.transcript import remove_workspace_sessions
@@ -196,6 +198,9 @@ class OrchestratorAgentRunner:
     # session from this. Populated when a run starts, cleared when it ends —
     # including on cancel, via the finally below.
     in_flight: dict[str, dict] = field(default_factory=dict)
+    # The jobs daemon's sandbox services. None when the daemon runs none, which
+    # leaves a job exactly as it was: no broker env, the real binaries on PATH.
+    brokers: JobBrokers | None = None
 
     async def run(self, job: Job) -> Result:
         # A keyed job's run id IS its session key, which is what makes the
@@ -221,8 +226,20 @@ class OrchestratorAgentRunner:
             if tmux.hosting_available()
             else None
         )
-        env_token = sandbox.session_env(pane.env) if pane is not None else None
+        env_token = None
+        job_services = contextlib.AsyncExitStack()
         try:
+            overrides = dict(pane.env) if pane is not None else {}
+            if self.brokers is not None:
+                # The command token, egress proxy and Linux relay a chat turn gets,
+                # held for this run only.
+                overrides.update(
+                    await job_services.enter_async_context(
+                        self.brokers.for_job(workspace, run_id)
+                    )
+                )
+            if overrides:
+                env_token = sandbox.session_env(overrides)
             # Keyed on `job.key`, the same field that names the unit of work in the
             # log line below: a poller aimed at one tracker can run its own
             # instructions without every other job inheriting them.
@@ -290,6 +307,7 @@ class OrchestratorAgentRunner:
             self.in_flight.pop(job.id, None)
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
+            await job_services.aclose()
             if pane is not None:
                 # Ends the server, which is the only reap that reaches a process
                 # the agent left running inside the pane.

@@ -465,6 +465,64 @@ class TestRunLoopWiring:
 
         assert order == ["verify_boundary", "build", "sweep", "run_loop"]
 
+    async def test_the_brokers_start_after_the_boundary_and_stop_last(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A job's agent needs the brokers a chat turn has, and nothing may claim
+        work before the jail is proven, so they start between the two. They reach
+        the runner through build_components and stop when the worker does."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        order: list[str] = []
+
+        class FakeBrokers:
+            async def start(self):
+                order.append("brokers.start")
+
+            async def stop(self):
+                order.append("brokers.stop")
+
+        fake = FakeBrokers()
+        monkeypatch.setattr(cli, "JobBrokers", lambda: fake)
+        handed: list = []
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda *args: (
+                handed.append(args[2]),
+                order.append("build"),
+                (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
+            )[2],
+        )
+
+        async def verify(*_args, **_kwargs):
+            order.append("verify_boundary")
+
+        monkeypatch.setattr(cli.sandbox, "verify_boundary", verify)
+        ledger = MagicMock()
+        ledger.sweep.return_value = 0
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+
+        async def fake_run_loop(*_args, **_kwargs):
+            order.append("run_loop")
+
+        monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
+
+        await cli._run("xoxb-token")
+
+        assert order == [
+            "verify_boundary",
+            "brokers.start",
+            "build",
+            "run_loop",
+            "brokers.stop",
+        ]
+        assert handed == [fake]
+
 
 @pytest.mark.parametrize(
     "error",

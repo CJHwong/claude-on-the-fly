@@ -2199,10 +2199,10 @@ def test_allow_reads_does_not_pass_runtime_slots(monkeypatch, tmp_path):
 
 
 def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog):
-    """The jobs daemon spawns without opening a relay, because it runs as its own
-    process and builds no broker. The namespace then reaches nothing on the host.
-    macOS is in the same position for the same reason, so this is not a Linux
-    regression -- but there it merely fails, where here it would look like a hang."""
+    """A spawn with no relay open reaches nothing on the host from inside the
+    namespace. macOS is in the same position for the same reason, so this is not
+    a Linux regression -- but there it merely fails, where here it would look like
+    a hang."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -2210,7 +2210,7 @@ def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog)
         sandbox.wrap(["codex", "exec"], tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "no brokered loopback port" in logged
-    assert "jobs daemon" in logged
+    assert "this spawn did not" in logged
 
 
 # --- one thread's transcripts must not be another thread's to read ---

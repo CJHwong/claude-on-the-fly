@@ -27,12 +27,11 @@ Before adding a tool:
    API or mutation prefixes unless you have reviewed their full provider-side scope.
 4. List commands and flags that print or mutate authentication state.
 5. Pass only environment names the real CLI requires.
-6. Restart the chat daemon so shims are rebuilt.
+6. Restart the chat and jobs daemons so shims are rebuilt.
 7. Test one allowed command, one rejected command, and every readback refusal.
 
-Only chat turns go through the broker. A cron job runs the real binary with no shim, so
-under `mode: env` it uses the tool's own credential as before, and under `mode: jail` it
-cannot reach the credential and fails.
+Chat turns and cron jobs both go through the broker. A job has nobody to ask, so a
+command that a chat turn would ask the operator about is refused for a job instead.
 
 ## Admit a REST subcommand for reads only
 

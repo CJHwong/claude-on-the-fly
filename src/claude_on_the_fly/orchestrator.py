@@ -1489,7 +1489,6 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
     appends frontend-specific fields via Frontend.describe(). Secrets are
     expected to be redacted by the frontend before being returned.
     """
-    import os
 
     backend = settings.get("AGENT_BACKEND", "claude").lower()
     mode_var = f"{backend.upper()}_MODE"
@@ -1553,19 +1552,7 @@ async def _start_sandbox(
         # harmless endpoint here; the session token is layered by _process().
         command_broker = commands.CommandBroker(sandbox.shim_dir())
         await command_broker.start()
-        # The endpoint is harmless to publish daemon-wide, but the bearer token
-        # must be issued per turn and bound to that turn's workspace. Do not leave
-        # the private base token in the daemon environment for sandbox.agent_env
-        # to forward accidentally.
-        command_env = command_broker.agent_env()
-        os.environ.update(
-            {
-                key: value
-                for key, value in command_env.items()
-                if key != commands.TOKEN_ENV
-            }
-        )
-        os.environ.pop(commands.TOKEN_ENV, None)
+        command_broker.publish_endpoint()
     except Exception:
         logger.exception("sandbox: startup failed, revoking what already started")
         if command_broker is not None:

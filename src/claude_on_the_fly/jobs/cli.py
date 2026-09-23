@@ -38,6 +38,7 @@ from claude_on_the_fly.jobs.agent_runner import (
     sweep_run_workspaces,
 )
 from claude_on_the_fly.jobs.alerts import build_alert_sink
+from claude_on_the_fly.jobs.brokers import JobBrokers
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
     AlertSink,
@@ -158,7 +159,7 @@ def _notifier_loop_warning(
 
 
 def build_components(
-    token: str, env: Mapping[str, str]
+    token: str, env: Mapping[str, str], brokers: JobBrokers | None = None
 ) -> tuple[JobQueue, AgentRunner, Notifier, OutcomeRecorder, AlertSink | None]:
     """Wire the worker's adapters from config — the single construction
     point the daemon uses.
@@ -176,7 +177,9 @@ def build_components(
     from claude_on_the_fly.cron import append_log
 
     queue = make_queue()
-    runner = OrchestratorAgentRunner(data_dir=agent.DATA_DIR, timeout=_timeout_s())
+    runner = OrchestratorAgentRunner(
+        data_dir=agent.DATA_DIR, timeout=_timeout_s(), brokers=brokers
+    )
     # One worker drains both producers, so delivery has to fan back out by where
     # the job came from: a Slack thread, or the cron entry's own log file.
     notifier = RoutingNotifier(
@@ -226,6 +229,7 @@ async def _run(token: str) -> None:
     heartbeat.claim()
     heartbeat_task: asyncio.Task[None] | None = None
     ledger: ProcessLedger | None = None
+    brokers: JobBrokers | None = None
     listener_attached = False
     try:
         # Before anything claims a job, and after the signal handlers so the probes
@@ -244,8 +248,15 @@ async def _run(token: str) -> None:
         # opposite choice is silent and irreversible: the reads have happened.
         await sandbox.verify_boundary()
 
+        # After the boundary is proven and before anything claims work: a job's
+        # agent needs the brokers a chat turn has, or every brokered tool fails
+        # and a Linux-jailed job cannot reach its model. Nobody can answer a
+        # prompt for a job, so everything that would ask is refused instead.
+        brokers = JobBrokers()
+        await brokers.start()
+
         queue, runner, notifier, recorder, alert_sink = build_components(
-            token, settings.environment()
+            token, settings.environment(), brokers
         )
 
         # Reap what a previous worker orphaned, before anything claims work:
@@ -305,6 +316,8 @@ async def _run(token: str) -> None:
             alert_sink=alert_sink,
         )
     finally:
+        if brokers is not None:
+            await brokers.stop()
         if listener_attached and ledger is not None:
             agent.remove_process_listener(ledger.on_process)
         if heartbeat_task is not None:

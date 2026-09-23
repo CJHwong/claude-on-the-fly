@@ -2100,9 +2100,6 @@ class TestStartSandbox:
         command_broker.start = AsyncMock()
         command_broker.stop = AsyncMock()
         command_broker.shimmed = ["gh"]
-        command_broker.agent_env = lambda: {
-            "COTF_COMMAND_ENDPOINT": "http://127.0.0.1:1"
-        }
         monkeypatch.setattr(
             orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
         )
@@ -2115,13 +2112,10 @@ class TestStartSandbox:
             egress_manager,
             got_commands,
         ) = await orchestrator_mod._start_sandbox(frontend)
-        try:
-            assert got_broker is credential_broker
-            assert got_commands is command_broker
-            assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
-            assert os.environ["COTF_COMMAND_ENDPOINT"] == "http://127.0.0.1:1"
-        finally:
-            os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+        assert got_broker is credential_broker
+        assert got_commands is command_broker
+        assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
+        command_broker.publish_endpoint.assert_called_once_with()
 
     async def _start_with(self, frontend, monkeypatch):
         """Start the sandbox with both brokers stubbed. Returns the triple."""
