@@ -7,7 +7,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -785,20 +785,56 @@ class _RecordingBrokers:
 
     def __init__(self) -> None:
         self.entered: list[tuple[Path, str]] = []
+        self.model_envs: list[dict[str, str]] = []
         self.released = 0
 
-    def for_job(self, workspace: Path, key: str):
+    def for_job(self, workspace: Path, key: str, model_env=None):
         import contextlib
 
         @contextlib.asynccontextmanager
         async def scope():
             self.entered.append((workspace, key))
+            self.model_envs.append(dict(model_env or {}))
             try:
                 yield {"COTF_CMD_TOKEN": "job-token"}
             finally:
                 self.released += 1
 
         return scope()
+
+
+async def test_the_brokers_get_the_jobs_model_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolved from the job's own profile, before the relay opens. A job
+    running an ollama profile otherwise had no route to its model server."""
+    from claude_on_the_fly import sandbox
+
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    monkeypatch.setattr(
+        sandbox,
+        "model_endpoint_env",
+        lambda mode: {"OLLAMA_HOST": f"for-{mode}"},
+    )
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            AsyncMock(return_value=Response(body="ok")),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.resolve_profile",
+            return_value=MagicMock(mode="ollama"),
+        ),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:ollama:glm",
+        ),
+    ):
+        await runner.run(_job())
+
+    assert brokers.model_envs == [{"OLLAMA_HOST": "for-ollama"}]
 
 
 async def test_a_job_agent_runs_with_the_brokers_env(tmp_path: Path) -> None:

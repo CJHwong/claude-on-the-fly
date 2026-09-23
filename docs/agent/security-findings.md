@@ -37,6 +37,8 @@ upgrade path, so none of that was covered by it.
 | `sandbox.extra_paths` had no validation, so the remedy `_JAIL_GUIDANCE` tells the agent to relay was also the bypass: an entry of `$HOME` re-opened `~/.ssh` and `~/.aws` | `sandbox._extra_read_paths` | Entries resolving to the home, an ancestor of it, or a credential store in either direction are logged at ERROR and dropped, the rest still granted; a test asserts every `_DENY_PROBES` entry is out of reach |
 | The command-broker path guard missed an attached short option, a second `=`, a traversal attached to a short option, and a relative path through a planted symlink, on a broker that runs outside the jail with the operator's credential | `commands._unsafe_path_argument` | All four verified passing the old guard and refused by the new one; the guard now reads every `=` segment and the short-option tail, and resolves each candidate against the settled cwd |
 | The agent's uv cache was the operator's, and `upgrade.run` installs from it outside any jail with the TUI's full environment | `seatbelt/*.sb`, `sandbox.agent_env` | Write grant moved to `DATA_DIR/uv-cache` and published as `UV_CACHE_DIR`; a live jailed write to `~/.cache/uv` reports "Operation not permitted" under both bases, while `uv venv` and `uv pip install --offline` complete and populate the new cache |
+| A uv venv's python runs through `cpython-3.X-*`, a link to the patch directory. The Linux wrap mounted the resolved directory and dropped the link, because bwrap refuses to bind onto a symlink, so under the tmpfs `$HOME` exec failed on a path that looked granted. That failed the preflight and every shim, and the installed tool on maoao has this chain | `sandbox._linked_dirs`, `sandbox_linux.jail_argv(links=)` | On maoao, a `uv sync` venv failed the preflight with "bwrap: execvp .venv/bin/python: No such file or directory". With the link recreated by `--symlink`, the preflight passes on the same venv. The link is added only when its target is already granted |
+| `claude.mode: ollama` could not run under a Linux jail. It publishes no base URL, so the relay never bridged the ollama port, and `ollama launch` execs claude, which `argv[0]` never names | `sandbox.model_endpoint_env`, `sandbox._EXECS_BEHIND` | On maoao the jailed launch first answered "could not connect to ollama server", then "claude is not installed". With both fixed, a queued cron job under `jail` got a model answer, ran `slacker.sh` through the job broker, and saw `gh auth token` refused (rc 126) and `example.com` refused (403) without a prompt. Only an ollama turn gets the port: the ollama API has no auth |
 | The startup self-test ran in one daemon of the two that spawn jailed agents, so a jail that could not hold `state/` stopped Slack loudly while the job worker kept draining the same queue across it | `sandbox.verify_boundary`, `jobs/cli._run` | Both halves now run from the worker's composition root before it claims work, fatal with exit 2; ordering and the before-claim position are asserted in `tests/jobs/test_cli.py` and `tests/test_sandbox.py`. Cron is deliberately not gated: it runs shell and never calls `agent.run` |
 | The macOS `deny-most` profile granted the project subpath but not stat() on its parents under the opaque `$HOME`, so git's repository discovery failed on the home directory and no git command worked inside a workspace | `seatbelt/fs-deny-most.sb` `_ANCESTOR_*`, `sandbox_macos.home_ancestors` | `git init` and `git clone --shared` measured failing with "Operation not permitted" on macOS 26 under the stock profile and passing with a metadata literal per ancestor; the parity suite now runs `git init` in the workspace on both platforms and checks a sibling of the path stays hidden |
 | `verify_denials` could pass having proven nothing: a probe that raised was dropped from the results, so an all-timeout run logged `0/0 probed paths confirmed denied` at INFO and returned success | `sandbox.verify_denials` | A probe that could not run is now `UNTESTED` and fatal, and every probe lands in the results dict. Reverting the `UNTESTED` return makes `test_a_probe_that_cannot_be_spawned_refuses_to_start` and `test_a_probe_that_hangs_is_abandoned_not_awaited_forever` fail. `ABSENT` stays non-fatal: the file is genuinely not on the host, and `preflight` has already proven the jail starts |
@@ -267,24 +269,6 @@ brokers. A `/notify` loop drives Escape keystrokes into the operator's pty pane.
 **pty dialog grants use a 48-bit truncated digest** of wrap-damaged pane text, while the
 other two subjects were widened to the full digest.
 
-### Linux jail reach
-
-Both found on maoao while proving the jobs daemon's brokers under `jail`. Neither is
-specific to jobs; a chat turn hits them the same way.
-
-**The jail breaks uv's minor-version interpreter link.** A uv venv's `bin/python` points
-at `~/.local/share/uv/python/cpython-3.X-<platform>`, which is itself a symlink to the
-patch-level directory. The grant binds `sys.prefix` and the resolved `sys.base_prefix`,
-not the link between them, and `$HOME` is a tmpfs, so `execvp` of the venv's python fails
-inside the namespace. That fails the preflight (the daemon refuses to start) and every
-shim, whose shebang is that interpreter. The installed tool on maoao has this chain, so
-switching it to `jail` today stops every daemon at startup.
-
-**`claude.mode: ollama` cannot reach the ollama server from a Linux jail.** The relay
-bridges a published `*_BASE_URL`, the egress proxy, and the brokers. Ollama mode
-publishes no base URL, so port 11434 is never bridged and the jailed `ollama launch`
-answers "could not connect to ollama server".
-
 ## Considered while adding tmux panes
 
 Not a review's findings. What the pane work (`tmux.py`, `backends/codex.py`) changed
@@ -378,8 +362,9 @@ replay from a partial journal record; submodules and the checkout's own `.git/ho
   real turn.
 - A real `api.anthropic.com` leg for the claude backend under the jail. Every macOS
   validation used a loopback stub.
-- A full job agent run under the jail. The jobs brokers were proven on maoao by driving
-  them directly, because the ollama gap above stops the model from starting.
+- Codex through `ollama launch` under the Linux jail. Only claude was run.
+- `sandbox.broker_only_loopback` with an ollama turn on macOS: the ollama port can be the
+  fifth loopback service, past the four profile slots, and the overflow only warns.
 - Two concurrent jailed turns, so the per-turn `_SESSION_ENV` ContextVar is untested under
   real concurrency.
 - Codex under the macOS jail, and claude under the Linux jail. Both share the policy layer;

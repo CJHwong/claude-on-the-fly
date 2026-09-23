@@ -781,6 +781,41 @@ class TestProcess:
         command_broker.agent_env.assert_called_once_with(workspace)
         command_broker.revoke_token.assert_called_once_with(f"token:{workspace}")
 
+    async def test_the_relay_bridges_the_turns_model_server(
+        self,
+        orch: Orchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ollama turn names its server before the relay opens. Opened after,
+        the Linux jail has no route to it and the model never starts."""
+        seen: dict = {}
+
+        def model_endpoint_env(profile_mode):
+            seen["mode"] = profile_mode
+            return {"OLLAMA_HOST": "http://127.0.0.1:11434"}
+
+        async def open_session_relay(overrides, key):
+            seen["overrides"] = dict(overrides)
+            return orchestrator_mod.sandbox.SessionRelay(None, None)
+
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "model_endpoint_env", model_endpoint_env
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "open_session_relay", open_session_relay
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+            profile = mock_agent.apply_override.return_value
+
+        assert seen["mode"] is profile.mode
+        assert seen["overrides"]["OLLAMA_HOST"] == "http://127.0.0.1:11434"
+
     async def test_sends_error_on_agent_failure(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:

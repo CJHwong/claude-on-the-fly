@@ -1025,6 +1025,8 @@ class Orchestrator:
                 command_env = self._commands.agent_env(workspace)
                 command_token = command_env[commands.TOKEN_ENV]
                 session_overrides.update(command_env)
+            # An ollama turn's model server, so the relay below bridges it.
+            session_overrides.update(sandbox.model_endpoint_env(profile.mode))
             # Must come before the spawn and after the overrides are known: on a
             # Linux jail the agent's network namespace contains nothing until
             # this bridges the brokered ports into it, and one of those ports

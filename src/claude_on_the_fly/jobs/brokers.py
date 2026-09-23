@@ -15,7 +15,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
 from claude_on_the_fly import approvals, broker, commands, egress, sandbox
@@ -83,8 +83,14 @@ class JobBrokers:
             self._credentials = None
 
     @contextlib.asynccontextmanager
-    async def for_job(self, workspace: Path, key: str) -> AsyncIterator[dict[str, str]]:
-        """The env one job's agent needs, torn down when the job ends."""
+    async def for_job(
+        self, workspace: Path, key: str, model_env: Mapping[str, str] | None = None
+    ) -> AsyncIterator[dict[str, str]]:
+        """The env one job's agent needs, torn down when the job ends.
+
+        `model_env` names the job's model server (`sandbox.model_endpoint_env`),
+        so the relay bridges it along with the brokers.
+        """
         command_broker = self._commands
         if command_broker is None:
             yield {}
@@ -104,6 +110,7 @@ class JobBrokers:
             command_env = command_broker.agent_env(workspace)
             token = command_env[commands.TOKEN_ENV]
             overrides.update(command_env)
+            overrides.update(model_env or {})
             # After the overrides are known: on a Linux jail the namespace holds
             # nothing until this bridges their ports in, the job's own egress
             # proxy among them. Inert everywhere else.

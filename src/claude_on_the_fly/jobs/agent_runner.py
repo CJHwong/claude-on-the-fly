@@ -229,13 +229,27 @@ class OrchestratorAgentRunner:
         env_token = None
         job_services = contextlib.AsyncExitStack()
         try:
+            # Resolved once, before the brokers, because the relay they open has
+            # to bridge this profile's model server. Used again for the session
+            # seed and the run. A bad profile name is the operator's typo, so it
+            # reports as a failed job with the name in it rather than as a
+            # traceback.
+            try:
+                profile = agent.resolve_profile(job.profile)
+            except ValueError as exc:
+                logger.error("jobs: %s", exc)
+                return Result(ok=False, text=f"Job failed: {exc}")
             overrides = dict(pane.env) if pane is not None else {}
             if self.brokers is not None:
                 # The command token, egress proxy and Linux relay a chat turn gets,
                 # held for this run only.
                 overrides.update(
                     await job_services.enter_async_context(
-                        self.brokers.for_job(workspace, run_id)
+                        self.brokers.for_job(
+                            workspace,
+                            run_id,
+                            sandbox.model_endpoint_env(profile.mode),
+                        )
                     )
                 )
             if overrides:
@@ -247,14 +261,6 @@ class OrchestratorAgentRunner:
                 workspace,
                 agent.persona_for("jobs", (job.key,) if job.key else ()),
             )
-            # Resolved once, then used for both the session seed and the run.
-            # A bad profile name is the operator's typo, so it reports as a
-            # failed job with the name in it rather than as a traceback.
-            try:
-                profile = agent.resolve_profile(job.profile)
-            except ValueError as exc:
-                logger.error("jobs: %s", exc)
-                return Result(ok=False, text=f"Job failed: {exc}")
             # The profile is part of the session identity, so an entry that
             # changes model starts a fresh transcript rather than resuming one
             # the new model never wrote.

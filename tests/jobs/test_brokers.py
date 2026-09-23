@@ -158,8 +158,12 @@ async def test_the_relay_is_opened_with_the_job_env_and_closed(monkeypatch, tmp_
     brokers = JobBrokers(tools=(ECHO,))
     await brokers.start()
     try:
-        async with brokers.for_job(tmp_path, "job-7") as env:
+        model_env = {"OLLAMA_HOST": "http://127.0.0.1:11434"}
+        async with brokers.for_job(tmp_path, "job-7", model_env) as env:
             assert commands.TOKEN_ENV in seen["overrides"]
+            # The model server rides into the relay with the brokers, or an
+            # ollama job has no route to it.
+            assert seen["overrides"]["OLLAMA_HOST"] == model_env["OLLAMA_HOST"]
             assert seen["key"] == "job-7"
             assert "closed" not in seen
             assert env[commands.TOKEN_ENV] == seen["overrides"][commands.TOKEN_ENV]

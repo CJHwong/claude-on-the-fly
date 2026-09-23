@@ -703,6 +703,35 @@ def _port_from_url(value: str) -> str | None:
     return port if port.isdigit() else None
 
 
+_OLLAMA_PORT = "11434"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0", "")
+
+
+def model_endpoint_env(profile_mode: str) -> dict[str, str]:
+    """The model server a jailed ollama turn must reach, as a session override.
+
+    Ollama mode publishes no base URL, so on a Linux jail nothing bridged the
+    ollama port into the namespace and `ollama launch` could not connect. Naming
+    the server in `OLLAMA_HOST` puts it in `_loopback_ports`, which the relay
+    bridges. The value is the ollama client's own default, so the child sees no
+    change. Only an ollama turn gets it: the ollama API has no auth, and a native
+    turn handed the port could pull or delete models.
+
+    Empty outside the jail, so no deployment's environment changes, and for a
+    server off this host, which the relay cannot bridge.
+    """
+    if mode() != "jail" or profile_mode != "ollama":
+        return {}
+    # Ollama's own variable, not a cotf setting, so it is read where ollama reads
+    # it: the environment this daemon and its children share.
+    configured = os.environ.get("OLLAMA_HOST", "").strip()
+    host, _, port = configured.split("://", 1)[-1].partition(":")
+    if host not in _LOOPBACK_HOSTS:
+        return {}
+    port = port.split("/", 1)[0] or _OLLAMA_PORT
+    return {"OLLAMA_HOST": f"http://127.0.0.1:{port}"}
+
+
 def _spawn_env() -> dict[str, str]:
     """What the agent will actually receive: os.environ plus session overrides.
 
@@ -720,8 +749,9 @@ def _loopback_ports() -> list[str]:
     Order is stable so the emitted profile is deterministic: credential broker
     (any published `*_BASE_URL`), then the egress proxy (`HTTPS_PROXY`), then the
     command broker (`COTF_CMD_ENDPOINT`), then the approval service
-    (`COTF_APPROVE_URL`, present only when permissions mode is `ask`). Duplicates
-    are collapsed.
+    (`COTF_APPROVE_URL`, present only when permissions mode is `ask`), then the
+    ollama server (`OLLAMA_HOST`, see `model_endpoint_env`). Duplicates are
+    collapsed.
     """
     env = _spawn_env()
     found: list[str] = []
@@ -731,7 +761,7 @@ def _loopback_ports() -> list[str]:
             if port is not None:
                 found.append(port)
                 break
-    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT", "COTF_APPROVE_URL"):
+    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT", "COTF_APPROVE_URL", "OLLAMA_HOST"):
         port = _port_from_url(env.get(key, ""))
         if port is not None:
             found.append(port)
@@ -1293,7 +1323,9 @@ def agent_guidance(workspace: Path | None = None) -> str:
 # a shell script: it runs `claude` for the turn and `tmux` to host it in a pane.
 # Under deny-most neither is granted, so the script dies rc 127 before it does
 # anything, and the failure reads as "command not found" rather than as a denial.
-_EXECS_BEHIND = {"claude-pty": ("claude", "tmux")}
+# `ollama launch <agent>` execs the agent, claude or codex, and without it
+# answered "claude is not installed" from inside the jail.
+_EXECS_BEHIND = {"claude-pty": ("claude", "tmux"), "ollama": ("claude", "codex")}
 
 
 def _install_library_dir(binary: Path) -> Path | None:
@@ -1319,6 +1351,10 @@ def _install_library_dir(binary: Path) -> Path | None:
         return None
     library = binary.parent.parent / "lib"
     return library if library.is_dir() else None
+
+
+# The kernel's own limit on symlinks followed in one lookup (MAXSYMLINKS).
+_MAX_LINK_HOPS = 40
 
 
 def _runtime_read_paths(argv: list[str]) -> list[Path]:
@@ -1378,7 +1414,32 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
         seen.setdefault(str(path), path)
         resolved = Path(os.path.realpath(path))
         seen.setdefault(str(resolved), resolved)
+    # A uv venv's python links to `.../uv/python/cpython-3.X-<platform>/bin/...`,
+    # and `cpython-3.X-<platform>` is itself a link to the patch directory. The
+    # list above holds both ends of that chain but not the link between them, and
+    # on Linux $HOME is a tmpfs, so the link does not exist inside the jail and
+    # exec fails on a path that looks granted. Measured: "bwrap: execvp
+    # .venv/bin/python: No such file or directory", failing the preflight and
+    # every shim. A link is added only when its target is already granted, so
+    # this recreates a path and grants nothing new.
+    for link in _linked_dirs(Path(sys.executable)):
+        if os.path.realpath(link) in seen:
+            seen.setdefault(str(link), link)
     return list(seen.values())
+
+
+def _linked_dirs(path: Path) -> list[Path]:
+    """Symlinked directories `path` passes through, following each link it names."""
+    found: list[Path] = []
+    current = path
+    for _ in range(_MAX_LINK_HOPS):
+        found += [parent for parent in current.parents if parent.is_symlink()]
+        try:
+            target = os.readlink(current)
+        except OSError:
+            break
+        current = current.parent / target
+    return found
 
 
 def scoped_sessions() -> bool:
@@ -2070,13 +2131,15 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # which aborts the whole jail rather than dropping one grant. Merged-usr is
     # the normal layout on Debian, Ubuntu and Fedora, so `/bin` and `/lib` are
     # symlinks on most Linux hosts. `_runtime_read_paths` lists every entry both
-    # as written and as resolved for seatbelt's sake, so dropping the symlink
-    # form here costs nothing: the twin it resolves to is already in the list.
+    # as written and as resolved for seatbelt's sake, so the resolved twin is
+    # mounted and the symlink form is recreated as a link instead. Dropping it
+    # was not free: a uv venv's python runs through `cpython-3.X-*`, a link under
+    # the opaque $HOME, and without it exec failed on a path that looked granted.
+    runtime = _runtime_read_paths(argv)
     grants["read_only"] += [
-        path
-        for path in _runtime_read_paths(argv)
-        if str(path) == os.path.realpath(path)
+        path for path in runtime if str(path) == os.path.realpath(path)
     ]
+    links = {path: os.readlink(path) for path in runtime if path.is_symlink()}
     # Same reason `ensure_write_deny_targets` materialises its targets: a mount
     # source has to exist on the host, because bwrap cannot create one inside the
     # read-only root. Both are this turn's own session directories, so creating
@@ -2116,6 +2179,7 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
         masked=grants["masked"],
         sockets=sockets,
         placeholders=placeholders,
+        links=links,
     )
     logger.info(
         "sandbox: jailed %s under bubblewrap (project=%s, brokered ports=%s)",
