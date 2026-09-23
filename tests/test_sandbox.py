@@ -301,7 +301,14 @@ def test_guidance_broker_only_loopback_note(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:5/anthropic")
-    assert "ONLY the local broker" in sandbox.agent_guidance(tmp_path)
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "open")
+    text = sandbox.agent_guidance(tmp_path)
+    assert "no other local port is reachable" in text
+    # Measured under a live seatbelt jail with this setting on: a public host
+    # through the proxy answered 200, so the old "external hosts are blocked"
+    # made the agent decline work it could do.
+    assert "external hosts are blocked" not in text
+    assert "any public host" in text
 
 
 def test_build_system_prompt_appends_guidance_only_when_on(monkeypatch, tmp_path):
@@ -2291,7 +2298,12 @@ def test_guidance_write_remedy_names_the_setting(monkeypatch, tmp_path):
     [
         (
             "gated",
-            ["operator is asked", "refused at once", "egress.private_allow"],
+            [
+                "operator is asked",
+                "refused at once",
+                "egress.private_allow",
+                "`egress.allow` when no one can approve it",
+            ],
             ["no internet"],
         ),
         (

@@ -390,7 +390,8 @@ _EGRESS_GUIDANCE = {
         "Reaching an unknown external host either pauses while the operator is "
         "asked, or is refused at once when no one can be asked. A refusal is a 403 "
         'whose status line starts "Forbidden by egress policy" and says why. A '
-        "private address the work needs takes the operator's `egress.private_allow`.",
+        "private address the work needs takes the operator's `egress.private_allow`, "
+        "plus approval, or `egress.allow` when no one can approve it.",
     ),
     "open": (
         "External HTTPS goes through the local egress proxy, which lets any public "
@@ -1318,9 +1319,11 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "private to this session and work normally."
         )
     elif settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() in _TRUTHY:
+        # Local ports only. The proxy is one of the broker services, so external
+        # hosts still work through it: measured, a public host answered 200.
         net = (
-            "Outbound network reaches ONLY the local broker; other local ports and "
-            "external hosts are blocked."
+            "Local network reaches only the broker services; no other local port "
+            f"is reachable. {external}"
         )
     else:
         net = external
