@@ -2883,10 +2883,12 @@ async def test_the_relocated_config_grant_keeps_the_denies_below_it(
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     history = config_dir_outside_tmpdir / "history.jsonl"
     history.write_text("every prompt ever typed\n")
+    credentials = config_dir_outside_tmpdir / ".credentials.json"
+    credentials.write_text('{"claudeAiOauth": {"refreshToken": "placeholder"}}\n')
     other = config_dir_outside_tmpdir / "projects" / "another-thread"
     other.mkdir(parents=True)
     (other / "x.jsonl").write_text("another conversation\n")
-    for target in (history, other / "x.jsonl"):
+    for target in (history, credentials, other / "x.jsonl"):
         done = _run_jailed(["/bin/cat", str(target)], tmp_path)
         assert done.returncode != 0, f"{target.name} was readable: {done.stdout!r}"
 
@@ -3752,6 +3754,8 @@ def test_the_cross_thread_session_denies_come_after_the_operator_allows():
         '(deny file-read* (subpath (param "_CODEX_SESSIONS")))',
         '(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") '
         '"/history.jsonl")))',
+        '(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") '
+        '"/.credentials.json")))',
     ):
         index = _rule_index(profile, deny)
         assert index > last_allow, f"an operator or runtime allow can re-open {deny}"
@@ -4168,6 +4172,96 @@ def test_a_keychain_that_cannot_be_read_is_not_fatal(monkeypatch):
         broker, "read_keychain", lambda _s: (_ for _ in ()).throw(OSError("nope"))
     )
     assert sandbox._claude_oauth_token() is None
+
+
+# --- the claude credential file on Linux ---
+
+
+@pytest.fixture
+def claude_credentials(monkeypatch, tmp_path):
+    """Writes the credential file into a config dir of the test's own."""
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+    def write(content: str) -> Path:
+        path = config / ".credentials.json"
+        path.write_text(content)
+        return path
+
+    return write
+
+
+def test_a_jailed_linux_turn_gets_the_access_token_not_the_file(
+    linux, claude_credentials
+):
+    """The file holds the refresh token too, and the jail used to leave it
+    readable. The daemon reads it outside and hands over the access token only,
+    the way macOS does from the keychain."""
+    claude_credentials(
+        json.dumps(
+            {"claudeAiOauth": {"accessToken": "access-x", "refreshToken": "refresh-x"}}
+        )
+    )
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "access-x"
+    assert "refresh-x" not in json.dumps(env)
+
+
+def test_the_credential_file_is_masked_in_the_linux_jail(
+    linux, claude_credentials, tmp_path
+):
+    credentials = claude_credentials("{}")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    assert credentials in sandbox._linux_grants(workspace)["masked"]
+
+
+def test_an_unjailed_linux_turn_keeps_its_own_credential(
+    monkeypatch, claude_credentials
+):
+    """Under env the CLI still reads and refreshes its own file. An env token
+    would shadow a credential that refreshes with one that expires."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    claude_credentials(json.dumps({"claudeAiOauth": {"accessToken": "access-x"}}))
+    assert sandbox._claude_oauth_token() is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "[]",
+        "{}",
+        '{"claudeAiOauth": {}}',
+        '{"claudeAiOauth": {"accessToken": ""}}',
+    ],
+)
+def test_a_malformed_credential_file_is_not_fatal(linux, claude_credentials, content):
+    claude_credentials(content)
+    assert sandbox._claude_oauth_token() is None
+
+
+def test_no_other_platform_has_a_claude_credential_to_hand_over(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "win32")
+    assert sandbox._claude_oauth_token() is None
+
+
+def test_no_credential_file_means_no_token(linux, claude_credentials):
+    assert sandbox._claude_oauth_token() is None
+
+
+def test_an_expired_linux_credential_is_passed_with_a_warning(
+    linux, claude_credentials, caplog
+):
+    claude_credentials(
+        json.dumps({"claudeAiOauth": {"accessToken": "access-x", "expiresAt": 1000}})
+    )
+    assert sandbox._claude_oauth_token() == "access-x"
+    assert "expired" in caplog.text
 
 
 # --- runtime read paths are granted as written and as resolved ---

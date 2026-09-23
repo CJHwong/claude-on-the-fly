@@ -170,10 +170,14 @@ seatbelt profile grants `process-info*` and `signal` globally, and the Linux jai
 does not unshare the PID or IPC namespaces. Linux could close this cheaply and
 deliberately does not yet; macOS cannot without revisiting the profile.
 
-**The agent can read the credential it runs on.** `~/.claude/.credentials.json`
-and `~/.codex/auth.json` must be readable or the backend cannot authenticate, so
-a hijacked turn can exfiltrate that token through the already-approved model
-host. Structural on both platforms.
+**The agent holds the credential it runs on.** A backend cannot authenticate
+without one, so a hijacked turn can exfiltrate it through the already-approved
+model host. Structural on both platforms. Under `jail`, a claude turn gets only
+the short-lived access token, in `ANTHROPIC_AUTH_TOKEN`: the daemon reads it from
+the keychain on macOS or from `.credentials.json` on Linux, and the jail hides
+both. The refresh token stays out of reach. An expired token needs a claude run
+outside the jail to refresh it. `~/.codex/auth.json` stays readable, refresh
+token included.
 
 **A brokered CLI is a capability grant.** It runs outside the jail with your real
 credential and only its output crosses back, so the provider-side token scope is
