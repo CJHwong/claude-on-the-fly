@@ -361,13 +361,10 @@ you need genuinely lives in another conversation, ask for it.
 Common blocked scenarios and the remedy to relay to the user:
 - Reading a file outside the allowed set (e.g. `cat ~/.aws/credentials`) \
 {block_read}. Remedy: the operator adds the path to `sandbox.extra_paths`.
-- Writing a file outside the workspace {block_write}. Remedy: the operator \
-widens the sandbox write profile.
-- Reaching an external host that is not yet approved pauses while the operator \
-is asked, then either succeeds or returns 403 with an "[sandbox] egress policy" \
-body. A 403 means they declined: say which host you needed and why, then carry \
-on with what you can. Do not retry in a loop, and do not look for another route \
-to the same host.
+- Writing a file outside the write set {block_write}. Remedy: the operator \
+adds the path to `sandbox.write_paths`.
+- {net_scenario} Say which host you needed and why, then carry on with what you \
+can. Do not retry in a loop, and do not look for another route to the same host.
 {keychain}
 - {brokered} A credentialed CLI that is not on that list will fail on its own \
 config or token file, because the sandbox denies credential stores. That is \
@@ -378,6 +375,41 @@ of {settings_path}. Report which command you needed and stop there — do not lo
 for the credential yourself, and do not reach the same service by another route \
 (a different host, another tool's token, a provider-side integration). Doing that \
 launders the boundary rather than respecting it."""
+
+
+# What `sandbox.egress` does to an external call, as (network line, blocked
+# scenario). The guidance is built without knowing whether this session can ask
+# anyone: a job never can, and a chat can only when an operator chat is set. So
+# `gated` names both outcomes rather than promising a wait that may not happen.
+_EGRESS_GUIDANCE = {
+    "gated": (
+        "External HTTPS goes through the local egress proxy, which gates it by "
+        "destination: pre-approved hosts just work. An unknown host pauses while "
+        "the operator is asked when this session can ask, and is refused at once "
+        "when it cannot.",
+        "Reaching an unknown external host either pauses while the operator is "
+        "asked, or is refused at once when no one can be asked. A refusal is a 403 "
+        'whose status line starts "Forbidden by egress policy" and says why. A '
+        "private address the work needs takes the operator's `egress.private_allow`, "
+        "plus approval, or `egress.allow` when no one can approve it.",
+    ),
+    "open": (
+        "External HTTPS goes through the local egress proxy, which lets any public "
+        "host through without asking. It still refuses private, loopback and "
+        "metadata addresses and any host the operator blocked.",
+        "Reaching a private, loopback or metadata address, or a host the operator "
+        'blocked, fails with a 403 whose status line starts "Forbidden by egress '
+        'policy" and says why. Any other public host works. A private address the '
+        "work needs takes the operator's `egress.private_allow`.",
+    ),
+    "off": (
+        "This session has no internet access: the egress proxy is off, so an "
+        "external call fails to connect or resolve. Only the brokered services "
+        "work.",
+        "Every external call fails, because this session has no internet. The "
+        "remedy is an operator change to `sandbox.egress`.",
+    ),
+}
 
 
 # How a policy block actually reads, per platform. Both sets are measured against
@@ -399,8 +431,11 @@ error, they are simply absent from your view of the filesystem. Do not conclude 
 the file does not exist on the machine, and do not go looking for it elsewhere.
 - "Read-only file system" (EROFS) means sandbox policy: the location is outside \
 your write set.
-- "Permission denied" (EACCES) means a genuine file-permission problem, not the \
-sandbox."""
+- "Permission denied" (EACCES) on a masked credential means sandbox policy: \
+a `.env` file, `~/.claude/.credentials.json`, claude's `history.jsonl` and the \
+ssh-agent socket are masked on purpose, and no grant will open them. If a tool \
+needs that credential, the remedy is brokering the tool, below. Anywhere else, \
+"Permission denied" is a genuine file-permission problem."""
 
 _MACOS_KEYCHAIN = """\
 - Reading the keychain (e.g. `security find-generic-password`) is denied, but it \
@@ -1253,8 +1288,12 @@ def agent_guidance(workspace: Path | None = None) -> str:
         else "No credentialed CLI is brokered in this deployment."
     )
 
+    linux = _platform().startswith("linux")
+    granted = _extra_write_paths(cap=None) if linux else _extra_write_paths()
     writes = (
-        f"the workspace ({project}), your memory ({MEMORY_DIR}), and your temp dir."
+        f"the workspace ({project}), your memory ({MEMORY_DIR}), "
+        + "".join(f"{path}, " for path in granted)
+        + "and your temp dir."
     )
     if _deny_most_in_force():
         reads = (
@@ -1269,31 +1308,27 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "the keychain, SSH private keys, cloud credentials (~/.aws/credentials), "
             "and token files (~/.npmrc, ~/.netrc, ~/.env)."
         )
-    if _platform().startswith("linux"):
+    external, net_scenario = _EGRESS_GUIDANCE[egress_mode()]
+    if linux:
         # Accurate for the namespace: no host service beyond the brokered ones is
         # reachable, but external hosts are, through the proxy. Saying "external
         # hosts are blocked" here would make the agent decline work it can do.
         net = (
             "Your network namespace reaches only the local broker services; no other "
-            "port on the host is reachable. External hosts go through the local "
-            "egress proxy, which gates them by destination: pre-approved hosts just "
-            "work, an unknown one pauses while the operator is asked. Ports you bind "
-            "yourself are private to this session and work normally."
+            f"port on the host is reachable. {external} Ports you bind yourself are "
+            "private to this session and work normally."
         )
     elif settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() in _TRUTHY:
+        # Local ports only. The proxy is one of the broker services, so external
+        # hosts still work through it: measured, a public host answered 200.
         net = (
-            "Outbound network reaches ONLY the local broker; other local ports and "
-            "external hosts are blocked."
+            "Local network reaches only the broker services; no other local port "
+            f"is reachable. {external}"
         )
     else:
-        net = (
-            "Outbound HTTPS goes through a local egress proxy that gates it by "
-            "destination host. Pre-approved hosts just work; an unknown host "
-            "pauses the request while the operator is asked to approve it, so a "
-            "first call to a new host may take up to a minute."
-        )
-    linux = _platform().startswith("linux")
+        net = external
     return _JAIL_GUIDANCE.format(
+        net_scenario=net_scenario,
         mechanism=(
             "a Linux bubblewrap sandbox in its own network namespace"
             if linux
