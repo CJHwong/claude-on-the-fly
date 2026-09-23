@@ -381,7 +381,6 @@ replay from a partial journal record; submodules and the checkout's own `.git/ho
   real turn.
 - A real `api.anthropic.com` leg for the claude backend under the jail. Every macOS
   validation used a loopback stub.
-- Codex through `ollama launch` under the Linux jail. Only claude was run.
 - Two concurrent jailed turns, so the per-turn `_SESSION_ENV` ContextVar is untested under
   real concurrency.
 - Codex under the macOS jail, and claude under the Linux jail. Both share the policy layer;

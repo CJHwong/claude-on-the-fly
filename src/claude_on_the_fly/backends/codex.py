@@ -1526,7 +1526,7 @@ class CodexBackend:
         # subcommand. Skip the binary when the launcher is set.
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
-        model_args = [] if self.launcher else (["-m", self.model] if self.model else [])
+        model_args = self._model_args()
         effort_args = self._effort_args()
         # --yolo stays whether approvals are on or not. codex exec overrides
         # approval_policy to `never` regardless (measured: request untrusted, get
@@ -1548,6 +1548,18 @@ class CodexBackend:
             *model_args,
             *effort_args,
         ]
+
+    def _model_args(self) -> list[str]:
+        """How the model is chosen: `-m`, or nothing when a launcher chose it.
+
+        Under ollama, also switch off the hosted web_search tool. codex sends it
+        by default, and ollama's endpoint refuses the whole request over it with
+        `the web_search tool is not supported`, so no ollama turn got a token.
+        The agent still reaches the web through its shell.
+        """
+        if self.launcher:
+            return ["-c", 'web_search="disabled"']
+        return ["-m", self.model] if self.model else []
 
     def _effort_args(self) -> list[str]:
         """`-c model_reasoning_effort=...`, or [] when no effort is configured.
@@ -1594,7 +1606,7 @@ class CodexBackend:
         """
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
-        model_args = [] if self.launcher else (["-m", self.model] if self.model else [])
+        model_args = self._model_args()
         flags = [
             "--dangerously-bypass-approvals-and-sandbox",
             *permissions.codex_argv(),
