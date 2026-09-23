@@ -30,6 +30,10 @@ Before adding a tool:
 6. Restart the chat daemon so shims are rebuilt.
 7. Test one allowed command, one rejected command, and every readback refusal.
 
+Only chat turns go through the broker. A cron job runs the real binary with no shim, so
+under `mode: env` it uses the tool's own credential as before, and under `mode: jail` it
+cannot reach the credential and fails.
+
 ## Admit a REST subcommand for reads only
 
 Some CLIs put an entire API behind one word. `gh api` fetches a file and also rewrites

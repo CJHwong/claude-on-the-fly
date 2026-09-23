@@ -619,8 +619,23 @@ def test_path_gets_the_shim_dir_when_populated(monkeypatch, tmp_path):
     (shims / "gh").write_text("#!/bin/sh\n")
     monkeypatch.setenv("COTF_SANDBOX", "env")
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(ENDPOINT_ENV, "http://127.0.0.1:9999")
     monkeypatch.setattr(sandbox, "shim_dir", lambda: shims)
     assert (sandbox.agent_env() or {})["PATH"] == f"{shims}:/usr/bin"
+
+
+def test_a_daemon_without_a_broker_gets_the_real_binaries(monkeypatch, tmp_path):
+    """The jobs daemon shares the shim dir but runs no broker."""
+    from claude_on_the_fly import sandbox
+
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    (shims / "gh").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv(ENDPOINT_ENV, raising=False)
+    monkeypatch.setattr(sandbox, "shim_dir", lambda: shims)
+    assert (sandbox.agent_env() or {})["PATH"] == "/usr/bin"
 
 
 def test_endpoint_var_survives_env_curation(monkeypatch):

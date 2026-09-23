@@ -646,11 +646,20 @@ def _with_shims_on_path(env: dict[str, str]) -> dict[str, str]:
     Prepended only when the dir has shims in it, so a deployment with no command
     broker running gets its PATH untouched rather than a phantom entry.
 
+    And only when this spawn can reach a broker. The dir is shared by every
+    daemon, but only the chat daemon runs a broker, so a cron job was handed
+    shims with no endpoint and every brokered tool failed where the real binary
+    would have run.
+
     Note this is convenience routing, not a boundary: the agent can still invoke
     /opt/homebrew/bin/gh directly. That path is useless because the profile denies
     the credential, and *that* deny is the boundary. The shim restores capability
     under the deny; it does not create the isolation.
     """
+    from claude_on_the_fly import commands
+
+    if not env.get(commands.ENDPOINT_ENV):
+        return env
     shims = shim_dir()
     try:
         populated = shims.is_dir() and any(shims.iterdir())

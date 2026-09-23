@@ -46,6 +46,14 @@ flags prevent credential material crossing back. Tool entries merge by name; rem
 packaged refusals are warned. An operator override without `allow` therefore disables
 that tool until its safe subcommands are listed.
 
+Only the chat daemon runs a command broker, but the shim dir is shared under `DATA_DIR`.
+`sandbox._with_shims_on_path` therefore puts the shims on PATH only when the spawn env
+carries `COTF_CMD_ENDPOINT`. Without that check, an agent the jobs daemon starts found
+the shim, had no broker to reach, and every brokered tool failed. A job runs the real
+binary instead: that works under `mode: env` and fails on the denied credential under
+`jail`. A broker in the jobs daemon needs its own shim dir, because a second broker's
+`write_shims` removes shims the first one wrote.
+
 The broker does not parse arbitrary CLI semantics after an allowed prefix. Generic API
 subcommands remain unavailable unless explicitly listed, and provider-side credential
 scope is still required because argv inspection cannot safely model every future flag.
