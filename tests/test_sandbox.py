@@ -432,7 +432,7 @@ def test_jail_argv_keeps_the_deepest_ancestors_when_the_chain_overflows(
             codex_operator_home="/h/.codex",
             pane_socket="/h/d/panes/tmux-501/default",
             base=sandbox_macos._DENY_MOST_PROFILE,
-            loopback=("a", "b", "c", "d"),
+            loopback=("a", "b", "c", "d", "e"),
             extra_paths=[],
             ancestor_paths=chain,
         )
@@ -633,11 +633,15 @@ def test_loopback_narrows_to_every_known_service(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:54322")
     monkeypatch.setenv("COTF_CMD_ENDPOINT", "http://127.0.0.1:54323")
     monkeypatch.setenv("COTF_APPROVE_URL", "http://127.0.0.1:54324/decide")
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    # Five services, one per slot. The ollama server was the fifth: with four
+    # slots it was the one dropped, and an ollama turn could not reach its model.
     assert sandbox._loopback_specs() == (
         "localhost:54321",
         "localhost:54322",
         "localhost:54323",
         "localhost:54324",
+        "localhost:11434",
     )
 
 
@@ -655,12 +659,13 @@ def test_loopback_reads_the_per_session_env_not_just_os_environ(monkeypatch):
         }
     )
     try:
-        # Three services and four slots, so the spare repeats the first
+        # Three services and five slots, so the spares repeat the first
         # port -- a duplicate allow, which is harmless.
         assert sandbox._loopback_specs() == (
             "localhost:5001",
             "localhost:6002",
             "localhost:7003",
+            "localhost:5001",
             "localhost:5001",
         )
     finally:
@@ -676,19 +681,22 @@ def test_loopback_narrows_to_egress_port_alone(monkeypatch):
 
 
 def test_loopback_warns_rather_than_silently_dropping_a_service(monkeypatch, caplog):
-    """Guard for a future fifth loopback service. Unreachable through env today
-    (the broker serves every route on one port, so the four sources fill the four
+    """Guard for a future sixth loopback service. Unreachable through env today
+    (the broker serves every route on one port, so the five sources fill the five
     slots exactly), so drive _loopback_ports directly."""
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
-    monkeypatch.setattr(sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4", "5"])
+    monkeypatch.setattr(
+        sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4", "5", "6"]
+    )
     with caplog.at_level("WARNING"):
         specs = sandbox._loopback_specs()
-    # Five services, four slots: the drop must be loud, never silent.
+    # Six services, five slots: the drop must be loud, never silent.
     assert specs == (
         "localhost:1",
         "localhost:2",
         "localhost:3",
         "localhost:4",
+        "localhost:5",
     )
     assert "unreachable" in caplog.text
 
@@ -708,13 +716,19 @@ def test_loopback_stays_open_when_no_service_is_known(monkeypatch):
     assert sandbox._loopback_specs() == ("localhost:*",) * sandbox._LOOPBACK_SLOTS
 
 
-def test_wrap_jail_passes_three_loopback_slots(monkeypatch, tmp_path):
+def test_wrap_jail_passes_every_loopback_slot(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
     monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     out = sandbox.wrap(["claude"], tmp_path)
-    for param in ("_LOOPBACK=", "_LOOPBACK_ALT=", "_LOOPBACK_ALT2="):
+    for param in (
+        "_LOOPBACK=",
+        "_LOOPBACK_ALT=",
+        "_LOOPBACK_ALT2=",
+        "_LOOPBACK_ALT3=",
+        "_LOOPBACK_ALT4=",
+    ):
         assert any(a.startswith(param) for a in out), param
 
 
@@ -1909,6 +1923,65 @@ def test_linux_grants_hide_the_data_dir_and_keep_memory(tmp_path):
     assert Path(os.path.realpath(agent.MEMORY_DIR)) in grants["read_write"]
 
 
+def test_a_symlinked_memory_dir_is_recreated_in_the_jail(linux, monkeypatch, tmp_path):
+    """memory/ is granted at its real path, and the data dir around it is opaque.
+    An operator who links memory/ into a repo then had no memory/ inside the jail
+    at the path the agent is told, and 524 of maoao's recorded writes used it."""
+    target = tmp_path / "soul" / "memory"
+    target.mkdir(parents=True)
+    link = tmp_path / "data" / "memory"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    monkeypatch.setattr(agent, "MEMORY_DIR", link)
+    out = sandbox.wrap(["true"], tmp_path / "ws")
+    at = [
+        i for i, arg in enumerate(out) if arg == "--symlink" and out[i + 2] == str(link)
+    ]
+    assert at, "the memory link was not recreated"
+    assert out[at[0] + 1] == str(target)
+
+
+class TestClaudeConfigLinks:
+    """A link out of the claude config dir dangles inside the jail unless its
+    target is mounted. `~/.claude/skills -> ~/<repo>/skills` loaded no skill."""
+
+    def _config(self, monkeypatch, tmp_path):
+        config = tmp_path / "claude"
+        (config / "skills").mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        return config
+
+    def test_a_linked_entry_is_granted_read_only(self, monkeypatch, tmp_path):
+        config = self._config(monkeypatch, tmp_path)
+        (config / "skills").rmdir()
+        target = tmp_path / "soul" / "skills"
+        target.mkdir(parents=True)
+        (config / "skills").symlink_to(target)
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert Path(os.path.realpath(target)) in grants["read_only"]
+
+    def test_a_linked_child_of_skills_is_granted(self, monkeypatch, tmp_path):
+        config = self._config(monkeypatch, tmp_path)
+        target = tmp_path / "shared" / "one-skill"
+        target.mkdir(parents=True)
+        (config / "skills" / "one-skill").symlink_to(target)
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert Path(os.path.realpath(target)) in grants["read_only"]
+
+    def test_a_link_into_a_credential_store_is_not_followed(
+        self, monkeypatch, tmp_path
+    ):
+        config = self._config(monkeypatch, tmp_path)
+        store = Path(os.path.realpath(Path.home())) / ".aws"
+        (config / "aws").symlink_to(store)
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert not any(Path(p).is_relative_to(store) for p in grants["read_only"])
+
+    def test_a_plain_entry_adds_nothing(self, monkeypatch, tmp_path):
+        self._config(monkeypatch, tmp_path)
+        assert sandbox._claude_link_targets() == []
+
+
 def test_linux_grants_protect_what_codex_executes_or_is_told(tmp_path):
     grants = sandbox._linux_grants(tmp_path / "ws")
     codex = Path(os.path.realpath(Path.home())) / ".codex"
@@ -2451,7 +2524,7 @@ def test_both_profiles_receive_the_session_grant_params(tmp_path):
             codex_operator_home=tmp_path / "codex",
             pane_socket=tmp_path / "panes" / "tmux-501" / "default",
             base=base,
-            loopback=("localhost:*",) * 4,
+            loopback=("localhost:*",) * 5,
             extra_paths=[],
         )
         assert f"_CLAUDE_PROJECTS={tmp_path / 'projects'}" in argv
@@ -4493,7 +4566,7 @@ def test_runtime_paths_past_the_slot_count_are_reported(caplog, tmp_path):
             codex_operator_home=tmp_path / "codex",
             pane_socket=tmp_path / "panes/tmux-501/default",
             base=sandbox_macos._DENY_MOST_PROFILE,
-            loopback=("a", "b", "c", "d"),
+            loopback=("a", "b", "c", "d", "e"),
             extra_paths=[],
             runtime_paths=overflow,
         )
@@ -4656,7 +4729,7 @@ class TestTheCodexLinkSlots:
             codex_operator_home=str(tmp_path / ".codex"),
             pane_socket=str(tmp_path / "pane"),
             base=sandbox_macos._DENY_MOST_PROFILE,
-            loopback=("localhost:1", "localhost:1", "localhost:1", "localhost:1"),
+            loopback=("localhost:1",) * 5,
             extra_paths=[],
             codex_link_paths=[str(tmp_path / "shared")],
         )
@@ -4681,7 +4754,7 @@ class TestTheCodexLinkSlots:
             codex_operator_home=str(tmp_path / ".codex"),
             pane_socket=str(tmp_path / "pane"),
             base=sandbox_macos._BASE_PROFILE,
-            loopback=("localhost:1", "localhost:1", "localhost:1", "localhost:1"),
+            loopback=("localhost:1",) * 5,
             extra_paths=[],
             codex_link_paths=[str(tmp_path / "shared")],
         )
@@ -4708,7 +4781,7 @@ class TestTheCodexLinkSlots:
                 codex_operator_home=str(tmp_path / ".codex"),
                 pane_socket=str(tmp_path / "pane"),
                 base=sandbox_macos._DENY_MOST_PROFILE,
-                loopback=("localhost:1", "localhost:1", "localhost:1", "localhost:1"),
+                loopback=("localhost:1",) * 5,
                 extra_paths=[],
                 codex_link_paths=["/a", "/b", "/dropped"],
             )
@@ -4906,7 +4979,7 @@ def test_unused_write_slots_do_not_re_open_the_project_write_denies(
         codex_operator_home=tmp_path / "home/.codex",
         pane_socket=tmp_path / "pane.sock",
         base=sandbox._DENY_MOST_PROFILE,
-        loopback=sandbox_macos._loopback_specs((1, 2, 3, 4)),
+        loopback=sandbox_macos._loopback_specs(["1", "2", "3", "4", "5"]),
         extra_paths=[],
         write_paths=[],
     )

@@ -775,7 +775,7 @@ def _fs_base_profile() -> Path:
     return sandbox_macos._fs_base_profile()
 
 
-def _loopback_specs() -> tuple[str, str, str, str]:
+def _loopback_specs() -> tuple[str, str, str, str, str]:
     """This turn's loopback allows. Resolves the ports here and hands them to the
     profile builder, which stays pure."""
     return sandbox_macos._loopback_specs(_loopback_ports())
@@ -1779,6 +1779,43 @@ def _ensure_session_mount_sources(workspace: Path) -> None:
             logger.warning("sandbox: could not create mount source %s: %s", source, exc)
 
 
+# Directories under the claude config dir whose entries may each link elsewhere,
+# the way `~/.claude/skills/<name>` does when skills are shared from a repo.
+_CLAUDE_LINKED_DIRS = ("skills", "agents", "commands")
+
+
+def _claude_link_targets() -> list[Path]:
+    """Where links in the claude config dir point, for the Linux jail to mount.
+
+    The config dir is mounted read-only, but a link out of it dangles inside the
+    jail unless its target is mounted too. `~/.claude/skills -> ~/<repo>/skills`
+    left claude with no skills at all. The claude counterpart of
+    `codex_state.shared_link_targets`. A target the extra-path check would refuse,
+    a credential store or the home itself, is not followed.
+    """
+    from claude_on_the_fly import envfile
+
+    config = envfile.claude_config_dir()
+    entries = [*_safe_children(config)]
+    for name in _CLAUDE_LINKED_DIRS:
+        entries += _safe_children(config / name)
+    targets: dict[str, Path] = {}
+    for entry in entries:
+        if not entry.is_symlink():
+            continue
+        real = Path(os.path.realpath(entry))
+        if _extra_path_refusal(real) is None:
+            targets.setdefault(str(real), real)
+    return list(targets.values())
+
+
+def _safe_children(directory: Path) -> list[Path]:
+    try:
+        return list(directory.iterdir())
+    except OSError:
+        return []
+
+
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
     from claude_on_the_fly import codex_state
@@ -1864,6 +1901,7 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             # codex then reports a missing file rather than a hidden one.
             *codex_state.shared_link_targets(),
             home / ".claude",
+            *_claude_link_targets(),
             codex,
             data_dir / "shims",
             # Read-only, where it used to be read-write: a warm cache still
@@ -2140,6 +2178,13 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
         path for path in runtime if str(path) == os.path.realpath(path)
     ]
     links = {path: os.readlink(path) for path in runtime if path.is_symlink()}
+    # memory/ is granted at its real path inside an opaque data dir, so an
+    # operator who links it into a repo loses the path the agent is told. The
+    # target is already granted; this puts the name back.
+    from claude_on_the_fly.agent import MEMORY_DIR
+
+    if Path(MEMORY_DIR).is_symlink():
+        links[Path(MEMORY_DIR)] = os.readlink(MEMORY_DIR)
     # Same reason `ensure_write_deny_targets` materialises its targets: a mount
     # source has to exist on the host, because bwrap cannot create one inside the
     # read-only root. Both are this turn's own session directories, so creating
