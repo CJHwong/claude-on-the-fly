@@ -120,6 +120,10 @@ class ShimmedTool:
         absolute path, which is right for a credentialed CLI and wrong for one
         whose job is to read a file the agent names. An entry reaching a
         credential store is refused; see `allowed_roots`. Empty by default.
+    :param boolean_flags: flags that never take the next token as their value.
+        Without a flag table the allowlist reads every bare flag as taking one,
+        so `systemctl --user status x` looked like `x` and was refused. Listing
+        `--user` here fixes the reading for that flag only. Empty by default.
     """
 
     name: str
@@ -129,6 +133,7 @@ class ShimmedTool:
     allow: tuple[tuple[str, ...], ...] = ()
     allow_read_only: tuple[tuple[str, ...], ...] = ()
     allow_paths: frozenset[str] = frozenset()
+    boolean_flags: frozenset[str] = frozenset()
 
 
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
@@ -176,6 +181,7 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
         allow=words(entry.get("allow"), "allow"),
         allow_read_only=words(entry.get("allow_read_only"), "allow_read_only"),
         allow_paths=names(entry.get("allow_paths"), "allow_paths"),
+        boolean_flags=names(entry.get("boolean_flags"), "boolean_flags"),
     )
 
 
@@ -362,7 +368,10 @@ raise SystemExit(int(payload.get("rc", 1)))
 
 
 def leading_tokens(
-    argv: list[str], *, flags_take_values: bool = True
+    argv: list[str],
+    *,
+    flags_take_values: bool = True,
+    boolean_flags: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """The subcommand path: leading non-flag tokens, stopping at the first flag.
 
@@ -375,7 +384,8 @@ def leading_tokens(
     tool's own flag table, so `flags_take_values=False` gives the other reading,
     where every non-flag token is a subcommand candidate. `refuses_readback`
     checks both, because assuming one of them is what lets `--verbose auth
-    logout` walk past a refusal for `auth logout`.
+    logout` walk past a refusal for `auth logout`. `boolean_flags` is the part of
+    that table an operator declared: those flags never consume the next token.
     """
     tokens: list[str] = []
     skip_value = False
@@ -385,7 +395,12 @@ def leading_tokens(
             continue
         if item.startswith("-"):
             # `--flag=value` carries its value; a bare flag may take the next arg.
-            skip_value = flags_take_values and "=" not in item and item != "--"
+            skip_value = (
+                flags_take_values
+                and "=" not in item
+                and item != "--"
+                and item not in boolean_flags
+            )
             continue
         tokens.append(item)
     return tuple(tokens)
@@ -413,7 +428,7 @@ def refuses_readback(tool: ShimmedTool, argv: list[str]) -> bool:
     if not tool.readback:
         return False
     readings = (
-        leading_tokens(argv),
+        leading_tokens(argv, boolean_flags=tool.boolean_flags),
         leading_tokens(argv, flags_take_values=False),
     )
     return any(
@@ -523,7 +538,7 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     A prefix on `allow_read_only` additionally has to ask for a read. `allow` is
     checked first, so a prefix listed on both is allowed outright.
     """
-    tokens = leading_tokens(argv)
+    tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
     if any(tokens[: len(prefix)] == prefix for prefix in tool.allow):
         return True
     if any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only):
@@ -540,7 +555,7 @@ def refused_as_write(tool: ShimmedTool, argv: list[str]) -> bool:
     """
     if allowed_command(tool, argv):
         return False
-    tokens = leading_tokens(argv)
+    tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
     return any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only)
 
 

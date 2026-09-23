@@ -172,6 +172,9 @@ host is a covert channel: TLS payloads are not inspected.
 | `readback` | list of command prefixes / empty | Commands refused because they reveal or change credentials |
 | `readback_flags` | list of strings / empty | Flags that make any command reveal a credential |
 | `allow` | list of leading subcommand prefixes / empty | Positive command allowlist; empty or absent denies every invocation |
+| `allow_read_only` | list of leading subcommand prefixes / empty | Prefixes admitted only when the invocation reads |
+| `allow_paths` | list of paths / empty | Trees outside the workspace that absolute path arguments may reach |
+| `boolean_flags` | list of strings / empty | Flags that never take the next token as a value when the subcommand is read |
 | `env_passthrough` | list of names / empty | Additional daemon variables forwarded to the real CLI |
 
 The whole section requires a chat-daemon restart. Removing a packaged refusal is

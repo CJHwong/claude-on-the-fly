@@ -68,6 +68,35 @@ Operator entries override packaged tools by name. Dropping a packaged readback r
 is legal but produces a warning. An override that omits `allow` intentionally disables
 the packaged tool rather than inheriting its safe command list.
 
+## Declare a tool's boolean flags
+
+The broker has no flag table, so it reads every bare flag as taking the next token as
+its value. That is right for `gh --repo o/r pr view` and wrong for a flag that takes
+none: `systemctl --user status cotf` reads as the subcommand `cotf`, so an `allow` entry
+of `status` refuses it. Name those flags:
+
+```yaml
+commands:
+  tools:
+    - name: systemctl
+      allow: [status, is-active, is-enabled, list-units, list-timers, show]
+      boolean_flags: [--user, --system, --quiet, --no-pager, --all, --full]
+      env_passthrough: [XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS]
+```
+
+`systemctl --user` finds the user manager through those two variables. The broker
+passes the real binary a curated environment, so without them it fails with `Failed
+to connect to user scope bus`.
+
+List every boolean flag that can come before the subcommand, not only the ones you
+use. An unlisted boolean flag still swallows the next word, and the words after it are
+matched instead. With `status` allowed and `--quiet` unlisted, the broker admits
+`systemctl --quiet stop status`. systemctl reads `--quiet` as boolean, so the verb it
+runs is `stop`.
+
+The readback check keeps its second reading, where no flag takes a value, so a wrong
+declaration cannot open a credential readback.
+
 ## Let a tool read a file outside the workspace
 
 The broker refuses every absolute path argument. That is right for a credentialed

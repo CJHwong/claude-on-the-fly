@@ -1336,6 +1336,79 @@ def test_allow_paths_is_parsed_from_configuration():
 
 
 # --------------------------------------------------------------------------
+# boolean_flags: flags that never take the next token as their value
+# --------------------------------------------------------------------------
+
+SYSTEMCTL = ShimmedTool(
+    name="systemctl",
+    allow=(("status",), ("is-active",)),
+    boolean_flags=frozenset({"--user", "--quiet"}),
+)
+
+
+def test_boolean_flags_are_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {
+            "tools": [
+                {"name": "systemctl", "allow": ["status"], "boolean_flags": ["--user"]}
+            ]
+        },
+        source="test",
+    )
+    assert tool.boolean_flags == frozenset({"--user"})
+
+
+def test_a_declared_boolean_flag_does_not_swallow_the_subcommand():
+    """`systemctl --user status x` is the everyday spelling, and reading
+    `--user` as taking a value hid `status` from the allowlist."""
+    assert leading_tokens(
+        ["--user", "status", "x"], boolean_flags=frozenset({"--user"})
+    ) == ("status", "x")
+    assert allowed_command(SYSTEMCTL, ["--user", "status", "cotf"]) is True
+    assert allowed_command(SYSTEMCTL, ["--user", "--quiet", "is-active", "x"]) is True
+
+
+def test_an_undeclared_flag_still_takes_a_value():
+    """Only the listed flags change; every other bare flag keeps the reading
+    the allowlist had before, so a tool without the key behaves as it did."""
+    assert allowed_command(SYSTEMCTL, ["-H", "status", "is-active"]) is True
+    assert allowed_command(SYSTEMCTL, ["--user", "stop", "cotf"]) is False
+    assert (
+        allowed_command(
+            ShimmedTool(name="systemctl", allow=(("status",),)),
+            [
+                "--user",
+                "status",
+                "x",
+            ],
+        )
+        is False
+    )
+
+
+def test_a_write_refusal_reads_boolean_flags_too():
+    tool = ShimmedTool(
+        name="gh",
+        allow_read_only=(("api",),),
+        boolean_flags=frozenset({"--paginate"}),
+    )
+    assert refused_as_write(tool, ["--paginate", "api", "-f", "a=b", "x"]) is True
+
+
+def test_boolean_flags_keep_the_second_readback_reading():
+    """The declared table sharpens the first reading; the reading where no
+    flag takes a value still runs, so a wrong declaration cannot open a
+    readback."""
+    tool = ShimmedTool(
+        name="gh",
+        readback=frozenset({("auth", "token")}),
+        boolean_flags=frozenset({"--verbose"}),
+    )
+    assert refuses_readback(tool, ["--verbose", "auth", "token"]) is True
+    assert refuses_readback(tool, ["--hostname", "auth", "token"]) is True
+
+
+# --------------------------------------------------------------------------
 # path introducers: @file and file:// URLs
 # --------------------------------------------------------------------------
 
