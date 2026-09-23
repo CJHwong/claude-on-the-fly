@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from claude_on_the_fly import agent, egress, sandbox, sandbox_macos
+from claude_on_the_fly import agent, commands, egress, sandbox, sandbox_macos
 
 # Set by the macOS CI job. The cases below run a real `sandbox-exec`, so off
 # macOS they can only skip -- and a skipped boundary case reads exactly like a
@@ -1419,8 +1419,28 @@ def test_an_unreadable_shim_dir_leaves_path_alone(monkeypatch, tmp_path):
         raise OSError("permission denied")
 
     monkeypatch.setattr(Path, "iterdir", cannot_list)
-    env = sandbox._with_shims_on_path({"PATH": "/usr/bin"})
+    env = sandbox._with_shims_on_path(
+        {"PATH": "/usr/bin", commands.ENDPOINT_ENV: "http://127.0.0.1:1"}
+    )
     assert env["PATH"] == "/usr/bin"
+
+
+def test_shims_go_on_path_only_where_a_broker_answers(monkeypatch):
+    """The shim dir is shared across daemons, and only the chat daemon runs a
+    broker. A cron job got the shims with no endpoint, so every brokered tool
+    failed where the real binary would have run."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    shims = sandbox.shim_dir()
+    shims.mkdir(parents=True, exist_ok=True)
+    (shims / "gh").write_text("#!/bin/sh\n")
+
+    no_broker = sandbox._with_shims_on_path({"PATH": "/usr/bin"})
+    assert no_broker["PATH"] == "/usr/bin"
+
+    brokered = sandbox._with_shims_on_path(
+        {"PATH": "/usr/bin", commands.ENDPOINT_ENV: "http://127.0.0.1:1"}
+    )
+    assert brokered["PATH"] == f"{shims}:/usr/bin"
 
 
 # --- the agent's own memory has to survive the jail ---
