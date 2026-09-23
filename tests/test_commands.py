@@ -880,7 +880,7 @@ def test_bundled_gh_still_refuses_writes_and_api(argv):
     [
         ["sts", "get-caller-identity"],
         ["s3", "ls", "s3://bucket/prefix/"],
-        ["--profile", "prod", "logs", "tail", "/aws/lambda/fn", "--since", "1h"],
+        ["logs", "tail", "/aws/lambda/fn", "--since", "1h", "--profile", "prod"],
         ["ecs", "describe-services", "--cluster", "c", "--services", "s"],
         ["cloudformation", "describe-stack-events", "--stack-name", "s"],
     ],
@@ -1687,3 +1687,112 @@ def test_decoding_runs_to_a_fixed_point(tmp_path):
 def test_an_ordinary_percent_in_a_name_is_not_a_traversal(tmp_path):
     assert commands._unsafe_path_argument(["100%-done.md"], str(tmp_path)) is None
     assert commands._unsafe_path_argument(["report%20final.md"], str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------
+# both flag readings have to admit a command
+# --------------------------------------------------------------------------
+
+
+def test_an_undeclared_boolean_flag_cannot_hide_a_refused_verb():
+    """systemctl reads `--quiet` as boolean, so the verb that runs is `stop`.
+    The value-taking reading swallowed it and matched `status` instead."""
+    tool = ShimmedTool(name="systemctl", allow=(("status",),))
+    assert allowed_command(tool, ["--quiet", "stop", "status"]) is False
+    assert allowed_command(tool, ["status", "--quiet", "cotf"]) is True
+
+
+def test_a_value_flag_before_the_subcommand_is_the_cost():
+    """The one spelling the second reading refuses. None of 1884 real gh, gws
+    and slacker.sh calls on the deployed host used it."""
+    tool = ShimmedTool(name="gh", allow=(("pr", "view"),))
+    assert allowed_command(tool, ["--repo", "o/r", "pr", "view"]) is False
+    assert allowed_command(tool, ["pr", "view", "12", "--repo", "o/r"]) is True
+
+
+def test_a_read_only_prefix_needs_both_readings_too():
+    tool = ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert allowed_command(tool, ["api", "--method", "GET", "repos/o/r"]) is True
+    assert allowed_command(tool, ["--verbose", "delete", "api"]) is False
+
+
+def test_a_split_reading_is_not_reported_as_a_write():
+    """The write wording tells the agent to drop the write. When the readings
+    disagree the request may be a read, so the generic wording is the true one."""
+    tool = ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert refused_as_write(tool, ["--verbose", "delete", "api"]) is False
+    assert refused_as_write(tool, ["api", "-f", "a=b", "x"]) is True
+
+
+# --------------------------------------------------------------------------
+# paths inside a JSON argument
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--params", '{"body":"/etc/passwd"}'],
+        ["--params", '{"a":[{"b":"../../etc/passwd"}]}'],
+        ['--json={"q":"a=b","f":"/etc/passwd"}'],
+        ["--json", '{"f":"\\u002fetc\\u002fpasswd"}'],
+        ["--json", '{"f":"@/etc/passwd"}'],
+        ["--json", '{"f":"file:///etc/passwd"}'],
+        ["-p" + '{"f":"/etc/passwd"}'],
+        ['body={"f":"/etc/passwd"}'],
+        ["--json", '["~/.ssh/id_ed25519"]'],
+        ["--json", "[" * 5000 + '"/etc/passwd"' + "]" * 5000],
+        # An escape JSON rejects still leaves the literal to check as written.
+        ["--json", '{"f":"/etc/\\q"}'],
+    ],
+)
+def test_a_path_inside_a_json_argument_is_refused(argv):
+    assert commands._unsafe_path_argument(argv) == argv[-1]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--params", '{"q":"name contains \'x\'","pageSize":10}'],
+        ["--params", '{"range":"Sheet1!A1:B2","userId":"me"}'],
+        ["--json", '{"text":"see a/b and c.d"}'],
+        ["--json", "[1, 2, true, null]"],
+        ["--json", "{not json"],
+    ],
+)
+def test_ordinary_json_arguments_still_run(argv):
+    assert commands._unsafe_path_argument(argv) is None
+
+
+async def test_a_leading_flag_refusal_says_to_move_the_flag(tmp_path):
+    """`aws --profile prod logs tail` is refused because the broker cannot tell
+    whether `--profile` takes a value. The CLI accepts the flag after the
+    subcommand, so that is the fix to name, not a trip to the operator."""
+    tool = ShimmedTool(name="echo", allow=(("logs", "tail"),))
+    broker, _port = await start(tmp_path, (tool,))
+    try:
+        leading = await post(
+            broker, {"tool": "echo", "argv": ["--profile", "prod", "logs", "tail", "g"]}
+        )
+        moved = await post(
+            broker, {"tool": "echo", "argv": ["logs", "tail", "g", "--profile", "prod"]}
+        )
+        assert leading["rc"] == 126 and leading["refused"] is True
+        assert "after the subcommand" in leading["stderr"]
+        assert moved["rc"] == 0
+    finally:
+        await broker.stop()
+
+
+def test_bundled_aws_names_the_fix_for_a_leading_profile():
+    aws = {t.name: t for t in commands.load_tools()}["aws"]
+    argv = ["--profile", "prod", "logs", "tail", "/aws/lambda/fn"]
+    assert not allowed_command(aws, argv)
+    assert commands.hidden_by_a_leading_flag(aws, argv)
+
+
+def test_the_move_hint_does_not_fire_for_an_unlisted_subcommand():
+    tool = ShimmedTool(name="aws", allow=(("logs", "tail"),))
+    assert commands.hidden_by_a_leading_flag(tool, ["--profile", "p", "logs", "tail"])
+    assert not commands.hidden_by_a_leading_flag(tool, ["s3", "rm", "x"])
+    assert not commands.hidden_by_a_leading_flag(tool, ["logs", "tail", "g"])

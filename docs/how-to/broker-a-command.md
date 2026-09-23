@@ -92,14 +92,14 @@ commands:
 passes the real binary a curated environment, so without them it fails with `Failed
 to connect to user scope bus`.
 
-List every boolean flag that can come before the subcommand, not only the ones you
-use. An unlisted boolean flag still swallows the next word, and the words after it are
-matched instead. With `status` allowed and `--quiet` unlisted, the broker admits
-`systemctl --quiet stop status`. systemctl reads `--quiet` as boolean, so the verb it
-runs is `stop`.
-
-The readback check keeps its second reading, where no flag takes a value, so a wrong
-declaration cannot open a credential readback.
+A command runs only when both readings admit it: the one where a bare flag takes the
+next token, and the one where it takes none. So an unlisted flag before the subcommand
+gets the command refused rather than hiding a verb. Without that rule, `status`
+allowed and `--quiet` unlisted admitted `systemctl --quiet stop status`, and systemctl
+ran `stop`. The refusal tells the agent to put its flags after the subcommand, which
+`aws`, `gh` and `systemctl` all accept. List the boolean flags the agent uses first,
+so the everyday spelling runs as written. A value flag such as `aws --profile prod`
+cannot be listed that way and has to follow the subcommand.
 
 ## Let a tool read a file outside the workspace
 
@@ -135,6 +135,11 @@ refused. A `file://` URL is read the way a URL parser reads it: the scheme match
 any case (`FILE://` too), an authority is dropped, because RFC 8089 makes
 `file://localhost/etc/passwd` mean `/etc/passwd` and curl reads it, and the path is
 percent-decoded, so `%2e%2e` cannot smuggle a `..` past the check.
+
+A JSON argument is read too. Every string value inside a token that starts with `{` or
+`[` is a candidate, at any depth and with escapes decoded, so `--params
+'{"body":"/etc/passwd"}'` is refused. No brokered tool is known to open a file named
+that way. The guard does not rely on that holding for every tool you add.
 
 An introducer is not a claim about the tool's grammar, so an argument that merely starts
 with `@` costs nothing: `send @alice` yields the extra candidate `alice`, which is

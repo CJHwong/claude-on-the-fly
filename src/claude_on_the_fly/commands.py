@@ -43,6 +43,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -537,13 +538,46 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
 
     A prefix on `allow_read_only` additionally has to ask for a read. `allow` is
     checked first, so a prefix listed on both is allowed outright.
+
+    Both flag readings have to admit the command, the mirror of the rule
+    `refuses_readback` applies. Reading only the value-taking one let a boolean
+    flag the operator did not declare swallow the real verb: with `status`
+    allowed, `systemctl --quiet stop status` matched `status` and systemctl ran
+    `stop`. The cost is a value flag written before the subcommand, such as
+    `gh --repo o/r pr view`; none of 1884 real calls on the deployed host did that.
     """
-    tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
+    return all(
+        _admits(tool, tokens, argv)
+        for tokens in (
+            leading_tokens(argv, boolean_flags=tool.boolean_flags),
+            leading_tokens(argv, flags_take_values=False),
+        )
+    )
+
+
+def _admits(tool: ShimmedTool, tokens: tuple[str, ...], argv: list[str]) -> bool:
+    """Whether one reading of the subcommand path is on the allowlist."""
     if any(tokens[: len(prefix)] == prefix for prefix in tool.allow):
         return True
     if any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only):
         return requests_read_only(argv)
     return False
+
+
+def hidden_by_a_leading_flag(tool: ShimmedTool, argv: list[str]) -> bool:
+    """True when a flag before the subcommand is the only reason for a refusal.
+
+    Only used to choose the refusal wording. The broker cannot tell whether
+    `--profile` in `aws --profile prod logs tail` takes a value, so the command
+    is refused, but the CLI accepts the flag after the subcommand. Naming that
+    fix keeps the agent from asking the operator for a prefix already listed.
+    Moving the flag also exposes the real verb when the flag was boolean, so the
+    hint is safe to give for an attempt to hide one.
+    """
+    if allowed_command(tool, argv):
+        return False
+    tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
+    return _admits(tool, tokens, argv)
 
 
 def refused_as_write(tool: ShimmedTool, argv: list[str]) -> bool:
@@ -553,7 +587,7 @@ def refused_as_write(tool: ShimmedTool, argv: list[str]) -> bool:
     allowlisted" sends the agent to ask for a prefix that is already configured,
     and it retries or works around instead of dropping the write.
     """
-    if allowed_command(tool, argv):
+    if allowed_command(tool, argv) or requests_read_only(argv):
         return False
     tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
     return any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only)
@@ -575,8 +609,11 @@ def _path_candidates(item: str) -> list[str]:
     the tail of a boolean cluster as a path over-refuses at worst: `-abc` is
     checked as the relative path `bc`, which is inside the workspace and allowed.
     """
+    # The value after the first `=` as well as each `=` segment: a JSON value can
+    # hold an `=` of its own, and the segments then cut it into invalid halves.
+    whole_value = item.split("=", 1)[1:]
     if item.startswith("-"):
-        candidates = item.split("=")[1:]
+        candidates = [*whole_value, *item.split("=")[1:]]
         if not item.startswith("--"):
             candidates.append(item[2:])
     else:
@@ -584,8 +621,38 @@ def _path_candidates(item: str) -> list[str]:
         # takes typed fields: `gh api -F body=@/etc/passwd` arrives as the single
         # token `body=@/etc/passwd`, which is not a flag, so splitting only flags
         # read the whole thing as one relative path inside the workspace.
-        candidates = [item, *item.split("=")[1:]]
+        candidates = [item, *whole_value, *item.split("=")[1:]]
+    candidates += [
+        text for candidate in candidates for text in _json_strings(candidate)
+    ]
     return [form for candidate in candidates for form in _introduced_paths(candidate)]
+
+
+# Every string literal in JSON text, found without parsing it. A parser gives up on
+# deep nesting (RecursionError) and on the lenient spellings some CLIs accept, and
+# either failure would hand the guard nothing to check. A literal is a literal at
+# any depth, so this reads the same strings the tool's own parser would.
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _json_strings(candidate: str) -> list[str]:
+    """The string values inside a JSON argument, each read as a path candidate.
+
+    The guard reads a token as a path, so `--params '{"body":"/etc/passwd"}'` was
+    one relative-looking token. No brokered tool is known to open a file named
+    this way, and gws measured does not, but the guard should not depend on every
+    future tool's grammar. None of 675 real JSON arguments on the deployed host
+    held a value this refuses.
+    """
+    if candidate.lstrip()[:1] not in ("{", "["):
+        return []
+    strings = []
+    for literal in _JSON_STRING.findall(candidate):
+        try:
+            strings.append(json.loads(f'"{literal}"'))
+        except json.JSONDecodeError:
+            strings.append(literal)
+    return strings
 
 
 # How an argument says "what follows is a file". `@` is the convention curl set
@@ -1093,6 +1160,8 @@ class CommandBroker:
                 logs.redact_argv(argv),
                 "write on a read-only subcommand"
                 if refused_as_write(tool, argv)
+                else "a flag before the subcommand"
+                if hidden_by_a_leading_flag(tool, argv)
                 else "not in the configured command allowlist",
             )
             if refused_as_write(tool, argv):
@@ -1101,6 +1170,16 @@ class CommandBroker:
                         f"[sandbox] {tool.name} may run this subcommand to read, "
                         "but this invocation asks the server to write. Re-run it "
                         "as a read, or ask the operator to do the write.\n"
+                    ),
+                    rc=126,
+                    refused=True,
+                )
+            if hidden_by_a_leading_flag(tool, argv):
+                return CommandResult(
+                    stderr=(
+                        f"[sandbox] {tool.name}: a flag before the subcommand "
+                        "hides it from the allowlist. Put every flag after the "
+                        "subcommand and run it again.\n"
                     ),
                     rc=126,
                     refused=True,
