@@ -104,6 +104,8 @@ _PTY_LOCK_WAIT_SECONDS = "60"
 # other backend, whose own auth.json stays readable because the agent process must
 # read it to authenticate.
 _CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+# Where the claude CLI keeps the same credential on Linux, under the config dir.
+_CLAUDE_CREDENTIALS_FILE = ".credentials.json"
 
 
 def _claude_oauth_token() -> str | None:
@@ -117,26 +119,16 @@ def _claude_oauth_token() -> str | None:
     Never logged, and never returned anywhere that logs its values: agent_env
     reports variable names and a dropped count, never contents.
     """
-    from claude_on_the_fly import broker
-
-    # The login keychain is a macOS store, and `read_keychain` shells out to
-    # `security`, which no other platform has. `broker.has_keychain` now refuses
-    # that call too, so this is the outer of two guards rather than the only one
-    # -- it stays because it is the one the tests drive, through `_platform`.
-    if _platform() != "darwin":
-        return None
-    try:
-        raw = broker.read_keychain(_CLAUDE_KEYCHAIN_SERVICE)
-    except (KeyError, OSError):
+    raw = _claude_credential_text()
+    if raw is None:
         return None
     try:
         oauth = json.loads(raw)["claudeAiOauth"]
         token = oauth["accessToken"]
     except (json.JSONDecodeError, KeyError, TypeError):
         logger.warning(
-            "sandbox: the %s keychain item is not the shape the claude CLI writes, "
-            "so a jailed claude turn will report 'Not logged in'",
-            _CLAUDE_KEYCHAIN_SERVICE,
+            "sandbox: the claude credential is not the shape the claude CLI "
+            "writes, so a jailed claude turn will report 'Not logged in'"
         )
         return None
     if not isinstance(token, str) or not token:
@@ -153,6 +145,37 @@ def _claude_oauth_token() -> str | None:
             "authenticate"
         )
     return token
+
+
+def _claude_credential_text() -> str | None:
+    """The raw credential the claude CLI stored, from wherever this platform keeps it.
+
+    macOS keeps it in the login keychain. Linux keeps it in `.credentials.json`
+    under the config dir, which the jail masks because it holds the refresh token
+    as well. Read here, outside the jail, only under `jail`: under `env` the CLI
+    can still read and refresh its own file, and an env token would shadow a
+    credential that refreshes with one that expires.
+    """
+    from claude_on_the_fly import broker, envfile
+
+    platform = _platform()
+    if platform == "linux":
+        if mode() != "jail":
+            return None
+        try:
+            return (envfile.claude_config_dir() / _CLAUDE_CREDENTIALS_FILE).read_text()
+        except OSError:
+            return None
+    # The login keychain is a macOS store, and `read_keychain` shells out to
+    # `security`, which no other platform has. `broker.has_keychain` now refuses
+    # that call too, so this is the outer of two guards rather than the only one
+    # -- it stays because it is the one the tests drive, through `_platform`.
+    if platform != "darwin":
+        return None
+    try:
+        return broker.read_keychain(_CLAUDE_KEYCHAIN_SERVICE)
+    except (KeyError, OSError):
+        return None
 
 
 def claude_pty_startup_is_delegated() -> bool:
@@ -1546,8 +1569,9 @@ _CLAUDE_RUNTIME_WRITES = (
 # Files under the claude config directory a turn must not read, named one by one
 # the way the credential denies are. history.jsonl is every prompt typed in every
 # project on the host, so it crosses threads exactly like projects/ does, and no
-# measured turn writes it.
-_CLAUDE_READ_DENIED = ("history.jsonl",)
+# measured turn writes it. The credentials file holds the refresh token; a jailed
+# turn gets the access token alone through ANTHROPIC_AUTH_TOKEN instead.
+_CLAUDE_READ_DENIED = ("history.jsonl", _CLAUDE_CREDENTIALS_FILE)
 
 
 # ~/.codex is writable on Linux, with the dangerous entries mounted read-only back

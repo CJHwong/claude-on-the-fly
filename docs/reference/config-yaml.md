@@ -180,6 +180,8 @@ host is a covert channel: TLS payloads are not inspected.
 The whole section requires a chat-daemon restart. Removing a packaged refusal is
 allowed but logged as a warning. Arguments and flags after an allowed prefix are passed
 through, so the broker is not a full CLI-semantics parser; scope the credential itself.
+A flag before the subcommand is refused unless it is listed in `boolean_flags`, and the
+refusal tells the agent to move it after the subcommand.
 Operator overrides replace packaged entries by name. They do not inherit the packaged
 `allow` list, so an override that omits it disables that tool.
 

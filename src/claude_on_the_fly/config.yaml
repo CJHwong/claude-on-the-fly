@@ -134,12 +134,13 @@ commands:
   #                     the sandbox with the real credential, so an entry that
   #                     reaches a credential store is logged at ERROR and dropped.
   #
-  #   boolean_flags     flags that never take a value. The allowlist reads every
-  #                     other bare flag as taking the next token, so without this
-  #                     `systemctl --user status x` matches `x`, not `status`,
-  #                     and is refused. List every boolean flag that can come
-  #                     before the subcommand: an unlisted one hides the next
-  #                     word from the allowlist.
+  #   boolean_flags     flags that never take a value. A command runs only when
+  #                     both flag readings admit it: a bare flag taking the next
+  #                     token, and taking none. So without this,
+  #                     `systemctl --user status x` is refused, and the agent is
+  #                     told to move the flag after the subcommand. List the
+  #                     boolean flags the agent writes first. A value flag
+  #                     (`aws --profile p`) has to follow the subcommand.
   #
   #   allow             safe leading subcommands. The list is deny-by-default;
   #                    flags and arguments may follow the listed words. A

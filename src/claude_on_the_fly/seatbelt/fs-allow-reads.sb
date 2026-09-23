@@ -224,6 +224,9 @@
 ;; way projects/ does. Denied by name, like the credentials above, because it is one
 ;; file rather than a tree. No measured turn writes it, so nothing is lost.
 (deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
+;; The CLI's own credential, refresh token included, where it keeps it off the
+;; keychain. A turn gets the access token alone through ANTHROPIC_AUTH_TOKEN.
+(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/.credentials.json")))
 ;; codex, same boundary and the wider hole of the two: its rollouts sit in one flat
 ;; date tree that the global read allow reached in full, 1088 files on the host this
 ;; was measured on. codex chooses the rollout name at startup, so there is nothing

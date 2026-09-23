@@ -236,6 +236,9 @@
 ;; way projects/ does. Denied by name, like the credentials further down, because it
 ;; is one file rather than a tree. No measured turn writes it, so nothing is lost.
 (deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/history.jsonl")))
+;; The CLI's own credential, refresh token included, where it keeps it off the
+;; keychain. A turn gets the access token alone through ANTHROPIC_AUTH_TOKEN.
+(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") "/.credentials.json")))
 ;; codex was the wider hole: the ~/.codex allow above reached every rollout in one
 ;; flat date tree, 1088 of them on the host this was measured on. codex picks the
 ;; rollout name at startup, so there is no per-workspace path to re-grant inside
