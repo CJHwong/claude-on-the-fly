@@ -95,14 +95,30 @@ and it is allowed. This is the same class as the `@file` finding above and it ha
 general fix for the same reason -- separating a path from a value needs the per-tool
 argument grammar the broker deliberately does not have.
 
-It matters for a tool whose arguments are JSON. The deployed host brokers `gws`, which
-takes `--params '{...}'` and is allowlisted at whole-service granularity (`drive`,
-`gmail`, `docs`). Not demonstrated: `gws` resolves only on the daemon's PATH, so it was
-not introspected here rather than guessed at. The check an operator can run is whether
-any allowlisted `gws` subcommand accepts a *local* file path inside `--params` or on a
-flag -- a media upload is the shape to look for. If one does, the broker will read that
-file as the operator. Narrow the `gws` allowlist to the subcommands actually used before
-relying on the guard here.
+It stays open as a class: it matters for any tool that reads a local file named inside
+a JSON value. `gws` 0.22.5, the one JSON-argument tool deployed, does not. Measured on
+the deployed host: `--params` and `--json` are parsed as JSON and never opened as a
+file, and `--params @/x` and `--json @/x` both fail with `Invalid ... JSON`. `gws`
+reads local files only through `--upload <PATH>`, `drive +upload <file>` and
+`gmail +send|+reply|+forward -a/--attach <PATH>`. `--output <PATH>` writes a file. All of
+them are plain flag values or positionals, so the guard sees them. Twelve spellings with
+an outside path were refused, including `-a/etc/passwd`, `--attach=`, `@/`, `file://`,
+`~/` and a planted symlink. Three legitimate calls with relative paths and JSON values
+were allowed. Recheck this when a new JSON-argument tool is brokered, or when `gws`
+adds a flag that takes a file inside `--params`.
+
+**An undeclared boolean flag hides a refused subcommand from the allowlist.** The
+allowlist reads a bare flag as taking the next token, so a boolean flag placed before a
+refused verb swallows it, and the words after it are matched instead. With `allow:
+[status]`, `systemctl --quiet stop status` is admitted. systemctl 259 reads `--quiet` as
+boolean, measured with `systemctl --user --quiet is-enabled <unit>` returning
+`is-enabled`'s rc 4, so the verb that runs is `stop`. `boolean_flags` closes it for
+every flag the operator lists, and nothing closes it for a flag left off. The general
+fix is the one `refuses_readback` already makes: admit a command only when both flag
+readings match the allowlist. Its cost is a refusal for a value flag written before the
+subcommand, such as `gh --repo o/r pr view`. Not applied: that changes what deployed
+agents may run. No deployed tool is exposed today, because neither `gh` nor `gws` has a
+boolean flag that can precede a subcommand on its allowlist.
 
 **`fs: allow-reads` leaves credential stores readable.** Measured on a real home: the
 Firefox profile tree (holding `logins.json` and `key4.db`) and `~/Library/Messages/chat.db`.
@@ -114,8 +130,23 @@ is the posture to deploy.
 tree is re-exposed read-only and only `history.jsonl` is masked. On macOS the equivalent
 lives in the Keychain, which the profile denies, so an operator reading the profile as
 "keychain denied" gets no such protection on Linux. Partly already recorded under "Known
-limits" in the security model, but the platform asymmetry is not. Unconfirmed: the test
-VM shares the macOS home, so no such file existed to probe.
+limits" in the security model, but the platform asymmetry is not.
+
+Confirmed with a real `_linux_wrap` bubblewrap run over a throwaway home with a
+placeholder file: `.credentials.json` is readable, refresh token included.
+`history.jsonl` (the control) is denied. The deployed host is not exposed today, because
+its claude runs against a local model and has no `.credentials.json`. A host that logs
+claude in on Linux is exposed.
+
+The fix is the macOS handoff, and it is measured to work. The daemon reads
+`claudeAiOauth.accessToken` outside the jail and passes it as `ANTHROPIC_AUTH_TOKEN`,
+and the jail masks `.credentials.json`. With the file emptied and the variable set,
+`claude auth status` reports `loggedIn: true, authMethod: oauth_token`, and a request
+with a placeholder token fails `401 Invalid bearer token`, so the variable is what the
+CLI sends. Without the variable it reports `loggedIn: false`. The agent then holds a
+short-lived access token and no refresh token. Open question before building it: codex's
+`auth.json` stays readable by design and also holds a refresh token, so the fix closes
+the claude half only.
 
 **A planted symlink turns the session grant into a filesystem-wide grant.** With
 `scope_sessions` off, `projects/` is writable, so a turn can create a symlink named with
