@@ -53,7 +53,7 @@ from claude_on_the_fly.agent import (
     unique_path,
     write_attachment,
 )
-from claude_on_the_fly.backends.claude import ClaudeBackend
+from claude_on_the_fly.backends.claude import ClaudeBackend, _discard_system_prompt
 from claude_on_the_fly.transcript import Turn
 
 
@@ -635,6 +635,10 @@ def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     proc.stderr = MagicMock()
     proc.stderr.read = _AsyncChunkReader(stderr)
     proc.wait = AsyncMock(return_value=returncode)
+    # A StreamWriter as asyncio hands it over: `write` and `close` are plain
+    # calls, only `drain` is awaited.
+    proc.stdin = MagicMock()
+    proc.stdin.drain = AsyncMock()
     return proc
 
 
@@ -918,6 +922,159 @@ def _never_ending_proc() -> MagicMock:
     proc.stderr.read = _AsyncChunkReader(b"")
     proc.wait = AsyncMock(return_value=-9)
     return proc
+
+
+class TestExecStdin:
+    """The turn's prompt travels on stdin, not as an argv element.
+
+    One argv element is capped at MAX_ARG_STRLEN (32 pages, 131072 bytes, on
+    Linux). A Slack reply in a long thread replays up to 50 prior messages ahead
+    of the prompt, which measured 131360-142743 bytes on the thread that broke,
+    so the spawn died in execve with E2BIG before the CLI ever started.
+    """
+
+    async def test_prompt_is_written_to_stdin_and_the_pipe_closed(self):
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await _exec(
+                Path("/tmp"), ["claude", "-p"], stdin_text="the prompt"
+            )
+
+        assert result["result"] == "hi"
+        proc.stdin.write.assert_called_once_with(b"the prompt")
+        proc.stdin.drain.assert_awaited()
+        proc.stdin.close.assert_called_once()
+
+    async def test_a_prompt_is_piped(self):
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await _exec(Path("/tmp"), ["claude", "-p"], stdin_text="x")
+
+        assert mock_exec.call_args.kwargs["stdin"] is asyncio.subprocess.PIPE
+
+    async def test_no_prompt_is_devnull_not_inherited(self):
+        """An inherited open pipe costs the CLI's 3-second stdin probe."""
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await _exec(Path("/tmp"), ["claude", "-p"])
+
+        assert mock_exec.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
+
+    async def test_a_cli_that_exits_before_reading_keeps_its_own_error(self):
+        """The broken pipe is a symptom; the exit status is the failure."""
+        proc = _make_proc(1, b"", stderr=b"unknown option")
+        proc.stdin.drain = AsyncMock(side_effect=BrokenPipeError)
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="unknown option"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p"], stdin_text="x")
+
+
+class TestPromptOffArgv:
+    """No argv element carries the prompt, whatever the thread's history is."""
+
+    async def test_a_prompt_over_the_arg_limit_reaches_the_cli(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """The regression: 200 KB of replayed thread history in argv is E2BIG."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        # A resume, which is the shape that failed in production: the CLI reads
+        # the transcript itself, and the prompt rides alongside it.
+        (session_dir / "sess-long.jsonl").write_text('{"type":"user"}\n')
+        long_prompt = "x" * 200_000
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=_cli_output(),
+        ) as mock:
+            await ClaudeBackend().run(
+                workspace, "sess-long", long_prompt, "slack", "hoss", "dm"
+            )
+
+        cmd = mock.call_args_list[0][0][1]
+        assert max(len(part) for part in cmd) < 131072
+        assert mock.call_args_list[0][1]["stdin_text"] == long_prompt
+
+    async def test_pty_still_carries_the_prompt_in_argv(self, tmp_path, monkeypatch):
+        """claude-pty takes its prompt from argv, so pty is unchanged."""
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("CLAUDE_MODE", "pty")
+        with (
+            patch.object(
+                claude_mod, "resolve_pty_binary", return_value="/bin/claude-pty"
+            ),
+            patch.object(
+                claude_mod,
+                "_exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(pty=True, model="sonnet").run(
+                workspace, "sess-pty", "the prompt", "telegram"
+            )
+
+        assert mock.call_args[0][1][-1] == "the prompt"
+        assert mock.call_args.kwargs["stdin_text"] is None
+
+
+class TestStagedSystemPromptCleanup:
+    """Cleanup runs in a `finally`, so it must never raise.
+
+    The agent works in this directory with permissions bypassed, so by the time
+    the turn ends the staged path can be something else entirely.
+    """
+
+    def test_the_file_is_removed(self, tmp_path):
+        path = tmp_path / "prompt"
+        path.write_text("system prompt", encoding="utf-8")
+        _discard_system_prompt(path)
+        assert not path.exists()
+
+    def test_a_missing_file_is_not_an_error(self, tmp_path):
+        _discard_system_prompt(tmp_path / "never-staged")
+
+    def test_a_path_that_is_not_a_file_is_reported_not_raised(self, tmp_path, caplog):
+        directory = tmp_path / "prompt"
+        directory.mkdir()
+        _discard_system_prompt(directory)
+        assert directory.exists()
+        assert "could not remove the staged system prompt" in caplog.text
+
+    async def test_a_failed_cleanup_does_not_replace_the_turns_result(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        blocker = workspace / "blocked"
+        blocker.mkdir()  # unlink() raises on a directory
+        with (
+            patch.object(claude_mod, "_stage_system_prompt", return_value=blocker),
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(result="kept"),
+            ),
+        ):
+            resp = await ClaudeBackend().run(workspace, "sess-x", "hi", "telegram")
+
+        assert resp.body == "kept"
 
 
 class TestClassify:
@@ -1567,8 +1724,10 @@ class TestRun:
 
         assert resp.body == "No response"
         assert mock.await_count == 2
-        # Second call is the nudge.
-        assert NUDGE_PROMPT in mock.call_args_list[1][0][1]
+        # Second call is the nudge, and it rides stdin like the first call: the
+        # retry exists for the turn that produced nothing, so it must not be the
+        # arm that dies on a long prompt.
+        assert mock.call_args_list[1][1]["stdin_text"] == NUDGE_PROMPT
 
     async def test_empty_result_triggers_retry(self):
         """Empty-string result fires a retry; retry's body is returned."""
@@ -1587,7 +1746,7 @@ class TestRun:
         retry_cmd = mock.call_args_list[1][0][1]
         assert "--resume" in retry_cmd
         assert "sess-1" in retry_cmd
-        assert NUDGE_PROMPT in retry_cmd
+        assert mock.call_args_list[1][1]["stdin_text"] == NUDGE_PROMPT
 
     async def test_whitespace_result_triggers_retry(self):
         first = _cli_output(result="   \n  ")
@@ -1742,8 +1901,8 @@ class TestRun:
         self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
         """Pre-create the session JSONL so the backend takes the --resume
-        branch (not --session-id), then verify the uuid+prompt make it
-        through."""
+        branch (not --session-id), then verify the uuid reaches argv and the
+        prompt reaches the CLI another way."""
         from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
         output = _cli_output()
@@ -1761,7 +1920,9 @@ class TestRun:
         cmd = mock.call_args[0][1]
         assert "--resume" in cmd
         assert "my-uuid" in cmd
-        assert "hi" in cmd
+        # The prompt is not an argv element any more (see TestPromptOffArgv).
+        assert "hi" not in cmd
+        assert mock.call_args.kwargs["stdin_text"] == "hi"
 
 
 # ---------------------------------------------------------------------------
@@ -2679,7 +2840,7 @@ class TestClaudeBackendHandoff:
         # No prior session JSONL → backend goes straight to --session-id.
         cmd = mock.call_args_list[0][0][1]
         assert "--session-id" in cmd
-        prompt_arg = cmd[-1]
+        prompt_arg = mock.call_args_list[0][1]["stdin_text"]
         assert "[Prior conversation via codex" in prompt_arg
         assert "prior codex msg" in prompt_arg
         assert "prior codex reply" in prompt_arg
@@ -2700,9 +2861,9 @@ class TestClaudeBackendHandoff:
         ):
             await run(self._workspace, "sess-2", "JUST_THIS", "telegram")
 
-        cmd = mock.call_args_list[0][0][1]
-        assert "[Prior conversation" not in cmd[-1]
-        assert cmd[-1] == "JUST_THIS"
+        prompt_arg = mock.call_args_list[0][1]["stdin_text"]
+        assert "[Prior conversation" not in prompt_arg
+        assert prompt_arg == "JUST_THIS"
 
     async def test_extractor_exception_falls_through_silently(self):
         output = _cli_output(result="new session reply")
@@ -2721,7 +2882,7 @@ class TestClaudeBackendHandoff:
 
         # Daemon must keep serving the user even when transcript extraction breaks.
         assert resp.body == "new session reply"
-        assert mock.call_args_list[0][0][1][-1] == "TEXT"
+        assert mock.call_args_list[0][1]["stdin_text"] == "TEXT"
 
     async def test_resume_skips_extractor_when_session_exists(self):
         """When the JSONL is present, backend takes the resume branch and
@@ -3163,8 +3324,27 @@ class TestClaudeBackendPty:
             ClaudeBackend(launcher=OllamaLauncher(model="qwen"), pty=True)
 
 
+class _StagedSystemPrompt:
+    """An `_exec` side effect that reads the staged prompt mid-turn.
+
+    The file is unlinked by the time `run` returns, so the call it was staged
+    for is the only place it can be observed at all.
+    """
+
+    def __init__(self) -> None:
+        self.path = ""
+        self.text = ""
+        self.mode = 0
+
+    def __call__(self, workspace, cmd, timeout=None, stdin_text=None) -> dict:
+        self.path = cmd[cmd.index("--system-prompt-file") + 1]
+        self.text = Path(self.path).read_text(encoding="utf-8")
+        self.mode = os.stat(self.path).st_mode & 0o777
+        return _cli_output()
+
+
 class TestResumeSystemPrompt:
-    """--system-prompt is attached only when (re-)establishing a session.
+    """The system prompt is attached only when (re-)establishing a session.
 
     A healthy resume reuses the prompt claude persisted into the session, so
     re-sending it every turn is wasted tokens. But the session file merely
@@ -3178,15 +3358,24 @@ class TestResumeSystemPrompt:
     ):
         workspace = tmp_path / "ws"
         workspace.mkdir()
+        staged = _StagedSystemPrompt()
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
-            return_value=_cli_output(),
+            side_effect=staged,
         ) as mock:
             await ClaudeBackend().run(workspace, "sess-missing", "hi", "telegram")
         cmd = mock.call_args_list[0][0][1]
         assert "--session-id" in cmd
-        assert "--system-prompt" in cmd
+        assert "--system-prompt-file" in cmd
+        # Not the inline flag: the prompt is a file in the workspace, 0600,
+        # readable by the CLI while it starts and by nobody else.
+        assert "--system-prompt" not in cmd
+        assert staged.text.startswith("You are an autonomous assistant")
+        assert Path(staged.path).parent == workspace
+        assert staged.mode == 0o600
+        # And gone once the turn is over.
+        assert not Path(staged.path).exists()
 
     async def test_empty_session_resumes_with_system_prompt(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -3199,15 +3388,17 @@ class TestResumeSystemPrompt:
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "sess-empty.jsonl").write_text("")  # exists, no content
 
+        staged = _StagedSystemPrompt()
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
-            return_value=_cli_output(),
+            side_effect=staged,
         ) as mock:
             await ClaudeBackend().run(workspace, "sess-empty", "hi", "telegram")
         cmd = mock.call_args_list[0][0][1]
         assert "--resume" in cmd
-        assert "--system-prompt" in cmd
+        assert "--system-prompt-file" in cmd
+        assert not Path(staged.path).exists()
 
     async def test_content_session_resumes_without_system_prompt(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -3229,6 +3420,32 @@ class TestResumeSystemPrompt:
         cmd = mock.call_args_list[0][0][1]
         assert "--resume" in cmd
         assert "--system-prompt" not in cmd
+
+    async def test_a_healthy_resume_never_builds_the_system_prompt(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """Building it enumerates the jail's grants, and a resume discards it."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-real.jsonl").write_text('{"type":"user"}\n')
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.build_system_prompt"
+            ) as mock_build,
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(),
+            ),
+        ):
+            await ClaudeBackend().run(workspace, "sess-real", "hi", "telegram")
+
+        mock_build.assert_not_called()
 
 
 class TestHandoffByPlatform:

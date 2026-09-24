@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from claude_on_the_fly import (
@@ -54,6 +55,10 @@ COMPACT_TIMEOUT = 900.0
 # `agent.claude.effort` -- it is validated against this before reaching the CLI,
 # because codex's accepted set differs and the ollama key is shared with it.
 _CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+# Staging name for the system prompt a session-establishing turn hands to
+# `--system-prompt-file`. Dotted so it reads as machinery beside the user's
+# files, and never a fixed name: two threads of one DM share a workspace.
+SYSTEM_PROMPT_FILE_PREFIX = ".cotf-system-prompt-"
 
 
 def _last_compact_boundary(path: Path | None) -> dict:
@@ -186,6 +191,43 @@ def _session_has_content(path: Path) -> bool:
             return any(line.strip() for line in handle)
     except OSError:
         return False
+
+
+def _stage_system_prompt(workspace: Path, text: str) -> Path:
+    """Write the system prompt where the CLI will read it, and return the path.
+
+    In the workspace because that is the one directory both jail profiles grant
+    the agent (`sandbox._readable_paths`), so it is the only place the CLI can
+    open reliably. mkstemp gives it 0600 and a name no second turn can collide
+    with; the caller discards it once the turn is over.
+
+    A file at all because this is the one argv element whose size cotf does not
+    bound. One argv element is capped at MAX_ARG_STRLEN, and the system prompt
+    grows with the deployment's own prompt template.
+    """
+    fd, name = tempfile.mkstemp(prefix=SYSTEM_PROMPT_FILE_PREFIX, dir=workspace)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return Path(name)
+
+
+def _discard_system_prompt(path: Path) -> None:
+    """Remove the staged prompt, and never let that failure outlive the turn.
+
+    The agent runs with bypassPermissions inside this workspace, so by the time
+    the turn ends the path can be a directory, or the mount can be read-only.
+    An error raised from a `finally` would replace the turn's own result or its
+    own exception, which is the one thing cleanup must not do.
+
+    A daemon killed mid-turn leaves the file behind. That is accepted: it is 0600
+    in the agent's own workspace, whose transcript already carries the same
+    prompt, and the name is unique per run so a later turn neither reads nor
+    needs it.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("run: could not remove the staged system prompt: %s", exc)
 
 
 def resolve_pty_binary() -> str | None:
@@ -357,12 +399,21 @@ class ClaudeBackend:
             channel_context,
             workspace,
         )
-        system_prompt = build_system_prompt(
-            platform, user_name, channel_context, workspace, session_uuid, facts
-        )
-        # --system-prompt is only attached when (re-)establishing a session; a
-        # healthy --resume reuses the prompt already persisted in the session.
-        sysprompt_args = ["--system-prompt", system_prompt]
+
+        def session_prompt_args() -> tuple[list[str], Path | None]:
+            """The flags carrying the system prompt, for a session-establishing turn.
+
+            Built here rather than before the branch: a healthy `--resume`
+            discards it, and building it calls `sandbox.agent_guidance`, which
+            enumerates the jail's read and write grants. That is filesystem work
+            on the daemon's serial path, paid every turn for nothing.
+            """
+            return self._system_prompt_args(
+                workspace,
+                build_system_prompt(
+                    platform, user_name, channel_context, workspace, session_uuid, facts
+                ),
+            )
 
         if self.pty:
             base = self._pty_base_argv()
@@ -390,6 +441,10 @@ class ClaudeBackend:
         # Before the spawn: everything already in the file belongs to earlier
         # turns, so this is the line between them and what this turn writes.
         usage_offset = transcript.claude_session_size(workspace, session_uuid)
+        # The system prompt is carried only when (re-)establishing a session; a
+        # healthy --resume reuses the prompt already persisted in the session.
+        # `sysprompt_file` is the staged copy to remove once the turn is over.
+        sysprompt_file: Path | None = None
         if _session_has_content(session_path):
             # Healthy resume: claude already persisted the system prompt into
             # the session, so don't re-send it (cuts tokens and stops every
@@ -397,7 +452,7 @@ class ClaudeBackend:
             logger.debug(
                 "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
             )
-            argv = [*base, "--resume", session_uuid, prompt]
+            argv = [*base, "--resume", session_uuid]
         elif session_path.is_file():
             # The file exists but has no content: a prior turn opened the
             # session yet the LLM never produced output (empty/synthetic reply).
@@ -408,15 +463,35 @@ class ClaudeBackend:
                 "prompt on resume",
                 session_uuid,
             )
-            argv = [*base, *sysprompt_args, "--resume", session_uuid, prompt]
+            sysprompt_args, sysprompt_file = session_prompt_args()
+            argv = [*base, *sysprompt_args, "--resume", session_uuid]
         else:
             logger.info("No existing session %s, creating new", session_uuid)
             if platform not in agent.NO_HANDOFF_PLATFORMS:
                 prompt = transcript.prepend_latest_handoff(
                     workspace, prompt, session_uuid=session_uuid, platform=platform
                 )
-            argv = [*base, *sysprompt_args, "--session-id", session_uuid, prompt]
-        cli_output = await executor(workspace, argv, timeout=timeout)
+            sysprompt_args, sysprompt_file = session_prompt_args()
+            argv = [*base, *sysprompt_args, "--session-id", session_uuid]
+        # Where the turn's prompt travels. Native and ollama: stdin, because one
+        # argv element is capped at MAX_ARG_STRLEN. Measured on the deployment
+        # host: a 131071-byte argument execs, a 131072-byte one dies with
+        # `OSError: [Errno 7] Argument list too long`. A Slack reply in a long
+        # thread replays up to 50 prior messages ahead of the prompt, which came
+        # to 131360-142743 bytes on the thread that failed. pty keeps it in argv:
+        # claude-pty reads its prompt from argv and its stdin is the pane's TTY.
+        if self.pty:
+            argv.append(prompt)
+        try:
+            cli_output = await executor(
+                workspace,
+                argv,
+                timeout=timeout,
+                stdin_text=None if self.pty else prompt,
+            )
+        finally:
+            if sysprompt_file is not None:
+                _discard_system_prompt(sysprompt_file)
 
         body = (cli_output.get("result") or "").strip()
         if body and not strip_suggestions_blocks(body).strip():
@@ -452,10 +527,18 @@ class ClaudeBackend:
                 "agent.run: no visible reply, retrying with nudge, session=%s",
                 session_uuid,
             )
+            # The same transport as the first call: this one is taken precisely
+            # when no reply exists to fall back on, so it must not be the arm
+            # that dies on a prompt past the argv cap.
+            nudge = nudge_prompt or agent.NUDGE_PROMPT
+            retry_argv = [*base, "--resume", session_uuid]
+            if self.pty:
+                retry_argv.append(nudge)
             retry_output = await executor(
                 workspace,
-                [*base, "--resume", session_uuid, nudge_prompt or agent.NUDGE_PROMPT],
+                retry_argv,
                 timeout=timeout,
+                stdin_text=None if self.pty else nudge,
             )
             if self.pty:
                 # claude-pty envelopes have no per-tool counts to merge and pty's
@@ -598,6 +681,29 @@ class ClaudeBackend:
             )
             return []
         return ["--effort", effort] if effort else []
+
+    def _system_prompt_args(
+        self, workspace: Path, text: str
+    ) -> tuple[list[str], Path | None]:
+        """The flags that carry the system prompt, and the staged file to remove.
+
+        A file rather than `--system-prompt <text>`: this is the one argv element
+        cotf cannot bound, because it grows with the deployment's own prompt
+        template, and one argv element is capped at MAX_ARG_STRLEN on Linux.
+        `--system-prompt-file` is a real claude flag, hidden from `--help` but
+        present in the binary on 2.1.276 and 2.1.281 (`hideHelp()` in the option
+        table, plus a `Cannot use both --system-prompt and --system-prompt-file`
+        guard). It reads the path as UTF-8 at startup and refuses to run when the
+        file is gone, which is why the caller unlinks it only after the turn.
+
+        pty keeps the inline flag: claude-pty forwards flags verbatim, but neither
+        its stdin nor its handling of this file has been measured, and a pty
+        deployment is not one cotf can test end to end here.
+        """
+        if self.pty:
+            return ["--system-prompt", text], None
+        path = _stage_system_prompt(workspace, text)
+        return ["--system-prompt-file", str(path)], path
 
     async def compact(
         self,
@@ -837,7 +943,10 @@ async def _hold_pty_startup_gate() -> None:
 
 
 async def _exec_pty(
-    workspace: Path, cmd: list[str], timeout: float | None = None
+    workspace: Path,
+    cmd: list[str],
+    timeout: float | None = None,
+    stdin_text: str | None = None,
 ) -> dict:
     """Run `claude-pty` and parse its single-JSON envelope on stdout.
 
@@ -845,6 +954,10 @@ async def _exec_pty(
     plus a `statusline` key carrying the pty-only subtree. tool_counts and
     skill_counts are always empty in pty mode (pty doesn't surface per-turn
     tool_use events).
+
+    `stdin_text` is accepted and ignored, because it is how the native executor
+    takes the turn's prompt. pty carries its prompt in argv instead: claude-pty
+    is handed the argv, and its stdin is the pane's TTY.
     """
     # Before the spawn, not after: claude skips its workspace trust dialog only
     # in non-interactive mode, and pty's whole job is to give it a real TTY. An
