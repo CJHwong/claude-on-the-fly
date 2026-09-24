@@ -75,8 +75,16 @@ Measured with codex 0.156 through the real route on macOS, with no placeholder h
   `Authorization` once, and the broker stripped it.
 - codex 0.156 treats a denied `auth.json` as logged out and keeps going, rather than
   exiting as 0.147 did.
+- With plugins on, codex's MCP client also polls `ps/mcp`, ChatGPT's apps and
+  connectors endpoint, every 10 to 30 seconds. Refused, each poll asked the operator
+  again and denied. It is on the allowlist.
 - codex closes every streamed model call after the last event and before the chunked
   terminator. The broker logs that at DEBUG; aiohttp logged it as an unhandled error.
+  A caller can also hang up before the response headers go out, so `prepare()` has
+  the same guard.
+- The session token sits in every brokered path. The broker's `allow` line logs the
+  route path after the token is stripped, and `_RedactingAccessLogger` replaces
+  aiohttp's access line with one that shows `/_session/<redacted>/...`.
 
 Real cotf turns through `CodexBackend` (`gpt-6-luna`, `medium`), each answering
 correctly:
