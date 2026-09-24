@@ -50,8 +50,10 @@ Refresh rules, from codex's own `manager.rs` and a live run against the token en
   expires, or after an upstream 401. A 401 gets one retry with the recovered token.
 - Take `DATA_DIR/state/codex-auth.lock` and re-read the file first. The chat daemon and
   the jobs worker both run a broker, and only one should spend the token.
-- Refresh tokens are single-use. A refused refresh re-reads the file: a changed refresh
-  token means another process won, and nothing failed. An unchanged one is logged at
+- codex treats a refresh token as single-use. Measured, the endpoint accepted one that a
+  hand-run codex had spent seconds earlier, so a lost race may simply succeed. When it
+  is refused, the broker re-reads the file: a changed refresh token means another
+  process won, and nothing failed. An unchanged one is logged at
   ERROR once, naming `codex login`, and not retried until the file changes.
 - Write a temporary `auth.json.cotf-*` in the same directory, then rename it over.
   Every field codex wrote is kept. The jail rule is a prefix match, so it covers the
@@ -71,6 +73,22 @@ Measured with codex 0.156 through the real route on macOS, with no placeholder h
   `Authorization` once, and the broker stripped it.
 - codex 0.156 treats a denied `auth.json` as logged out and keeps going, rather than
   exiting as 0.147 did.
+- codex closes every streamed model call after the last event and before the chunked
+  terminator. The broker logs that at DEBUG; aiohttp logged it as an unhandled error.
+
+Real cotf turns through `CodexBackend` (`gpt-6-luna`, `medium`), each answering
+correctly:
+
+| Case | Jail off | Jail on |
+|---|---|---|
+| exec, tool call writing a file | pass | pass, both bases |
+| exec, resume | pass | pass |
+| pty, tool call and resume | pass | pass (default `~/.codex`) |
+| resume a thread started without the broker | pass | not run |
+| `auth.json` read from a tool call | readable | refused |
+| 401 on a bad access token, then refresh and retry | | pass |
+| login 8 days old, refreshed before the call | | pass |
+| hand-run codex refreshes during the broker's refresh | pass | |
 
 ## Egress proxy
 

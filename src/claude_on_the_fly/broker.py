@@ -529,9 +529,16 @@ class Broker:
                 headers=_forward_response_headers(upstream.headers),
             )
             await response.prepare(request)
-            async for chunk in upstream.content.iter_chunked(_CHUNK):
-                await response.write(chunk)
-            await response.write_eof()
+            try:
+                async for chunk in upstream.content.iter_chunked(_CHUNK):
+                    await response.write(chunk)
+                await response.write_eof()
+            except ConnectionResetError:
+                # The caller hung up. codex does this on every streamed model call,
+                # after the last event and before the chunked terminator, so the
+                # answer was already delivered. aiohttp would log it as an
+                # unhandled error with a traceback.
+                logger.debug("broker: %s closed by the caller mid-stream", route.prefix)
             return response
         finally:
             upstream.release()

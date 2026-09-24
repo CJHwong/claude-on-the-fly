@@ -18,7 +18,10 @@ Measured against the live token endpoint: a refresh answers 200 with a new
 access, id and refresh token, the refresh token rotates on every call, and
 codex keeps working with the tokens written back. A second refresh 17 seconds
 later also succeeded, so the `earliest_refresh_at` hint the endpoint returns
-(nine days out) is advisory.
+(nine days out) is advisory. A refresh token that a hand-run codex had spent
+seconds earlier was also accepted, so a lost race does not always end in a
+refusal; codex's own source treats reuse as an error, which is the case the
+re-read covers.
 """
 
 from __future__ import annotations
@@ -73,7 +76,7 @@ ALLOWED_METHODS = frozenset({"GET", "POST"})
 REFRESH_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 # A day earlier than codex's own eight, so the operator's hand-run codex rarely
-# races the broker for the single-use refresh token.
+# races the broker for the refresh token, which codex treats as single-use.
 REFRESH_AFTER = datetime.timedelta(days=7)
 EXPIRY_MARGIN = datetime.timedelta(minutes=5)
 _TIMEOUT_SECONDS = 30
@@ -288,8 +291,8 @@ class ChatGPTLogin:
             self._write(current, answer)
 
     def _rejected(self, error: RefreshRejected, refresh_token: str) -> None:
-        # Single-use tokens: "already used" usually means the operator's own codex
-        # refreshed first. The file then holds its new token and nothing failed.
+        # A refusal usually means the operator's own codex refreshed first with
+        # the same token. The file then holds its new token and nothing failed.
         self._cached = None
         if self._read()["tokens"]["refresh_token"] != refresh_token:
             logger.info("codex auth: another process refreshed first; using its token")

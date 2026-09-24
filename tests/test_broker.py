@@ -1074,3 +1074,36 @@ async def test_default_broker_adds_the_chatgpt_login_beside_keychain_routes(
 async def test_default_broker_without_keychain_or_chatgpt_starts_nothing(monkeypatch):
     monkeypatch.setattr(broker, "keychain_exists", lambda s: True)
     assert await broker.start_default_broker(keychain=False) is None
+
+
+async def test_a_caller_hanging_up_mid_stream_is_not_an_error(
+    fake_keychain, monkeypatch, caplog
+):
+    """codex closes a streamed model call before the chunked terminator. The
+    answer was delivered, so the broker must not surface it as a handler error."""
+    from aiohttp.client_exceptions import ClientConnectionResetError
+
+    fake_keychain["cotf-scoped"] = "REAL"
+    received: list[dict] = []
+    bro, up_runner, _ = await _scoped_broker(fake_keychain, received)
+
+    original = web.StreamResponse.write_eof
+
+    async def closed(self, data=b""):
+        # Only the broker's own streamed response; the fake upstream's
+        # json_response is a StreamResponse subclass and must still finish.
+        if type(self) is web.StreamResponse:
+            raise ClientConnectionResetError("Cannot write to closing transport")
+        await original(self, data)
+
+    monkeypatch.setattr(web.StreamResponse, "write_eof", closed)
+    caplog.set_level("DEBUG", logger="claude_on_the_fly.broker")
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(_url(bro, "/scoped/x"))
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert "closed by the caller mid-stream" in caplog.text
+    assert "Error handling request" not in caplog.text
