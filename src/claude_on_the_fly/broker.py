@@ -27,6 +27,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from aiohttp import ClientResponse, ClientSession, ClientTimeout, web
+from aiohttp.abc import AbstractAccessLogger
 
 from claude_on_the_fly.approvals import ApprovalBroker, ApprovalRequest
 
@@ -96,6 +97,34 @@ _CHUNK = 64 * 1024
 # `_handle` buffers the body in memory before forwarding.
 _MAX_BODY_BYTES = 64 * 1024 * 1024
 _SESSION_PREFIX = "/_session/"
+
+
+def _redacted(path: str) -> str:
+    """The path with its session token cut out, valid or not."""
+    if not path.startswith(_SESSION_PREFIX):
+        return path
+    _, separator, route_tail = path[len(_SESSION_PREFIX) :].partition("/")
+    return f"{_SESSION_PREFIX}<redacted>{separator}{route_tail}"
+
+
+class _RedactingAccessLogger(AbstractAccessLogger):
+    """aiohttp's access log line, minus the token.
+
+    The token is the loopback capability every brokered call carries in its
+    path, so the default line would write it to the daemon log on each request.
+    """
+
+    def log(
+        self, request: web.BaseRequest, response: web.StreamResponse, time: float
+    ) -> None:
+        self.logger.info(
+            '%s "%s %s" %d %.3fs',
+            request.remote,
+            request.method,
+            _redacted(request.path_qs),
+            response.status,
+            time,
+        )
 
 
 class HeaderSource(Protocol):
@@ -339,7 +368,7 @@ class Broker:
         )
         app = web.Application(client_max_size=_MAX_BODY_BYTES)
         app.router.add_route("*", "/{tail:.*}", self._handle)
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(app, access_log_class=_RedactingAccessLogger)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host, port)
         await site.start()
@@ -540,7 +569,7 @@ class Broker:
                 "broker: allow %s %s%s [%s] -> %d",
                 request.method,
                 urlsplit(route.upstream).hostname,
-                request.path,
+                route_path,
                 route.label,
                 upstream.status,
             )
@@ -548,7 +577,14 @@ class Broker:
                 status=upstream.status,
                 headers=_forward_response_headers(upstream.headers),
             )
-            await response.prepare(request)
+            try:
+                await response.prepare(request)
+            except ConnectionResetError:
+                logger.debug(
+                    "broker: %s closed by the caller before the response started",
+                    route.prefix,
+                )
+                return response
             try:
                 async for chunk in upstream.content.iter_chunked(_CHUNK):
                     await response.write(chunk)

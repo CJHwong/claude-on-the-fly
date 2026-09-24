@@ -428,6 +428,12 @@ def test_route_serves_the_operators_login(tmp_path, monkeypatch):
     assert route.source._lock_path == tmp_path / "data" / "state" / "codex-auth.lock"
 
 
+def test_the_route_allows_codex_apps():
+    """With plugins on, codex's MCP client polls ChatGPT's apps endpoint. A
+    refusal asks the operator and denies every 10 to 30 seconds for the run."""
+    assert "backend-api/ps/mcp" in codex_auth.ALLOWED_TAILS
+
+
 def test_route_refuses_to_start_without_a_login(tmp_path, monkeypatch):
     from claude_on_the_fly import envfile
 

@@ -56,7 +56,9 @@ UPSTREAM = "https://chatgpt.com"
 # calls only. With auth.json visible (the jail off) it also makes the rest, and
 # they are allowed so that stage behaves like codex does without the broker.
 # A jailed turn can reach them too, with the operator's login: plugin lists,
-# user settings, and analytics posts.
+# user settings, and analytics posts. `ps/mcp` is ChatGPT's apps and connectors
+# endpoint, which codex's MCP client polls when plugins are on. A refusal there
+# asks the operator again every few seconds for the whole run.
 ALLOWED_TAILS = frozenset(
     {
         "backend-api/codex/responses",
@@ -66,6 +68,7 @@ ALLOWED_TAILS = frozenset(
         "backend-api/ps/plugins/installed",
         "backend-api/ps/plugins/list",
         "backend-api/ps/plugins/suggested/codex",
+        "backend-api/ps/mcp",
         "backend-api/wham/settings/user",
     }
 )

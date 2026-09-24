@@ -1109,6 +1109,66 @@ async def test_a_caller_hanging_up_mid_stream_is_not_an_error(
     assert "Error handling request" not in caplog.text
 
 
+async def test_a_caller_hanging_up_before_the_headers_is_not_an_error(
+    fake_keychain, monkeypatch, caplog
+):
+    """codex can close a call while the broker still waits on the upstream
+    headers, so prepare() is the first write to hit the closed transport."""
+    from aiohttp.client_exceptions import (
+        ClientConnectionResetError,
+        ServerDisconnectedError,
+    )
+
+    fake_keychain["cotf-scoped"] = "REAL"
+    received: list[dict] = []
+    bro, up_runner, _ = await _scoped_broker(fake_keychain, received)
+
+    original = web.StreamResponse.prepare
+
+    async def closed(self, request):
+        if type(self) is web.StreamResponse:
+            raise ClientConnectionResetError("Cannot write to closing transport")
+        return await original(self, request)
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", closed)
+    caplog.set_level("DEBUG", logger="claude_on_the_fly.broker")
+    try:
+        async with ClientSession() as client:
+            # aiohttp retries prepare() on the dead transport and drops it.
+            with pytest.raises(ServerDisconnectedError):
+                await client.get(_url(bro, "/scoped/x"))
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert "closed by the caller before the response started" in caplog.text
+    assert "Error handling request" not in caplog.text
+
+
+async def test_logs_never_carry_the_session_token(fake_keychain, caplog):
+    """The token in the path is the loopback capability. The broker's allow
+    line and aiohttp's access log both name the path, so both must cut it."""
+    fake_keychain["cotf-scoped"] = "REAL"
+    received: list[dict] = []
+    bro, up_runner, _ = await _scoped_broker(fake_keychain, received)
+    caplog.set_level("INFO")
+    try:
+        async with ClientSession() as client:
+            ok = await client.get(_url(bro, "/scoped/x?q=1"))
+            assert ok.status == 200
+            wrong = f"http://127.0.0.1:{bro.port}/_session/not-the-token/scoped/x"
+            assert (await client.get(wrong)).status == 403
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert bro._token not in caplog.text
+    assert "not-the-token" not in caplog.text
+    allow = [r for r in caplog.records if "broker: allow" in r.getMessage()]
+    assert allow and "/scoped/x" in allow[0].getMessage()
+    access = [r.getMessage() for r in caplog.records if r.name == "aiohttp.access"]
+    assert any('"GET /_session/<redacted>/scoped/x?q=1" 200' in m for m in access)
+    assert any('"GET /_session/<redacted>/scoped/x" 403' in m for m in access)
+
+
 def test_an_expected_auth_header_is_replaced_quietly(caplog):
     """A source route's client may hold its own login. Stripping that is
     routine, while an unexpected auth header on the same request still warns."""
