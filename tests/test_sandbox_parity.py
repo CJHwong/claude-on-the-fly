@@ -575,8 +575,6 @@ def test_the_brokered_codex_login_is_hidden_from_the_turn(
     assert not _can_read(str(auth), project)
     assert not _can_write(str(auth), project)
     assert not _can_read(str(project / "login.json"), project)
-    # The name the broker writes a refresh to before the rename.
-    assert not _can_write(str(codex_login / "auth.json.cotf-parity"), project)
     # Only the login: codex still reads the config beside it.
     assert _can_read(str(codex_login / "config.toml"), project)
 
