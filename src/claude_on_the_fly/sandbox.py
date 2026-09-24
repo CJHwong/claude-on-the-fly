@@ -1467,6 +1467,19 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     return list(seen.values())
 
 
+def linux_runtime_grants(argv: list[str]) -> tuple[list[Path], dict[Path, str]]:
+    """`_runtime_read_paths` split the way bwrap needs it: (mounts, links).
+
+    Resolved paths are mounted; each symlinked entry is recreated as a link,
+    because bwrap refuses a symlink as a mount destination. Public so the live
+    jail tests build the same split rather than a copy that drifts from it.
+    """
+    runtime = _runtime_read_paths(argv)
+    mounts = [path for path in runtime if str(path) == os.path.realpath(path)]
+    links = {path: os.readlink(path) for path in runtime if path.is_symlink()}
+    return mounts, links
+
+
 def _linked_dirs(path: Path) -> list[Path]:
     """Symlinked directories `path` passes through, following each link it names."""
     found: list[Path] = []
@@ -2318,11 +2331,8 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # mounted and the symlink form is recreated as a link instead. Dropping it
     # was not free: a uv venv's python runs through `cpython-3.X-*`, a link under
     # the opaque $HOME, and without it exec failed on a path that looked granted.
-    runtime = _runtime_read_paths(argv)
-    grants["read_only"] += [
-        path for path in runtime if str(path) == os.path.realpath(path)
-    ]
-    links = {path: os.readlink(path) for path in runtime if path.is_symlink()}
+    runtime_mounts, links = linux_runtime_grants(argv)
+    grants["read_only"] += runtime_mounts
     # memory/ is granted at its real path inside an opaque data dir, so an
     # operator who links it into a repo loses the path the agent is told. The
     # target is already granted; this puts the name back.
