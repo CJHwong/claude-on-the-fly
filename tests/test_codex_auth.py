@@ -240,9 +240,10 @@ async def test_headers_when_fresh_spend_no_refresh(tmp_path):
     assert endpoint.bodies == []
 
 
-async def test_a_due_login_is_refreshed_and_written_back_atomically(tmp_path):
+async def test_a_due_login_is_refreshed_and_written_back_in_place(tmp_path):
     endpoint = Endpoint()
     login, path = _login(tmp_path, _stale(), endpoint)
+    inode = path.stat().st_ino
 
     headers = await login.headers()
 
@@ -266,7 +267,8 @@ async def test_a_due_login_is_refreshed_and_written_back_atomically(tmp_path):
     assert written["last_refresh"] == "2026-09-24T12:00:00.000000Z"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert headers["Authorization"] == f"Bearer {endpoint.answer['access_token']}"
-    # No temporary file left beside it.
+    # Same inode: a rename would detach the Linux jail's mask over the file.
+    assert path.stat().st_ino == inode
     assert sorted(p.name for p in path.parent.iterdir()) == ["auth.json"]
 
 
@@ -364,16 +366,10 @@ async def test_a_transient_failure_keeps_the_current_token_and_retries(
     assert len(endpoint.bodies) == 2
 
 
-async def test_an_unwritable_file_keeps_the_new_token_in_memory(
-    tmp_path, caplog, monkeypatch
-):
+async def test_an_unwritable_file_keeps_the_new_token_in_memory(tmp_path, caplog):
     endpoint = Endpoint()
     login, path = _login(tmp_path, _stale(), endpoint)
-
-    def refuse(src, dst):
-        raise PermissionError("read-only")
-
-    monkeypatch.setattr(codex_auth.os, "replace", refuse)
+    path.chmod(0o400)
     headers = await login.headers()
 
     assert headers["Authorization"] == f"Bearer {endpoint.answer['access_token']}"
@@ -441,3 +437,18 @@ def test_route_refuses_to_start_without_a_login(tmp_path, monkeypatch):
     monkeypatch.setattr(envfile, "codex_home", lambda: home)
     with pytest.raises(RuntimeError, match="holds no ChatGPT login"):
         codex_auth.route()
+
+
+async def test_a_read_that_lands_mid_write_uses_the_last_good_copy(tmp_path):
+    auth = _fresh()
+    login, path = _login(tmp_path, auth, Endpoint())
+    first = await login.headers()
+    path.write_text('{"tokens": {"access_')
+    assert await login.headers() == first
+
+
+def test_a_first_read_of_a_broken_file_fails(tmp_path):
+    login, path = _login(tmp_path, _fresh(), Endpoint())
+    path.write_text("{")
+    with pytest.raises(ValueError):
+        login.check()

@@ -1107,3 +1107,38 @@ async def test_a_caller_hanging_up_mid_stream_is_not_an_error(
         await up_runner.cleanup()
     assert "closed by the caller mid-stream" in caplog.text
     assert "Error handling request" not in caplog.text
+
+
+def test_an_expected_auth_header_is_replaced_quietly(caplog):
+    """A source route's client may hold its own login. Stripping that is
+    routine, while an unexpected auth header on the same request still warns."""
+    from claude_on_the_fly.broker import _forward_request_headers
+
+    caplog.set_level("DEBUG", logger="claude_on_the_fly.broker")
+    kept = _forward_request_headers(
+        {"Authorization": "Bearer own", "x-api-key": "planted", "accept": "*/*"},
+        injected={"Authorization": "Bearer real"},
+        expected={"Authorization": "Bearer real"},
+    )
+    assert kept == {"accept": "*/*"}
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == [
+        "broker: stripped caller-supplied auth header(s) ['x-api-key'] before forwarding"
+    ]
+    assert "replaced the caller's own ['Authorization']" in caplog.text
+
+
+async def test_a_source_route_replaces_the_callers_login_without_warning(caplog):
+    received: list[dict] = []
+    bro, up_runner = await _source_broker(_echo_app(received), _Source())
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(
+                _url(bro, "/chatgpt/x"), headers={"Authorization": "Bearer own"}
+            )
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert received[0]["headers"]["authorization"] == "Bearer first"
+    assert "stripped caller-supplied" not in caplog.text

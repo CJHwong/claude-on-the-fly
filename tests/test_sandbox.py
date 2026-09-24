@@ -3649,6 +3649,7 @@ async def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
     target.write_text("be helpful\n")
     (home / ".codex" / "AGENTS.md").symlink_to(target)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
     monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
 
     async def must_not_probe(*_args, **_kwargs):  # pragma: no cover - asserts absence
@@ -3695,6 +3696,7 @@ class TestSymlinkedExecutionControlPathsOnMacos:
         target.write_text("be helpful\n")
         (home / ".codex" / "AGENTS.md").symlink_to(target)
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
         monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
         return target
 

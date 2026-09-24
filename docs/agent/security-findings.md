@@ -188,10 +188,11 @@ has the design and the measurements. Still open:
 - **Request body parity.** The built-in provider refuses a plain-HTTP
   `chatgpt_base_url` ("workspace backend must use an HTTPS origin without
   credentials"), so its body could not be captured for comparison.
-- **Linux.** The mask is asserted in unit tests, not yet run under bubblewrap.
-- **The temporary file on Linux.** `~/.codex` is a read-write bind there, and the mask
-  covers `auth.json` only. The `auth.json.cotf-*` file exists for the length of one
-  write, and a jailed turn could read it in that window.
+- **Anything that renames over `auth.json` on Linux.** The mask is a bind mount, and a
+  rename over the path on the host drops it in a running turn's namespace (measured
+  under bubblewrap). The broker and codex both rewrite the file in place, so neither
+  does it. An editor that saves by rename, or a restore from backup, would expose the
+  file to a turn that is already running; the next turn is masked again.
 
 ### The self-test
 

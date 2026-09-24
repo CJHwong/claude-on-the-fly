@@ -55,9 +55,11 @@ Refresh rules, from codex's own `manager.rs` and a live run against the token en
   is refused, the broker re-reads the file: a changed refresh token means another
   process won, and nothing failed. An unchanged one is logged at
   ERROR once, naming `codex login`, and not retried until the file changes.
-- Write a temporary `auth.json.cotf-*` in the same directory, then rename it over.
-  Every field codex wrote is kept. The jail rule is a prefix match, so it covers the
-  temporary file too.
+- Rewrite the file in place, the way codex does, keeping every field codex wrote. Not a
+  temporary file renamed over it: the Linux jail hides the file with a bind mount, and
+  a rename over the path on the host drops that mount in every namespace. Measured with
+  bubblewrap 0.11.1 on Linux 7.0, a jailed process read the new content a second after
+  the rename. A read that lands mid-write gets the broker's last good copy.
 
 Measured with codex 0.156 through the real route on macOS, with no placeholder headers:
 

@@ -1980,7 +1980,8 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     data_dir = Path(os.path.realpath(DATA_DIR))
     project = Path(os.path.realpath(workspace))
     tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
-    codex = home / ".codex"
+    # CODEX_HOME can move the tree; `$HOME/.codex` then names nothing codex uses.
+    codex = _codex_operator_home()
     claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
     codex_auth = _codex_auth_denied()
@@ -2943,7 +2944,7 @@ async def _preflight_protected_symlinks() -> None:
     weakening but an established layout, so it warns rather than refusing to serve
     a deployment that has been working.
     """
-    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    codex = _codex_operator_home()
     linked = [path for path in _codex_protected(codex) if path.is_symlink()]
     if not linked:
         return

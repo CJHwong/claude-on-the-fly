@@ -61,8 +61,8 @@
 ;; `_CODEX_AUTH` is the operator's auth.json with agent.codex.chatgpt_via_broker on,
 ;; and an unused path otherwise. Here rather than in a base so it comes after
 ;; both, and after every read and write allow they hold for ~/.codex. A prefix
-;; match, so the broker's `auth.json.cotf-*` temporary file is covered while a
-;; refresh writes it. Measured: codex 0.156 treats a denied auth.json as logged
-;; out and keeps going, rather than exiting.
+;; match, so a copy named after it (`auth.json.bak`) is covered too. Measured:
+;; codex 0.156 treats a denied auth.json as logged out and keeps going, rather
+;; than exiting.
 (deny file-read* file-write*
   (regex (string-append "^" (regex-quote (param "_CODEX_AUTH")))))

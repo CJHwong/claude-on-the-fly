@@ -33,7 +33,6 @@ import fcntl
 import json
 import logging
 import os
-import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -254,11 +253,25 @@ class ChatGPTLogin:
         }
 
     def _read(self) -> dict[str, Any]:
-        """The file's content, re-read only when its stat changed."""
+        """The file's content, re-read only when its stat changed.
+
+        The file is rewritten in place (see `_write`), by this broker, by the
+        other daemon's, or by a hand-run codex, so a read can land mid-write.
+        The last good copy answers then; its token is at most one refresh old.
+        """
         stat = self._path.stat()
         key = (stat.st_mtime_ns, stat.st_size)
         if self._cached is None or self._cached[0] != key:
-            self._cached = (key, json.loads(self._path.read_text()))
+            try:
+                content = json.loads(self._path.read_text())
+            except ValueError:
+                if self._cached is None:
+                    raise
+                logger.debug(
+                    "codex auth: %s is mid-write; using the last copy", self._path
+                )
+                return self._cached[1]
+            self._cached = (key, content)
         return self._cached[1]
 
     def _refresh_if(
@@ -306,11 +319,15 @@ class ChatGPTLogin:
         )
 
     def _write(self, current: dict[str, Any], answer: Mapping[str, Any]) -> None:
-        """Write the new tokens beside the old file, then rename over it.
+        """Rewrite the file in place with the new tokens.
 
-        Every other field is kept, because codex owns the format. The temporary
-        name starts with `auth.json` so the jail rule hiding the file covers it
-        too.
+        In place, not a temporary file renamed over it, because the Linux jail
+        hides the file with a bind mount, and the kernel drops that mount in
+        every namespace when the path is renamed over on the host. Measured with
+        bubblewrap 0.11.1 on Linux 7.0: a jailed process read the new content one
+        second after the rename. codex writes the same way (the inode survives
+        its own refresh), so the only writer that could expose the file was this
+        one. Every other field is kept, because codex owns the format.
         """
         updated = dict(current)
         tokens = dict(current["tokens"])
@@ -320,16 +337,12 @@ class ChatGPTLogin:
         updated["tokens"] = tokens
         updated["last_refresh"] = _now().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         try:
-            handle, temp = tempfile.mkstemp(
-                dir=self._path.parent, prefix="auth.json.cotf-"
-            )
-            try:
-                with os.fdopen(handle, "w") as out:
-                    json.dump(updated, out, indent=2)
-                os.chmod(temp, 0o600)
-                os.replace(temp, self._path)
-            finally:
-                Path(temp).unlink(missing_ok=True)
+            with open(self._path, "r+") as out:
+                os.fchmod(out.fileno(), 0o600)
+                out.write(json.dumps(updated, indent=2))
+                out.truncate()
+                out.flush()
+                os.fsync(out.fileno())
         except OSError as error:
             # The old refresh token is spent, so dropping the answer would lose
             # the login. Serve the new tokens from memory, keyed to the file as it

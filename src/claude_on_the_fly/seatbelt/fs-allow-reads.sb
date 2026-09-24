@@ -346,8 +346,10 @@
 ;; denies the file for reading and writing after this, and the broker refreshes it.
 (allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/auth.json")))
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
+;; Against the operator's codex home, not `$HOME/.codex`: a relocated CODEX_HOME
+;; left codex unable to open `state_5.sqlite`, and a jailed pty turn died on it.
 (allow file-write*
-  (regex (string-append "^" (regex-quote (param "_HOME")) "/\\.codex/[^/]*\\.sqlite(-wal|-shm)?$")))
+  (regex (string-append "^" (regex-quote (param "_CODEX_OPERATOR_HOME")) "/[^/]*\\.sqlite(-wal|-shm)?$")))
 ;; uv: needed for caching packages and metadata, but NOT the operator's cache.
 ;; `upgrade.run` installs this daemon's own dependencies with `uv sync`, outside
 ;; any jail and with the TUI's full environment, so a wheel a jailed turn seeded

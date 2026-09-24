@@ -218,12 +218,17 @@ def blocked_host(host: str) -> bool:
     return any(addr in net for net in _BLOCKED_NETS)
 
 
-def _forward_request_headers(headers, injected: Iterable[str] = ()) -> dict[str, str]:
+def _forward_request_headers(
+    headers, injected: Iterable[str] = (), expected: Iterable[str] = ()
+) -> dict[str, str]:
     """Copy request headers minus hop-by-hop and any caller-supplied auth.
 
     A header the broker injects is dropped too, whatever its case. Headers go
     upstream as a plain dict, so a caller's `chatgpt-account-id` beside the
     broker's `ChatGPT-Account-Id` would otherwise travel as two headers.
+
+    `expected` names auth headers the caller sends legitimately, logged at DEBUG
+    when stripped instead of WARNING.
     """
     replaced = {name.lower() for name in injected}
     kept = {
@@ -238,10 +243,17 @@ def _forward_request_headers(headers, injected: Iterable[str] = ()) -> dict[str,
     # injected payload planted, and both are worth seeing. Logged at WARNING for
     # that reason rather than folded into the debug stream.
     stripped = [key for key in headers if key.lower() in _STRIP_REQUEST_HEADERS]
-    if stripped:
+    quiet = {name.lower() for name in expected}
+    loud = [key for key in stripped if key.lower() not in quiet]
+    if loud:
         logger.warning(
             "broker: stripped caller-supplied auth header(s) %s before forwarding",
-            stripped,
+            loud,
+        )
+    if len(loud) < len(stripped):
+        logger.debug(
+            "broker: replaced the caller's own %s",
+            [key for key in stripped if key.lower() in quiet],
         )
     return kept
 
@@ -486,7 +498,15 @@ class Broker:
                     "the daemon log."
                 ),
             )
-        headers = _forward_request_headers(request.headers, injected)
+        # codex with the jail off still reads its own login and sends that
+        # Authorization on its side calls: 15 WARNINGs a turn for a header the
+        # source replaces anyway. A keychain route keeps the WARNING, because no
+        # client of one holds a credential of its own.
+        headers = _forward_request_headers(
+            request.headers,
+            injected,
+            expected=injected if route.source is not None else (),
+        )
         headers.update(injected)
         body = await request.read()
         # Header *names* and the injection target, so a "why is upstream 401"
