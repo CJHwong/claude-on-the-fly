@@ -174,7 +174,7 @@ host is a covert channel: TLS payloads are not inspected.
 | `name` | non-empty string / required | Executable shimmed onto the agent PATH |
 | `readback` | list of command prefixes / empty | Commands refused because they reveal or change credentials |
 | `readback_flags` | list of strings / empty | Flags that make any command reveal a credential |
-| `allow` | list of leading subcommand prefixes / empty | Positive command allowlist; empty or absent denies every invocation |
+| `allow` | list of leading subcommand prefixes / empty | Positive command allowlist; empty or absent denies every invocation except a help request (`<words> --help`, `-h` or `--version` last with no earlier flag, or a leading `help`) |
 | `allow_read_only` | list of leading subcommand prefixes / empty | Prefixes admitted only when the invocation reads |
 | `allow_paths` | list of paths / empty | Trees outside the workspace that absolute path arguments may reach |
 | `boolean_flags` | list of strings / empty | Flags that never take the next token as a value when the subcommand is read |

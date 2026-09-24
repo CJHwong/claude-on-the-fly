@@ -25,6 +25,9 @@ Before adding a tool:
 3. List the exact safe leading subcommands under `allow`. The list is deny-by-default;
    an omitted or empty list makes the shim refuse every invocation. Do not add generic
    API or mutation prefixes unless you have reviewed their full provider-side scope.
+   A help request needs no entry: `<words> --help`, `-h` or `--version` as the last
+   token with no flag before it, or `help` as the first word. The readback list still
+   applies to it.
 4. List commands and flags that print or mutate authentication state.
 5. Pass only environment names the real CLI requires.
 6. Restart the chat and jobs daemons so shims are rebuilt.

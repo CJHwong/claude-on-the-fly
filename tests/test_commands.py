@@ -98,6 +98,55 @@ def test_bundled_gh_allowlist_blocks_alias_api_and_unknown_commands():
     assert not allowed_command(GH, ["arbitrary-alias"])
 
 
+# --- a help request needs no allow entry ---
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--help"],
+        ["-h"],
+        ["--version"],
+        # A group the allowlist only names deeper, the common probe.
+        ["repo", "--help"],
+        # A verb the allowlist refuses: cobra and commander print help and exit.
+        ["repo", "delete", "o/r", "--help"],
+        ["help", "repo", "delete"],
+    ],
+)
+def test_a_help_request_is_admitted_without_an_allow_entry(argv):
+    """An agent learns a CLI by asking it. Refusing `acli jira --help` because only
+    `jira workitem view` is listed sent 1,113 of avery's calls back as refusals,
+    and the help text never reaches the server."""
+    assert allowed_command(GH, argv) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # A flag before `--help` may take it as its value. gh then runs the DELETE
+        # with `--jq --help`, so no flag may come first.
+        ["api", "-X", "DELETE", "repos/o/r", "--jq", "--help"],
+        ["pr", "comment", "1", "--body", "--help"],
+        # `--help` has to be last, or the argv is more than a question.
+        ["repo", "delete", "o/r", "--help", "--yes"],
+        # A trailing `help` word is an argument to gh: `repo delete help` deletes
+        # a repository named help.
+        ["repo", "delete", "help"],
+        # And `--help` is not a help request when a word follows it.
+        ["--help", "repo", "delete", "o/r"],
+    ],
+)
+def test_a_help_flag_does_not_admit_a_command_that_can_still_run(argv):
+    assert allowed_command(GH, argv) is False
+
+
+def test_a_help_request_still_meets_the_readback_refusal():
+    """Admitted past the allowlist, not past the credential check behind it."""
+    assert allowed_command(GH, ["auth", "token", "--help"]) is True
+    assert refuses_readback(GH, ["auth", "token", "--help"]) is True
+
+
 # --- the read-only method gate ---
 
 # `gh api` is one prefix covering the whole REST API, so an operator who wants

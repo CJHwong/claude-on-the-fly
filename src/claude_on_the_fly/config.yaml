@@ -149,7 +149,8 @@ commands:
   #                    `gh alias`, auth changes, and mutations stay unavailable
   #                    unless an operator explicitly adds a narrowly chosen
   #                    prefix. The loopback endpoint also requires a per-daemon
-  #                    bearer token.
+  #                    bearer token. A help request (`<words> --help`, `-h`,
+  #                    `--version`, or a leading `help`) needs no entry.
   tools:
     - name: gh
       # `gh auth token` and `--show-token` print the credential itself.

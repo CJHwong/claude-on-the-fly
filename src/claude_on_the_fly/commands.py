@@ -545,7 +545,11 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     allowed, `systemctl --quiet stop status` matched `status` and systemctl ran
     `stop`. The cost is a value flag written before the subcommand, such as
     `gh --repo o/r pr view`; none of 1884 real calls on the deployed host did that.
+
+    A help request passes without an allow entry; see `is_help_request`.
     """
+    if is_help_request(argv):
+        return True
     return all(
         _admits(tool, tokens, argv)
         for tokens in (
@@ -553,6 +557,33 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
             leading_tokens(argv, flags_take_values=False),
         )
     )
+
+
+_HELP_FLAGS = frozenset({"--help", "-h", "--version"})
+
+
+def is_help_request(argv: list[str]) -> bool:
+    """Whether the argv only asks the CLI to describe itself.
+
+    An agent learns a CLI by probing it, and an allowlist that names `jira
+    workitem view` refuses `jira --help`. Help never reaches the server, but
+    `--help` alone does not prove the command will not run, so the shape is narrow:
+
+    - subcommand words, then one help flag as the last token. No flag may come
+      earlier, because a value flag takes `--help` as its value and the command
+      runs: `gh api -X DELETE repos/o/r --jq --help` deletes.
+    - `help` as the first word. A trailing `help` is an argument: `gh repo delete
+      help` deletes a repository named help.
+
+    Measured: gh and acli (cobra) and twg (commander) print help for `<verb> <arg>
+    --help` and exit 0 without running it; aws exits 252 with a usage error.
+    """
+    if not argv:
+        return False
+    if argv[0] == "help":
+        return not any(item.startswith("-") for item in argv)
+    *words, last = argv
+    return last in _HELP_FLAGS and not any(item.startswith("-") for item in words)
 
 
 def _admits(tool: ShimmedTool, tokens: tuple[str, ...], argv: list[str]) -> bool:
