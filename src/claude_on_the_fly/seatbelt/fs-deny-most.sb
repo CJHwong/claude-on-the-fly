@@ -345,7 +345,8 @@
 ;; is already permitted by design (see "Deliberately NOT denied" above), so an agent
 ;; that wanted the token already has it. What denying would cost is token refresh --
 ;; codex persists a refreshed ChatGPT token here, and a deployment that cannot would
-;; break the first time one expired.
+;; break the first time one expired. With agent.codex.chatgpt_via_broker on, jail.sb
+;; denies the file for reading and writing after this, and the broker refreshes it.
 (allow file-write* (literal (string-append (param "_CODEX_OPERATOR_HOME") "/auth.json")))
 ;; The sqlite state files, plus the -wal/-shm siblings each one opens alongside it.
 (allow file-write*

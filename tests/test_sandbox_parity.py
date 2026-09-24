@@ -548,3 +548,43 @@ def test_an_entry_the_claude_config_links_out_to_is_readable(world, monkeypatch)
 
     assert _can_read(str(config / "skills" / "review" / "SKILL.md"), project)
     assert not _can_read(str(beside), project)
+
+
+@pytest.fixture
+def codex_login(world, monkeypatch):
+    """The operator's codex home with a ChatGPT login in it."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex = world["home"] / ".codex"
+    codex.mkdir(exist_ok=True)
+    (codex / "auth.json").write_text('{"tokens": "PARITY"}\n')
+    (codex / "config.toml").write_text('model = "parity"\n')
+    return codex
+
+
+def test_the_brokered_codex_login_is_hidden_from_the_turn(
+    world, codex_login, monkeypatch
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    project = world["project"]
+    auth = codex_login / "auth.json"
+    # A link the turn plants in its own workspace resolves onto the same file.
+    (project / "login.json").symlink_to(auth)
+
+    assert not _can_read(str(auth), project)
+    assert not _can_write(str(auth), project)
+    assert not _can_read(str(project / "login.json"), project)
+    # The name the broker writes a refresh to before the rename.
+    assert not _can_write(str(codex_login / "auth.json.cotf-parity"), project)
+    # Only the login: codex still reads the config beside it.
+    assert _can_read(str(codex_login / "config.toml"), project)
+
+
+def test_the_codex_login_stays_readable_when_the_broker_does_not_hold_it(
+    world, codex_login, monkeypatch
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    assert _can_read(str(codex_login / "auth.json"), world["project"])

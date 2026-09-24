@@ -19,6 +19,7 @@ from uuid import NAMESPACE_URL, uuid5
 from claude_on_the_fly import (
     agent,
     broker,
+    codex_auth,
     commands,
     cotf_approve,
     egress,
@@ -1509,6 +1510,14 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
         logger.info("  %-15s = %s", label, value)
 
 
+def _route_approvals(frontend: Frontend) -> ApprovalBroker:
+    """Who answers when a turn reaches past a broker route's scope."""
+    return ApprovalBroker(
+        approvals_mod.gate_from_frontend(frontend),
+        policy=approvals_mod.ApprovalPolicy(never_ask=egress.never_ask_subjects()),
+    )
+
+
 async def _start_sandbox(
     frontend: Frontend,
 ) -> tuple[broker.Broker | None, SessionEgress | None, commands.CommandBroker | None]:
@@ -1531,7 +1540,15 @@ async def _start_sandbox(
         permissions.write_mcp_config()
         permissions.write_pty_settings()
     if not sandbox.enabled():
-        return None, None, None
+        # The ChatGPT login is brokered on its own when asked for, so an operator
+        # can run the broker for a while before turning the jail on.
+        if not codex_auth.enabled():
+            return None, None, None
+        only = await broker.start_default_broker(
+            approvals=_route_approvals(frontend), keychain=False
+        )
+        logger.info("sandbox: off, broker=on for the codex ChatGPT login only")
+        return only, None, None
     # Resolved before anything binds a socket, so a bad value is reported by a
     # daemon that has started nothing rather than by one already tearing down.
     egress_mode = sandbox.egress_mode()
@@ -1542,12 +1559,7 @@ async def _start_sandbox(
         # session earns, so one credential-holding proxy for the daemon is right.
         # Egress is the opposite -- see SessionEgress for why it is per-session.
         broker_instance = await broker.start_default_broker(
-            approvals=ApprovalBroker(
-                approvals_mod.gate_from_frontend(frontend),
-                policy=approvals_mod.ApprovalPolicy(
-                    never_ask=egress.never_ask_subjects(),
-                ),
-            )
+            approvals=_route_approvals(frontend)
         )
         # The broker is daemon-wide, but its bearer token is per turn so the
         # request can be bound to the originating workspace. Publish only the

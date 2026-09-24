@@ -605,6 +605,37 @@ def test_linux_write_denies_cover_codex_prompts_and_auth(tmp_path):
     assert codex / "skills" not in grants["write_denied"]
 
 
+def test_linux_hides_the_codex_login_the_broker_holds(tmp_path, monkeypatch):
+    """Masked rather than read-only, and only in one list: two mounts on one
+    path would leave argv order deciding which one the turn sees."""
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex = Path(os.path.realpath(tmp_path)) / "home" / ".codex"
+    codex.mkdir(parents=True)
+    auth = codex / "auth.json"
+    auth.write_text("{}\n")
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+
+    grants = sandbox._linux_grants(tmp_path / "ws")
+
+    assert auth in grants["masked"]
+    assert auth not in grants["write_denied"]
+    assert codex / "config.toml" in grants["write_denied"]
+
+
+def test_linux_masks_no_codex_login_that_is_not_there(tmp_path, monkeypatch):
+    """bwrap cannot mount over a path that does not exist."""
+    from claude_on_the_fly import codex_auth
+
+    missing = tmp_path / "no-codex"
+    monkeypatch.setattr(sandbox, "_codex_operator_home", lambda: missing)
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    assert missing / "auth.json" not in grants["masked"]
+
+
 # --- Slice 3: loopback narrowing ---
 
 
@@ -1695,6 +1726,39 @@ def test_deny_probe_specs_append_a_redirected_env(monkeypatch, tmp_path):
     monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", redirected)
     specs = sandbox._deny_probe_specs()
     assert specs == (*sandbox._DENY_PROBES, str(redirected / ".env"))
+
+
+def test_deny_probe_specs_prove_the_brokered_codex_login_is_hidden(
+    monkeypatch, tmp_path
+):
+    """Probed only while the broker holds it; otherwise the jail grants the
+    file on purpose and a probe would fail the startup self-test."""
+    from claude_on_the_fly import codex_auth
+
+    codex = tmp_path / "codex"
+    monkeypatch.setattr(sandbox, "_codex_operator_home", lambda: codex)
+    for data in (Path.home() / ".claude-on-the-fly", tmp_path / "other-data"):
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+        assert str(codex / "auth.json") not in sandbox._deny_probe_specs()
+        monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_s/t/chatgpt")
+        assert sandbox._deny_probe_specs()[-1] == str(codex / "auth.json")
+
+
+def test_jail_argv_passes_an_unused_codex_login_path_by_default(tmp_path, monkeypatch):
+    """jail.sb references `_CODEX_AUTH` unconditionally, so it is always passed,
+    and names nothing real unless the broker holds the login."""
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    argv = sandbox.wrap(["true"], tmp_path)
+    assert "_CODEX_AUTH=/.cotf-unused-codex-auth" in argv
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_s/t/chatgpt")
+    argv = sandbox.wrap(["true"], tmp_path)
+    assert f"_CODEX_AUTH={sandbox._codex_operator_home() / 'auth.json'}" in argv
 
 
 @pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])

@@ -2075,6 +2075,29 @@ class TestStartSandbox:
         monkeypatch.delenv("COTF_SANDBOX", raising=False)
         assert await orchestrator_mod._start_sandbox(frontend) == (None, None, None)
 
+    async def test_the_codex_login_is_brokered_alone_when_sandboxing_is_off(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        """An operator can broker the ChatGPT login before turning the jail on.
+        Only the credential broker starts, and without the keychain routes."""
+        from claude_on_the_fly import codex_auth
+
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+        seen: dict = {}
+        started = object()
+
+        async def start_default_broker(approvals=None, *, keychain=True):
+            seen["approvals"], seen["keychain"] = approvals, keychain
+            return started
+
+        monkeypatch.setattr(
+            orchestrator_mod.broker, "start_default_broker", start_default_broker
+        )
+        assert await orchestrator_mod._start_sandbox(frontend) == (started, None, None)
+        assert seen["keychain"] is False
+        assert seen["approvals"] is not None
+
     async def test_a_command_broker_that_cannot_start_revokes_the_credentials(
         self, frontend: StubFrontend, monkeypatch, operator_settings
     ) -> None:

@@ -18,7 +18,7 @@ import os
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
-from claude_on_the_fly import approvals, broker, commands, egress, sandbox
+from claude_on_the_fly import approvals, broker, codex_auth, commands, egress, sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,13 @@ class JobBrokers:
 
     async def start(self) -> None:
         if not sandbox.enabled():
+            # Same as the chat daemon: the ChatGPT login is brokered on its own
+            # when asked for, and nothing else starts.
+            if codex_auth.enabled():
+                self._credentials = await broker.start_default_broker(
+                    approvals=_never_asking(), keychain=False
+                )
+                logger.info("jobs: sandbox off, broker=on for the codex ChatGPT login")
             return
         try:
             self._credentials = await broker.start_default_broker(

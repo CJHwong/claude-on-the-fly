@@ -3565,3 +3565,35 @@ class TestSharedWorkspaceFirstTurns:
         assert running == ["one", "two"]
         release.set()
         await asyncio.gather(first, second)
+
+
+def test_a_brokered_chatgpt_login_points_every_argv_at_the_broker(monkeypatch):
+    """Both argv builders, and so compaction too, carry the provider overrides
+    once the broker publishes its URL, and neither does before it."""
+    from claude_on_the_fly import codex_auth
+
+    backend = CodexBackend(model="gpt-test")
+    workspace = Path("/ws")
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    assert "model_provider=cotf" not in backend._base_argv(workspace)
+
+    url = "http://127.0.0.1:1/_session/t/chatgpt"
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, url)
+    overrides = codex_auth.provider_args(url)
+    base = backend._base_argv(workspace)
+    interactive = backend._interactive_argv(workspace, None, "hi")
+    for argv in (base, interactive):
+        start = argv.index("-m")
+        assert argv[start : start + 2 + len(overrides)] == [
+            "-m",
+            "gpt-test",
+            *overrides,
+        ]
+
+
+def test_an_ollama_launcher_ignores_the_brokered_chatgpt_login(monkeypatch):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    launcher = OllamaLauncher(model="m")
+    assert "model_provider=cotf" not in CodexBackend(launcher=launcher)._model_args()

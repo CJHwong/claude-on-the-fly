@@ -125,6 +125,7 @@ FIELDS: dict[str, Field] = {
     "agent.codex.mode": Field("CODEX_MODE"),
     "agent.codex.model": Field("CODEX_MODEL"),
     "agent.codex.effort": Field("CODEX_EFFORT"),
+    "agent.codex.chatgpt_via_broker": Field("COTF_CODEX_CHATGPT_VIA_BROKER"),
     "agent.ollama.model": Field("OLLAMA_MODEL"),
     "agent.ollama.effort": Field("OLLAMA_EFFORT"),
     "agent.ollama.context_window": Field("OLLAMA_CONTEXT_WINDOW"),
@@ -183,6 +184,8 @@ RESTART_REQUIRED = (
     "sandbox.mode",
     # Decides whether the per-session egress proxy is constructed at all.
     "sandbox.egress",
+    # Adds a route to the credential broker, which is built once.
+    "agent.codex.chatgpt_via_broker",
     # PATH shims, written once into the agent's environment.
     "commands",
     # Decides whether the approval service is constructed at all, and whether the

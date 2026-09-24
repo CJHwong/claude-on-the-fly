@@ -152,6 +152,7 @@ def jail_argv(
     codex_link_paths: list[str] | None = None,
     runtime_paths: list[str] | None = None,
     ancestor_paths: list[str] | None = None,
+    codex_auth_file: Path | str | None = None,
     profile: Path | None = None,
     sandbox_exec: str = "sandbox-exec",
 ) -> list[str]:
@@ -213,6 +214,10 @@ def jail_argv(
         f"_LOOPBACK_ALT3={fourth}",
         "-D",
         f"_LOOPBACK_ALT4={fifth}",
+        # jail.sb denies this path, and every name that starts with it, after both
+        # bases. A path nothing uses when the broker does not hold the login.
+        "-D",
+        f"_CODEX_AUTH={codex_auth_file or '/.cotf-unused-codex-auth'}",
     ]
     # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
     # so only pass them there. Pad unused slots with the project dir (a no-op).

@@ -29,6 +29,49 @@ workspace, so discovering a port does not by itself authorize a request or let a
 choose another cwd. `sandbox.agent_env` forwards provider base URLs but omits token-like
 daemon variables.
 
+## codex's ChatGPT login
+
+`codex_auth.py` turns codex's `auth.json` into a broker route. With
+`agent.codex.chatgpt_via_broker` on, `start_default_broker` adds a `/chatgpt` route to
+`https://chatgpt.com` whose `Route.source` is a `ChatGPTLogin`. The source is read per
+request, because the operator's own `codex` can rotate the token while the daemon runs.
+The broker publishes `COTF_CHATGPT_BASE_URL`, and two things key on that variable rather
+than on the setting: `CodexBackend._model_args` adds a custom provider pointed at it,
+and the jail denies `auth.json` (`_CODEX_AUTH` in `jail.sb`, a mask in `_linux_grants`,
+and a startup probe). The route and the deny therefore cannot disagree.
+
+The route starts with the sandbox off as well, alone, with no keychain route. That lets
+an operator run the broker on real traffic before turning the jail on. Publishing
+`ANTHROPIC_BASE_URL` there would move claude turns onto the broker as a side effect.
+
+Refresh rules, from codex's own `manager.rs` and a live run against the token endpoint:
+
+- Refresh at 7 days, one day before codex's 8, or 5 minutes before the access token
+  expires, or after an upstream 401. A 401 gets one retry with the recovered token.
+- Take `DATA_DIR/state/codex-auth.lock` and re-read the file first. The chat daemon and
+  the jobs worker both run a broker, and only one should spend the token.
+- Refresh tokens are single-use. A refused refresh re-reads the file: a changed refresh
+  token means another process won, and nothing failed. An unchanged one is logged at
+  ERROR once, naming `codex login`, and not retried until the file changes.
+- Write a temporary `auth.json.cotf-*` in the same directory, then rename it over.
+  Every field codex wrote is kept. The jail rule is a prefix match, so it covers the
+  temporary file too.
+
+Measured with codex 0.156 through the real route on macOS, with no placeholder headers:
+
+- `auth.json` hidden by seatbelt: a turn answered, and codex made two calls,
+  `POST backend-api/codex/responses` and `GET backend-api/plugins/featured`. Those two
+  are always needed.
+- `auth.json` visible (the jail off): a turn with a tool call answered, and codex also
+  called `codex/models`, `codex/analytics-events/events`, `ps/plugins/installed`,
+  `ps/plugins/list`, `ps/plugins/suggested/codex` and `wham/settings/user`. A
+  refusal did not affect the turn, but they are on the allowlist anyway, so the
+  jail-off stage behaves like codex without the broker. The cost is that a jailed
+  turn can reach them too with the operator's login. codex sent its own
+  `Authorization` once, and the broker stripped it.
+- codex 0.156 treats a denied `auth.json` as logged out and keeps going, rather than
+  exiting as 0.147 did.
+
 ## Egress proxy
 
 `egress.py` handles HTTPS CONNECT without TLS interception. Packaged and operator host

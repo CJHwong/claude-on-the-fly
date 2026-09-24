@@ -16,6 +16,7 @@ from typing import Any
 
 from claude_on_the_fly import (
     agent,
+    codex_auth,
     codex_state,
     permissions,
     pricing,
@@ -1556,10 +1557,17 @@ class CodexBackend:
         by default, and ollama's endpoint refuses the whole request over it with
         `the web_search tool is not supported`, so no ollama turn got a token.
         The agent still reaches the web through its shell.
+
+        Natively, a ChatGPT login the broker holds (`codex_auth`) adds the
+        provider overrides that point codex at the broker. Keyed on the URL the
+        broker published rather than on the setting, so a turn and the jail both
+        follow what started, not an edit that has not been applied yet.
         """
         if self.launcher:
             return ["-c", 'web_search="disabled"']
-        return ["-m", self.model] if self.model else []
+        model = ["-m", self.model] if self.model else []
+        brokered = codex_auth.published_url()
+        return [*model, *codex_auth.provider_args(brokered)] if brokered else model
 
     def _effort_args(self) -> list[str]:
         """`-c model_reasoning_effort=...`, or [] when no effort is configured.
