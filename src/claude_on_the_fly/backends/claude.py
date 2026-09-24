@@ -458,6 +458,16 @@ class ClaudeBackend:
             # session yet the LLM never produced output (empty/synthetic reply).
             # Resume but RE-SUPPLY the system prompt — otherwise the agent runs
             # with no system prompt at all.
+            #
+            # Measured on 2.1.276, on a 0-byte session file: this branch does NOT
+            # recover the session. `--resume` answers "No conversation found with
+            # session ID: <uuid>", rc 1, so the prompt below never reaches a
+            # running CLI. `--session-id` with the empty file still in place
+            # answers "Session ID <uuid> is already in use.", rc 1. What works is
+            # unlinking the empty file first and then creating: rc 0, and the CLI
+            # writes the session. Not changed here because the repair is a
+            # decision of its own; the measurement is recorded so the next reader
+            # does not have to trust the intent this branch was written with.
             logger.warning(
                 "agent.run: session=%s exists but is empty; re-supplying system "
                 "prompt on resume",
