@@ -1553,6 +1553,19 @@ def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
     return (Path(os.path.realpath(envfile.claude_config_dir())), projects, thread)
 
 
+def _codex_auth_denied() -> Path | None:
+    """The operator's codex `auth.json` when the broker holds it, else None.
+
+    Keyed on the URL the broker published, like the codex argv, so the jail
+    hides the file exactly when a turn is pointed at the broker instead.
+    """
+    from claude_on_the_fly import codex_auth
+
+    if codex_auth.published_url() is None:
+        return None
+    return _codex_operator_home() / "auth.json"
+
+
 def _codex_operator_home() -> Path:
     """The codex home the operator configured, which `CODEX_HOME` can move.
 
@@ -1718,7 +1731,8 @@ _CODEX_PROTECTED = (
     "prompts",
     # The backend's own OAuth token. The agent must read it to authenticate, so
     # it stays readable; only the write is denied, which keeps a turn from
-    # swapping the operator's credential for one it controls.
+    # swapping the operator's credential for one it controls. When the broker
+    # holds the ChatGPT login, `_linux_grants` masks it instead.
     "auth.json",
 )
 
@@ -1979,9 +1993,11 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     data_dir = Path(os.path.realpath(DATA_DIR))
     project = Path(os.path.realpath(workspace))
     tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
-    codex = home / ".codex"
+    # CODEX_HOME can move the tree; `$HOME/.codex` then names nothing codex uses.
+    codex = _codex_operator_home()
     claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
+    codex_auth = _codex_auth_denied()
     granted_writes = _extra_write_paths(cap=None)
     protected = _write_grant_protected(granted_writes)
     read_write = [
@@ -2069,7 +2085,7 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         "read_write": read_write,
         "write_denied": [
             *_project_write_denies(project, _PROJECT_WRITE_DENIES),
-            *_codex_protected(codex),
+            *(path for path in _codex_protected(codex) if path != codex_auth),
             *protected,
         ],
         "write_denied_dirs": [
@@ -2082,6 +2098,10 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # needs a mount over that file, which is what masked does.
         "masked": [
             *_linux_masked(data_dir),
+            # Hidden rather than read-only when the broker holds the login. Not
+            # in write_denied too: two mounts on one path leave argv order
+            # deciding which wins.
+            *([codex_auth] if codex_auth is not None and codex_auth.exists() else []),
             *(
                 path
                 for name in _CLAUDE_READ_DENIED
@@ -2481,6 +2501,7 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
         codex_sessions=codex_sessions,
         codex_home=codex_write,
         codex_operator_home=_codex_operator_home(),
+        codex_auth_file=_codex_auth_denied(),
         pane_socket=_pane_socket(),
         base=base,
         profile=_JAIL_PROFILE,
@@ -2545,9 +2566,13 @@ def _deny_probe_specs() -> tuple[str, ...]:
     from claude_on_the_fly.agent import DATA_DIR
 
     own = str(DATA_DIR / ".env")
+    # The codex login joins the probes only while the broker holds it; otherwise
+    # the jail grants it on purpose and a probe would report a failure.
+    codex_auth = _codex_auth_denied()
+    brokered = (str(codex_auth),) if codex_auth is not None else ()
     if os.path.realpath(Path(_DEFAULT_COTF_ENV).expanduser()) == os.path.realpath(own):
-        return _DENY_PROBES
-    return (*_DENY_PROBES, own)
+        return (*_DENY_PROBES, *brokered)
+    return (*_DENY_PROBES, own, *brokered)
 
 
 def _probe_workspace() -> Path:
@@ -2929,7 +2954,7 @@ async def _preflight_protected_symlinks() -> None:
     weakening but an established layout, so it warns rather than refusing to serve
     a deployment that has been working.
     """
-    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    codex = _codex_operator_home()
     linked = [path for path in _codex_protected(codex) if path.is_symlink()]
     if not linked:
         return

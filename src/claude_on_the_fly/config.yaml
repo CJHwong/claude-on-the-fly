@@ -411,6 +411,10 @@ agent:
   #   mode: native
   #   model: o3
   #   effort: high
+  #   # Codex signed in with ChatGPT: the credential broker holds auth.json and
+  #   # refreshes it, and the jail hides the file from the turn. Starts the broker
+  #   # even with the sandbox off. Restart to apply.
+  #   chatgpt_via_broker: true
   # ollama:
   #   model: deepseek-v4-flash:cloud
   #   effort: high

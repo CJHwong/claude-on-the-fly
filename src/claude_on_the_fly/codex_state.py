@@ -44,7 +44,9 @@ _THREAD_ID_SAFE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 # copied, so an operator's edit to the real file takes effect on the next turn and
 # a jailed turn writing through the link lands on a path the profile already
 # governs: the instruction and execution entries stay write-denied there, and
-# auth.json stays writable so token refresh still works.
+# auth.json stays writable so token refresh still works. When the broker holds
+# the ChatGPT login (`codex_auth`), jail.sb denies the file behind the link, and
+# codex runs as logged out against the broker's provider.
 #
 # Measured against codex-cli 0.147.0: a home holding only an auth.json link and an
 # empty config.toml completed a real `codex exec` turn, so the rest of this list is

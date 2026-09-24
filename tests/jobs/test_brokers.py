@@ -79,6 +79,38 @@ async def test_nothing_starts_without_a_sandbox(monkeypatch, tmp_path):
         await brokers.stop()
 
 
+async def test_the_codex_login_is_brokered_alone_without_a_sandbox(
+    monkeypatch, tmp_path
+):
+    """With the sandbox off, the ChatGPT login is still brokered when asked for,
+    and nothing else starts: no command broker, no per-job env."""
+    from claude_on_the_fly import approvals, broker, codex_auth
+
+    monkeypatch.setenv("COTF_SANDBOX", "off")
+    monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+    monkeypatch.delenv(commands.ENDPOINT_ENV, raising=False)
+    seen: dict = {}
+
+    class FakeBroker:
+        async def stop(self):
+            seen["stopped"] = True
+
+    async def start_default_broker(approvals=None, *, keychain=True):
+        seen["gate"], seen["keychain"] = approvals._gate, keychain
+        return FakeBroker()
+
+    monkeypatch.setattr(broker, "start_default_broker", start_default_broker)
+    brokers = JobBrokers(tools=(ECHO,))
+    await brokers.start()
+    async with brokers.for_job(tmp_path, "k") as env:
+        assert env == {}
+    assert commands.ENDPOINT_ENV not in os.environ
+    await brokers.stop()
+    assert seen["keychain"] is False
+    assert isinstance(seen["gate"], approvals.DenyAllGate)
+    assert seen["stopped"] is True
+
+
 async def test_a_job_token_is_bound_to_its_workspace_and_revoked_after(
     monkeypatch, tmp_path
 ):

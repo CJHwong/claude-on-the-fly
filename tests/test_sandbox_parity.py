@@ -548,3 +548,98 @@ def test_an_entry_the_claude_config_links_out_to_is_readable(world, monkeypatch)
 
     assert _can_read(str(config / "skills" / "review" / "SKILL.md"), project)
     assert not _can_read(str(beside), project)
+
+
+@pytest.fixture
+def codex_login(world, monkeypatch):
+    """The operator's codex home with a ChatGPT login in it."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex = world["home"] / ".codex"
+    codex.mkdir(exist_ok=True)
+    (codex / "auth.json").write_text('{"tokens": "PARITY"}\n')
+    (codex / "config.toml").write_text('model = "parity"\n')
+    return codex
+
+
+def test_the_brokered_codex_login_is_hidden_from_the_turn(
+    world, codex_login, monkeypatch
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    project = world["project"]
+    auth = codex_login / "auth.json"
+    # A link the turn plants in its own workspace resolves onto the same file.
+    (project / "login.json").symlink_to(auth)
+
+    assert not _can_read(str(auth), project)
+    assert not _can_write(str(auth), project)
+    assert not _can_read(str(project / "login.json"), project)
+    # Only the login: codex still reads the config beside it.
+    assert _can_read(str(codex_login / "config.toml"), project)
+
+
+def test_the_codex_login_stays_readable_when_the_broker_does_not_hold_it(
+    world, codex_login, monkeypatch
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    assert _can_read(str(codex_login / "auth.json"), world["project"])
+
+
+def test_a_relocated_codex_home_keeps_its_state_writable(world, monkeypatch):
+    """codex opens `state_N.sqlite` in its home on every run. The rule granting
+    it named `$HOME/.codex`, so a relocated CODEX_HOME made a jailed pty turn
+    die with "attempt to write a readonly database". The login beside it stays
+    governed by the same home."""
+    relocated = world["home"] / "elsewhere" / "codex"
+    relocated.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(relocated))
+    project = world["project"]
+    assert _can_write(str(relocated / "state_5.sqlite"), project)
+    assert _can_write(str(relocated / "state_5.sqlite-wal"), project)
+    assert not _can_write(str(relocated / "config.toml"), project)
+
+
+def test_a_refresh_during_a_turn_does_not_expose_the_login(
+    world, codex_login, monkeypatch, tmp_path
+):
+    """The broker rewrites the login while a jailed turn is running. On Linux the
+    file is hidden by a bind mount, and a rename over the path on the host drops
+    that mount in the turn's namespace: measured, the turn then read the new
+    login. The broker writes in place, so the mask has to survive the refresh."""
+    import json
+    import time
+
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    auth = codex_login / "auth.json"
+    auth.write_text(
+        json.dumps({"tokens": {"access_token": "OLD", "refresh_token": "R"}})
+    )
+    project = world["project"]
+    ready = project / "ready"
+    script = f"cat '{auth}' >/dev/null 2>&1; touch '{ready}'; sleep 3; cat '{auth}'"
+    proc = subprocess.Popen(
+        sandbox.wrap(["/bin/sh", "-c", script], project),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 30
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists(), "the jailed process never started"
+
+    login = codex_auth.ChatGPTLogin(auth, tmp_path / "codex-auth.lock")
+    login._write(
+        json.loads(auth.read_text()),
+        {"access_token": "REFRESHED", "refresh_token": "ROTATED"},
+    )
+    out, _ = proc.communicate(timeout=30)
+
+    assert "REFRESHED" in auth.read_text()
+    assert "REFRESHED" not in out
+    assert proc.returncode != 0

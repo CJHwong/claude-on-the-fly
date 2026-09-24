@@ -839,3 +839,306 @@ class TestLoopbackAuthentication:
         finally:
             await bro.stop()
             await up_runner.cleanup()
+
+
+# --- Header sources: a credential read per request, e.g. codex's ChatGPT login ---
+
+
+class _Source:
+    """A header source that rotates to a new token when asked to recover."""
+
+    def __init__(self, *, recovers: bool = True, fails: bool = False) -> None:
+        self.token = "first"
+        self.recovers = recovers
+        self.fails = fails
+        self.recovered_from: list[dict] = []
+
+    async def headers(self) -> dict[str, str]:
+        if self.fails:
+            raise OSError("auth file unreadable")
+        return {"Authorization": f"Bearer {self.token}", "ChatGPT-Account-Id": "acct"}
+
+    async def recover(self, sent) -> bool:
+        self.recovered_from.append(dict(sent))
+        if self.recovers:
+            self.token = "second"
+        return self.recovers
+
+
+def _rejecting_app(record: list[dict], bad: str) -> web.Application:
+    """Upstream that answers 401 to one bearer token and 200 to any other."""
+
+    async def handler(request: web.Request) -> web.Response:
+        record.append({k.lower(): v for k, v in request.headers.items()})
+        if request.headers.get("Authorization") == f"Bearer {bad}":
+            return web.Response(status=401, text="expired")
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    return app
+
+
+async def _source_broker(app: web.Application, source: _Source):
+    up_runner, up_port = await _start(app)
+    bro = Broker(
+        [
+            Route(
+                prefix="/chatgpt",
+                upstream=f"http://localhost:{up_port}",
+                header="authorization",
+                keychain_service="",
+                source=source,
+            )
+        ]
+    )
+    await bro.start()
+    return bro, up_runner
+
+
+async def test_a_source_route_injects_its_headers_without_a_keychain(fake_keychain):
+    received: list[dict] = []
+    bro, up_runner = await _source_broker(_echo_app(received), _Source())
+    try:
+        async with ClientSession() as client:
+            resp = await client.post(
+                _url(bro, "/chatgpt/backend-api/codex/responses"),
+                headers={"chatgpt-account-id": "planted", "authorization": "Bearer x"},
+                json={},
+            )
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+
+    headers = received[0]["headers"]
+    assert headers["authorization"] == "Bearer first"
+    # The caller's own copy, in another case, does not travel beside the real one.
+    assert headers["chatgpt-account-id"] == "acct"
+    assert fake_keychain == {}
+
+
+async def test_a_401_is_retried_once_with_the_recovered_token():
+    seen: list[dict] = []
+    source = _Source()
+    bro, up_runner = await _source_broker(_rejecting_app(seen, "first"), source)
+    try:
+        async with ClientSession() as client:
+            resp = await client.post(_url(bro, "/chatgpt/x"), json={"n": 1})
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+
+    assert [h["authorization"] for h in seen] == ["Bearer first", "Bearer second"]
+    assert source.recovered_from == [
+        {"Authorization": "Bearer first", "ChatGPT-Account-Id": "acct"}
+    ]
+
+
+async def test_a_401_the_source_cannot_recover_is_passed_back_unretried():
+    seen: list[dict] = []
+    source = _Source(recovers=False)
+    bro, up_runner = await _source_broker(_rejecting_app(seen, "first"), source)
+    try:
+        async with ClientSession() as client:
+            resp = await client.post(_url(bro, "/chatgpt/x"), json={})
+            assert resp.status == 401
+            assert await resp.text() == "expired"
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+
+    assert len(seen) == 1
+
+
+async def test_a_keychain_route_401_is_passed_back_unretried(fake_keychain):
+    fake_keychain["cotf-k"] = "first"
+    seen: list[dict] = []
+    up_runner, up_port = await _start(_rejecting_app(seen, "first"))
+    bro = Broker(
+        [
+            Route(
+                prefix="/k",
+                upstream=f"http://localhost:{up_port}",
+                header="authorization",
+                value_prefix="Bearer ",
+                keychain_service="cotf-k",
+            )
+        ]
+    )
+    await bro.start()
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(_url(bro, "/k/x"))
+            assert resp.status == 401
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert len(seen) == 1
+
+
+async def test_an_unloadable_source_answers_502_and_names_no_value(caplog):
+    seen: list[dict] = []
+    bro, up_runner = await _source_broker(_echo_app(seen), _Source(fails=True))
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(_url(bro, "/chatgpt/x"))
+            assert resp.status == 502
+            assert "could not load the credential" in await resp.text()
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert seen == []
+    assert "cannot load the credential for /chatgpt" in caplog.text
+
+
+async def test_add_route_with_a_source_reads_no_keychain(fake_keychain):
+    fake_keychain["cotf-anthropic"] = "REAL"
+    bro = Broker(
+        [
+            Route(
+                prefix="/anthropic",
+                upstream="https://api.anthropic.com",
+                header="x-api-key",
+                keychain_service="cotf-anthropic",
+            )
+        ]
+    )
+    bro.add_route(
+        Route(
+            prefix="/chatgpt",
+            upstream="https://chatgpt.com",
+            header="authorization",
+            keychain_service="",
+            source=_Source(),
+        )
+    )
+    assert bro._match("/chatgpt/x").label == "/chatgpt source"
+    assert bro._match("/anthropic/x").label == "cotf-anthropic"
+
+
+def _chatgpt_route() -> Route:
+    return Route(
+        prefix="/chatgpt",
+        upstream="https://chatgpt.com",
+        header="authorization",
+        keychain_service="",
+        base_url_env_var="COTF_CHATGPT_BASE_URL",
+        source=_Source(),
+    )
+
+
+async def test_default_broker_without_keychain_serves_only_the_chatgpt_login(
+    monkeypatch,
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setattr(broker, "keychain_exists", lambda s: True)
+    monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+    monkeypatch.setattr(codex_auth, "route", _chatgpt_route)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("COTF_CHATGPT_BASE_URL", raising=False)
+    bro = await broker.start_default_broker(keychain=False)
+    assert bro is not None
+    try:
+        assert "COTF_CHATGPT_BASE_URL" in os.environ
+        assert "ANTHROPIC_BASE_URL" not in os.environ
+    finally:
+        await bro.stop()
+        os.environ.pop("COTF_CHATGPT_BASE_URL", None)
+
+
+async def test_default_broker_adds_the_chatgpt_login_beside_keychain_routes(
+    monkeypatch,
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setattr(broker, "keychain_exists", lambda s: True)
+    monkeypatch.setattr(broker, "read_keychain", lambda s: "REAL")
+    monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+    monkeypatch.setattr(codex_auth, "route", _chatgpt_route)
+    bro = await broker.start_default_broker()
+    assert bro is not None
+    try:
+        assert set(bro.base_url_env()) == {
+            "ANTHROPIC_BASE_URL",
+            "COTF_CHATGPT_BASE_URL",
+        }
+    finally:
+        await bro.stop()
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("COTF_CHATGPT_BASE_URL", None)
+
+
+async def test_default_broker_without_keychain_or_chatgpt_starts_nothing(monkeypatch):
+    monkeypatch.setattr(broker, "keychain_exists", lambda s: True)
+    assert await broker.start_default_broker(keychain=False) is None
+
+
+async def test_a_caller_hanging_up_mid_stream_is_not_an_error(
+    fake_keychain, monkeypatch, caplog
+):
+    """codex closes a streamed model call before the chunked terminator. The
+    answer was delivered, so the broker must not surface it as a handler error."""
+    from aiohttp.client_exceptions import ClientConnectionResetError
+
+    fake_keychain["cotf-scoped"] = "REAL"
+    received: list[dict] = []
+    bro, up_runner, _ = await _scoped_broker(fake_keychain, received)
+
+    original = web.StreamResponse.write_eof
+
+    async def closed(self, data=b""):
+        # Only the broker's own streamed response; the fake upstream's
+        # json_response is a StreamResponse subclass and must still finish.
+        if type(self) is web.StreamResponse:
+            raise ClientConnectionResetError("Cannot write to closing transport")
+        await original(self, data)
+
+    monkeypatch.setattr(web.StreamResponse, "write_eof", closed)
+    caplog.set_level("DEBUG", logger="claude_on_the_fly.broker")
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(_url(bro, "/scoped/x"))
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert "closed by the caller mid-stream" in caplog.text
+    assert "Error handling request" not in caplog.text
+
+
+def test_an_expected_auth_header_is_replaced_quietly(caplog):
+    """A source route's client may hold its own login. Stripping that is
+    routine, while an unexpected auth header on the same request still warns."""
+    from claude_on_the_fly.broker import _forward_request_headers
+
+    caplog.set_level("DEBUG", logger="claude_on_the_fly.broker")
+    kept = _forward_request_headers(
+        {"Authorization": "Bearer own", "x-api-key": "planted", "accept": "*/*"},
+        injected={"Authorization": "Bearer real"},
+        expected={"Authorization": "Bearer real"},
+    )
+    assert kept == {"accept": "*/*"}
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == [
+        "broker: stripped caller-supplied auth header(s) ['x-api-key'] before forwarding"
+    ]
+    assert "replaced the caller's own ['Authorization']" in caplog.text
+
+
+async def test_a_source_route_replaces_the_callers_login_without_warning(caplog):
+    received: list[dict] = []
+    bro, up_runner = await _source_broker(_echo_app(received), _Source())
+    try:
+        async with ClientSession() as client:
+            resp = await client.get(
+                _url(bro, "/chatgpt/x"), headers={"Authorization": "Bearer own"}
+            )
+            assert resp.status == 200
+    finally:
+        await bro.stop()
+        await up_runner.cleanup()
+    assert received[0]["headers"]["authorization"] == "Bearer first"
+    assert "stripped caller-supplied" not in caplog.text

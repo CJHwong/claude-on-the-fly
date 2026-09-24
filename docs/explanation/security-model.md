@@ -136,7 +136,8 @@ and no measured turn writes it.
 A codex home holds links back to the operator's `config.toml`, `AGENTS.md`, hooks, rules,
 plugins, prompts and `auth.json`. Writes through those links resolve onto the shared paths
 the profile already governs, so the execution and instruction surface stays read-only
-while token refresh keeps working.
+while token refresh keeps working. With `agent.codex.chatgpt_via_broker` on, the
+`auth.json` link resolves to a file the jail denies, and the broker refreshes it instead.
 
 Deleting a thread's workspace removes both stores, because each is named after a path
 that will never exist again.
@@ -177,7 +178,11 @@ the short-lived access token, in `ANTHROPIC_AUTH_TOKEN`: the daemon reads it fro
 the keychain on macOS or from `.credentials.json` on Linux, and the jail hides
 both. The refresh token stays out of reach. An expired token needs a claude run
 outside the jail to refresh it. `~/.codex/auth.json` stays readable, refresh
-token included.
+token included, unless `agent.codex.chatgpt_via_broker` is on. Then the credential
+broker holds codex's ChatGPT login: it adds the access token to each model call on the
+upstream leg, refreshes the login itself, and the jail hides the file, so a codex turn
+holds no credential at all. A turn can still use the login through the broker while it
+runs, on the eight ChatGPT paths codex was measured calling.
 
 **A brokered CLI is a capability grant.** It runs outside the jail with your real
 credential and only its output crosses back, so the provider-side token scope is

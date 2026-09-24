@@ -21,10 +21,12 @@ import os
 import secrets
 import subprocess
 import sys
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.parse import urlsplit
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientResponse, ClientSession, ClientTimeout, web
 
 from claude_on_the_fly.approvals import ApprovalBroker, ApprovalRequest
 
@@ -96,6 +98,22 @@ _MAX_BODY_BYTES = 64 * 1024 * 1024
 _SESSION_PREFIX = "/_session/"
 
 
+class HeaderSource(Protocol):
+    """A credential read per request instead of once from the keychain.
+
+    For a credential another process can rotate while the broker runs, such as
+    codex's ChatGPT login (`codex_auth.ChatGPTLogin`).
+    """
+
+    async def headers(self) -> dict[str, str]:
+        """The headers to inject on this request."""
+        ...
+
+    async def recover(self, sent: Mapping[str, str]) -> bool:
+        """After an upstream 401: True when a retry would carry new headers."""
+        ...
+
+
 @dataclass(frozen=True)
 class Route:
     """One allowlisted upstream the agent may reach, keyed by path prefix.
@@ -122,6 +140,14 @@ class Route:
     # patterns, so a typo can never silently reopen the prefix.
     methods: frozenset[str] = frozenset()
     allowed_tails: frozenset[str] = frozenset()
+    # Set to read the credential per request instead of from the keychain;
+    # `header`, `value_prefix` and `keychain_service` are then unused.
+    source: HeaderSource | None = None
+
+    @property
+    def label(self) -> str:
+        """Where the credential comes from, for logs. Never the value."""
+        return self.keychain_service or f"{self.prefix} source"
 
 
 def has_keychain() -> bool:
@@ -192,22 +218,42 @@ def blocked_host(host: str) -> bool:
     return any(addr in net for net in _BLOCKED_NETS)
 
 
-def _forward_request_headers(headers) -> dict[str, str]:
-    """Copy request headers minus hop-by-hop and any caller-supplied auth."""
+def _forward_request_headers(
+    headers, injected: Iterable[str] = (), expected: Iterable[str] = ()
+) -> dict[str, str]:
+    """Copy request headers minus hop-by-hop and any caller-supplied auth.
+
+    A header the broker injects is dropped too, whatever its case. Headers go
+    upstream as a plain dict, so a caller's `chatgpt-account-id` beside the
+    broker's `ChatGPT-Account-Id` would otherwise travel as two headers.
+
+    `expected` names auth headers the caller sends legitimately, logged at DEBUG
+    when stripped instead of WARNING.
+    """
+    replaced = {name.lower() for name in injected}
     kept = {
         key: value
         for key, value in headers.items()
-        if key.lower() not in _HOP_BY_HOP and key.lower() not in _STRIP_REQUEST_HEADERS
+        if key.lower() not in _HOP_BY_HOP
+        and key.lower() not in _STRIP_REQUEST_HEADERS
+        and key.lower() not in replaced
     }
     # Names only, never values. A stripped auth header means the agent sent a
     # credential of its own, which is either a misconfigured SDK or a key an
     # injected payload planted, and both are worth seeing. Logged at WARNING for
     # that reason rather than folded into the debug stream.
     stripped = [key for key in headers if key.lower() in _STRIP_REQUEST_HEADERS]
-    if stripped:
+    quiet = {name.lower() for name in expected}
+    loud = [key for key in stripped if key.lower() not in quiet]
+    if loud:
         logger.warning(
             "broker: stripped caller-supplied auth header(s) %s before forwarding",
-            stripped,
+            loud,
+        )
+    if len(loud) < len(stripped):
+        logger.debug(
+            "broker: replaced the caller's own %s",
+            [key for key in stripped if key.lower() in quiet],
         )
     return kept
 
@@ -278,7 +324,10 @@ class Broker:
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         for route in self._routes:
-            self._creds[route.keychain_service] = read_keychain(route.keychain_service)
+            if route.source is None:
+                self._creds[route.keychain_service] = read_keychain(
+                    route.keychain_service
+                )
         # auto_decompress=False keeps this byte-transparent. aiohttp decompresses
         # by default, which combined with forwarding the upstream's
         # `Content-Encoding: gzip` handed every client a decompressed body still
@@ -325,7 +374,8 @@ class Broker:
         Lets an operator widen the broker without a restart. Ordering is
         re-established on insert because _match relies on longest-prefix-first.
         """
-        self._creds[route.keychain_service] = read_keychain(route.keychain_service)
+        if route.source is None:
+            self._creds[route.keychain_service] = read_keychain(route.keychain_service)
         self._routes = sorted(
             [*self._routes, route], key=lambda r: len(r.prefix), reverse=True
         )
@@ -434,39 +484,64 @@ class Broker:
         if denial is not None:
             return denial
         url = route.upstream.rstrip("/") + "/" + tail
-        headers = _forward_request_headers(request.headers)
-        headers[route.header] = route.value_prefix + self._creds[route.keychain_service]
+        try:
+            injected = await self._injected(route)
+        except Exception:
+            # The message names the route, not the credential. A traceback here
+            # comes from reading a file or a token endpoint, never from a value.
+            logger.exception("broker: cannot load the credential for %s", route.prefix)
+            return web.Response(
+                status=502,
+                text=(
+                    "[sandbox] broker could not load the credential for this route. "
+                    "Retrying will not help; tell the user the operator must check "
+                    "the daemon log."
+                ),
+            )
+        # codex with the jail off still reads its own login and sends that
+        # Authorization on its side calls: 15 WARNINGs a turn for a header the
+        # source replaces anyway. A keychain route keeps the WARNING, because no
+        # client of one holds a credential of its own.
+        headers = _forward_request_headers(
+            request.headers,
+            injected,
+            expected=injected if route.source is not None else (),
+        )
+        headers.update(injected)
         body = await request.read()
         # Header *names* and the injection target, so a "why is upstream 401"
         # question can be answered without the value ever being written down.
         logger.debug(
-            "broker: %s -> %s, injecting %r from %s, forwarding headers %s, %d B body",
+            "broker: %s -> %s, injecting %s from %s, forwarding headers %s, %d B body",
             route_path,
             url,
-            route.header,
-            route.keychain_service,
+            sorted(injected),
+            route.label,
             sorted(headers),
             len(body),
         )
 
         assert self._session is not None
-        upstream_host = urlsplit(route.upstream).hostname
-        # allow_redirects=False: never follow a redirect, so we never re-inject
-        # the credential onto a redirected request (the strands rule).
-        async with self._session.request(
-            request.method,
-            url,
-            headers=headers,
-            params=request.query,
-            data=body,
-            allow_redirects=False,
-        ) as upstream:
+        upstream = await self._send(request, url, headers, body)
+        # One retry, with whatever the source now holds. The body was buffered
+        # above, so the retry sends the same request.
+        if (
+            upstream.status == 401
+            and route.source is not None
+            and await route.source.recover(injected)
+        ):
+            upstream.release()
+            injected = await route.source.headers()
+            headers.update(injected)
+            logger.info("broker: %s got 401, retrying once", route.prefix)
+            upstream = await self._send(request, url, headers, body)
+        try:
             logger.info(
                 "broker: allow %s %s%s [%s] -> %d",
                 request.method,
-                upstream_host,
+                urlsplit(route.upstream).hostname,
                 request.path,
-                route.keychain_service,
+                route.label,
                 upstream.status,
             )
             response = web.StreamResponse(
@@ -474,10 +549,40 @@ class Broker:
                 headers=_forward_response_headers(upstream.headers),
             )
             await response.prepare(request)
-            async for chunk in upstream.content.iter_chunked(_CHUNK):
-                await response.write(chunk)
-            await response.write_eof()
+            try:
+                async for chunk in upstream.content.iter_chunked(_CHUNK):
+                    await response.write(chunk)
+                await response.write_eof()
+            except ConnectionResetError:
+                # The caller hung up. codex does this on every streamed model call,
+                # after the last event and before the chunked terminator, so the
+                # answer was already delivered. aiohttp would log it as an
+                # unhandled error with a traceback.
+                logger.debug("broker: %s closed by the caller mid-stream", route.prefix)
             return response
+        finally:
+            upstream.release()
+
+    async def _injected(self, route: Route) -> dict[str, str]:
+        """The credential headers for one request on `route`."""
+        if route.source is not None:
+            return await route.source.headers()
+        return {route.header: route.value_prefix + self._creds[route.keychain_service]}
+
+    async def _send(
+        self, request: web.Request, url: str, headers: dict[str, str], body: bytes
+    ) -> ClientResponse:
+        assert self._session is not None
+        # allow_redirects=False: never follow a redirect, so we never re-inject
+        # the credential onto a redirected request (the strands rule).
+        return await self._session.request(
+            request.method,
+            url,
+            headers=headers,
+            params=request.query,
+            data=body,
+            allow_redirects=False,
+        )
 
 
 # Provider routes the daemon offers by default. Extend with OpenAI / OpenRouter
@@ -522,15 +627,24 @@ def routes_from_keychain(routes: list[Route]) -> list[Route]:
 
 
 async def start_default_broker(
-    approvals: ApprovalBroker | None = None,
+    approvals: ApprovalBroker | None = None, *, keychain: bool = True
 ) -> Broker | None:
     """Start a broker for whichever DEFAULT_ROUTES have keychain items, publish
     their token-scoped base-urls into os.environ for sandbox.agent_env to forward,
     and return it.
 
+    The codex ChatGPT route joins them when the operator turned it on. With
+    `keychain=False` it is the only route: a daemon without a sandbox brokers
+    the ChatGPT login and nothing else, because publishing ANTHROPIC_BASE_URL
+    there would move every claude turn onto the broker as a side effect.
+
     Returns None when no route is provisioned (nothing to serve).
     """
-    routes = routes_from_keychain(DEFAULT_ROUTES)
+    from claude_on_the_fly import codex_auth
+
+    routes = routes_from_keychain(DEFAULT_ROUTES) if keychain else []
+    if codex_auth.enabled():
+        routes.append(codex_auth.route())
     if not routes:
         logger.warning("broker: no provisioned routes found; not starting")
         return None
