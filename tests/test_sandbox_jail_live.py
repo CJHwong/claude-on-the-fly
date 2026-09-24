@@ -74,16 +74,21 @@ def jail(tmp_path):
     (data / ".env").write_text("TELEGRAM_BOT_TOKEN=xxx\n")
     (data / "memory").mkdir()
     places = sandbox_linux.prepare_placeholders(data / "jail")
+    # The production split: a uv interpreter runs through a symlinked
+    # `cpython-3.X-*` directory, and bwrap refuses a symlink as a mount
+    # destination, so it has to arrive as a link rather than a mount.
+    runtime_mounts, links = sandbox.linux_runtime_grants([sys.executable])
     return {
         "home": home,
         "data": data,
         "workspace": workspace,
         "grants": {
             "opaque": [home, data],
-            "read_only": [*sandbox._runtime_read_paths([sys.executable])],
+            "read_only": runtime_mounts,
             "read_write": [workspace, data / "memory"],
             "write_denied": [workspace / ".mcp.json"],
             "masked": [],
+            "links": links,
         },
         "places": places,
     }
