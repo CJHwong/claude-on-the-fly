@@ -258,8 +258,10 @@ readable.
 ### Frontends and journal
 
 **Forwarded and quoted Slack messages carry no untrusted-content boundary.** The allowlist
-gates the forwarder, not the original author, and `system_prompt.md` says nothing about
-the body of a forward being untrusted.
+gates the forwarder, not the original author. `system_prompt.md` now says a forwarded or
+quoted approval does not count, but it still says nothing about the rest of a forward's
+body. That is deliberate: operators treat a forward with no note as the thing the sender
+wants handled, so calling its instructions untrusted would override them.
 
 **Suggestion labels are replayed with the tapper's full sender authority.** Model-generated
 text, tapped by a human, is fed back wrapped in the real sender's `[from-id:]` marker.

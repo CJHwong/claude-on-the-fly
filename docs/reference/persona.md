@@ -16,6 +16,11 @@ The symlink is re-created on every message, so even if removed mid-session it se
 
 If no `CLAUDE.md` exists, Claude runs with the default system prompt only.
 
+The system prompt applies to every chat, whatever persona it runs. It already covers the
+final reply, memory and its privacy, sender identity, untrusted content, approvals, when to
+confirm before acting, and secrets, so a persona does not need to restate them. A persona
+can make them stricter, for example by asking for confirmation more often.
+
 ## Per-chat persona
 
 One Slack channel, one Telegram chat, or one background job can run different
