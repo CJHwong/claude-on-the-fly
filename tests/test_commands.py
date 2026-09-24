@@ -22,6 +22,7 @@ from claude_on_the_fly.commands import (
     CommandBroker,
     ShimmedTool,
     allowed_command,
+    hidden_by_a_leading_flag,
     leading_tokens,
     refused_as_write,
     refuses_readback,
@@ -96,6 +97,55 @@ def test_bundled_gh_allowlist_blocks_alias_api_and_unknown_commands():
     assert not allowed_command(GH, ["alias", "set", "x", "!cat /etc/passwd"])
     assert not allowed_command(GH, ["api", "--method", "DELETE", "/repos/x"])
     assert not allowed_command(GH, ["arbitrary-alias"])
+
+
+# --- a help request needs no allow entry ---
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--help"],
+        ["-h"],
+        ["--version"],
+        # A group the allowlist only names deeper, the common probe.
+        ["repo", "--help"],
+        # A verb the allowlist refuses: cobra and commander print help and exit.
+        ["repo", "delete", "o/r", "--help"],
+        ["help", "repo", "delete"],
+    ],
+)
+def test_a_help_request_is_admitted_without_an_allow_entry(argv):
+    """An agent learns a CLI by asking it. Refusing `acli jira --help` because only
+    `jira workitem view` is listed sent 1,113 of avery's calls back as refusals,
+    and the help text never reaches the server."""
+    assert allowed_command(GH, argv) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # A flag before `--help` may take it as its value. gh then runs the DELETE
+        # with `--jq --help`, so no flag may come first.
+        ["api", "-X", "DELETE", "repos/o/r", "--jq", "--help"],
+        ["pr", "comment", "1", "--body", "--help"],
+        # `--help` has to be last, or the argv is more than a question.
+        ["repo", "delete", "o/r", "--help", "--yes"],
+        # A trailing `help` word is an argument to gh: `repo delete help` deletes
+        # a repository named help.
+        ["repo", "delete", "help"],
+        # And `--help` is not a help request when a word follows it.
+        ["--help", "repo", "delete", "o/r"],
+    ],
+)
+def test_a_help_flag_does_not_admit_a_command_that_can_still_run(argv):
+    assert allowed_command(GH, argv) is False
+
+
+def test_a_help_request_still_meets_the_readback_refusal():
+    """Admitted past the allowlist, not past the credential check behind it."""
+    assert allowed_command(GH, ["auth", "token", "--help"]) is True
+    assert refuses_readback(GH, ["auth", "token", "--help"]) is True
 
 
 # --- the read-only method gate ---
@@ -1521,6 +1571,74 @@ def test_boolean_flags_keep_the_second_readback_reading():
     )
     assert refuses_readback(tool, ["--verbose", "auth", "token"]) is True
     assert refuses_readback(tool, ["--hostname", "auth", "token"]) is True
+
+
+# --------------------------------------------------------------------------
+# value_flags: flags that always take the next token as their value
+# --------------------------------------------------------------------------
+
+TWG = ShimmedTool(
+    name="twg",
+    allow=(("jira", "workitem", "get"),),
+    readback=frozenset({("auth",)}),
+    value_flags=frozenset({"-o", "--output-summary", "-s"}),
+)
+
+
+def test_value_flags_are_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {"tools": [{"name": "twg", "allow": ["jira"], "value_flags": ["-o"]}]},
+        source="test",
+    )
+    assert tool.value_flags == frozenset({"-o"})
+
+
+def test_a_flag_cannot_be_both_boolean_and_value():
+    with pytest.raises(ValueError, match="both boolean_flags and value_flags"):
+        commands.parse_tools(
+            {
+                "tools": [
+                    {
+                        "name": "twg",
+                        "boolean_flags": ["-o"],
+                        "value_flags": ["-o"],
+                    }
+                ]
+            },
+            source="test",
+        )
+
+
+def test_a_declared_value_flag_before_the_subcommand_is_admitted():
+    """`twg -o json --output-summary inline jira workitem get` is how avery's
+    skill writes it: 35 of its twg calls were refused only because the reading
+    where no flag takes a value saw `json inline jira` as the subcommand."""
+    argv = ["-o", "json", "--output-summary", "inline", "jira", "workitem", "get", "X"]
+    assert allowed_command(TWG, argv) is True
+    assert hidden_by_a_leading_flag(TWG, argv) is False
+
+
+def test_an_undeclared_flag_before_the_subcommand_is_still_refused():
+    """Only the listed flags change. `--agent-fields` is not declared here, so
+    the command stays refused and the agent is told to move the flag."""
+    argv = ["--agent-fields", "data.key", "jira", "workitem", "get", "X"]
+    assert allowed_command(TWG, argv) is False
+    assert hidden_by_a_leading_flag(TWG, argv) is True
+
+
+def test_a_declared_value_flag_does_not_hide_a_verb_from_the_allowlist():
+    """The value is skipped, not the verb after it. `-o delete jira workitem
+    get` reads as `jira workitem get` with `-o delete`, which is what the CLI
+    does with a flag that takes a value."""
+    assert allowed_command(TWG, ["-o", "json", "jira", "workitem", "delete"]) is False
+
+
+def test_value_flags_keep_the_second_readback_reading():
+    """A wrong declaration must not open a readback. If `-s` were really
+    boolean, `twg -s auth` runs `auth`, so the readback check still reads
+    every flag both ways."""
+    assert refuses_readback(TWG, ["-s", "auth"]) is True
+    assert refuses_readback(TWG, ["-s", "site", "auth"]) is True
 
 
 # --------------------------------------------------------------------------

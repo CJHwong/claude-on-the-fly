@@ -125,6 +125,13 @@ class ShimmedTool:
         Without a flag table the allowlist reads every bare flag as taking one,
         so `systemctl --user status x` looked like `x` and was refused. Listing
         `--user` here fixes the reading for that flag only. Empty by default.
+    :param value_flags: flags that always take the next token as their value.
+        The mirror of `boolean_flags`: without it, a value flag before the
+        subcommand is refused, because the reading where no flag takes a value
+        sees `twg -o json jira` as the subcommand `json jira`. Only the allowlist
+        uses it; the readback check keeps reading every flag both ways, so a
+        boolean flag listed here by mistake cannot open a readback. Empty by
+        default.
     """
 
     name: str
@@ -135,6 +142,7 @@ class ShimmedTool:
     allow_read_only: tuple[tuple[str, ...], ...] = ()
     allow_paths: frozenset[str] = frozenset()
     boolean_flags: frozenset[str] = frozenset()
+    value_flags: frozenset[str] = frozenset()
 
 
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
@@ -174,6 +182,12 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
             )
         return frozenset(str(item) for item in value)
 
+    boolean_flags = names(entry.get("boolean_flags"), "boolean_flags")
+    value_flags = names(entry.get("value_flags"), "value_flags")
+    if both := sorted(boolean_flags & value_flags):
+        raise ValueError(
+            f"{name}: {', '.join(both)} listed in both boolean_flags and value_flags"
+        )
     return ShimmedTool(
         name=name,
         readback=frozenset(words(entry.get("readback"), "readback")),
@@ -182,7 +196,8 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
         allow=words(entry.get("allow"), "allow"),
         allow_read_only=words(entry.get("allow_read_only"), "allow_read_only"),
         allow_paths=names(entry.get("allow_paths"), "allow_paths"),
-        boolean_flags=names(entry.get("boolean_flags"), "boolean_flags"),
+        boolean_flags=boolean_flags,
+        value_flags=value_flags,
     )
 
 
@@ -373,6 +388,7 @@ def leading_tokens(
     *,
     flags_take_values: bool = True,
     boolean_flags: frozenset[str] = frozenset(),
+    value_flags: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """The subcommand path: leading non-flag tokens, stopping at the first flag.
 
@@ -387,6 +403,7 @@ def leading_tokens(
     checks both, because assuming one of them is what lets `--verbose auth
     logout` walk past a refusal for `auth logout`. `boolean_flags` is the part of
     that table an operator declared: those flags never consume the next token.
+    `value_flags` is the other part: those always do, in either reading.
     """
     tokens: list[str] = []
     skip_value = False
@@ -397,10 +414,10 @@ def leading_tokens(
         if item.startswith("-"):
             # `--flag=value` carries its value; a bare flag may take the next arg.
             skip_value = (
-                flags_take_values
-                and "=" not in item
+                "=" not in item
                 and item != "--"
                 and item not in boolean_flags
+                and (flags_take_values or item in value_flags)
             )
             continue
         tokens.append(item)
@@ -545,14 +562,47 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     allowed, `systemctl --quiet stop status` matched `status` and systemctl ran
     `stop`. The cost is a value flag written before the subcommand, such as
     `gh --repo o/r pr view`; none of 1884 real calls on the deployed host did that.
+    A flag the operator lists in `value_flags` is read as taking its value in
+    both readings, which admits that form for the listed flags only.
+
+    A help request passes without an allow entry; see `is_help_request`.
     """
+    if is_help_request(argv):
+        return True
     return all(
         _admits(tool, tokens, argv)
         for tokens in (
             leading_tokens(argv, boolean_flags=tool.boolean_flags),
-            leading_tokens(argv, flags_take_values=False),
+            leading_tokens(argv, flags_take_values=False, value_flags=tool.value_flags),
         )
     )
+
+
+_HELP_FLAGS = frozenset({"--help", "-h", "--version"})
+
+
+def is_help_request(argv: list[str]) -> bool:
+    """Whether the argv only asks the CLI to describe itself.
+
+    An agent learns a CLI by probing it, and an allowlist that names `jira
+    workitem view` refuses `jira --help`. Help never reaches the server, but
+    `--help` alone does not prove the command will not run, so the shape is narrow:
+
+    - subcommand words, then one help flag as the last token. No flag may come
+      earlier, because a value flag takes `--help` as its value and the command
+      runs: `gh api -X DELETE repos/o/r --jq --help` deletes.
+    - `help` as the first word. A trailing `help` is an argument: `gh repo delete
+      help` deletes a repository named help.
+
+    Measured: gh and acli (cobra) and twg (commander) print help for `<verb> <arg>
+    --help` and exit 0 without running it; aws exits 252 with a usage error.
+    """
+    if not argv:
+        return False
+    if argv[0] == "help":
+        return not any(item.startswith("-") for item in argv)
+    *words, last = argv
+    return last in _HELP_FLAGS and not any(item.startswith("-") for item in words)
 
 
 def _admits(tool: ShimmedTool, tokens: tuple[str, ...], argv: list[str]) -> bool:
