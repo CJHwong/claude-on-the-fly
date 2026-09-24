@@ -178,13 +178,14 @@ host is a covert channel: TLS payloads are not inspected.
 | `allow_read_only` | list of leading subcommand prefixes / empty | Prefixes admitted only when the invocation reads |
 | `allow_paths` | list of paths / empty | Trees outside the workspace that absolute path arguments may reach |
 | `boolean_flags` | list of strings / empty | Flags that never take the next token as a value when the subcommand is read |
+| `value_flags` | list of strings / empty | Flags that always take the next token as a value when the allowlist reads the subcommand; the readback check ignores it. A flag cannot be in both lists |
 | `env_passthrough` | list of names / empty | Additional daemon variables forwarded to the real CLI |
 
 The whole section requires a chat-daemon restart. Removing a packaged refusal is
 allowed but logged as a warning. Arguments and flags after an allowed prefix are passed
 through, so the broker is not a full CLI-semantics parser; scope the credential itself.
-A flag before the subcommand is refused unless it is listed in `boolean_flags`, and the
-refusal tells the agent to move it after the subcommand.
+A flag before the subcommand is refused unless it is listed in `boolean_flags` or
+`value_flags`, and the refusal tells the agent to move it after the subcommand.
 Operator overrides replace packaged entries by name. They do not inherit the packaged
 `allow` list, so an override that omits it disables that tool.
 

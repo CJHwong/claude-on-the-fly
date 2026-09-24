@@ -140,8 +140,13 @@ commands:
   #                     token, and taking none. So without this,
   #                     `systemctl --user status x` is refused, and the agent is
   #                     told to move the flag after the subcommand. List the
-  #                     boolean flags the agent writes first. A value flag
-  #                     (`aws --profile p`) has to follow the subcommand.
+  #                     boolean flags the agent writes first.
+  #
+  #   value_flags       flags that always take the next token as their value, so
+  #                     `twg -o json jira workitem get` reads as `jira workitem
+  #                     get`. Only list a flag that really takes one: a boolean
+  #                     flag listed here hides the next word from the allowlist.
+  #                     The readback check ignores this list.
   #
   #   allow             safe leading subcommands. The list is deny-by-default;
   #                    flags and arguments may follow the listed words. A

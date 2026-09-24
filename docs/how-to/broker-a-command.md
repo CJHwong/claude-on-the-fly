@@ -100,8 +100,24 @@ gets the command refused rather than hiding a verb. Without that rule, `status`
 allowed and `--quiet` unlisted admitted `systemctl --quiet stop status`, and systemctl
 ran `stop`. The refusal tells the agent to put its flags after the subcommand, which
 `aws`, `gh` and `systemctl` all accept. List the boolean flags the agent uses first,
-so the everyday spelling runs as written. A value flag such as `aws --profile prod`
-cannot be listed that way and has to follow the subcommand.
+so the everyday spelling runs as written.
+
+## Declare a tool's value flags
+
+A value flag written before the subcommand, such as `twg -o json jira workitem get`,
+is refused by the same rule: the reading where no flag takes a value sees `json jira`
+as the subcommand. List the flags the agent writes first that always take a value:
+
+```yaml
+    - name: twg
+      value_flags: [-o, --output, -s, --site, --output-summary, --agent-fields]
+```
+
+Both readings then skip the listed flag's value. Only list a flag that really takes
+one. A boolean flag listed here hides the next word from the allowlist, the way an
+unlisted `--quiet` did above. The readback check ignores this list and keeps reading
+every flag both ways, so a wrong entry cannot expose a credential. A flag cannot be in
+both lists.
 
 ## Let a tool read a file outside the workspace
 
