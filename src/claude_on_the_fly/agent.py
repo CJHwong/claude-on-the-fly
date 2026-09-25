@@ -1318,7 +1318,37 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
         _announce_process(proc, "", running=False)
 
 
-async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -> dict:
+async def _feed_stdin(proc: asyncio.subprocess.Process, text: str) -> None:
+    """Hand `text` to the CLI on stdin, then close the pipe.
+
+    A task of its own rather than a write before the read loop: 143 KB does not
+    fit a 64 KB pipe buffer, so writing inline would wait on a child that is
+    still producing the output nobody is draining yet. Both sides move, or
+    neither does.
+
+    Errors are swallowed by design. A CLI that rejected its own arguments exits
+    before reading anything, and its exit status is the failure worth reporting;
+    a broken pipe here is only the symptom of it. `commands._collect` writes
+    stdin the same way for a brokered CLI, inline rather than as a task because
+    its payloads are small: keep the two in step.
+    """
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(text.encode("utf-8"))
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        logger.debug("exec: stdin closed before the prompt reached the CLI")
+    finally:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+            proc.stdin.close()
+
+
+async def _exec(
+    workspace: Path,
+    cmd: list[str],
+    timeout: float | None = None,
+    stdin_text: str | None = None,
+) -> dict:
     cmd = sandbox.wrap(cmd, workspace)
     logger.debug(
         "exec: cwd=%s cmd=%s timeout=%s",
@@ -1326,8 +1356,18 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         " ".join(cmd[:6]) + "...",
         timeout,
     )
+    # DEVNULL, not inherited, when there is no prompt to send. A spawn handed an
+    # open pipe that never delivers makes the CLI wait out its 3-second stdin
+    # probe first ("no stdin data received in 3s, proceeding without it",
+    # measured on 2.1.276 when stdin was an ssh channel). The codex backend
+    # learned the same lesson from the other side: see `_run_codex_exec`.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=(
+            asyncio.subprocess.PIPE
+            if stdin_text is not None
+            else asyncio.subprocess.DEVNULL
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
@@ -1336,6 +1376,11 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         env=sandbox.agent_env(),
     )
     track_agent_process(proc, cmd)
+    feed = (
+        asyncio.create_task(_feed_stdin(proc, stdin_text))
+        if stdin_text is not None
+        else None
+    )
     try:
         if timeout is not None:
             return await asyncio.wait_for(_consume(proc), timeout=timeout)
@@ -1344,7 +1389,10 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         logger.warning("exec: timed out after %ss", timeout)
         raise RuntimeError(f"Claude CLI timed out after {timeout}s") from None
     finally:
+        # Kill first: that is what closes the pipe a writer may be parked on.
         await _kill_process_tree(proc)
+        if feed is not None:
+            await asyncio.gather(feed, return_exceptions=True)
 
 
 NUDGE_PROMPT = "Please provide your final reply to the user."

@@ -28,13 +28,16 @@ workspace), for every `__runs/` entry past the retention window. Keeping them
 until then means a run that failed overnight can still be inspected. A keyed
 workspace is never swept; it is the continuity.
 
-NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
-(the codex backend passes DEVNULL itself; this is about the claude path)
-so the child inherits this process's stdin. That is harmless for the supervised
-worker — `supervisor.spawn` starts daemons with `stdin=subprocess.DEVNULL` — but
-a worker run in the foreground from a terminal hands the agent CLI that terminal's
-stdin, and it may consume input meant for the shell. Run the worker detached
-(`claude-tui start jobs`), or redirect its stdin, if that matters to you.
+NOTE (stdin): the claude print path no longer inherits this worker's stdin.
+`agent._exec` passes `stdin=` every time — a pipe carrying the turn's prompt, or
+DEVNULL when there is none — and the codex backend passes DEVNULL in its own
+spawn. For those, a foreground worker started from a terminal no longer hands the
+agent CLI that terminal's stdin to consume.
+
+Two spawns still inherit, and both belong to the pty mode: the `claude-pty` spawn
+(`_exec_pty`) and the skills probe (`_probe_skills`). Neither was measured, so
+neither was changed. On a `CLAUDE_MODE=pty` deployment the old advice still
+applies: run the worker detached (`claude-tui start jobs`) or redirect its stdin.
 """
 
 from __future__ import annotations

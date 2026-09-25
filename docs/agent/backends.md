@@ -126,8 +126,37 @@ fold an earlier turn's tool counts and final message into this one.
 
 ### System prompt
 
-- **claude**: `--system-prompt` flag.
+- **claude**: `--system-prompt-file <path>`, a 0600 file staged in the workspace and
+  discarded after the turn. The inline `--system-prompt <text>` is a real flag but hidden
+  from `--help`, and the file variant keeps the one argument cotf cannot bound off the
+  command line. Only sent when (re-)establishing a session; a healthy `--resume` reuses
+  the prompt claude recorded into the session (`--system-prompt-snapshot` defaults to on).
+  There is no fallback to the inline flag: a CLI release that drops the file variant makes
+  every first turn fail loudly at launch (`unknown option`), which is the intended trade
+  over quietly putting the prompt back into argv. pty mode still passes the inline flag,
+  because claude-pty's handling of the file variant has not been measured.
 - **codex**: no flag — format hint is prepended to each user message.
+
+### The turn's prompt
+
+One argv element is capped at `MAX_ARG_STRLEN` (32 pages, 131072 bytes, Linux), and a reply
+in a long Slack thread replays up to 50 prior messages ahead of the prompt. Measured on the
+thread that broke: 131360-142743 bytes, which killed the spawn in `execve` with `E2BIG`
+before the CLI started. The user saw the failure as the reply itself:
+`OSError: [Errno 7] Argument list too long: 'ollama'`.
+
+- **claude, native and ollama**: written to the CLI's stdin by `agent._exec`, which passes
+  `DEVNULL` when a turn has no prompt. An inherited open pipe would instead cost the CLI's
+  3-second stdin probe before the turn starts. Verified end to end on the deployment host
+  through `ollama launch claude`: 143072 bytes in argv reproduced the `E2BIG`, and the same
+  bytes on stdin answered correctly in one turn, so the launcher does forward its stdin.
+- **claude, pty**: stays in argv, and so does the inline system prompt. claude-pty reads
+  its prompt from argv and its stdin is the pane's TTY. **Known gap**: a pty deployment
+  still dies on a prompt past the argv cap.
+- **codex**: stays in argv on every arm, so the same gap applies. The tmux arm moves that
+  argv into the pane script (`_write_pane_script`), which lifts the 16 KB imsg limit a tmux
+  client imposes, but the script still execs codex with the prompt in argv, so codex's own
+  `execve` carries it either way.
 
 ### Permission mode
 
