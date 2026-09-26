@@ -967,6 +967,14 @@ class AgentOutputLimitError(RuntimeError):
     """The CLI produced more output than a supervised turn may buffer."""
 
 
+class AgentTurnError(RuntimeError):
+    """A failed turn with a short, safe explanation for the requester."""
+
+    def __init__(self, diagnostic: str, public_message: str) -> None:
+        super().__init__(diagnostic)
+        self.public_message = public_message
+
+
 # Chunk size for the drain loop below. Any value works; this one keeps the
 # syscall count sane on an 8 MB cap without holding a large slice per read.
 _READ_CHUNK_BYTES = 64 * 1024
@@ -1396,6 +1404,14 @@ async def _exec(
 
 
 NUDGE_PROMPT = "Please provide your final reply to the user."
+EMPTY_REPLY_NOTICE = (
+    "I didn't get a usable reply from the agent, so I can't confirm whether "
+    "your request was handled."
+)
+AGENT_FAILURE_NOTICE = (
+    "I couldn't finish this request. The failure was logged, but I can't "
+    "confirm the outcome."
+)
 
 
 def _sum_counts(a: dict | None, b: dict | None) -> dict:
