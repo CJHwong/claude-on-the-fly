@@ -1711,7 +1711,7 @@ class TestRun:
         assert resp.model == ""
 
     async def test_missing_result_triggers_retry_then_defaults(self):
-        """Missing result key → retry → retry also empty → 'No response'."""
+        """Missing result key → retry → retry also empty → useful fallback."""
         first = {"total_cost_usd": 0.01}
         retry = {"result": ""}
 
@@ -1722,7 +1722,7 @@ class TestRun:
         ) as mock:
             resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
 
-        assert resp.body == "No response"
+        assert resp.body == agent_mod.EMPTY_REPLY_NOTICE
         assert mock.await_count == 2
         # Second call is the nudge, and it rides stdin like the first call: the
         # retry exists for the turn that produced nothing, so it must not be the

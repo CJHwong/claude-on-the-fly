@@ -14,6 +14,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from rich.text import Text
+
 from claude_on_the_fly import (
     agent,
     codex_auth,
@@ -202,9 +204,11 @@ ROLLOUT_POLL_S = 1.0
 # What codex takes as "read the prompt from stdin", per `codex exec --help`.
 _STDIN_PROMPT = "-"
 
-# Rows of the pane kept to explain a failing exit. A pane is a screenful, not an
-# error message, and the tail is where the failure is.
+# Keep a small diagnostic from a failed pane. TUI frames can be one enormous
+# line of ANSI controls, so a row limit alone does not bound the exception.
 _PANE_ERROR_ROWS = 40
+_PANE_ERROR_BYTES = 8192
+_PANE_ERROR_CHARS = 2000
 
 # How often the hosted arm asks whether the turn is done. The answer comes from
 # the rollout follower, which polls once a second itself, so anything finer only
@@ -284,8 +288,9 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
 
     `completed` comes from `task_complete`, which codex writes after the final
     message — the same in-band proof the stream's `turn.completed` gave, and what
-    the nudge retry keys on. `error` comes from `turn_aborted`, the only terminal
-    failure record observed in the local corpus.
+    the nudge retry keys on. A failed `task_complete` also carries `error`; it
+    must win over an empty body so a rejected model call is never nudged.
+    `turn_aborted` is the other terminal failure record.
 
     `usage` is a fallback here rather than the source of truth: `run` diffs the
     rollout's cumulative `total_token_usage` across the call, which is what makes
@@ -334,6 +339,12 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
         elif sub == "task_complete":
             completed = True
             body = payload.get("last_agent_message") or body
+            failure = payload.get("error")
+            if failure is not None:
+                detail = (
+                    failure.get("message") if isinstance(failure, dict) else failure
+                )
+                error = str(detail) if detail else "codex turn failed"
         elif sub == "turn_aborted":
             error = payload.get("reason") or "codex turn aborted"
     return {
@@ -1020,18 +1031,21 @@ async def _run_codex_in_pane(
 
 
 def _pane_output_tail(path: Path) -> str:
-    """The last rows of what the pane printed, for explaining a failing exit.
-
-    A whole turn's terminal output is not an error message, so only the tail is
-    kept. Read as text with escapes stripped, because this ends up in a chat
-    message rather than in a terminal.
-    """
+    """A bounded, plain-text diagnostic from a failed terminal pane."""
     try:
-        text = path.read_text(errors="replace")
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - _PANE_ERROR_BYTES))
+            text = stream.read(_PANE_ERROR_BYTES).decode(errors="replace")
     except OSError:
         return ""
+    # `pipe-pane` commonly writes CRLF. The pane renderer treats a row ending
+    # in carriage return as blank, so normalize it before trimming rows.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     rows = tmux.trim_trailing_blank_rows(text).splitlines()
-    return "\n".join(rows[-_PANE_ERROR_ROWS:]).strip()
+    plain = Text.from_ansi("\n".join(rows[-_PANE_ERROR_ROWS:])).plain
+    printable = "".join(c for c in plain if c.isprintable() or c in "\n\t")
+    return printable[-_PANE_ERROR_CHARS:].strip()
 
 
 async def _run_codex_exec(
@@ -1132,7 +1146,20 @@ async def _run_codex_exec(
 
     parsed = parse_codex_rollout(follower.records)
     if parsed.get("error"):
-        raise RuntimeError(parsed["error"])
+        detail = parsed["error"]
+        if "401 Unauthorized" in detail:
+            raise agent.AgentTurnError(
+                "Codex model authentication rejected (401)",
+                "I couldn't finish this request because the model service rejected "
+                "authentication (401). The failure was logged.",
+            )
+        if "403 Forbidden" in detail:
+            raise agent.AgentTurnError(
+                "Codex model access denied (403)",
+                "I couldn't finish this request because the model service denied "
+                "access (403). The failure was logged.",
+            )
+        raise RuntimeError(detail)
     if returncode != 0:
         # A non-zero exit *after* the turn completed means the turn's work is
         # done and only codex's own teardown failed. That happens: codex can
@@ -1444,9 +1471,9 @@ class CodexBackend:
                 )
                 duration += time.monotonic() - retry_started
                 result = _merge_codex_results(result, retry_result)
-                body = (result.get("body") or "").strip() or "No response"
+                body = (result.get("body") or "").strip() or agent.EMPTY_REPLY_NOTICE
             else:
-                body = "No response"
+                body = agent.EMPTY_REPLY_NOTICE
 
         # Prefer the model codex actually recorded in its session file; fall
         # back to whatever the profile resolved. With no model configured that

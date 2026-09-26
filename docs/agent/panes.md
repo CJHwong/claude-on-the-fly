@@ -161,6 +161,11 @@ session landing on another server, a script that cannot be staged — takes that
 fallback rather than the turn. A pane is a mirror, and losing the mirror must not cost
 the reply.
 
+If a pane disappears before the turn completes, its tap is only a diagnostic. The
+reader takes at most the final 8 KiB, normalizes carriage returns, strips terminal
+controls, and retains at most 2,000 printable characters. The orchestrator sends
+a fixed failure notice instead of putting that diagnostic in the chat.
+
 The mode is separate from `agent.pane` on purpose. `pane` is global, so using it to
 retreat from a break in codex's interactive path would take claude-pty's mirror away
 at the same time; `codex.mode: native` gives up only what broke.

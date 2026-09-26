@@ -557,7 +557,7 @@ class ClaudeBackend:
                 cli_output = retry_output
             else:
                 cli_output = agent._merge_cli_output(cli_output, retry_output)
-            body = (cli_output.get("result") or "").strip() or "No response"
+            body = (cli_output.get("result") or "").strip() or agent.EMPTY_REPLY_NOTICE
 
         tokens_in, tokens_out = self._extract_tokens(
             cli_output, workspace, session_uuid, usage_offset

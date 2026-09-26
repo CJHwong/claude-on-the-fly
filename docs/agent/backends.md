@@ -109,9 +109,14 @@ Everything is read from the rollout instead, by `parse_codex_rollout`:
 | thread id | `session_meta.session_id` |
 | the reply | `event_msg/task_complete.last_agent_message` |
 | turn finished | `event_msg/task_complete` present |
-| turn failed | `event_msg/turn_aborted.reason` |
+| turn failed | `event_msg/task_complete.error` or `event_msg/turn_aborted.reason` |
 | tool counts | `event_msg/item_completed.item.type` |
 | usage fallback | `event_msg/token_count.info.last_token_usage` |
+
+An `error` on `task_complete` is terminal even though the turn has a completion
+record. The backend raises it before the empty-reply nudge. Authentication
+rejections get a fixed, credential-free notice; the provider's raw text stays
+in the Codex rollout and never becomes the Slack reply.
 
 Usage and the context reading already came from the rollout before this, so the numbers
 in the footer did not move.

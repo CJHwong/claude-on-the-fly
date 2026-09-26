@@ -733,7 +733,7 @@ class TestProcess:
         sent = frontend.sent[0][1]
         # Not "Suggestions:" — the labels are dropped below, so naming them
         # would promise buttons that are not there.
-        assert sent.body == "No response"
+        assert sent.body == agent_mod.EMPTY_REPLY_NOTICE
         # A reply that is only buttons is a skipped reply: no body to pair
         # the buttons with, so they are dropped rather than shown blind.
         assert sent.suggestions == []
@@ -827,7 +827,38 @@ class TestProcess:
             await orch._process(1, Turn("bad prompt"))
 
         assert len(frontend.sent) == 1
-        assert "Error: boom" in frontend.sent[0][1].body
+        assert frontend.sent[0][1].body == agent_mod.AGENT_FAILURE_NOTICE
+
+    async def test_agent_failure_uses_only_its_safe_public_message(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        failure = agent_mod.AgentTurnError(
+            "private provider detail", "The model service rejected authentication."
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=failure)
+            await orch._process(1, Turn("bad prompt"))
+
+        assert frontend.sent[0][1].body == failure.public_message
+        assert "private provider detail" not in frontend.sent[0][1].body
+
+    async def test_terminal_capture_is_never_sent_as_an_error_reply(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        capture = "\x1b[31m" + "terminal screen " * 1000
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=RuntimeError(capture))
+            await orch._process(1, Turn("bad prompt"))
+
+        assert len(frontend.sent) == 1
+        assert frontend.sent[0][1].body == agent_mod.AGENT_FAILURE_NOTICE
+        assert "terminal screen" not in frontend.sent[0][1].body
 
     async def test_notifies_complete_on_success(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
@@ -1551,7 +1582,7 @@ class TestProcessInterim:
             (1, ["and then it broke"]),
         ]
         assert order == [2]
-        assert "Error: boom" in frontend.sent[0][1].body
+        assert frontend.sent[0][1].body == agent_mod.AGENT_FAILURE_NOTICE
         assert frontend.progress_ended == [(1, False)]
         assert event_log.tail(10)[-1]["type"] == "worker_failed"
 
@@ -2039,9 +2070,8 @@ class TestEgressStartupFailure:
 
         assert orch._in_flight == {}, "in-flight slot leaked"
         assert frontend.complete_notifications == [1], "frontend left thinking"
-        # Reported to the user rather than swallowed: a turn that produced nothing
-        # with no message is indistinguishable from the daemon being asleep.
-        assert "address in use" in frontend.sent[-1][1].body
+        # Reported without forwarding raw exception text to the chat.
+        assert frontend.sent[-1][1].body == agent_mod.AGENT_FAILURE_NOTICE
 
     async def test_the_drain_loop_survives_it(self, frontend: StubFrontend) -> None:
         """The queue must keep draining: one failed turn is not a reason to strand
@@ -3114,7 +3144,7 @@ class TestSuggestionsParsing:
     def test_block_only_reply_gets_placeholder_and_drops_labels(self, caplog):
         with caplog.at_level("WARNING", logger="claude_on_the_fly.orchestrator"):
             body, labels = _extract_suggestions('<suggestions>["x?"]</suggestions>')
-        assert body == "No response"
+        assert body == agent_mod.EMPTY_REPLY_NOTICE
         assert labels == []
         assert "reply body empty" in "\n".join(r.getMessage() for r in caplog.records)
 

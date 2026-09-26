@@ -34,9 +34,12 @@ from claude_on_the_fly import (
 )
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
+    AGENT_FAILURE_NOTICE,
     DATA_DIR,
+    EMPTY_REPLY_NOTICE,
     SUGGESTIONS_BLOCK_RE,
     WORKSPACE_MEMORY_DIRNAME,
+    AgentTurnError,
     ClaudeUnavailableError,
     Response,
     current_backend_key,
@@ -230,7 +233,7 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
         # the backends' own empty-reply fallback: naming the buttons here
         # would promise an affordance the line above just deleted.
         logger.warning("suggestions: reply body empty; dropping suggestion labels")
-        return "No response", []
+        return EMPTY_REPLY_NOTICE, []
     return cleaned, _parse_suggestion_block(matches[-1].group(1))
 
 
@@ -1182,9 +1185,14 @@ class Orchestrator:
             )
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)
+            public_message = (
+                exc.public_message
+                if isinstance(exc, AgentTurnError)
+                else AGENT_FAILURE_NOTICE
+            )
             await self._frontend.send(
                 chat_id,
-                Response(body=f"Error: {exc}"),
+                Response(body=public_message),
             )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
