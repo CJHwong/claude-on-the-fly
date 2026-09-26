@@ -86,11 +86,14 @@ def _assistant_text(text: str) -> dict:
     }
 
 
-def _task_complete(text: str = "") -> dict:
-    return {
+def _task_complete(text: str = "", error: object = None) -> dict:
+    record = {
         "type": "event_msg",
         "payload": {"type": "task_complete", "last_agent_message": text},
     }
+    if error is not None:
+        record["payload"]["error"] = error
+    return record
 
 
 def _token_count(**usage: int) -> dict:
@@ -186,6 +189,22 @@ class TestParseCodexRollout:
     def test_turn_aborted_sets_error(self):
         out = parse_codex_rollout([_session_meta("t1"), _turn_aborted("interrupted")])
         assert out["error"] == "interrupted"
+
+    def test_task_complete_error_is_a_failure_despite_completion(self):
+        out = parse_codex_rollout(
+            [_task_complete("partial", {"message": "401 Unauthorized"})]
+        )
+        assert out["completed"] is True
+        assert out["body"] == "partial"
+        assert out["error"] == "401 Unauthorized"
+
+    def test_task_complete_error_without_a_message_is_still_a_failure(self):
+        out = parse_codex_rollout([_task_complete(error={})])
+        assert out["error"] == "codex turn failed"
+
+    def test_task_complete_string_error_is_preserved(self):
+        out = parse_codex_rollout([_task_complete(error="model unavailable")])
+        assert out["error"] == "model unavailable"
 
     def test_turn_aborted_without_a_reason_still_reports_an_error(self):
         out = parse_codex_rollout(
@@ -665,6 +684,28 @@ class TestRunCodexExec:
         proc = _exec_proc(1, stderr=b"noisy teardown")
         with pytest.raises(RuntimeError, match="rate limited"):
             await _run_exec(proc, tmp_path, records=(_turn_aborted("rate limited"),))
+
+    async def test_authentication_failure_stops_before_nudge(self, tmp_path: Path):
+        proc = _exec_proc(0)
+        private_detail = "401 Unauthorized: rejected private credential"
+        with pytest.raises(codex_mod.agent.AgentTurnError) as raised:
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_task_complete(error={"message": private_detail}),),
+            )
+        assert "private credential" not in str(raised.value)
+        assert "authentication (401)" in raised.value.public_message
+
+    async def test_access_denial_has_a_safe_message(self, tmp_path: Path):
+        proc = _exec_proc(0)
+        with pytest.raises(codex_mod.agent.AgentTurnError) as raised:
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_task_complete(error={"message": "403 Forbidden"}),),
+            )
+        assert "access (403)" in raised.value.public_message
 
     async def test_clean_exit_returns_parsed(self, tmp_path: Path):
         proc = _exec_proc(0)
@@ -1614,6 +1655,24 @@ class TestCodexBackendNudgeRetry:
         assert mock.await_count == 1
         assert resp.body == "all good"
 
+    async def test_model_authentication_failure_is_not_nudged(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        failure = codex_mod.agent.AgentTurnError(
+            "Codex model authentication rejected (401)", "Authentication failed."
+        )
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                side_effect=failure,
+            ) as mock,
+            pytest.raises(codex_mod.agent.AgentTurnError),
+        ):
+            await CodexBackend().run(workspace, "sess-auth", "hi", "telegram")
+
+        assert mock.await_count == 1
+
     async def test_empty_first_with_no_thread_id_returns_no_response(
         self, tmp_path: Path
     ):
@@ -1630,7 +1689,7 @@ class TestCodexBackendNudgeRetry:
             resp = await CodexBackend().run(workspace, "sess-q", "hi", "telegram")
 
         assert mock.await_count == 1  # no retry attempted
-        assert resp.body == "No response"
+        assert resp.body == codex_mod.agent.EMPTY_REPLY_NOTICE
 
     async def test_whitespace_only_body_triggers_retry(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -1661,7 +1720,7 @@ class TestCodexBackendNudgeRetry:
         ):
             resp = await CodexBackend().run(workspace, "sess-v", "hi", "telegram")
 
-        assert resp.body == "No response"
+        assert resp.body == codex_mod.agent.EMPTY_REPLY_NOTICE
 
 
 # ---------------------------------------------------------------------------
@@ -3001,6 +3060,13 @@ class TestPaneArmEdges:
         self, tmp_path: Path
     ):
         assert codex_mod._pane_output_tail(tmp_path / "never-written") == ""
+
+    def test_terminal_diagnostic_is_plain_text_and_byte_bounded(self, tmp_path: Path):
+        capture = tmp_path / "pane.out"
+        capture.write_bytes(b"A" * 100_000 + b"B" * 20_000 + b"\x1b[31m" + b"C" * 1000)
+        detail = codex_mod._pane_output_tail(capture)
+        assert detail == "B" * 1000 + "C" * 1000
+        assert "\x1b" not in detail
 
     def test_an_env_that_cannot_be_staged_costs_the_env_not_the_pane(
         self, tmp_path: Path, caplog
