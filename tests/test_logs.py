@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
-from claude_on_the_fly import agent, logs
+from claude_on_the_fly import agent, logs, settings
 
 
 @pytest.fixture
@@ -16,7 +17,24 @@ def log_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point `logs.log_dir()` at a tmp tree and pin the host tag."""
     monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
     monkeypatch.setenv("COTF_HOST_TAG", "testbox")
+    # The variable is a legacy setting, so the first read in a process warns.
+    # Resetting the once-per-process memory makes every test here pay that
+    # warning, instead of whichever one xdist happens to run first.
+    monkeypatch.setattr(settings, "_LEGACY_WARNED", set())
     return tmp_path / "logs"
+
+
+class _Stderr(io.StringIO):
+    """A stand-in for `sys.stderr`. It has to be writable, not only a tty probe:
+    `configure` logs that warning through whatever handler is there, and with
+    none, logging's last-resort handler writes to `sys.stderr` directly."""
+
+    def __init__(self, *, tty: bool) -> None:
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
 
 
 @pytest.fixture
@@ -103,12 +121,7 @@ class TestConfigure:
         """The duplicate-write bug: `supervisor.spawn` redirects a daemon's
         stderr to a file, so a console handler wrote the whole log a second time
         into `<role>.stdout`."""
-
-        class _NotATty:
-            def isatty(self) -> bool:
-                return False
-
-        monkeypatch.setattr("sys.stderr", _NotATty())
+        monkeypatch.setattr("sys.stderr", _Stderr(tty=False))
         logs.configure("slack")
 
         streams = [
@@ -126,11 +139,7 @@ class TestConfigure:
     def test_console_handler_when_stderr_is_a_tty(
         self, log_root, restore_root_handlers, monkeypatch
     ):
-        class _Tty:
-            def isatty(self) -> bool:
-                return True
-
-        monkeypatch.setattr("sys.stderr", _Tty())
+        monkeypatch.setattr("sys.stderr", _Stderr(tty=True))
         logs.configure("slack")
 
         assert any(
@@ -142,11 +151,7 @@ class TestConfigure:
     def test_console_false_wins_over_a_tty(
         self, log_root, restore_root_handlers, monkeypatch
     ):
-        class _Tty:
-            def isatty(self) -> bool:
-                return True
-
-        monkeypatch.setattr("sys.stderr", _Tty())
+        monkeypatch.setattr("sys.stderr", _Stderr(tty=True))
         logs.configure("slack", console=False)
 
         assert not any(
