@@ -132,7 +132,7 @@ class TestCompactionFrom:
         path = tmp_path / "s.jsonl"
         _write_transcript(path, pre=48939, post=5162, ms=10842)
         outcome = claude_mod._compaction_from(_compact_stream(), path)
-        assert (outcome.ok, outcome.pre_tokens, outcome.post_tokens) == (
+        assert (outcome.ok, outcome.pre_tokens, outcome.conversation_tokens_after) == (
             True,
             48939,
             5162,
@@ -145,6 +145,23 @@ class TestCompactionFrom:
         )
         assert outcome.ok is False
         assert outcome.error == "Not enough messages to compact."
+
+    def test_a_boundary_without_a_post_count_reports_none(self, tmp_path):
+        """None, not 0: a zero would read as a conversation that vanished."""
+        path = tmp_path / "s.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "compactMetadata": {"preTokens": 900},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        outcome = claude_mod._compaction_from(_compact_stream(), path)
+        assert (outcome.pre_tokens, outcome.conversation_tokens_after) == (900, None)
 
     def test_absent_status_events_read_as_failure_not_success(self):
         """A claude build that stops emitting them must not be reported as a
@@ -398,13 +415,12 @@ class TestNativeContextFields:
         )
         assert out["context_window_size"] == 1000000
 
-    def test_no_window_means_no_reading_rather_than_zero(self):
-        assert (
-            claude_mod._native_context_fields(
-                {"last_assistant_usage": {"input_tokens": 100}}
-            )
-            == {}
-        )
+    def test_no_window_still_reports_the_tokens(self):
+        """The idle compaction thresholds on the count alone. Everything that
+        needs a percentage checks for the window itself."""
+        assert claude_mod._native_context_fields(
+            {"last_assistant_usage": {"input_tokens": 100}}
+        ) == {"context_tokens": 100}
 
     def test_no_usage_means_no_reading(self):
         assert (
@@ -606,12 +622,14 @@ class TestOllamaContextWindow:
         assert response.context_tokens == 38_502
         assert response.context_window_size == 200000
 
-    async def test_ollama_reports_none(self, tmp_path, monkeypatch):
+    async def test_ollama_reports_the_tokens_but_no_window(self, tmp_path, monkeypatch):
+        """The count is the routed model's own; only the window is claude's
+        guess. Without the count the idle compaction never sees the chat."""
         backend = claude_mod.ClaudeBackend(
             launcher=claude_mod.OllamaLauncher("glm-5.2:cloud")
         )
         response = await self._run(backend, tmp_path, monkeypatch)
-        assert response.context_tokens is None
+        assert response.context_tokens == 38_502
         assert response.context_window_size is None, (
             "a made-up denominator is worse than none"
         )

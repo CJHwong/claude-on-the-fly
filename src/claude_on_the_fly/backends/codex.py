@@ -27,6 +27,7 @@ from claude_on_the_fly import (
     transcript,
 )
 from claude_on_the_fly.agent import (
+    COMPACT_TIMEOUT,
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
     Compaction,
@@ -44,9 +45,17 @@ logger = logging.getLogger(__name__)
 # this is small enough to always trip and non-zero to stay a plausible limit.
 COMPACT_TOKEN_LIMIT = 2000
 # Codex compaction is checked *before* a turn, so it needs one to hang off — it
-# cannot be a standalone operation the way claude's `/compact` is. Keep the reply
-# tiny: it lands in the conversation the compaction just summarized.
-COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
+# cannot be a standalone operation the way claude's `/compact` is. `compact`
+# stops codex before the model reads this, so it is only a backstop: if it does
+# reach the model, it asks for nothing. An earlier "Reply with the single word:
+# compacted" did reach one, and the model took it as the task — it replied
+# "compacted" to the user's next question, and one model made tool calls that
+# compacted the thread again in a loop.
+COMPACT_TRIGGER_PROMPT = "Automatic context checkpoint. No action is needed."
+# How often `compact` reads the rollout for the compacted history. The trigger's
+# user message follows the `turn_context` record by about 0.3s, and the model
+# request follows that, so a slow poll lets the model start.
+COMPACT_POLL_S = 0.1
 
 # How long to let codex exit on its own after it has gone quiet on a finished
 # turn, before killing it.
@@ -1184,6 +1193,32 @@ async def _run_codex_exec(
     return parsed
 
 
+class _CompactionWatch:
+    """Reads the records a compaction run appends to a rollout.
+
+    Reading from the pre-run size, not by timestamp, keeps an older compaction
+    in a long thread from counting as this one.
+    """
+
+    def __init__(self, path: Path, offset: int) -> None:
+        self.path = path
+        self.offset = offset
+        self.compacted = False
+        self.settled = False
+
+    def poll(self) -> None:
+        records, self.offset = read_rollout(self.path, self.offset)
+        for record in records:
+            kind = record.get("type")
+            if kind == "compacted":
+                self.compacted = True
+            elif kind == "turn_context":
+                # The turn's `turn_context` comes before its model request, and
+                # a compaction before the turn comes ahead of it. So whether or
+                # not codex compacted, nothing more is coming that matters.
+                self.settled = True
+
+
 def _codex_prompts_dir() -> Path:
     """Codex custom-prompt dir: `$CODEX_HOME/prompts` (defaults to ~/.codex)."""
     home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
@@ -1682,8 +1717,20 @@ class CodexBackend:
         only, leaving the user's `~/.codex/config.toml` alone. Same thread, that
         took 46,357 → 18,507 and it survived later plain resumes.
 
-        The cost is that codex compaction needs a turn to hang off, so it spends
-        one cheap exchange where claude spends none.
+        That check runs before a turn, so it needs a prompt, and the model then
+        answers the prompt. So the run is stopped at the first `turn_context`
+        it writes: past that point any compacted history is on disk and the
+        model has not been called yet. It stops there even with no `compacted`
+        record, because a run that skipped the compaction (the provider ignored
+        the lowered limit, or the compaction failed) would otherwise send the
+        trigger to the model and run a turn in the chat's session. The
+        `compacted` record is the evidence of success. A token drop is not, and
+        an earlier build that judged by it failed real compactions, because codex
+        re-sends its developer instructions after compacting.
+
+        The size after compaction is unknown: codex writes no count for it, and
+        no request runs on the compacted context before codex is stopped. So
+        the result carries `pre_tokens` only.
         """
         thread_id = self._thread_id(workspace, session_uuid)
         if thread_id is None:
@@ -1692,8 +1739,13 @@ class CodexBackend:
                 ok=False,
                 error="this thread has no session yet, so there is nothing to compact",
             )
+        rollout = transcript._find_codex_rollout(thread_id)
+        if rollout is None:
+            return Compaction(ok=False, error="couldn't find the thread's rollout")
 
         before = transcript.extract_codex_prompt_tokens(thread_id)
+        pre_tokens = before[0] if before is not None else 0
+        watch = _CompactionWatch(rollout, rollout_size(rollout))
         argv = [
             *self._base_argv(workspace),
             "-c",
@@ -1702,26 +1754,35 @@ class CodexBackend:
             thread_id,
             COMPACT_TRIGGER_PROMPT,
         ]
-        logger.info("compact: codex thread=%s", thread_id)
-        await _run_codex_exec(workspace, argv, timeout=timeout, thread_id=thread_id)
-        after = transcript.extract_codex_prompt_tokens(thread_id)
-
-        if before is None or after is None:
-            return Compaction(ok=False, error="couldn't read the thread's token usage")
-        pre_tokens, _ = before
-        post_tokens, _ = after
-        if post_tokens >= pre_tokens:
-            # No in-band signal exists, so the token count is the only evidence.
-            # A context that didn't shrink means the threshold found nothing worth
-            # summarizing — reporting success off the trigger alone would be the
-            # same lie `/compact` tells.
-            logger.info(
-                "compact: codex context did not shrink (%s → %s)",
-                pre_tokens,
-                post_tokens,
-            )
-            return Compaction(ok=False, error="nothing to compact")
-        return Compaction(ok=True, pre_tokens=pre_tokens, post_tokens=post_tokens)
+        deadline = timeout if timeout is not None else COMPACT_TIMEOUT
+        logger.info("compact: codex thread=%s timeout=%s", thread_id, deadline)
+        run = asyncio.create_task(
+            _run_codex_exec(workspace, argv, timeout=deadline, thread_id=thread_id)
+        )
+        try:
+            while not run.done():
+                await asyncio.wait({run}, timeout=COMPACT_POLL_S)
+                watch.poll()
+                if watch.settled:
+                    logger.info("compact: turn context written, stopping codex")
+                    break
+        finally:
+            # Cancelling the run is what kills codex: `_run_codex_plain` reaps
+            # the process group in its `finally`.
+            run.cancel()
+            (result,) = await asyncio.gather(run, return_exceptions=True)
+        watch.poll()
+        if watch.compacted:
+            return Compaction(ok=True, pre_tokens=pre_tokens)
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            # Its text is codex's stderr. `_process` owns failures: it logs the
+            # traceback, records the turn as failed and posts the public text.
+            raise result
+        error = "codex did not compact the thread"
+        logger.info("compact: codex thread=%s failed: %s", thread_id, error)
+        return Compaction(ok=False, pre_tokens=pre_tokens, error=error)
 
     def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
         """`codex resume <thread_id>` when a thread mapping exists for this uuid."""

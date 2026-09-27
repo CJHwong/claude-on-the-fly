@@ -114,18 +114,15 @@ class TestDataDirFrom:
 
 
 class TestCompaction:
-    def test_saved_tokens_is_the_difference(self):
-        c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162)
-        assert c.saved_tokens == 48939 - 5162
-
-    def test_saved_tokens_never_goes_negative(self):
-        """A compaction that grew the conversation is nonsense, not a credit."""
-        assert Compaction(ok=True, pre_tokens=100, post_tokens=500).saved_tokens == 0
-
-    def test_summary_reports_both_sides_and_the_wait(self):
-        c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162, duration=10.8)
+    def test_summary_names_the_conversation_part_and_the_wait(self):
+        """The two numbers count different things, so the line never puts an
+        arrow between them."""
+        c = Compaction(
+            ok=True, pre_tokens=48939, conversation_tokens_after=5162, duration=10.8
+        )
         assert c.summary() == (
-            "Compacted the conversation: 48,939 → 5,162 tokens in 11s."
+            "Compacted the conversation in 11s (it was 48,939 tokens). "
+            "The conversation part is now 5,162 tokens."
         )
 
     def test_summary_without_numbers_still_says_it_happened(self):
@@ -4069,18 +4066,24 @@ class TestOutboxSurvivesAFilesystemThatSaysNo:
     ("compaction", "expected"),
     [
         (
-            Compaction(ok=True, pre_tokens=0, post_tokens=0),
+            Compaction(ok=True, pre_tokens=0),
             "Compacted the conversation.",
         ),
         (
-            # codex publishes no duration, and "in 0s" reads as a suspiciously
-            # fast compaction rather than as a missing figure.
-            Compaction(ok=True, pre_tokens=120_000, post_tokens=8_000),
-            "Compacted the conversation: 120,000 → 8,000 tokens.",
+            # codex: no size after, and no duration, since "in 0s" reads as a
+            # suspiciously fast compaction rather than as a missing figure.
+            Compaction(ok=True, pre_tokens=120_000),
+            "Compacted the conversation (it was 120,000 tokens).",
         ),
         (
-            Compaction(ok=True, pre_tokens=120_000, post_tokens=8_000, duration=42.4),
-            "Compacted the conversation: 120,000 → 8,000 tokens in 42s.",
+            Compaction(
+                ok=True,
+                pre_tokens=120_000,
+                conversation_tokens_after=8_000,
+                duration=42.4,
+            ),
+            "Compacted the conversation in 42s (it was 120,000 tokens). "
+            "The conversation part is now 8,000 tokens.",
         ),
     ],
 )
@@ -4178,7 +4181,7 @@ async def test_compact_returns_none_when_the_backend_cannot_do_it(
 
 
 async def test_compact_delegates_when_the_backend_supports_it(monkeypatch, tmp_path):
-    expected = Compaction(ok=True, pre_tokens=10, post_tokens=1)
+    expected = Compaction(ok=True, pre_tokens=10)
     backend = MagicMock()
     backend.compact = AsyncMock(return_value=expected)
     monkeypatch.setattr(agent_mod, "get_backend", lambda _profile=None: backend)

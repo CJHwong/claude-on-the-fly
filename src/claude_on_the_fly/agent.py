@@ -715,22 +715,20 @@ def build_system_prompt(
 class Compaction:
     """Outcome of a compaction turn.
 
-    `pre_tokens`/`post_tokens` come from the transcript's `compact_boundary`
-    record, which counts the *conversation* — not the billed prompt. The prompt
-    also carries the system prompt and tool schemas, tens of thousands of tokens
-    that compaction cannot touch, so `saved_tokens` is the ceiling on what a
-    later turn actually stops paying for, never the whole prompt.
+    `pre_tokens` is the whole prompt before the compaction: system prompt, tool
+    schemas and conversation. Nothing measures the whole prompt after it, so
+    there is no `post_tokens` beside it. claude reports one smaller number,
+    `conversation_tokens_after`, which counts the summarized conversation only
+    and leaves out the system prompt and tools. Measured on one thread: 55,161
+    before, 6,050 conversation after, and the next request was 50,171. Putting
+    the two side by side would claim a drop that the next turn does not pay.
     """
 
     ok: bool
     pre_tokens: int = 0
-    post_tokens: int = 0
+    conversation_tokens_after: int | None = None
     duration: float = 0
     error: str = ""
-
-    @property
-    def saved_tokens(self) -> int:
-        return max(0, self.pre_tokens - self.post_tokens)
 
     def summary(self) -> str:
         """One line for the user. Frontend-agnostic: no mrkdwn, no emoji."""
@@ -742,15 +740,21 @@ class Compaction:
                 if self.error
                 else "Nothing to compact."
             )
-        if not self.pre_tokens:
-            return "Compacted the conversation."
-        counts = f"{self.pre_tokens:,} → {self.post_tokens:,} tokens"
+        text = "Compacted the conversation"
         # Only claude records how long it took; codex publishes no compaction
         # duration, and "in 0s" reads as a suspiciously fast compaction rather
-        # than as a missing figure.
-        if not self.duration:
-            return f"Compacted the conversation: {counts}."
-        return f"Compacted the conversation: {counts} in {self.duration:.0f}s."
+        # than as a missing figure. The time sits by the verb it measures.
+        if self.duration:
+            text += f" in {self.duration:.0f}s"
+        if self.pre_tokens:
+            text += f" (it was {self.pre_tokens:,} tokens)"
+        text += "."
+        if self.conversation_tokens_after is not None:
+            text += (
+                f" The conversation part is now "
+                f"{self.conversation_tokens_after:,} tokens."
+            )
+        return text
 
 
 @dataclass
@@ -960,6 +964,14 @@ def parse_stream(stdout: bytes) -> dict:
 
 
 DEFAULT_TIMEOUT = 3600.0
+# Cap for a compaction when the caller sets none, on every backend. The chat
+# frontends all leave `timeout_for` at its default of None, which the executors
+# read as "wait with no deadline" — fine for a turn a human is watching, wrong
+# for this: a compaction is a single summarization pass (measured at 8-22s,
+# minutes on a very large thread), and the drain loop is serial per chat, so an
+# unbounded one wedges every message queued behind it. The idle loop runs one
+# with nobody watching at all.
+COMPACT_TIMEOUT = 900.0
 MAX_AGENT_OUTPUT_BYTES = 8 * 1024 * 1024
 
 
@@ -1668,6 +1680,7 @@ class AgentProfile:
     model: str
     effort: str
     ollama_context_window: int | None = None
+    ollama_cache_ttl_s: int | None = None
 
     @property
     def key(self) -> str:
@@ -1832,6 +1845,14 @@ def resolve_profile(name: str | None = None) -> AgentProfile:
                 settings.get("OLLAMA_CONTEXT_WINDOW"),
             )
         ),
+        ollama_cache_ttl_s=_ollama_cache_ttl_s(
+            _overlay_str(
+                ollama,
+                "cache_ttl_min",
+                f"{where}.ollama",
+                settings.get("OLLAMA_CACHE_TTL_MIN"),
+            )
+        ),
     )
 
 
@@ -1937,6 +1958,27 @@ def _ollama_context_window(raw: str) -> int | None:
         )
         return None
     return window
+
+
+def _ollama_cache_ttl_s(raw: str) -> int | None:
+    """Parse the operator-declared cache lifetime for ollama mode, in seconds.
+
+    Ollama's cloud cache is implicit and documents no lifetime, so the engine
+    cannot know one; unset leaves ollama chats out of idle compaction, as they
+    were before this setting existed. A junk value does the same and is logged.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        minutes = int(raw)
+    except ValueError:
+        logger.warning("OLLAMA_CACHE_TTL_MIN=%r is not a number, ignoring it", raw)
+        return None
+    if minutes <= 0:
+        logger.warning("OLLAMA_CACHE_TTL_MIN=%d is not positive, ignoring it", minutes)
+        return None
+    return minutes * 60
 
 
 def _build_claude_backend(profile: AgentProfile) -> AgentBackend:

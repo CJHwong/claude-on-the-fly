@@ -20,6 +20,7 @@ from claude_on_the_fly import (
     transcript,
 )
 from claude_on_the_fly.agent import (
+    COMPACT_TIMEOUT,
     DEFAULT_TIMEOUT,
     Compaction,
     OllamaLauncher,
@@ -43,13 +44,6 @@ PTY_INSTALL_HINT = (
 # claude's own slash command, sent as the prompt. Runs the real compaction and
 # writes a `compact_boundary` into the session transcript.
 COMPACT_PROMPT = "/compact"
-# Cap for a compaction when the caller sets none. The chat frontends all leave
-# `timeout_for` at its default of None, which the executors read as "wait with no
-# deadline" — fine for a turn a human is watching, wrong for this: a compaction
-# is a single summarization pass (measured at 8-22s, minutes on a very large
-# thread), and the drain loop is serial per chat, so an unbounded one wedges
-# every message queued behind it.
-COMPACT_TIMEOUT = 900.0
 # `--effort` choices, from `claude --help`. Whichever key the resolver read it
 # from -- the shared `agent.ollama.effort` or this backend's own
 # `agent.claude.effort` -- it is validated against this before reaching the CLI,
@@ -111,8 +105,10 @@ def _native_context_fields(
     `modelUsage` lists every model a turn touched, sub-agents included. Pair
     the prompt with the widest window listed: a sub-agent's smaller one would
     overstate how full the context is, and for a feature that spends money to
-    act, over-reading is the costly direction. Empty dict when either number is
-    missing, which reads downstream as "no reading" rather than as zero.
+    act, over-reading is the costly direction. The window is left out when it is
+    unknown, and everything that needs a percentage checks for it. The count
+    alone is still a reading: the idle compaction thresholds on it. Empty dict
+    when there is no count, which reads downstream as "no reading", not zero.
 
     `window_override` replaces that lookup with a number the operator declared.
     Ollama mode needs it: the CLI still prints a `contextWindow`, but it comes
@@ -134,8 +130,10 @@ def _native_context_fields(
             for entry in (cli_output.get("modelUsage") or {}).values()
             if isinstance(entry, dict) and entry.get("contextWindow")
         ]
-    if not tokens or not windows:
+    if not tokens:
         return {}
+    if not windows:
+        return {"context_tokens": tokens}
     return {"context_tokens": tokens, "context_window_size": max(windows)}
 
 
@@ -172,7 +170,11 @@ def _compaction_from(cli_output: dict, session_path: Path | None) -> Compaction:
     return Compaction(
         ok=True,
         pre_tokens=int(meta.get("preTokens", 0)),
-        post_tokens=int(meta.get("postTokens", 0)),
+        # The conversation only: see `Compaction` for why it is not a
+        # whole-prompt "after".
+        conversation_tokens_after=(
+            int(meta["postTokens"]) if "postTokens" in meta else None
+        ),
         duration=int(meta.get("durationMs", 0)) / 1000,
     )
 
@@ -608,7 +610,7 @@ class ClaudeBackend:
 
         statusline = cli_output.get("statusline") or {}
         extra = _statusline_response_fields(statusline)
-        if not self.pty and (self.launcher is None or self.ollama_context_window):
+        if not self.pty:
             # pty already has these from the statusline, and its top-level
             # `usage` is the last assistant message only (see `_extract_tokens`),
             # so deriving them there would understate a multi-turn prompt.
@@ -620,17 +622,19 @@ class ClaudeBackend:
             # registry; a window has none the engine can derive — so the engine
             # does not invent one. `agent.ollama.context_window` lets the
             # operator state it instead, and a stated window is not a guess.
-            # Left unset, nothing is reported: the footer omits `ctx` and the
-            # auto-compact gate stays off rather than thresholding against a
-            # made-up denominator, since over-reading is the direction that
-            # spends money. `$compact` is unaffected either way: it is asked
-            # for, and the CLI does the real work.
-            extra.update(
-                _native_context_fields(
-                    cli_output,
-                    self.ollama_context_window if self.launcher is not None else None,
-                )
+            # Left unset, only the token count is reported: it is the routed
+            # model's own. The footer omits `ctx` and the auto-compact gate stays
+            # off rather than thresholding against a made-up denominator, since
+            # over-reading is the direction that spends money. The idle
+            # compaction needs the count alone. `$compact` is unaffected either
+            # way: it is asked for, and the CLI does the real work.
+            fields = _native_context_fields(
+                cli_output,
+                self.ollama_context_window if self.launcher is not None else None,
             )
+            if self.launcher is not None and not self.ollama_context_window:
+                fields.pop("context_window_size", None)
+            extra.update(fields)
 
         return Response(
             body=body,
@@ -774,11 +778,11 @@ class ClaudeBackend:
         cli_output = await executor(workspace, argv, timeout=deadline)
         result = _compaction_from(cli_output, session_path)
         logger.info(
-            "compact: session=%s ok=%s %s→%s tokens",
+            "compact: session=%s ok=%s before=%s conversation_after=%s tokens",
             session_uuid,
             result.ok,
             result.pre_tokens,
-            result.post_tokens,
+            result.conversation_tokens_after,
         )
         return result
 

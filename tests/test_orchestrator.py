@@ -1254,6 +1254,26 @@ class TestShutdown:
         # A finished drain task is not interrupted work; an unstarted queue is.
         assert orch.interrupted_chats() == {4: (False, 1)}
 
+    async def test_a_running_idle_compaction_is_not_interrupted_work(
+        self, orch: Orchestrator
+    ) -> None:
+        """Nobody asked for it and nothing replays it, so a stop must not post
+        "work interrupted" into the quiet chat. A message queued behind it
+        still counts."""
+        gate: asyncio.Future = asyncio.get_event_loop().create_future()
+        running = asyncio.ensure_future(_hang(gate))
+        orch._running[5] = running
+        orch._background.add(5)
+        orch._running[6] = running
+        orch._background.add(6)
+        orch._queues[6] = asyncio.Queue()
+        orch._queues[6].put_nowait(Turn("a"))
+        try:
+            assert orch.interrupted_chats() == {6: (False, 1)}
+        finally:
+            gate.set_result(None)
+            await running
+
 
 # ---------------------------------------------------------------------------
 # Event log emission (cross-frontend audit trail)
@@ -1845,7 +1865,9 @@ class TestRunCompaction:
     async def test_reports_the_numbers_to_the_user(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
-        outcome = Compaction(ok=True, pre_tokens=48939, post_tokens=5162, duration=10.8)
+        outcome = Compaction(
+            ok=True, pre_tokens=48939, conversation_tokens_after=5162, duration=10.8
+        )
         with (
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
@@ -1973,6 +1995,476 @@ class TestContextIsForgottenOnSessionChange:
         orch.reset_session(7)
 
         assert orch._context.get(8) == (650_000, 1_000_000)
+
+    def test_a_session_change_drops_the_idle_reading_too(
+        self, orch: Orchestrator
+    ) -> None:
+        """The idle loop would otherwise compact a session with nothing in it."""
+        orch._idle[7] = orchestrator_mod.IdleReading(0.0, 300_000, 1800)
+
+        orch.set_session_token(7, "fresh")
+
+        assert 7 not in orch._idle
+
+
+# ---------------------------------------------------------------------------
+# Idle compaction
+# ---------------------------------------------------------------------------
+
+
+def _events(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _profile(backend: str = "claude", mode: str = "native") -> agent_mod.AgentProfile:
+    return agent_mod.AgentProfile(backend=backend, mode=mode, model="m", effort="")
+
+
+class TestIdleCompactSettings:
+    def test_off_unless_the_toggle_is_on(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT", raising=False)
+        assert orchestrator_mod._idle_compact_enabled() is False
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "maybe")
+        assert orchestrator_mod._idle_compact_enabled() is False
+        monkeypatch.setenv("COTF_IDLE_COMPACT", " On ")
+        assert orchestrator_mod._idle_compact_enabled() is True
+
+    def test_the_threshold_defaults_to_200k(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT_TOKENS", raising=False)
+        assert orchestrator_mod._idle_compact_tokens() == 200_000
+        monkeypatch.setenv("COTF_IDLE_COMPACT_TOKENS", "150000")
+        assert orchestrator_mod._idle_compact_tokens() == 150_000
+
+    def test_the_lead_defaults_to_five_minutes(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT_LEAD_MIN", raising=False)
+        assert orchestrator_mod._idle_compact_lead_min() == 5
+        monkeypatch.setenv("COTF_IDLE_COMPACT_LEAD_MIN", "10")
+        assert orchestrator_mod._idle_compact_lead_min() == 10
+
+    @pytest.mark.parametrize("raw", ["lots", "0", "-5"])
+    def test_a_bad_tuning_value_keeps_the_default_rather_than_switching_off(
+        self, monkeypatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT_TOKENS", raw)
+        assert orchestrator_mod._idle_compact_tokens() == 200_000
+
+    def test_all_three_read_from_config(self, operator_settings) -> None:
+        operator_settings.write_text(
+            "agent:\n  idle_compact: true\n  idle_compact_tokens: 300000\n"
+            "  idle_compact_lead_min: 3\n"
+        )
+        assert orchestrator_mod._idle_compact_enabled() is True
+        assert orchestrator_mod._idle_compact_tokens() == 300_000
+        assert orchestrator_mod._idle_compact_lead_min() == 3
+
+
+class TestCacheTtl:
+    def test_codex_caches_for_thirty_minutes(self) -> None:
+        assert orchestrator_mod._cache_ttl_s(_profile("codex"), {}) == 1800
+
+    def test_claude_defaults_to_five_minutes(self) -> None:
+        assert orchestrator_mod._cache_ttl_s(_profile(), {}) == 300
+
+    def test_claude_takes_the_one_hour_setting_from_the_agent_env(self) -> None:
+        env = {"CLAUDE_CODE_PROMPT_CACHE_TTL": " 1H "}
+        assert orchestrator_mod._cache_ttl_s(_profile(), env) == 3600
+
+    def test_ollama_has_no_window_unless_declared(self) -> None:
+        env = {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+        assert orchestrator_mod._cache_ttl_s(_profile(mode="ollama"), env) is None
+        assert orchestrator_mod._cache_ttl_s(_profile("codex", "ollama"), {}) is None
+
+    def test_ollama_uses_the_declared_lifetime(self) -> None:
+        env = {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+        declared = agent_mod.AgentProfile(
+            backend="codex", mode="ollama", model="m", effort="", ollama_cache_ttl_s=600
+        )
+        assert orchestrator_mod._cache_ttl_s(declared, env) == 600
+
+
+class TestCacheTtlEnv:
+    def test_off_adds_nothing(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT", raising=False)
+        assert orchestrator_mod._cache_ttl_env(_profile()) == {}
+
+    def test_on_gives_claude_the_one_hour_cache(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        monkeypatch.delenv("CLAUDE_CODE_PROMPT_CACHE_TTL", raising=False)
+        env = orchestrator_mod._cache_ttl_env(_profile())
+        assert env == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+        assert orchestrator_mod._cache_ttl_s(_profile(), env) == 3600
+
+    def test_an_operator_value_wins(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        monkeypatch.setenv("CLAUDE_CODE_PROMPT_CACHE_TTL", "5m")
+        env = orchestrator_mod._cache_ttl_env(_profile())
+        assert env == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "5m"}
+
+    def test_codex_and_ollama_are_left_alone(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        assert orchestrator_mod._cache_ttl_env(_profile("codex")) == {}
+        assert orchestrator_mod._cache_ttl_env(_profile(mode="ollama")) == {}
+
+
+class TestIdleReadingIsRecorded:
+    async def _run_turn(
+        self, orch: Orchestrator, tmp_path: Path, response: Response, turn: Turn
+    ) -> None:
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            patch.object(orch, "current_profile", return_value=_profile("codex")),
+        ):
+            mock_agent.run = AsyncMock(return_value=response)
+            mock_agent.compact = AsyncMock(return_value=Compaction(ok=True))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, turn)
+
+    async def test_a_turn_with_a_reading_records_it(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        response = Response(body="hi", context_tokens=250_000, context_window_size=1)
+        before = time.monotonic()
+        await self._run_turn(orch, tmp_path, response, Turn("hi"))
+
+        reading = orch._idle[1]
+        assert reading.context_tokens == 250_000
+        assert reading.cache_ttl_s == 1800
+        assert reading.ended_at >= before
+
+    async def test_a_turn_without_a_reading_leaves_none(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        """A stale reading would outlive the turn that made the cache warm again."""
+        orch._idle[1] = orchestrator_mod.IdleReading(0.0, 300_000, 1800)
+        await self._run_turn(orch, tmp_path, Response(body="hi"), Turn("hi"))
+
+        assert 1 not in orch._idle
+
+    async def test_an_ollama_turn_records_nothing(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        response = Response(body="hi", context_tokens=250_000, context_window_size=1)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            patch.object(orch, "current_profile", return_value=_profile(mode="ollama")),
+        ):
+            mock_agent.run = AsyncMock(return_value=response)
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("hi"))
+
+        assert 1 not in orch._idle
+
+    async def test_a_compaction_consumes_it(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        orch._idle[1] = orchestrator_mod.IdleReading(0.0, 300_000, 1800)
+        response = Response(
+            body="unused", context_tokens=250_000, context_window_size=1
+        )
+        await self._run_turn(orch, tmp_path, response, Turn("", compact=True))
+
+        assert 1 not in orch._idle
+
+
+class TestCompactIdleChats:
+    NOW = 10_000.0
+
+    @pytest.fixture(autouse=True)
+    def enabled(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        monkeypatch.delenv("COTF_IDLE_COMPACT_TOKENS", raising=False)
+        monkeypatch.delenv("COTF_IDLE_COMPACT_LEAD_MIN", raising=False)
+
+    @pytest.fixture
+    def queued(self, orch: Orchestrator) -> list[tuple[int, Turn]]:
+        seen: list[tuple[int, Turn]] = []
+
+        async def capture(chat_id: int, turn: Turn) -> None:
+            seen.append((chat_id, turn))
+
+        orch._enqueue = capture  # type: ignore[method-assign]
+        return seen
+
+    def _idle(
+        self, orch: Orchestrator, chat_id: int, idle_s: float, tokens=250_000, ttl=1800
+    ) -> None:
+        orch._idle[chat_id] = orchestrator_mod.IdleReading(
+            self.NOW - idle_s, tokens, ttl
+        )
+
+    async def test_queues_a_silent_compaction_inside_the_window(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == [(1, Turn("", compact=True, background=True))]
+        assert 1 not in orch._idle
+        assert orch._background == {1}
+
+    async def test_queueing_drops_the_context_reading_too(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """A message landing before the pass pops `_context` itself would read
+        the pre-compaction size and queue a second, visible compaction."""
+        self._idle(orch, 1, idle_s=26 * 60)
+        orch._context[1] = (250_000, 1_000_000)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert 1 not in orch._context
+
+    async def test_does_nothing_while_the_toggle_is_off(
+        self, orch: Orchestrator, queued, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "0")
+        self._idle(orch, 1, idle_s=26 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 in orch._idle
+
+    async def test_waits_until_the_window_opens(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """Too early would compact a conversation somebody is still in."""
+        self._idle(orch, 1, idle_s=20 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 in orch._idle
+
+    async def test_drops_a_reading_whose_cache_already_expired(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=31 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 not in orch._idle
+
+    async def test_leaves_a_small_context_alone(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60, tokens=199_999)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 in orch._idle
+
+    async def test_the_five_minute_claude_cache_has_no_window(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """A lead as long as the cache would compact straight after every turn."""
+        self._idle(orch, 1, idle_s=60, ttl=300)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+
+    async def test_skips_a_chat_with_work_queued(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+        orch._queues[1] = asyncio.Queue()
+        orch._queues[1].put_nowait(Turn("hi"))
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+
+    async def test_skips_a_busy_chat(self, orch: Orchestrator, queued) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+        orch._running[1] = asyncio.create_task(asyncio.sleep(3600))
+        try:
+            await orch.compact_idle_chats(now=self.NOW)
+        finally:
+            orch._running[1].cancel()
+
+        assert queued == []
+
+    async def test_caps_the_run_and_takes_the_nearest_expiry_first(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+        self._idle(orch, 2, idle_s=29 * 60)
+        self._idle(orch, 3, idle_s=28 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert [chat for chat, _turn in queued] == [2, 3]
+        assert 1 in orch._idle
+
+    async def test_a_dropped_compaction_does_not_hold_the_cap(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """`abort` can drop a queued compaction before `_process` discards it."""
+        orch._background = {8, 9}
+        self._idle(orch, 1, idle_s=26 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert [chat for chat, _turn in queued] == [1]
+
+    async def test_reads_the_clock_when_not_given_one(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        orch._idle[1] = orchestrator_mod.IdleReading(
+            time.monotonic() - 26 * 60, 250_000, 1800
+        )
+
+        await orch.compact_idle_chats()
+
+        assert [chat for chat, _turn in queued] == [1]
+
+
+class TestBackgroundCompaction:
+    async def _process(
+        self, orch: Orchestrator, tmp_path: Path, compact: AsyncMock
+    ) -> None:
+        orch._background.add(1)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = compact
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True, background=True))
+
+    async def test_says_nothing_and_records_the_outcome(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+    ) -> None:
+        outcome = Compaction(
+            ok=True, pre_tokens=250_000, conversation_tokens_after=30_000
+        )
+        with patch.object(orch, "_report_config_restarts") as report:
+            await self._process(orch, tmp_path, AsyncMock(return_value=outcome))
+
+        report.assert_not_called()
+        assert frontend.sent == []
+        assert frontend.start_notifications == []
+        assert frontend.complete_notifications == []
+        assert frontend.typing_sent == []
+        assert orch._background == set()
+        [event] = [
+            e for e in _events(event_log.path) if e["type"] == "session_compacted"
+        ]
+        assert event["source"] == "test"
+        assert event["identifier"] == "test/1"
+        assert event["tokens_before"] == 250_000
+        assert event["conversation_tokens_after"] == 30_000
+        # Nothing measures the whole prompt after, so the field stays absent.
+        assert "tokens_after" not in event
+        assert event["outcome"] == "compacted"
+        assert event["duration_s"] >= 0
+        assert "backend" in event
+
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [(Compaction(ok=False, error="nope"), "failed"), (None, "unsupported")],
+    )
+    async def test_names_a_compaction_that_did_not_happen(
+        self,
+        orch: Orchestrator,
+        event_log: EventLog,
+        tmp_path: Path,
+        outcome,
+        expected: str,
+    ) -> None:
+        await self._process(orch, tmp_path, AsyncMock(return_value=outcome))
+
+        [event] = [
+            e for e in _events(event_log.path) if e["type"] == "session_compacted"
+        ]
+        assert event["outcome"] == expected
+
+    async def test_an_unsupported_compaction_carries_no_counts(
+        self, orch: Orchestrator, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        await self._process(orch, tmp_path, AsyncMock(return_value=None))
+
+        [event] = [
+            e for e in _events(event_log.path) if e["type"] == "session_compacted"
+        ]
+        # The log leaves a None out, so absent reads the same as "no count".
+        assert "tokens_before" not in event
+        assert "conversation_tokens_after" not in event
+
+    @pytest.mark.parametrize(
+        "error", [ClaudeUnavailableError("down"), RuntimeError("boom")]
+    )
+    async def test_a_failure_is_logged_not_posted(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+        error: Exception,
+    ) -> None:
+        await self._process(orch, tmp_path, AsyncMock(side_effect=error))
+
+        assert frontend.sent == []
+        assert frontend.complete_notifications == []
+        assert [e["type"] for e in _events(event_log.path)][-1] == "worker_failed"
+        assert orch._background == set()
+
+    async def test_a_message_arriving_meanwhile_waits_behind_it(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        """The hourglass is the only thing the person sees of the compaction."""
+        release = asyncio.Event()
+
+        async def slow_compact(*_args, **_kwargs) -> Compaction:
+            await release.wait()
+            return Compaction(ok=True, pre_tokens=250_000)
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = slow_compact
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._enqueue(1, Turn("", compact=True, background=True))
+            await asyncio.sleep(0)
+            await orch.on_message(1, "hi")
+            assert frontend.queued_notifications == [(1, 1)]
+            release.set()
+            await orch._running[1]
+
+        assert [r.body for _chat, r in frontend.sent] == ["answer"]
+        assert frontend.start_notifications == [1]
+
+
+class TestIdleCompactLoop:
+    async def test_ticks_and_survives_a_failed_tick(
+        self, orch: Orchestrator, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(orchestrator_mod, "IDLE_COMPACT_TICK_S", 0)
+        calls: list[int] = []
+
+        async def tick() -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("one bad tick")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(orch, "compact_idle_chats", tick)
+        with pytest.raises(asyncio.CancelledError):
+            await orch.idle_compact_loop()
+
+        assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------

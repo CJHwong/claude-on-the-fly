@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from claude_on_the_fly import agent
 from claude_on_the_fly.agent import NUDGE_PROMPT, OllamaLauncher, get_backend
 from claude_on_the_fly.backends import codex as codex_mod
 from claude_on_the_fly.backends.codex import (
@@ -2044,11 +2045,32 @@ class TestCodexCompact:
     """Codex has no compaction *command* we can send: `thread/compact/start` is
     app-server only, and `/compact` typed as a prompt is acknowledged
     ("Context compacted.") while changing nothing — measured 45,730 → 46,357.
-    What works is forcing codex's own pre-turn threshold via `-c`.
+    What works is forcing codex's own pre-turn threshold via `-c`, then stopping
+    codex once the compacted history is on disk and before the model runs.
     """
 
-    def _wire_thread(self, workspace: Path, session_uuid: str, thread_id: str) -> None:
-        _write_mapping(workspace, session_uuid, thread_id)
+    def _wire(self, tmp_path: Path, *records: dict) -> Path:
+        _write_mapping(tmp_path, "sid", "thread-1")
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_session_meta("thread-1"), *records))
+        return rollout
+
+    def _patches(self, rollout: Path | None, run_exec, tokens=(45_000, 258_400)):
+        return (
+            patch.object(
+                codex_mod.transcript, "_find_codex_rollout", return_value=rollout
+            ),
+            patch.object(
+                codex_mod.transcript, "extract_codex_prompt_tokens", return_value=tokens
+            ),
+            patch.object(codex_mod, "_run_codex_exec", run_exec),
+            patch.object(codex_mod, "COMPACT_POLL_S", 0.01),
+        )
+
+    async def _compact(self, tmp_path, rollout, run_exec, **kwargs):
+        first, second, third, fourth = self._patches(rollout, run_exec, **kwargs)
+        with first, second, third, fourth:
+            return await codex_mod.CodexBackend().compact(tmp_path, "sid")
 
     async def test_no_thread_yet_is_not_reported_as_unsupported(self, tmp_path):
         outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
@@ -2056,81 +2078,172 @@ class TestCodexCompact:
         assert outcome.ok is False
         assert "no session" in outcome.error
 
-    async def test_forces_the_threshold_via_a_per_invocation_override(self, tmp_path):
-        """Never writes to the user's ~/.codex/config.toml — the override is
-        scoped to this one run."""
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript,
-                "extract_codex_prompt_tokens",
-                side_effect=[(45_000, 258_400), (18_000, 258_400)],
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ) as run_exec,
-        ):
-            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+    async def test_a_missing_rollout_is_a_failure(self, tmp_path):
+        _write_mapping(tmp_path, "sid", "thread-1")
+        outcome = await self._compact(tmp_path, None, AsyncMock())
+        assert outcome is not None and outcome.ok is False
+        assert "rollout" in outcome.error
 
-        argv = run_exec.await_args[0][1]
-        assert "-c" in argv
-        assert f"model_auto_compact_token_limit={codex_mod.COMPACT_TOKEN_LIMIT}" in argv
-        assert argv[-3:-1] == ["resume", "thread-1"]
+    async def test_stops_codex_once_the_compacted_history_is_written(self, tmp_path):
+        """The rollout is written in stages, the way codex writes it. The run is
+        cancelled at `turn_context`, before the trigger reaches the model, and
+        the cancel is what reaps codex's process group."""
+        rollout = self._wire(tmp_path, _task_complete("older turn"))
+        cancelled = asyncio.Event()
+        seen: dict = {}
+
+        async def codex(_workspace, argv, **_kwargs):
+            seen["argv"] = argv
+            stages = (
+                {"type": "compacted", "payload": {}},
+                {"type": "event_msg", "payload": {"type": "token_count"}},
+                {"type": "turn_context", "payload": {}},
+            )
+            try:
+                for record in stages:
+                    await asyncio.sleep(0.02)
+                    with rollout.open("a") as handle:
+                        handle.write(json.dumps(record) + "\n")
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        outcome = await self._compact(tmp_path, rollout, codex)
+
+        assert cancelled.is_set()
         assert outcome is not None and outcome.ok is True
-        assert (outcome.pre_tokens, outcome.post_tokens) == (45_000, 18_000)
+        assert outcome.pre_tokens == 45_000
+        assert outcome.conversation_tokens_after is None
+        argv = seen["argv"]
+        assert f"model_auto_compact_token_limit={codex_mod.COMPACT_TOKEN_LIMIT}" in argv
+        assert argv[-3:] == ["resume", "thread-1", codex_mod.COMPACT_TRIGGER_PROMPT]
+        assert "/compact" not in argv
 
-    async def test_never_sends_slash_compact(self, tmp_path):
-        """It would be accepted and do nothing, which is the one outcome worse
-        than an error."""
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript,
-                "extract_codex_prompt_tokens",
-                side_effect=[(45_000, 258_400), (18_000, 258_400)],
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ) as run_exec,
-        ):
-            await codex_mod.CodexBackend().compact(tmp_path, "sid")
+    async def test_a_run_that_never_compacts_is_stopped_before_the_model(
+        self, tmp_path
+    ):
+        """If codex skips the compaction (the provider ignores the lowered limit,
+        or the compaction fails), the next record is still the turn's
+        `turn_context`. Stopping there keeps the trigger prompt away from the
+        model, where it would otherwise run a whole turn in the chat's session."""
+        rollout = self._wire(tmp_path, _task_complete("older turn"))
+        cancelled = asyncio.Event()
 
-        assert "/compact" not in run_exec.await_args[0][1]
+        async def codex(_workspace, _argv, **_kwargs):
+            try:
+                await asyncio.sleep(0.02)
+                with rollout.open("a") as handle:
+                    handle.write(json.dumps({"type": "turn_context", "payload": {}}))
+                    handle.write("\n")
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
 
-    async def test_a_context_that_did_not_shrink_is_not_success(self, tmp_path):
-        """The only evidence available is the token count — codex publishes no
-        in-band compaction signal, so trusting the trigger would repeat the exact
-        lie `/compact` tells."""
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript,
-                "extract_codex_prompt_tokens",
-                side_effect=[(45_000, 258_400), (45_100, 258_400)],
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ),
-        ):
-            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+        outcome = await asyncio.wait_for(
+            self._compact(tmp_path, rollout, codex), timeout=5
+        )
 
+        assert cancelled.is_set()
         assert outcome is not None and outcome.ok is False
-        assert "nothing to compact" in outcome.error
+        assert outcome.error == "codex did not compact the thread"
 
-    async def test_unreadable_usage_is_reported_not_guessed(self, tmp_path):
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript, "extract_codex_prompt_tokens", return_value=None
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ),
-        ):
-            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
-
+    async def test_an_older_compaction_in_the_thread_does_not_count(self, tmp_path):
+        """Only records written after the run starts are this compaction's."""
+        rollout = self._wire(
+            tmp_path,
+            {"type": "compacted", "payload": {}},
+            {"type": "turn_context", "payload": {}},
+        )
+        outcome = await self._compact(
+            tmp_path, rollout, AsyncMock(return_value={"body": "hi"})
+        )
         assert outcome is not None and outcome.ok is False
-        assert "token usage" in outcome.error
+        assert outcome.error == "codex did not compact the thread"
+        assert outcome.pre_tokens == 45_000, "a failure keeps the count"
+
+    async def test_a_run_that_compacted_and_exited_on_its_own_is_success(
+        self, tmp_path
+    ):
+        rollout = self._wire(tmp_path)
+
+        async def codex(*_args, **_kwargs):
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"type": "compacted", "payload": {}}) + "\n")
+            return {}
+
+        outcome = await self._compact(tmp_path, rollout, codex)
+        assert outcome is not None and outcome.ok is True
+
+    async def test_a_codex_error_propagates_to_the_turn_handler(self, tmp_path):
+        """The error text is codex's stderr. Raising lets `_process` post its
+        public message and record the failure, instead of the chat reading the
+        raw narration as a compaction result."""
+        rollout = self._wire(tmp_path)
+        with pytest.raises(RuntimeError, match="Exit code 2"):
+            await self._compact(
+                tmp_path, rollout, AsyncMock(side_effect=RuntimeError("Exit code 2"))
+            )
+
+    async def test_an_error_after_the_compacted_record_is_still_success(self, tmp_path):
+        rollout = self._wire(tmp_path)
+
+        async def codex(*_args, **_kwargs):
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"type": "compacted", "payload": {}}) + "\n")
+            raise RuntimeError("Exit code 1")
+
+        outcome = await self._compact(tmp_path, rollout, codex)
+        assert outcome is not None and outcome.ok is True
+
+    async def test_no_timeout_from_the_frontend_gets_the_compaction_cap(self, tmp_path):
+        """The chat frontends pass None, which means no deadline downstream; an
+        unattended compaction that never settles would hold the chat."""
+        rollout = self._wire(tmp_path)
+        run_exec = AsyncMock(return_value={})
+        first, second, third, fourth = self._patches(rollout, run_exec)
+        with first, second, third, fourth:
+            await codex_mod.CodexBackend().compact(tmp_path, "sid", timeout=None)
+        assert run_exec.await_args.kwargs["timeout"] == agent.COMPACT_TIMEOUT
+
+    async def test_unreadable_usage_does_not_block_the_compaction(self, tmp_path):
+        """The count is only for the report; the `compacted` record decides."""
+        rollout = self._wire(tmp_path)
+
+        async def codex(*_args, **_kwargs):
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"type": "compacted", "payload": {}}) + "\n")
+            return {}
+
+        outcome = await self._compact(tmp_path, rollout, codex, tokens=None)
+        assert outcome is not None and outcome.ok is True
+        assert outcome.pre_tokens == 0
+
+    async def test_cancelling_the_compaction_cancels_codex(self, tmp_path):
+        """$stop cancels the caller; codex must not keep running behind it."""
+        rollout = self._wire(tmp_path)
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def codex(*_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        first, second, third, fourth = self._patches(rollout, codex)
+        with first, second, third, fourth:
+            task = asyncio.create_task(
+                codex_mod.CodexBackend().compact(tmp_path, "sid")
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert cancelled.is_set()
 
 
 # ---------------------------------------------------------------------------
