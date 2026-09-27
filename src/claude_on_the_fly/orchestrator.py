@@ -11,7 +11,7 @@ import re
 import signal
 import time
 import unicodedata
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -49,6 +49,7 @@ from claude_on_the_fly.agent import (
 from claude_on_the_fly.approvals import ApprovalBroker
 from claude_on_the_fly.events import (
     EVENT_DISPATCHED,
+    EVENT_SESSION_COMPACTED,
     EVENT_WORKER_DONE,
     EVENT_WORKER_FAILED,
     EventLog,
@@ -71,6 +72,28 @@ logger = logging.getLogger(__name__)
 # (see `Response.context_tokens`), so in native mode this is inert however it is
 # set — the manual trigger is the whole feature there.
 AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
+
+# Idle compaction: compact a big conversation shortly before its prompt cache
+# expires, so the pass reads the context at the cached rate and the next message
+# starts from a short context instead of paying for the long one uncached. Off
+# unless the toggle is on; the other two only tune it.
+IDLE_COMPACT_VAR = "COTF_IDLE_COMPACT"
+IDLE_COMPACT_TOKENS_VAR = "COTF_IDLE_COMPACT_TOKENS"
+IDLE_COMPACT_LEAD_MIN_VAR = "COTF_IDLE_COMPACT_LEAD_MIN"
+DEFAULT_IDLE_COMPACT_TOKENS = 200_000
+DEFAULT_IDLE_COMPACT_LEAD_MIN = 5
+IDLE_COMPACT_TICK_S = 60.0
+# Per daemon. Each one is a full-context model pass, and a burst of chats going
+# idle together should not become a burst of spend.
+IDLE_COMPACT_MAX_RUNNING = 2
+
+# How long each provider keeps a prompt cached after the request that wrote it.
+# Claude's default is five minutes; `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` in the
+# agent's environment raises it to an hour. Codex caches for thirty minutes.
+CLAUDE_CACHE_TTL_VAR = "CLAUDE_CODE_PROMPT_CACHE_TTL"
+CLAUDE_CACHE_TTL_S = 300
+CLAUDE_CACHE_TTL_1H_S = 3600
+CODEX_CACHE_TTL_S = 1800
 
 # Appended to every chat turn's prompt when suggestions are enabled: the agent
 # ends its reply with the follow-ups it was asked for, wrapped so the daemon
@@ -125,7 +148,7 @@ MAX_SUGGESTION_LENGTH = 75
 # keeps a long agent label from sinking a whole actions block.
 MAX_SUGGESTION_WIDTH = 32
 
-_SUGGESTIONS_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # How long shutdown may spend telling interrupted chats their work died. Sized
 # under the supervisor's safe grace (`supervisor.SAFE_GRACE_S`) so the notices
@@ -209,7 +232,7 @@ def _resume_prompt(entry: PendingTurn) -> str:
 
 def _suggestions_enabled() -> bool:
     """Live gate for the suggestions template. Read per turn, not at import."""
-    return settings.get("COTF_SUGGESTIONS_ENABLED").lower() in _SUGGESTIONS_TRUTHY
+    return settings.get("COTF_SUGGESTIONS_ENABLED").lower() in _TRUTHY
 
 
 def _extract_suggestions(body: str) -> tuple[str, list[str]]:
@@ -316,6 +339,23 @@ class Turn:
     # nothing journaled (a compaction, which is daemon maintenance rather than
     # somebody's message, and which the auto-compact gate re-queues by itself).
     journal_id: str = ""
+    # A compaction the idle loop queued, not one somebody asked for. It runs
+    # through the same queue, so a message arriving meanwhile waits behind it,
+    # but it says nothing: the chat went quiet, and a reply out of nowhere
+    # would read as the agent talking to itself.
+    background: bool = False
+
+
+@dataclass(frozen=True)
+class IdleReading:
+    """What the idle loop knows about a chat's last turn."""
+
+    # Monotonic time the turn ended. It errs late against the cache clock, which
+    # starts at the request, so the loop compacts at worst a little after the
+    # lead it was given, never before.
+    ended_at: float
+    context_tokens: int
+    cache_ttl_s: int
 
 
 class SessionEgress:
@@ -549,6 +589,12 @@ class Orchestrator:
         # None means use the live setting. Tests and embedders may assign an
         # explicit threshold through the compatibility property below.
         self._auto_compact_pct_override: int | None = None
+        # Chats whose last turn finished with a reading, for the idle loop. In
+        # memory only: after a restart the on-return gate above still covers a
+        # chat that went quiet before it.
+        self._idle: dict[int, IdleReading] = {}
+        # Chats with an idle compaction queued or running, to hold the cap.
+        self._background: set[int] = set()
         self._event_log = event_log if event_log is not None else EventLog()
         # chat_id -> {identifier, started_at_monotonic, session_uuid}.
         # Populated at dispatch, cleared on completion. Drives the heartbeat
@@ -608,6 +654,7 @@ class Orchestrator:
         nothing in it yet.
         """
         self._context.pop(chat_id, None)
+        self._idle.pop(chat_id, None)
 
     def _fold_legacy_workspace(
         self, chat_id: int, workspace: Path, session: str
@@ -676,7 +723,8 @@ class Orchestrator:
             # thread may never be spoken to again, and compacting one that isn't
             # pays a full-context pass for nothing. Waiting until someone
             # actually comes back costs them this turn's latency and saves every
-            # turn after it.
+            # turn after it. `idle_compact_loop` is the exception, and only inside
+            # the cache lifetime, where the same pass reads the context cached.
             logger.info("on_message: chat_id=%s auto-compacting first", chat_id)
             await self.on_compact(chat_id)
         await self._enqueue(chat_id, Turn(text))
@@ -925,7 +973,13 @@ class Orchestrator:
         # safe direction for the few milliseconds of difference.
         self._journal.mark_dispatched(turn.journal_id)
         interrupted = False
-        await self._report_config_restarts(chat_id)
+        # Any turn replaces the idle reading: a normal one records a fresh one
+        # when it ends, and a compaction leaves nothing left to compact.
+        self._idle.pop(chat_id, None)
+        if not turn.background:
+            # Not into a chat nobody is in: the notice would land in whichever
+            # quiet chat the loop picked and never reach the operator.
+            await self._report_config_restarts(chat_id)
         workspace = workspace_path(self._frontend.workspace_name(chat_id), DATA_DIR)
         session = self.session_uuid(chat_id)
         # Resolved once per turn, before anything can report on it, so the event
@@ -1031,6 +1085,7 @@ class Orchestrator:
                 session_overrides.update(command_env)
             # An ollama turn's model server, so the relay below bridges it.
             session_overrides.update(sandbox.model_endpoint_env(profile.mode))
+            session_overrides.update(_cache_ttl_env(profile))
             # Must come before the spawn and after the overrides are known: on a
             # Linux jail the agent's network namespace contains nothing until
             # this bridges the brokered ports into it, and one of those ports
@@ -1039,8 +1094,9 @@ class Orchestrator:
             relay = await sandbox.open_session_relay(session_overrides, str(chat_id))
             if session_overrides:
                 env_token = sandbox.session_env(session_overrides)
-            await self._frontend.notify_start(chat_id)
-            typing_task = asyncio.create_task(self._typing_loop(chat_id))
+            if not turn.background:
+                await self._frontend.notify_start(chat_id)
+                typing_task = asyncio.create_task(self._typing_loop(chat_id))
             if turn.compact:
                 response = await self._run_compaction(
                     chat_id,
@@ -1143,9 +1199,15 @@ class Orchestrator:
                     response.context_tokens,
                     response.context_window_size,
                 )
+            if not turn.compact:
+                self._note_idle(chat_id, response, profile)
             if outbox is not None:
                 response.attachments = agent.collect_outbox(outbox)
-            delivered = await self._frontend.send(chat_id, response)
+            if turn.background:
+                delivered = None
+                self._log_background_compaction(chat_id, identifier, profile, response)
+            else:
+                delivered = await self._frontend.send(chat_id, response)
             if delivered:
                 agent.archive_outbox(workspace, delivered)
             if outbox is not None:
@@ -1169,10 +1231,11 @@ class Orchestrator:
             raise
         except ClaudeUnavailableError as exc:
             logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
-            await self._frontend.send(
-                chat_id,
-                Response(body=f"Claude unavailable: {exc}"),
-            )
+            if not turn.background:
+                await self._frontend.send(
+                    chat_id,
+                    Response(body=f"Claude unavailable: {exc}"),
+                )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
@@ -1190,10 +1253,11 @@ class Orchestrator:
                 if isinstance(exc, AgentTurnError)
                 else AGENT_FAILURE_NOTICE
             )
-            await self._frontend.send(
-                chat_id,
-                Response(body=public_message),
-            )
+            if not turn.background:
+                await self._frontend.send(
+                    chat_id,
+                    Response(body=public_message),
+                )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
@@ -1237,7 +1301,10 @@ class Orchestrator:
                 await relay.close()
             if command_token is not None and self._commands is not None:
                 self._commands.revoke_token(command_token)
-            await self._frontend.notify_complete(chat_id)
+            if turn.background:
+                self._background.discard(chat_id)
+            else:
+                await self._frontend.notify_complete(chat_id)
 
     def _start_interim(self, chat_id: int) -> InterimProgress | None:
         """This turn's progress relay, or None when nothing could come of one.
@@ -1289,6 +1356,126 @@ class Orchestrator:
             return Response(body="This backend can't compact a conversation.")
         return Response(body=outcome.summary(), compaction=outcome)
 
+    def _note_idle(
+        self, chat_id: int, response: Response, profile: agent.AgentProfile
+    ) -> None:
+        """Record what the idle loop needs from the turn that just ended.
+
+        Called inside the turn, so `sandbox.agent_env()` still carries this
+        session's overrides and reads the environment the agent actually got.
+        Under the sandbox that matters: the one-hour cache setting is not on the
+        passthrough list, so the agent ran on the five-minute default whatever
+        the daemon's own environment says.
+        """
+        ttl = _cache_ttl_s(profile, sandbox.agent_env() or os.environ)
+        if not response.context_tokens or ttl is None:
+            return
+        self._idle[chat_id] = IdleReading(
+            ended_at=time.monotonic(),
+            context_tokens=response.context_tokens,
+            cache_ttl_s=ttl,
+        )
+
+    def _log_background_compaction(
+        self,
+        chat_id: int,
+        identifier: str,
+        profile: agent.AgentProfile,
+        response: Response,
+    ) -> None:
+        """Record an idle compaction where the operator looks, not in the chat."""
+        outcome = response.compaction
+        if outcome is None:
+            result = "unsupported"
+        else:
+            result = "compacted" if outcome.ok else "failed"
+        started = self._in_flight.get(chat_id, {}).get("started_at_monotonic")
+        duration = time.monotonic() - started if started is not None else 0.0
+        logger.info("idle-compact: chat_id=%s %s: %s", chat_id, result, response.body)
+        self._event_log.append(
+            EVENT_SESSION_COMPACTED,
+            source=self._platform,
+            identifier=identifier,
+            backend=current_backend_key(profile),
+            # No `tokens_after`: nothing measures the whole prompt after a
+            # compaction, and the log drops a None field anyway.
+            tokens_before=(outcome.pre_tokens or None) if outcome else None,
+            conversation_tokens_after=(
+                outcome.conversation_tokens_after if outcome else None
+            ),
+            duration_s=round(duration, 1),
+            outcome=result,
+        )
+
+    async def idle_compact_loop(self) -> None:
+        """Compact quiet chats shortly before their prompt cache expires.
+
+        This reverses the choice `on_message` records, on purpose. Compacting a
+        chat nobody returns to used to be a full-context pass for nothing; inside
+        the cache lifetime the same pass reads the context at the cached rate, so
+        it costs little, and a chat that does come back starts short.
+        """
+        while True:
+            await asyncio.sleep(IDLE_COMPACT_TICK_S)
+            try:
+                await self.compact_idle_chats()
+            except Exception:
+                # One bad tick must not end the loop for the daemon's lifetime.
+                logger.exception("idle-compact: tick failed")
+
+    async def compact_idle_chats(self, now: float | None = None) -> None:
+        """Queue a silent compaction for each chat whose window is open now."""
+        if not _idle_compact_enabled():
+            return
+        now = time.monotonic() if now is None else now
+        # A compaction that `abort` dropped before it started never reaches the
+        # discard in `_process`, so the cap counts only chats still working.
+        self._background = {chat for chat in self._background if self.is_busy(chat)}
+        due = self._idle_compact_due(
+            now, _idle_compact_tokens(), _idle_compact_lead_min() * 60
+        )
+        for chat_id in due:
+            if len(self._background) >= IDLE_COMPACT_MAX_RUNNING:
+                return
+            reading = self._idle.pop(chat_id)
+            # `_run_compaction` drops it too, but only after the awaits that
+            # set up the turn; a message landing first would read the
+            # pre-compaction size and queue a second, visible compaction.
+            self._context.pop(chat_id, None)
+            logger.info(
+                "idle-compact: chat_id=%s %s tokens, idle %.0fs of %ss cache",
+                chat_id,
+                reading.context_tokens,
+                now - reading.ended_at,
+                reading.cache_ttl_s,
+            )
+            self._background.add(chat_id)
+            await self._enqueue(chat_id, Turn("", compact=True, background=True))
+
+    def _idle_compact_due(self, now: float, threshold: int, lead_s: int) -> list[int]:
+        """Chats inside their window, the nearest cache expiry first.
+
+        A reading whose cache already expired is dropped: the pass would read
+        the context at the full rate and save nothing, and the on-return gate
+        still covers the chat when somebody writes to it.
+        """
+        due: list[tuple[float, int]] = []
+        for chat_id, reading in list(self._idle.items()):
+            idle_s = now - reading.ended_at
+            if idle_s >= reading.cache_ttl_s:
+                self._idle.pop(chat_id)
+                continue
+            if reading.context_tokens < threshold:
+                continue
+            # A lead as long as the cache (the five-minute default against a
+            # five-minute lead) leaves no window, only a compaction per turn.
+            if reading.cache_ttl_s <= lead_s or idle_s < reading.cache_ttl_s - lead_s:
+                continue
+            if self.is_busy(chat_id) or self.queue_size(chat_id):
+                continue
+            due.append((reading.ended_at + reading.cache_ttl_s, chat_id))
+        return [chat_id for _expiry, chat_id in sorted(due)]
+
     def heartbeat_extra(self) -> dict:
         """Snapshot in-flight chat jobs for the TUI's Active AI jobs pane.
 
@@ -1327,7 +1514,10 @@ class Orchestrator:
         """
         chats: dict[int, tuple[bool, int]] = {}
         for chat_id, task in self._running.items():
-            if not task.done():
+            # An idle compaction is nobody's answer and is not journaled, so
+            # nothing resumes it: saying "interrupted" would post into a quiet
+            # chat about work nobody asked for.
+            if not task.done() and chat_id not in self._background:
                 chats[chat_id] = (True, 0)
         for chat_id, queue in self._queues.items():
             queued = queue.qsize()
@@ -1481,6 +1671,73 @@ def _auto_compact_pct() -> int:
         )
         return 0
     return pct
+
+
+def _idle_compact_enabled() -> bool:
+    """Live toggle for idle compaction. Read per tick, so an edit needs no restart."""
+    return settings.get(IDLE_COMPACT_VAR).strip().lower() in _TRUTHY
+
+
+def _idle_compact_tokens() -> int:
+    return _positive_setting(IDLE_COMPACT_TOKENS_VAR, DEFAULT_IDLE_COMPACT_TOKENS)
+
+
+def _idle_compact_lead_min() -> int:
+    return _positive_setting(IDLE_COMPACT_LEAD_MIN_VAR, DEFAULT_IDLE_COMPACT_LEAD_MIN)
+
+
+def _positive_setting(name: str, default: int) -> int:
+    """A positive integer setting, or its default when unset or unusable.
+
+    The default rather than off, unlike `_auto_compact_pct`: the toggle already
+    says whether the feature runs, so a typo in a tuning value should not
+    silently switch it off. The value is logged so the typo is visible.
+    """
+    raw = settings.get(name).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value > 0:
+        return value
+    logger.warning("%s=%r is not a positive number, using %d", name, raw, default)
+    return default
+
+
+def _cache_ttl_env(profile: agent.AgentProfile) -> dict[str, str]:
+    """The one-hour cache for claude turns while idle compaction is on.
+
+    Claude's five-minute default leaves no window to compact in, so enabling the
+    feature without this would do nothing for claude. An operator value in the
+    daemon's environment wins. It is forwarded rather than left to inherit,
+    because the sandbox passthrough list does not carry it. Ollama mode is left
+    alone: that request goes to ollama, not to Anthropic's cache.
+    """
+    if (
+        not _idle_compact_enabled()
+        or profile.backend != "claude"
+        or profile.mode == "ollama"
+    ):
+        return {}
+    return {CLAUDE_CACHE_TTL_VAR: os.environ.get(CLAUDE_CACHE_TTL_VAR) or "1h"}
+
+
+def _cache_ttl_s(profile: agent.AgentProfile, env: Mapping[str, str]) -> int | None:
+    """How long this turn's prompt stays cached, or None for no idle compaction.
+
+    Under ollama it is whatever the operator declared, None when unset: the
+    hosted lifetimes say nothing about the model ollama routed the turn to, and
+    ollama's own cache is implicit, with no lifetime to read.
+    """
+    if profile.mode == "ollama":
+        return profile.ollama_cache_ttl_s
+    if profile.backend == "codex":
+        return CODEX_CACHE_TTL_S
+    if env.get(CLAUDE_CACHE_TTL_VAR, "").strip().lower() == "1h":
+        return CLAUDE_CACHE_TTL_1H_S
+    return CLAUDE_CACHE_TTL_S
 
 
 def _redact_token(token: str) -> str:
@@ -1640,6 +1897,7 @@ async def run(frontend: Frontend, platform: str) -> None:
     process_ledger = ProcessLedger(DATA_DIR / "state" / f"{platform}.pids")
     listener_attached = False
     heartbeat_task: asyncio.Task[None] | None = None
+    idle_task: asyncio.Task[None] | None = None
 
     try:
         process_ledger.sweep()
@@ -1684,6 +1942,7 @@ async def run(frontend: Frontend, platform: str) -> None:
 
         heartbeat.set_extra_provider(orch.heartbeat_extra)
         heartbeat_task = asyncio.create_task(heartbeat.run())
+        idle_task = asyncio.create_task(orch.idle_compact_loop())
 
         # Between the sandbox and the listener, deliberately. A replayed turn
         # spawns a jailed agent, so it needs the broker, the proxy and the shims
@@ -1703,8 +1962,12 @@ async def run(frontend: Frontend, platform: str) -> None:
         # first can tear down the client the notice needs to post through.
         await orch.notify_interrupted()
         heartbeat_task.cancel()
+        # Before `orch.shutdown`, so no idle compaction is queued behind a stop.
+        idle_task.cancel()
         frontend_task.cancel()
-        await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
+        await asyncio.gather(
+            heartbeat_task, idle_task, frontend_task, return_exceptions=True
+        )
         await orch.shutdown()
         await frontend.stop()
         # Stopping these revokes every route out of the sandbox at once.
@@ -1730,5 +1993,8 @@ async def run(frontend: Frontend, platform: str) -> None:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if idle_task is not None:
+            idle_task.cancel()
+            await asyncio.gather(idle_task, return_exceptions=True)
         heartbeat.remove_owned()
         heartbeat.release()

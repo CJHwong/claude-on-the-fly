@@ -34,8 +34,12 @@ configuration writes, not those persona links.
 | `codex.chatgpt_via_broker` | boolean / `false` | Codex signed in with ChatGPT only. The credential broker holds `auth.json`, adds the token to each model call, and refreshes it; the jail hides the file from the turn. Starts the broker even with the sandbox off. Startup fails if `auth.json` holds no ChatGPT login. Not for `ollama` mode or an API key | Restart |
 | `ollama.model` | string / unset | Required when either backend mode is `ollama` | Next turn |
 | `ollama.effort` | string / unset | Effort for the ollama-served model, whichever backend runs under it; wins over the backend's own `effort` key | Next turn |
-| `ollama.context_window` | integer / unset | Window that `ctx N%` and `auto_compact_pct` measure against in ollama mode; unset reports no reading | Next turn |
+| `ollama.context_window` | integer / unset | Window that `ctx N%` and `auto_compact_pct` measure against in ollama mode; unset reports the token count but no window, so both stay off | Next turn |
+| `ollama.cache_ttl_min` | integer / unset | How long ollama keeps a prompt cached, in minutes; idle compaction uses it in ollama mode, and unset skips those chats | Next turn |
 | `auto_compact_pct` | integer / unset | `1..100`; invalid disables automatic compaction | Immediate |
+| `idle_compact` | boolean / `false` | Compact a quiet chat shortly before its prompt cache expires; `true`, `1`, `yes` or `on` switches it on | Immediate |
+| `idle_compact_tokens` | integer / `200000` | Smallest context an idle compaction acts on; invalid uses the default | Immediate |
+| `idle_compact_lead_min` | integer / `5` | Minutes before the cache expires that a chat becomes eligible; invalid uses the default | Immediate |
 | `skills_cache_ttl_seconds` | number / `3600` | `<=0` probes on every query; invalid uses default | Immediate |
 | `pricing_ttl_seconds` | integer / `604800` | `0` always refreshes; negative never expires | Immediate |
 | `pane` | boolean / true | Host each turn in its own tmux server so the dashboard's live view mirrors the agent's terminal; `false`, `0`, `no` or `off` switches it off, anything else leaves it on. Inert without tmux | Next turn |
@@ -56,6 +60,33 @@ worth hosting either way: their panes would show stream JSON and plain lines.
 Automatic compaction requires a reliable context-window reading. Native and pty
 derive one. Ollama cannot, so it is inert there until `ollama.context_window`
 supplies one; manual `$compact` remains available either way.
+
+Idle compaction runs only for chats this daemon served since it started, and only
+inside the cache lifetime: 30 minutes on codex and an hour on claude. While
+`idle_compact` is on, claude turns get `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`, forwarded
+past the sandbox too, because the 5-minute default leaves no window. A value in the
+daemon's environment wins, and a claude turn left on 5 minutes is skipped.
+
+That setting applies to every claude turn outside ollama mode, including chats far
+under `idle_compact_tokens`. A 1-hour cache write costs about 2x the base input price,
+against 1.25x for the 5-minute default, so each turn's new context costs more to cache.
+Reads cost the same. The trade pays off when chats come back between 5 and 60 minutes
+later; a daemon whose chats rarely do pays the higher write price for nothing.
+
+The daemon reads only its own process environment. A `CLAUDE_CODE_PROMPT_CACHE_TTL` in
+the `env` block of claude's `settings.json` overrides the process environment inside
+claude, so a `5m` set there makes claude cache for 5 minutes while the daemon counts on
+an hour. Idle compaction then runs after the cache has expired and pays the full price
+for the pass. Leave the variable out of `settings.json` when this is on.
+
+Ollama mode uses `ollama.cache_ttl_min`. Ollama's cache is implicit: it honours no
+`cache_control` TTL and no `keep_alive`, and documents no lifetime. Measured on two
+cloud models, `glm-5.3-flash` hit at 3 and 6 minutes and missed from 11 minutes on.
+`deepseek-v4.1-flash` hit at 3, 6, 11, 31 and 46 minutes and missed at 21 and 61. So
+the lifetime runs from under 11 minutes to over 46 depending on the model, and a model
+can miss and then hit again, which points at routing. The value is a best estimate,
+and unset skips ollama chats. Claude under ollama needs nothing more: its token count is
+the routed model's own, and the idle compaction reads only that count, never the window.
 
 ### Profiles
 

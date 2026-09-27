@@ -495,12 +495,10 @@ def extract_codex_prompt_tokens(thread_id: str) -> tuple[int, int] | None:
     Unlike `total_token_usage` above, `last_token_usage.input_tokens` is that
     turn's own prompt — so it tracks how big the thread's context has become,
     which is the number a compaction is supposed to shrink. Compaction itself
-    reports a turn with `input_tokens: 0`, so those are skipped: they describe
+    writes a count with `input_tokens: 0`, so those are skipped: they describe
     the compaction pass, not the context it left behind.
 
-    None when the rollout is missing or has no usable event. Codex publishes no
-    in-band compaction signal in `--json`, so comparing this before and after is
-    the only way to tell whether a compaction actually did anything.
+    None when the rollout is missing or has no usable event.
     """
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:

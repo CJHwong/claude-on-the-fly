@@ -429,6 +429,13 @@ agent:
   #   # it is not actually talking to. State it here and both work; leave it unset
   #   # and neither does. Match it to the CLI's own limit.
   #   context_window: 200000
+  #   # How long ollama keeps a prompt cached, for idle compaction. Ollama's cache
+  #   # is implicit and documents no lifetime, and no cache_control TTL or
+  #   # keep_alive extends it. Measured on cloud models it ran from under 11
+  #   # minutes (glm-5.3-flash) to over 46 (deepseek-v4.1-flash), and a model
+  #   # could miss and then hit again, so treat this as a best estimate. Unset
+  #   # leaves ollama chats out of idle compaction.
+  #   cache_ttl_min: 10
   # Effort is set by whichever key owns the model. `ollama.effort` applies to the
   # ollama-served model, whichever backend runs under it, and wins whenever the
   # launcher is in play. A backend's own `effort` applies to its native mode,
@@ -466,6 +473,22 @@ agent:
   # Compact before answering once the previous turn left the context at or above
   # this share of the window. Unset means compaction only on $compact.
   # auto_compact_pct: 80
+
+  # Compact a quiet chat shortly before its prompt cache expires, so the pass
+  # reads the context at the cached rate and the next message starts short. Off
+  # unless idle_compact is true. A chat qualifies once its last turn left at least
+  # idle_compact_tokens in the context and it has been quiet for the cache
+  # lifetime less idle_compact_lead_min: 25 minutes on codex (30-minute cache),
+  # 55 on claude, whose turns get CLAUDE_CODE_PROMPT_CACHE_TTL=1h while this is on
+  # (a value in the daemon's environment wins). That covers every claude turn, so
+  # cache writes cost about 2x base input instead of 1.25x. A value in claude's
+  # settings.json env block overrides it unseen; keep it out of there. Ollama
+  # mode needs ollama.cache_ttl_min; without it the chat is skipped. Nothing is
+  # posted; a message arriving meanwhile
+  # waits behind it under the hourglass.
+  # idle_compact: false
+  # idle_compact_tokens: 200000
+  # idle_compact_lead_min: 5
 
   # Caches. skills_cache_ttl_seconds <= 0 probes the CLI every query;
   # pricing_ttl_seconds of 0 always refreshes, negative never expires.

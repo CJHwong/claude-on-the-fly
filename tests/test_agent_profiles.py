@@ -37,6 +37,7 @@ _AGENT_ENV = (
     "OLLAMA_MODEL",
     "OLLAMA_EFFORT",
     "OLLAMA_CONTEXT_WINDOW",
+    "OLLAMA_CACHE_TTL_MIN",
 )
 
 
@@ -188,6 +189,24 @@ class TestResolveTheGlobalConfig:
         monkeypatch.setenv("OLLAMA_MODEL", "qwen3:30b")
         monkeypatch.setenv("OLLAMA_CONTEXT_WINDOW", "not-a-number")
         assert agent.resolve_profile().ollama_context_window is None
+
+    def test_the_cache_lifetime_is_declared_in_minutes(
+        self, clean_agent_env, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen3:30b")
+        assert agent.resolve_profile().ollama_cache_ttl_s is None
+        monkeypatch.setenv("OLLAMA_CACHE_TTL_MIN", "10")
+        assert agent.resolve_profile().ollama_cache_ttl_s == 600
+
+    @pytest.mark.parametrize("raw", ["soon", "0", "-3"])
+    def test_an_unusable_cache_lifetime_is_dropped_not_fatal(
+        self, clean_agent_env, monkeypatch, raw
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_MODE", "ollama")
+        monkeypatch.setenv("OLLAMA_MODEL", "qwen3:30b")
+        monkeypatch.setenv("OLLAMA_CACHE_TTL_MIN", raw)
+        assert agent.resolve_profile().ollama_cache_ttl_s is None
 
     def test_ollama_without_a_model_is_refused(
         self, clean_agent_env, monkeypatch
