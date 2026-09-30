@@ -6483,6 +6483,167 @@ class TestIngestSubtypeFiltering:
         )
 
 
+def _thread_reply(user: str, text: str, *, broadcast: bool) -> dict:
+    """One reply in thread 100.0 of channel C1, sent plainly or with "Also send
+    to channel". A broadcast carries `subtype` and the parent as `root`; the
+    rest of the payload is the same message."""
+    event = {
+        "type": "message",
+        "ts": "100.5",
+        "thread_ts": "100.0",
+        "text": text,
+        "channel": "C1",
+        "channel_type": "channel",
+        "user": user,
+    }
+    if broadcast:
+        event["subtype"] = "thread_broadcast"
+        event["root"] = {
+            "type": "message",
+            "ts": "100.0",
+            "text": "the parent message",
+            "user": "U_ALLOWED",
+            "thread_ts": "100.0",
+            "reply_count": 1,
+        }
+    return event
+
+
+@contextlib.contextmanager
+def _fresh_frontend(data_dir: Path, **kwargs):
+    """A frontend like the `frontend` fixture, so one test can run the plain and
+    the broadcast reply through two identical, independent instances. Each gets
+    its own data dir: the processed-event set persists there, and a shared one
+    would have the second instance skip the first one's ts as already seen."""
+    with (
+        patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls,
+        patch.object(slack_mod, "DATA_DIR", data_dir),
+    ):
+        mock_app = MagicMock()
+        mock_app.client.users_info = AsyncMock(
+            return_value={"user": {"name": "testuser"}}
+        )
+        mock_app.client.conversations_info = AsyncMock(
+            return_value={
+                "channel": {"name": "general", "is_mpim": False, "is_private": False}
+            }
+        )
+        mock_app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {"ts": "100.0", "text": "the parent message", "user": "U_ALLOWED"}
+                ]
+            }
+        )
+        mock_app.client.chat_postMessage = AsyncMock()
+        mock_app.client.chat_postEphemeral = AsyncMock()
+        mock_app_cls.return_value = mock_app
+        fe = SlackFrontend(
+            "xapp-tok", "xoxp-tok", "U_SELF", allowed_user_ids={"U_ALLOWED"}, **kwargs
+        )
+        fe._on_message = AsyncMock()
+        fe._hint_mention_required = AsyncMock()
+        yield fe
+
+
+async def _ingest_both(tmp_path: Path, user: str, text: str, **kwargs):
+    """Ingest the plain and the broadcast form of one reply; return each
+    frontend so a test can compare what they did."""
+    results = []
+    for broadcast in (False, True):
+        data_dir = tmp_path / ("broadcast" if broadcast else "plain")
+        with _fresh_frontend(data_dir, **kwargs) as fe:
+            await fe._ingest_event(_thread_reply(user, text, broadcast=broadcast))
+            results.append(fe)
+    return results
+
+
+class TestThreadBroadcastIsAThreadReply:
+    """A reply sent with "Also send to channel" arrives as
+    subtype=thread_broadcast. On 2026-09-30 a colleague's reply sent that way was
+    dropped at the subtype filter and never reached the relay; it must be
+    handled exactly like the same reply sent plainly."""
+
+    async def test_an_allowed_broadcast_reaches_the_agent_like_a_plain_reply(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_both(
+            tmp_path, "U_ALLOWED", "<@U_SELF> please check"
+        )
+
+        plain._on_message.assert_awaited_once()
+        broadcast._on_message.assert_awaited_once()
+        assert broadcast._on_message.await_args == plain._on_message.await_args
+        chat_id, text = broadcast._on_message.await_args.args
+        assert chat_id == _session_key("C1", "100.0")
+        assert "please check" in text
+        assert "<thread_context>" in text
+        assert (
+            broadcast._pending_reply_suppressed[chat_id]
+            == plain._pending_reply_suppressed[chat_id]
+            == deque([False])
+        )
+
+    async def test_a_broadcast_from_a_sender_not_allowed_is_refused_the_same_way(
+        self, tmp_path, caplog
+    ):
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            plain, broadcast = await _ingest_both(tmp_path, "U_RANDOM", "<@U_SELF> hi")
+        plain._on_message.assert_not_awaited()
+        broadcast._on_message.assert_not_awaited()
+        refusals = [
+            r.getMessage()
+            for r in caplog.records
+            if "U_RANDOM not in allowed_user_ids" in r.getMessage()
+        ]
+        assert len(refusals) == 2
+
+    async def test_a_broadcast_from_a_silent_sender_is_silenced_the_same_way(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_both(
+            tmp_path, "U_ALLOWED", "<@U_SELF> fyi", silent_sender_ids={"U_ALLOWED"}
+        )
+        chat_id = _session_key("C1", "100.0")
+        broadcast._on_message.assert_awaited_once()
+        assert broadcast._on_message.await_args == plain._on_message.await_args
+        assert (
+            broadcast._pending_reply_suppressed[chat_id]
+            == plain._pending_reply_suppressed[chat_id]
+            == deque([True])
+        )
+
+    async def test_an_untagged_broadcast_meets_the_mention_gate_the_same_way(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_both(tmp_path, "U_ALLOWED", "no tag here")
+        plain._on_message.assert_not_awaited()
+        broadcast._on_message.assert_not_awaited()
+        plain._hint_mention_required.assert_awaited_once()
+        broadcast._hint_mention_required.assert_awaited_once()
+        # Same channel, thread and sender; the event itself is held for the
+        # replay card as received, subtype and all, which the filter now admits.
+        plain_args = plain._hint_mention_required.await_args.args
+        broadcast_args = broadcast._hint_mention_required.await_args.args
+        assert broadcast_args[:3] == plain_args[:3] == ("C1", "100.0", "U_ALLOWED")
+        assert broadcast_args[3]["subtype"] == "thread_broadcast"
+
+    @pytest.mark.parametrize(
+        "subtype", ["bot_message", "message_changed", "message_deleted", "made_up"]
+    )
+    async def test_other_subtypes_are_still_skipped(self, subtype, tmp_path, caplog):
+        event = _thread_reply("U_ALLOWED", "<@U_SELF> please check", broadcast=False)
+        event["subtype"] = subtype
+        with _fresh_frontend(tmp_path) as fe:
+            with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+                await fe._ingest_event(event)
+            fe._on_message.assert_not_awaited()
+        assert any(
+            "skipped:" in r.getMessage() and subtype in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestSetStatusWithoutAThread:
     async def test_a_session_with_no_thread_gets_no_status(self, frontend):
         """assistant.threads.setStatus needs a thread to attach to."""

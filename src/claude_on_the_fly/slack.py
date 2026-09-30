@@ -448,7 +448,12 @@ GATED_EMOJI = "lock"
 
 _DOWNLOAD_CHUNK = 64 * 1024
 
-_ALLOWED_SUBTYPES = {"file_share"}
+# `thread_broadcast` is a thread reply sent with "Also send to channel": the same
+# message with the parent attached as `root`, which nothing here reads. It was
+# missing until 2026-09-30, when a colleague's reply sent that way was dropped at
+# the subtype filter and never reached the relay. Everything downstream treats it
+# as the plain reply it is: same sender gates, same @mention gate, same thread.
+_ALLOWED_SUBTYPES = {"file_share", "thread_broadcast"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
 
