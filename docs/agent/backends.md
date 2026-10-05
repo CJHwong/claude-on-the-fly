@@ -115,7 +115,9 @@ Everything is read from the rollout instead, by `parse_codex_rollout`:
 
 An `error` on `task_complete` is terminal even though the turn has a completion
 record. The backend raises it before the empty-reply nudge. Authentication
-rejections get a fixed, credential-free notice; the provider's raw text stays
+rejections get a fixed, credential-free notice. A selected-model capacity error
+gets a fixed notice naming the capacity limit and suggesting a retry or a model
+change, without claiming that no work occurred. The provider's raw text stays
 in the Codex rollout and never becomes the Slack reply.
 
 Usage and the context reading already came from the rollout before this, so the numbers
