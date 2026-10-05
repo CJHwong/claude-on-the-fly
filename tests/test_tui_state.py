@@ -202,6 +202,24 @@ class TestJobs:
         # every-min fires before daily on any reasonable now.
         assert snap.jobs[0].name == "every-min"
 
+    def test_one_shot_entry_fires_at_its_time(self, tmp_path, empty_state, alive_check):
+        """An `at:` entry has no cron expression; handing None to croniter
+        crashed the whole snapshot."""
+        schedule = tmp_path / "cron.yaml"
+        _write_schedule(
+            schedule,
+            [
+                {"name": "once", "at": "2099-01-02 09:30", "prompt": "x"},
+                {"name": "every-min", "cron": "* * * * *", "prompt": "y"},
+            ],
+        )
+        snap = snapshot(empty_state, schedule, process_check=alive_check)
+        assert snap.schedule_error is None
+        once = next(j for j in snap.jobs if j.name == "once")
+        assert once.next_fire == datetime(2099, 1, 2, 9, 30)
+        assert once.cron == "at 09:30"
+        assert snap.jobs[-1].name == "once"
+
     def test_malformed_yaml_reports_error(self, tmp_path, empty_state, alive_check):
         schedule = tmp_path / "cron.yaml"
         schedule.write_text("entries: not-a-list")
