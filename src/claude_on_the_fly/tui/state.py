@@ -436,19 +436,27 @@ def _jobs_from_schedule(
 
     # croniter wants a naive local datetime (matches cron.py behavior).
     local_now = datetime.now()
-    jobs = [
-        JobInfo(
-            name=s.name,
-            cron=s.cron,
-            kind=s.kind,
-            next_fire=cron_next_fire(s.cron, local_now),
-            detail=_job_detail(s),
-            preview=_job_preview(s),
-        )
-        for s in specs
-    ]
+    jobs = [_job_info(s, local_now) for s in specs]
     jobs.sort(key=lambda j: j.next_fire)
     return jobs, None
+
+
+def _job_info(entry: CronEntry, local_now: datetime) -> JobInfo:
+    # A one-shot `at:` entry has no cron expression. Label it the way the
+    # daemon's own listing does.
+    if entry.cron is None:
+        assert entry.at is not None
+        cron, next_fire = f"at {entry.at:%H:%M}", entry.at
+    else:
+        cron, next_fire = entry.cron, cron_next_fire(entry.cron, local_now)
+    return JobInfo(
+        name=entry.name,
+        cron=cron,
+        kind=entry.kind,
+        next_fire=next_fire,
+        detail=_job_detail(entry),
+        preview=_job_preview(entry),
+    )
 
 
 # ---------------------------------------------------------------------------
