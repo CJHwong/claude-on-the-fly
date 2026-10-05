@@ -1168,6 +1168,13 @@ async def _run_codex_exec(
                 "I couldn't finish this request because the model service denied "
                 "access (403). The failure was logged.",
             )
+        if "selected model is at capacity" in detail.casefold():
+            raise agent.AgentTurnError(
+                "Codex selected model is at capacity",
+                "The selected model is at capacity, so this request stopped "
+                "without a final answer. Try again shortly, or ask me to use "
+                "a different model.",
+            )
         raise RuntimeError(detail)
     if returncode != 0:
         # A non-zero exit *after* the turn completed means the turn's work is

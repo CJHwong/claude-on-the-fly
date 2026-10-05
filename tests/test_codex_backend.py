@@ -713,6 +713,37 @@ class TestRunCodexExec:
         out = await _run_exec(proc, tmp_path, records=(_task_complete("done"),))
         assert out["body"] == "done"
 
+    @pytest.mark.parametrize("aborted", [False, True])
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "Selected model is at capacity. Please try a different model.",
+            "SELECTED MODEL IS AT CAPACITY. private provider detail",
+        ],
+    )
+    async def test_capacity_failure_has_an_actionable_safe_message(
+        self, tmp_path: Path, aborted: bool, detail: str
+    ):
+        record = (
+            _turn_aborted(detail)
+            if aborted
+            else _task_complete("partial", error={"message": detail})
+        )
+        with pytest.raises(codex_mod.agent.AgentTurnError) as raised:
+            await _run_exec(
+                _exec_proc(1),
+                tmp_path,
+                records=(_agent_message("partial"), record),
+            )
+        assert str(raised.value) == "Codex selected model is at capacity"
+        assert raised.value.public_message == (
+            "The selected model is at capacity, so this request stopped "
+            "without a final answer. Try again shortly, or ask me to use "
+            "a different model."
+        )
+        assert "partial" not in raised.value.public_message
+        assert "private provider detail" not in raised.value.public_message
+
 
 # ---------------------------------------------------------------------------
 # CodexBackend.run
