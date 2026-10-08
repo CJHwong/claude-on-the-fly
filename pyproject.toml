@@ -73,7 +73,7 @@ ignore = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", "skills"]
 
 # Coverage is deliberately NOT in `addopts`: it adds about a minute to the suite's
 # wall clock (~150s -> ~210s), and the inner loop runs `uv run pytest` constantly. Run

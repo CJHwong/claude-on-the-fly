@@ -19,6 +19,7 @@ empty configuration and ends with a sandboxed agent whose tool calls require app
 - [Configure background workers](how-to/configure-workers.md).
 - [Upgrade safely](how-to/upgrade-safely.md).
 - [Migrate old thread directories](how-to/migrate-workspaces.md).
+- [Review skill proposals from past sessions](how-to/reflect-on-skills.md).
 - [Recover a wedged daemon](how-to/recover-a-wedged-daemon.md).
 - [Troubleshoot configuration](how-to/troubleshoot-configuration.md).
 
