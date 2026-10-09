@@ -10,11 +10,8 @@ How to make it work:
   2. Run it once by hand without --apply. It lists every clone it would remove and
      why it keeps the rest:
        uv run --script sweep_workspace_clones.py
-  3. Add a bare command entry to cron.yaml:
-       - name: sweep-clones
-         cron: "10 3 * * *"
-         timeout: 900
-         command: uv run --script /path/to/sweep_workspace_clones.py --apply
+  3. Copy the entry in cron.yaml, next to this file, into
+     ~/.claude-on-the-fly/cron.yaml.
   4. Optional: install a trash command (`trash` on macOS, trash-cli's `trash-put`, or
      GNOME's `gio`) so a removal can be undone. Without one, removal is permanent.
   A data directory other than ~/.claude-on-the-fly needs --root <dir>/workspaces.

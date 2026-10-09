@@ -14,8 +14,8 @@ How to make it work:
        uv run --script mail_poll.py --senders a@example.com --seed
   3. Check what a poll would print, without marking anything read:
        uv run --script mail_poll.py --senders a@example.com --dry-run
-  4. Add a producer entry to cron.yaml. docs/how-to/cron-recipes.md has a full one:
-       command: uv run --script /path/to/mail_poll.py --senders a@example.com
+  4. Link ../ (the mail-handoff skill) into the agent's skills directory, and copy
+     the entry in ../cron.yaml into ~/.claude-on-the-fly/cron.yaml.
   Only mail from --senders is touched. Everything else stays unread and is never
   printed, so a stranger cannot put text in front of the agent.
 

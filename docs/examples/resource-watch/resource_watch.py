@@ -10,11 +10,8 @@ How to make it work:
   2. Set `slack.alert_target` or `telegram.alert_target` in
      ~/.claude-on-the-fly/config.yaml, and restart claude-cron. Without one, an alert
      only reaches the entry's log.
-  3. Add a bare command entry to cron.yaml:
-       - name: resource-watch
-         cron: "*/5 * * * *"
-         timeout: 45
-         command: uv run --script /path/to/resource_watch.py --threshold 85
+  3. Copy the entry in cron.yaml, next to this file, into
+     ~/.claude-on-the-fly/cron.yaml.
   4. Optional: pass --recovery-command to hear when usage drops again. The cron daemon
      alerts only on failure, so recovery needs its own sender, for example
        --recovery-command 'slacker.sh send @U0123 "$RESOURCE_WATCH_MESSAGE"'

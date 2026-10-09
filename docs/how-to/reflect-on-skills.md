@@ -1,6 +1,6 @@
 # Review skill proposals from past sessions
 
-The example `skill-reflect` skill under `docs/examples/skills/skill-reflect/` reads the agent's past cotf sessions and finds lessons that repeat. It turns those lessons into proposed skill changes. It posts them to one approver in Slack. Nothing changes a skill until the approver replies `approve <n>` in the digest thread.
+The example `skill-reflect` skill under `docs/examples/skill-reflect/` reads the agent's past cotf sessions and finds lessons that repeat. It turns those lessons into proposed skill changes. It posts them to one approver in Slack. Nothing changes a skill until the approver replies `approve <n>` in the digest thread.
 
 It reads Codex and Claude Code transcripts whose working directory is a cotf workspace, and the per-job cron logs. Transcripts outlive the logs, so a first run can scan months of history.
 
@@ -8,7 +8,7 @@ It reads Codex and Claude Code transcripts whose working directory is a cotf wor
 
 ```bash
 git clone https://github.com/CJHwong/claude-on-the-fly ~/claude-on-the-fly-src
-ln -s ~/claude-on-the-fly-src/docs/examples/skills/skill-reflect ~/my-agent-soul/skills/skill-reflect
+ln -s ~/claude-on-the-fly-src/docs/examples/skill-reflect ~/my-agent-soul/skills/skill-reflect
 ```
 
 Use the directory the backend loads skills from. A later `git pull` in the clone updates the skill.
@@ -43,14 +43,6 @@ Ask for `test` mode. The agent posts the digest to the approver's DM, marked as 
 
 ## 5. Schedule the weekly run
 
-Add a prompt job to the cron file:
-
-```yaml
-- name: skill-reflect
-  cron: "40 9 * * 1"
-  timeout: 3600
-  prompt: |
-    Use skill-reflect in live mode. No confirmation needed.
-```
+Copy the entry in `docs/examples/skill-reflect/cron.yaml` into your cron file.
 
 The first live run scans the last 7 days. Each later run starts where the last one ended.
