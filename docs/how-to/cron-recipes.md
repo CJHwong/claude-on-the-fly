@@ -1,0 +1,148 @@
+# Cron recipes
+
+Each recipe is one or two `cron.yaml` entries that a real deployment runs. Copy the entry, then change the paths, the skill names and the times. [Cron](cron.md) explains producers, keys and alerts; read it first.
+
+Most recipes rely on two cron daemon rules:
+
+- A bare `command` that exits non-zero, and a producer that exits non-zero, alert `slack.alert_target` or `telegram.alert_target`. At most one alert goes out per entry per 30 minutes. A script can therefore raise an alert by printing the reason and exiting 1, with no Slack code.
+- A producer that prints nothing starts no agent. A poll that finds no work costs one shell command, not a model session.
+
+Two recipes use scripts from `docs/examples/cron/`. They run with `uv run --script`, so clone the repository once:
+
+```bash
+git clone https://github.com/CJHwong/claude-on-the-fly ~/claude-on-the-fly-src
+```
+
+The cron daemon runs commands with its own `PATH`. If `uv` or `gh` is not on it, write the absolute path.
+
+## Commit the agent's own repo every night
+
+The agent edits its memory, skills and notes during the day. A producer starts a commit run only when the repo is dirty. A plain command pushes later, so the agent never holds push rights in an unattended run.
+
+```yaml
+- name: self-commit
+  cron: "30 23 * * *"
+  command: |
+    repo=~/my-agent-soul
+    dirty="$(git -C "$repo" status --porcelain)" || exit 1
+    [ -z "$dirty" ] || printf '{"key":"self-commit","change":"%s"}\n' \
+      "$(printf '%s\n%s' "$(git -C "$repo" rev-parse HEAD)" "$dirty" | git hash-object --stdin | cut -c1-12)"
+  prompt: >-
+    Work in ~/my-agent-soul. Commit every uncommitted change there in logical commits.
+    No one reviews this run: treat your commit plan as approved. Do not push.
+
+- name: self-push
+  cron: "0 0 * * *"
+  command: git -C ~/my-agent-soul push origin HEAD
+```
+
+If `git status` fails, for example because the path is wrong, the producer exits 1 and alerts instead of finding nothing forever. The key is fixed, so every run resumes one session. `change` hashes `HEAD` and the dirty file list. It moves whenever new work appears. If the same dirty set survives three nights, the key parks (`max_fires` defaults to 3), and a person should look.
+
+## Wake the agent only when there is work
+
+A watcher that runs every 15 minutes as a plain prompt starts a model session every time, even when nothing happened. Make the poll a producer instead. This one hands each failed CI run to the agent once:
+
+```yaml
+- name: ci-failures
+  cron: "*/15 * * * *"
+  max_fires: 1              # one attempt per failed run
+  max_concurrent: 2
+  command: >-
+    gh run list --repo OWNER/REPO --status failure --limit 20
+    --json databaseId,workflowName,headBranch
+    | jq -c '.[] | {key: "run-\(.databaseId)", workflow: .workflowName, branch: .headBranch}'
+  prompt: |
+    CI run {{ item.key }} ({{ item.workflow }} on {{ item.branch }}) failed.
+    Read its log with gh, find the cause, and post a short diagnosis to the team channel.
+```
+
+A failed run stays failed, so the producer prints it on every poll. `max_fires: 1` parks the key after its first run, so each failure is handled once. A failed attempt is not retried until the item's fields change.
+
+Print only the work list on stdout. Write errors to stderr: every stdout line must be a JSON object.
+
+## Run every other week
+
+Cron has no "every 14 days". Fire weekly, and let the producer print an item only on the right weeks:
+
+```yaml
+- name: sprint-review
+  cron: "0 12 * * 1"        # every Monday at noon
+  max_fires: 1
+  command: >-
+    python3 -c 'import datetime as d, json, sys;
+    today = d.date.today(); days = (today - d.date.fromisoformat(sys.argv[1])).days;
+    days >= 0 and days % 14 == 0 and print(json.dumps({"key": f"review-{today}"}))'
+    2026-09-21
+  prompt: Draft the sprint review for the two weeks ending today. Post it as a preview, not to the team.
+```
+
+The argument is the first Monday of the cadence. Each due week prints a new key, so each review is a fresh session.
+
+## Alert when a scheduled post did not happen
+
+A job can finish without posting: the agent hit a limit, or replied instead of acting. Have the posting job leave a marker, and check for the marker after its deadline:
+
+```yaml
+- name: standup
+  cron: "0 9 * * 1-5"
+  prompt: >-
+    Post the daily standup to the team channel. After the post succeeds, run
+    `touch ~/.claude-on-the-fly/state/standup/$(date +%F).posted`.
+
+- name: standup-delivered
+  cron: "30 9 * * 1-5"
+  command: >-
+    mkdir -p ~/.claude-on-the-fly/state/standup &&
+    test -f ~/.claude-on-the-fly/state/standup/$(date +%F).posted ||
+    { echo "standup not posted by 09:30"; exit 1; }
+```
+
+Silence means the post happened. For a run that skips its work entirely, see `min_tool_calls` in the [`cron.yaml` reference](../reference/cron-yaml.md).
+
+## Alert when the cron file stops loading
+
+When an edit breaks `cron.yaml`, the cron daemon logs the error and keeps the entries it loaded before. A new entry then never fires, and nothing says so. This check loads the file with cotf's own parser:
+
+```yaml
+- name: cron-config-check
+  cron: "43 * * * *"
+  timeout: 60
+  command: >-
+    "$(uv tool dir)/claude-on-the-fly/bin/python" -c
+    'from claude_on_the_fly.cron import load_config, resolve_config_path;
+    path = resolve_config_path(); print(path, len(load_config(path)), "entries")'
+```
+
+The check itself keeps running after a bad edit, because the daemon keeps the last good entries.
+
+## Watch CPU and memory without an agent
+
+`resource_watch.py` exits 1 when CPU or memory stays high. It waits out short spikes, repeats an alert at most once per reminder interval, and clears only after usage drops below a lower threshold:
+
+```yaml
+- name: resource-watch
+  cron: "*/5 * * * *"
+  timeout: 45
+  command: >-
+    uv run --script ~/claude-on-the-fly-src/docs/examples/cron/resource_watch.py
+    --threshold 85 --recovery-threshold 70 --sustain-seconds 300 --reminder-seconds 3600
+```
+
+The state lives in `~/.claude-on-the-fly/state/resource-watch.json`. Recovery sends nothing; the entry's log records it.
+
+## Sweep finished clones from workspaces
+
+Agents clone repositories into their conversation workspaces, and cotf never removes them. `sweep_workspace_clones.py` removes a clone only when it is older than `--days`, clean, fully pushed, and not lending its objects to another clone. It moves the clone to the trash when `trash`, `trash-put` or `gio` is installed.
+
+```yaml
+- name: sweep-clones
+  cron: "10 3 * * *"
+  timeout: 900
+  command: uv run --script ~/claude-on-the-fly-src/docs/examples/cron/sweep_workspace_clones.py --apply
+```
+
+Run it once without `--apply` first. It prints what it would remove and why it keeps the rest.
+
+## Review the agent's skills every week
+
+The `skill-reflect` example skill reads the week's transcripts and proposes skill changes to one approver. See [Review skill proposals from past sessions](reflect-on-skills.md).

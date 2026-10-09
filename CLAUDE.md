@@ -102,6 +102,8 @@ Operator docs follow Diátaxis and start at `docs/index.md`:
 - `docs/reference/` is the exact schema, defaults, and lifecycle contract.
 - `docs/explanation/` describes security and design concepts.
 - `docs/agent/` remains contributor-only implementation notes.
+- `docs/examples/` holds the scripts and skills that how-to pages point at. They are not
+  part of the package; their tests run with the suite.
 
 Keep each page focused on one of those jobs. A setting change must update the packaged
 `config.yaml` template and the reference lifecycle table; add how-to or explanation only
