@@ -72,6 +72,8 @@ Example: [`docs/examples/mail-handoff/`](../examples/mail-handoff/).
 2. Link `docs/examples/mail-handoff` into the agent's skills directory.
 3. Copy `cron.yaml` into your cron file, with your senders and a fallback Slack user.
 
+To allow a whole domain, write `@example.com` in `--senders`. A domain also lets automated mail through, such as calendar invites from colleagues. Narrow it with the Gmail query: `--query "is:unread -filename:ics"` drops every message with a calendar attachment.
+
 The person answers in the DM thread. If that DM is a conversation the chat frontend already answers in, the reply arrives as an ordinary chat turn. The frontend adds the earlier messages of the thread as context, so the agent sees its summary and the Gmail id on the summary's last line. The skill's second phase covers that turn. The cron session itself is not resumed.
 
 Google expires the login of an OAuth app in "Testing" status after 7 days. Publish the app, or schedule a check that alerts when `gws` stops answering.
