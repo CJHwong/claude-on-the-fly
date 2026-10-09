@@ -28,6 +28,9 @@ claude-watchdog = "claude_on_the_fly.watchdog:main"
 
 [dependency-groups]
 dev = [
+    # docs/examples/cron/resource_watch.py declares it inline for operators; the
+    # suite needs it too, or its tests skip in CI.
+    "psutil>=5.9",
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",

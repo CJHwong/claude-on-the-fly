@@ -5,6 +5,14 @@
 # ///
 """Pick the cotf sessions most likely to hold a skill lesson.
 
+How to make it work:
+  1. Install uv (https://docs.astral.sh/uv/). It installs pyyaml on the first run.
+  2. Write ~/.claude-on-the-fly/skill-reflect.yaml; the Configuration section of
+     ../SKILL.md lists every key.
+  3. The skill runs this script in its step 1. To run it by hand:
+       uv run --script select_candidates.py --days 7 --out /tmp/sr/candidates.json
+     It prints the counts and writes candidates.json. It sends nothing.
+
 Deterministic and model-free. Reads Codex rollouts (through the Codex thread index) and
 Claude Code transcripts whose working directory is a cotf workspace, plus the per-job
 cron logs, and writes candidates.json for the skill-reflect skill. The model never

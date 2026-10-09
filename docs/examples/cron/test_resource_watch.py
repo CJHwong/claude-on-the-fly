@@ -1,4 +1,4 @@
-"""Tests for resource_watch.py: the state machine, and one run against the real host."""
+"""Tests for resource_watch.py: the state machine, and runs against the real host."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
-pytest.importorskip("psutil")
 
 SPEC = importlib.util.spec_from_file_location(
     "resource_watch", Path(__file__).with_name("resource_watch.py")
@@ -37,28 +35,34 @@ def usage(cpu: float, memory: float = 10) -> dict[str, float]:
 
 
 def test_a_short_spike_does_not_alert():
-    state, alert = watch.step({}, usage(95), 0, ARGS)
+    state, alert, _ = watch.step({}, usage(95), 0, ARGS)
     assert alert is None and state == {"high_since": 0}
-    state, alert = watch.step(state, usage(95), 200, ARGS)
+    state, alert, _ = watch.step(state, usage(95), 200, ARGS)
     assert alert is None
 
 
 def test_sustained_load_alerts_once_then_reminds():
-    state, _ = watch.step({}, usage(95), 0, ARGS)
-    state, alert = watch.step(state, usage(10, 96), 300, ARGS)
+    state, _, _ = watch.step({}, usage(95), 0, ARGS)
+    state, alert, _ = watch.step(state, usage(10, 96), 300, ARGS)
     assert alert == "cpu 10%, memory 96%; memory high for 5 min"
-    state, alert = watch.step(state, usage(95), 600, ARGS)
+    state, alert, _ = watch.step(state, usage(95), 600, ARGS)
     assert alert is None  # inside the reminder window
-    state, alert = watch.step(state, usage(95), 3900, ARGS)
+    state, alert, _ = watch.step(state, usage(95), 3900, ARGS)
     assert alert is not None and state["alerted_at"] == 3900
 
 
 def test_the_alert_clears_only_below_the_recovery_threshold():
     state = {"high_since": 0, "alerted_at": 300}
-    kept, alert = watch.step(state, usage(85), 400, ARGS)
+    kept, alert, _ = watch.step(state, usage(85), 400, ARGS)
     assert kept == state and alert is None
-    cleared, alert = watch.step(state, usage(70), 500, ARGS)
-    assert cleared == {} and alert is None
+    cleared, alert, recovered = watch.step(state, usage(70), 500, ARGS)
+    assert (
+        cleared == {}
+        and alert is None
+        and recovered == "recovered: cpu 70%, memory 10%"
+    )
+    _, _, recovered = watch.step({"high_since": 0}, usage(70), 500, ARGS)
+    assert recovered is None  # it never alerted, so there is nothing to clear
 
 
 def test_recovery_above_threshold_is_refused():
@@ -102,3 +106,33 @@ def test_one_real_sample(tmp_path):
         )
         == 0
     )
+
+
+def test_recovery_runs_the_command_once(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"high_since": 0, "alerted_at": 1}))
+    out = tmp_path / "sent.txt"
+    monkeypatch.setattr(watch, "sample", lambda: usage(5))
+    command = f'printf "%s" "$RESOURCE_WATCH_MESSAGE" > {out}'
+    assert watch.main(["--state", str(path), "--recovery-command", command]) == 0
+    assert out.read_text() == "recovered: cpu 5%, memory 10%"
+    assert json.loads(path.read_text()) == {}
+    out.unlink()
+    assert watch.main(["--state", str(path), "--recovery-command", command]) == 0
+    assert not out.exists()  # already clear: no second notice
+
+
+def test_a_failing_recovery_command_alerts(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"high_since": 0, "alerted_at": 1}))
+    monkeypatch.setattr(watch, "sample", lambda: usage(5))
+    assert watch.main(["--state", str(path), "--recovery-command", "exit 3"]) == 1
+    assert "--recovery-command exited 3" in capsys.readouterr().out
+
+
+def test_recovery_without_a_command_only_logs(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"high_since": 0, "alerted_at": 1}))
+    monkeypatch.setattr(watch, "sample", lambda: usage(5))
+    assert watch.main(["--state", str(path)]) == 0
+    assert "recovered" in capsys.readouterr().out

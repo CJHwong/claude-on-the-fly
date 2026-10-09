@@ -8,6 +8,14 @@ The model writes proposals.json. This script decides what survives: every eviden
 must exist in candidates.json, the threshold must hold, the target's owner must allow
 the action, and an earlier rejection must not come back. It renders digest.md (the Slack
 message) and digest-detail.md (the attachment with every proposed text).
+
+How to make it work:
+  1. Install uv (https://docs.astral.sh/uv/). No other dependency.
+  2. The skill runs this script in its steps 5 and 7, after select_candidates.py has
+     written candidates.json and the model has written proposals.json into the same
+     run directory. To run it by hand:
+       uv run --script finalize.py --run-dir /tmp/sr --mode dry-run
+  --record writes the state file and is meant for the skill's live mode only.
 """
 
 from __future__ import annotations
