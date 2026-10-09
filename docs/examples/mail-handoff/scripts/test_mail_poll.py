@@ -173,3 +173,25 @@ def test_missing_gws_and_bad_output(tmp_path, monkeypatch):
     fake.chmod(0o755)
     with pytest.raises(RuntimeError, match="printed no JSON"):
         poll.gws("users")
+
+
+@pytest.mark.parametrize(
+    "address,hit",
+    [
+        ("boss@example.com", True),
+        ("anyone@corp.test", True),
+        ("x@sub.corp.test", False),
+        ("x@corp.test.evil", False),
+        ("corp.test", False),
+        ("", False),
+    ],
+)
+def test_allowed_takes_addresses_and_domains(address, hit):
+    assert poll.allowed(address, {"boss@example.com", "@corp.test"}) is hit
+
+
+def test_a_domain_lets_every_address_there_through(mailbox, capsys):
+    assert (
+        poll.main(["--senders", "@example.com", "--state", str(mailbox["state"])]) == 0
+    )
+    assert [i["key"] for i in printed(capsys)] == ["m1", "m3"]

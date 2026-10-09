@@ -17,7 +17,10 @@ How to make it work:
   4. Link ../ (the mail-handoff skill) into the agent's skills directory, and copy
      the entry in ../cron.yaml into ~/.claude-on-the-fly/cron.yaml.
   Only mail from --senders is touched. Everything else stays unread and is never
-  printed, so a stranger cannot put text in front of the agent.
+  printed, so a stranger cannot put text in front of the agent. An entry that starts
+  with @ allows a whole domain (`@example.com`, not its subdomains). A domain lets
+  automated mail through as well; narrow it with --query, for example
+  `--query "is:unread -filename:ics"` drops calendar invites.
 
 Each matching message is marked read before it is printed, and its id is kept in the
 state file. Either one alone stops a repeat; together a crash between them cannot.
@@ -120,7 +123,7 @@ def poll(args: argparse.Namespace, processed: dict[str, str]) -> list[dict]:
             continue
         try:
             meta = metadata(message_id)
-            if meta["from"] not in args.senders:
+            if not allowed(meta["from"], args.senders):
                 continue
             if not args.dry_run:
                 mark_read(message_id)
@@ -135,13 +138,19 @@ def poll(args: argparse.Namespace, processed: dict[str, str]) -> list[dict]:
     return items
 
 
+def allowed(address: str, senders: set[str]) -> bool:
+    """An exact address, or `@domain` for every address at that domain."""
+    local, at, domain = address.rpartition("@")
+    return address in senders or bool(local and at and f"@{domain}" in senders)
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument(
         "--senders",
         required=True,
         type=lambda raw: {s.strip().lower() for s in raw.split(",") if s.strip()},
-        help="comma-separated addresses; mail from anyone else is ignored",
+        help="comma-separated addresses or @domains; mail from anyone else is ignored",
     )
     parser.add_argument("--query", default="is:unread", help="Gmail search query")
     parser.add_argument("--limit", type=int, default=50)
