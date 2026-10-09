@@ -1,0 +1,7 @@
+# Copy this entry into the `entries:` list of ~/.claude-on-the-fly/cron.yaml.
+# Write ~/.claude-on-the-fly/skill-reflect.yaml first (see SKILL.md, Configuration),
+# and review one dry run and one test digest before you schedule the live run.
+- name: skill-reflect
+  cron: "40 9 * * 1"        # Monday 09:40
+  timeout: 3600
+  prompt: Use the skill-reflect skill in live mode. No confirmation needed.

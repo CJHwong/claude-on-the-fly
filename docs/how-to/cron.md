@@ -46,6 +46,8 @@ dashboard's cron tab shows the highlighted entry's command and prompt, with a
 `prompt_file` inlined, so you can read what an entry runs without opening the file. Press
 `v` there for the daemon log instead.
 
+For entries a real deployment runs, see [Cron recipes](cron-recipes.md).
+
 ## The three shapes
 
 | Keys | What happens |
