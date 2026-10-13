@@ -14,7 +14,7 @@ This skill writes procedures: how to do a class of task. A lesson about how the 
 | Mode | What it does | Who triggers it |
 | --- | --- | --- |
 | `dry-run` | Steps 1 to 5. Writes files only. Sends nothing. | A person testing the skill |
-| `test` | Steps 1 to 6. Posts the digest to the approver's DM, marked as a test. Does not record state. | A person testing the skill |
+| `test` | Steps 1 to 6. Posts the digest to `<digest_to>`, marked as a test. Does not record state. | A person testing the skill |
 | `live` | Steps 1 to 7. | The weekly schedule |
 | `apply` | Reads an approval reply in a digest thread and runs `references/apply.md`. | The approver's reply |
 
@@ -27,6 +27,7 @@ Read `~/.claude-on-the-fly/skill-reflect.yaml` first. If it is missing, stop and
 ```yaml
 soul_root: ~/my-agent-soul        # the repo whose skills/ this agent owns
 approver: U0123456789             # Slack user id; only this user's replies count
+digest_to: C0123456789            # optional; a channel id or @handle that gets the digest. Default: @<approver>
 slack_cli: ~/my-agent-soul/skills/slacker-sh/slacker.sh
 schedule_file: ~/my-agent-soul/schedule.yaml   # the cotf cron file
 new_skill_dir: skills             # where a new skill goes, under soul_root
@@ -121,10 +122,12 @@ The script checks every proposal against `candidates.json`: known evidence ids, 
 ### 6. Post the digest (`test` and `live` only)
 
 ```bash
-"<slack_cli>" send @<approver> "$(cat "$RUN_DIR/digest.md")" --no-unfurl
+"<slack_cli>" send "<digest_to>" "$(cat "$RUN_DIR/digest.md")" --no-unfurl
 ```
 
-Read the returned XML for the message permalink. Attach `digest-detail.md` as a reply in that thread: `"<slack_cli>" send @<approver> "Proposed text and skill usage" --thread <permalink> --file "$RUN_DIR/digest-detail.md"`. Then read the parent message back with `read-message` and confirm it arrived. Write the permalink to `RUN_DIR/posted.json`.
+If `digest_to` is not set, use `@<approver>`.
+
+Read the returned XML for the message permalink. Attach `digest-detail.md` as a reply in that thread: `"<slack_cli>" send "<digest_to>" "Proposed text and skill usage" --thread <permalink> --file "$RUN_DIR/digest-detail.md"`. In a channel, the agent sees only the messages that tag it. So when `<digest_to>` is a channel, end that reply text with: `Tag me in your reply, or I will not see it.` Then read the parent message back with `read-message` and confirm it arrived. Write the permalink to `RUN_DIR/posted.json`.
 
 ### 7. Record state (`live` only)
 

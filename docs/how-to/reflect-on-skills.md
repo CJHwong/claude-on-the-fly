@@ -1,6 +1,6 @@
 # Review skill proposals from past sessions
 
-The example `skill-reflect` skill under `docs/examples/skill-reflect/` reads the agent's past cotf sessions and finds lessons that repeat. It turns those lessons into proposed skill changes. It posts them to one approver in Slack. Nothing changes a skill until the approver replies `approve <n>` in the digest thread.
+The example `skill-reflect` skill under `docs/examples/skill-reflect/` reads the agent's past cotf sessions and finds lessons that repeat. It turns those lessons into proposed skill changes. It posts them to one approver in Slack, by DM or in a channel. Nothing changes a skill until the approver replies `approve <n>` in the digest thread.
 
 It reads Codex and Claude Code transcripts whose working directory is a cotf workspace, and the per-job cron logs. Transcripts outlive the logs, so a first run can scan months of history.
 
@@ -39,7 +39,9 @@ It writes `candidates.json`, `proposals.json`, `digest.md` and `digest-detail.md
 
 ## 4. Test digest
 
-Ask for `test` mode. The agent posts the digest to the approver's DM, marked as a test. A reply to a test digest is never applied.
+Ask for `test` mode. The agent posts the digest where `digest_to` points (the approver's DM by default), marked as a test. A reply to a test digest is never applied.
+
+To post the digest in a channel instead, set `digest_to` to the channel id. Only the approver's reply still counts, and in a channel that reply must tag the agent.
 
 ## 5. Schedule the weekly run
 
