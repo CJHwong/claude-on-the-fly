@@ -2154,13 +2154,17 @@ class SlackFrontend(Frontend):
         # `(button)` is load-bearing rather than decoration: a tap has no Slack
         # message behind it, so a line that looked exactly like a typed one would
         # send the next reader to a permalink that does not exist. It goes last
-        # because the typed path already puts its own suffix there.
+        # because the typed path already puts its own suffix there. The prefix
+        # names the thread, as a typed line does; `menu-ts` names the menu the
+        # tap answered, and is left out when the payload carries no message.
+        menu = f" [menu-ts: {ts}]" if ts else ""
         logger.info(
-            "slack %s/%s: %s %s (button)",
+            "slack %s/%s: %s%s %s (button)",
             channel,
             thread_ts or ts,
             sender_marker(sender_id, display),
-            label[:80],
+            menu,
+            label,
         )
         # Same sender marker a typed message carries, so the agent sees who
         # pressed the button. A tap is a turn like any other, so it pays the

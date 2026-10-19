@@ -3111,6 +3111,45 @@ class TestReplySoftLimit:
         # that a tap does not leave behind.
         assert line.endswith("(button)"), line
 
+    async def test_a_tap_log_line_names_the_menu_it_answered(self, frontend, caplog):
+        """The prefix names the thread, which can hold many menus; the line
+        also names the menu message the tap answered."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_ALLOWED", "name": "testuser"},
+                    "channel": {"id": "C1"},
+                    "message": {"ts": "300.0", "thread_ts": "t1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        lines = [r.getMessage() for r in caplog.records]
+        inbound = [ln for ln in lines if ln.startswith("slack C1/t1: ")]
+        assert inbound, f"no inbound line for the tap; got {lines}"
+        assert "[menu-ts: 300.0] Do the thing (button)" in inbound[0]
+
+    async def test_a_tap_without_a_message_logs_no_menu_ts(self, frontend, caplog):
+        """No message in the payload means no menu to name: the field is left
+        out rather than printed empty."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_ALLOWED", "name": "testuser"},
+                    "channel": {"id": "C1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        lines = [r.getMessage() for r in caplog.records if "(button)" in r.getMessage()]
+        assert lines, "no inbound line for the tap"
+        assert "menu-ts" not in lines[0]
+        assert lines[0].endswith('"testuser"] Do the thing (button)'), lines[0]
+
     async def test_a_dropped_tap_writes_no_inbound_line(self, frontend, caplog):
         """Logged at dispatch, not on arrival: a tap from someone who may not
         send never reached the agent, so it must not read as an inbound
