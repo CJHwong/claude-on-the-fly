@@ -607,7 +607,10 @@ def cron_blocks(path: Path):
 
 
 def skill_inventory(
-    config: Config, codex_home: Path, claude_home: Path
+    config: Config,
+    codex_home: Path,
+    claude_home: Path,
+    source_files: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Every skill on disk the agent could load: the soul repo's own, then both plugin caches."""
     roots = [home / "plugins" / "cache" for home in (codex_home, claude_home)]
@@ -621,11 +624,21 @@ def skill_inventory(
             text = path.as_posix()
             if any(skip in text for skip in INVENTORY_SKIP):
                 continue
-            inventory.setdefault(skill_name(text, config), owner_of(text, config))
+            name = skill_name(text, config)
+            owner = owner_of(text, config)
+            if name in inventory:
+                continue
+            inventory[name] = owner
+            if source_files is not None and owner == "local":
+                source_files[name] = str(path.resolve())
     return inventory
 
 
-def usage_report(sessions: list[Session], inventory: dict[str, str]) -> dict:
+def usage_report(
+    sessions: list[Session],
+    inventory: dict[str, str],
+    source_files: dict[str, str] | None = None,
+) -> dict:
     reads: Counter = Counter()
     for session in sessions:
         for (name, _owner), _count in session.skills_read.items():
@@ -640,6 +653,7 @@ def usage_report(sessions: list[Session], inventory: dict[str, str]) -> dict:
         "sessions_reading": used,
         "unused_in_window": unused,
         "inventory": inventory,
+        "source_files": source_files or {},
     }
 
 
@@ -676,7 +690,8 @@ def run(args: argparse.Namespace) -> dict:
     now = datetime.now(UTC)
     since = load_cursor(args.state) or now - timedelta(days=args.days)
     workspaces = args.cotf_home / "workspaces"
-    inventory = skill_inventory(config, args.codex_home, args.claude_home)
+    source_files: dict[str, str] = {}
+    inventory = skill_inventory(config, args.codex_home, args.claude_home, source_files)
     sessions = codex_manifest(
         args.codex_home / "state_5.sqlite", since, workspaces
     ) + claude_manifest(args.claude_home / "projects", since, workspaces)
@@ -708,7 +723,7 @@ def run(args: argparse.Namespace) -> dict:
         },
         "candidates": [candidate(s) for s in ranked],
         "cron_recoveries": cron_recoveries(args.cotf_home / "logs", since),
-        "skill_usage": usage_report(sessions, inventory),
+        "skill_usage": usage_report(sessions, inventory, source_files),
     }
 
 

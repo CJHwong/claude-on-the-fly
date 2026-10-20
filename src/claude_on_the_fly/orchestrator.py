@@ -121,6 +121,11 @@ SUGGESTIONS_TEMPLATE = (
     'Never offer "wait", "monitor" or "leave it as is" as filler. Offer a '
     "cancel option only when acting would be hard to undo.\n"
     "\n"
+    "Offer an option only when it addresses an unresolved choice or next "
+    "action tied to the user's stated goal.\n"
+    "If the reply completes the request and leaves no choice, return an "
+    "empty array.\n"
+    "\n"
     "Example of a complete reply:\n"
     "The Eiffel Tower is in Paris, built for the 1889 World's Fair.\n"
     '<suggestions>["Tell me more about its history", "Show me photos", '

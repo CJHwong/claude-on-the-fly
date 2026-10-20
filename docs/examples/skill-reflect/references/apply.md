@@ -21,9 +21,14 @@ Read `posted.json` in each `~/.claude-on-the-fly/state/skill-reflect/runs/*/` di
 
 Handle one proposal at a time. Read its patch file and the current target file before you change anything. If the target changed since the digest and the patch no longer fits, do not force it. Report that proposal as stale.
 
+For a local patch, compare the current skill hash with `evaluation.source_skill_sha256`.
+Compare the proposal hash with `evaluation.candidate_sha256`. If either differs, mark the proposal stale and stop its application.
+The proposal contains the complete tested skill. Apply those exact bytes after approval.
+Check that the resulting skill hash equals `evaluation.candidate_sha256`.
+
 | Action | Steps |
 | --- | --- |
-| `patch`, owner `local` | Edit the skill under `<soul_root>/skills/` as the patch file says. Commit it the way the soul repo's own instructions say. Push only if they say so. |
+| `patch`, owner `local` | Apply the complete tested skill under `<soul_root>/skills/` after the hash checks above. Commit it as the soul repo requires. Push only if those instructions require it. |
 | `new-skill` | Create the skill directory under `<soul_root>/<new_skill_dir>/` from the patch file. Commit as above. |
 | `patch`, owner `upstream` | Work in a clone of the marketplace repo, on a new branch, following that repo's own contribution rules. Apply the patch to the plugin's source skill, not the installed cache. Run the focused eval below. Open a **draft** PR and put the eval scores in its body. The approver marks it ready. Never change the copy under a `plugins/cache/` directory. |
 | `profile-note` | Add the preference to `<soul_root>/<profile_dir>/<id>/profile.md` for that user only. |
@@ -42,3 +47,8 @@ The skill's full suite can cost more than the change is worth. A small focused s
 
 1. Update `~/.claude-on-the-fly/state/skill-reflect/state.json`: set each proposal's status to `applied`, `rejected` (with the approver's reason), or `stale`.
 2. Reply once in the thread. For each proposal number, give the result: the commit, the draft PR link, `rejected`, or `stale` with the reason.
+
+For an applied local patch, retain `evaluation` and record `applied_version`, `applied_at`, and the commit.
+Set `followup` to `{"status": "pending", "evidence": []}`.
+The next weekly review checks later sessions for recurrence and regressions.
+That review records observations, not proof that the patch caused the result.
