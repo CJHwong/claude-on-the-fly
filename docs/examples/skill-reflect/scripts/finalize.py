@@ -86,9 +86,9 @@ def problem(prop: dict, ev: Evidence, run_dir: Path, rejected: dict) -> str | No
     ):
         return f"patch file not found: {prop.get('patch_file')}"
     if prop["action"] == "patch" and ev.inventory.get(prop["target"]) == "local":
-        reason, _summary = evaluation_check(prop, run_dir, ev)
+        reason, _versions = patch_versions(prop, run_dir, ev)
         if reason:
-            return f"paired evaluation rejected: {reason}"
+            return reason
     if seen := rejected.get(rule_key(prop["target"], prop["rule"])):
         return f"rejected before ({seen})"
     return None
@@ -131,225 +131,26 @@ def sha256_file(path: Path) -> str | None:
         return None
 
 
-def evaluation_check(
-    prop: dict, run_dir: Path, ev: Evidence
-) -> tuple[str | None, dict | None]:
-    """Validate paired local-skill results and summarize their evidence."""
-    eval_file = run_file(run_dir, prop.get("evaluation_file", ""))
-    if not eval_file or not eval_file.is_file():
-        return "evaluation file is required under the run directory", None
-    try:
-        evaluation = json.loads(eval_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        return "evaluation file is invalid", None
-    if (
-        not isinstance(evaluation, dict)
-        or type(evaluation.get("schema_version")) is not int
-        or evaluation["schema_version"] != 1
-    ):
-        return "evaluation schema version must be 1", None
-    if evaluation.get("target") != prop["target"]:
-        return "evaluation target does not match proposal", None
-
-    patch_file = run_file(run_dir, prop.get("patch_file", ""))
-    if not patch_file or evaluation.get("patch_file") != prop["patch_file"]:
-        return "evaluation patch file does not match proposal", None
-    patch_hash = sha256_file(patch_file)
-    if not patch_hash or patch_hash != evaluation.get("patch_sha256"):
-        return "patch hash does not match evaluation", None
-
-    source_name = evaluation.get("source_skill_file", "")
-    source_file = Path(source_name) if isinstance(source_name, str) else Path()
-    if not source_file.is_absolute():
-        return "source skill file must be absolute", None
-    trusted_name = ev.source_files.get(prop["target"])
-    trusted_file = Path(trusted_name) if isinstance(trusted_name, str) else Path()
-    if (
-        not trusted_file.is_absolute()
-        or source_file.resolve() != trusted_file.resolve()
-    ):
-        return "source skill path does not match selector inventory", None
-    source_hash = sha256_file(source_file)
-    if not source_hash or source_hash != evaluation.get("source_skill_sha256"):
-        return "source skill hash does not match evaluation", None
-
-    arms = evaluation.get("arms")
-    if not isinstance(arms, dict) or set(arms) != {"original", "candidate"}:
-        return "evaluation must contain original and candidate arms", None
-    arm_files = {}
-    for arm in ("original", "candidate"):
-        item = arms[arm]
-        if not isinstance(item, dict):
-            return f"evaluation {arm} arm is invalid", None
-        path = run_file(run_dir, item.get("file", ""))
-        if not path or not path.is_file():
-            return (
-                f"evaluation {arm} file is missing or outside the run directory",
-                None,
-            )
-        actual_hash = sha256_file(path)
-        if not actual_hash or actual_hash != item.get("sha256"):
-            return f"evaluation {arm} hash does not match file", None
-        arm_files[arm] = path
-    if arms["original"]["sha256"] != source_hash:
-        return "original skill hash does not match source skill", None
-    if (
-        arms["candidate"]["sha256"] != patch_hash
-        or arm_files["candidate"].read_bytes() != patch_file.read_bytes()
-    ):
-        return "candidate skill does not match proposed full skill file", None
-
-    labels = evaluation.get("blind_labels")
-    if (
-        not isinstance(labels, dict)
-        or set(labels) != {"original", "candidate"}
-        or any(
-            not isinstance(label, str) or label not in {"A", "B"}
-            for label in labels.values()
-        )
-        or len(set(labels.values())) != 2
-    ):
-        return "blind labels must assign A and B to both arms", None
-    label_to_arm = {label: arm for arm, label in labels.items()}
-    declared, reason = evaluation_case_definitions(evaluation, eval_file, run_dir)
-    if reason:
-        return reason, None
-    result, reason = validate_evaluation_cases(
-        evaluation.get("cases"), label_to_arm, run_dir, declared
-    )
-    if reason:
-        return reason, None
-    summary = {
-        "source_skill_sha256": source_hash,
-        "original_sha256": arms["original"]["sha256"],
-        "candidate_sha256": arms["candidate"]["sha256"],
-        "patch_sha256": patch_hash,
-        "evaluation_sha256": sha256_file(eval_file),
-        "case_sha256": evaluation["case_sha256"],
-        **result,
+def patch_versions(prop: dict, run_dir: Path, ev: Evidence) -> tuple[str | None, dict]:
+    """Bind approval to the installed source and the proposed replacement."""
+    patch = run_file(run_dir, prop.get("patch_file", ""))
+    if patch is None:
+        return "patch file must stay under the run directory", {}
+    candidate_hash = sha256_file(patch)
+    if candidate_hash is None:
+        return "patch file is unreadable", {}
+    source_name = ev.source_files.get(prop["target"])
+    if not source_name:
+        return "source skill is missing from the inventory; select candidates again", {}
+    source = Path(source_name)
+    source_hash = sha256_file(source)
+    if source_hash is None:
+        return "source skill is unreadable; select candidates again", {}
+    return None, {
+        "source_skill_file": str(source.resolve()),
+        "source_sha256": source_hash,
+        "candidate_sha256": candidate_hash,
     }
-    return None, summary
-
-
-def evaluation_case_definitions(
-    evaluation: dict, eval_file: Path, run_dir: Path
-) -> tuple[dict, str | None]:
-    case_path = run_file(
-        run_dir, str(eval_file.relative_to(run_dir.resolve()).parent / "cases.json")
-    )
-    if not case_path or not case_path.is_file():
-        return {}, "evaluation case file is required under the run directory"
-    try:
-        document = json.loads(case_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}, "evaluation case file is invalid"
-    cases = document.get("cases") if isinstance(document, dict) else None
-    if not isinstance(cases, list) or not cases:
-        return {}, "evaluation case file must contain cases"
-    actual_hash = hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest()
-    if actual_hash != evaluation.get("case_sha256"):
-        return {}, "evaluation case file hash does not match recorded cases"
-    declared = {}
-    for case in cases:
-        if not isinstance(case, dict):
-            return {}, "evaluation case file contains an invalid case"
-        case_id, kind = case.get("case_id"), case.get("kind")
-        if not isinstance(case_id, str) or not case_id or case_id in declared:
-            return {}, "evaluation case file needs unique case IDs"
-        if not isinstance(kind, str) or kind not in {"targeted", "control"}:
-            return {}, "evaluation case file contains an invalid kind"
-        declared[case_id] = kind
-    return declared, None
-
-
-def validate_evaluation_cases(
-    rows: object, label_to_arm: dict, run_dir: Path, declared: dict
-) -> tuple[dict, str | None]:
-    if not isinstance(rows, list) or not rows:
-        return {}, "evaluation cases are missing"
-    paired: dict[tuple[str, int], dict[str, dict]] = {}
-    kinds: dict[str, str] = {}
-    for row in rows:
-        reason = validate_evaluation_row(row, label_to_arm, run_dir)
-        if reason:
-            return {}, reason
-        case_id, repeat = row["case_id"], row["repeat"]
-        if declared.get(case_id) != row["kind"]:
-            return {}, "recorded cases do not match declared cases"
-        if case_id in kinds and kinds[case_id] != row["kind"]:
-            return {}, "evaluation case kind changed between repeats"
-        kinds[case_id] = row["kind"]
-        pair = paired.setdefault((case_id, repeat), {})
-        arm = label_to_arm[row["arm_label"]]
-        if arm in pair:
-            return {}, "evaluation has a duplicate arm and repeat"
-        pair[arm] = row
-    if set(kinds) != set(declared):
-        return {}, "recorded cases do not cover all declared cases"
-    if any(set(pair) != {"original", "candidate"} for pair in paired.values()):
-        return {}, "evaluation has an unpaired case and repeat"
-    return score_evaluation_pairs(paired, kinds)
-
-
-def validate_evaluation_row(
-    row: object, label_to_arm: dict, run_dir: Path
-) -> str | None:
-    if not isinstance(row, dict):
-        return "evaluation case row is invalid"
-    if not isinstance(row.get("case_id"), str) or not row["case_id"]:
-        return "evaluation case id is missing"
-    if not isinstance(row.get("kind"), str) or row["kind"] not in {
-        "targeted",
-        "control",
-    }:
-        return "evaluation case kind must be targeted or control"
-    if (
-        not isinstance(row.get("repeat"), int)
-        or isinstance(row["repeat"], bool)
-        or row["repeat"] < 1
-    ):
-        return "evaluation repeat must be a positive integer"
-    if (
-        not isinstance(row.get("arm_label"), str)
-        or row["arm_label"] not in label_to_arm
-    ):
-        return "evaluation case has an unknown blind label"
-    if not isinstance(row.get("grade"), str) or row["grade"] not in {"pass", "fail"}:
-        return "evaluation grade must be pass or fail"
-    output = run_file(run_dir, row.get("output_file", ""))
-    if not output or not output.is_file() or not output.stat().st_size:
-        return "recorded output is missing or outside the run directory"
-    if sha256_file(output) != row.get("output_sha256"):
-        return "output hash does not match recorded output"
-    return None
-
-
-def score_evaluation_pairs(
-    paired: dict[tuple[str, int], dict[str, dict]], kinds: dict[str, str]
-) -> tuple[dict, str | None]:
-    targeted_gains = 0
-    targeted_cases = {case for case, kind in kinds.items() if kind == "targeted"}
-    control_cases = {case for case, kind in kinds.items() if kind == "control"}
-    if not targeted_cases or not control_cases:
-        return {}, "evaluation needs targeted and control cases"
-    for (case_id, _repeat), arms in paired.items():
-        original = arms["original"]["grade"]
-        candidate = arms["candidate"]["grade"]
-        if kinds[case_id] == "control" and (original != "pass" or candidate != "pass"):
-            return {}, "control candidate did not pass on both arms"
-        if original == "pass" and candidate == "fail":
-            return {}, "candidate regressed on an evaluation case"
-        if kinds[case_id] == "targeted" and original == "fail" and candidate == "pass":
-            targeted_gains += 1
-    if not targeted_gains:
-        return {}, "evaluation has no targeted improvement"
-    return {
-        "targeted_cases": len(targeted_cases),
-        "control_cases": len(control_cases),
-        "targeted_gains": targeted_gains,
-        "targeted_regressions": 0,
-        "paired_case_repeats": len(paired),
-    }, None
 
 
 def owner_label(prop: dict, ev: Evidence) -> str:
@@ -397,7 +198,7 @@ def validate(
             "owner": owner_label(prop, ev),
         }
         if prop["action"] == "patch" and ev.inventory.get(prop["target"]) == "local":
-            _reason, kept_prop["evaluation"] = evaluation_check(prop, run_dir, ev)
+            _reason, kept_prop["versions"] = patch_versions(prop, run_dir, ev)
         kept.append(kept_prop)
     return kept, dropped, ev, candidates
 
@@ -450,20 +251,6 @@ def plural(count: int, noun: str, many: str = "") -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {many or noun + 's'}"
 
 
-def render_evaluation(evaluation: dict) -> list[str]:
-    return [
-        "Paired evaluation: "
-        f"{plural(evaluation['targeted_cases'], 'targeted case')}, "
-        f"{plural(evaluation['control_cases'], 'control case')}, "
-        f"{evaluation['targeted_gains']} targeted gains, "
-        f"{evaluation['targeted_regressions']} regressions.",
-        f"Original skill SHA-256: `{evaluation['original_sha256']}`",
-        f"Candidate skill SHA-256: `{evaluation['candidate_sha256']}`",
-        f"Proposal SHA-256: `{evaluation['patch_sha256']}`",
-        "",
-    ]
-
-
 def render_detail(kept: list[dict], candidates: dict, run_dir: Path) -> str:
     out = ["# Skill proposals: proposed text", ""]
     for prop in kept:
@@ -477,8 +264,12 @@ def render_detail(kept: list[dict], candidates: dict, run_dir: Path) -> str:
             out += [(run_dir / prop["patch_file"]).read_text().rstrip(), ""]
         else:
             out += ["No text change. This is a note for the skill's owner.", ""]
-        if evaluation := prop.get("evaluation"):
-            out += render_evaluation(evaluation)
+        if versions := prop.get("versions"):
+            out += [
+                f"Source skill SHA-256: `{versions['source_sha256']}`",
+                f"Candidate skill SHA-256: `{versions['candidate_sha256']}`",
+                "",
+            ]
     discarded = load_json(run_dir / "proposals.json", {}).get("discarded", [])
     out += ["# Clusters the review discarded", ""]
     out += [f"- {d.get('theme', '?')}: {d.get('reason', '?')}" for d in discarded] or [
@@ -519,9 +310,9 @@ def record(run_dir: Path, state_path: Path, permalink: str) -> dict:
             "permalink": permalink,
             "sent_at": now,
         }
-        if evaluation := prop.get("evaluation"):
-            entry["evaluation"] = evaluation
-            entry["skill_version"] = evaluation["candidate_sha256"]
+        if versions := prop.get("versions"):
+            entry["versions"] = versions
+            entry["skill_version"] = versions["candidate_sha256"]
         state["proposals"].setdefault(prop["key"], entry)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1))

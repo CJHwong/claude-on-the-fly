@@ -49,7 +49,7 @@ Below, `<name>` means that key's value.
 Before new proposals, read applied entries in `STATE` whose `followup.status` is `pending`.
 Compare later evidence for the same task class with the recorded applied version.
 Record recurrence, new regressions, or insufficient evidence. Do not treat silence as success.
-If the skill changed again, record `version-changed`. Do not attribute later results to the tested version.
+If the skill changed again, record `version-changed`. Do not attribute later results to the applied version.
 Keep evidence IDs and the observation window. Keep conversation excerpts in `RUN_DIR` only.
 Update follow-up state in `live` mode only. Other modes write observations into `RUN_DIR/followup.json`.
 
@@ -105,8 +105,7 @@ Follow `references/proposal-rules.md` for the content of every proposal. Write t
       "why": "One clause: the mechanism that makes the rule matter.",
       "evidence": ["<thread_id>", "job:<cron job name>"],
       "explicit_ask": false,
-      "patch_file": "patches/01-short-slug.md",
-      "evaluation_file": "evaluations/plugin-skill-name/evaluation.json"
+      "patch_file": "patches/01-short-slug.md"
     }
   ],
   "discarded": [{"theme": "short label", "reason": "which discard rule"}]
@@ -120,49 +119,12 @@ Follow `references/proposal-rules.md` for the content of every proposal. Write t
   - `note`: the skill belongs to a third party. Describe the issue only.
   - `profile-note`: one person's preference.
 - `evidence`: thread ids from `candidates.json`, or `job:<name>` from `cron_recoveries`. Never quote the excerpt.
-- `evaluation_file`: required for a local `patch`. Other actions can omit it.
 - For a local `patch`, `patch_file` contains the complete proposed `SKILL.md`.
-  Preserve all instructions outside the proposed change. The approver must review the exact tested text.
+  Preserve all instructions outside the proposed change. The approver reviews the exact proposed text.
 
-### 4a. Evaluate each local patch
-
-Create a case file with at least one targeted case and one unaffected control.
-Use cases from the selected transcripts. Remove identifiers and secrets before model calls.
-Keep the source IDs in the private case file. Do not include them in the task prompt.
-Use another session for evaluation when available. Record any overlap with the discovery evidence.
-Base expectations on the user's request and observed outcomes, not the proposed wording.
-
-```json
-{
-  "cases": [
-    {"case_id": "target", "kind": "targeted", "prompt": "Neutral task and available facts", "expectations": ["Observable required behavior"]},
-    {"case_id": "control", "kind": "control", "prompt": "An unaffected task", "expectations": ["Existing behavior still works"]}
-  ]
-}
-```
-
-```bash
-uv run "$SKILL_DIR/scripts/evaluate_patch.py" \
-  --run-dir "$RUN_DIR" --target "<skill-name>" \
-  --source-skill "<current-skill>/SKILL.md" \
-  --candidate "$RUN_DIR/patches/01-short-slug.md" \
-  --cases "$RUN_DIR/cases/01.json" --reps 2 --workers 2
-```
-
-The runner freezes both skills and saves each answer with its hash.
-Generation sees the task and one skill. Only grading sees the expectations.
-The judge receives no arm labels. A separate record maps labels to the original and candidate.
-Model calls use temporary directories. Generation has no tools. The judge runs read-only, and tool calls fail the evaluation.
-
-The runner measures plans and drafted replies. It does not execute live tools.
-Record this limit. Do not claim that a passing draft proves a live procedure works.
-The default uses Claude for generation and Codex for grading. Model calls consume quota.
-Use `--model` and `--judge-model` to select exact model identifiers for a repeatable run.
-
-Set `evaluation_file` to `evaluations/<skill-name>/evaluation.json`.
-The directory name replaces `:` with `-`.
-Finalization requires a targeted improvement, no paired regression, and passing controls for both arms.
-Ties do not justify a patch. Invalid or stale records also fail validation.
+Use the current agent harness to review proposals. No separate model CLI or paired evaluator is required.
+Run relevant checks with available tools. Record what you checked and any limits in `why`.
+Do not claim that a review or a draft proves the procedure works.
 
 ### 5. Validate and render (script)
 
@@ -171,9 +133,8 @@ uv run "$SKILL_DIR/scripts/finalize.py" --run-dir "$RUN_DIR" --mode <dry-run|tes
 ```
 
 The script checks evidence IDs, the evidence threshold, ownership, and earlier rejections.
-For local patches, it also checks paired results, frozen cases, frozen outputs, and skill hashes.
-The recorded case IDs and kinds must cover the complete frozen case file.
-It drops failures and records their reasons. The detail includes evaluation scores and versions.
+For local patches, it records hashes of the installed source and the proposed replacement.
+It drops failures and records their reasons. The detail includes both hashes.
 Then it writes `RUN_DIR/digest.md` and `RUN_DIR/digest-detail.md`.
 Do not edit those files by hand. If the script drops a proposal, do not re-add it.
 
