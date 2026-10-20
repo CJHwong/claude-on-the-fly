@@ -27,6 +27,16 @@ new_skill_dir: skills
 
 The skill keeps its run files and state under `~/.claude-on-the-fly/state/skill-reflect/`. The run files hold DM excerpts, so they stay out of the soul repo.
 
+Local skill patches now require paired evaluation before they enter the approval digest.
+The runner compares frozen versions on transcript-derived cases and an unaffected control.
+It saves outputs, grades, and hashes. Ties, regressions, stale skills, and altered outputs fail validation.
+The approver reviews the exact full skill that passed evaluation.
+After application, the weekly review checks later evidence against the recorded version.
+
+This evaluation uses model calls and measures plans and draft answers.
+It does not replay live writes or prove that a procedure works with real services.
+Keep raw transcripts outside the repository. Remove secrets and identifiers before model calls.
+
 ## 3. Dry run
 
 Ask the agent in a chat:

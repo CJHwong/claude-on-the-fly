@@ -21,6 +21,8 @@ Pick the first option that fits:
 - Give one clause of why: the mechanism, not the story. "…because the parent field rejects an issue in another project."
 - Attach the rule to the step it changes. Quote that step's current text in the patch file so the reviewer sees where it goes.
 - One lesson is one rule. If the skill already has a weaker form of the rule, change that sentence. Do not add a second copy.
+- For a local patch, provide the complete proposed skill and a paired evaluation record before the digest.
+- Include a targeted case and an unaffected control. A tie provides no evidence to change the skill.
 - If a sentence in the skill is wrong, replace it. Do not add a correction note under it.
 - If the rule asks a person something, search `<schedule_file>` from `~/.claude-on-the-fly/skill-reflect.yaml` for an entry that runs the skill. If one does, the rule must also say what the unattended run does instead, because nobody is there to answer.
 

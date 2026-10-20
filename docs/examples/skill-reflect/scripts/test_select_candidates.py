@@ -294,6 +294,12 @@ def test_usage_report_lists_unused_owned_skills_only(world):
     # twg and the other marketplace are third-party; the trashed skill is not on disk.
     assert usage["unused_in_window"] == ["agent-ops:unused-one", "jira-kit:fetch"]
     assert usage["inventory"]["tool:thing"] == "third-party"
+    assert usage["source_files"] == {
+        "agent-ops:check-ai-usage": str(used.resolve()),
+        "agent-ops:unused-one": str(
+            (world["soul"] / "skills/agent-ops/skills/unused-one/SKILL.md").resolve()
+        ),
+    }
 
 
 def test_cron_recovery_from_job_logs(world):
