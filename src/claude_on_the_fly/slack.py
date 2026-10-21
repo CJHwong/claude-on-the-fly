@@ -448,7 +448,12 @@ GATED_EMOJI = "lock"
 
 _DOWNLOAD_CHUNK = 64 * 1024
 
-_ALLOWED_SUBTYPES = {"file_share"}
+# `thread_broadcast` is a thread reply sent with "Also send to channel": the same
+# message with the parent attached as `root`, which nothing here reads. It was
+# missing until 2026-09-30, when a colleague's reply sent that way was dropped at
+# the subtype filter and never reached the relay. Everything downstream treats it
+# as the plain reply it is: same sender gates, same @mention gate, same thread.
+_ALLOWED_SUBTYPES = {"file_share", "thread_broadcast"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
 
@@ -2607,14 +2612,23 @@ class SlackFrontend(Frontend):
         bot_id = event.get("bot_id", "")
         # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
         # no user field. Only let through bots trusted by bot_id and not blocked.
+        # A bot's "Also send to channel" reply is a thread_broadcast with the same
+        # bot_id and no user, and it is that bot's reply: it takes this path too.
+        # On the person path its bot id became the sender, so a `*` allowlist let
+        # any bot that tagged us through, past this list and its bot policy. A
+        # broadcast that does carry a `user` is a person's (or an app bot's own
+        # bot-user) reply and stays on the person path, as its plain reply does.
+        is_bot_post = subtype == "bot_message" or (
+            subtype == "thread_broadcast" and bool(bot_id) and not event.get("user")
+        )
         is_trusted_bot = (
-            subtype == "bot_message"
+            is_bot_post
             and bot_id in self._allowed_bot_ids
             and bot_id not in self._blocked_senders
         )
-        if subtype == "bot_message":
+        if is_bot_post:
             if not is_trusted_bot:
-                self._skip(False, "untrusted bot_message bot_id=%s", bot_id)
+                self._skip(False, "untrusted %s bot_id=%s", subtype, bot_id)
                 return
         elif subtype and subtype not in _ALLOWED_SUBTYPES:
             self._skip(False, "subtype=%s", subtype)
