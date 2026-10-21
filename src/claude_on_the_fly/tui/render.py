@@ -41,6 +41,24 @@ def fmt_age(seconds: float | None) -> str:
 _fmt_age = fmt_age
 
 
+def fmt_in(seconds: float | None) -> str:
+    """A countdown to a future moment: `45s`, `6.9m`, `6.9h`, `3.2d`.
+
+    Separate from `fmt_age` because the two read differently past a day: an
+    age stays in hours (`137.8h`) so a stuck job's size is obvious, while a
+    countdown in hours tells an operator nothing about tomorrow.
+    """
+    if seconds is None:
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
 def state_cell(state_str: str) -> Text:
     """One-cell renderable for a frontend state (running/stopped/broken)."""
     return Text(

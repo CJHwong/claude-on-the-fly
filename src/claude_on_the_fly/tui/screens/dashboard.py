@@ -37,6 +37,7 @@ import contextlib
 import shlex
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
@@ -127,10 +128,10 @@ CHAT_FRONTENDS = checks.CHAT_FRONTENDS
 def _short_job_id(job_id: str) -> str:
     """The tail of a `<time_ns>-<uuid8>` job id.
 
-    The time half is already rendered as the row's `enqueued` age, so showing
-    it again would cost 20 columns to say the same thing twice. The row key
-    keeps the full id, so nothing downstream is truncated. An id in some other
-    shape is shown whole.
+    The time half is already rendered as the row's `wait` (its age, or its
+    countdown), so showing it again would cost 20 columns to say the same thing
+    twice. The row key keeps the full id, so nothing downstream is truncated.
+    An id in some other shape is shown whole.
 
     Split on the *first* hyphen, not the last: the time half never contains one,
     while the tail can (`rpartition` turned `...-ACE-1234` into `1234`).
@@ -187,6 +188,42 @@ def _job_source(origin: dict) -> str:
     if kind == "cron":
         return str(origin.get("entry") or "cron")
     return kind or "-"
+
+
+def _age_seconds(row: file_queue.QueueRow, now: datetime) -> float | None:
+    """Seconds since the job was enqueued, or None when the id carried no time.
+
+    `enqueued_at` comes from the id as a tz-aware UTC datetime and the
+    snapshot's `now` is the same, so the subtraction needs no conversion.
+    """
+    if row.enqueued_at is None:
+        return None
+    return (now - row.enqueued_at).total_seconds()
+
+
+def _job_state_cells(row: file_queue.QueueRow, now: datetime) -> tuple[str, str]:
+    """The state and the wait cell for one queue row.
+
+    A job enqueued with a later `available_at` is not queued in the usual
+    sense: the worker skips it until its due time, so its enqueue age keeps
+    climbing while nothing is wrong. Saying `scheduled` and counting down to
+    the due moment answers the operator's real question ("when will this
+    run?"); the plain age only raised a false alarm.
+
+    `available_at` is naive local time by the queue's convention, so `now`
+    comes down to local naive for the delta. A due time that has already
+    passed means the row is an ordinary queued job again (the worker's next
+    poll claims it), and a claimed row is running whatever it was told to
+    wait for.
+    """
+    if row.in_flight:
+        return "running", render.fmt_age(_age_seconds(row, now))
+    if row.available_at is not None:
+        now_local = now.astimezone().replace(tzinfo=None) if now.tzinfo else now
+        due_s = (row.available_at - now_local).total_seconds()
+        if due_s > 0:
+            return "scheduled", f"in {render.fmt_in(due_s)}"
+    return "queued", render.fmt_age(_age_seconds(row, now))
 
 
 class DashboardScreen(Screen):
@@ -464,13 +501,16 @@ class DashboardScreen(Screen):
         jobs.add_column(PROMPT_COLUMN, width=14)
         # The background-job queue: what the worker is running now and what is
         # waiting. The id cell shows only the random tail (the time half of the
-        # id is already the `enqueued` column); the row key keeps the full id.
+        # id is already the `wait` column); the row key keeps the full id.
         # `job` is sized for the widest placeholder rather than the widest id:
         # "queue unavailable" is 17 cells against an id tail's 8, and a fixed
         # column clips rather than wraps. `source` names the producer — the
         # cron entry that fired this job, or the chat frontend that asked —
         # which is the only thing tying a queue row back to a schedule.
-        # `prompt` is the flexible column: the other four take 48 cells and 8
+        # `state` is wide enough for "scheduled", the longest state a row can
+        # hold. `wait` reads as a signed wait: an age for a queued or running
+        # row, a countdown ("in 6.9h") for one held for a later `available_at`.
+        # `prompt` is the flexible column: the other four take 49 cells and 8
         # of padding, so it gets whatever the terminal leaves over (see
         # _resize_flex_column) rather than a fifth fixed width that no longer
         # fits in the 76 the panel is given at an 80-column terminal. Its
@@ -481,9 +521,9 @@ class DashboardScreen(Screen):
         queue = self.query_one("#jobs-queue", DataTable)
         queue.add_column("job", width=17)
         queue.add_column("source", width=14)
-        queue.add_column("state", width=8)
-        queue.add_column(PROMPT_COLUMN, width=18)
-        queue.add_column("enqueued", width=9)
+        queue.add_column("state", width=9)
+        queue.add_column(PROMPT_COLUMN, width=17)
+        queue.add_column("wait", width=9)
         # The chat strip shows the selected frontend's currently-running jobs:
         # what's running and for how long. The header says which frontend.
         chat = self.query_one("#chat-strip", DataTable)
@@ -1977,11 +2017,7 @@ class DashboardScreen(Screen):
         }
         for row in view.rows if view else []:
             keys.append(row.id)
-            age_s = (
-                None
-                if row.enqueued_at is None
-                else (snap.timestamp - row.enqueued_at).total_seconds()
-            )
+            state, wait_cell = _job_state_cells(row, snap.timestamp)
             # Text(), not str: a bare str cell goes through Rich's markup
             # parser, and the prompt is the one cell on this dashboard carrying
             # third-party text (a Slack user's message). "[pytest]" would be
@@ -1991,9 +2027,9 @@ class DashboardScreen(Screen):
             table.add_row(
                 Text(_short_job_id(row.id)),
                 Text(_job_source(row.origin)),
-                "running" if row.in_flight else "queued",
+                state,
                 Text(_prompt_preview(row.prompt)),
-                render.fmt_age(age_s),
+                Text(wait_cell),
                 key=row.id,
             )
         if not keys:

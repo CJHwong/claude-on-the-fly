@@ -1329,18 +1329,26 @@ class TestJobsQueueTable:
         base.update(fields)
         return QueueRow(**base)
 
-    def _snap(self, view):
+    def _snap(self, view, *, timestamp=None):
         from datetime import UTC, datetime
 
         from claude_on_the_fly.tui.state import Snapshot
 
         return Snapshot(
-            timestamp=datetime.now(UTC),
+            timestamp=timestamp or datetime.now(UTC),
             frontends=[],
             jobs=[],
             schedule_error=None,
             jobs_queue=view,
         )
+
+    def _due(self, *, hours=0.0, timestamp):
+        """An `available_at` that many hours after `timestamp`, in the queue's
+        naive-local convention."""
+        from datetime import timedelta
+
+        local = timestamp.astimezone().replace(tzinfo=None)
+        return local + timedelta(hours=hours)
 
     async def test_a_queued_job_is_listed(self, isolated):
         app = _Host()
@@ -1364,6 +1372,81 @@ class TestJobsQueueTable:
             await pilot.pause()
             table = app.screen.query_one("#jobs-queue", DataTable)
             assert "running" in [str(c) for c in table.get_row_at(0)]
+
+    async def test_a_scheduled_job_says_when_it_will_run(self, isolated):
+        """A job held for its `available_at` is not a backlog: the age keeps
+        climbing while the worker is right to skip it. The countdown is the
+        answer to "when does this run?"."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [self._row(available_at=self._due(hours=6, timestamp=stamp))]
+                    ),
+                    timestamp=stamp,
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert row[2] == "scheduled"
+        assert row[4] == "in 6.0h"
+
+    async def test_a_due_time_that_has_passed_is_queued_again(self, isolated):
+        """The worker's next poll claims it; the row is no longer held."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [self._row(available_at=self._due(hours=-1, timestamp=stamp))]
+                    ),
+                    timestamp=stamp,
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert row[2] == "queued"
+        assert not row[4].startswith("in ")
+
+    async def test_a_running_job_ignores_a_due_time(self, isolated):
+        """A claimed row is running whatever it was told to wait for."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [
+                            self._row(
+                                in_flight=True,
+                                available_at=self._due(hours=6, timestamp=stamp),
+                            )
+                        ]
+                    ),
+                    timestamp=stamp,
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert row[2] == "running"
 
     async def test_markup_in_a_prompt_cannot_kill_the_dashboard(self, isolated):
         """The prompt is the one cell carrying third-party text. `[/]` raises

@@ -14,6 +14,7 @@ from claude_on_the_fly.tui.render import (
     _fmt_uptime,
     _format_extra_notes,
     chat_header,
+    fmt_in,
     frontends_table,
     jobs_header,
     read_new_lines,
@@ -80,6 +81,26 @@ class TestFmtHelpers:
 
     def test_fmt_age_hours(self):
         assert _fmt_age(7200) == "2.0h"
+
+    def test_an_age_past_a_day_stays_in_hours(self):
+        """A long wait must read as the alarm it is, not be folded into days."""
+        assert _fmt_age(137.8 * 3600) == "137.8h"
+
+    def test_fmt_in_none(self):
+        assert fmt_in(None) == "-"
+
+    def test_fmt_in_seconds(self):
+        assert fmt_in(45) == "45s"
+
+    def test_fmt_in_minutes(self):
+        assert fmt_in(120) == "2.0m"
+
+    def test_fmt_in_hours(self):
+        assert fmt_in(6.9 * 3600) == "6.9h"
+
+    def test_fmt_in_folds_into_days(self):
+        """A countdown in hours says nothing about a job due next week."""
+        assert fmt_in(3.2 * 86400) == "3.2d"
 
     def test_fmt_uptime_invalid_returns_dash(self):
         now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=UTC)
