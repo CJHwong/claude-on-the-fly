@@ -3756,6 +3756,23 @@ class SlackFrontend(Frontend):
         channel, ts = pending[-1]
         await self._react(channel, ts, QUEUED_EMOJI)
 
+    async def retire_failed_turn(self, chat_id: int, route: dict) -> None:
+        """Do not let an early intake failure consume the next message's marker."""
+        channel, message_ts = route.get("channel"), route.get("message_ts")
+        if not isinstance(channel, str) or not isinstance(message_ts, str):
+            return
+        target = (channel, message_ts)
+        pending = self._pending_msg.get(chat_id)
+        suppressed = self._pending_reply_suppressed.get(chat_id)
+        if pending:
+            while target in pending:
+                index = pending.index(target)
+                del pending[index]
+                if suppressed is not None and index < len(suppressed):
+                    del suppressed[index]
+        if self._in_flight.get(chat_id) == target:
+            await self.notify_complete(chat_id)
+
     async def notify_interrupted(
         self, chat_id: int, *, running: bool, queued: int
     ) -> None:

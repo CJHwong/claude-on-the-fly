@@ -143,12 +143,14 @@ class TestPhases:
 
         assert [t.turn_id for t in replay] == ["t1"], (replay, nudge)
 
-    def test_a_turn_dispatched_long_ago_still_ages_out(self, journal):
-        """The clock restarts; it does not stop."""
+    def test_an_old_dispatched_turn_is_preserved_for_explicit_recovery(self, journal):
         journal.record(_turn(turn_id="t1", recorded_at=1000.0))
         journal.mark_dispatched("t1", now=1000.0)
 
-        assert journal.take(ttl_s=60, now=1000.0 + 3600) == ([], [])
+        replay, nudge = journal.take(ttl_s=60, now=1000.0 + 3600)
+        assert replay == []
+        assert [turn.turn_id for turn in nudge] == ["t1"]
+        assert journal.parked() == nudge
 
     def test_the_wall_clock_is_used_when_no_moment_is_given(self, journal):
         """The production callers pass nothing, so the default has to be the wall
@@ -178,16 +180,14 @@ class TestPhases:
 
 
 class TestTake:
-    def test_taking_empties_the_journal(self, journal):
-        """Emptied before anything runs, so a turn that kills the daemon cannot
-        be replayed at every start. Same move as cron renaming its trigger."""
+    def test_taking_reserves_the_same_turn_until_its_reply_lands(self, journal):
         journal.record(_turn())
 
         first, _ = journal.take(now=1000.0)
-        second = journal.take(now=1000.0)
-
         assert len(first) == 1
-        assert second == ([], [])
+        assert journal.pending() == first
+        journal.forget(first[0].turn_id)
+        assert journal.take(now=1000.0) == ([], [])
 
     def test_an_absent_journal_is_empty_not_an_error(self, journal):
         assert journal.take() == ([], [])
@@ -202,14 +202,15 @@ class TestTake:
 
         assert [t.turn_id for t in replay] == sorted(t.turn_id for t in replay)
 
-    def test_an_expired_turn_is_neither_replayed_nor_mentioned(self, journal, caplog):
-        """Nothing is owed to a question from another day."""
+    def test_an_expired_turn_is_archived_and_offered_back(self, journal, caplog):
         journal.record(_turn())
 
         with caplog.at_level("INFO", logger="claude_on_the_fly.turns"):
             result = journal.take(ttl_s=60, now=1000.0 + 3600)
 
-        assert result == ([], [])
+        assert result[0] == []
+        assert result[1] == journal.parked()
+        assert len(result[1]) == 1
         assert "older than" in caplog.text
 
     def test_a_turn_with_no_timestamp_is_not_treated_as_expired(self, journal):
@@ -238,7 +239,9 @@ class TestTake:
     def test_the_default_ttl_is_used_when_none_is_given(self, journal):
         journal.record(_turn(recorded_at=1.0))
 
-        assert journal.take() == ([], [])
+        replay, nudge = journal.take()
+        assert replay == [] and len(nudge) == 1
+        assert journal.parked() == nudge
 
 
 class TestCorruptRecords:

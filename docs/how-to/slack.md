@@ -120,3 +120,20 @@ next one without a restart.
 - The app must be invited to private channels (`/invite @your-app-name`)
 
 See the [`slack` reference](../reference/config-yaml.md#slack) for every field.
+
+## Unfinished requests and recovery
+
+Recent unfinished requests resume after a restart, keeping their original source
+and bounded retry count. The journal retains them until their replies land, so a
+crash between reserving and requeuing work does not erase the request.
+
+Requests older than 30 minutes, requests that exhaust their restart retries, and
+requests that fail unexpectedly are preserved in
+`~/.claude-on-the-fly/state/slack.turns.recovery.json`. They are offered back for
+explicit recovery rather than silently discarded or automatically retried. The
+recovery file is owner-only and retains the original text, route, and session.
+Check whether a request was already fulfilled or cancelled before resending it.
+
+One failed request does not stop later messages in the same conversation from
+being processed. Its queue markers are retired without consuming a later
+message's reaction target or reply-suppression setting.
