@@ -140,13 +140,17 @@ class Frontend(ABC):
     async def notify_nudge(self, chat_id: int, text: str) -> None:
         """Offer back a turn the daemon has stopped retrying.
 
-        Rare by design: everything else resumes silently, and this is reached
-        only for a turn that hit the replay limit. Default posts the prompt as
+        Recent recoverable work resumes silently. Stale turns and turns that
+        fail or exhaust their replay limit are preserved and offered back.
+        Default posts the prompt as
         text for the person to resend. A frontend with a tappable affordance
         should override and offer it as one, since a button carries the text back
         verbatim with no copy and paste.
         """
         await self.send(chat_id, Response(body=nudge_notice(text)))
+
+    async def retire_failed_turn(self, chat_id: int, route: dict) -> None:
+        """Remove only this failed source from frontend queue bookkeeping."""
 
     async def notify_start(self, chat_id: int) -> None:
         """Signal that processing has started for the next pending message.

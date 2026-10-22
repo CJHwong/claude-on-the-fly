@@ -865,8 +865,9 @@ class Orchestrator:
         A compaction is not journaled. It is daemon maintenance with no text, so
         replaying it would answer nobody and offering it back would show an empty
         prompt; the auto-compact gate re-queues one when the next message arrives.
+        A replay already has a reserved record; preserve its id and source data.
         """
-        if turn.compact:
+        if turn.compact or turn.journal_id:
             return turn
         entry = PendingTurn(
             chat_id=chat_id,
@@ -942,7 +943,36 @@ class Orchestrator:
                     turn = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                await self._process(chat_id, turn)
+                try:
+                    await self._process(chat_id, turn)
+                except Exception:
+                    # One intake/adapter failure must not strand later messages.
+                    # Park instead of blindly retrying possibly completed writes.
+                    logger.exception(
+                        "turn failed: chat_id=%s turn=%s", chat_id, turn.journal_id
+                    )
+                    entry = next(
+                        (
+                            item
+                            for item in self._journal.pending()
+                            if item.turn_id == turn.journal_id
+                        ),
+                        None,
+                    )
+                    if entry is not None:
+                        parked = self._journal.park(entry)
+                        if parked:
+                            self._journal.forget(entry.turn_id)
+                        try:
+                            await self._frontend.retire_failed_turn(
+                                chat_id, entry.route
+                            )
+                        except Exception:
+                            logger.exception(
+                                "turn failed: could not retire source markers"
+                            )
+                        if parked:
+                            await self._offer_back(entry)
         finally:
             if self._running.get(chat_id) is asyncio.current_task():
                 self._running.pop(chat_id, None)
@@ -1594,8 +1624,8 @@ class Orchestrator:
         the frontend starts listening, so a live message cannot overtake work that
         was already waiting.
 
-        The journal is emptied by `take` before anything here runs, so a turn that
-        kills the daemon cannot be replayed at every start.
+        `take` persists each reservation before anything here runs, so a crash
+        cannot lose a handoff or reset the bounded replay count.
         """
         replay, nudge = self._journal.take()
         if not replay and not nudge:
@@ -1628,8 +1658,12 @@ class Orchestrator:
 
     async def _offer_back(self, entry: PendingTurn) -> None:
         """Hand one turn back, for the rare case a replay is the wrong answer."""
-        self._restore_chat(entry)
         try:
+            # A notice is not another queued turn. Restore its destination and
+            # session without appending a reaction target that will never run.
+            route = dict(entry.route)
+            route.pop("message_ts", None)
+            self._restore_chat(replace(entry, route=route))
             await self._frontend.notify_nudge(entry.chat_id, entry.text)
         except Exception:
             logger.exception(
@@ -1655,7 +1689,11 @@ class Orchestrator:
             self._restore_chat(entry)
             await self._enqueue(
                 chat_id,
-                Turn(_resume_prompt(entry), compact=entry.compact),
+                Turn(
+                    _resume_prompt(entry),
+                    compact=entry.compact,
+                    journal_id=entry.turn_id,
+                ),
                 replays=entry.replays,
             )
 
