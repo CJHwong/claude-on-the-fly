@@ -17,6 +17,7 @@ empty configuration and ends with a sandboxed agent whose tool calls require app
 - [Allow network access](how-to/manage-egress.md).
 - [Broker a credentialed CLI](how-to/broker-a-command.md).
 - [Configure background workers](how-to/configure-workers.md).
+- [Select accounts by channel or user](how-to/select-accounts.md).
 - [Upgrade safely](how-to/upgrade-safely.md).
 - [Migrate old thread directories](how-to/migrate-workspaces.md).
 - [Review skill proposals from past sessions](how-to/reflect-on-skills.md).

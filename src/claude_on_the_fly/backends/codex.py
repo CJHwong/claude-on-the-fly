@@ -22,6 +22,7 @@ from claude_on_the_fly import (
     codex_state,
     permissions,
     pricing,
+    quota,
     sandbox,
     tmux,
     transcript,
@@ -305,6 +306,7 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
     rollout's cumulative `total_token_usage` across the call, which is what makes
     a resumed thread's numbers per-turn instead of running totals.
     """
+    records = list(records)
     thread_id: str | None = None
     body = ""
     last_assistant_text = ""
@@ -357,6 +359,7 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
         elif sub == "turn_aborted":
             error = payload.get("reason") or "codex turn aborted"
     return {
+        **_quota_evidence(records),
         "thread_id": thread_id,
         "body": body,
         "last_assistant_text": last_assistant_text,
@@ -364,6 +367,44 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
         "error": error,
         "completed": completed,
         "tool_counts": _count_tool_calls(tool_items, tool_calls),
+    }
+
+
+def _quota_evidence(records: list[dict]) -> dict:
+    """Require durable tool outputs before another account can resume work."""
+    calls: set[str] = set()
+    results: set[str] = set()
+    item_ids: set[str] = set()
+    started = False
+    exhausted = False
+    for record in records:
+        payload = record.get("payload") or {}
+        kind = payload.get("type")
+        if record.get("type") == "response_item":
+            if kind in _RESPONSE_TOOL_TYPES:
+                started = True
+                calls.add(payload.get("call_id") or "")
+            elif kind in {"function_call_output", "custom_tool_call_output"}:
+                results.add(payload.get("call_id") or "")
+        if record.get("type") != "event_msg":
+            continue
+        if kind in {"item_started", "item_completed"}:
+            item_kind = (payload.get("item") or {}).get("type")
+            if item_kind and item_kind not in _NON_TOOL_ROLLOUT_ITEMS:
+                started = True
+                item_ids.add((payload.get("item") or {}).get("id") or "")
+        if kind == "task_complete":
+            exhausted = quota.provider_exhausted(payload.get("error"))
+        elif kind == "error":
+            exhausted = exhausted or quota.provider_exhausted(payload)
+    return {
+        "account_exhausted": exhausted,
+        "tools_started": started,
+        "resume_ready": (
+            bool(calls)
+            and "" not in (calls | item_ids)
+            and (calls | item_ids) <= results
+        ),
     }
 
 
@@ -1154,6 +1195,13 @@ async def _run_codex_exec(
         await follower.aclose()
 
     parsed = parse_codex_rollout(follower.records)
+    if parsed.get("account_exhausted"):
+        raise quota.AccountExhaustedError(
+            "codex",
+            tools_started=parsed.get("tools_started", False),
+            resume_ready=parsed.get("resume_ready", False),
+            thread_id=parsed.get("thread_id") or thread_id,
+        )
     if parsed.get("error"):
         detail = parsed["error"]
         if "401 Unauthorized" in detail:
@@ -1437,19 +1485,26 @@ class CodexBackend:
         )
 
         started_at = time.monotonic()
-        async with _first_turn_guard(workspace, existing_thread) as gate:
-            result = await _run_codex_exec(
-                workspace,
-                cmd,
-                timeout=timeout,
-                thread_id=existing_thread,
-                interactive=(
-                    self._interactive_argv(workspace, existing_thread, composed_prompt)
-                    if self._pty
-                    else None
-                ),
-                gate=gate,
-            )
+        try:
+            async with _first_turn_guard(workspace, existing_thread) as gate:
+                result = await _run_codex_exec(
+                    workspace,
+                    cmd,
+                    timeout=timeout,
+                    thread_id=existing_thread,
+                    interactive=(
+                        self._interactive_argv(
+                            workspace, existing_thread, composed_prompt
+                        )
+                        if self._pty
+                        else None
+                    ),
+                    gate=gate,
+                )
+        except quota.AccountExhaustedError as failure:
+            if failure.thread_id and not existing_thread:
+                codex_state.write_thread_id(workspace, session_uuid, failure.thread_id)
+            raise
         duration = time.monotonic() - started_at
 
         new_thread = result.get("thread_id")
@@ -1498,19 +1553,33 @@ class CodexBackend:
                 ]
                 retry_started = time.monotonic()
                 retry_thread = result.get("thread_id") or existing_thread
-                retry_result = await _run_codex_exec(
-                    workspace,
-                    retry_cmd,
-                    timeout=timeout,
-                    thread_id=retry_thread,
-                    interactive=(
-                        self._interactive_argv(
-                            workspace, retry_thread, nudge_prompt or NUDGE_PROMPT
-                        )
-                        if self._pty
-                        else None
-                    ),
-                )
+                try:
+                    retry_result = await _run_codex_exec(
+                        workspace,
+                        retry_cmd,
+                        timeout=timeout,
+                        thread_id=retry_thread,
+                        interactive=(
+                            self._interactive_argv(
+                                workspace, retry_thread, nudge_prompt or NUDGE_PROMPT
+                            )
+                            if self._pty
+                            else None
+                        ),
+                    )
+                except quota.AccountExhaustedError as failure:
+                    previous_tools = result.get("tools_started") or bool(
+                        result.get("tool_counts")
+                    )
+                    current_safe = not failure.tools_started or failure.resume_ready
+                    previous_safe = not previous_tools or result.get(
+                        "resume_ready", False
+                    )
+                    failure.tools_started = failure.tools_started or previous_tools
+                    failure.resume_ready = bool(
+                        current_safe and previous_safe and failure.tools_started
+                    )
+                    raise
                 duration += time.monotonic() - retry_started
                 result = _merge_codex_results(result, retry_result)
                 body = (result.get("body") or "").strip() or agent.EMPTY_REPLY_NOTICE

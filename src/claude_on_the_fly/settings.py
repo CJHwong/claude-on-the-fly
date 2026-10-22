@@ -66,6 +66,8 @@ BUNDLED_SETTINGS = Path(__file__).parent / FILENAME
 # a misspelled section, which YAML accepts happily and which would otherwise do
 # nothing at all with no diagnostic; `check_operator_settings` names them instead.
 SECTIONS = (
+    "accounts",
+    "routing",
     "egress",
     "commands",
     "permissions",
@@ -183,6 +185,7 @@ FIELDS: dict[str, Field] = {
 # names them rather than leaving an operator to wonder why their edit did nothing.
 # Dotted paths address one field; a bare name covers a whole section.
 RESTART_REQUIRED = (
+    "accounts",
     # The spawn path must keep using the mode whose broker/proxy/jail services
     # were constructed at startup.
     "sandbox.mode",
@@ -613,7 +616,10 @@ def _remember_restart_state() -> None:
     """Record what the restart-required fields were at startup."""
     global _RESTART_STATE, _STARTUP_VALUES
     _RESTART_STATE = _restart_state()
+    from claude_on_the_fly import accounts
+
     _STARTUP_VALUES = {path: _current_value(path) for path in RESTART_REQUIRED}
+    _STARTUP_VALUES["accounts"] = accounts._configuration("accounts", startup=False)
 
 
 def _current_value(path: str) -> object:

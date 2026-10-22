@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import (
+    account_fallback,
     agent,
     broker,
     codex_auth,
@@ -27,6 +28,7 @@ from claude_on_the_fly import (
     migration,
     model_command,
     permissions,
+    quota,
     sandbox,
     settings,
     tmux,
@@ -738,7 +740,9 @@ class Orchestrator:
         """Queue a compaction for this chat. Runs in FIFO order like any turn."""
         await self._enqueue(chat_id, Turn("", compact=True))
 
-    def current_profile(self, chat_id: int) -> agent.AgentProfile:
+    def current_profile(
+        self, chat_id: int, *, persist: bool = False
+    ) -> agent.AgentProfile:
         """The agent configuration this conversation runs on.
 
         The resolved global configuration with whatever this conversation pinned
@@ -747,7 +751,22 @@ class Orchestrator:
         resolve, exactly as `agent.resolve_profile` does: the caller that can
         tell somebody is the one that should catch it.
         """
-        return agent.apply_override(agent.resolve_profile(), self._overrides(chat_id))
+        from claude_on_the_fly import accounts
+
+        profile = agent.resolve_profile()
+        channel, user = self._frontend.account_subjects(chat_id)
+        chosen = accounts.selection(
+            self._platform,
+            self.session_uuid(chat_id),
+            profile.backend,
+            channel,
+            user,
+            persist=persist,
+        )
+        profile = accounts.apply_profile(profile, chosen.account)
+        if chosen.pool:
+            profile = replace(profile, account_pool=chosen.pool)
+        return agent.apply_override(profile, self._overrides(chat_id))
 
     def on_model(self, chat_id: int, tokens: list[str]) -> str:
         """Apply a `$model` request and return the reply to post for it.
@@ -971,6 +990,27 @@ class Orchestrator:
             logger.exception("settings: could not report the restart-required change")
 
     async def _process(self, chat_id: int, turn: Turn) -> None:
+        from claude_on_the_fly import accounts
+
+        try:
+            profile = self.current_profile(chat_id, persist=True)
+            account = accounts.for_profile(profile)
+            with accounts.use(account, mode=profile.mode):
+                workspace = workspace_path(
+                    self._frontend.workspace_name(chat_id), DATA_DIR
+                )
+                accounts.prepare(workspace)
+                await self._process_turn(chat_id, turn, profile)
+        except (accounts.AccountError, OSError) as exc:
+            logger.error("account selection failed: %s", exc)
+            self._journal.forget(turn.journal_id)
+            await self._frontend.send(
+                chat_id, Response(body=f"Account selection failed: {exc}")
+            )
+
+    async def _process_turn(
+        self, chat_id: int, turn: Turn, profile: agent.AgentProfile
+    ) -> None:
         text = turn.text
         # Before any of this turn's setup: from here on an agent may start, and a
         # turn that started is never replayed automatically. Marking early errs
@@ -993,7 +1033,13 @@ class Orchestrator:
         # inside the try is deliberate: a configuration that does not resolve
         # already failed on this line before this change, when the dispatch event
         # called `current_backend_key()` for the same answer.
-        profile = self.current_profile(chat_id)
+        logger.info(
+            "account: platform=%s chat=%s backend=%s account=%s",
+            self._platform,
+            chat_id,
+            profile.backend,
+            profile.account or "daemon default",
+        )
         self._fold_legacy_workspace(chat_id, workspace, session)
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / WORKSPACE_MEMORY_DIRNAME).mkdir(exist_ok=True)
@@ -1147,6 +1193,8 @@ class Orchestrator:
                         profile=profile,
                         facts=self._frontend.session_facts(chat_id),
                     )
+                    if profile.account_pool:
+                        profile = self.current_profile(chat_id)
                 except asyncio.CancelledError:
                     # FIRST, and the order is load-bearing rather than stylistic:
                     # CancelledError IS a BaseException, so the arm below would
@@ -1255,7 +1303,14 @@ class Orchestrator:
             logger.exception("Agent error for chat %s", chat_id)
             public_message = (
                 exc.public_message
-                if isinstance(exc, AgentTurnError)
+                if isinstance(
+                    exc,
+                    (
+                        AgentTurnError,
+                        account_fallback.AccountFallbackError,
+                        quota.AccountExhaustedError,
+                    ),
+                )
                 else AGENT_FAILURE_NOTICE
             )
             if not turn.background:

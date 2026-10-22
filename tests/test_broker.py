@@ -1202,3 +1202,82 @@ async def test_a_source_route_replaces_the_callers_login_without_warning(caplog)
         await up_runner.cleanup()
     assert received[0]["headers"]["authorization"] == "Bearer first"
     assert "stripped caller-supplied" not in caplog.text
+
+
+async def test_account_capability_cannot_select_another_credential(monkeypatch):
+    """Each account URL grants only its own route, even with a guessed prefix."""
+    import asyncio
+
+    monkeypatch.setattr(broker, "blocked_host", lambda host: False)
+    received: list[dict] = []
+    upstream, port = await _start(_echo_app(received))
+    routes = [
+        Route(
+            prefix=f"/accounts/{name}",
+            upstream=f"http://127.0.0.1:{port}",
+            header="authorization",
+            keychain_service=name,
+            isolated=True,
+        )
+        for name in ("avery", "bela")
+    ]
+    monkeypatch.setattr(broker, "read_keychain", lambda name: f"Bearer {name}")
+    bro = Broker(routes)
+    await bro.start()
+    try:
+        avery = bro.route_url("/accounts/avery")
+        bela = bro.route_url("/accounts/bela")
+        async with ClientSession() as client:
+            responses = await asyncio.gather(
+                client.get(avery + "/responses"), client.get(bela + "/responses")
+            )
+            assert [response.status for response in responses] == [200, 200]
+            for response in responses:
+                await response.read()
+            async with client.get(
+                avery.replace("/accounts/avery", "/accounts/bela") + "/responses"
+            ) as response:
+                assert response.status == 403
+            async with client.get(_url(bro, "/accounts/avery/responses")) as response:
+                assert response.status == 403
+        assert {entry["headers"]["authorization"] for entry in received} == {
+            "Bearer avery",
+            "Bearer bela",
+        }
+        assert bro.base_url_env() == {}
+    finally:
+        await bro.stop()
+        await upstream.cleanup()
+
+
+def test_route_url_refuses_an_unknown_route():
+    bro = Broker([Route("/known", "https://example.com", "authorization", "key")])
+    with pytest.raises(ValueError, match="unknown broker route"):
+        bro.route_url("/unknown")
+
+
+async def test_added_account_route_keeps_an_isolated_capability(fake_keychain):
+    fake_keychain["default"] = "default"
+    fake_keychain["work"] = "work"
+    bro = Broker([Route("/default", "https://example.com", "authorization", "default")])
+    await bro.start()
+    try:
+        bro.add_route(
+            Route(
+                "/work", "https://example.com", "authorization", "work", isolated=True
+            )
+        )
+        selected = bro.route_url("/work")
+        assert (
+            bro._authorized_path(selected.split(f":{bro.port}", 1)[1] + "/responses")
+            == "/work/responses"
+        )
+        assert bro._authorized_path(f"/_session/{bro._token}/work/responses") is None
+        assert (
+            bro._authorized_path(
+                selected.split(f":{bro.port}", 1)[1].replace("/work", "/default")
+            )
+            is None
+        )
+    finally:
+        await bro.stop()

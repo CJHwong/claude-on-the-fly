@@ -43,9 +43,8 @@ jobs:
   # seatbelt profile was covered by argv assertions alone. Measured on the
   # Linux job: 195 passed, 32 skipped.
   #
-  # This file only, not the whole suite. The rest is platform-independent and
-  # already runs on Linux; repeating it here would buy a slower signal and
-  # nothing else.
+  # Run boundary probes and account simulations here. The remaining suite runs
+  # on Linux.
   macos-seatbelt:
     runs-on: macos-latest
     timeout-minutes: 15
@@ -117,9 +116,11 @@ jobs:
           # A skipped boundary case is indistinguishable from a passing one, and
           # a macOS runner without seatbelt means the job is testing nothing.
           COTF_REQUIRE_SEATBELT: "1"
+          COTF_REQUIRE_JAIL: "1"
         run: |
-          uv run --no-sync pytest -q tests/test_sandbox.py -rs \
-            -o faulthandler_timeout=60
+          uv run --no-sync pytest -q tests/test_sandbox.py \
+            tests/test_account_fallback_cli.py tests/test_account_fallback_codex_cli.py \
+            -rs -o faulthandler_timeout=60
 
   # Deliberately not `needs: lint`. Nothing here consumes anything lint
   # produces, so gating on it only added lint's wall clock to the front of every
@@ -184,7 +185,8 @@ jobs:
         run: |
           uv run --no-sync pytest \
             --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
-            tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py -q -rs
+            tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py \
+            tests/test_account_fallback_cli.py tests/test_account_fallback_codex_cli.py -q -rs
 
       # A hung test must name itself. Left to the job's own `timeout-minutes`,
       # the step is *cancelled* rather than failed, and GitHub archives no log

@@ -41,6 +41,27 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
   system prompt and the handoff, because `resume` on a missing rollout fails the turn
   outright (`thread/resume failed: no rollout found for thread id`).
 
+### Account profiles
+
+`accounts` names authentication profiles; `routing` selects an alias for the active backend.
+Keep account selection separate from backend and model selection.
+Resolve each account into a value passed with the turn; never change the daemon's environment for a turn.
+Concurrent conversations can select different accounts.
+
+Claude selects credentials with `CLAUDE_CONFIG_DIR`; a null home leaves that variable unset.
+Workspace transcript links preserve resume across profile contexts without sharing complete personal histories.
+Codex selects authentication from the account home and keeps the daemon's default configuration source.
+Its per-workspace, per-account home shares workspace sessions, without copying credentials.
+Transcript lookup, handoff, compaction, and sandbox grants must use the same effective paths as the spawn.
+
+Missing selected profiles fail explicitly.
+Only ordered routing lists permit fallback after provider-confirmed exhausted credits or quota.
+Keep each attempt within the saved backend and list; start with the saved alias and attempt each alias once per turn.
+Save the successful replacement. Generic rate limits, authentication errors, network errors, overload, and model capacity do not trigger fallback.
+After partial work, continue only from a durable native transcript with completed tool results.
+Unknown or incomplete checkpoints stop automatic retry. Never replay the original request after completed tool work.
+When account configuration is absent, preserve existing spawn and session behavior.
+
 ### Shared workspaces
 
 Every session of a conversation runs in one directory (`protocol.Frontend.workspace_name`),

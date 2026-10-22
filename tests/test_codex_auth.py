@@ -458,3 +458,191 @@ def test_a_first_read_of_a_broken_file_fails(tmp_path):
     path.write_text("{")
     with pytest.raises(ValueError):
         login.check()
+
+
+def test_named_account_routes_use_separate_sources_and_locks(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from claude_on_the_fly import accounts, agent
+
+    profiles = {
+        name: SimpleNamespace(
+            name=name, backend="codex", mode=None, source_home=tmp_path / name
+        )
+        for name in ("avery", "bela")
+    }
+    monkeypatch.setattr(accounts, "all_accounts", lambda: profiles)
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path / "data")
+    routes = codex_auth.account_routes()
+    assert [route.source._path for route in routes] == [
+        tmp_path / "avery" / "auth.json",
+        tmp_path / "bela" / "auth.json",
+    ]
+    assert routes[0].source._lock_path != routes[1].source._lock_path
+    assert all(route.isolated and not route.base_url_env_var for route in routes)
+    profiles["bela"].source_home = profiles["avery"].source_home
+    shared_routes = codex_auth.account_routes()
+    assert shared_routes[0].source._lock_path == shared_routes[1].source._lock_path
+
+
+async def test_published_account_url_checks_only_the_selected_login(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from claude_on_the_fly import accounts, broker
+
+    selected = SimpleNamespace(
+        name="avery", backend="codex", mode=None, source_home=tmp_path / "avery"
+    )
+    missing = SimpleNamespace(
+        name="missing", backend="codex", mode=None, source_home=tmp_path / "missing"
+    )
+    selected.source_home.mkdir()
+    (selected.source_home / "auth.json").write_text(json.dumps(_fresh()))
+    monkeypatch.setattr(
+        accounts, "all_accounts", lambda: {"avery": selected, "missing": missing}
+    )
+    monkeypatch.setattr(accounts, "current", lambda: selected)
+    monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://default.invalid/chatgpt")
+    monkeypatch.setattr(codex_auth, "_account_urls", {})
+    running = broker.Broker(codex_auth.account_routes())
+    await running.start()
+    try:
+        codex_auth.publish_account_urls(running)
+        assert codex_auth.published_url() == running.route_url(
+            "/chatgpt/accounts/avery"
+        )
+        assert running.base_url_env() == {}
+        monkeypatch.setattr(accounts, "current", lambda: missing)
+        with pytest.raises(FileNotFoundError):
+            codex_auth.published_url()
+        monkeypatch.setattr(accounts, "current", lambda: None)
+        assert codex_auth.published_url() == "http://default.invalid/chatgpt"
+    finally:
+        await running.stop()
+
+
+def test_selected_account_never_falls_back_to_default_url(monkeypatch):
+    from types import SimpleNamespace
+
+    from claude_on_the_fly import accounts
+
+    selected = SimpleNamespace(name="new", backend="codex", mode=None)
+    monkeypatch.setattr(accounts, "current", lambda: selected)
+    monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+    monkeypatch.setattr(codex_auth, "_account_urls", {})
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://default.invalid/chatgpt")
+    with pytest.raises(RuntimeError, match="restart the daemon"):
+        codex_auth.published_url()
+
+
+async def test_concurrent_account_routes_inject_each_profiles_credential(
+    tmp_path, monkeypatch
+):
+    import asyncio
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from aiohttp import ClientSession, web
+
+    from claude_on_the_fly import accounts, broker
+
+    received: list[tuple[str, str]] = []
+
+    async def collect(request):
+        received.append(
+            (request.headers["Authorization"], request.headers["ChatGPT-Account-Id"])
+        )
+        return web.Response(text="ok")
+
+    profiles = {}
+    for name in ("avery", "bela"):
+        home = tmp_path / name
+        home.mkdir()
+        auth = _fresh()
+        auth["tokens"]["account_id"] = name
+        # Different valid tokens let the test check both credential headers.
+        auth["tokens"]["access_token"] = (
+            auth["tokens"]["access_token"].removesuffix("sig") + name
+        )
+        (home / "auth.json").write_text(json.dumps(auth))
+        profiles[name] = SimpleNamespace(
+            name=name, backend="codex", mode=None, source_home=home
+        )
+    monkeypatch.setattr(accounts, "all_accounts", lambda: profiles)
+    monkeypatch.setattr(broker, "blocked_host", lambda host: False)
+    app = web.Application()
+    app.router.add_post("/backend-api/codex/responses", collect)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    port = runner.addresses[0][1]
+    routes = [
+        replace(route, upstream=f"http://127.0.0.1:{port}")
+        for route in codex_auth.account_routes()
+    ]
+    running = broker.Broker(routes)
+    await running.start()
+    try:
+        async with ClientSession() as client:
+            responses = await asyncio.gather(
+                *(
+                    client.post(
+                        running.route_url(route.prefix) + "/backend-api/codex/responses"
+                    )
+                    for route in routes
+                )
+            )
+            assert [response.status for response in responses] == [200, 200]
+            for response in responses:
+                await response.read()
+        assert {account for _, account in received} == {"avery", "bela"}
+        assert all(bearer.endswith(account) for bearer, account in received)
+    finally:
+        await running.stop()
+        await runner.cleanup()
+
+
+def test_named_default_alias_shares_the_legacy_refresh_lock(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from claude_on_the_fly import envfile
+
+    home = tmp_path / "codex"
+    selected = SimpleNamespace(name="default", source_home=home)
+    monkeypatch.setattr(envfile, "codex_home", lambda env=None: home)
+    named = codex_auth.route(selected)
+    assert named.source._lock_path.name == "codex-auth.lock"
+
+
+def test_named_accounts_allow_startup_without_a_default_login(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from claude_on_the_fly import accounts, envfile
+
+    configured = SimpleNamespace(name="work", backend="codex")
+    monkeypatch.setattr(accounts, "all_accounts", lambda: {"work": configured})
+    monkeypatch.setattr(envfile, "codex_home", lambda: tmp_path / "missing")
+    assert codex_auth.route().prefix == "/chatgpt"
+
+
+@pytest.mark.parametrize("backend,mode", [("claude", None), ("codex", "ollama")])
+def test_other_backends_do_not_receive_a_chatgpt_capability(monkeypatch, backend, mode):
+    from claude_on_the_fly import accounts
+
+    selected = accounts.Account("local", backend, mode=mode)
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://default.invalid/chatgpt")
+    with accounts.use(selected):
+        assert codex_auth.published_url() is None
+
+
+def test_named_account_does_not_inherit_default_route_when_broker_disabled(monkeypatch):
+    from claude_on_the_fly import accounts
+
+    monkeypatch.setattr(codex_auth, "enabled", lambda: False)
+    monkeypatch.setattr(codex_auth, "_account_urls", {})
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://default.invalid/chatgpt")
+    with accounts.use(accounts.Account("work", "codex")):
+        assert codex_auth.published_url() is None

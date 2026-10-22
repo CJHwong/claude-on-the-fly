@@ -97,6 +97,12 @@ def claude_config_dir(env: Mapping[str, str] | None = None) -> Path:
     which is the right default for a viewer: the interesting case is precisely
     the one where this process and the daemon disagree.
     """
+    if env is None:
+        from claude_on_the_fly import accounts
+
+        account = accounts.current()
+        if account is not None and account.backend == "claude":
+            return account.source_home
     resolved = daemon_environment() if env is None else env
     return Path(resolved.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
@@ -109,5 +115,11 @@ def codex_home(env: Mapping[str, str] | None = None) -> Path:
     their config and credential back to, and where rollouts written before
     per-workspace homes existed still live.
     """
+    if env is None:
+        from claude_on_the_fly import accounts
+
+        account = accounts.current()
+        if account is not None and account.backend == "codex":
+            return account.source_home
     resolved = daemon_environment() if env is None else env
     return Path(resolved.get("CODEX_HOME") or Path.home() / ".codex")
