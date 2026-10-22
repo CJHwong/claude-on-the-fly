@@ -40,6 +40,21 @@ Messaging-platform adapters (Slack, Telegram) implement the `Frontend` ABC at `s
 - **Image / file input**: frontends save uploads into `<workspace>/inbox/` through `agent.inbox_path`, flat, with a numeric suffix on a name clash (every thread of a conversation shares the inbox). The `[File saved: inbox/<name>]` line names the path relative to the workspace, which is the agent's cwd. Don't try to pipe image bytes through the agent CLI.
 - **File output (outbox)**: the agent attaches files by dropping them in its session's outbox, `<workspace>/outbox/<session uuid>/` (`agent.session_outbox`). Per session rather than per workspace because every thread of a conversation shares the workspace and two can run at once; a shared outbox handed one thread's file to the other's reply. The orchestrator creates the directory before the turn, names it in the system prompt and again in a `<cotf-outbox>` line on every turn's prompt (claude never re-reads the system prompt on a healthy resume, so a session from before a move would otherwise deliver into a directory nothing collects), scans it after the run (`agent.collect_outbox`), sets `response.attachments`, lets `send()` upload them, archives to `<workspace>/outbox/.sent/<ts>/` (`agent.archive_outbox`), then removes the empty session directory (`agent.retire_outbox`). This is gated on `agent.ATTACHMENT_PLATFORMS`. To support outbox on a new frontend: add its platform to `ATTACHMENT_PLATFORMS` and have `send()` upload `response.attachments`. Slack uploads via `files_upload_v2` and must record the share `ts` (echo guard, since it posts as the user); Telegram routes images to `send_photo`, else `send_document`.
 
+## Account routing
+
+Account rules use platform identifiers, not display names.
+The channel rule wins over the initiating user's rule, then the backend default.
+Telegram channel keys identify chats; its user keys identify senders.
+Save the selected alias and fallback list per platform, conversation session, and backend before the first spawn.
+Resume and later participants keep that alias. A new conversation selects again.
+Recovery must retain the original routing context, selected account, and fallback list.
+Save a successful replacement account for later replies and resume.
+Only confirmed exhausted credits or quota permit fallback within the saved list.
+
+Routing edits affect new conversations. Account definitions require a restart because broker routes are constructed at startup.
+Jobs use backend defaults and have no per-job account override.
+See [the schema](../reference/config-yaml.md#accounts) for the operator contract.
+
 ## Slack control surface (token-kind split)
 
 Slack exposes two control surfaces, chosen by the token kind (`_is_bot_token`, from the `xoxb`/`xoxp` prefix):

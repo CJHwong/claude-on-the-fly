@@ -95,6 +95,12 @@ def check_backend() -> None:
     Each distinct (backend, mode) pair is checked once. Several profiles that
     differ only by model share one CLI, and the checks below spawn it.
     """
+    from claude_on_the_fly import accounts
+
+    try:
+        accounts.validate()
+    except accounts.AccountError as exc:
+        raise _exit(str(exc)) from exc
     checked: set[tuple[str, str]] = set()
     for name in (None, *agent.profile_names()):
         profile = _resolve_or_exit(name)
@@ -103,6 +109,18 @@ def check_backend() -> None:
             continue
         checked.add(pair)
         _check_agent_cli(profile)
+    for account in accounts.all_accounts().values():
+        base = agent.AgentProfile(
+            account.backend,
+            settings.get(f"{account.backend.upper()}_MODE", "native"),
+            settings.get(f"{account.backend.upper()}_MODEL", ""),
+            settings.get(f"{account.backend.upper()}_EFFORT", ""),
+        )
+        profile = accounts.apply_profile(base, account)
+        pair = (profile.backend, profile.mode)
+        if pair not in checked:
+            checked.add(pair)
+            _check_agent_cli(profile)
 
 
 def _resolve_or_exit(name: str | None) -> agent.AgentProfile:

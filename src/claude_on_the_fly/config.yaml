@@ -509,6 +509,64 @@ agent:
   #   auto_install: false
   #   auto_refresh: true
 
+# Account profiles select credentials when a conversation starts or resumes.
+# Definitions need a restart. Credentials stay in each CLI profile, never here.
+# Omit both sections to keep the existing daemon account behavior.
+accounts:
+#   claude_default:
+#     backend: claude
+#     home: null              # Leave CLAUDE_CONFIG_DIR unset.
+#   claude_local:
+#     backend: claude
+#     home: ~/.claude-local
+#     mode: ollama
+#     model: qwen3:30b
+#   codex_default:
+#     backend: codex
+#     home: null              # Use ~/.codex for authentication.
+#   codex_avery:
+#     backend: codex
+#     home: ~/.codex-avery
+#   codex_bela:
+#     backend: codex
+#     home: ~/.codex-bela
+#
+# Channel rule wins over initiating user rule, then the backend default.
+# A saved conversation keeps its account and fallback list through resume/restart.
+# Routing edits affect new conversations; /new selects again on Telegram.
+# A string pins one account. A list permits fallback on confirmed exhausted quota.
+# Each turn starts with its saved account and attempts each alias at most once.
+# The successful replacement stays selected. Routing edits affect new sessions.
+# Temporary rate limits, auth/network errors, and overload do not trigger fallback.
+# Partial work needs a complete native checkpoint; fallback continues from it.
+# Account profiles share workspace history. Every listed account must allow this.
+# Jobs use the backend default. A missing chosen account fails without fallback.
+routing:
+#   defaults:
+#     claude: claude_default
+#     codex:
+#       - codex_default
+#       - codex_avery
+#       - codex_bela
+#   slack:
+#     channels:
+#       C0123456789:
+#         codex:
+#           - codex_avery
+#           - codex_bela
+#     users:
+#       U0123456789:
+#         claude: claude_local
+#   telegram:
+#     channels:
+#       "-1001234567890":
+#         codex:
+#           - codex_avery
+#           - codex_bela
+#     users:
+#       "123456789":
+#         claude: claude_default
+
 watchdog:
   # `claude-watchdog` restarts a daemon whose process is alive but whose
   # heartbeat has gone stale. Nothing else recovers one without a person

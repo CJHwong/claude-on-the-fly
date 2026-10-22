@@ -172,6 +172,9 @@ class Route:
     # Set to read the credential per request instead of from the keychain;
     # `header`, `value_prefix` and `keychain_service` are then unused.
     source: HeaderSource | None = None
+    # Account routes need separate capabilities. A turn must not select another
+    # account by changing the path in its published URL.
+    isolated: bool = False
 
     @property
     def label(self) -> str:
@@ -327,6 +330,11 @@ class Broker:
         # random path capability keeps an unrelated local process that merely
         # discovers the port from invoking a credentialed upstream request.
         self._token = secrets.token_urlsafe(32)
+        self._route_tokens = {
+            route.prefix: secrets.token_urlsafe(32)
+            for route in routes
+            if route.isolated
+        }
 
     @property
     def port(self) -> int:
@@ -343,13 +351,17 @@ class Broker:
         never a usable route.
         """
         return {
-            route.base_url_env_var: (
-                f"http://127.0.0.1:{self.port}{_SESSION_PREFIX}"
-                f"{self._token}{route.prefix}"
-            )
+            route.base_url_env_var: self.route_url(route.prefix)
             for route in self._routes
             if route.base_url_env_var
         }
+
+    def route_url(self, prefix: str) -> str:
+        """Return the capability URL for one configured route."""
+        if not any(route.prefix == prefix for route in self._routes):
+            raise ValueError(f"unknown broker route: {prefix}")
+        token = self._route_tokens.get(prefix, self._token)
+        return f"http://127.0.0.1:{self.port}{_SESSION_PREFIX}{token}{prefix}"
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         for route in self._routes:
@@ -405,6 +417,8 @@ class Broker:
         """
         if route.source is None:
             self._creds[route.keychain_service] = read_keychain(route.keychain_service)
+        if route.isolated:
+            self._route_tokens[route.prefix] = secrets.token_urlsafe(32)
         self._routes = sorted(
             [*self._routes, route], key=lambda r: len(r.prefix), reverse=True
         )
@@ -478,9 +492,16 @@ class Broker:
             return None
         rest = path[len(_SESSION_PREFIX) :]
         token, separator, route_tail = rest.partition("/")
-        if not separator or not token or not hmac.compare_digest(token, self._token):
+        if not separator or not token:
             return None
-        return "/" + route_tail
+        route_path = "/" + route_tail
+        route = self._match(route_path)
+        required = self._token
+        if route is not None and route.isolated:
+            required = self._route_tokens[route.prefix]
+        if not hmac.compare_digest(token, required):
+            return None
+        return route_path
 
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         route_path = self._authorized_path(request.path)
@@ -681,11 +702,13 @@ async def start_default_broker(
     routes = routes_from_keychain(DEFAULT_ROUTES) if keychain else []
     if codex_auth.enabled():
         routes.append(codex_auth.route())
+        routes.extend(codex_auth.account_routes())
     if not routes:
         logger.warning("broker: no provisioned routes found; not starting")
         return None
     broker = Broker(routes, approvals=approvals)
     await broker.start()
     os.environ.update(broker.base_url_env())
+    codex_auth.publish_account_urls(broker)
     logger.info("broker: started with %d route(s)", len(routes))
     return broker

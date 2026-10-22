@@ -1206,6 +1206,16 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
         result["last_assistant_text"] = last_text.get("text", "")
         result["last_assistant_model"] = last_model.get("model", "")
 
+    from claude_on_the_fly import quota
+
+    exhausted = quota.claude_error(
+        result,
+        stderr_bytes.decode(errors="replace").strip(),
+        proc.returncode or 0,
+        tool_counts,
+    )
+    if exhausted is not None:
+        raise exhausted
     if proc.returncode != 0:
         err_stderr = stderr_bytes.decode().strip()
         logger.debug(
@@ -1681,6 +1691,10 @@ class AgentProfile:
     effort: str
     ollama_context_window: int | None = None
     ollama_cache_ttl_s: int | None = None
+    account: str | None = None
+    account_pool: tuple[str, ...] = ()
+    account_base: tuple[str, str] | None = None
+    overrides: tuple[tuple[str, str], ...] = ()
 
     @property
     def key(self) -> str:
@@ -1719,7 +1733,11 @@ def apply_override(profile: AgentProfile, overrides: Mapping[str, str]) -> Agent
     pinned = {
         key: value for key, value in overrides.items() if key in OVERRIDABLE_FIELDS
     }
-    return replace(profile, **pinned) if pinned else profile
+    return (
+        replace(profile, **pinned, overrides=tuple(sorted(pinned.items())))
+        if pinned
+        else profile
+    )
 
 
 def profile_names() -> list[str]:
@@ -1861,7 +1879,11 @@ def get_backend(profile: AgentProfile | None = None) -> AgentBackend:
 
     Raises ValueError on misconfiguration, via `resolve_profile`.
     """
-    resolved = profile if profile is not None else resolve_profile()
+    from claude_on_the_fly import accounts
+
+    resolved = accounts.resolve_profile(
+        profile if profile is not None else resolve_profile()
+    )
     if resolved.backend == "claude":
         return _build_claude_backend(resolved)
     return _build_codex_backend(resolved)
@@ -2021,16 +2043,41 @@ async def run(
     profile: AgentProfile | None = None,
     facts: dict[str, str] | None = None,
 ) -> Response:
-    return await get_backend(profile).run(
-        workspace,
-        session_uuid,
-        prompt,
-        platform,
-        user_name=user_name,
-        channel_context=channel_context,
-        timeout=timeout,
-        nudge_prompt=nudge_prompt,
-        facts=facts,
+    from claude_on_the_fly import account_fallback, accounts
+
+    original = profile if profile is not None else resolve_profile()
+    resolved = accounts.resolve_profile(original)
+    if original.account is None:
+        saved = accounts.saved_selection(platform, session_uuid, original.backend)
+        if resolved.account_pool or (saved is not None and saved.pool):
+            chosen = saved or accounts.selection(
+                platform, session_uuid, original.backend, "", "", persist=True
+            )
+            resolved = replace(
+                accounts.apply_profile(original, chosen.account),
+                account_pool=chosen.pool,
+            )
+
+    async def invoke(
+        candidate: AgentProfile, attempt_prompt: str, remaining: float | None
+    ) -> Response:
+        account = accounts.for_profile(candidate)
+        with accounts.use(account, mode=candidate.mode):
+            accounts.prepare(workspace)
+            return await get_backend(candidate).run(
+                workspace,
+                session_uuid,
+                attempt_prompt,
+                platform,
+                user_name=user_name,
+                channel_context=channel_context,
+                timeout=remaining,
+                nudge_prompt=nudge_prompt if attempt_prompt == prompt else None,
+                facts=facts,
+            )
+
+    return await account_fallback.run(
+        resolved, workspace, session_uuid, prompt, platform, invoke, timeout
     )
 
 
@@ -2046,8 +2093,16 @@ async def compact(
     than the turn it compacts would summarize with a model the conversation
     never used.
     """
-    backend = get_backend(profile)
-    compactor = getattr(backend, "compact", None)
-    if compactor is None:
-        return None
-    return await compactor(workspace, session_uuid, timeout=timeout)
+    from claude_on_the_fly import accounts
+
+    resolved = accounts.resolve_profile(
+        profile if profile is not None else resolve_profile()
+    )
+    account = accounts.for_profile(resolved)
+    with accounts.use(account, mode=resolved.mode):
+        accounts.prepare(workspace)
+        backend = get_backend(resolved)
+        compactor = getattr(backend, "compact", None)
+        if compactor is None:
+            return None
+        return await compactor(workspace, session_uuid, timeout=timeout)

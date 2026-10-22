@@ -44,6 +44,19 @@ The route starts with the sandbox off as well, alone, with no keychain route. Th
 an operator run the broker on real traffic before turning the jail on. Publishing
 `ANTHROPIC_BASE_URL` there would move claude turns onto the broker as a side effect.
 
+Named Codex accounts add `/chatgpt/accounts/<name>` routes with independent path
+capabilities. The default capability cannot authorize these routes. An account's
+capability cannot authorize another route. The daemon keeps account URLs in memory;
+`codex_auth.published_url()` selects the current account. The sandbox publishes only
+that URL as `COTF_CHATGPT_BASE_URL` to the child. Account routes read their profile's
+`auth.json` and cache that source separately.
+
+Unused accounts can lack credentials. Selection checks the account's login before
+the child starts and never falls back to the default route. With named Codex
+accounts configured, the default login can also remain absent at startup.
+Refresh locks use the resolved profile path, so aliases share a lock. An alias of
+the default profile shares the existing `codex-auth.lock`.
+
 Refresh rules, from codex's own `manager.rs` and a live run against the token endpoint:
 
 - Refresh at 7 days, one day before codex's 8, or 5 minutes before the access token

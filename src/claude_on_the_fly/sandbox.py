@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
 import time
+import unicodedata
 from collections.abc import Iterable
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -156,8 +158,13 @@ def _claude_credential_text() -> str | None:
     can still read and refresh its own file, and an env token would shadow a
     credential that refreshes with one that expires.
     """
-    from claude_on_the_fly import broker, envfile
+    from claude_on_the_fly import accounts, broker, envfile
 
+    account = accounts.current()
+    if account is not None and (
+        account.backend != "claude" or account.mode == "ollama"
+    ):
+        return None
     platform = _platform()
     if platform == "linux":
         if mode() != "jail":
@@ -172,8 +179,13 @@ def _claude_credential_text() -> str | None:
     # -- it stays because it is the one the tests drive, through `_platform`.
     if platform != "darwin":
         return None
+    service = _CLAUDE_KEYCHAIN_SERVICE
+    if account is not None and account.home is not None:
+        profile_path = unicodedata.normalize("NFC", str(account.home))
+        suffix = hashlib.sha256(profile_path.encode("utf-8")).hexdigest()[:8]
+        service = f"{service}-{suffix}"
     try:
-        return broker.read_keychain(_CLAUDE_KEYCHAIN_SERVICE)
+        return broker.read_keychain(service)
     except (KeyError, OSError):
         return None
 
@@ -577,6 +589,30 @@ def _is_passthrough(key: str) -> bool:
     )
 
 
+def _account_env(env: dict[str, str]) -> dict[str, str]:
+    """Select one profile without changing the daemon environment."""
+    from claude_on_the_fly import accounts
+
+    account = accounts.current()
+    if account is None:
+        return env
+    for name in accounts.AUTH_OVERRIDE_ENV:
+        env.pop(name, None)
+    from claude_on_the_fly import codex_auth
+
+    env.pop("COTF_CHATGPT_BASE_URL", None)
+    if account.backend == "codex":
+        url = codex_auth.published_url()
+        if url is not None:
+            env["COTF_CHATGPT_BASE_URL"] = url
+    if account.backend == "claude":
+        if account.home is None:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            env["CLAUDE_CONFIG_DIR"] = str(account.source_home)
+    return env
+
+
 def agent_env() -> dict[str, str] | None:
     """Environment for a spawned agent, or None to inherit the parent's unchanged.
 
@@ -594,9 +630,11 @@ def agent_env() -> dict[str, str] | None:
     claude-pty named its own tmux session -- a turn that parked at a permission
     dialog no one could answer.
     """
+    from claude_on_the_fly import accounts
+
     overrides = _SESSION_ENV.get() or {}
     if not enabled():
-        if not overrides:
+        if not overrides and accounts.current() is None:
             return None
         # Inherit and layer, not curate: nothing is being withheld in this mode,
         # so building the env from an allowlist would break every spawn that
@@ -606,7 +644,7 @@ def agent_env() -> dict[str, str] | None:
             len(overrides),
             sorted(overrides),
         )
-        return {**os.environ, **overrides}
+        return {**_account_env(dict(os.environ)), **overrides}
     env = {key: value for key, value in os.environ.items() if _is_passthrough(key)}
     dropped = len(os.environ) - len(env)
     # The jail grants the claude session directory by name, derived from the
@@ -646,6 +684,7 @@ def agent_env() -> dict[str, str] | None:
     # Only on this branch, never when the sandbox is off: an environment token
     # shadows the CLI's stored credential, so setting it on a turn that can reach
     # the keychain would change how an unjailed turn authenticates for no reason.
+    env = _account_env(env)
     claude_token = _claude_oauth_token()
     if claude_token is not None:
         env["ANTHROPIC_AUTH_TOKEN"] = claude_token
@@ -775,7 +814,7 @@ def _spawn_env() -> dict[str, str]:
     process environment, so reading os.environ narrowed the jail to the broker
     port alone and locked the agent out of the very proxy it was handed.
     """
-    return {**os.environ, **(_SESSION_ENV.get() or {})}
+    return {**_account_env(dict(os.environ)), **(_SESSION_ENV.get() or {})}
 
 
 def _loopback_ports() -> list[str]:
@@ -904,13 +943,18 @@ def _extra_path_stores() -> list[Path]:
 
     stores = [Path(store).expanduser() for store in _CREDENTIAL_STORES]
     stores.append(Path(DATA_DIR))
+    stores.extend(_account_homes())
     return [Path(os.path.realpath(store)) for store in stores]
 
 
 def _extra_path_files() -> list[Path]:
     """The file-level credential paths an entry may not reach, realpath'd."""
     return [
-        Path(os.path.realpath(Path(file).expanduser())) for file in _CREDENTIAL_FILES
+        *(
+            Path(os.path.realpath(Path(file).expanduser()))
+            for file in _CREDENTIAL_FILES
+        ),
+        *_account_credential_paths(),
     ]
 
 
@@ -1563,6 +1607,11 @@ def _codex_auth_denied() -> Path | None:
 
     if codex_auth.published_url() is None:
         return None
+    from claude_on_the_fly import accounts, envfile
+
+    account = accounts.current()
+    if account is not None and account.backend == "codex":
+        return Path(os.path.realpath(envfile.codex_home() / "auth.json"))
     return _codex_operator_home() / "auth.json"
 
 
@@ -1583,7 +1632,7 @@ def _codex_operator_home() -> Path:
     """
     from claude_on_the_fly import envfile
 
-    return Path(os.path.realpath(envfile.codex_home()))
+    return Path(os.path.realpath(envfile.codex_home(envfile.daemon_environment())))
 
 
 def _pane_socket() -> Path:
@@ -1984,6 +2033,149 @@ def _macos_write_protection(granted: list[str]) -> tuple[list[str], list[str]]:
     return protect, unprotect
 
 
+def _account_policy_active() -> bool:
+    from claude_on_the_fly import accounts
+
+    return accounts.current() is not None or bool(accounts.all_accounts())
+
+
+def _account_profile_roots() -> list[tuple[str, Path]]:
+    from claude_on_the_fly import accounts, envfile
+
+    profiles = [
+        (account.backend, account.source_home)
+        for account in accounts.all_accounts().values()
+    ]
+    if profiles or accounts.current() is not None:
+        daemon = envfile.daemon_environment()
+        profiles.extend(
+            [
+                ("claude", envfile.claude_config_dir(daemon)),
+                ("codex", envfile.codex_home(daemon)),
+            ]
+        )
+    return list(
+        dict.fromkeys(
+            (backend, Path(os.path.realpath(root))) for backend, root in profiles
+        )
+    )
+
+
+def _account_homes() -> list[Path]:
+    return [root for _, root in _account_profile_roots()]
+
+
+def _account_credential_paths() -> list[Path]:
+    paths = []
+    for backend, root in _account_profile_roots():
+        name = "auth.json" if backend == "codex" else _CLAUDE_CREDENTIALS_FILE
+        paths.append(Path(os.path.realpath(root / name)))
+    return paths
+
+
+def _account_denied_homes() -> list[Path]:
+    from claude_on_the_fly import accounts, envfile
+
+    if not _account_policy_active():
+        return []
+    active = [Path(os.path.realpath(envfile.claude_config_dir()))]
+    if accounts.current() is None:
+        active.append(_codex_operator_home())
+    return [home for home in _account_homes() if home not in active]
+
+
+def _account_config_reads() -> list[Path]:
+    from claude_on_the_fly import codex_state
+
+    base = _codex_operator_home()
+    return [
+        Path(os.path.realpath(base / name))
+        for name in (*codex_state._SHARED_ENTRIES, *codex_state._SHARED_MERGED)
+        if name != "auth.json" and (base / name).exists()
+    ]
+
+
+def _protect_account_mounts(grants: dict[str, list[Path]], workspace: Path) -> None:
+    from claude_on_the_fly import accounts, envfile
+
+    if not _account_policy_active():
+        return
+    denied = _account_denied_homes()
+    grants["opaque"].extend(path for path in denied if path.is_dir())
+    grants["read_write"] = [
+        path
+        for path in grants["read_write"]
+        if not any(path.is_relative_to(root) for root in denied)
+    ]
+    grants["read_only"] = [
+        path
+        for path in grants["read_only"]
+        if not any(path.is_relative_to(root) for root in denied)
+    ]
+    for key in ("write_denied", "write_denied_dirs"):
+        grants[key] = [
+            path
+            for path in grants.get(key, [])
+            if not any(path == root / "auth.json" for root in denied)
+        ]
+    grants["read_only"].extend(_account_config_reads())
+    selected_auth = None
+    account = accounts.current()
+    if account is None or account.backend == "codex":
+        selected_auth = Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+    grants.setdefault("masked", []).extend(
+        path
+        for path in _account_credential_paths()
+        if path.exists() and (path != selected_auth or _codex_auth_denied() is not None)
+    )
+    _, _, thread = _claude_session_paths(workspace)
+    grants["read_write"].append(thread)
+    account = accounts.current()
+    if account is not None and account.backend == "codex":
+        auth = Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+        if _codex_auth_denied() is None and auth.exists():
+            grants["read_write"].append(auth)
+
+
+def _account_seatbelt_rules(workspace: Path) -> str:
+    from claude_on_the_fly import accounts, codex_state, envfile
+
+    account = accounts.current()
+    if not _account_policy_active():
+        return ""
+    rules = [
+        f"(deny file-read* file-write* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        for path in _account_denied_homes()
+    ]
+    for path in _account_config_reads():
+        rules.append(
+            f"(allow file-read* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        )
+    _, _, claude_thread = _claude_session_paths(workspace)
+    codex_home = codex_state.home_dir(workspace)
+    sessions = Path(os.path.realpath(codex_home / "sessions"))
+    for path in (claude_thread, sessions):
+        rules.append(
+            f"(allow file-read* file-write* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        )
+    for path in _account_credential_paths():
+        rules.append(
+            f"(deny file-read* file-write* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        )
+    if (account is None or account.backend == "codex") and _codex_auth_denied() is None:
+        auth = Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+        rules.append(
+            f"(allow file-read* file-write* (literal {json.dumps(str(auth), ensure_ascii=False)}))"
+        )
+    for path in _account_config_reads():
+        quoted = json.dumps(str(path), ensure_ascii=False)
+        rules.append(
+            '(deny file-read* file-write* (regex (string-append "^" '
+            f'(regex-quote {quoted}) "/(.*/)?\\\\.env[^/]*$")))'
+        )
+    return "\n".join(rules)
+
+
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
     from claude_on_the_fly import codex_state
@@ -2032,13 +2224,14 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # the data dir, which is opaque, so without this the directory the backend
         # just pointed the child at would not exist inside the namespace.
         codex_home,
+        Path(os.path.realpath(codex_home / "sessions")),
         # Operator write grants. Last so a narrower entry cannot be shadowed by
         # one of the fixed grants above; bwrap applies these by depth, not by
         # argv order, so position here is for the reader rather than the kernel.
         *(Path(p) for p in granted_writes),
         *_rename_pins(protected, granted_writes),
     ]
-    return {
+    grants = {
         # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
         # $HOME gets the same treatment. memory/ and shims/ are granted back below
         # at greater depth, so the sibling .env and logs/ stay hidden either way.
@@ -2073,7 +2266,7 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             # inside the namespace: a link into ~/.agents resolves nowhere here, and
             # codex then reports a missing file rather than a hidden one.
             *codex_state.shared_link_targets(),
-            home / ".claude",
+            claude_config,
             *_claude_link_targets(),
             codex,
             data_dir / "shims",
@@ -2109,6 +2302,9 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             ),
         ],
     }
+
+    _protect_account_mounts(grants, workspace)
+    return grants
 
 
 def _linux_masked(data_dir: Path) -> list[Path]:
@@ -2488,11 +2684,15 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     # Linux needs no equivalent. `_linux_grants` puts `_codex_protected` under
     # `write_denied` whatever the setting says, so the shared tree keeps its
     # instruction files read-only there either way.
-    codex_write = codex_home if scoped_sessions() else codex_sessions
+    from claude_on_the_fly import accounts
+
+    selected = accounts.current()
+    account_codex = selected is not None and selected.backend == "codex"
+    codex_write = codex_home if scoped_sessions() or account_codex else codex_sessions
     resolved = sandbox_macos.realpaths(workspace, DATA_DIR)
     granted_writes = _extra_write_paths() if base == _DENY_MOST_PROFILE else []
     protect, unprotect = _macos_write_protection(granted_writes)
-    return sandbox_macos.jail_argv(
+    wrapped = sandbox_macos.jail_argv(
         argv,
         **resolved,
         claude_config=claude_config,
@@ -2523,6 +2723,16 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
             resolved["project"], resolved["home"]
         ),
     )
+
+    rules = _account_seatbelt_rules(workspace)
+    if rules:
+        profile_index = wrapped.index("-f")
+        profile = wrapped[profile_index + 1]
+        wrapped[profile_index : profile_index + 2] = [
+            "-p",
+            f"(import {json.dumps(profile, ensure_ascii=False)})\n{rules}",
+        ]
+    return wrapped
 
 
 # Credential stores the profile is expected to deny. Probed at startup so the

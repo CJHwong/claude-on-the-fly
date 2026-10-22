@@ -16,6 +16,7 @@ from claude_on_the_fly import (
     permissions,
     pricing,
     pty_install,
+    quota,
     sandbox,
     transcript,
 )
@@ -501,6 +502,13 @@ class ClaudeBackend:
                 timeout=timeout,
                 stdin_text=None if self.pty else prompt,
             )
+        except quota.AccountExhaustedError as failure:
+            failure.thread_id = session_uuid
+            if failure.tools_started and not self.pty:
+                failure.resume_ready = quota.claude_resume_ready(
+                    session_path, usage_offset
+                )
+            raise
         finally:
             if sysprompt_file is not None:
                 _discard_system_prompt(sysprompt_file)
@@ -546,12 +554,23 @@ class ClaudeBackend:
             retry_argv = [*base, "--resume", session_uuid]
             if self.pty:
                 retry_argv.append(nudge)
-            retry_output = await executor(
-                workspace,
-                retry_argv,
-                timeout=timeout,
-                stdin_text=None if self.pty else nudge,
-            )
+            try:
+                retry_output = await executor(
+                    workspace,
+                    retry_argv,
+                    timeout=timeout,
+                    stdin_text=None if self.pty else nudge,
+                )
+            except quota.AccountExhaustedError as failure:
+                failure.thread_id = session_uuid
+                failure.tools_started = failure.tools_started or bool(
+                    cli_output.get("tool_counts")
+                )
+                if failure.tools_started and not self.pty:
+                    failure.resume_ready = quota.claude_resume_ready(
+                        session_path, usage_offset
+                    )
+                raise
             if self.pty:
                 # claude-pty envelopes have no per-tool counts to merge and pty's
                 # `usage` is just the last assistant message — simpler to
@@ -1020,6 +1039,9 @@ async def _exec_pty(
     stderr_text = stderr.decode(errors="replace").strip()
 
     if rc != 0 and not stdout_text:
+        failure = quota.claude_error({}, stderr_text, rc, {"unknown": 1})
+        if failure is not None:
+            raise failure
         raise agent._classify(stderr_text or f"claude-pty exit {rc}")
 
     if not stdout_text:
@@ -1038,6 +1060,9 @@ async def _exec_pty(
         ) from exc
 
     if envelope.get("is_error") or str(envelope.get("subtype", "")).startswith("error"):
+        failure = quota.claude_error(envelope, stderr_text, rc, {"unknown": 1})
+        if failure is not None:
+            raise failure
         raise agent._classify(envelope.get("result") or stderr_text or "pty error")
 
     envelope.setdefault("tool_counts", {})

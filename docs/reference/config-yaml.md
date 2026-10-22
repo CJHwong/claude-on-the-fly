@@ -135,6 +135,74 @@ The model is part of the session identity, so a keyed entry whose profile change
 model starts a fresh transcript rather than resuming one that model never wrote.
 Effort is not, so raising it leaves the transcript alone.
 
+## `accounts`
+
+Optional mapping from an account alias to a CLI profile. Aliases contain no credentials.
+If `accounts` and `routing` are absent, existing account behavior stays unchanged.
+Restart the affected chat and jobs daemons after changing account definitions.
+
+| Key | Type / default | Values and effect | Lifecycle |
+|---|---|---|---|
+| `<alias>.backend` | required string | `claude` or `codex` | Restart required |
+| `<alias>.home` | path or null / null | Existing CLI profile directory; `~` expands to the operator home | Restart required |
+| `<alias>.mode` | optional string | `native`, `ollama`, or `pty`; overrides the backend mode | Restart required |
+| `<alias>.model` | optional string | Overrides the model; specify the served model for `ollama` mode | Restart required |
+
+For Claude, `home: null` leaves `CLAUDE_CONFIG_DIR` unset.
+An explicit `~/.claude` sets that variable and can select different login state.
+For Codex, `home: null` selects `~/.codex` for authentication.
+Codex keeps the daemon's default configuration source; an account home selects credentials, not its `config.toml`.
+Omitted `mode` and `model` inherit the existing agent settings.
+Account homes must be separate directories. Do not nest them inside another account home or a daemon base profile.
+
+The daemon shares only transcripts for its workspace across Claude account contexts.
+It does not merge the operator's complete personal histories.
+Codex uses a separate home for each workspace and account, with shared workspace sessions.
+The daemon does not copy Codex credentials into that home.
+
+## `routing`
+
+| Key | Type / default | Values and effect | Lifecycle |
+|---|---|---|---|
+| `defaults.<backend>` | alias or nonempty alias list / unset | Default account for `claude` or `codex`, including jobs | New conversation |
+| `<platform>.channels.<id>.<backend>` | alias or nonempty alias list / unset | Account for a Slack channel or Telegram chat | New conversation |
+| `<platform>.users.<id>.<backend>` | alias or nonempty alias list / unset | Account for the user who starts the conversation | New conversation |
+
+Supported platforms are `slack` and `telegram`. Use stable platform identifiers.
+Quote Telegram numeric identifiers. Telegram `channels` keys are chat identifiers; `users` keys are sender identifiers.
+See [Select accounts by channel or user](../how-to/select-accounts.md) for a complete example.
+
+Selection follows this order:
+
+1. Use the matching channel rule for the active backend.
+2. Otherwise, use the initiating user's rule for that backend.
+3. Otherwise, use the backend default.
+4. If no rule selects an account, keep the existing daemon account behavior.
+
+The daemon saves the alias and ordered fallback list per platform, conversation session, and backend.
+Replies and resume keep that selection, including after a daemon restart.
+Another participant does not change the account by replying.
+A new Slack thread or Telegram `/new` selects again.
+Routing does not select a backend; existing backend and model controls still apply.
+
+A missing account, wrong backend, or invalid selected profile fails explicitly.
+A string pins the selected account. A nonempty ordered list permits fallback after provider-confirmed exhausted credits or quota.
+Every alias must name the same backend. The daemon never selects an account outside the saved list.
+Routing edits affect new conversations, including the list they save.
+
+Each turn starts with the saved account, then follows the list and wraps around.
+The daemon attempts each alias at most once per turn and saves the successful replacement.
+If all accounts are exhausted, the turn fails with a clear error.
+Temporary rate limits, generic HTTP 429 responses, overload, model capacity, authentication errors, and network errors do not trigger fallback.
+There is no quota polling or background rotation.
+
+After partial work, retry requires a durable native transcript with completed tool results.
+The replacement continues from that transcript and does not replay the original request.
+An unknown or incomplete checkpoint stops automatic retry.
+Workspace history already spans account profiles; replacement accounts receive that history.
+Only configure a fallback list when every account may receive the same messages and tool results.
+Jobs use backend defaults; this version has no per-job account override or account command.
+
 ## `watchdog`
 
 | Key | Type / default | Values and effect | Lifecycle |

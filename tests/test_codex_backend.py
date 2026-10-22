@@ -3807,3 +3807,131 @@ def test_an_ollama_launcher_ignores_the_brokered_chatgpt_login(monkeypatch):
     monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
     launcher = OllamaLauncher(model="m")
     assert "model_provider=cotf" not in CodexBackend(launcher=launcher)._model_args()
+
+
+class TestQuotaExhaustion:
+    async def test_provider_error_raises_with_thread_and_durable_tool_results(
+        self, tmp_path
+    ):
+        from claude_on_the_fly.quota import AccountExhaustedError
+
+        records = (
+            _session_meta("quota-thread"),
+            _tool_call(call_id="call-1"),
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": "done",
+                },
+            },
+            _task_complete(
+                error={"code": "usage_limit_reached", "message": "Exhausted"}
+            ),
+        )
+        with pytest.raises(AccountExhaustedError) as raised:
+            await _run_exec(_exec_proc(1), tmp_path, records=records)
+        assert raised.value.thread_id == "quota-thread"
+        assert raised.value.tools_started
+        assert raised.value.resume_ready
+
+    async def test_first_turn_failure_keeps_native_thread_mapping(self, tmp_path):
+        from claude_on_the_fly.quota import AccountExhaustedError
+
+        failure = AccountExhaustedError("codex", thread_id="failed-native-thread")
+        with (
+            patch.object(codex_mod, "_run_codex_exec", AsyncMock(side_effect=failure)),
+            pytest.raises(AccountExhaustedError),
+        ):
+            await CodexBackend().run(tmp_path, "failed-session", "hello", "telegram")
+        assert (
+            codex_mod.codex_state.read_thread_id(tmp_path, "failed-session")
+            == "failed-native-thread"
+        )
+
+    def test_unfinished_tool_blocks_resume(self):
+        parsed = parse_codex_rollout(
+            [
+                _tool_call(call_id="unfinished"),
+                _task_complete(error={"code": "insufficient_quota"}),
+            ]
+        )
+        assert parsed["account_exhausted"]
+        assert parsed["tools_started"]
+        assert not parsed["resume_ready"]
+
+    def test_structured_error_event_detects_usage_limit(self):
+        parsed = parse_codex_rollout(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "error",
+                        "codex_error_info": "UsageLimitExceeded",
+                        "message": "No more usage",
+                    },
+                }
+            ]
+        )
+        assert parsed["account_exhausted"]
+
+    async def test_assistant_quota_text_cannot_trigger_switch(self, tmp_path):
+        result = await _run_exec(
+            _exec_proc(0),
+            tmp_path,
+            records=(
+                _assistant_text("You've hit your usage limit."),
+                _task_complete("You've hit your usage limit."),
+            ),
+        )
+        assert not result["account_exhausted"]
+
+    async def test_stderr_tool_output_cannot_trigger_switch(self, tmp_path):
+        from claude_on_the_fly.quota import AccountExhaustedError
+
+        with pytest.raises(RuntimeError) as raised:
+            await _run_exec(
+                _exec_proc(1, stderr=b"You've hit your usage limit."), tmp_path
+            )
+        assert not isinstance(raised.value, AccountExhaustedError)
+
+    def test_recovered_provider_error_does_not_switch_account(self):
+        parsed = parse_codex_rollout(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "error",
+                        "codex_error_info": "UsageLimitExceeded",
+                    },
+                },
+                _task_complete("Recovered successfully"),
+            ]
+        )
+        assert not parsed["account_exhausted"]
+
+    def test_unmatched_tool_item_blocks_resume_despite_another_completed_call(self):
+        parsed = parse_codex_rollout(
+            [
+                _tool_call(call_id="complete"),
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "complete",
+                        "output": "done",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_started",
+                        "item": {"type": "CommandExecution", "id": "pending"},
+                    },
+                },
+                _task_complete(error={"code": "insufficient_quota"}),
+            ]
+        )
+        assert parsed["tools_started"]
+        assert not parsed["resume_ready"]

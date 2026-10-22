@@ -57,7 +57,16 @@ from textual.widgets import (
     TabPane,
 )
 
-from claude_on_the_fly import checks, logs, permissions, tmux, turns, upgrade
+from claude_on_the_fly import (
+    accounts,
+    checks,
+    logs,
+    permissions,
+    takeover,
+    tmux,
+    turns,
+    upgrade,
+)
 from claude_on_the_fly.agent import (
     DATA_DIR,
     get_backend,
@@ -1066,7 +1075,11 @@ class DashboardScreen(Screen):
             return
         workspace = self._run_workspace(source, identifier)
         try:
-            cmd = get_backend().takeover_command(workspace, session_uuid)
+            cmd = (
+                takeover.command(workspace, session_uuid, platform=source)
+                if accounts.all_accounts()
+                else get_backend().takeover_command(workspace, session_uuid)
+            )
         except Exception as exc:
             self._notify(f"takeover failed: {exc}", "error")
             return
@@ -1081,8 +1094,8 @@ class DashboardScreen(Screen):
             # Re-tokenize and re-quote both pieces before placing them in a
             # shell command copied to the clipboard.
             safe_cmd = shlex.join(shlex.split(cmd))
-            takeover = f"cd -- {shlex.quote(str(workspace))} && {safe_cmd}"
-            self.app.copy_to_clipboard(takeover)
+            clipboard_command = f"cd -- {shlex.quote(str(workspace))} && {safe_cmd}"
+            self.app.copy_to_clipboard(clipboard_command)
         except Exception as exc:
             self._notify(f"clipboard write failed: {exc}", "error")
             return

@@ -96,7 +96,7 @@ def claude_projects_dir() -> Path:
     run a turn" over a session that was streaming. Resolving through
     `envfile` per call is what makes the reader agree with the writer.
     """
-    return envfile.claude_config_dir() / "projects"
+    return envfile.claude_config_dir(envfile.daemon_environment()) / "projects"
 
 
 @dataclass(frozen=True)

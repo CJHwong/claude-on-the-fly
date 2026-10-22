@@ -30,6 +30,7 @@ import asyncio
 import base64
 import datetime
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -85,6 +86,7 @@ _TIMEOUT_SECONDS = 30
 _TRUTHY = {"1", "true", "yes", "on"}
 
 Post = Callable[[dict[str, str]], dict[str, Any]]
+_account_urls: dict[str, tuple[str, ChatGPTLogin]] = {}
 
 
 class RefreshRejected(Exception):
@@ -103,6 +105,22 @@ def enabled() -> bool:
 
 def published_url() -> str | None:
     """The broker URL codex should use, or None when no broker serves the route."""
+    from claude_on_the_fly import accounts
+
+    account = accounts.current()
+    if account is not None:
+        if account.backend != "codex" or account.mode == "ollama":
+            return None
+        published = _account_urls.get(account.name)
+        if published is not None:
+            url, login = published
+            login.check()
+            return url
+        if enabled():
+            raise RuntimeError(
+                f"No Codex broker route for account {account.name!r}; restart the daemon"
+            )
+        return None
     return os.environ.get(BASE_URL_ENV) or None
 
 
@@ -365,26 +383,69 @@ class ChatGPTLogin:
         logger.info("codex auth: refreshed the ChatGPT login")
 
 
-def route() -> Any:
+def route(account: Any = None) -> Any:
     """The broker route serving the operator's ChatGPT login.
 
-    Raises when the login is missing, so an operator who opted in learns at
-    startup rather than on the first turn.
+    With no named accounts, reject a missing default login at startup.
+    Named accounts can remain unused, so check their login at selection.
     """
-    from claude_on_the_fly import broker, envfile
+    from claude_on_the_fly import accounts, broker, envfile
     from claude_on_the_fly.agent import DATA_DIR
 
-    login = ChatGPTLogin(
-        envfile.codex_home() / "auth.json", DATA_DIR / "state" / "codex-auth.lock"
+    home = envfile.codex_home() if account is None else account.source_home
+    # Aliases that share a login also share its lock across daemon processes.
+    digest = hashlib.sha256(str(home.resolve()).encode()).hexdigest()[:24]
+    legacy_home = (
+        envfile.codex_home(envfile.daemon_environment())
+        if account is not None
+        else home
     )
-    login.check()
+    lock = (
+        "codex-auth.lock"
+        if home.resolve() == legacy_home.resolve()
+        else f"codex-auth-{digest}.lock"
+    )
+    login = ChatGPTLogin(home / "auth.json", DATA_DIR / "state" / lock)
+    configured = accounts.all_accounts().values()
+    if account is None and not any(item.backend == "codex" for item in configured):
+        login.check()
+    prefix = ROUTE_PREFIX if account is None else f"/chatgpt/accounts/{account.name}"
     return broker.Route(
-        prefix=ROUTE_PREFIX,
+        prefix=prefix,
         upstream=UPSTREAM,
         header="authorization",
         keychain_service="",
-        base_url_env_var=BASE_URL_ENV,
+        base_url_env_var=BASE_URL_ENV if account is None else "",
         methods=ALLOWED_METHODS,
         allowed_tails=ALLOWED_TAILS,
         source=login,
+        isolated=account is not None,
     )
+
+
+def account_routes() -> list[Any]:
+    """Create isolated account routes without requiring unused accounts to log in."""
+    from claude_on_the_fly import accounts
+
+    return [
+        route(account)
+        for account in accounts.all_accounts().values()
+        if account.backend == "codex" and account.mode != "ollama"
+    ]
+
+
+def publish_account_urls(running_broker: Any) -> None:
+    """Keep account capabilities in the daemon, outside the inherited environment."""
+    from claude_on_the_fly import accounts
+
+    _account_urls.clear()
+    if not enabled():
+        return
+    for account in accounts.all_accounts().values():
+        prefix = f"/chatgpt/accounts/{account.name}"
+        selected = running_broker._match(prefix)
+        if selected is not None and selected.prefix == prefix:
+            _account_urls[account.name] = (
+                running_broker.route_url(prefix),
+                selected.source,
+            )

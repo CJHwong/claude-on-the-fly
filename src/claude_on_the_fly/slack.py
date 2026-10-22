@@ -1378,6 +1378,7 @@ class SlackFrontend(Frontend):
         # id or name) from a DM (keyed by whoever is talking).
         self._channel_names: dict[int, str] = {}
         self._user_name_cache: dict[str, str] = {}  # slack user_id -> display name
+        self._account_senders: dict[int, str] = {}
         self._session_sender_ids: dict[int, str] = {}  # session -> slack user_id
         self._dm_channels: dict[str, str] = {}  # slack user_id -> im channel id
         self._pending_msg: dict[
@@ -1589,6 +1590,14 @@ class SlackFrontend(Frontend):
 
     def sender_name(self, chat_id: int) -> str:
         return self._sender_names.get(chat_id, "unknown")
+
+    def account_subjects(self, chat_id: int) -> tuple[str, str]:
+        """Use immutable Slack identifiers rather than display names."""
+        entry = self._sessions.get(chat_id)
+        channel = entry[0] if entry is not None else ""
+        return channel, self._account_senders.get(
+            chat_id, self._session_sender_ids.get(chat_id, "")
+        )
 
     def session_facts(self, chat_id: int) -> dict[str, str]:
         facts: dict[str, str] = {}
@@ -2541,6 +2550,7 @@ class SlackFrontend(Frontend):
         self._sender_names[session_id] = sender
         if user_id:
             self._session_sender_ids[session_id] = user_id
+            self._account_senders.setdefault(session_id, user_id)
         channel_type = await self._channel_type(channel)
         await self._resolve_session_metadata(
             session_id, sender, user_id, channel, channel_type, thread_ts or ""
@@ -2990,6 +3000,7 @@ class SlackFrontend(Frontend):
             return
 
         self._session_sender_ids[session_id] = sender_id
+        self._account_senders.setdefault(session_id, sender_id)
         self._processed_ts.add(ts)
         self._active_channels[channel] = ts
         if channel_type:

@@ -133,8 +133,16 @@ def home_dir(workspace: Path) -> Path:
     decides it, so the profile parameter and the `CODEX_HOME` the backend sets on
     the child cannot disagree about where the rollouts are.
     """
-    from claude_on_the_fly import envfile, sandbox
+    from claude_on_the_fly import accounts, envfile, sandbox
 
+    account = accounts.current()
+    if account is not None and account.backend == "codex":
+        identity = (
+            f"{workspace.resolve(strict=False)}\0{account.name}"
+            f"\0{account.source_home.resolve(strict=False)}"
+        )
+        suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return HOMES_DIR / f"{_home_key(workspace)}-account-{suffix}"
     if not sandbox.scoped_sessions():
         return envfile.codex_home()
     return HOMES_DIR / _home_key(workspace)
@@ -148,9 +156,24 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
     Absent shared entries are skipped rather than stubbed, because codex treats a
     missing config as "use the defaults" and a dangling link as an error.
     """
-    from claude_on_the_fly import envfile, sandbox
+    from claude_on_the_fly import accounts, envfile, sandbox
 
+    account = accounts.current()
+    selected = account is not None and account.backend == "codex"
     home = home_dir(workspace)
+    if selected:
+        shared_sessions = HOMES_DIR / _home_key(workspace) / "sessions"
+        shared_sessions.mkdir(parents=True, exist_ok=True)
+        home.mkdir(parents=True, exist_ok=True)
+        session_link = home / "sessions"
+        if session_link.is_symlink() and session_link.readlink() != shared_sessions:
+            session_link.unlink()
+        if session_link.exists() and not session_link.is_symlink():
+            raise accounts.AccountError(
+                f"Codex sessions path must link to the workspace history: {session_link}"
+            )
+        if not session_link.is_symlink():
+            session_link.symlink_to(shared_sessions, target_is_directory=True)
     # sessions/ is created here rather than left to codex because the jail makes
     # $HOME opaque, and a recursive mkdir that cannot stat an ancestor walks up and
     # tries to create it instead: measured as `mkdir: /Users/hoss: Operation not
@@ -159,7 +182,7 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
     # home too: the boundary decides which home a turn gets, not whether the
     # directory codex is about to write into is there.
     (home / "sessions").mkdir(parents=True, exist_ok=True)
-    if not sandbox.scoped_sessions():
+    if not sandbox.scoped_sessions() and not selected:
         # `home` is the operator's own shared tree here, so there is nothing to link:
         # every entry is already in place, and linking one onto itself would replace
         # the operator's config with a link to itself. `shared` is only ever a link
@@ -170,9 +193,12 @@ def ensure_home(workspace: Path, shared: Path | None = None) -> Path:
     # pointed at a directory that may hold neither -- every link then skipped as an
     # absent target, leaving a home with no config and no credential at all. The
     # shared tree the jail denies resolves the same way, so the two cannot disagree.
-    source_root = envfile.codex_home() if shared is None else shared
+    base_home = envfile.codex_home(envfile.daemon_environment())
+    source_root = base_home if shared is None else shared
     for name in _SHARED_ENTRIES:
-        link, target = home / name, source_root / name
+        credential_root = account.source_home if selected else source_root
+        root = credential_root if name == "auth.json" else source_root
+        link, target = home / name, root / name
         if not target.exists():
             continue
         if link.is_symlink():
@@ -260,7 +286,9 @@ def shared_link_targets(shared: Path | None = None) -> list[Path]:
     """
     from claude_on_the_fly import envfile
 
-    root = envfile.codex_home() if shared is None else shared
+    root = (
+        envfile.codex_home(envfile.daemon_environment()) if shared is None else shared
+    )
     resolved: dict[str, Path] = {}
     for name in (*_SHARED_ENTRIES, *_SHARED_MERGED):
         entry = root / name
@@ -360,15 +388,22 @@ def adopt_rollout(workspace: Path, thread_id: str, shared: Path | None = None) -
     it for the token and model lookups, and an operator who turns the boundary back
     off has to find it there.
     """
-    from claude_on_the_fly import envfile
+    from claude_on_the_fly import accounts, envfile
 
     if not thread_id:
         return False
     pattern = f"sessions/**/{rollout_glob(thread_id)}"
-    home = home_dir(workspace)
+    account = accounts.current()
+    home = (
+        ensure_home(workspace)
+        if account is not None and account.backend == "codex"
+        else home_dir(workspace)
+    )
     if any(home.glob(pattern)):
         return True
-    source_root = envfile.codex_home() if shared is None else shared
+    source_root = (
+        envfile.codex_home(envfile.daemon_environment()) if shared is None else shared
+    )
     found = sorted(source_root.glob(pattern))
     if not found:
         logger.warning("codex: no rollout anywhere for thread=%s", thread_id)
@@ -509,6 +544,10 @@ def remove_workspace(workspace: Path) -> None:
     # workspace either way, so a home left behind by an earlier scoped run is still
     # the one that goes.
     home = HOMES_DIR / _home_key(workspace)
+    prefix = f"{_home_key(workspace)}-account-"
+    for overlay in _safe_iterdir(HOMES_DIR):
+        if overlay.name.startswith(prefix):
+            shutil.rmtree(overlay, ignore_errors=True)
     for link in [
         *(home / name for name in _SHARED_ENTRIES),
         *(entry for name in _SHARED_MERGED for entry in _safe_iterdir(home / name)),

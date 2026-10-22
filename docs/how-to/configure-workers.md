@@ -28,3 +28,10 @@ default for its own job.
 
 Start the worker with `uv run claude-jobs`; run doctor before relying on unattended
 work. Tool approvals do not apply to jobs.
+
+Workers use `routing.defaults` for the job's backend.
+A string pins one account. An ordered list permits fallback after confirmed exhausted credits or quota.
+Each attempt stays within that list and backend.
+Channel and user rules apply only to chat conversations.
+Restart the worker after changing `accounts`; no per-job account override exists.
+See [Select accounts by channel or user](select-accounts.md).

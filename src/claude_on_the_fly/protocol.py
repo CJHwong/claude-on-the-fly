@@ -279,6 +279,11 @@ class Frontend(ABC):
     def channel_context(self, chat_id: int) -> str:
         """Where this conversation is happening, e.g. 'dm', 'channel:#general'."""
 
+    def account_subjects(self, chat_id: int) -> tuple[str, str]:
+        """Stable channel and user identifiers for account rules."""
+        facts = self.session_facts(chat_id)
+        return str(chat_id), facts.get("sender_id", str(chat_id))
+
     def session_facts(self, chat_id: int) -> dict[str, str]:
         """Platform ids for the "Where you are" block that closes the system
         prompt: `conversation` (kind and id, e.g. "dm D0…" or "channel C0… #name"),
