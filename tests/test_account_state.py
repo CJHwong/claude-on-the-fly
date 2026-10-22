@@ -429,3 +429,45 @@ def test_implicit_default_turn_hides_named_credentials(
         assert f'(deny file-read* file-write* (subpath "{external}"))' in rules
         allow_auth = f'(allow file-read* file-write* (literal "{base / "auth.json"}"))'
         assert (allow_auth in rules) == (not brokered)
+
+
+def test_redirected_claude_config_keeps_default_read_grant_without_accounts(
+    tmp_path, monkeypatch
+):
+    from claude_on_the_fly import agent
+
+    home = tmp_path / "home"
+    redirected = tmp_path / "redirected-claude"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(redirected))
+    monkeypatch.setattr(accounts, "all_accounts", lambda: {})
+    monkeypatch.setattr(agent, "DATA_DIR", home / "daemon")
+    monkeypatch.setattr(agent, "MEMORY_DIR", home / "daemon" / "memory")
+    monkeypatch.setattr(
+        envfile, "daemon_environment", lambda: {"CLAUDE_CONFIG_DIR": str(redirected)}
+    )
+    grants = sandbox._linux_grants(tmp_path / "workspace")
+    assert home / ".claude" in grants["read_only"]
+    assert redirected in grants["read_only"]
+
+
+def test_named_account_does_not_restore_default_claude_read_grant(
+    tmp_path, monkeypatch
+):
+    from claude_on_the_fly import agent
+
+    home = tmp_path / "home"
+    selected = accounts.Account("selected", "claude", home / "selected")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(accounts, "all_accounts", lambda: {"selected": selected})
+    monkeypatch.setattr(agent, "DATA_DIR", home / "daemon")
+    monkeypatch.setattr(agent, "MEMORY_DIR", home / "daemon" / "memory")
+    monkeypatch.setattr(
+        envfile,
+        "daemon_environment",
+        lambda: {"CLAUDE_CONFIG_DIR": str(home / "redirected")},
+    )
+    with accounts.use(selected):
+        grants = sandbox._linux_grants(tmp_path / "workspace")
+    assert home / ".claude" not in grants["read_only"]
+    assert selected.source_home in grants["read_only"]

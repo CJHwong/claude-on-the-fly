@@ -1,6 +1,7 @@
 """Simulate Codex exhaustion through real subprocesses and native rollouts."""
 
 import json
+import os
 import sys
 from uuid import uuid4
 
@@ -14,12 +15,13 @@ from claude_on_the_fly import (
     codex_auth,
     codex_state,
     envfile,
+    sandbox,
     settings,
 )
 
 
 @pytest.fixture
-def simulated_codex(tmp_path, monkeypatch):
+def simulated_codex(tmp_path, monkeypatch, account_sandbox_mode):
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
     executable = binary_dir / "codex"
@@ -38,6 +40,15 @@ root = Path(os.environ['COTF_SIMULATION_DIR'])
 mode = (root / 'mode').read_text()
 home = Path(os.environ['CODEX_HOME'])
 account = json.loads((home / 'auth.json').read_text())['simulation_account']
+if os.environ.get('COTF_SIMULATION_JAIL') == '1':
+    other = 'second' if account == 'first' else 'first'
+    try:
+        (root / other / 'auth.json').read_text()
+    except OSError:
+        hidden = True
+    else:
+        hidden = False
+    assert hidden, 'Jail exposed another account credential'
 arguments = sys.argv[1:]
 resuming = 'resume' in arguments
 thread = arguments[arguments.index('resume') + 1] if resuming else str(uuid4())
@@ -93,7 +104,7 @@ emit('event_msg', {'type': 'task_complete', 'last_agent_message': 'Codex simulat
             {
                 "accounts": registry,
                 "routing": {"defaults": {"codex": ["first", "second"]}},
-                "sandbox": {"mode": "off"},
+                "sandbox": {"mode": account_sandbox_mode},
             }
         )
     )
@@ -110,13 +121,22 @@ emit('event_msg', {'type': 'task_complete', 'last_agent_message': 'Codex simulat
     monkeypatch.setattr(envfile, "daemon_environment", lambda: environment)
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv("PATH", str(binary_dir))
+    monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.defpath)
     monkeypatch.setenv("COTF_SIMULATION_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_BACKEND", "codex")
     monkeypatch.setenv("CODEX_CHATGPT_VIA_BROKER", "false")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    return tmp_path, workspace
+    token = sandbox.session_env(
+        {
+            "COTF_SIMULATION_DIR": str(tmp_path),
+            "COTF_SIMULATION_JAIL": "1" if account_sandbox_mode == "jail" else "0",
+        }
+    )
+    try:
+        yield tmp_path, workspace
+    finally:
+        sandbox.reset_session_env(token)
 
 
 async def call_simulation(workspace, session):

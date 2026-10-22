@@ -1,6 +1,7 @@
 """Simulate Claude provider failures through the real subprocess and resume path."""
 
 import json
+import os
 import sys
 from uuid import uuid4
 
@@ -12,12 +13,13 @@ from claude_on_the_fly import (
     accounts,
     agent,
     envfile,
+    sandbox,
     settings,
 )
 
 
 @pytest.fixture
-def simulated_cli(tmp_path, monkeypatch):
+def simulated_cli(tmp_path, monkeypatch, account_sandbox_mode):
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
     executable = binary_dir / "claude"
@@ -36,6 +38,16 @@ mode=(root/'mode').read_text()
 arguments=sys.argv[1:]
 prompt=sys.stdin.read()
 account=Path(os.environ['CLAUDE_CONFIG_DIR']).name
+if os.environ.get('COTF_SIMULATION_JAIL') == '1':
+    other = 'second' if account == 'first' else 'first'
+    protected = [root / name / '.credentials.json' for name in ('first', 'second')]
+    protected.append(root / other / 'settings.json')
+    for secret in protected:
+        try:
+            secret.read_text()
+        except OSError:
+            continue
+        raise AssertionError('Jail exposed a protected profile file')
 session=arguments[arguments.index('--resume')+1] if '--resume' in arguments else arguments[arguments.index('--session-id')+1]
 workspace=Path.cwd().resolve()
 slug=str(workspace).replace('/','-').replace('.','-').replace('_','-')
@@ -81,8 +93,15 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'Simulation 
             for name in ("first", "second")
         },
         "routing": {"defaults": {"claude": ["first", "second"]}},
-        "sandbox": {"mode": "off"},
+        "sandbox": {"mode": account_sandbox_mode},
     }
+    for name in ("first", "second"):
+        home = tmp_path / name
+        home.mkdir()
+        (home / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "simulation-only"}})
+        )
+        (home / "settings.json").write_text("{}")
     config.write_text(yaml.safe_dump(document))
     monkeypatch.setattr(settings, "operator_settings", lambda: config)
     monkeypatch.setattr(settings, "_STARTUP_VALUES", {})
@@ -92,12 +111,21 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'Simulation 
         "daemon_environment",
         lambda: {"CLAUDE_CONFIG_DIR": str(tmp_path / "base")},
     )
-    monkeypatch.setenv("PATH", str(binary_dir))
+    monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.defpath)
     monkeypatch.setenv("COTF_SIMULATION_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_BACKEND", "claude")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    return tmp_path, workspace, document, config
+    token = sandbox.session_env(
+        {
+            "COTF_SIMULATION_DIR": str(tmp_path),
+            "COTF_SIMULATION_JAIL": "1" if account_sandbox_mode == "jail" else "0",
+        }
+    )
+    try:
+        yield tmp_path, workspace, document, config
+    finally:
+        sandbox.reset_session_env(token)
 
 
 async def call_simulation(workspace, session):

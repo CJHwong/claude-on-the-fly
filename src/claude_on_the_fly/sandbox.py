@@ -2266,6 +2266,7 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             # inside the namespace: a link into ~/.agents resolves nowhere here, and
             # codex then reports a missing file rather than a hidden one.
             *codex_state.shared_link_targets(),
+            *([home / ".claude"] if not _account_policy_active() else []),
             claude_config,
             *_claude_link_targets(),
             codex,

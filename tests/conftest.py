@@ -303,3 +303,17 @@ def process_gone():
         return not _still_running(pid)
 
     return _gone
+
+
+@pytest.fixture(params=("off", "jail"))
+def account_sandbox_mode(request, monkeypatch):
+    """Run account simulations with and without the real platform jail."""
+    if request.param == "jail":
+        from tests.test_sandbox_parity import _why_not
+
+        reason = _why_not()
+        if reason is not None:
+            pytest.skip(reason)
+    monkeypatch.setenv("COTF_SANDBOX", request.param)
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    return request.param
