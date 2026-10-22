@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from claude_on_the_fly import turns
 from claude_on_the_fly.tui import supervisor
 
 # ---------------------------------------------------------------------------
@@ -26,6 +32,9 @@ def isolated_state(tmp_path, monkeypatch):
     logs.mkdir()
     monkeypatch.setattr(supervisor, "STATE_DIR", state)
     monkeypatch.setattr(supervisor, "LOG_DIR", logs)
+    # The handles of daemons this process started. Module state, so one test's
+    # leftovers must not be visible to the next.
+    monkeypatch.setattr(supervisor, "_spawned", {})
     return tmp_path
 
 
@@ -226,6 +235,397 @@ class TestStop:
         supervisor.stop("telegram", grace_s=0.05)
 
         assert not (supervisor.STATE_DIR / "telegram.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# restart_command — a service manager starts the daemon, not this process
+# ---------------------------------------------------------------------------
+
+
+class TestRestartCommand:
+    """On a server the daemons belong to systemd or launchd, not to whoever ran
+    the upgrade. Stopping one works either way. Starting one does not: the
+    supervisor used to spawn a child of the upgrading process, which left the
+    manager's unit inactive while an unsupervised copy served traffic, and
+    nothing brought the unit back, because the manager reads the external stop
+    as a clean exit."""
+
+    COMMAND = "systemctl --user restart cotf-{frontend}"
+
+    def _configure(self, monkeypatch, command: str | None = COMMAND) -> None:
+        def fake_get(name, default=""):
+            if name == supervisor.RESTART_COMMAND_SETTING:
+                return command if command is not None else default
+            return default
+
+        monkeypatch.setattr(supervisor.settings, "get", fake_get)
+
+    def test_unset_means_the_supervisor_starts_it_itself(self, isolated_state):
+        assert supervisor.restart_command("slack") is None
+
+    def test_blank_is_unset(self, isolated_state, monkeypatch):
+        """An operator who cleared the key gets the default behaviour, not a
+        command that is the empty string."""
+        self._configure(monkeypatch, "   ")
+
+        assert supervisor.restart_command("slack") is None
+
+    def test_the_frontend_name_is_substituted(self, isolated_state, monkeypatch):
+        self._configure(monkeypatch)
+
+        assert (
+            supervisor.restart_command("slack") == "systemctl --user restart cotf-slack"
+        )
+
+    def test_a_template_without_the_placeholder_is_used_as_written(
+        self, isolated_state, monkeypatch
+    ):
+        """One command for every frontend is a legitimate answer. It must not be
+        mangled into something else."""
+        self._configure(monkeypatch, "systemctl --user restart cotf-all")
+
+        assert supervisor.restart_command("slack") == (
+            "systemctl --user restart cotf-all"
+        )
+
+    def test_spawn_runs_the_command_and_waits_for_the_new_pid(
+        self, isolated_state, monkeypatch
+    ):
+        self._configure(monkeypatch)
+        popen = MagicMock()
+        ran: list[str] = []
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: True)
+        monkeypatch.setattr(supervisor, "_resolve_pid", lambda _f: 4242)
+
+        def fake_runner(command, **_kwargs):
+            ran.append(command)
+            return subprocess.CompletedProcess([], 0)
+
+        pid = supervisor.spawn(
+            "telegram",
+            env=TELEGRAM_ENV,
+            popen_factory=popen,
+            runner=fake_runner,
+        )
+
+        assert pid == 4242
+        assert ran == ["systemctl --user restart cotf-telegram"]
+        # The whole point: no child of this process.
+        popen.assert_not_called()
+        # And the pid is recorded, so the dashboard and a later stop find it.
+        assert (supervisor.STATE_DIR / "telegram.pid").read_text() == "4242"
+
+    def test_a_stale_heartbeat_is_cleared_before_the_command(
+        self, isolated_state, monkeypatch
+    ):
+        """The outgoing daemon's file would otherwise read as the new one and
+        the wait would return its pid."""
+        self._configure(monkeypatch)
+        _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=1111)
+        seen: list[bool] = []
+        monkeypatch.setattr(
+            supervisor,
+            "_heartbeat_fresh",
+            lambda _f, **_kw: (
+                seen.append((supervisor.STATE_DIR / "telegram.json").exists()),
+                True,
+            )[1],
+        )
+        monkeypatch.setattr(supervisor, "_resolve_pid", lambda _f: 4242)
+
+        supervisor.spawn(
+            "telegram",
+            env=TELEGRAM_ENV,
+            popen_factory=MagicMock(),
+            runner=lambda command, **_kw: subprocess.CompletedProcess([], 0),
+        )
+
+        assert seen and seen[0] is False, "the stale heartbeat was not removed"
+
+    def test_a_failing_command_reports_its_output(self, isolated_state, monkeypatch):
+        """The command is the operator's own, so the reason it failed is only in
+        its output. A bare exit code sends them to a shell to reproduce it."""
+        self._configure(monkeypatch)
+        popen = MagicMock()
+
+        def fake_runner(_command, **_kwargs):
+            return subprocess.CompletedProcess(
+                [], 3, "", "Failed to restart cotf-telegram.service: not found\n"
+            )
+
+        with pytest.raises(supervisor.RestartCommandFailed) as caught:
+            supervisor.spawn(
+                "telegram", env=TELEGRAM_ENV, popen_factory=popen, runner=fake_runner
+            )
+
+        message = str(caught.value)
+        assert "exit 3" in message
+        assert "not found" in message
+        assert caught.value.returncode == 3
+        popen.assert_not_called()
+        # No pid file: nothing started, and a stale one would make `stop`
+        # signal a pid the OS has since recycled.
+        assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+
+    def test_a_command_that_starts_nothing_says_so(self, isolated_state, monkeypatch):
+        self._configure(monkeypatch)
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: False)
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _s: None)
+
+        with pytest.raises(supervisor.DaemonDidNotComeBack) as caught:
+            supervisor.spawn(
+                "telegram",
+                env=TELEGRAM_ENV,
+                popen_factory=MagicMock(),
+                runner=lambda command, **_kw: subprocess.CompletedProcess([], 0),
+                spawn_timeout_s=0.01,
+            )
+
+        assert "no heartbeat within" in str(caught.value)
+        assert not (supervisor.STATE_DIR / "telegram.pid").exists()
+
+    def test_the_frontends_own_command_is_used_not_a_shared_one(
+        self, isolated_state, monkeypatch
+    ):
+        self._configure(monkeypatch)
+
+        assert supervisor.restart_command("cron") == (
+            "systemctl --user restart cotf-cron"
+        )
+        assert supervisor.restart_command("jobs") == (
+            "systemctl --user restart cotf-jobs"
+        )
+
+    def test_resume_starts_through_the_command_too(self, isolated_state, monkeypatch):
+        """`resume` is what an upgrade calls, so it is the path that matters
+        most. It reaches the command by going through `spawn` like everything
+        else."""
+        self._configure(monkeypatch)
+        supervisor._write_last_running(["telegram"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda _p: False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "1")
+        ran: list[str] = []
+        monkeypatch.setattr(supervisor, "_heartbeat_fresh", lambda _f, **_kw: True)
+        monkeypatch.setattr(supervisor, "_resolve_pid", lambda _f: 99)
+
+        def fake_runner(command, **_kwargs):
+            ran.append(command)
+            return subprocess.CompletedProcess([], 0)
+
+        results = supervisor.resume(
+            env_file=None, popen_factory=MagicMock(), runner=fake_runner
+        )
+
+        assert ran == ["systemctl --user restart cotf-telegram"]
+        assert results == [("telegram", 99, None)]
+
+    def test_a_broken_command_is_reported_by_resume_not_raised(
+        self, isolated_state, monkeypatch
+    ):
+        """One frontend failing must not abort the rest, which is the contract
+        `resume` already had for a failed spawn."""
+        self._configure(monkeypatch)
+        supervisor._write_last_running(["telegram"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda _p: False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "1")
+
+        results = supervisor.resume(
+            env_file=None,
+            popen_factory=MagicMock(),
+            runner=lambda command, **_kw: subprocess.CompletedProcess(
+                [], 1, "", "nope"
+            ),
+        )
+
+        assert len(results) == 1
+        name, pid, exc = results[0]
+        assert name == "telegram"
+        assert pid is None
+        assert isinstance(exc, supervisor.RestartCommandFailed)
+
+
+# ---------------------------------------------------------------------------
+# reaping
+# ---------------------------------------------------------------------------
+
+
+class TestReaping:
+    """A child this process spawned stays a zombie until somebody reaps it, and
+    `os.kill(pid, 0)` is true for a zombie.
+
+    `spawn` handed its `Popen` to nobody, so nothing reaped ours: a stop spent
+    its whole grace polling a daemon that had already exited, then SIGKILLed the
+    corpse. An upgrade stops every frontend, which made that the larger part of
+    its downtime.
+    """
+
+    def test_waitpid_decides_without_asking_the_kernel_about_a_zombie(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(os, "waitpid", lambda pid, flags: (pid, 0))
+        asked = MagicMock(return_value=True)
+        monkeypatch.setattr(supervisor, "_process_exists", asked)
+
+        assert supervisor._has_exited(1234) is True
+        asked.assert_not_called()
+
+    def test_a_process_that_is_not_our_child_falls_back_to_the_kill_check(
+        self, monkeypatch
+    ):
+        def not_our_child(pid, flags):
+            raise ChildProcessError(10, "No child processes")
+
+        monkeypatch.setattr(os, "waitpid", not_our_child)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+        assert supervisor._has_exited(1234) is False
+
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        assert supervisor._has_exited(1234) is True
+
+    def test_a_child_that_exits_on_sigterm_is_not_force_killed(
+        self, isolated_state, monkeypatch
+    ):
+        """End to end, with a real child.
+
+        The point of the fix is that a stop waits for the shutdown rather than
+        for the grace to run out. A daemon that exits cleanly must not be
+        SIGKILLed, and must not cost the window its whole grace.
+        """
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+                "time.sleep(30)\n",
+            ]
+        )
+        real_kill = os.kill
+        try:
+            _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=child.pid)
+            (supervisor.STATE_DIR / "telegram.pid").write_text(str(child.pid))
+
+            signalled: list[int] = []
+            monkeypatch.setattr(
+                os,
+                "kill",
+                lambda pid, sig: signalled.append(sig) or real_kill(pid, sig),
+            )
+
+            started = time.monotonic()
+            stopped = supervisor.stop("telegram", grace_s=5.0)
+            elapsed = time.monotonic() - started
+
+            assert stopped == child.pid
+            assert signal.SIGKILL not in signalled
+            assert elapsed < 3.0, f"stop waited {elapsed:.1f}s on an exited child"
+        finally:
+            # real_kill, not child.kill: os.kill is still patched here, and a
+            # second recorded signal would be the test talking to itself.
+            with contextlib.suppress(ProcessLookupError):
+                real_kill(child.pid, signal.SIGKILL)
+            child.wait()
+
+
+class TestReap:
+    """The half of the reaping problem that `_has_exited` cannot reach.
+
+    Only a parent can reap its own child, so a `claude-tui upgrade` running in
+    another process cannot clean up a daemon the dashboard started. All it can do
+    is wait for the parent to. Until then the exited daemon is a zombie, and
+    `os.kill(pid, 0)` reports it alive to every process on the machine.
+    """
+
+    @staticmethod
+    def _exited_child() -> subprocess.Popen:
+        """A real child that has exited and has NOT been reaped.
+
+        Waiting on the process state rather than on a pipe. A pipe reaches EOF
+        when the kernel closes the child's descriptors, which happens *during*
+        exit, before the child becomes waitable by its parent -- so `poll()`
+        straight afterwards can still answer None and `reap()` correctly reports
+        nothing to reap. Measured on macOS: 9 of 300 rounds, and rarely enough on
+        a loaded ubuntu runner to read as a random CI failure rather than a race.
+
+        `ps` because neither portable alternative works. `poll()` and `wait()`
+        both reap, which is the state under test, and `os.waitid` with WNOWAIT
+        would be exactly right but CPython does not expose it on macOS.
+        """
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(proc.pid)],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if state.startswith("Z"):
+                return proc
+        proc.kill()
+        proc.wait()
+        raise AssertionError("the child never became an unreaped zombie")
+
+    def test_nothing_to_reap_returns_zero(self, isolated_state):
+        assert supervisor.reap() == 0
+
+    def test_a_zombie_reads_as_alive_until_it_is_reaped(self, isolated_state):
+        """Pins the fact the whole mechanism exists for, so it cannot quietly
+        stop being true on a future platform."""
+        proc = self._exited_child()
+        try:
+            assert supervisor._process_exists(proc.pid), (
+                "an exited child nobody reaped must read as alive"
+            )
+            supervisor._spawned[proc.pid] = proc
+
+            assert supervisor.reap() == 1
+
+            assert not supervisor._process_exists(proc.pid)
+        finally:
+            proc.wait()
+
+    def test_the_handle_is_forgotten_once_it_is_reaped(self, isolated_state):
+        proc = self._exited_child()
+        try:
+            supervisor._spawned[proc.pid] = proc
+
+            supervisor.reap()
+
+            assert supervisor._spawned == {}
+            # And a second pass has nothing left to do.
+            assert supervisor.reap() == 0
+        finally:
+            proc.wait()
+
+    def test_a_running_daemon_is_left_alone(self, isolated_state):
+        """This runs on a one-second tick. Reaping a live child would take its
+        exit status away from whoever is waiting on it."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            supervisor._spawned[proc.pid] = proc
+
+            assert supervisor.reap() == 0
+
+            assert proc.pid in supervisor._spawned
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_spawn_remembers_the_handle(self, isolated_state):
+        """Without this the registry stays empty and the tick has nothing to
+        poll, which is the state the fix exists to end."""
+        popen = MagicMock(return_value=MagicMock(pid=4242))
+
+        supervisor.spawn(
+            "telegram",
+            env={"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALLOWED_USER_ID": "1"},
+            popen_factory=popen,
+            wait_for_heartbeat=False,
+        )
+
+        assert 4242 in supervisor._spawned
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +831,25 @@ class TestStopAll:
         names = {n for n, _ in stopped}
         assert names == {"telegram", "slack"}
 
+    def test_the_stops_overlap_instead_of_queueing(self, isolated_state, monkeypatch):
+        """Stopping in turn made the outage the *sum* of the shutdown times.
+        The barrier only clears if every worker is inside its own stop at once,
+        so a regression to sequential raises BrokenBarrierError here."""
+        for name, pid in (("telegram", 11), ("slack", 22), ("cron", 33)):
+            _write_heartbeat(supervisor.STATE_DIR, name, pid=pid)
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: True)
+
+        barrier = threading.Barrier(3, timeout=5)
+
+        def fake_stop(name, *, grace_s):
+            barrier.wait()
+            return 1
+
+        monkeypatch.setattr(supervisor, "stop", fake_stop)
+
+        stopped = supervisor.stop_all()
+        assert {n for n, _ in stopped} == {"telegram", "slack", "cron"}
+
     def test_writes_last_running_file(self, isolated_state, monkeypatch):
         _write_heartbeat(supervisor.STATE_DIR, "telegram", pid=11)
         liveness = {11: True}
@@ -481,6 +900,30 @@ class TestResume:
         assert name == "telegram"
         assert pid == 4242
         assert exc is None
+
+    def test_the_spawns_overlap_and_report_in_recorded_order(
+        self, isolated_state, monkeypatch
+    ):
+        """Two things at once: the spawns must overlap, because each one blocks
+        on its own heartbeat, and the results must come back in the recorded
+        order rather than the order they happened to finish."""
+        supervisor._write_last_running(["telegram", "slack", "cron"])
+        monkeypatch.setattr(supervisor, "_process_exists", lambda p: False)
+        barrier = threading.Barrier(3, timeout=5)
+        pids = {"telegram": 1, "slack": 2, "cron": 3}
+
+        def fake_spawn(name, **_kwargs):
+            barrier.wait()
+            if name == "telegram":
+                time.sleep(0.05)  # slowest, so it finishes last
+            return pids[name]
+
+        monkeypatch.setattr(supervisor, "spawn", fake_spawn)
+
+        results = supervisor.resume()
+
+        assert [name for name, _, _ in results] == ["telegram", "slack", "cron"]
+        assert [pid for _, pid, _ in results] == [1, 2, 3]
 
     def test_skips_already_running(self, isolated_state, monkeypatch):
         supervisor._write_last_running(["telegram"])
@@ -1006,9 +1449,14 @@ class TestPendingWork:
 
         assert supervisor.pending_work("slack") is None
 
-    def test_a_chat_daemons_turns_are_reported_as_unrecoverable(self, isolated_state):
-        """Nothing replays a chat turn, so this is the number that has to reach
-        the operator before they agree to a stop."""
+    def test_a_chat_daemons_turns_are_reported_as_recoverable(self, isolated_state):
+        """A chat turn is journaled before it runs and replayed on the next
+        start, so a stop delays it rather than destroying it.
+
+        This said the opposite, and the modal told an operator with three live
+        conversations that all three were lost. They were not: `turns.take()`
+        replays a queued turn and a dispatched one alike.
+        """
         _write_extra(
             isolated_state / "state",
             "slack",
@@ -1019,9 +1467,34 @@ class TestPendingWork:
 
         assert pending is not None
         assert (pending.running, pending.queued) == (1, 2)
-        assert pending.recoverable is False
-        assert pending.at_risk == 3
-        assert "lost, needs resending" in pending.describe()
+        assert pending.recoverable is True
+        assert pending.at_risk == 0
+        assert "resumes after the restart" in pending.describe()
+
+    def test_the_journal_really_does_replay_both_phases(self, tmp_path):
+        """The claim above, checked against the journal rather than restated.
+
+        `pending_work` cannot see the journal, so nothing else ties its verdict
+        to what recovery actually does. If `take()` ever stops replaying a
+        dispatched turn, this fails and the modal's wording is wrong again.
+        """
+        journal = turns.TurnJournal(tmp_path / "slack.turns.json")
+        for turn_id, phase in (("t1", turns.QUEUED), ("t2", turns.DISPATCHED)):
+            journal.record(
+                turns.PendingTurn(
+                    turn_id=turn_id,
+                    chat_id=1,
+                    text="hi",
+                    route={},
+                    phase=phase,
+                    recorded_at=time.time(),
+                )
+            )
+
+        replay, nudge = journal.take()
+
+        assert [entry.turn_id for entry in replay] == ["t1", "t2"]
+        assert nudge == []
 
     def test_a_heartbeat_without_extras_reads_as_idle(self, isolated_state):
         """An older daemon publishes no queued count. Absent is zero, not a crash."""

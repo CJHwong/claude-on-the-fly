@@ -13,8 +13,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+from claude_on_the_fly import cron as cron_mod
 from claude_on_the_fly.cron import (
+    _NEVER_FIRE,
     DEFAULT_MAX_FIRES,
+    MAX_PRODUCER_TIMEOUT_S,
+    PRODUCER_TIMEOUT_S,
     CronDaemon,
     CronEntry,
     load_config,
@@ -94,6 +98,17 @@ def daemon(
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
+
+
+async def fire_and_settle(cron: CronDaemon, entry: CronEntry) -> None:
+    """Fire an entry, then wait for whatever task the fire started.
+
+    `_fire` returns as soon as the work is under way, which is the whole point of
+    it, so a test that asserts on what a producer *did* has to wait for the task
+    itself. Nothing in production waits like this.
+    """
+    await cron._fire(entry)
+    await asyncio.gather(*list(cron._command_tasks), return_exceptions=True)
 
 
 class TestConfigShape:
@@ -178,6 +193,167 @@ class TestConfigShape:
             {"name": "a", "cron": "* * * * *", "prompt": "x", "max_concurrent": 3},
         )
         with pytest.raises(ValueError, match="needs a 'command'"):
+            load_config(path)
+
+
+class TestUnknownKeys:
+    """A key the schema does not define is an error, not a shrug.
+
+    Ignoring one let an inert `model: sonnet` sit on a live entry: the file
+    loaded, the entry fired, and nothing ever said the setting did nothing.
+    """
+
+    def test_an_unrecognised_key_is_rejected(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {"name": "digest", "cron": "0 9 * * *", "prompt": "x", "model": "sonnet"},
+        )
+        with pytest.raises(ValueError, match="unknown key 'model'"):
+            load_config(path)
+
+    def test_the_message_names_the_entry_and_the_valid_keys(
+        self, tmp_path: Path
+    ) -> None:
+        """The operator edits this file by hand, so "invalid config" alone is
+        unactionable: the message has to say which entry and what is allowed."""
+        path = cfg(
+            tmp_path,
+            {"name": "digest", "cron": "0 9 * * *", "prompt": "x", "model": "sonnet"},
+        )
+        with pytest.raises(ValueError) as caught:
+            load_config(path)
+        message = str(caught.value)
+        assert "(digest)" in message
+        assert "valid keys: " in message
+        assert "prompt_file" in message
+        assert "max_concurrent" in message
+
+    def test_every_unknown_key_is_named_at_once(self, tmp_path: Path) -> None:
+        """Naming one per load would make fixing a pasted block a guessing game."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "a",
+                "cron": "* * * * *",
+                "prompt": "x",
+                "model": "sonnet",
+                "effort": "high",
+            },
+        )
+        with pytest.raises(ValueError, match=re.escape("'effort', 'model'")):
+            load_config(path)
+
+    def test_every_documented_key_is_accepted(self, tmp_path: Path) -> None:
+        """Pins the schema against the reference table: a key the docs promise
+        but the validator forgot would now be rejected outright."""
+        (tmp_path / "brief.md").write_text("work {{ item.key }}", encoding="utf-8")
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "prompt_file": "./brief.md",
+                "command": "true",
+                "timeout": 600,
+                "producer_timeout": 300,
+                "max_concurrent": 2,
+                "max_fires": 5,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.kind == "producer"
+
+    def test_a_legacy_script_entry_still_loads(self, tmp_path: Path) -> None:
+        """`script` and `args` are consumed by the translation before the check,
+        so tightening the schema must not lock out a pre-rename config."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "prune",
+                "cron": "0 4 * * *",
+                "script": "/opt/prune.sh",
+                "args": ["--verbose"],
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.command == "/opt/prune.sh --verbose"
+
+
+class TestProducerTimeout:
+    """The producer's own limit, separate from the entry's `timeout`."""
+
+    def test_it_defaults_to_the_module_limit(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "command": "true",
+                "prompt": "work {{ item.key }}",
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.producer_timeout == PRODUCER_TIMEOUT_S
+
+    def test_an_entry_may_raise_its_own(self, tmp_path: Path) -> None:
+        """One slow producer must not force every other entry to wait as long."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "command": "true",
+                "prompt": "work {{ item.key }}",
+                "producer_timeout": 300,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.producer_timeout == 300
+        assert entry.timeout == 1800
+
+    def test_bounds_are_enforced(self, tmp_path: Path) -> None:
+        for bad in (0, MAX_PRODUCER_TIMEOUT_S + 1):
+            path = cfg(
+                tmp_path,
+                {
+                    "name": "jira",
+                    "cron": "* * * * *",
+                    "command": "true",
+                    "prompt": "work {{ item.key }}",
+                    "producer_timeout": bad,
+                },
+            )
+            with pytest.raises(
+                ValueError, match=re.escape("'producer_timeout' must be 1..")
+            ):
+                load_config(path)
+
+    def test_it_needs_a_producer(self, tmp_path: Path) -> None:
+        """A plain entry runs no command, so the key would bound nothing."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "a",
+                "cron": "* * * * *",
+                "prompt": "x",
+                "producer_timeout": 300,
+            },
+        )
+        with pytest.raises(ValueError, match="'producer_timeout' needs a producer"):
+            load_config(path)
+
+    def test_a_side_effect_command_cannot_carry_it(self, tmp_path: Path) -> None:
+        """A bare command is bounded by the entry's own `timeout`, not this one."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "prune",
+                "cron": "0 4 * * *",
+                "command": "true",
+                "producer_timeout": 300,
+            },
+        )
+        with pytest.raises(ValueError, match="'producer_timeout' needs a producer"):
             load_config(path)
 
 
@@ -297,6 +473,7 @@ def _producer_entry(**overrides) -> CronEntry:
         max_concurrent=base.get("max_concurrent", 1),
         max_fires=base.get("max_fires", DEFAULT_MAX_FIRES),
         timeout=base.get("timeout", 1800),
+        producer_timeout=base.get("producer_timeout", PRODUCER_TIMEOUT_S),
     )
 
 
@@ -423,9 +600,40 @@ class TestFire:
             max_concurrent=2,
         )
 
-        await cron._fire(entry)
+        await fire_and_settle(cron, entry)
 
         assert [j.key for j in queue.jobs] == ["jira/ACE-1", "jira/ACE-2"]
+
+    async def test_the_producer_gets_the_entrys_own_limit(self, tmp_path: Path) -> None:
+        """Not the entry's `timeout`: that one bounds the agent run each printed
+        item becomes, and is measured in tens of minutes."""
+        cron = daemon(tmp_path, cfg(tmp_path))
+        seen: list[float] = []
+
+        async def record(command: str, *, timeout: float, capture: bool):
+            seen.append(timeout)
+            return "", 0
+
+        cron._run_command = record  # type: ignore[method-assign]
+
+        await fire_and_settle(cron, _producer_entry(producer_timeout=300, timeout=1800))
+
+        assert seen == [300]
+
+    async def test_a_producer_over_its_limit_is_killed(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A real subprocess, so this pins that the per-entry value reaches the
+        wait rather than only reaching the dataclass."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+
+        await fire_and_settle(
+            cron, _producer_entry(command="sleep 30", producer_timeout=1)
+        )
+
+        assert queue.jobs == []
+        assert "timed out after 1s" in caplog.text
 
     async def test_a_failing_producer_enqueues_nothing(
         self, tmp_path: Path, caplog
@@ -435,7 +643,7 @@ class TestFire:
         queue = FakeQueue()
         cron = daemon(tmp_path, cfg(tmp_path), queue)
 
-        await cron._fire(_producer_entry(command="exit 3"))
+        await fire_and_settle(cron, _producer_entry(command="exit 3"))
 
         assert queue.jobs == []
         assert "producer exited 3" in caplog.text
@@ -444,7 +652,7 @@ class TestFire:
         sink = _RecordingAlertSink()
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
 
-        await cron._fire(_producer_entry(command="exit 3"))
+        await fire_and_settle(cron, _producer_entry(command="exit 3"))
 
         assert sink.calls == [
             (
@@ -457,7 +665,7 @@ class TestFire:
         sink = _RecordingAlertSink()
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
 
-        await cron._fire(_producer_entry(command="true"))
+        await fire_and_settle(cron, _producer_entry(command="true"))
 
         assert sink.calls == []
 
@@ -527,6 +735,169 @@ class TestFire:
         await cron._run_side_effect(entry)  # must not raise
 
 
+class TestProducerOffTheLoop:
+    """A producer runs as a task, not inline in the scheduling loop.
+
+    Awaiting it inline made every entry due in the same minute wait out the poll:
+    a measured 38s producer firing four times an hour delayed the four other
+    entries due at `:00` by 38s each.
+    """
+
+    def _config(self, tmp_path: Path) -> Path:
+        return cfg(
+            tmp_path,
+            {
+                "name": "slow",
+                "cron": "* * * * *",
+                "command": 'sleep 2; printf \'{"key":"ACE-1"}\\n\'',
+                "prompt": "work {{ item.key }}",
+            },
+            {"name": "quick", "cron": "* * * * *", "prompt": "x"},
+        )
+
+    async def test_a_slow_producer_does_not_delay_the_entry_behind_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The one test that pins the fix. `slow` comes first in the config, so
+        the loop reaches `quick` only after `_fire` returns."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, self._config(tmp_path), queue)
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        ticks = 0
+
+        async def one_pass_then_stop() -> None:
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                cron._stop.set()
+
+        cron._sleep_to_next_minute = one_pass_then_stop  # type: ignore[method-assign]
+        cron.reload()
+        for state in cron._state.values():
+            state.next_fire = datetime(2000, 1, 1)
+
+        started = time.monotonic()
+        await asyncio.wait_for(cron.run(), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert [j.key for j in queue.jobs] == ["quick"]
+        assert elapsed < 1, f"the scan waited for the producer ({elapsed:.1f}s)"
+        assert cron._is_running("slow")
+
+        await asyncio.gather(*list(cron._command_tasks))
+        assert [j.key for j in queue.jobs] == ["quick", "slow/ACE-1"]
+
+    async def test_the_producer_still_does_its_work_after_the_scan_moves_on(
+        self, tmp_path: Path
+    ) -> None:
+        """Not blocking is only worth anything if the poll still lands."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+
+        await fire_and_settle(
+            cron,
+            _producer_entry(command='printf \'{"key":"ACE-9"}\\n\''),
+        )
+
+        assert [j.key for j in queue.jobs] == ["jira/ACE-9"]
+
+    async def test_a_second_fire_is_skipped_while_the_first_still_runs(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Two overlapping runs of one poll would emit the same work list twice,
+        and every item would be handed to `_admit` a second time."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        entry = _producer_entry(command='sleep 2; printf \'{"key":"ACE-1"}\\n\'')
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.cron"):
+            await cron._fire(entry)
+            await cron._fire(entry)
+
+        assert len([t for t in cron._command_tasks if t.get_name() == "jira"]) == 1
+        assert "still running, skipping this fire" in caplog.text
+
+        await asyncio.gather(*list(cron._command_tasks))
+        assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
+
+    async def test_a_finished_producer_does_not_block_the_next_fire(
+        self, tmp_path: Path
+    ) -> None:
+        """The done-callback that removes a task runs a tick late, so the guard
+        asks each task whether it is done rather than trusting the set."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        entry = _producer_entry(command='printf \'{"key":"ACE-1"}\\n\'')
+
+        await fire_and_settle(cron, entry)
+        await cron._fire(entry)
+        await asyncio.gather(*list(cron._command_tasks))
+
+        assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
+        assert cron._queue.count_unfinished("jira") == 1
+
+    async def test_an_exception_in_the_task_is_logged_against_its_entry(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """`_fire` has already returned by then, so its try/except cannot catch
+        this. Unhandled, it would sit in the Task until the garbage collector
+        mentioned it, with no entry name attached."""
+        cron = daemon(tmp_path, cfg(tmp_path), FakeQueue())
+
+        def explode(_entry, _items):
+            raise RuntimeError("queue exploded")
+
+        cron._admit = explode  # type: ignore[method-assign]
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            await fire_and_settle(
+                cron, _producer_entry(command='printf \'{"key":"ACE-1"}\\n\'')
+            )
+
+        assert "cron jira: fire failed" in caplog.text
+
+    async def test_a_run_now_still_fires_a_producer(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """`_drain_triggers` fires through `_fire` too, so the spawn has to work
+        from there as well as from the scheduled scan."""
+        from claude_on_the_fly import agent
+
+        monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {
+                    "name": "jira",
+                    "cron": "0 9 * * *",
+                    "command": 'printf \'{"key":"ACE-1"}\\n\'',
+                    "prompt": "work {{ item.key }}",
+                },
+            ),
+            queue,
+        )
+        cron.reload()
+        request_run_now("jira")
+
+        await cron._drain_triggers()
+        await asyncio.gather(*list(cron._command_tasks))
+
+        assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
+
+    async def test_stop_cancels_a_running_producer(self, tmp_path: Path) -> None:
+        """A producer is a running command like any other, so a shutdown cuts it
+        and names it. The work is not lost: the next fire polls again."""
+        cron = daemon(tmp_path, cfg(tmp_path), FakeQueue())
+
+        await cron._fire(_producer_entry(command="sleep 30"))
+        assert cron._running_command_names() == ["jira"]
+        await cron.stop()
+
+        assert all(task.done() for task in cron._command_tasks)
+
+
 class TestReload:
     def test_an_unrelated_edit_keeps_the_pending_fire_time(
         self, tmp_path: Path
@@ -550,12 +921,14 @@ class TestReload:
         assert cron._state["a"].entry.timeout == 200
 
     def test_a_changed_cron_reschedules(self, tmp_path: Path) -> None:
+        """The two schedules never share a fire minute (:00 of hour nine against
+        :30 of any hour), so the assertion cannot depend on the wall clock."""
         path = cfg(tmp_path, {"name": "a", "cron": "0 9 * * *", "prompt": "x"})
         cron = daemon(tmp_path, path)
         cron.reload()
         before = cron._state["a"].next_fire
 
-        write_config(path, [{"name": "a", "cron": "*/5 * * * *", "prompt": "x"}])
+        write_config(path, [{"name": "a", "cron": "30 * * * *", "prompt": "x"}])
         cron.reload()
 
         assert cron._state["a"].next_fire != before
@@ -1096,6 +1469,73 @@ class TestMaybeReload:
         )
 
 
+class TestUnknownKeyIsFatalOnlyAtStartup:
+    """The two halves of the same rejection, which must not behave the same way.
+
+    A stricter validator is only safe because a running daemon survives it. At
+    startup an unknown key stops the process, so nobody gets a daemon quietly
+    running a config it could not fully read. On a live edit the same error keeps
+    the prior entries, so a typo saved at 3am does not empty the schedule.
+    """
+
+    def test_the_daemon_refuses_to_start(self, tmp_path: Path, monkeypatch) -> None:
+        import dotenv
+
+        from claude_on_the_fly import preflight
+
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: True)
+        monkeypatch.setattr(preflight, "setup_daemon_logging", lambda _role: None)
+        path = cfg(
+            tmp_path,
+            {"name": "a", "cron": "* * * * *", "prompt": "x", "model": "sonnet"},
+        )
+        monkeypatch.setattr("sys.argv", ["claude-cron", "--config", str(path)])
+
+        with pytest.raises(SystemExit, match=r"config error: .*unknown key 'model'"):
+            cron_mod.main()
+
+    def test_a_running_daemon_keeps_its_entries(self, tmp_path: Path, caplog) -> None:
+        path = cfg(tmp_path, {"name": "a", "cron": "0 9 * * *", "prompt": "x"})
+        cron = daemon(tmp_path, path, FakeQueue())
+        cron.reload()
+        before = cron._state["a"].next_fire
+
+        write_config(
+            path,
+            [{"name": "a", "cron": "0 9 * * *", "prompt": "x", "model": "sonnet"}],
+        )
+        import os as _os
+
+        _os.utime(path, (0, 0))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
+            cron._maybe_reload()
+
+        assert set(cron._state) == {"a"}
+        assert cron._state["a"].next_fire == before
+        assert "keeping prior entries" in caplog.text
+        assert "unknown key 'model'" in caplog.text
+
+    async def test_the_kept_entries_still_fire(self, tmp_path: Path) -> None:
+        """Keeping the entries is only worth anything if they still do their work,
+        so this fires one after the failed reload rather than reading the dict."""
+        queue = FakeQueue()
+        path = cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"})
+        cron = daemon(tmp_path, path, queue)
+        cron.reload()
+
+        write_config(
+            path,
+            [{"name": "a", "cron": "* * * * *", "prompt": "x", "model": "sonnet"}],
+        )
+        import os as _os
+
+        _os.utime(path, (0, 0))
+        cron._maybe_reload()
+        await cron._fire(cron._state["a"].entry)
+
+        assert [j.key for j in queue.jobs] == ["a"]
+
+
 # ---------------------------------------------------------------------------
 # The daemon loop
 # ---------------------------------------------------------------------------
@@ -1129,6 +1569,44 @@ class TestRunLoop:
         await asyncio.wait_for(cron.run(), timeout=5)
         assert fired == ["a"]
         assert all(s.next_fire.year > 2000 for s in cron._state.values())
+
+    async def test_an_entry_whose_time_has_not_come_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """The scan walks every known entry each minute, so one whose time has
+        not come has to fall out before anything fires. Firing it early would
+        run a nightly job on the first tick after the daemon started."""
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {"name": "due", "cron": "* * * * *", "prompt": "x"},
+                {"name": "later", "cron": "* * * * *", "prompt": "x"},
+            ),
+            FakeQueue(),
+        )
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+            await cron.stop()
+
+        cron._fire = record  # type: ignore[method-assign]
+
+        async def immediately(self=cron):
+            return None
+
+        cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
+        cron.reload()
+        for state in cron._state.values():
+            state.next_fire = (
+                datetime(2000, 1, 1)
+                if state.entry.name == "due"
+                else datetime(2999, 1, 1)
+            )
+        await asyncio.wait_for(cron.run(), timeout=5)
+        assert fired == ["due"]
 
     async def test_a_stop_between_the_sleep_and_the_scan_ends_the_loop(
         self, tmp_path: Path
@@ -1473,6 +1951,25 @@ class TestSummary:
             lines[0].index("next:")
         ) == 2
 
+    async def test_a_one_shot_row_shows_its_at_time_not_cron(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """A one-shot carries no cron expression, so the startup table prints
+        its `at` time in the schedule column instead of crashing on len(None)."""
+        cron = daemon(
+            tmp_path,
+            cfg(
+                tmp_path,
+                {"name": "later", "at": "2099-01-01 09:00", "prompt": "x"},
+                {"name": "tick", "cron": "* * * * *", "prompt": "y"},
+            ),
+            FakeQueue(),
+        )
+        cron.reload()
+        cron._print_summary()
+        out = capsys.readouterr().err
+        assert "at 09:00" in out
+
 
 class TestSideEffectCommandFailures:
     async def test_a_command_that_cannot_start_is_logged_to_the_entry(
@@ -1732,3 +2229,285 @@ class TestSideEffectFiresInTheBackground:
         assert cron._command_tasks == set() or all(
             t.done() for t in cron._command_tasks
         )
+
+
+class TestMinToolCalls:
+    """The optional per-entry floor on a run's tool calls.
+
+    Off by default: an entry with a designed periodic no-op legitimately makes
+    zero tool calls on some fires, so a blanket check would alert on each of them.
+    """
+
+    def test_it_is_unset_by_default(self, tmp_path: Path) -> None:
+        path = cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"})
+        (entry,) = load_config(path)
+        assert entry.min_tool_calls == 0
+
+    def test_an_entry_may_set_one(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {
+                "name": "nightly-check",
+                "cron": "* * * * *",
+                "prompt": "check the deploy",
+                "min_tool_calls": 2,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.min_tool_calls == 2
+
+    def test_a_negative_floor_is_refused(self, tmp_path: Path) -> None:
+        path = cfg(
+            tmp_path,
+            {
+                "name": "a",
+                "cron": "* * * * *",
+                "prompt": "x",
+                "min_tool_calls": -1,
+            },
+        )
+        with pytest.raises(
+            ValueError, match=re.escape("'min_tool_calls' must be a non-negative int")
+        ):
+            load_config(path)
+
+    def test_a_non_integer_floor_is_refused(self, tmp_path: Path) -> None:
+        for bad in ("2", 1.5, True, None, [1]):
+            path = cfg(
+                tmp_path,
+                {
+                    "name": "a",
+                    "cron": "* * * * *",
+                    "prompt": "x",
+                    "min_tool_calls": bad,
+                },
+            )
+            with pytest.raises(
+                ValueError,
+                match=re.escape("'min_tool_calls' must be a non-negative int"),
+            ):
+                load_config(path)
+
+    def test_a_bare_command_cannot_carry_one(self, tmp_path: Path) -> None:
+        """Same rule as `profile`: a side-effect command runs no agent, so the
+        floor would bound nothing."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "prune",
+                "cron": "0 4 * * *",
+                "command": "true",
+                "min_tool_calls": 1,
+            },
+        )
+        with pytest.raises(ValueError, match="'min_tool_calls' needs a 'prompt'"):
+            load_config(path)
+
+    def test_a_producer_may_carry_one(self, tmp_path: Path) -> None:
+        """A producer's items each become an agent run, so the floor applies."""
+        path = cfg(
+            tmp_path,
+            {
+                "name": "jira",
+                "cron": "* * * * *",
+                "command": "true",
+                "prompt": "work {{ item.key }}",
+                "min_tool_calls": 1,
+            },
+        )
+        (entry,) = load_config(path)
+        assert entry.min_tool_calls == 1
+
+    def test_the_floor_rides_to_the_worker_on_the_job(self, tmp_path: Path) -> None:
+        """The queue is the only thing between the entry and the runner, so the
+        floor has to travel on the job rather than be re-read there."""
+        entry = CronEntry(
+            name="nightly-check",
+            cron="* * * * *",
+            prompt="check the deploy",
+            min_tool_calls=2,
+        )
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        cron._enqueue(
+            entry, key="nightly-check", session_key=None, prompt="check the deploy"
+        )
+        (job,) = queue.jobs
+        assert job.min_tool_calls == 2
+
+
+class TestOneShotAt:
+    """`at:` entries: one fire at a set local time, then spent — durably."""
+
+    def _at_entry(self, at: str = "2026-09-19 09:00") -> dict:
+        return {"name": "later", "at": at, "prompt": "hello"}
+
+    # --- config ---
+
+    def test_an_at_entry_loads_with_no_cron(self, tmp_path: Path) -> None:
+        (entry,) = load_config(cfg(tmp_path, self._at_entry()))
+        assert entry.at is not None
+        assert entry.cron is None
+        assert entry.kind == "prompt"
+
+    def test_cron_and_at_together_are_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not both"):
+            load_config(
+                cfg(
+                    tmp_path,
+                    {
+                        "name": "a",
+                        "cron": "0 9 * * *",
+                        "at": "2026-09-19 09:00",
+                        "prompt": "x",
+                    },
+                )
+            )
+
+    def test_an_at_entry_needs_a_prompt(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="needs 'prompt'"):
+            load_config(cfg(tmp_path, {"name": "a", "at": "2026-09-19 09:00"}))
+
+    def test_an_at_with_a_command_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'at' needs"):
+            load_config(
+                cfg(
+                    tmp_path, {"name": "a", "at": "2026-09-19 09:00", "command": "true"}
+                )
+            )
+
+    def test_an_invalid_at_fails_at_load(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="invalid 'at'"):
+            load_config(cfg(tmp_path, {"name": "a", "at": "someday", "prompt": "x"}))
+
+    def test_a_non_string_at_fails_at_load(self, tmp_path: Path) -> None:
+        """YAML is untyped enough that `at: 2026-09-19` parses as a date and
+        `at: 300` as an int, so the type is checked rather than assumed. Without
+        that check the entry reaches `parse_when` and fails there with a message
+        about the wrong thing."""
+        with pytest.raises(ValueError, match="'at' must be a string"):
+            load_config(cfg(tmp_path, {"name": "a", "at": 300, "prompt": "x"}))
+
+    def test_a_relative_at_resolves_at_load(self, tmp_path: Path) -> None:
+        entry = load_config(cfg(tmp_path, {"name": "a", "at": "30m", "prompt": "x"}))[0]
+        assert entry.at is not None
+        assert (entry.at - datetime.now()).total_seconds() >= 29 * 60
+
+    # --- reload ---
+
+    def test_an_unrelated_edit_keeps_the_one_shot_fire_time(
+        self, tmp_path: Path
+    ) -> None:
+        path = cfg(
+            tmp_path,
+            {"name": "a", "at": "2026-09-19 09:00", "prompt": "x", "timeout": 100},
+        )
+        cron = daemon(tmp_path, path)
+        cron.reload()
+
+        write_config(
+            path,
+            [{"name": "a", "at": "2026-09-19 09:00", "prompt": "x", "timeout": 200}],
+        )
+        cron.reload()
+
+        assert cron._state["a"].next_fire == datetime(2026, 9, 19, 9, 0)
+        assert cron._state["a"].entry.timeout == 200
+
+    def test_a_changed_at_reschedules(self, tmp_path: Path) -> None:
+        path = cfg(tmp_path, {"name": "a", "at": "2026-09-19 09:00", "prompt": "x"})
+        cron = daemon(tmp_path, path)
+        cron.reload()
+
+        write_config(path, [{"name": "a", "at": "2026-09-20 09:00", "prompt": "x"}])
+        cron.reload()
+
+        assert cron._state["a"].next_fire == datetime(2026, 9, 20, 9, 0)
+
+    # --- the loop ---
+
+    async def _run_one_tick(self, cron: CronDaemon) -> list[str]:
+        """One scan of the run loop, then stop.
+
+        The second sleep sets stop: a spent one-shot never calls `_fire`, so
+        nothing inside the scan ends the loop, and the patched sleep must.
+        (The real sleep blocks for the rest of the minute; only the patch can
+        spin, and only if it neither stops nor yields.)
+        """
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        ticks = 0
+
+        async def immediately():
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                cron._stop.set()
+
+        cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+
+        cron._fire = record  # type: ignore[method-assign]
+        await asyncio.wait_for(cron.run(), timeout=5)
+        return fired
+
+    async def test_a_due_one_shot_fires_once(self, tmp_path: Path) -> None:
+        """The fire lands on the key-state store, which is what makes it
+        exactly-once across restarts."""
+        cron = daemon(tmp_path, cfg(tmp_path, self._at_entry()), FakeQueue())
+        cron.reload()
+        cron._state["later"].next_fire = datetime(2000, 1, 1)
+        assert await self._run_one_tick(cron) == ["later"]
+        state = cron._key_state.load("later")
+        assert state.fires_since_change == 1
+
+    async def test_a_spent_one_shot_does_not_fire_after_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The fire record is durable, so a fresh daemon on the same state dir
+        cannot run the prompt a second time."""
+        path = cfg(tmp_path, self._at_entry())
+        first = daemon(tmp_path, path, FakeQueue())
+        first.reload()
+        first._state["later"].next_fire = datetime(2000, 1, 1)
+        assert await self._run_one_tick(first) == ["later"]
+
+        second = daemon(tmp_path, path, FakeQueue())
+        second.reload()
+        second._state["later"].next_fire = datetime(2000, 1, 1)
+        assert await self._run_one_tick(second) == []
+
+    async def test_a_spent_one_shot_is_marked_never_again_in_process(
+        self, tmp_path: Path
+    ) -> None:
+        """Even without a restart, the entry must not re-enter the fire branch
+        on a later tick."""
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path, self._at_entry()), queue)
+        cron.reload()
+        cron._state["later"].next_fire = datetime(2000, 1, 1)
+        await self._run_one_tick(cron)
+        assert cron._state["later"].next_fire == _NEVER_FIRE
+
+    async def test_a_future_one_shot_does_not_fire(self, tmp_path: Path) -> None:
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, {"name": "later", "at": "2099-01-01 09:00", "prompt": "x"}),
+            queue,
+        )
+        cron.reload()
+        cron._state["later"].next_fire = datetime(2098, 1, 1)
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+        fired: list[str] = []
+
+        async def record(entry):
+            fired.append(entry.name)
+
+        cron._fire = record  # type: ignore[method-assign]
+        cron._stop.set()
+        await asyncio.wait_for(cron.run(), timeout=5)
+        assert fired == []
+        assert cron._state["later"].next_fire == datetime(2098, 1, 1)

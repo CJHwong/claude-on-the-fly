@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +26,15 @@ def sockdir():
     macOS is long enough to blow that on its own."""
     with tempfile.TemporaryDirectory(dir="/tmp") as name:
         yield Path(name)
+
+
+def _free_port() -> int:
+    """A port nothing holds right now: bind 0, read the number back, release it.
+    Guessing an adjacent number instead raced with whatever already had it, and
+    CI failed with EADDRINUSE."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 async def _echo_server(banner: bytes):
@@ -132,9 +142,10 @@ async def test_inside_listener_bridges_the_port_to_the_bound_in_socket(sockdir):
     host_port = server.sockets[0].getsockname()[1]
     relay = netns_relay.LoopbackRelay(sockdir)
     sockets = await relay.start([host_port])
-    inside = await netns_relay._serve_inside({host_port + 1: str(sockets[host_port])})
+    inside_port = _free_port()
+    inside = await netns_relay._serve_inside({inside_port: str(sockets[host_port])})
     try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", host_port + 1)
+        reader, writer = await asyncio.open_connection("127.0.0.1", inside_port)
         writer.write(b"hop")
         await writer.drain()
         assert await reader.read(64) == b"VIA:hop"

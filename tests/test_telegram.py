@@ -101,14 +101,45 @@ class TestWorkspaceName:
         frontend._chat_names[1] = "hoss"
         assert frontend.workspace_name(1) == "telegram/1"
 
-    def test_session_token_adds_suffix(self, frontend: TelegramFrontend) -> None:
+    def test_session_token_does_not_change_the_directory(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        """`/new` is a new session in the same directory, not a new directory."""
         frontend._chat_names[1] = "hoss"
         frontend._session_tokens[1] = "20260606-123412"
-        assert frontend.workspace_name(1) == "telegram/1-20260606-123412"
+        assert frontend.workspace_name(1) == "telegram/1"
 
-    def test_unknown_chat_with_token(self, frontend: TelegramFrontend) -> None:
+    def test_legacy_workspace_is_the_pinned_tokens_old_directory(
+        self, frontend: TelegramFrontend
+    ) -> None:
         frontend._session_tokens[5] = "20260606-090000"
-        assert frontend.workspace_name(5) == "telegram/5-20260606-090000"
+        assert frontend.legacy_workspace(5) == (
+            "telegram/5-20260606-090000",
+            "20260606-090000",
+        )
+
+    def test_no_token_means_no_legacy_workspace(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        assert frontend.legacy_workspace(5) is None
+
+
+# ============================================================
+# display_label
+# ============================================================
+
+
+class TestDisplayLabel:
+    def test_names_the_person_in_the_chat(self, frontend: TelegramFrontend) -> None:
+        frontend._chat_names[1] = "hoss"
+        assert frontend.display_label(1) == "telegram/1 hoss"
+
+    def test_falls_back_to_the_id_alone(self, frontend: TelegramFrontend) -> None:
+        """A chat with no message seen yet, and one whose sender has neither a
+        username nor a first name (their chat id is stored as the name)."""
+        frontend._chat_names[2] = "2"
+        assert frontend.display_label(1) == "telegram/1"
+        assert frontend.display_label(2) == "telegram/2"
 
 
 # ============================================================
@@ -489,10 +520,30 @@ class TestExtractFile:
 
 
 class TestEnqueueMediaGroup:
+    @staticmethod
+    def _dropped_task():
+        """A `create_task` stand-in that closes the coroutine it is handed.
+
+        Patching `create_task` with a bare mock leaves the coroutine built and
+        never run, which Python reports as "coroutine ... was never awaited" --
+        against whichever test happens to be running when the collector gets to
+        it, not this one. Closing it is what a real scheduler's absence should
+        look like, and it keeps the warning from masking a genuine leak later.
+        """
+
+        def close_it(coro):
+            coro.close()
+            return MagicMock()
+
+        return close_it
+
     def test_first_file_creates_group_and_schedules_flush(
         self, frontend: TelegramFrontend
     ) -> None:
-        with patch("claude_on_the_fly.telegram.asyncio.create_task") as mock_task:
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ) as mock_task:
             frontend._enqueue_media_group("grp1", 1, "fid1", "a.jpg", "caption")
 
         assert "grp1" in frontend._media_groups
@@ -502,18 +553,27 @@ class TestEnqueueMediaGroup:
         mock_task.assert_called_once()
 
     def test_subsequent_files_append(self, frontend: TelegramFrontend) -> None:
-        with patch("claude_on_the_fly.telegram.asyncio.create_task"):
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ):
             frontend._enqueue_media_group("grp1", 1, "fid1", "a.jpg", "cap")
 
         # Second file should not create_task again
-        with patch("claude_on_the_fly.telegram.asyncio.create_task") as mock_task:
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ) as mock_task:
             frontend._enqueue_media_group("grp1", 1, "fid2", "b.jpg", "")
 
         mock_task.assert_not_called()
         assert len(frontend._media_groups["grp1"]["files"]) == 2
 
     def test_caption_captured_from_any_file(self, frontend: TelegramFrontend) -> None:
-        with patch("claude_on_the_fly.telegram.asyncio.create_task"):
+        with patch(
+            "claude_on_the_fly.telegram.asyncio.create_task",
+            side_effect=self._dropped_task(),
+        ):
             frontend._enqueue_media_group("grp1", 1, "fid1", "a.jpg", "")
             frontend._enqueue_media_group("grp1", 1, "fid2", "b.jpg", "late caption")
 
@@ -567,9 +627,10 @@ class TestCmdNew:
         token = frontend._session_tokens[1]
         # YYYYMMDD-HHMMSS — unique and sortable, no disk scan or counter.
         assert re.fullmatch(r"\d{8}-\d{6}", token)
-        # The workspace suffix is the token, so it never recycles an old dir.
+        # The token seeds the session uuid; the directory stays the chat's.
         frontend._chat_names[1] = "hoss"
-        assert frontend.workspace_name(1) == f"telegram/1-{token}"
+        assert frontend.workspace_name(1) == "telegram/1"
+        assert frontend.legacy_workspace(1) == (f"telegram/1-{token}", token)
 
     async def test_pushes_token_to_orchestrator_in_step(
         self, frontend: TelegramFrontend
@@ -595,7 +656,7 @@ class TestCmdNew:
         await frontend._cmd_new(make_update(chat_id=9), MagicMock())
 
         assert frontend._session_tokens[9] == "20260606-120000"
-        assert frontend.workspace_name(9) == "telegram/9-20260606-120000"
+        assert frontend.workspace_name(9) == "telegram/9"
 
     async def test_replies_with_session_token(self, frontend: TelegramFrontend) -> None:
         update = make_update(chat_id=1)
@@ -639,7 +700,10 @@ class TestSessionPersistence:
         assert frontend._session_tokens[7] == "20260606-120000"
         orch.set_session_token.assert_called_once_with(7, "20260606-120000")
         frontend._chat_names[7] = "hoss"
-        assert frontend.workspace_name(7) == "telegram/7-20260606-120000"
+        assert frontend.legacy_workspace(7) == (
+            "telegram/7-20260606-120000",
+            "20260606-120000",
+        )
 
     def test_load_missing_file_is_noop(self, frontend: TelegramFrontend) -> None:
         # Fresh install: no file yet, no crash, no tokens (base session).
@@ -738,9 +802,9 @@ class TestStart:
 
         assert frontend._on_message is on_message
         assert frontend._app is mock_app
-        # 3 commands, 2 message handlers, 3 callback queries
+        # 5 commands, 2 message handlers, 3 callback queries
         # (approval + suggestion + spent-suggestion)
-        assert mock_app.add_handler.call_count == 8
+        assert mock_app.add_handler.call_count == 10
         mock_app.initialize.assert_awaited_once()
         mock_app.start.assert_awaited_once()
         mock_updater.start_polling.assert_awaited_once()
@@ -1040,7 +1104,7 @@ class TestOnUpdate:
 
         frontend._on_message.assert_awaited_once()
         call_text = frontend._on_message.call_args[0][1]
-        assert "[File saved: report.pdf]" in call_text
+        assert "[File saved: inbox/report.pdf]" in call_text
         assert "check this" in call_text
 
     async def test_media_group_enqueues(self, frontend: TelegramFrontend) -> None:
@@ -1160,6 +1224,20 @@ class TestSaveFile:
 # ============================================================
 
 
+class TestSessionFacts:
+    def test_reports_the_chat_as_conversation_and_sender(self, frontend):
+        frontend._chat_names[7] = "hoss"
+        assert frontend.session_facts(7) == {
+            "conversation": "dm chat 7",
+            "sender_id": "7",
+            "sender_name": "hoss",
+        }
+        assert frontend.session_facts(8) == {
+            "conversation": "dm chat 8",
+            "sender_id": "8",
+        }
+
+
 class TestFlushMediaGroup:
     async def test_saves_all_files_and_calls_on_message(
         self, frontend: TelegramFrontend
@@ -1173,7 +1251,12 @@ class TestFlushMediaGroup:
         }
 
         with (
-            patch.object(frontend, "_save_file", new_callable=AsyncMock) as mock_save,
+            patch.object(
+                frontend,
+                "_save_file",
+                new_callable=AsyncMock,
+                side_effect=lambda _chat, _fid, name: Path("/ws/inbox") / name,
+            ) as mock_save,
             patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
         ):
             await frontend._flush_media_group("grp1")
@@ -1184,8 +1267,8 @@ class TestFlushMediaGroup:
 
         frontend._on_message.assert_awaited_once()
         call_text = frontend._on_message.call_args[0][1]
-        assert "[File saved: a.jpg]" in call_text
-        assert "[File saved: b.png]" in call_text
+        assert "[File saved: inbox/a.jpg]" in call_text
+        assert "[File saved: inbox/b.png]" in call_text
         assert "look at these" in call_text
         assert '[from-id: 1] [display: "hoss"]' in call_text
 
@@ -1200,13 +1283,24 @@ class TestFlushMediaGroup:
         }
 
         with (
-            patch.object(frontend, "_save_file", new_callable=AsyncMock),
+            # A real path, not a bare AsyncMock. Without a return value the await
+            # hands back an AsyncMock child, and `saved.relative_to(...)` in the
+            # code under test then builds a coroutine nobody awaits -- so the
+            # "[File saved: ...]" half of the message was a coroutine repr and
+            # this case only ever checked the caption fallback.
+            patch.object(
+                frontend,
+                "_save_file",
+                new_callable=AsyncMock,
+                side_effect=lambda _chat, _fid, name: Path("/ws/inbox") / name,
+            ),
             patch("claude_on_the_fly.telegram.asyncio.sleep", new_callable=AsyncMock),
         ):
             await frontend._flush_media_group("grp2")
 
         call_text = frontend._on_message.call_args[0][1]
         assert "Please review the uploaded files." in call_text
+        assert "[File saved: inbox/a.jpg]" in call_text
 
     async def test_noop_when_group_missing(self, frontend: TelegramFrontend) -> None:
         frontend._on_message = AsyncMock()
@@ -1319,7 +1413,139 @@ class TestCmdCompact:
             for call in mock_app.add_handler.call_args_list
             if getattr(call.args[0], "commands", None)
         }
-        assert registered == {"new", "status", "compact"}
+        assert registered == {"new", "status", "compact", "model", "stop"}
+
+
+# ============================================================
+# _cmd_model, _cmd_stop
+# ============================================================
+
+
+class TestCmdModel:
+    """The Telegram half of the model command: `/model` where Slack spells it
+    `$model`, with the same orchestrator call and the same grammar behind both."""
+
+    async def test_posts_what_the_orchestrator_answers(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: `opus`. Effort: `high`.")
+        frontend._orchestrator = orch
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        update = make_update(chat_id=5)
+        ctx = MagicMock()
+        ctx.args = ["opus", "high"]
+
+        await frontend._cmd_model(update, ctx)
+
+        orch.on_model.assert_called_once_with(5, ["opus", "high"])
+        # Through _send_msg, so the backticks the reply marks model names with
+        # reach Telegram as code rather than as literal characters.
+        frontend._app.bot.send_message.assert_called_once_with(
+            chat_id=5, text="Model: `opus`. Effort: `high`.", parse_mode="Markdown"
+        )
+
+    async def test_a_bare_command_asks_for_the_report(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: sonnet. Effort: unset.")
+        frontend._orchestrator = orch
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        update = make_update(chat_id=5)
+        ctx = MagicMock()
+        ctx.args = []
+
+        await frontend._cmd_model(update, ctx)
+
+        orch.on_model.assert_called_once_with(5, [])
+
+    async def test_a_missing_args_attribute_is_an_empty_request(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        """`CallbackContext.args` is None unless the handler parsed some."""
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        frontend._app = MagicMock()
+        frontend._app.bot.send_message = AsyncMock()
+        update = make_update(chat_id=5)
+        ctx = MagicMock()
+        ctx.args = None
+
+        await frontend._cmd_model(update, ctx)
+
+        orch.on_model.assert_called_once_with(5, [])
+
+    async def test_says_so_with_no_orchestrator(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._orchestrator = None
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_model(update, MagicMock())
+
+        update.message.reply_text.assert_awaited()
+
+    async def test_ignores_an_unauthorized_user(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+
+        await frontend._cmd_model(make_update(chat_id=5, user_id=999999), MagicMock())
+
+        orch.on_model.assert_not_called()
+
+
+class TestCmdStop:
+    """The other half of the parity with Slack's `$` prefixes. Telegram had no
+    way to cancel a turn before this, so the ack wording is Slack's own."""
+
+    async def test_stops_the_running_turn(self, frontend: TelegramFrontend) -> None:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        frontend._orchestrator = orch
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_stop(update, MagicMock())
+
+        orch.abort.assert_awaited_once_with(5)
+        update.message.reply_text.assert_awaited_once_with("Stopped the current turn.")
+
+    async def test_says_nothing_was_running(self, frontend: TelegramFrontend) -> None:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=False)
+        frontend._orchestrator = orch
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_stop(update, MagicMock())
+
+        update.message.reply_text.assert_awaited_once_with("Nothing was running.")
+
+    async def test_says_nothing_was_running_with_no_orchestrator(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        frontend._orchestrator = None
+        update = make_update(chat_id=5)
+
+        await frontend._cmd_stop(update, MagicMock())
+
+        update.message.reply_text.assert_awaited_once_with("Nothing was running.")
+
+    async def test_ignores_an_unauthorized_user(
+        self, frontend: TelegramFrontend
+    ) -> None:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        frontend._orchestrator = orch
+
+        await frontend._cmd_stop(make_update(chat_id=5, user_id=999999), MagicMock())
+
+        orch.abort.assert_not_awaited()
 
 
 class TestApprovalLinkPreview:
@@ -1940,7 +2166,8 @@ class TestDownloadCleanup:
         target = (
             tmp_path / "home" / ".claude-on-the-fly" / "workspaces" / "telegram/probe"
         )
-        assert [p.name for p in target.iterdir()] == []
+        assert [p.name for p in target.iterdir()] == ["inbox"]
+        assert list((target / "inbox").iterdir()) == []
         assert workspace.exists() is False
 
 
@@ -1976,7 +2203,11 @@ class TestRouteForAndRestore:
 
         assert frontend._session_tokens[1] == "20260606-123412"
         # The workspace the replayed turn will use matches the one it was in.
-        assert frontend.workspace_name(1) == "telegram/1-20260606-123412"
+        assert frontend.workspace_name(1) == "telegram/1"
+        assert frontend.legacy_workspace(1) == (
+            "telegram/1-20260606-123412",
+            "20260606-123412",
+        )
 
     @pytest.mark.parametrize("route", [{}, {"session_token": ""}, {"session_token": 7}])
     def test_a_route_without_a_usable_token_leaves_the_base_session(

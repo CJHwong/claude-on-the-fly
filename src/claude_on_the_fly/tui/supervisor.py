@@ -7,6 +7,10 @@ Liveness model:
   marker that lets the TUI claim ownership across restarts. Optional — if a
   daemon was started outside the TUI (e.g. `uv run claude-telegram` in a shell),
   there's no PID file but the heartbeat still works.
+- The handles of the daemons *this* process started are held in `_spawned`, and
+  `reap()` polls them. Only a parent can reap its own child, so this is the only
+  way an exited daemon stops being a zombie, and a zombie answers `os.kill(pid,
+  0)` as alive for every process on the machine. See `reap`.
 
 Spawn semantics: detached via os.setsid (subprocess.Popen start_new_session=True),
 stdout/stderr redirected to per-frontend log files so the child survives TUI
@@ -25,8 +29,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +58,23 @@ DEFAULT_SPAWN_TIMEOUT_S = 20.0
 KILL_POLL_INTERVAL_S = 0.1
 HEARTBEAT_POLL_INTERVAL_S = 0.1
 HEARTBEAT_FRESH_WINDOW_S = 30.0
+
+RESTART_COMMAND_SETTING = "COTF_DAEMONS_RESTART_COMMAND"
+# The one placeholder a restart command may carry.
+FRONTEND_PLACEHOLDER = "{frontend}"
+
+# Handles for the daemons this process started, so that it can reap them.
+#
+# Only a parent can. `os.kill(pid, 0)` is true for a zombie, so a daemon that
+# exited reads as alive to every process on the machine until its parent cleans
+# up, including a `claude-tui upgrade` running somewhere else, which then waits
+# out its whole grace on a daemon that is already gone. `_has_exited` cannot fix
+# that from the outside: `waitpid` refuses a process that is not its child. So
+# the parent keeps the handle and `reap()` polls it.
+#
+# A lock because `resume` spawns from a thread pool.
+_spawned: dict[int, subprocess.Popen] = {}
+_spawned_lock = threading.Lock()
 
 
 def _last_running_file() -> Path:
@@ -119,21 +142,65 @@ class SpawnTimeout(SupervisorError):
         exited: bool = False,
         returncode: int | None = None,
     ) -> None:
-        cause = (
-            f"exited (rc={returncode}) before heartbeat"
-            if exited
-            else "did not heartbeat within timeout"
-        )
-        msg = f"{frontend} {cause} (pid {pid}); see {log_path}"
-        if log_tail:
-            msg += f"\n--- last lines ---\n{log_tail}"
-        super().__init__(msg)
         self.frontend = frontend
         self.pid = pid
         self.log_path = log_path
         self.log_tail = log_tail
         self.exited = exited
         self.returncode = returncode
+        msg = f"{frontend} {self.cause} (pid {pid}); see {log_path}"
+        if log_tail:
+            msg += f"\n--- last lines ---\n{log_tail}"
+        super().__init__(msg)
+
+    @property
+    def cause(self) -> str:
+        """What actually happened, in one line.
+
+        A crash and a hang are different failures and send an operator looking
+        in different places, so the wording has to tell them apart. Callers with
+        no room for the tail show this instead.
+        """
+        if self.exited:
+            return f"exited (rc={self.returncode}) before heartbeat"
+        return "did not heartbeat within timeout"
+
+
+class RestartCommandFailed(SupervisorError):
+    """The operator's restart command exited non-zero.
+
+    Carries the tail of its output. The command is the operator's own, so the
+    reason it failed is only in there, and a bare exit code sends them to a
+    shell to reproduce it.
+    """
+
+    def __init__(
+        self, frontend: str, command: str, returncode: int, output: str
+    ) -> None:
+        tail = "\n".join(output.strip().splitlines()[-5:])
+        message = f"{frontend}: `{command}` failed (exit {returncode})"
+        if tail:
+            message += f"\n--- last lines ---\n{tail}"
+        super().__init__(message)
+        self.frontend = frontend
+        self.command = command
+        self.returncode = returncode
+
+
+class DaemonDidNotComeBack(SupervisorError):
+    """A restart command succeeded, but no new daemon wrote a heartbeat.
+
+    Nothing here owns the daemon's log, so this points at the service manager's
+    instead of carrying a tail the way SpawnTimeout does.
+    """
+
+    def __init__(self, frontend: str, command: str, timeout_s: float) -> None:
+        super().__init__(
+            f"{frontend}: `{command}` finished, but no heartbeat within "
+            f"{timeout_s:.0f}s. Read the service manager's log for that unit."
+        )
+        self.frontend = frontend
+        self.command = command
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +268,119 @@ def _remove_heartbeat(frontend: str) -> None:
     makes a stopped daemon read as stopped immediately."""
     with contextlib.suppress(FileNotFoundError):
         _heartbeat_file(frontend).unlink()
+
+
+def _has_exited(pid: int) -> bool:
+    """True when this pid is gone, reaping it first if it is our own child.
+
+    `os.kill(pid, 0)` is true for a child that exited and was never reaped, so a
+    daemon that shut down cleanly reads as alive for as long as it stays a
+    zombie. `spawn` hands its `Popen` to nobody, so nothing was reaping ours: a
+    `stop` spent its whole grace polling a process that was already gone, then
+    SIGKILLed the corpse. Measured on this machine, that turned a 1s shutdown
+    into a 22s stop, and an upgrade stops every frontend.
+
+    `waitpid` is the only call that can tell the truth about our own children,
+    and it is what reaps them. A daemon this process did not spawn raises
+    ChildProcessError, and `os.kill` is still the right answer for that one: it
+    was reparented, so its new parent reaps it.
+    """
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return True
+    except ChildProcessError:
+        pass
+    return not _process_exists(pid)
+
+
+def restart_command(frontend: str) -> str | None:
+    """The operator's command for bringing this frontend up, or None.
+
+    Set when a service manager owns the daemons rather than this process.
+    Stopping one works either way, because a service manager leaves a
+    deliberately stopped daemon alone. Starting one does not: without this, the
+    replacement is a child of whoever ran the upgrade, so the manager's unit
+    reads inactive while an unsupervised copy serves traffic. Measured on a
+    systemd host, the unit does not come back on its own either, because systemd
+    treats that external SIGTERM as a clean exit.
+
+    `{frontend}` is replaced with the frontend name, so one template covers
+    every unit. Nothing else about the deployment is assumed: systemd, launchd
+    and a container runtime are each just a command here.
+    """
+    template = settings.get(RESTART_COMMAND_SETTING, "").strip()
+    if not template:
+        return None
+    return template.replace(FRONTEND_PLACEHOLDER, frontend)
+
+
+def _start_via_command(
+    frontend: str,
+    command: str,
+    *,
+    timeout_s: float,
+    runner=subprocess.run,
+) -> int:
+    """Run a restart command and wait for the daemon it starts. Returns its pid.
+
+    Always waits, unlike the Popen path: the manager starts the daemon
+    asynchronously, so its pid is only knowable once it heartbeats, and a
+    `spawn` that returned earlier would report a start that has not happened.
+    The stale heartbeat goes first, or the outgoing daemon's file would read as
+    the new one.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        _heartbeat_file(frontend).unlink()
+
+    logger.info("%s: starting via %r", frontend, command)
+    completed = runner(command, shell=True, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RestartCommandFailed(
+            frontend,
+            command,
+            completed.returncode,
+            (completed.stdout or "") + (completed.stderr or ""),
+        )
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _heartbeat_fresh(frontend):
+            pid = _resolve_pid(frontend)
+            if pid is not None:
+                _write_pid(frontend, pid)
+                logger.info("%s: up as pid=%d via %r", frontend, pid, command)
+                return pid
+        time.sleep(HEARTBEAT_POLL_INTERVAL_S)
+    raise DaemonDidNotComeBack(frontend, command, timeout_s)
+
+
+def reap() -> int:
+    """Reap daemons this process started that have since exited. Returns the count.
+
+    The parent has to do this itself. Until it does, an exited daemon is a
+    zombie, and `os.kill(pid, 0)` reports a zombie as alive to everybody. That
+    is what makes a `claude-tui upgrade` in another process wait out its whole
+    grace on a daemon that has already gone: it is not the parent, so it cannot
+    reap, and the kernel will not tell it the truth.
+
+    Cheap enough for a tick: one `poll()` per daemon this process started and
+    has not yet reaped. Polling is also what reaps, so the entries clear
+    themselves.
+    """
+    with _spawned_lock:
+        handles = list(_spawned.items())
+
+    reaped = 0
+    for pid, proc in handles:
+        if proc.poll() is None:
+            continue
+        with _spawned_lock:
+            _spawned.pop(pid, None)
+        reaped += 1
+
+    if reaped:
+        logger.debug("reaped %d exited daemon(s)", reaped)
+    return reaped
 
 
 def _load_env(env_file: Path | None) -> dict[str, str]:
@@ -295,10 +475,18 @@ def _tail_file(path: Path, n_lines: int = 25) -> str:
 class PendingWork:
     """What stopping one daemon costs, as an outside reader can see it.
 
-    `recoverable` is the whole point of showing this: a job re-runs and a cron
-    command re-fires, but a chat turn is gone and the only recovery is the
-    person sending it again. An operator deciding whether to upgrade now needs
-    those two told apart, not a single total.
+    `recoverable` is the whole point of showing this: a job re-runs, a cron
+    command re-fires, and a chat turn is journaled to `state/<platform>.turns.json`
+    before it runs, so it is replayed on the next start. An operator deciding
+    whether to upgrade now needs work that comes back told apart from work that
+    does not, rather than a single total.
+
+    Chat turns counted as recoverable because `turns.take()` replays both a
+    queued and a dispatched turn. Two narrow cases do not come back: a turn
+    already replayed `MAX_REPLAYS` times is parked, and one older than the TTL
+    is dropped. Neither is visible from the heartbeat this reads, and both mean
+    something is already wrong, so they do not change what the modal should say
+    about an ordinary upgrade.
     """
 
     frontend: str
@@ -365,7 +553,7 @@ def pending_work(frontend: str) -> PendingWork | None:
             frontend,
             running,
             queued if isinstance(queued, int) else 0,
-            recoverable=False,
+            recoverable=True,
         )
     if frontend == "cron":
         # A cancelled command re-fires on its own schedule, and a job it already
@@ -402,8 +590,15 @@ def all_pending_work() -> list[PendingWork]:
 
 
 def is_running(frontend: str) -> bool:
+    """Whether a live daemon answers for this frontend.
+
+    An exited child this process has not reaped reads as alive through
+    `os.kill`, so this asks `_has_exited` instead. `resume` skips anything that
+    reports running, and a zombie that reports running would keep a dead daemon
+    down for good.
+    """
     pid = _resolve_pid(frontend)
-    return pid is not None and _process_exists(pid)
+    return pid is not None and not _has_exited(pid)
 
 
 def read_pid(frontend: str) -> int | None:
@@ -417,6 +612,7 @@ def spawn(
     env_file: Path | None = DEFAULT_ENV_FILE,
     env: Mapping[str, str] | None = None,
     popen_factory=subprocess.Popen,
+    runner=subprocess.run,
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
     preflighted: bool = False,
@@ -430,17 +626,23 @@ def spawn(
     exact env, as `restart` does: the probes write to disk, so running them
     twice per restart is a visible side effect, not just wasted work.
 
+    With `daemons.restart_command` set the daemon is started by that command
+    rather than by this process, and the wait is for the heartbeat it produces.
+    See `restart_command`.
+
     Raises:
         PreflightFailed: env checks failed.
         AlreadyRunning: a live daemon is already known.
         SpawnTimeout: daemon did not heartbeat in time.
+        RestartCommandFailed: the configured restart command exited non-zero.
+        DaemonDidNotComeBack: it finished, but nothing heartbeated after it.
         ValueError: unknown frontend name.
     """
     if frontend not in _FRONTEND_MODULE:
         raise ValueError(f"unknown frontend: {frontend!r}")
 
     existing = _resolve_pid(frontend)
-    if existing is not None and _process_exists(existing):
+    if existing is not None and not _has_exited(existing):
         raise AlreadyRunning(frontend, existing)
 
     resolved_env: dict[str, str] = dict(env) if env is not None else _load_env(env_file)
@@ -452,6 +654,17 @@ def spawn(
     # log "legacy env var wins" warnings about values it never asked for.
     if not preflighted:
         _spawn_preflight(frontend, resolved_env)
+
+    # A service manager owns this daemon, so it is the one to start it. Spawning
+    # a child here instead would put the replacement outside that manager while
+    # its unit read inactive. Every path that brings a frontend up comes through
+    # here, so `start`, `restart` and `resume` are all covered by this one
+    # branch.
+    command = restart_command(frontend)
+    if command is not None:
+        return _start_via_command(
+            frontend, command, timeout_s=spawn_timeout_s, runner=runner
+        )
 
     stdout = _stdout_file(frontend)
     log_handle = stdout.open("ab")
@@ -469,6 +682,8 @@ def spawn(
         # The child inherits the fd via Popen; we can close ours.
         log_handle.close()
 
+    with _spawned_lock:
+        _spawned[proc.pid] = proc
     _write_pid(frontend, proc.pid)
     logger.info("spawned %s pid=%d", frontend, proc.pid)
 
@@ -513,7 +728,7 @@ def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
     Raises NotRunning if no daemon found.
     """
     pid = _resolve_pid(frontend)
-    if pid is None or not _process_exists(pid):
+    if pid is None or _has_exited(pid):
         _remove_pid(frontend)
         _remove_heartbeat(frontend)
         raise NotRunning(f"{frontend} is not running")
@@ -522,7 +737,7 @@ def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
 
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
-        if not _process_exists(pid):
+        if _has_exited(pid):
             _remove_pid(frontend)
             _remove_heartbeat(frontend)
             logger.info("%s pid=%d exited cleanly", frontend, pid)
@@ -535,7 +750,7 @@ def stop(frontend: str, *, grace_s: float = SAFE_GRACE_S) -> int:
 
     # Best-effort second wait so callers don't race on file cleanup.
     for _ in range(20):
-        if not _process_exists(pid):
+        if _has_exited(pid):
             break
         time.sleep(KILL_POLL_INTERVAL_S)
 
@@ -614,19 +829,30 @@ def read_last_running() -> list[str]:
 def stop_all(*, grace_s: float = SAFE_GRACE_S) -> list[tuple[str, int]]:
     """Stop every currently-running daemon. Returns (frontend, pid) per stop.
 
-    Sequential (one at a time) so a single misbehaving daemon does not block
-    the others' grace windows. Records the list of stopped daemons to the
-    last_running file so `resume` can restore them.
+    Concurrent, one worker per frontend. Stopping them in turn made the outage
+    the *sum* of their shutdown times: four daemons that each take a second to
+    exit kept the first one down for four. Concurrently it is the *max*, and a
+    daemon that ignores its grace no longer delays the ones behind it.
+
+    Results come back in `SUPERVISABLE_FRONTENDS` order either way, so what a
+    caller prints does not depend on which daemon happened to exit first.
+    Records the stopped daemons to the last_running file so `resume` can
+    restore them.
     """
-    stopped: list[tuple[str, int]] = []
-    for name in checks.SUPERVISABLE_FRONTENDS:
-        if not is_running(name):
-            continue
+    running = [name for name in checks.SUPERVISABLE_FRONTENDS if is_running(name)]
+    if not running:
+        return []
+
+    def stop_one(name: str) -> tuple[str, int | None]:
         try:
-            pid = stop(name, grace_s=grace_s)
+            return name, stop(name, grace_s=grace_s)
         except NotRunning:
-            continue
-        stopped.append((name, pid))
+            return name, None
+
+    with ThreadPoolExecutor(max_workers=len(running)) as pool:
+        results = list(pool.map(stop_one, running))
+
+    stopped = [(name, pid) for name, pid in results if pid is not None]
     if stopped:
         _write_last_running([name for name, _ in stopped])
     return stopped
@@ -637,30 +863,40 @@ def resume(
     env_file: Path | None = DEFAULT_ENV_FILE,
     env: Mapping[str, str] | None = None,
     popen_factory=subprocess.Popen,
+    runner=subprocess.run,
     wait_for_heartbeat: bool = True,
     spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
 ) -> list[tuple[str, int | None, Exception | None]]:
     """Spawn every frontend recorded by the most recent stop_all().
 
+    Concurrent, for the same reason `stop_all` is: each spawn blocks until its
+    daemon writes a heartbeat, so starting them in turn makes the outage the
+    sum of the startup times instead of the longest one.
+
     Skips daemons that are already running. Returns (frontend, pid, error)
-    triples — error is None on success, the raised exception otherwise.
-    Per-frontend failures do not abort the rest.
+    triples in the order they were recorded, where error is None on success and
+    the raised exception otherwise. Per-frontend failures do not abort the rest.
     """
-    results: list[tuple[str, int | None, Exception | None]] = []
-    for name in read_last_running():
+    recorded = read_last_running()
+    if not recorded:
+        return []
+
+    def resume_one(name: str) -> tuple[str, int | None, Exception | None]:
         if is_running(name):
-            results.append((name, _resolve_pid(name), None))
-            continue
+            return name, _resolve_pid(name), None
         try:
             pid = spawn(
                 name,
                 env_file=env_file,
                 env=env,
                 popen_factory=popen_factory,
+                runner=runner,
                 wait_for_heartbeat=wait_for_heartbeat,
                 spawn_timeout_s=spawn_timeout_s,
             )
-            results.append((name, pid, None))
+            return name, pid, None
         except Exception as exc:
-            results.append((name, None, exc))
-    return results
+            return name, None, exc
+
+    with ThreadPoolExecutor(max_workers=len(recorded)) as pool:
+        return list(pool.map(resume_one, recorded))

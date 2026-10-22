@@ -26,8 +26,8 @@ from claude_on_the_fly.tui.screens.dashboard import DashboardScreen
 
 class _Host(App):
     CSS = """
-    #log-row { height: 1fr; min-height: 8; }
-    #log-pane, #watch-pane { height: 1fr; min-height: 8; }
+    #bottom-row { height: 1fr; min-height: 8; }
+    #log-pane, #live-view, #preview-view { height: 1fr; min-height: 8; }
     """
     SCREENS = {"doctor": DashboardScreen}  # replaced per-test where it matters
 
@@ -44,7 +44,7 @@ def isolated(tmp_path, monkeypatch):
 
 
 def _freeze_refresh_ticks(screen: DashboardScreen) -> None:
-    """Keep the screen's repeating `_refresh` / `_refresh_log` timers from ever
+    """Keep the screen's repeating `_refresh` / `_refresh_bottom` timers from ever
     being scheduled.
 
     `_refresh` resets `_job_sessions`, `_chat_workspaces` and `_job_workspaces`
@@ -64,7 +64,7 @@ def _freeze_refresh_ticks(screen: DashboardScreen) -> None:
 
     def skip_refresh_timers(*args, **kwargs):
         callback = args[1] if len(args) > 1 else kwargs.get("callback")
-        if callback in (screen._refresh, screen._refresh_log):
+        if callback in (screen._refresh, screen._refresh_bottom):
             return None
         return real_set_interval(*args, **kwargs)
 
@@ -253,15 +253,30 @@ class TestSupervisorActionFailures:
         assert any("already running (pid 42)" in msg for msg, _s in notices)
 
     async def test_a_spawn_timeout_points_at_the_log(self, isolated, monkeypatch):
-        notices = await self._press(
-            isolated,
-            monkeypatch,
-            "restart",
-            supervisor.SpawnTimeout(
+        """A toast has no room for the tail, so it names the cause and hands the
+        operator to the logs screen with the failing file already selected."""
+        pushed: list[object] = []
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            notices = _capture(screen)
+            error = supervisor.SpawnTimeout(
                 frontend="cron", pid=1, log_path=Path("/logs/cron.stdout")
-            ),
-        )
-        assert any("/logs/cron.stdout" in msg for msg, _s in notices)
+            )
+            monkeypatch.setattr(
+                supervisor,
+                "restart",
+                lambda _name: (_ for _ in ()).throw(error),
+            )
+            app.push_screen = lambda scr, *a, **kw: pushed.append(scr)  # type: ignore[method-assign]
+            await screen.action_restart()
+            await pilot.pause()
+
+        assert any(f"cron: {error.cause} — opening logs" == msg for msg, _s in notices)
+        assert [type(scr).__name__ for scr in pushed] == ["LogsScreen"]
+        assert pushed[0]._preselect == Path("/logs/cron.stdout")  # type: ignore[attr-defined]
 
     async def test_an_unexpected_error_is_reported_verbatim(
         self, isolated, monkeypatch
@@ -465,28 +480,28 @@ class TestCopyLog:
             screen = await _open(app, pilot)
             notices = _capture(screen)
             screen._log_path = None
-            screen._watch_path = None
+            screen._live_path = None
             screen.action_copy_log()
             await pilot.pause()
         assert any("no log selected" in msg for msg, _s in notices)
 
-    async def test_the_watch_pane_wins_when_both_are_open(self, isolated):
+    async def test_the_live_view_wins_when_both_are_open(self, isolated):
         """It is the more specific of the two: a per-job session beats the whole
         daemon's log."""
         daemon_log = isolated / "daemon.log"
         daemon_log.write_text("daemon line\n")
-        watch_log = isolated / "watch.log"
-        watch_log.write_text("watch line\n")
+        live_log = isolated / "live.log"
+        live_log.write_text("live line\n")
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             screen._log_path = daemon_log
-            screen._watch_path = watch_log
+            screen._live_path = live_log
             copied: list[str] = []
             app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
             screen.action_copy_log()
             await pilot.pause()
-        assert copied == ["watch line"]
+        assert copied == ["live line"]
 
     async def test_only_the_tail_is_copied(self, isolated):
         log = isolated / "big.log"
@@ -494,7 +509,7 @@ class TestCopyLog:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            screen._watch_path = None
+            screen._live_path = None
             screen._log_path = log
             copied: list[str] = []
             app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
@@ -509,7 +524,7 @@ class TestCopyLog:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            screen._watch_path = None
+            screen._live_path = None
             screen._log_path = isolated / "gone.log"
             notices = _capture(screen)
             screen.action_copy_log()
@@ -523,7 +538,7 @@ class TestCopyLog:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
-            screen._watch_path = None
+            screen._live_path = None
             screen._log_path = log
             app.copy_to_clipboard = lambda _t: (_ for _ in ()).throw(  # type: ignore[method-assign]
                 RuntimeError("no clipboard")
@@ -729,62 +744,235 @@ def _write_session(path: Path, *texts: str) -> Path:
     return path
 
 
+def _use_mode(screen: DashboardScreen, mode: str) -> None:
+    """Show the bottom viewport's `mode`, the way `v` does.
+
+    A hidden RichLog renders nothing, so a test that reads a pane has to say
+    which mode it is reading rather than lean on the active tab's default.
+    """
+    screen._bottom_mode[screen._active_tab()] = mode
+    screen._apply_mode()
+
+
 def _pane_text(app: _Host, selector: str) -> str:
     pane = app.screen.query_one(selector, RichLog)
     return "\n".join(seg.text for line in pane.lines for seg in line._segments)
 
 
-class TestWatchPaneVisibility:
-    async def test_it_hides_when_nothing_is_drilled_into(self, isolated):
-        """Hidden gives the daemon log full width, which is what an operator wants
-        when there is no specific job to follow."""
+class TestBottomViewport:
+    """One viewport, three modes. `v` cycles; each tab keeps its own choice."""
+
+    async def test_only_the_active_mode_is_displayed(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "log")
+            await pilot.pause()
+            assert app.screen.query_one("#log-pane").display is True
+            assert app.screen.query_one("#live-view").display is False
+            _use_mode(screen, "live")
+            await pilot.pause()
+            assert app.screen.query_one("#log-pane").display is False
+            assert app.screen.query_one("#live-view").display is True
+
+    def test_before_mount_it_answers_for_the_tab_that_opens_first(self):
+        """`_mode` is read while painting, so it cannot raise on a screen that
+        has not mounted its tabs yet."""
+        screen = DashboardScreen()
+        assert screen._active_tab() == "tab-chat"
+        assert screen._mode() == "live"
+
+    async def test_v_cycles_the_mode(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "log")
+            seen = []
+            for _ in range(3):
+                screen.action_cycle_view()
+                await pilot.pause()
+                seen.append(screen._mode())
+        assert seen == ["live", "preview", "log"]
+
+    async def test_p_jumps_to_the_preview_and_back(self, isolated):
+        """A glance at what a row runs returns you where you were, rather than
+        leaving you one step further around the cycle."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "log")
+            screen.action_preview()
+            await pilot.pause()
+            assert screen._mode() == "preview"
+            screen.action_preview()
+            await pilot.pause()
+            assert screen._mode() == "log"
+
+    async def test_p_from_the_tab_default_returns_to_it(self, isolated):
+        """`p` pressed before any `v` has nothing recorded to go back to."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             screen.action_show_tab("tab-jobs")
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen.action_preview()
             await pilot.pause()
-            assert app.screen.query_one("#log-watch-col").display is False
-        assert screen._watch_target is None
+            assert screen._mode() == "preview"
+            screen.action_preview()
+            await pilot.pause()
+            assert screen._mode() == "live"
 
-    async def test_a_highlighted_cron_entry_opens_it(self, isolated, monkeypatch):
+    async def test_each_tab_remembers_its_own_mode(self, isolated):
+        """A tab switch must not undo the mode you chose on the tab you left."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
             screen.action_show_tab("tab-cron")
             await pilot.pause()
-            monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
-            screen._refresh_watch_pane(force_reload=True)
+            screen.action_cycle_view()  # cron: preview -> log
             await pilot.pause()
-            assert app.screen.query_one("#log-watch-col").display is True
-        assert screen._watch_target == "cron:nightly"
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            assert screen._mode() == "live"  # the jobs tab's own default
+            screen.action_cycle_view()  # jobs: live -> preview
+            await pilot.pause()
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            assert screen._mode() == "log"
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            assert screen._mode() == "preview"
+
+    async def test_the_tabs_open_on_their_own_default(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            assert screen._mode() == "live"  # chat: the running request
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            assert screen._mode() == "preview"  # cron: what the entry runs
+
+    async def test_the_header_carries_the_strip_and_the_label(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen._set_bottom_label("[bold]live: telegram/H[/bold]")
+            screen._paint_bottom_header()
+            await pilot.pause()
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "LIVE" in header
+        assert "telegram/H" in header
+
+    async def test_an_unchanged_header_is_not_rewritten(self, isolated):
+        """The 1Hz tick repaints the header; rewriting an identical Static
+        every second is churn the terminal pays for."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._set_bottom_label("stable")
+            screen._paint_bottom_header()
+            writes: list[object] = []
+            static = app.screen.query_one("#bottom-header", Static)
+            object.__setattr__(static, "update", writes.append)
+            screen._paint_bottom_header()
+        assert writes == []
+
+    async def test_a_mode_with_nothing_to_follow_is_reported_unavailable(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            monkeypatch.setattr(screen, "_selected_job", lambda: None)
+            assert "live" in screen._unavailable_modes()
+            monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
+            assert "live" not in screen._unavailable_modes()
+
+    async def test_copy_follows_the_visible_mode(self, isolated, monkeypatch):
+        """`c` copies what you are reading. Copying a session log while the
+        daemon log is on screen would answer a question nobody asked."""
+        daemon_log = isolated / "daemon.log"
+        session_log = isolated / "session.jsonl"
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._log_path = daemon_log
+            screen._live_path = session_log
+            _use_mode(screen, "log")
+            assert screen._current_log_path() == daemon_log
+            _use_mode(screen, "live")
+            assert screen._current_log_path() == session_log
+
+    async def test_live_mode_with_no_file_falls_back_to_the_daemon_log(self, isolated):
+        """A live view rendering a tmux pane holds no path at all."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._log_path = isolated / "daemon.log"
+            screen._live_path = None
+            _use_mode(screen, "live")
+            assert screen._current_log_path() == isolated / "daemon.log"
+
+
+class TestWatchPaneVisibility:
+    async def test_it_says_so_when_nothing_is_drilled_into(self, isolated):
+        """The viewport belongs to the mode, so an empty live view states the
+        reason rather than handing its space to another mode."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen.action_show_tab("tab-jobs")
+            await pilot.pause()
+            screen._refresh_live_view(force_reload=True)
+            await pilot.pause()
+            assert "nothing highlighted" in _pane_text(app, "#live-view")
+        assert screen._live_target is None
+
+    async def test_a_highlighted_cron_entry_becomes_the_target(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
+            screen._refresh_live_view(force_reload=True)
+            await pilot.pause()
+        assert screen._live_target == "cron:nightly"
 
     async def test_the_placeholder_row_is_not_a_target(self, isolated, monkeypatch):
         """`__empty__` is the "no jobs (g)" row, not a job."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "__empty__")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-        assert screen._watch_target is None
+        assert screen._live_target is None
 
     async def test_switching_target_forces_a_reload(self, isolated, monkeypatch):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "one")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "two")
-            screen._refresh_watch_pane(force_reload=False)
+            screen._refresh_live_view(force_reload=False)
             await pilot.pause()
-        assert screen._watch_target == "cron:two"
+        assert screen._live_target == "cron:two"
 
 
 class TestWatchCron:
@@ -792,17 +980,18 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "hasn't fired since startup" in rendered
 
     async def test_a_job_log_is_tailed_as_plain_text(self, isolated, monkeypatch):
         """Markup is bypassed on purpose: a literal [INFO] in a log line must survive
-        even though the pane has markup on for the session watch."""
+        even though the pane has markup on for the live view."""
         from claude_on_the_fly import logs as logs_mod
 
         log = isolated / logs_mod.log_name("cron-nightly")
@@ -810,13 +999,14 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
-            header = str(app.screen.query_one("#watch-header", Static).content)
+            rendered = _pane_text(app, "#live-view")
+            header = screen._bottom_label
         assert "[INFO] started" in rendered
         assert "[WARN] slow" in rendered
         assert "nightly" in header
@@ -828,12 +1018,13 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "is empty" in rendered
 
     async def test_a_quiet_job_log_is_not_re_read(self, isolated, monkeypatch):
@@ -843,10 +1034,11 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             reads = {"n": 0}
             real_tail = dash.render.tail_lines
@@ -857,7 +1049,7 @@ class TestWatchCron:
                     1
                 ],
             )
-            screen._refresh_watch_pane(force_reload=False)
+            screen._refresh_live_view(force_reload=False)
             await pilot.pause()
         assert reads["n"] == 0
 
@@ -879,16 +1071,17 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
             monkeypatch.setattr(
                 dash.logs, "find_log", lambda _role, directory=None: VanishingPath()
             )
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
         # No crash, and nothing claimed as rendered.
-        assert screen._watch_path is None
+        assert screen._live_path is None
 
     async def test_a_reader_scrolled_up_keeps_their_place(self, isolated, monkeypatch):
         import os
@@ -900,10 +1093,11 @@ class TestWatchCron:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-cron")
             await pilot.pause()
             monkeypatch.setattr(screen, "_selected_job", lambda: "nightly")
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             restores: list[int] = []
             monkeypatch.setattr(dash.render, "capture_scroll", lambda _p: (False, 9))
@@ -914,7 +1108,7 @@ class TestWatchCron:
             )
             log.write_text("".join(f"line {i}\n" for i in range(60)))
             os.utime(log, (9999, 9999))
-            screen._refresh_watch_pane(force_reload=False)
+            screen._refresh_live_view(force_reload=False)
             await pilot.pause()
         assert restores == [9]
 
@@ -931,12 +1125,13 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch, uuid="")
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
-            header = str(app.screen.query_one("#watch-header", Static).content)
+            rendered = _pane_text(app, "#live-view")
+            header = screen._bottom_label
         assert "no session uuid" in rendered
         assert "pending" in header
 
@@ -946,12 +1141,13 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: None)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "hasn't run a turn" in rendered
 
     async def test_a_session_log_is_rendered(self, isolated, monkeypatch):
@@ -959,13 +1155,14 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
-            header = str(app.screen.query_one("#watch-header", Static).content)
+            rendered = _pane_text(app, "#live-view")
+            header = screen._bottom_label
         assert "hello from the agent" in rendered
         assert "telegram/hoss" in header
 
@@ -975,12 +1172,13 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "no displayable events yet" in rendered
 
     async def test_blank_and_malformed_lines_are_skipped(self, isolated, monkeypatch):
@@ -989,12 +1187,13 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "real" in rendered
 
     async def test_a_quiet_session_is_not_re_read(self, isolated, monkeypatch):
@@ -1002,10 +1201,11 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             reads = {"n": 0}
             real_tail = dash.render.tail_lines
@@ -1016,7 +1216,7 @@ class TestWatchSession:
                     1
                 ],
             )
-            screen._refresh_watch_pane(force_reload=False)
+            screen._refresh_live_view(force_reload=False)
             await pilot.pause()
         assert reads["n"] == 0
 
@@ -1027,13 +1227,14 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             log.unlink()
-            screen._refresh_watch_pane(force_reload=False)
+            screen._refresh_live_view(force_reload=False)
             await pilot.pause()
 
     async def test_a_reader_scrolled_up_keeps_their_place(self, isolated, monkeypatch):
@@ -1045,10 +1246,11 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_chat(screen, monkeypatch)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
             restores: list[int] = []
             monkeypatch.setattr(dash.render, "capture_scroll", lambda _p: (False, 4))
@@ -1059,7 +1261,7 @@ class TestWatchSession:
             )
             _write_session(log, *[f"line {i}" for i in range(31)])
             os.utime(log, (9999, 9999))
-            screen._refresh_watch_pane(force_reload=False)
+            screen._refresh_live_view(force_reload=False)
             await pilot.pause()
         assert restores == [4]
 
@@ -1069,13 +1271,14 @@ class TestWatchSession:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen.action_show_tab("tab-chat")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
             monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _s: "nocolon")
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-        assert screen._watch_target is None
+        assert screen._live_target is None
 
 
 class TestJobIdAndPromptCells:
@@ -1126,18 +1329,26 @@ class TestJobsQueueTable:
         base.update(fields)
         return QueueRow(**base)
 
-    def _snap(self, view):
+    def _snap(self, view, *, timestamp=None):
         from datetime import UTC, datetime
 
         from claude_on_the_fly.tui.state import Snapshot
 
         return Snapshot(
-            timestamp=datetime.now(UTC),
+            timestamp=timestamp or datetime.now(UTC),
             frontends=[],
             jobs=[],
             schedule_error=None,
             jobs_queue=view,
         )
+
+    def _due(self, *, hours=0.0, timestamp):
+        """An `available_at` that many hours after `timestamp`, in the queue's
+        naive-local convention."""
+        from datetime import timedelta
+
+        local = timestamp.astimezone().replace(tzinfo=None)
+        return local + timedelta(hours=hours)
 
     async def test_a_queued_job_is_listed(self, isolated):
         app = _Host()
@@ -1161,6 +1372,81 @@ class TestJobsQueueTable:
             await pilot.pause()
             table = app.screen.query_one("#jobs-queue", DataTable)
             assert "running" in [str(c) for c in table.get_row_at(0)]
+
+    async def test_a_scheduled_job_says_when_it_will_run(self, isolated):
+        """A job held for its `available_at` is not a backlog: the age keeps
+        climbing while the worker is right to skip it. The countdown is the
+        answer to "when does this run?"."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [self._row(available_at=self._due(hours=6, timestamp=stamp))]
+                    ),
+                    timestamp=stamp,
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert row[2] == "scheduled"
+        assert row[4] == "in 6.0h"
+
+    async def test_a_due_time_that_has_passed_is_queued_again(self, isolated):
+        """The worker's next poll claims it; the row is no longer held."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [self._row(available_at=self._due(hours=-1, timestamp=stamp))]
+                    ),
+                    timestamp=stamp,
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert row[2] == "queued"
+        assert not row[4].startswith("in ")
+
+    async def test_a_running_job_ignores_a_due_time(self, isolated):
+        """A claimed row is running whatever it was told to wait for."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._refresh_jobs(
+                self._snap(
+                    self._view(
+                        [
+                            self._row(
+                                in_flight=True,
+                                available_at=self._due(hours=6, timestamp=stamp),
+                            )
+                        ]
+                    ),
+                    timestamp=stamp,
+                ),
+                None,
+            )
+            await pilot.pause()
+            table = app.screen.query_one("#jobs-queue", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert row[2] == "running"
 
     async def test_markup_in_a_prompt_cannot_kill_the_dashboard(self, isolated):
         """The prompt is the one cell carrying third-party text. `[/]` raises
@@ -1329,7 +1615,7 @@ class TestCronTable:
             depth=QueueDepth(new=0, running=len(rows), done=0, failed=0), rows=rows
         )
 
-    def _job(self, name="nightly", detail=""):
+    def _job(self, name="nightly", detail="", preview=None):
         from datetime import datetime, timedelta
 
         from claude_on_the_fly.tui.state import JobInfo
@@ -1340,6 +1626,7 @@ class TestCronTable:
             kind="prompt",
             next_fire=datetime.now() + timedelta(hours=1),
             detail=detail,
+            preview=detail if preview is None else preview,
         )
 
     @staticmethod
@@ -1513,7 +1800,7 @@ class TestCronTable:
         assert "no jobs (g)" in str(table.get_row_at(0)[0])
 
     async def test_the_cursor_survives_a_refresh(self, isolated, monkeypatch):
-        """The table is rebuilt every second; losing the cursor would make the watch
+        """The table is rebuilt every second; losing the cursor would make the live
         pane unusable."""
         app = _Host()
         async with app.run_test() as pilot:
@@ -1634,9 +1921,9 @@ class TestCronTable:
         assert "summarise my inbox" in row
         assert "\n" not in row[4]
 
-    async def test_the_detail_block_shows_the_highlighted_row(self, isolated):
-        """The block below the table shows the full prompt as written, not the
-        collapsed one-liner the cell clips."""
+    async def test_the_preview_shows_the_highlighted_row(self, isolated):
+        """The preview mode shows the full prompt as written, not the collapsed
+        one-liner the cell clips."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1646,16 +1933,14 @@ class TestCronTable:
                 self._snap([self._job("digest", detail="summarise\nmy inbox")]),
                 self._status("running"),
             )
+            screen._refresh_bottom(force_reload=True)
             await pilot.pause()
-            header = app.screen.query_one("#cron-detail-header", Static)
-            rendered = _pane_text(app, "#cron-detail")
-            # Inside the run_test block: display reverts to the CSS default
-            # (none) when the app shuts down.
-            assert header.display
-            assert "digest" in str(header.content)
-            assert "summarise\nmy inbox" in rendered
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+            rendered = _pane_text(app, "#preview-view")
+        assert "digest" in header
+        assert "summarise\nmy inbox" in rendered
 
-    async def test_the_detail_block_follows_the_cursor(self, isolated):
+    async def test_the_preview_follows_the_cursor(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1670,13 +1955,11 @@ class TestCronTable:
             table = app.screen.query_one("#cron-entries", DataTable)
             table.move_cursor(row=1)
             await pilot.pause()
-            rendered = _pane_text(app, "#cron-detail")
+            rendered = _pane_text(app, "#preview-view")
         assert "prompt b" in rendered
         assert "prompt a" not in rendered
 
-    async def test_the_detail_block_hides_when_nothing_is_highlighted(self, isolated):
-        """An empty schedule leaves the block hidden so the log row keeps the
-        space."""
+    async def test_an_empty_schedule_has_nothing_to_preview(self, isolated):
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1688,15 +1971,15 @@ class TestCronTable:
             )
             await pilot.pause()
             screen._refresh_cron(self._snap([]), self._status("running"))
+            screen._refresh_bottom()
             await pilot.pause()
-            header = app.screen.query_one("#cron-detail-header", Static)
-            pane = app.screen.query_one("#cron-detail", RichLog)
-        assert not header.display
-        assert not pane.display
+            rendered = _pane_text(app, "#preview-view")
+            assert "preview" in screen._unavailable_modes()
+        assert "nothing to preview" in rendered
 
-    async def test_the_detail_block_is_not_rewritten_when_unchanged(self, isolated):
-        """The 1Hz refresh must not repaint the block every tick; a rewrite
-        would clear the pane, so a clear that raises proves the skip."""
+    async def test_the_preview_is_not_rewritten_when_unchanged(self, isolated):
+        """The 1Hz refresh must not repaint the pane every tick; a rewrite
+        clears it, so a clear that raises proves the skip."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1706,15 +1989,18 @@ class TestCronTable:
                 self._snap([self._job("digest", detail="summarise")]),
                 self._status("running"),
             )
+            screen._refresh_bottom(force_reload=True)
             await pilot.pause()
-            pane = app.screen.query_one("#cron-detail", RichLog)
+            pane = app.screen.query_one("#preview-view", RichLog)
             pane.clear = lambda: (_ for _ in ()).throw(AssertionError("rewritten"))  # type: ignore[method-assign]
-            screen._refresh_cron_detail()
+            screen._refresh_bottom()
 
-    async def test_the_detail_block_hides_for_a_row_without_detail(self, isolated):
+    async def test_a_row_the_snapshot_does_not_know_has_nothing_to_preview(
+        self, isolated
+    ):
         """Defensive: a highlighted row the snapshot knows nothing about (it
-        can only appear by hand-editing the table) hides the block, even when
-        it was showing another job's prompt."""
+        can only appear by hand-editing the table) reports no preview, even
+        when the pane was showing another entry's prompt."""
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
@@ -1731,11 +2017,10 @@ class TestCronTable:
             table.add_row("orphan-b", "", "", "", key="orphan-b")
             await pilot.pause()
             table.move_cursor(row=1)
+            screen._refresh_bottom()
             await pilot.pause()
-            header = app.screen.query_one("#cron-detail-header", Static)
-            pane = app.screen.query_one("#cron-detail", RichLog)
-        assert not header.display
-        assert not pane.display
+            rendered = _pane_text(app, "#preview-view")
+        assert "nothing to preview" in rendered
 
     async def test_the_header_shows_the_job_count(self, isolated):
         app = _Host()
@@ -1784,12 +2069,11 @@ class TestCronTable:
             await pilot.pause()
             assert screen._cron_sort == "next"
 
-    async def test_the_cron_table_leaves_room_for_the_detail_block(self, isolated):
-        """A long entry list must not push the prompt preview off the panel.
-
-        The table is the panel's flexible child, so it scrolls instead of
-        growing; the detail block below it stays on screen.
-        """
+    async def test_a_long_entry_list_does_not_push_the_viewport_off_screen(
+        self, isolated
+    ):
+        """The table is the panel's flexible child, so it scrolls instead of
+        growing, and the bottom viewport stays on screen below it."""
         app = _Host()
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
@@ -1801,13 +2085,13 @@ class TestCronTable:
             ]
             screen._refresh_cron(self._snap(jobs), self._status("running"))
             await pilot.pause()
-            panel = app.screen.query_one("#cron-panel")
+            body = app.screen.query_one("#dashboard-body")
             table = app.screen.query_one("#cron-entries", DataTable)
-            detail = app.screen.query_one("#cron-detail", RichLog)
-            assert detail.display
-            assert detail.region.height > 0
-            assert detail.region.bottom <= panel.region.bottom
-            assert table.region.bottom <= detail.region.y
+            viewport = app.screen.query_one("#preview-view", RichLog)
+            assert viewport.display
+            assert viewport.region.height > 0
+            assert viewport.region.bottom <= body.region.bottom
+            assert table.region.bottom <= viewport.region.y
 
     async def test_a_scrolled_table_stays_put_across_a_refresh(self, isolated):
         """`clear()` drops the scroll offset and the cursor restore scrolls
@@ -1837,8 +2121,8 @@ class TestCronTable:
     async def test_a_short_entry_list_keeps_the_table_at_its_content_height(
         self, isolated
     ):
-        """The flexible table is capped at the rows it has, so two entries
-        don't paint a half-screen of empty zebra stripes."""
+        """The table sizes to its rows, so two entries don't paint a half-screen
+        of empty zebra stripes."""
         app = _Host()
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
@@ -1848,8 +2132,12 @@ class TestCronTable:
             screen._refresh_cron(self._snap(jobs), self._status("running"))
             await pilot.pause()
             table = app.screen.query_one("#cron-entries", DataTable)
-            # 2 rows + the column header.
-            assert table.region.height == 3
+            panel = app.screen.query_one("#cron-panel")
+            # 2 rows, the column header, and the scrollbar row the table keeps
+            # for its overflowing prompt column. Asserted as a bound rather
+            # than an exact number: what matters is that it tracks the rows.
+            assert table.region.height <= len(jobs) + 2
+            assert table.region.height < panel.region.height
 
     async def test_name_sort_orders_the_table(self, isolated):
         """The snapshot arrives sorted by next fire; the name order is a
@@ -1951,7 +2239,7 @@ class TestChatStrip:
 
         return FrontendStatus(name=name, state=state_str)
 
-    async def test_a_running_job_is_listed_and_mapped_for_the_watch_pane(
+    async def test_a_running_job_is_listed_and_mapped_for_the_live_view(
         self, isolated, monkeypatch
     ):
         app = _Host()
@@ -1984,6 +2272,40 @@ class TestChatStrip:
         assert "slack/hoss" in row
         assert screen._job_sessions
         assert screen._chat_workspaces
+
+    async def test_the_row_shows_the_label_when_the_frontend_sends_one(self, isolated):
+        """Slack resolves its ids to names; the row shows both."""
+        from claude_on_the_fly.tui.state import FrontendStatus
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._chat_selected_idx = 0
+            by_name = {
+                "slack": FrontendStatus(
+                    name="slack",
+                    state="running",
+                    extra={
+                        "running_jobs": [
+                            {
+                                "identifier": "slack/channel/C1",
+                                "label": "slack/channel/C1 #general",
+                                "chat_id": "C1",
+                                "session_uuid": "s-1",
+                                "uptime_s": 12,
+                            }
+                        ]
+                    },
+                ),
+                "telegram": self._status("telegram", "stopped"),
+            }
+            screen._refresh_chat_strip(by_name)
+            await pilot.pause()
+            table = app.screen.query_one("#chat-strip", DataTable)
+            row = [str(c) for c in table.get_row_at(0)]
+        assert "slack/channel/C1 #general" in row
+        # The live view still keys off the identifier, not the label.
+        assert "slack/channel/C1" in screen._chat_workspaces.values()
 
     async def test_an_idle_running_daemon_says_idle(self, isolated):
         app = _Host()
@@ -2072,6 +2394,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2090,6 +2413,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2111,6 +2435,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             target = {"name": "cron"}
             monkeypatch.setattr(screen, "_active_daemon", lambda: target["name"])
             screen._refresh_daemon_log(force_reload=True)
@@ -2143,6 +2468,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2174,6 +2500,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             monkeypatch.setattr(
                 dash.logs, "find_log", lambda _role, directory=None: VanishingPath()
@@ -2194,6 +2521,7 @@ class TestDaemonLogAppendPath:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "log")
             monkeypatch.setattr(screen, "_active_daemon", lambda: "cron")
             screen._refresh_daemon_log(force_reload=True)
             await pilot.pause()
@@ -2216,7 +2544,7 @@ class TestRefreshNowKey:
             monkeypatch.setattr(screen, "_refresh", lambda: calls.append("tables"))
             monkeypatch.setattr(
                 screen,
-                "_refresh_log",
+                "_refresh_bottom",
                 lambda *, force_reload=False: calls.append(f"log:{force_reload}"),
             )
             screen.action_refresh_now()
@@ -2365,6 +2693,216 @@ class TestChatTakeover:
         assert any("clipboard write failed" in msg for msg, _sev in notices)
 
 
+class TestJobTakeover:
+    """`t` reaches the jobs tab too.
+
+    The worker publishes a running job's session uuid in its heartbeat, so a job
+    row names its session exactly as a chat row does. It also carries its own
+    workspace path, which is the one the resume command must cd into.
+    """
+
+    def _wire_job(self, screen: DashboardScreen, monkeypatch, workspace: Path):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "job-7")
+        screen._job_sessions = {"jobs:job-7": "s-9"}
+        screen._job_workspaces = {"jobs:job-7": workspace}
+        screen._chat_workspaces = {"jobs:job-7": "job-7"}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+
+    async def test_a_job_row_copies_its_own_workspace_not_a_chat_path(
+        self, isolated, monkeypatch
+    ):
+        workspace = isolated / "runs" / "run7"
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_job(screen, monkeypatch, workspace)
+            backend = type(
+                "B", (), {"takeover_command": lambda _s, _w, _u: "codex resume t1"}
+            )()
+            monkeypatch.setattr(dash, "get_backend", lambda: backend)
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            await pilot.press("t")
+            await pilot.pause()
+        assert copied == [f"cd -- {shlex.quote(str(workspace))} && codex resume t1"]
+
+    async def test_a_job_row_with_no_session_says_no_takeover(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_job(screen, monkeypatch, isolated / "runs" / "run7")
+            screen._job_sessions = {}
+            notices = _capture(screen)
+            await pilot.press("t")
+            await pilot.pause()
+        assert any("no takeover for this row" in msg for msg, _sev in notices)
+
+
+class TestAttach:
+    """`a` copies the `tmux attach` command for the highlighted run's live pane.
+
+    Copy rather than attach in place: a tmux client seizes the terminal the TUI
+    draws in, and detaching would drop the operator back mid-render.
+    """
+
+    def _wire_chat(self, screen: DashboardScreen, monkeypatch):
+        screen.action_show_tab("tab-chat")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "telegram:42")
+        screen._chat_workspaces = {"telegram:42": "telegram/hoss"}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+
+    def _wire_job(self, screen: DashboardScreen, monkeypatch, workspace: Path):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: "job-7")
+        screen._job_workspaces = {"jobs:job-7": workspace}
+        screen._chat_workspaces = {"jobs:job-7": "job-7"}
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+
+    @staticmethod
+    def _serve(monkeypatch, session: str) -> list[tuple[str, ...]]:
+        """Stand in for the tmux server, recording what it was asked for."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        asked: list[tuple[str, ...]] = []
+
+        def pane_named(*prefixes: str):
+            asked.append(prefixes)
+            return tmux_mod.Pane(session=session)
+
+        monkeypatch.setattr(tmux_mod, "available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", pane_named)
+        return asked
+
+    async def test_a_chat_run_copies_the_attach_command_for_its_pane(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            asked = self._serve(monkeypatch, "cotf-pty-telegram-42-abcd1234")
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert copied == [
+            tmux_mod.attach_command(
+                tmux_mod.Pane(session="cotf-pty-telegram-42-abcd1234")
+            )
+        ]
+        # The chat id is all the viewer knows; the orchestrator minted the rest.
+        assert asked[0][0] == "cotf-pty-telegram-42-"
+        assert any("Ctrl-b d to detach" in msg for msg, _sev in notices)
+
+    async def test_a_job_run_asks_for_the_pane_named_after_its_workspace(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_job(screen, monkeypatch, isolated / "runs" / "run7")
+            asked = self._serve(monkeypatch, "cotf-job-run7")
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert asked[0][1] == "cotf-job-run7"
+        assert copied and copied[0].endswith("attach -t cotf-job-run7")
+
+    async def test_a_run_with_no_live_pane_copies_nothing(self, isolated, monkeypatch):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            monkeypatch.setattr(tmux_mod, "available", lambda: True)
+            monkeypatch.setattr(tmux_mod, "pane_named", lambda *_p: None)
+            copied: list[str] = []
+            app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert copied == []
+        assert any("no live pane for this run" in msg for msg, _sev in notices)
+
+    async def test_no_tmux_explains_itself_instead_of_doing_nothing(
+        self, isolated, monkeypatch
+    ):
+        """The binding stays offered on a box without tmux, so the key has to
+        answer. Hiding it would swallow the press and say nothing at all."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            monkeypatch.setattr(tmux_mod, "available", lambda: False)
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+
+        assert any("tmux is not installed" in msg for msg, _sev in notices)
+
+    async def test_an_empty_table_says_no_row(self, isolated):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+        assert any("no row selected" in msg for msg, _sev in notices)
+
+    async def test_a_clipboard_that_will_not_write_is_reported(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire_chat(screen, monkeypatch)
+            self._serve(monkeypatch, "cotf-pty-telegram-42-abcd1234")
+            app.copy_to_clipboard = lambda _t: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                RuntimeError("no clipboard")
+            )
+            notices = _capture(screen)
+            await pilot.press("a")
+            await pilot.pause()
+        assert any("clipboard write failed" in msg for msg, _sev in notices)
+
+
+class TestRunVerbsAreScopedToTheTabsThatShowARun:
+    """`t` and `a` act on a run, so both tabs that show one offer them and the
+    cron tab does not. A key the footer offers where it cannot work is noise."""
+
+    @pytest.mark.parametrize("action", ["copy_takeover", "attach"])
+    @pytest.mark.parametrize("tab", ["tab-chat", "tab-jobs"])
+    async def test_a_run_tab_offers_both_verbs(self, isolated, tab, action):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab(tab)
+            await pilot.pause()
+            assert screen.check_action(action, ()) is True
+
+    @pytest.mark.parametrize("action", ["copy_takeover", "attach"])
+    async def test_the_cron_tab_offers_neither(self, isolated, action):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen.action_show_tab("tab-cron")
+            await pilot.pause()
+            assert screen.check_action(action, ()) is False
+
+
 class TestRunNow:
     """`n` fires the highlighted cron entry via the daemon's trigger file. The
     trigger lands under the redirected DATA_DIR, so the tests assert on the file
@@ -2485,8 +3023,229 @@ class TestRunNow:
         assert any("run-now failed" in msg for msg, _sev in notices)
 
 
+class TestChatPreview:
+    """The chat tab's preview: the message the running turn is answering."""
+
+    def _journal(self, isolated, frontend, chat_id, text):
+        from claude_on_the_fly import turns
+
+        journal = turns.TurnJournal(isolated / "state" / f"{frontend}.turns.json")
+        journal.record(
+            turns.PendingTurn(
+                chat_id=chat_id,
+                text=text,
+                turn_id=turns.new_turn_id(),
+                recorded_at=1.0,
+            )
+        )
+
+    def _wire(self, screen, monkeypatch, chat_id="4242"):
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+        monkeypatch.setattr(screen, "_selected_run", lambda: ("telegram", chat_id))
+        screen._chat_workspaces = {f"telegram:{chat_id}": "telegram/H"}
+
+    async def test_it_shows_the_message_the_turn_is_answering(
+        self, isolated, monkeypatch
+    ):
+        """The heartbeat carries the identifier and the uptime; the message
+        itself lives only in the turn journal."""
+        (isolated / "state").mkdir(exist_ok=True)
+        self._journal(isolated, "telegram", 4242, "rebase this branch onto main")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "rebase this branch onto main" in rendered
+        assert "telegram/H" in header
+
+    async def test_another_conversation_s_turn_is_not_shown(
+        self, isolated, monkeypatch
+    ):
+        """One journal holds every unanswered turn for that frontend."""
+        (isolated / "state").mkdir(exist_ok=True)
+        self._journal(isolated, "telegram", 1, "someone else's question")
+        self._journal(isolated, "telegram", 4242, "mine")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "mine" in rendered
+        assert "someone else" not in rendered
+
+    async def test_a_turn_already_answered_has_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        """The journal drops a turn when it is answered, and a stale message
+        would be worse than none."""
+        (isolated / "state").mkdir(exist_ok=True)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "nothing to preview" in rendered
+
+    async def test_markup_in_a_workspace_name_stays_literal(
+        self, isolated, monkeypatch
+    ):
+        """The header renders markup and the name is remote text on the
+        trusted-bot path: `[/bold]` would eat the line or raise."""
+        (isolated / "state").mkdir(exist_ok=True)
+        self._journal(isolated, "telegram", 4242, "hello")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            screen._chat_workspaces = {"telegram:4242": "telegram/[/bold]evil"}
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "evil" in header
+
+    async def test_no_highlighted_run_has_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            monkeypatch.setattr(screen, "_active_daemon", lambda: "telegram")
+            monkeypatch.setattr(screen, "_selected_run", lambda: None)
+            assert screen._preview_subject() is None
+
+
+class TestJobsPreview:
+    """The jobs tab's preview: what the highlighted job was asked to do."""
+
+    def _wire(self, screen, monkeypatch, job_id="t1-abc", origin=None):
+        screen.action_show_tab("tab-jobs")
+        monkeypatch.setattr(screen, "_active_daemon", lambda: "jobs")
+        monkeypatch.setattr(screen, "_datatable_cursor_key", lambda _sel: job_id)
+        default = {"kind": "cron", "entry": "jira"}
+        screen._job_origins = {job_id: default if origin is None else origin}
+
+    async def test_it_shows_the_whole_prompt_and_who_asked(self, isolated, monkeypatch):
+        """The table cell holds the truncated head the listing carries; the
+        preview reads the record itself."""
+        long_prompt = "work on ACE-2750. " * 60
+        monkeypatch.setattr(
+            dash.file_queue, "read_job_prompt", lambda _root, _id: long_prompt
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+            header = str(app.screen.query_one("#bottom-header", Static).content)
+        assert "from jira" in rendered
+        # Every repetition, not the truncated head the listing carries.
+        assert rendered.count("ACE-2750") == 60
+        assert "abc" in header
+
+    async def test_the_record_is_read_once_per_job(self, isolated, monkeypatch):
+        """A job's prompt is written at enqueue and never changes, so the 1Hz
+        tick must not re-read the file every second."""
+        reads: list[str] = []
+        monkeypatch.setattr(
+            dash.file_queue,
+            "read_job_prompt",
+            lambda _root, job_id: reads.append(job_id) or "do the thing",
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+        assert reads == ["t1-abc"]
+
+    async def test_a_job_that_left_the_queue_has_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        """Claimed or finished between the listing and the read: no record to
+        show, and a stale prompt would be worse than none."""
+        monkeypatch.setattr(dash.file_queue, "read_job_prompt", lambda _root, _id: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch)
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "nothing to preview" in rendered
+
+    async def test_a_job_with_no_named_producer_says_so(self, isolated, monkeypatch):
+        """An origin predating the `kind` field names no producer, and the
+        preview says that rather than claiming one."""
+        monkeypatch.setattr(
+            dash.file_queue, "read_job_prompt", lambda _root, _id: "do the thing"
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch, origin={})
+            _use_mode(screen, "preview")
+            await pilot.pause()
+            screen._refresh_preview(force_reload=True)
+            await pilot.pause()
+            rendered = _pane_text(app, "#preview-view")
+        assert "unnamed producer" in rendered
+
+    async def test_the_placeholder_rows_have_nothing_to_preview(
+        self, isolated, monkeypatch
+    ):
+        """ "queue empty" and "… N more" are rows, but neither is a job."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            self._wire(screen, monkeypatch, job_id="__empty__")
+            assert screen._preview_subject() is None
+            self._wire(screen, monkeypatch, job_id="__more__")
+            assert screen._preview_subject() is None
+
+    async def test_a_finished_job_drops_its_cached_prompt(self, isolated):
+        """Otherwise a long session accumulates the prompt of every job it ever
+        showed."""
+        table = TestJobsQueueTable()
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            screen._job_prompts = {"gone": "old prompt", "here": "current prompt"}
+            view = table._view([table._row(job_id="here")])
+            screen._refresh_jobs(table._snap(view), None)
+            await pilot.pause()
+        assert set(screen._job_prompts) == {"here"}
+
+
 class TestWatchJobs:
-    """The jobs tab's watch pane: the worker publishes the running job's
+    """The jobs tab's live view: the worker publishes the running job's
     session uuid in its heartbeat, so the highlighted job's live agent
     conversation is tailed like a chat job's."""
 
@@ -2503,12 +3262,13 @@ class TestWatchJobs:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_jobs(screen, monkeypatch, isolated)
             monkeypatch.setattr(dash, "resolve_session_log", lambda _w, _u: log)
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "hello from the job agent" in rendered
 
     async def test_a_running_job_without_a_session_says_pending(
@@ -2517,14 +3277,15 @@ class TestWatchJobs:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             self._wire_jobs(screen, monkeypatch, isolated, uuid="")
             await pilot.pause()
-            screen._refresh_watch_pane(force_reload=True)
+            screen._refresh_live_view(force_reload=True)
             await pilot.pause()
-            rendered = _pane_text(app, "#watch-pane")
+            rendered = _pane_text(app, "#live-view")
         assert "no session uuid" in rendered
 
-    async def test_refresh_jobs_builds_the_watch_maps_from_the_heartbeat(
+    async def test_refresh_jobs_builds_the_live_view_maps_from_the_heartbeat(
         self, isolated
     ):
         """The worker's heartbeat `running_jobs` is what resolves a row to
@@ -2560,6 +3321,7 @@ class TestWatchJobs:
         app = _Host()
         async with app.run_test() as pilot:
             screen = await _open(app, pilot)
+            _use_mode(screen, "live")
             screen._refresh_jobs(snap, status)
             await pilot.pause()
         assert screen._job_sessions == {"jobs:t1-abc": "s-1"}
@@ -2568,6 +3330,32 @@ class TestWatchJobs:
         }
         # The display label is the short id, the same one the table shows.
         assert screen._chat_workspaces == {"jobs:t1-abc": "abc"}
+
+
+class TestTheTickReaps:
+    """The dashboard reaps the daemons it started, on its own tick.
+
+    This is what makes a `claude-tui upgrade` running in another process fast.
+    That process is not the daemons' parent, so it cannot reap them, and while
+    the parent has not, they are zombies that `os.kill(pid, 0)` reports as
+    alive. The upgrade then waits out its whole grace on a daemon that already
+    exited, which on this host is the difference between a second and twenty.
+
+    Asserted as "it happens", not "it happens once": the 1s timer may fire
+    during the same yield, and a count would make this depend on timing.
+    """
+
+    async def test_refresh_reaps_the_daemons_it_started(self, isolated, monkeypatch):
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            calls: list[int] = []
+            monkeypatch.setattr(supervisor, "reap", lambda: (calls.append(1), 0)[1])
+
+            screen._refresh()
+            await pilot.pause()
+
+        assert calls, "the dashboard's refresh never reaped"
 
 
 class TestUpgradeAction:
@@ -2686,6 +3474,95 @@ class TestUpgradeAction:
         log = isolated / dash.logs.log_name("upgrade")
         assert "Updated 1 file" in log.read_text()
 
+    def _two_step_plan(self):
+        from claude_on_the_fly.upgrade import Plan
+
+        return Plan(
+            command="git merge --ff-only && uv sync",
+            source="test",
+            prepare="git fetch",
+        )
+
+    async def test_a_two_step_upgrade_fetches_before_it_stops_anything(
+        self, isolated, monkeypatch
+    ):
+        """The window is the whole point. Everything that can run while the
+        daemons still serve has to run before the first stop, or it is downtime
+        that bought nothing."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            order: list[str] = []
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_prepare_captured",
+                lambda _plan: (order.append("prepare"), (0, "Fetched 1 commit"))[1],
+            )
+            monkeypatch.setattr(
+                supervisor,
+                "stop_all",
+                lambda: (order.append("stop"), [("slack", 1)])[1],
+            )
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_captured",
+                lambda _plan: (order.append("activate"), (0, ""))[1],
+            )
+            monkeypatch.setattr(
+                supervisor, "resume", lambda: (order.append("resume"), [])[1]
+            )
+
+            await screen._upgrade(self._two_step_plan())
+            await pilot.pause()
+
+            assert order == ["prepare", "stop", "activate", "resume"]
+            assert app.relaunch_on_exit is True
+
+        # Both steps land in the one log file, so the operator can see what the
+        # fetch did as well as what the activate step did.
+        log = isolated / dash.logs.log_name("upgrade")
+        assert "=== git fetch ===" in log.read_text()
+        assert "Fetched 1 commit" in log.read_text()
+        assert "=== git merge --ff-only && uv sync ===" in log.read_text()
+
+    async def test_a_failed_fetch_leaves_every_daemon_running(
+        self, isolated, monkeypatch
+    ):
+        """A fetch that cannot reach the network used to surface only after
+        every daemon was already down. Now it costs an error message."""
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            notices = _capture(screen)
+            monkeypatch.setattr(
+                dash.upgrade,
+                "run_prepare_captured",
+                lambda _plan: (3, "fatal: unable to access remote"),
+            )
+            stopped: list[str] = []
+            monkeypatch.setattr(
+                supervisor, "stop_all", lambda: (stopped.append("stop"), [])[1]
+            )
+            resumed: list[str] = []
+            monkeypatch.setattr(
+                supervisor, "resume", lambda: (resumed.append("resume"), [])[1]
+            )
+
+            await screen._upgrade(self._two_step_plan())
+            await pilot.pause()
+
+        assert stopped == []
+        assert resumed == []
+        # Nothing was stopped and there is no new code to show, so the TUI stays.
+        assert getattr(app, "relaunch_on_exit", False) is False
+        assert any(
+            "prepare failed" in msg and severity == "error" for msg, severity in notices
+        )
+
+        # The failed fetch is still on disk for the operator to read.
+        log = isolated / dash.logs.log_name("upgrade")
+        assert "unable to access remote" in log.read_text()
+
     async def test_a_failed_upgrade_restarts_the_daemons_and_does_not_hand_over(
         self, isolated, monkeypatch
     ):
@@ -2756,7 +3633,7 @@ class TestTheWatchPaneRendersRemoteTextAsData:
     """
 
     class _Recorder:
-        """Stands in for the header Static and the watch RichLog."""
+        """Stands in for the live-view RichLog."""
 
         def __init__(self) -> None:
             self.written: list[str] = []
@@ -2774,9 +3651,9 @@ class TestTheWatchPaneRendersRemoteTextAsData:
         screen._chat_workspaces = {"telegram:7": label}
         screen._job_sessions = {}
         screen._job_workspaces = {}
-        header, pane = self._Recorder(), self._Recorder()
-        screen._refresh_watch_session("telegram", "7", header, pane, True)
-        return "\n".join(header.written + pane.written)
+        pane = self._Recorder()
+        screen._refresh_live_session("telegram", "7", pane, True)
+        return "\n".join([screen._bottom_label, *pane.written])
 
     async def test_markup_in_a_workspace_name_stays_literal(self, isolated):
         label = "telegram/[/bold]evil[blink]"
@@ -2798,3 +3675,146 @@ class TestTheWatchPaneRendersRemoteTextAsData:
             rendered = self._drive(screen, label)
 
         assert label in render_markup(rendered).plain
+
+
+class TestWatchGrid:
+    """The live view prefers the agent's own terminal when the run is hosted."""
+
+    @staticmethod
+    def _call(screen, workspace):
+        from textual.widgets import RichLog
+
+        return screen._refresh_live_grid(
+            "telegram",
+            "12345",
+            workspace,
+            "telegram/H",
+            screen.query_one("#live-view", RichLog),
+        )
+
+    async def test_a_hosted_run_renders_its_pane_instead_of_the_transcript(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(session="cotf-pty-telegram-12345-abcd")
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
+        monkeypatch.setattr(
+            tmux_mod, "capture", lambda *_a, **_k: "\x1b[32mrunning tests\x1b[0m"
+        )
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            screen._live_path = isolated / "stale.jsonl"
+            handled = self._call(screen, isolated / "workspaces" / "telegram" / "H")
+            await pilot.pause()
+            rendered = _pane_text(app, "#live-view")
+            header = screen._bottom_label
+
+        assert handled is True
+        assert "running tests" in rendered
+        assert "tmux pane" in header
+        # Cleared, or a later switch back to the transcript would refuse to reload.
+        assert screen._live_path is None
+
+    async def test_the_live_view_itself_prefers_a_tmux_pane(
+        self, isolated, monkeypatch
+    ):
+        """Through the real refresh path, not the helper: the tail must not also
+        run and overwrite the grid."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(session="cotf-pty-telegram-777-abcd")
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
+        monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "live grid text")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            from textual.widgets import RichLog
+
+            screen._refresh_live_session(
+                "telegram",
+                "777",
+                screen.query_one("#live-view", RichLog),
+                True,
+            )
+            await pilot.pause()
+            rendered = _pane_text(app, "#live-view")
+
+        assert "live grid text" in rendered
+
+    async def test_an_unhosted_run_falls_back_to_the_transcript_tail(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            assert self._call(screen, isolated / "ws") is False
+
+    async def test_hosting_unavailable_never_probes_for_a_pane(
+        self, isolated, monkeypatch
+    ):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: False)
+
+        def fail(*_prefixes):
+            raise AssertionError("probed for a pane with hosting unavailable")
+
+        monkeypatch.setattr(tmux_mod, "pane_named", fail)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            assert self._call(screen, isolated / "ws") is False
+
+    async def test_a_pane_that_ends_mid_capture_falls_back(self, isolated, monkeypatch):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(session="cotf-job-run1")
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
+        monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: None)
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            assert self._call(screen, isolated / "ws") is False
+
+
+class TestWatchGridBlank:
+    async def test_a_pane_that_has_not_drawn_yet_falls_back_to_the_transcript(
+        self, isolated, monkeypatch
+    ):
+        """A live pane trims to "" until the agent draws. Rendering that would
+        blank the live view for the opening stretch of every turn."""
+        from textual.widgets import RichLog
+
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(session="cotf-job-run1")
+        monkeypatch.setattr(tmux_mod, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux_mod, "pane_named", lambda *_prefixes: pane)
+        monkeypatch.setattr(tmux_mod, "capture", lambda *_a, **_k: "   \n  \n")
+        app = _Host()
+        async with app.run_test() as pilot:
+            screen = await _open(app, pilot)
+            _use_mode(screen, "live")
+            handled = screen._refresh_live_grid(
+                "telegram",
+                "12345",
+                isolated / "ws",
+                "telegram/H",
+                screen.query_one("#live-view", RichLog),
+            )
+
+        assert handled is False

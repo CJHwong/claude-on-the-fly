@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
-from claude_on_the_fly import agent, egress, sandbox, sandbox_macos
+from claude_on_the_fly import agent, commands, egress, sandbox, sandbox_macos
+
+# Set by the macOS CI job. The cases below run a real `sandbox-exec`, so off
+# macOS they can only skip -- and a skipped boundary case reads exactly like a
+# passing one. Where seatbelt is expected to be present, its absence has to fail
+# collection loudly instead. Same contract as COTF_REQUIRE_JAIL in
+# test_sandbox_jail_live.py; this is the other half of the pair.
+if os.environ.get("COTF_REQUIRE_SEATBELT") and not shutil.which("sandbox-exec"):
+    raise RuntimeError("COTF_REQUIRE_SEATBELT is set but sandbox-exec is not on PATH")
+
+
+def _seatbelt_or_skip() -> None:
+    """Guard for a case that spawns the real seatbelt, rather than asserting argv."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
 
 
 def test_mode_defaults_off(monkeypatch):
@@ -33,6 +50,67 @@ def test_enabled_modes(monkeypatch, value):
     monkeypatch.setenv("COTF_SANDBOX", value)
     assert sandbox.mode() == value
     assert sandbox.enabled() is True
+
+
+def test_egress_defaults_to_gated(monkeypatch):
+    monkeypatch.delenv("COTF_SANDBOX_EGRESS", raising=False)
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    assert sandbox.egress_mode() == "gated"
+    assert sandbox.egress_proxy_enabled() is True
+    assert sandbox.egress_asks() is True
+
+
+def test_an_emptied_egress_key_reads_as_gated(monkeypatch):
+    """Commenting the key out must not silently drop the gate."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "  ")
+    assert sandbox.egress_mode() == "gated"
+
+
+@pytest.mark.parametrize("sandbox_mode", ["env", "jail"])
+def test_egress_open_runs_the_proxy_without_asking(monkeypatch, sandbox_mode):
+    """The posture for an agent that reads the web. The proxy still runs -- that
+    is what keeps the jail's namespace free of the host's loopback services --
+    it just stops asking about the allowlist."""
+    monkeypatch.setenv("COTF_SANDBOX", sandbox_mode)
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "open")
+    assert sandbox.egress_mode() == "open"
+    assert sandbox.egress_proxy_enabled() is True
+    assert sandbox.egress_asks() is False
+
+
+@pytest.mark.parametrize("sandbox_mode", ["env", "jail"])
+def test_egress_off_starts_no_proxy_in_either_mode(monkeypatch, sandbox_mode):
+    """Legal under the jail too, where it means broker-only: the relay still
+    bridges the credential broker, so model calls work and the agent has no
+    internet. That is a lockdown, not a broken configuration."""
+    monkeypatch.setenv("COTF_SANDBOX", sandbox_mode)
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+    assert sandbox.egress_mode() == "off"
+    assert sandbox.egress_proxy_enabled() is False
+
+
+@pytest.mark.parametrize(("yaml_value", "expected"), [(False, "off"), (True, "gated")])
+def test_the_yaml_boolean_spelling_is_accepted(monkeypatch, yaml_value, expected):
+    """YAML 1.1 reads a bare `off` as False, so an operator copying the template
+    value without quotes hands this a bool. Refusing it would answer "'False' is
+    not one of [...]" to somebody who wrote the documented value."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setattr(
+        sandbox.settings,
+        "startup_value",
+        lambda path, default=None: yaml_value if path == "sandbox.egress" else "env",
+    )
+    assert sandbox.egress_mode() == expected
+
+
+def test_unknown_egress_value_refuses(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "banana")
+    with pytest.raises(sandbox.SandboxModeError) as excinfo:
+        sandbox.egress_mode()
+    assert "sandbox.egress='banana'" in str(excinfo.value)
+    assert "open" in str(excinfo.value)
 
 
 def test_agent_env_none_when_off(monkeypatch):
@@ -194,7 +272,7 @@ def test_guidance_jail_covers_all_denial_scenarios(monkeypatch, tmp_path):
     assert (
         "sandbox.extra_paths" in text
     )  # file-read remedy, named as the operator sets it
-    assert "write profile" in text  # file-write remedy
+    assert "sandbox.write_paths" in text  # file-write remedy
     # Network remedy is now an approval, not a config change: the agent is told
     # the request pauses for the operator and that a 403 means they declined.
     assert "operator is asked" in text
@@ -223,7 +301,14 @@ def test_guidance_broker_only_loopback_note(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:5/anthropic")
-    assert "ONLY the local broker" in sandbox.agent_guidance(tmp_path)
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", "open")
+    text = sandbox.agent_guidance(tmp_path)
+    assert "no other local port is reachable" in text
+    # Measured under a live seatbelt jail with this setting on: a public host
+    # through the proxy answered 200, so the old "external hosts are blocked"
+    # made the agent decline work it could do.
+    assert "external hosts are blocked" not in text
+    assert "any public host" in text
 
 
 def test_build_system_prompt_appends_guidance_only_when_on(monkeypatch, tmp_path):
@@ -283,6 +368,83 @@ def test_wrap_deny_most_pads_unused_slots_with_project(monkeypatch, tmp_path):
     # No grants => all three slots resolve to the (already-allowed) project dir.
     assert out.count(f"_EXTRA_1={project}") == 1
     assert f"_EXTRA_2={project}" in out and f"_EXTRA_3={project}" in out
+
+
+def test_home_ancestors_walks_from_the_home_to_the_project_parent():
+    from claude_on_the_fly import sandbox_macos
+
+    assert sandbox_macos.home_ancestors(
+        "/u/me/.cotf/workspaces/slack/dm/U1", "/u/me"
+    ) == [
+        "/u/me",
+        "/u/me/.cotf",
+        "/u/me/.cotf/workspaces",
+        "/u/me/.cotf/workspaces/slack",
+        "/u/me/.cotf/workspaces/slack/dm",
+    ]
+
+
+def test_home_ancestors_is_empty_when_the_project_is_not_under_the_home():
+    from claude_on_the_fly import sandbox_macos
+
+    # Reads outside $HOME are allowed already, so there is nothing to re-grant.
+    assert sandbox_macos.home_ancestors("/srv/cotf/ws", "/u/me") == []
+    assert sandbox_macos.home_ancestors("/u/me", "/u/me") == []
+
+
+def test_wrap_deny_most_grants_metadata_on_the_project_ancestors(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    home = tmp_path / "home"
+    project = home / "data" / "workspaces" / "ws"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    out = sandbox.wrap(["claude"], project)
+    resolved_home = str(home.resolve())
+    resolved = str(project.resolve())
+    slots = {
+        a.split("=", 1)[0]: a.split("=", 1)[1]
+        for a in out
+        if a.startswith("_ANCESTOR_")
+    }
+    assert len(slots) == 8
+    # $HOME down to the project's parent, then the (already allowed) project pads the rest.
+    assert slots["_ANCESTOR_1"] == resolved_home
+    assert slots["_ANCESTOR_2"] == f"{resolved_home}/data"
+    assert slots["_ANCESTOR_3"] == f"{resolved_home}/data/workspaces"
+    assert all(slots[f"_ANCESTOR_{i}"] == resolved for i in range(4, 9))
+
+
+def test_jail_argv_keeps_the_deepest_ancestors_when_the_chain_overflows(
+    tmp_path, caplog
+):
+    from claude_on_the_fly import sandbox_macos
+
+    chain = [f"/h/{i}" for i in range(10)]
+    with caplog.at_level("WARNING"):
+        out = sandbox_macos.jail_argv(
+            ["claude"],
+            home="/h",
+            data_dir="/h/d",
+            project=str(tmp_path),
+            tmpdir="/tmp",
+            claude_config="/h/.claude",
+            claude_projects="/h/.claude/projects",
+            claude_project="/h/.claude/projects/x",
+            codex_sessions="/h/.codex/sessions",
+            codex_home="/h/.codex",
+            codex_operator_home="/h/.codex",
+            pane_socket="/h/d/panes/tmux-501/default",
+            base=sandbox_macos._DENY_MOST_PROFILE,
+            loopback=("a", "b", "c", "d", "e"),
+            extra_paths=[],
+            ancestor_paths=chain,
+        )
+    assert "_ANCESTOR_1=/h/2" in out and "_ANCESTOR_8=/h/9" in out
+    assert "only the deepest 8" in caplog.text
 
 
 # --- operator read grants that would undo the profile ---
@@ -443,6 +605,37 @@ def test_linux_write_denies_cover_codex_prompts_and_auth(tmp_path):
     assert codex / "skills" not in grants["write_denied"]
 
 
+def test_linux_hides_the_codex_login_the_broker_holds(tmp_path, monkeypatch):
+    """Masked rather than read-only, and only in one list: two mounts on one
+    path would leave argv order deciding which one the turn sees."""
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex = Path(os.path.realpath(tmp_path)) / "home" / ".codex"
+    codex.mkdir(parents=True)
+    auth = codex / "auth.json"
+    auth.write_text("{}\n")
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+
+    grants = sandbox._linux_grants(tmp_path / "ws")
+
+    assert auth in grants["masked"]
+    assert auth not in grants["write_denied"]
+    assert codex / "config.toml" in grants["write_denied"]
+
+
+def test_linux_masks_no_codex_login_that_is_not_there(tmp_path, monkeypatch):
+    """bwrap cannot mount over a path that does not exist."""
+    from claude_on_the_fly import codex_auth
+
+    missing = tmp_path / "no-codex"
+    monkeypatch.setattr(sandbox, "_codex_operator_home", lambda: missing)
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    assert missing / "auth.json" not in grants["masked"]
+
+
 # --- Slice 3: loopback narrowing ---
 
 
@@ -452,6 +645,7 @@ def _clear_loopback_env(monkeypatch):
         "OPENAI_BASE_URL",
         "HTTPS_PROXY",
         "COTF_CMD_ENDPOINT",
+        "OLLAMA_HOST",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -477,11 +671,15 @@ def test_loopback_narrows_to_every_known_service(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:54322")
     monkeypatch.setenv("COTF_CMD_ENDPOINT", "http://127.0.0.1:54323")
     monkeypatch.setenv("COTF_APPROVE_URL", "http://127.0.0.1:54324/decide")
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    # Five services, one per slot. The ollama server was the fifth: with four
+    # slots it was the one dropped, and an ollama turn could not reach its model.
     assert sandbox._loopback_specs() == (
         "localhost:54321",
         "localhost:54322",
         "localhost:54323",
         "localhost:54324",
+        "localhost:11434",
     )
 
 
@@ -499,12 +697,13 @@ def test_loopback_reads_the_per_session_env_not_just_os_environ(monkeypatch):
         }
     )
     try:
-        # Three services and four slots, so the spare repeats the first
+        # Three services and five slots, so the spares repeat the first
         # port -- a duplicate allow, which is harmless.
         assert sandbox._loopback_specs() == (
             "localhost:5001",
             "localhost:6002",
             "localhost:7003",
+            "localhost:5001",
             "localhost:5001",
         )
     finally:
@@ -520,19 +719,22 @@ def test_loopback_narrows_to_egress_port_alone(monkeypatch):
 
 
 def test_loopback_warns_rather_than_silently_dropping_a_service(monkeypatch, caplog):
-    """Guard for a future fifth loopback service. Unreachable through env today
-    (the broker serves every route on one port, so the four sources fill the four
+    """Guard for a future sixth loopback service. Unreachable through env today
+    (the broker serves every route on one port, so the five sources fill the five
     slots exactly), so drive _loopback_ports directly."""
     monkeypatch.setenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", "1")
-    monkeypatch.setattr(sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4", "5"])
+    monkeypatch.setattr(
+        sandbox, "_loopback_ports", lambda: ["1", "2", "3", "4", "5", "6"]
+    )
     with caplog.at_level("WARNING"):
         specs = sandbox._loopback_specs()
-    # Five services, four slots: the drop must be loud, never silent.
+    # Six services, five slots: the drop must be loud, never silent.
     assert specs == (
         "localhost:1",
         "localhost:2",
         "localhost:3",
         "localhost:4",
+        "localhost:5",
     )
     assert "unreachable" in caplog.text
 
@@ -552,13 +754,19 @@ def test_loopback_stays_open_when_no_service_is_known(monkeypatch):
     assert sandbox._loopback_specs() == ("localhost:*",) * sandbox._LOOPBACK_SLOTS
 
 
-def test_wrap_jail_passes_three_loopback_slots(monkeypatch, tmp_path):
+def test_wrap_jail_passes_every_loopback_slot(monkeypatch, tmp_path):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
     monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
     out = sandbox.wrap(["claude"], tmp_path)
-    for param in ("_LOOPBACK=", "_LOOPBACK_ALT=", "_LOOPBACK_ALT2="):
+    for param in (
+        "_LOOPBACK=",
+        "_LOOPBACK_ALT=",
+        "_LOOPBACK_ALT2=",
+        "_LOOPBACK_ALT3=",
+        "_LOOPBACK_ALT4=",
+    ):
         assert any(a.startswith(param) for a in out), param
 
 
@@ -566,6 +774,46 @@ def test_loopback_ports_reads_any_base_url(monkeypatch):
     _clear_loopback_env(monkeypatch)
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9911/openai")
     assert sandbox._loopback_ports() == ["9911"]
+
+
+def test_loopback_ports_read_the_ollama_host(monkeypatch):
+    """Ollama mode publishes no base URL, so nothing bridged 11434 into a Linux
+    jail and a jailed `ollama launch` answered "could not connect to ollama
+    server"."""
+    _clear_loopback_env(monkeypatch)
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    assert sandbox._loopback_ports() == ["11434"]
+
+
+class TestModelEndpointEnv:
+    def test_an_ollama_turn_under_the_jail_names_its_server(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        assert sandbox.model_endpoint_env("ollama") == {
+            "OLLAMA_HOST": "http://127.0.0.1:11434"
+        }
+
+    def test_the_operators_port_is_kept(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("OLLAMA_HOST", "localhost:11500")
+        assert sandbox.model_endpoint_env("ollama") == {
+            "OLLAMA_HOST": "http://127.0.0.1:11500"
+        }
+
+    def test_a_remote_server_has_nothing_to_bridge(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("OLLAMA_HOST", "https://ollama.example:443")
+        assert sandbox.model_endpoint_env("ollama") == {}
+
+    def test_other_modes_get_nothing(self, monkeypatch):
+        """Only an ollama turn gets the port: the ollama API has no auth, so a
+        native turn handed it could pull or delete models."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        assert sandbox.model_endpoint_env("native") == {}
+
+    def test_nothing_changes_outside_the_jail(self, monkeypatch):
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        assert sandbox.model_endpoint_env("ollama") == {}
 
 
 def test_session_env_layers_over_the_allowlist(monkeypatch):
@@ -813,8 +1061,7 @@ async def test_verify_denials_reports_each_probe(
     because the profile denies anything. So this one test reaches for the real
     home on purpose.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     # The write probe is isolated here on purpose. This suite's home lives under
@@ -828,6 +1075,15 @@ async def test_verify_denials_reports_each_probe(
         results = await sandbox.verify_denials(tmp_path)
     assert results, "expected at least one probe"
     assert sandbox.READABLE not in results.values(), f"leaked: {results}"
+    # A host that holds none of the probed credentials has no deny to prove, and
+    # `verify_denials` settles absent-versus-denied outside the jail, so it spawns
+    # nothing at all. That is a fact about the host, not about the profile. Seven
+    # sibling cases below already skip on the same reasoning ("no real ~/.codex on
+    # this machine to probe"); a CI runner is simply the first host where every
+    # probe lands that way at once. Asserting here instead would make the job red
+    # for having a clean home.
+    if all(outcome == sandbox.ABSENT for outcome in results.values()):
+        pytest.skip(f"no probed credential exists in this home: {sorted(results)}")
     # At least one real deny must have been exercised, or the run proved nothing.
     assert sandbox.DENIED in results.values(), f"nothing actually denied: {results}"
     logged = "\n".join(r.getMessage() for r in caplog.records)
@@ -863,8 +1119,7 @@ async def test_absent_path_is_not_counted_as_denied(monkeypatch, tmp_path, caplo
     conftest's tmpdir HOME gives exactly that situation, so this asserts the
     honest outcome rather than a false pass.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     # The write probe is isolated here on purpose. This suite's home lives under
     # $TMPDIR, which both profiles grant writes to for scratch space, so the probe
@@ -916,8 +1171,7 @@ async def test_broken_profile_is_not_reported_as_absent(
     The first version of verify_denials reported it as six "absent" paths, which
     reads as benign. Found by deliberately breaking the profile, not by review.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     broken = tmp_path / "broken.sb"
     broken.write_text("(version 1)\n(this-is-not-a-real-operation\n")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -979,8 +1233,7 @@ def test_data_dir_param_is_realpathed(monkeypatch, tmp_path):
 async def test_credential_denies_fire_under_a_symlinked_home(monkeypatch, tmp_path):
     """End-to-end version of the above: a real sandbox-exec run proves the deny
     matches when home is reached through a symlink."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     real_home = Path(os.path.realpath(tmp_path)) / "home"
     (real_home / ".aws").mkdir(parents=True)
     (real_home / ".aws" / "credentials").write_text("CANARY\n")
@@ -1009,8 +1262,7 @@ async def test_daemon_env_file_is_denied_to_the_agent(monkeypatch, tmp_path):
     means answering its own approval prompts: the gate re-checks the sender, and
     the sender would have been legitimate.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     home = Path(os.path.realpath(tmp_path)) / "home"
     data = home / ".claude-on-the-fly"
     (data / "logs").mkdir(parents=True)
@@ -1261,11 +1513,40 @@ def test_an_unreadable_shim_dir_leaves_path_alone(monkeypatch, tmp_path):
         raise OSError("permission denied")
 
     monkeypatch.setattr(Path, "iterdir", cannot_list)
-    env = sandbox._with_shims_on_path({"PATH": "/usr/bin"})
+    env = sandbox._with_shims_on_path(
+        {"PATH": "/usr/bin", commands.ENDPOINT_ENV: "http://127.0.0.1:1"}
+    )
     assert env["PATH"] == "/usr/bin"
 
 
+def test_shims_go_on_path_only_where_a_broker_answers(monkeypatch):
+    """The shim dir is shared across daemons, and only the chat daemon runs a
+    broker. A cron job got the shims with no endpoint, so every brokered tool
+    failed where the real binary would have run."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    shims = sandbox.shim_dir()
+    shims.mkdir(parents=True, exist_ok=True)
+    (shims / "gh").write_text("#!/bin/sh\n")
+
+    no_broker = sandbox._with_shims_on_path({"PATH": "/usr/bin"})
+    assert no_broker["PATH"] == "/usr/bin"
+
+    brokered = sandbox._with_shims_on_path(
+        {"PATH": "/usr/bin", commands.ENDPOINT_ENV: "http://127.0.0.1:1"}
+    )
+    assert brokered["PATH"] == f"{shims}:/usr/bin"
+
+
 # --- the agent's own memory has to survive the jail ---
+
+
+def _always(answer: bool):
+    """An awaitable stand-in for the symlink write probe."""
+
+    async def probe(*_args, **_kwargs):
+        return answer
+
+    return probe
 
 
 def _run_jailed(argv: list[str], workspace: Path) -> subprocess.CompletedProcess:
@@ -1284,8 +1565,7 @@ def test_memory_is_writable_under_the_jail(monkeypatch, tmp_path, fs_base):
     an explicit grant every memory write failed with "Operation not permitted" and
     the feature was silently off under `jail` — with nothing in the log, because
     macOS cannot report a seatbelt denial."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     memory = agent.MEMORY_DIR / "users" / "someone"
@@ -1312,7 +1592,7 @@ def test_memory_grant_is_scoped_to_memory_not_the_whole_data_dir(profile):
     grants = re.findall(
         r'\(allow file-(?:read|write)\*.*?\(param "_DATA_DIR"\) "([^"]*)"', text
     )
-    scoped = ("/memory", "/shims", "/uv-cache")
+    scoped = ("/memory", "/shims", "/uv-cache", "/panes")
     assert grants, "expected at least one data-dir grant"
     for suffix in grants:
         assert suffix.startswith(scoped), (
@@ -1326,8 +1606,7 @@ def test_the_daemons_own_env_file_is_unreadable_in_the_jail(
     """The live counterpart, against the real home so the deny is the reason the
     read fails rather than the file being absent. Reads only; never creates or
     modifies anything under the real home."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     secrets = original_home / ".claude-on-the-fly" / ".env"
     if not secrets.is_file():
         pytest.skip("no real .env on this machine to probe")
@@ -1346,13 +1625,15 @@ _CODEX_MUST_WRITE = (
     # CODEX_HOME, so the shared tree is denied both ways on purpose: it held every
     # other thread's verbatim turns, and leaving it writable while denying the read
     # would mean codex could write a rollout it cannot then resume from.
-    "/.codex/tmp",
-    "/.codex/cache",
-    "/.codex/log",
-    "/.codex/shell_snapshots",
-    "/.codex/plugins/cache",
-    "/.codex/models_cache.json",
-    "/.codex/auth.json",
+    # Relative to _CODEX_OPERATOR_HOME, not to $HOME: CODEX_HOME can move the tree,
+    # and a rule spelled "$HOME/.codex" matched nothing when it did.
+    "/tmp",
+    "/cache",
+    "/log",
+    "/shell_snapshots",
+    "/plugins/cache",
+    "/models_cache.json",
+    "/auth.json",
 )
 
 # Files that decide what codex executes, or what it is told to do. None was written by
@@ -1372,36 +1653,54 @@ _CODEX_MUST_NOT_WRITE = (
 def test_the_cotf_env_deny_covers_any_depth(profile):
     """The tokens must not be readable from a copy one directory down.
 
-    `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and memory
-    live under it -- so the tokens are covered by a regex rather than a subpath deny.
-    The regex used to be anchored at the directory root, which left
-    `pre-migration-backup-*/.env` and a syncer's `sub/.env` readable while the file an
-    operator actually thinks about was protected. Asserted on the profile text because
-    the suite's HOME is a tmpdir the profile grants wholesale, so a live read there
-    would succeed for the wrong reason.
+    `~/.claude-on-the-fly` is deliberately readable -- the agent's workspace and
+    memory live under it -- so the tokens are covered by a regex rather than a
+    subpath deny. That regex used to be anchored at the directory root, which left
+    `pre-migration-backup-*/.env` and a syncer's `sub/.env` readable while the file
+    an operator actually thinks about was protected. One global rule now covers
+    every directory in both profiles, so the property is asserted on it. Asserted
+    on the profile text because the suite's HOME is a tmpdir the profile grants
+    wholesale, so a live read there would succeed for the wrong reason.
     """
-    text = profile.read_text()
-    if profile == sandbox._BASE_PROFILE:
-        # The default location's own deny lives only in allow-reads; deny-most
-        # covers the default location through its blanket _HOME opacity.
-        default_rule = next(
-            line
-            for line in text.splitlines()
-            if "deny file-read*" in line
-            and "claude-on-the-fly" in line
-            and ".env" in line
-        )
-        assert "(.*/)?" in default_rule, default_rule
-    # A redirected data dir (COTF_DATA_DIR) is covered by the same-shaped rule
-    # scoped to _DATA_DIR in both profiles, so a second daemon's .env is denied
-    # wherever the dir sits -- under _HOME, where deny-most is opaque anyway,
-    # or outside it, where only this deny reaches.
-    data_rule = next(
-        line
-        for line in text.splitlines()
-        if "deny file-read*" in line and "_DATA_DIR" in line and ".env" in line
+    rule = next(
+        line.strip()
+        for line in profile.read_text().splitlines()
+        if line.strip().startswith("(deny file-read*") and "\\.env" in line
     )
-    assert "(.*/)?" in data_rule, data_rule
+    assert "(.*/)?" in rule, rule
+    assert '"^' not in rule, f"a root anchor would miss every other tree: {rule}"
+    assert "\\.env$" not in rule, f"an end anchor would miss .env.local: {rule}"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_dotenv_deny_is_the_last_word_on_reads(profile):
+    """It only holds because nothing re-allows a read after it. SBPL is
+    last-match-wins, so a grant added below would reopen every dotenv it covers,
+    and nothing in the rule itself would look wrong."""
+    lines = [
+        line.strip()
+        for line in profile.read_text().splitlines()
+        if not line.strip().startswith(";;") and line.strip()
+    ]
+    deny = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("(deny file-read*") and "\\.env" in line
+    )
+    later = [line for line in lines[deny + 1 :] if line.startswith("(allow file-read")]
+    assert not later, f"a read allow after the dotenv deny reopens it: {later}"
+
+
+def test_jail_sb_adds_no_read_allow_after_importing_the_base():
+    """The base is imported first, so a read allow in jail.sb would sit after the
+    dotenv deny and win over it. Pins the assumption the test above rests on."""
+    lines = [
+        line.strip()
+        for line in sandbox._JAIL_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;") and line.strip()
+    ]
+    allows = [line for line in lines if line.startswith("(allow file-read")]
+    assert not allows, f"jail.sb re-allows reads after the base: {allows}"
 
 
 def test_the_cotf_env_is_a_verified_denial():
@@ -1429,6 +1728,39 @@ def test_deny_probe_specs_append_a_redirected_env(monkeypatch, tmp_path):
     assert specs == (*sandbox._DENY_PROBES, str(redirected / ".env"))
 
 
+def test_deny_probe_specs_prove_the_brokered_codex_login_is_hidden(
+    monkeypatch, tmp_path
+):
+    """Probed only while the broker holds it; otherwise the jail grants the
+    file on purpose and a probe would fail the startup self-test."""
+    from claude_on_the_fly import codex_auth
+
+    codex = tmp_path / "codex"
+    monkeypatch.setattr(sandbox, "_codex_operator_home", lambda: codex)
+    for data in (Path.home() / ".claude-on-the-fly", tmp_path / "other-data"):
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+        assert str(codex / "auth.json") not in sandbox._deny_probe_specs()
+        monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_s/t/chatgpt")
+        assert sandbox._deny_probe_specs()[-1] == str(codex / "auth.json")
+
+
+def test_jail_argv_passes_an_unused_codex_login_path_by_default(tmp_path, monkeypatch):
+    """jail.sb references `_CODEX_AUTH` unconditionally, so it is always passed,
+    and names nothing real unless the broker holds the login."""
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    argv = sandbox.wrap(["true"], tmp_path)
+    assert "_CODEX_AUTH=/.cotf-unused-codex-auth" in argv
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_s/t/chatgpt")
+    argv = sandbox.wrap(["true"], tmp_path)
+    assert f"_CODEX_AUTH={sandbox._codex_operator_home() / 'auth.json'}" in argv
+
+
 @pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
 def test_the_codex_directory_is_deny_default_not_a_denylist(profile):
     """~/.codex must stay partly writable or codex will not start, but it also holds
@@ -1446,20 +1778,62 @@ def test_the_codex_directory_is_deny_default_not_a_denylist(profile):
     live counterpart is below.
     """
     text = profile.read_text()
-    assert (
-        '(deny file-write* (subpath (string-append (param "_HOME") "/.codex")))' in text
-    ), "the ~/.codex write policy is no longer deny-default"
+    assert '(deny file-write* (subpath (param "_CODEX_OPERATOR_HOME")))' in text, (
+        "the ~/.codex write policy is no longer deny-default"
+    )
     granted = set(
         re.findall(
             r"\(allow file-write\*\s*\n?\s*\((?:subpath|literal) "
-            r'\(string-append \(param "_HOME"\) "([^"]+)"',
+            r'\(string-append \(param "_CODEX_OPERATOR_HOME"\) "([^"]+)"',
             text,
         )
     )
     for path in _CODEX_MUST_WRITE:
         assert path in granted, f"{path} is not granted; codex cannot run without it"
     # The re-grants must not reach back up to the whole directory.
-    assert "/.codex" not in granted, "the blanket ~/.codex grant is back"
+    # A bare re-grant of the home itself would take the whole tree back.
+    assert '(allow file-write* (subpath (param "_CODEX_OPERATOR_HOME")))' not in text, (
+        "the blanket ~/.codex grant is back"
+    )
+
+
+def _grant_covers(kind: str, granted: str, target: str) -> bool:
+    """True if an `allow file-write*` rule for `granted` also permits `target`.
+
+    Seatbelt is last-match-wins, so a re-grant written after the blanket ~/.codex
+    deny takes back everything it covers. `subpath` covers the directory and
+    everything below it; `literal` covers exactly one path. Compared on whole
+    segments, or `plugins/cacher` would read as covered by `plugins/cache`.
+    """
+    if kind == "literal":
+        return granted == target
+    return target == granted or target.startswith(granted + "/")
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_no_regrant_reaches_a_codex_execution_control_path(profile):
+    """The other half of the deny-default contract, and the half CI can check.
+
+    Its sibling above proves the paths codex needs are granted back. Nothing proved
+    the re-grants stop there, and widening one is the natural way this breaks: a
+    plugin write fails, somebody moves the `plugins/cache` grant up to `plugins`,
+    and `plugins/manifest.toml` becomes writable again. The live test below would
+    catch it, but only on a machine that has a real ~/.codex, so on CI the
+    _CODEX_MUST_NOT_WRITE list asserted nothing at all.
+    """
+    grants = re.findall(
+        r"\(allow file-write\*\s*\n?\s*\((subpath|literal) "
+        r'\(string-append \(param "_HOME"\) "([^"]+)"',
+        profile.read_text(),
+    )
+    for target in _CODEX_MUST_NOT_WRITE:
+        full = f"/.codex/{target}"
+        covering = [
+            f"{kind} {granted}"
+            for kind, granted in grants
+            if _grant_covers(kind, granted, full)
+        ]
+        assert not covering, f"{full} is writable again via {covering}"
 
 
 @pytest.mark.parametrize("target", _CODEX_MUST_NOT_WRITE)
@@ -1476,21 +1850,31 @@ def test_codex_execution_control_paths_are_unwritable_in_the_jail(
     Appends zero bytes so an existing file cannot be altered even if a deny had stopped
     working, and for the paths that do not exist the only possible damage is a stray
     empty file that codex's own parsers would reject rather than act on.
+
+    A target one directory down (`rules/`, `plugins/`) only gets that treatment on a
+    machine where codex has already made the directory. Where it has not, an append
+    dies of ENOENT in the shell before the kernel is ever asked, which passes the
+    returncode check for the wrong reason. So probe the missing directory instead:
+    refusing to let codex invent a `rules/` is the same protection, and its own parent
+    `~/.codex` does exist, so a refusal there is the deny talking.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     if not (original_home / ".codex").is_dir():
         pytest.skip("no real ~/.codex on this machine to probe")
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     path = original_home / ".codex" / target
-    existed = path.exists()
+    if path.parent.is_dir():
+        probed, command = path, f"printf '' >> {path}"
+    else:
+        probed, command = path.parent, f"mkdir {path.parent}"
+    existed = probed.exists()
 
-    done = _run_jailed(["/bin/sh", "-c", f"printf '' >> {path}"], tmp_path)
+    done = _run_jailed(["/bin/sh", "-c", command], tmp_path)
 
-    assert done.returncode != 0, f"{target} was writable inside the jail"
+    assert done.returncode != 0, f"{probed} was writable inside the jail"
     assert "not permitted" in done.stderr.lower(), done.stderr
-    assert path.exists() == existed, f"the probe changed {target} on disk"
+    assert probed.exists() == existed, f"the probe changed {probed} on disk"
 
 
 def test_codex_can_still_write_what_a_real_turn_needs(
@@ -1505,8 +1889,7 @@ def test_codex_can_still_write_what_a_real_turn_needs(
     with CODEX_HOME redirected wrote its rollout under that directory, so the
     redirect is the mechanism and not an assumption.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     from claude_on_the_fly import codex_state
 
     monkeypatch.setenv("COTF_SANDBOX", "jail")
@@ -1609,6 +1992,65 @@ def test_linux_grants_hide_the_data_dir_and_keep_memory(tmp_path):
     # memory/ is re-granted deeper than the opaque data dir, so the sibling .env
     # and logs/ stay hidden while the agent's memory stays writable.
     assert Path(os.path.realpath(agent.MEMORY_DIR)) in grants["read_write"]
+
+
+def test_a_symlinked_memory_dir_is_recreated_in_the_jail(linux, monkeypatch, tmp_path):
+    """memory/ is granted at its real path, and the data dir around it is opaque.
+    An operator who links memory/ into a repo then had no memory/ inside the jail
+    at the path the agent is told, and 524 of maoao's recorded writes used it."""
+    target = tmp_path / "soul" / "memory"
+    target.mkdir(parents=True)
+    link = tmp_path / "data" / "memory"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    monkeypatch.setattr(agent, "MEMORY_DIR", link)
+    out = sandbox.wrap(["true"], tmp_path / "ws")
+    at = [
+        i for i, arg in enumerate(out) if arg == "--symlink" and out[i + 2] == str(link)
+    ]
+    assert at, "the memory link was not recreated"
+    assert out[at[0] + 1] == str(target)
+
+
+class TestClaudeConfigLinks:
+    """A link out of the claude config dir dangles inside the jail unless its
+    target is mounted. `~/.claude/skills -> ~/<repo>/skills` loaded no skill."""
+
+    def _config(self, monkeypatch, tmp_path):
+        config = tmp_path / "claude"
+        (config / "skills").mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        return config
+
+    def test_a_linked_entry_is_granted_read_only(self, monkeypatch, tmp_path):
+        config = self._config(monkeypatch, tmp_path)
+        (config / "skills").rmdir()
+        target = tmp_path / "soul" / "skills"
+        target.mkdir(parents=True)
+        (config / "skills").symlink_to(target)
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert Path(os.path.realpath(target)) in grants["read_only"]
+
+    def test_a_linked_child_of_skills_is_granted(self, monkeypatch, tmp_path):
+        config = self._config(monkeypatch, tmp_path)
+        target = tmp_path / "shared" / "one-skill"
+        target.mkdir(parents=True)
+        (config / "skills" / "one-skill").symlink_to(target)
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert Path(os.path.realpath(target)) in grants["read_only"]
+
+    def test_a_link_into_a_credential_store_is_not_followed(
+        self, monkeypatch, tmp_path
+    ):
+        config = self._config(monkeypatch, tmp_path)
+        store = Path(os.path.realpath(Path.home())) / ".aws"
+        (config / "aws").symlink_to(store)
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert not any(Path(p).is_relative_to(store) for p in grants["read_only"])
+
+    def test_a_plain_entry_adds_nothing(self, monkeypatch, tmp_path):
+        self._config(monkeypatch, tmp_path)
+        assert sandbox._claude_link_targets() == []
 
 
 def test_linux_grants_protect_what_codex_executes_or_is_told(tmp_path):
@@ -1877,6 +2319,82 @@ def test_guidance_network_line_is_accurate_on_linux(monkeypatch, tmp_path):
     assert "external hosts are blocked" not in text
 
 
+def test_guidance_says_a_masked_credential_refuses_on_linux(monkeypatch, tmp_path):
+    """A mask is a mode-000 mount, so reading one fails with EACCES. The guidance
+    used to call every EACCES a genuine permission problem, which sent the agent
+    to fix file modes on a `.env` the jail refuses on purpose. Measured on a
+    deployed host: `cat .../.env: Permission denied`."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    text = sandbox.agent_guidance(tmp_path)
+    assert '"Permission denied" (EACCES) on a masked credential' in text
+    assert "`.env`" in text and ".credentials.json" in text
+
+
+def test_guidance_write_scope_names_the_operator_write_grants(monkeypatch, tmp_path):
+    """The read list came from the real grants; the write line was a fixed
+    sentence, so an agent granted `sandbox.write_paths` was told writing there
+    fails."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(notes))
+    for platform in ("linux", "darwin"):
+        monkeypatch.setattr(sandbox, "_platform", lambda platform=platform: platform)
+        writing = next(
+            line
+            for line in sandbox.agent_guidance(tmp_path / "ws").splitlines()
+            if line.startswith("- Writing:")
+        )
+        assert str(notes.resolve()) in writing, platform
+
+
+def test_guidance_write_remedy_names_the_setting(monkeypatch, tmp_path):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    text = sandbox.agent_guidance(tmp_path)
+    assert "adds the path to `sandbox.write_paths`" in text
+    assert "write profile" not in text
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize(
+    ("egress", "present", "absent"),
+    [
+        (
+            "gated",
+            [
+                "operator is asked",
+                "refused at once",
+                "egress.private_allow",
+                "`egress.allow` when no one can approve it",
+            ],
+            ["no internet"],
+        ),
+        (
+            "open",
+            ["any public host", "egress.private_allow"],
+            ["operator is asked"],
+        ),
+        ("off", ["no internet"], ["operator is asked", "any public host"]),
+    ],
+)
+def test_guidance_network_follows_the_egress_mode(
+    monkeypatch, tmp_path, platform, egress, present, absent
+):
+    """The network lines used to describe `gated` whatever `sandbox.egress` said:
+    under `open` the agent was told an unknown host waits for approval, and
+    under `off` nothing said there is no internet at all."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_EGRESS", egress)
+    monkeypatch.delenv("COTF_SANDBOX_BROKER_ONLY_LOOPBACK", raising=False)
+    monkeypatch.setattr(sandbox, "_platform", lambda: platform)
+    text = sandbox.agent_guidance(tmp_path)
+    for phrase in present:
+        assert phrase in text, phrase
+    for phrase in absent:
+        assert phrase not in text, phrase
+
+
 def test_inert_linux_settings_are_announced(monkeypatch, caplog):
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
@@ -1916,6 +2434,75 @@ def test_runtime_read_paths_cover_the_binary_and_its_interpreter(monkeypatch, tm
     assert len(paths) == len({str(p) for p in paths}), "duplicates waste fixed slots"
 
 
+def _uv_style_interpreter(root: Path) -> tuple[Path, Path, Path]:
+    """A venv python behind uv's minor-version link: (venv python, link, install)."""
+    install = root / "uv" / "python" / "cpython-3.13.13-linux"
+    (install / "bin").mkdir(parents=True)
+    (install / "bin" / "python3.13").write_text("")
+    link = root / "uv" / "python" / "cpython-3.13-linux"
+    link.symlink_to(install)
+    venv_python = root / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(link / "bin" / "python3.13")
+    return venv_python, link, install
+
+
+def test_runtime_read_paths_recreate_the_interpreter_link(monkeypatch, tmp_path):
+    """A uv venv's python points through `cpython-3.X-*`, a symlink to the patch
+    directory. The jail's $HOME is a tmpfs, so a link nobody granted does not
+    exist inside it, and exec failed on a path that looked granted. Measured on
+    Linux: "bwrap: execvp .venv/bin/python: No such file or directory", which
+    failed the preflight and every shim."""
+    venv_python, link, install = _uv_style_interpreter(tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(sys, "prefix", str(venv_python.parent.parent))
+    monkeypatch.setattr(sys, "base_prefix", str(install))
+    assert link in sandbox._runtime_read_paths([])
+
+
+def test_the_linux_jail_recreates_the_interpreter_link(monkeypatch, tmp_path):
+    """Binding the link is not an option: bwrap refuses a symlink destination,
+    which is why the Linux wrap drops the as-written twin. Dropping it cost the
+    path itself, so it comes back as a link."""
+    venv_python, link, install = _uv_style_interpreter(tmp_path)
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(sys, "prefix", str(venv_python.parent.parent))
+    monkeypatch.setattr(sys, "base_prefix", str(install))
+    out = sandbox.wrap(["true"], tmp_path / "ws")
+    at = out.index("--symlink")
+    assert out[at + 1 : at + 3] == [str(install), str(link)]
+
+
+def test_runtime_read_paths_add_no_link_to_an_ungranted_target(monkeypatch, tmp_path):
+    """Recreating a link must not widen the grant. `/tmp` on macOS is a link to
+    `/private/tmp`, and following it blindly would grant the whole of it."""
+    venv_python, link, _install = _uv_style_interpreter(tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(sys, "prefix", str(venv_python.parent.parent))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "elsewhere"))
+    assert link not in sandbox._runtime_read_paths([])
+
+
+def test_runtime_read_paths_cover_what_ollama_launches(monkeypatch, tmp_path):
+    """`ollama launch claude` execs claude, which `argv[0]` never names. Under
+    the jail the launcher then answered "claude is not installed"."""
+    bins = {}
+    for name in ("ollama", "claude", "codex"):
+        binary = tmp_path / name / "bin" / name
+        binary.parent.mkdir(parents=True)
+        binary.write_text("")
+        bins[name] = binary
+    monkeypatch.setattr(shutil, "which", lambda name: str(bins.get(name, "")) or None)
+    paths = sandbox._runtime_read_paths(["ollama", "launch", "claude"])
+    assert bins["claude"].parent in paths
+    assert bins["codex"].parent in paths
+
+
 def test_runtime_read_paths_tolerate_an_unresolvable_binary(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     assert sandbox._runtime_read_paths([]) == sandbox._runtime_read_paths(["nope"])
@@ -1943,10 +2530,10 @@ def test_allow_reads_does_not_pass_runtime_slots(monkeypatch, tmp_path):
 
 
 def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog):
-    """The jobs daemon spawns without opening a relay, because it runs as its own
-    process and builds no broker. The namespace then reaches nothing on the host.
-    macOS is in the same position for the same reason, so this is not a Linux
-    regression -- but there it merely fails, where here it would look like a hang."""
+    """A spawn with no relay open reaches nothing on the host from inside the
+    namespace. macOS is in the same position for the same reason, so this is not
+    a Linux regression -- but there it merely fails, where here it would look like
+    a hang."""
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -1954,7 +2541,23 @@ def test_jailing_without_a_relay_is_said_out_loud(monkeypatch, tmp_path, caplog)
         sandbox.wrap(["codex", "exec"], tmp_path)
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "no brokered loopback port" in logged
-    assert "jobs daemon" in logged
+    assert "this spawn did not" in logged
+
+
+def test_a_startup_probe_without_a_relay_is_debug_not_warning(monkeypatch, caplog):
+    """The startup probes spawn in the probe workspace with no relay on purpose,
+    eight or more per start. A WARNING each time buries the one a real turn logs."""
+    from claude_on_the_fly.agent import DATA_DIR
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    probe = DATA_DIR / "jail" / "probe"
+    probe.mkdir(parents=True, exist_ok=True)
+    with caplog.at_level("DEBUG", logger="claude_on_the_fly.sandbox"):
+        sandbox.wrap(["/bin/echo", "cotf"], probe)
+    relay = [r for r in caplog.records if "no brokered loopback port" in r.getMessage()]
+    assert [r.levelname for r in relay] == ["DEBUG"]
 
 
 # --- one thread's transcripts must not be another thread's to read ---
@@ -1984,8 +2587,7 @@ def test_the_running_threads_claude_session_dir_is_writable_under_the_jail(
     which both profiles grant wholesale, so a write there would pass for the wrong
     reason. Creates only its own session directory and removes it again.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     monkeypatch.setenv("HOME", str(original_home))
@@ -2024,8 +2626,7 @@ def test_another_threads_claude_session_file_is_unreadable_under_the_jail(
     needs it more: a tmpdir home would make the read succeed via the _TMPDIR grant
     and the assertion would be measuring nothing.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
     monkeypatch.setenv("HOME", str(original_home))
@@ -2083,8 +2684,10 @@ def test_both_profiles_receive_the_session_grant_params(tmp_path):
             claude_project=tmp_path / "projects" / "thread",
             codex_sessions=tmp_path / "codex" / "sessions",
             codex_home=tmp_path / "codex-homes" / "thread",
+            codex_operator_home=tmp_path / "codex",
+            pane_socket=tmp_path / "panes" / "tmux-501" / "default",
             base=base,
-            loopback=("localhost:*",) * 4,
+            loopback=("localhost:*",) * 5,
             extra_paths=[],
         )
         assert f"_CLAUDE_PROJECTS={tmp_path / 'projects'}" in argv
@@ -2200,6 +2803,22 @@ def test_the_spawned_agent_is_told_which_config_dir_the_daemon_resolved(
     env = sandbox.agent_env()
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "elsewhere")
+
+
+def test_a_daemon_without_a_config_dir_does_not_invent_one(monkeypatch):
+    """Naming claude's default directory is not the no-op it reads as. The default
+    *directory* is ~/.claude, but the default settings *file* is ~/.claude.json at
+    home root, and setting the variable moves that file to ~/.claude/.claude.json.
+    On an install that never set the variable those are two different files, and
+    the one the variable selects has no `hasCompletedOnboarding`. A -p turn does
+    not care; a pty turn runs the real TUI, opens the first-run theme picker, and
+    waits for a keypress nobody can send. Measured: claude-pty passed in 4s with
+    the variable absent and timed out at 150s with it set to the default."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    env = sandbox.agent_env()
+    assert env is not None
+    assert "CLAUDE_CONFIG_DIR" not in env
 
 
 def test_linux_grants_hide_other_threads_sessions_and_keep_this_ones(
@@ -2455,6 +3074,287 @@ def test_the_claude_runtime_writes_are_granted_against_the_config_param(profile)
     assert '(deny file-write* (subpath (param "_CLAUDE_CONFIG")))' in text
 
 
+class TestTheJailedAgentGetsClaudesOwnCredential:
+    """claude keeps its OAuth token in the login keychain, which the jail denies.
+
+    The deny cannot be narrowed to one item -- seatbelt matches file paths and every
+    secret lives in one database, so allowing claude's credential allows the ssh
+    passphrases and the broker's own API key with it. The daemon is outside the jail,
+    so it reads that one item and passes the one value. Without this a jailed claude
+    turn fails with "Not logged in" before it makes any network call.
+    """
+
+    CREDENTIAL = json.dumps(
+        {"claudeAiOauth": {"accessToken": "tok-abc", "expiresAt": 9_999_999_999_000}}
+    )
+
+    @pytest.fixture(autouse=True)
+    def _on_macos(self, monkeypatch):
+        """The hand-off is a macOS keychain concept and is skipped everywhere else,
+        so these cases have to name the platform rather than inherit the runner's.
+        Without this the whole class passes on macOS and fails on Linux."""
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+
+    @staticmethod
+    def _keychain(monkeypatch, value):
+        """Stand in for the keychain, raising KeyError the way read_keychain does."""
+        from claude_on_the_fly import broker
+
+        def read(service):
+            if value is None:
+                raise KeyError(service)
+            return value
+
+        monkeypatch.setattr(broker, "read_keychain", read)
+
+    def test_the_token_reaches_a_jailed_turn(self, monkeypatch):
+        self._keychain(monkeypatch, self.CREDENTIAL)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        env = sandbox.agent_env()
+        assert env is not None
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "tok-abc"
+
+    def test_an_unjailed_turn_is_left_alone(self, monkeypatch):
+        """An environment token shadows the CLI's stored credential. A turn that can
+        reach the keychain itself must keep authenticating the way it always did."""
+        self._keychain(monkeypatch, self.CREDENTIAL)
+        monkeypatch.setenv("COTF_SANDBOX", "off")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        token = sandbox.session_env({"COTF_APPROVE_URL": "http://127.0.0.1:1"})
+        try:
+            env = sandbox.agent_env()
+        finally:
+            sandbox.reset_session_env(token)
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    def test_no_keychain_item_is_not_an_error(self, monkeypatch):
+        """A host that never ran the claude CLI. The turn still fails, but with the
+        CLI's own "Not logged in" rather than a daemon traceback."""
+        self._keychain(monkeypatch, None)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        env = sandbox.agent_env()
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    @pytest.mark.parametrize(
+        "value",
+        ["not json at all", json.dumps({"other": 1}), json.dumps({"claudeAiOauth": 7})],
+    )
+    def test_an_unexpected_shape_warns_and_yields_nothing(
+        self, monkeypatch, caplog, value
+    ):
+        """The CLI owns this format and can change it. A shape this does not know
+        must degrade to the old behaviour, and say so, rather than raise."""
+        self._keychain(monkeypatch, value)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level(logging.WARNING):
+            env = sandbox.agent_env()
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+        assert "not the shape" in caplog.text
+
+    def test_an_empty_token_yields_nothing(self, monkeypatch):
+        self._keychain(monkeypatch, json.dumps({"claudeAiOauth": {"accessToken": ""}}))
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        env = sandbox.agent_env()
+        assert env is not None
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    def test_an_expired_token_is_passed_with_a_warning(self, monkeypatch, caplog):
+        """Passed, not withheld: an expired token fails the turn with an auth error
+        naming the cause, where withholding it says "Not logged in" and blames the
+        wrong thing. Nothing here can refresh it -- a refresh rotates the credential
+        the operator's own CLI is using."""
+        self._keychain(
+            monkeypatch,
+            json.dumps({"claudeAiOauth": {"accessToken": "old", "expiresAt": 1000}}),
+        )
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level(logging.WARNING):
+            env = sandbox.agent_env()
+        assert env is not None
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "old"
+        assert "expired" in caplog.text
+
+    def test_the_token_is_never_logged(self, monkeypatch, caplog):
+        """agent_env logs variable names and a dropped count on purpose, because it
+        is the record that a secret did not reach the agent. It must not become the
+        leak itself."""
+        self._keychain(monkeypatch, self.CREDENTIAL)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level(logging.DEBUG):
+            sandbox.agent_env()
+        assert "tok-abc" not in caplog.text
+
+
+def test_deny_most_grants_reads_against_the_resolved_config_dir():
+    """The read grant was written against _HOME/.claude while every write re-grant
+    on the same tree uses _CLAUDE_CONFIG. CLAUDE_CONFIG_DIR can move the tree
+    outside $HOME, where a _HOME-derived rule matches nothing -- so a relocated
+    config directory was invisible and the CLI could not read its own settings."""
+    text = sandbox._DENY_MOST_PROFILE.read_text()
+    live = [ln for ln in text.splitlines() if not ln.strip().startswith(";;")]
+    assert any(
+        '(allow file-read* (subpath (param "_CLAUDE_CONFIG")))' in ln for ln in live
+    )
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_a_relocated_config_dir_is_readable_under_the_jail(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir
+):
+    """Live counterpart. Measured failing under deny-most before the grant:
+    "Operation not permitted" on <config>/settings.json."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    settings_file = config_dir_outside_tmpdir / "settings.json"
+    settings_file.write_text('{"probe": true}\n')
+    done = _run_jailed(["/bin/cat", str(settings_file)], tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "probe" in done.stdout
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_the_relocated_config_grant_keeps_the_denies_below_it(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir, scoped_sessions
+):
+    """What makes the grant a capability rather than a hole. SBPL is last-match-wins
+    and both denies are written after it, so they still win: history.jsonl is every
+    prompt typed in every project, and projects/ is another conversation."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    history = config_dir_outside_tmpdir / "history.jsonl"
+    history.write_text("every prompt ever typed\n")
+    credentials = config_dir_outside_tmpdir / ".credentials.json"
+    credentials.write_text('{"claudeAiOauth": {"refreshToken": "placeholder"}}\n')
+    other = config_dir_outside_tmpdir / "projects" / "another-thread"
+    other.mkdir(parents=True)
+    (other / "x.jsonl").write_text("another conversation\n")
+    for target in (history, credentials, other / "x.jsonl"):
+        done = _run_jailed(["/bin/cat", str(target)], tmp_path)
+        assert done.returncode != 0, f"{target.name} was readable: {done.stdout!r}"
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_pty_startup_lock_is_granted(profile):
+    """claude-pty mkdir's this directory to serialize claude's supervisor boot, and
+    its stale-lock recovery reads a pid file *inside* it. So a denied mkdir is the
+    one failure the script cannot recover from: no directory means no pid to find
+    dead, and it spins until CLAUDE_PTY_LOCK_WAIT_SEC. Measured before the grant:
+    every jailed claude-pty turn burned its whole timeout with an empty pane."""
+    rule = (
+        '(allow file-write* (subpath (string-append (param "_CLAUDE_CONFIG") '
+        '"/.pty-lock")))'
+    )
+    # Live lines only. `rule in text` also matches the rule quoted inside a
+    # comment, so the first version of this test passed against a grant that had
+    # been commented out -- caught by running it that way.
+    live = [
+        line
+        for line in profile.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    assert any(rule in line for line in live)
+
+
+@pytest.fixture
+def config_dir_outside_tmpdir(original_home, monkeypatch):
+    """A claude config directory the profile does not already grant.
+
+    Not pytest's tmp_path, and not the suite's redirected HOME either: both sit
+    under TMPDIR, which the profile grants wholesale, so a write in them succeeds
+    whatever the claude rules say. The first two versions of the test below passed
+    for exactly that reason and proved nothing.
+
+    Under the developer's real home instead, where the deny-default posture holds,
+    so the only thing that can make a write succeed is the rule under test. A
+    fresh name rather than the real ~/.claude, because taking that lock for real
+    would collide with a claude-pty the operator is running right now.
+    """
+    # HOME too, not just the path: the suite redirects HOME into a tmpdir, so
+    # _HOME would name the fake home and `deny file-read* (subpath _HOME)` would
+    # leave the real one wide open under the global read allow. A test written
+    # without this passed with the grant it was testing deleted.
+    monkeypatch.setenv("HOME", str(original_home))
+    config = original_home / f"cotf-test-claude-config-{os.getpid()}"
+    config.mkdir(parents=True)
+    yield config
+    shutil.rmtree(config, ignore_errors=True)
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_pty_startup_lock_can_be_taken_under_the_jail(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir
+):
+    """The live counterpart, and the one that actually failed. A structural check
+    cannot catch this: the profile loads either way and macOS reports no denial, so
+    the symptom was a turn that hung rather than an error anyone could read.
+
+    Takes the lock the way claude-pty does, mkdir plus a pid file, because the
+    mkdir is the step that was denied and the pid file is what its stale-lock
+    recovery goes looking for afterwards."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    lock = config_dir_outside_tmpdir / ".pty-lock"
+    done = _run_jailed(
+        ["/bin/sh", "-c", f"mkdir {lock} && echo $$ > {lock}/pid && cat {lock}/pid"],
+        tmp_path,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip().isdigit()
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+def test_the_pty_lock_grant_did_not_reopen_the_config_directory(
+    monkeypatch, tmp_path, fs_base, config_dir_outside_tmpdir
+):
+    """The grant is a subpath, so what makes it safe is that its siblings stay
+    denied. settings.json and hooks/ decide what the agent executes and is told,
+    and they sit one level up from the directory just opened."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    for sibling in ("settings.json", "hooks/on-stop.sh"):
+        target = config_dir_outside_tmpdir / sibling
+        done = _run_jailed(
+            ["/bin/sh", "-c", f"mkdir -p {target.parent} && echo pwned > {target}"],
+            tmp_path,
+        )
+        assert done.returncode != 0, f"{sibling} became writable: {done.stdout}"
+        assert not target.exists()
+
+
+def test_the_pty_lock_wait_is_capped_below_a_turn(monkeypatch):
+    """claude-pty's own default is 600s, longer than every turn timeout cotf uses,
+    so a lock it cannot take costs the whole turn and explains nothing: cotf's
+    timeout fires while the script is still spinning. Below a turn instead, the
+    script loses on its own terms and names the holder in its own error."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.delenv("CLAUDE_PTY_LOCK_WAIT_SEC", raising=False)
+    env = sandbox.agent_env()
+    assert env is not None
+    assert int(env["CLAUDE_PTY_LOCK_WAIT_SEC"]) < 600
+
+
+def test_an_operator_can_still_raise_the_pty_lock_wait(monkeypatch):
+    """setdefault rather than assignment: the key is a passthrough one, so an
+    operator who set it in the daemon environment has already said what they want.
+    A deployment running many concurrent chats is the case that needs it."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("CLAUDE_PTY_LOCK_WAIT_SEC", "900")
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["CLAUDE_PTY_LOCK_WAIT_SEC"] == "900"
+
+
 def test_the_runtime_write_list_holds_nothing_instruction_bearing():
     """The line that makes the grants safe. Anything here is read on a later
     invocation, so a turn that could write it would leave itself standing orders,
@@ -2474,8 +3374,7 @@ def test_claude_instruction_paths_stay_unwritable_in_the_jail(
     """Live counterpart, against the real home so the deny is why the write fails
     rather than the path being absent. Never creates anything under the real home:
     a successful write is the failure this asserts against."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -2491,8 +3390,7 @@ def test_claude_instruction_dirs_stay_unwritable_in_the_jail(
 ):
     """A turn must not be able to drop a new command, skill, agent or plugin
     manifest, each of which the next invocation would load."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     monkeypatch.setenv("COTF_SANDBOX", "jail")
     monkeypatch.setenv("HOME", str(original_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -2513,8 +3411,7 @@ def test_the_prompt_history_of_other_threads_is_unreadable_in_the_jail(
     """history.jsonl is every prompt typed in every project on the host, so it
     crosses threads the same way projects/ does. Read-only probe against the real
     file, so the deny is the reason it fails."""
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     history = original_home / ".claude" / "history.jsonl"
     if not history.is_file():
         pytest.skip("no real history.jsonl on this machine to probe")
@@ -2735,57 +3632,164 @@ def test_the_runtime_slot_count_covers_every_path_the_wrapper_supplies(tmp_path)
     )
 
 
-def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
+async def test_preflight_refuses_a_symlinked_execution_control_path_on_linux(
     monkeypatch, tmp_path
 ):
     """A mount namespace cannot mount read-only over a symlink: bwrap reports
     "Can't create file at <path>: No such file or directory" and the turn dies,
     which reads like a missing file rather than a layout it refuses. Measured with
     ~/.codex/AGENTS.md symlinked to ~/.claude/CLAUDE.md, which is an ordinary way
-    to keep one set of instructions for both backends."""
+    to keep one set of instructions for both backends.
+
+    Answered from the layout alone, without spawning: on Linux the turn would fail
+    anyway, so it must not pay for a probe first."""
     home = tmp_path / "home"
     (home / ".codex").mkdir(parents=True)
     target = home / "shared-instructions.md"
     target.write_text("be helpful\n")
     (home / ".codex" / "AGENTS.md").symlink_to(target)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
     monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+
+    async def must_not_probe(*_args, **_kwargs):  # pragma: no cover - asserts absence
+        raise AssertionError("Linux answered from the layout; it must not spawn")
+
+    monkeypatch.setattr(sandbox, "_symlink_target_is_writable", must_not_probe)
     with pytest.raises(sandbox.SandboxBoundaryError, match="cannot mount read-only"):
-        sandbox._preflight_protected_symlinks()
+        await sandbox._preflight_protected_symlinks()
 
 
-def test_a_symlinked_execution_control_path_warns_on_macos(
+class TestSymlinkedExecutionControlPathsOnMacos:
+    """Seatbelt matches the resolved path, so a deny written against the link covers
+    the link and not the file behind it.
+
+    Whether that is a hole depends entirely on where the link points, which is why
+    this asks instead of assuming. The first version warned about every symlink,
+    and on a real machine both links pointed into trees the profile already denies
+    for their own reasons -- so it cried wolf on every start, which is how an
+    operator learns to ignore the case that matters.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _on_macos(self, monkeypatch):
+        """The class name is the contract: this branch is seatbelt's. Linux answers
+        from the mount layout without spawning a probe, so these cases have to name
+        the platform rather than inherit the runner's. `sandbox-exec` too: on a
+        host that does not have it, `wrap` refuses before the probe it is here to
+        exercise ever runs."""
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+        real_which = shutil.which
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name: (
+                "/usr/bin/sandbox-exec" if name == "sandbox-exec" else real_which(name)
+            ),
+        )
+
+    @staticmethod
+    def _linked_home(monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        (home / ".codex").mkdir(parents=True)
+        target = home / "shared-instructions.md"
+        target.write_text("be helpful\n")
+        (home / ".codex" / "AGENTS.md").symlink_to(target)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+        return target
+
+    async def test_a_reachable_target_warns_and_names_what_it_resolves_to(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The operator has to fix the target, so the message has to name it. The
+        link alone does not say where the writable file actually is."""
+        self._linked_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(sandbox, "_symlink_target_is_writable", _always(True))
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+            await sandbox._preflight_protected_symlinks()
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert "AGENTS.md" in message
+        assert "shared-instructions.md" in message
+        assert "protects the link and not the file behind it" in message
+
+    async def test_a_covered_target_does_not_warn(self, monkeypatch, tmp_path, caplog):
+        """A link into a tree the profile already denies is not a hole. Measured on
+        a real machine: ~/.codex/AGENTS.md -> ~/.claude/CLAUDE.md is covered by the
+        _CLAUDE_CONFIG write deny, and the old warning fired on it every start."""
+        self._linked_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(sandbox, "_symlink_target_is_writable", _always(False))
+        with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+            await sandbox._preflight_protected_symlinks()
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "covered" in message
+
+    async def test_a_probe_that_cannot_run_is_treated_as_reachable(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """This decides whether to warn, so an unanswerable question warns. A jail
+        too broken to spawn fails on the echo probe straight afterwards anyway."""
+        self._linked_home(monkeypatch, tmp_path)
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("no such binary")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
+            await sandbox._preflight_protected_symlinks()
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert "treating it as reachable" in message
+        assert "protects the link and not the file behind it" in message
+
+
+async def test_no_warning_when_the_protected_paths_are_real(
     monkeypatch, tmp_path, caplog
 ):
-    """Seatbelt matches the resolved path, so a deny written against the link covers
-    the link and not the file behind it: the profile loads, the log says jailed, and
-    the target stays writable. Warned rather than refused, because this is an
-    established layout and refusing would stop a deployment that has been working.
-    """
-    home = tmp_path / "home"
-    (home / ".codex").mkdir(parents=True)
-    target = home / "shared-instructions.md"
-    target.write_text("be helpful\n")
-    (home / ".codex" / "AGENTS.md").symlink_to(target)
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        sandbox._preflight_protected_symlinks()
-    message = "\n".join(r.getMessage() for r in caplog.records)
-    assert "AGENTS.md" in message and "are symlinks" in message
-    assert "protects the link and not the file behind it" in message
-
-
-def test_no_warning_when_the_protected_paths_are_real(monkeypatch, tmp_path, caplog):
     """The common case must stay silent, or the warning becomes noise nobody reads."""
     home = tmp_path / "home"
     (home / ".codex").mkdir(parents=True)
     (home / ".codex" / "AGENTS.md").write_text("be helpful\n")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
-    with caplog.at_level("WARNING", logger="claude_on_the_fly.sandbox"):
-        sandbox._preflight_protected_symlinks()
+    with caplog.at_level("INFO", logger="claude_on_the_fly.sandbox"):
+        await sandbox._preflight_protected_symlinks()
     assert "symlink" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestTheSymlinkTargetProbeIsLive:
+    """The probe itself, against the real jail rather than a stand-in.
+
+    The mocked tests above fix the *policy*; these fix the *question*. A probe that
+    always answered one way would make every one of them pass while telling the
+    operator nothing.
+    """
+
+    async def test_a_target_in_a_granted_tree_reads_as_writable(
+        self, monkeypatch, tmp_path
+    ):
+        _seatbelt_or_skip()
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        target = tmp_path / "reachable.md"
+        target.write_text("standing orders\n")
+        assert await sandbox._symlink_target_is_writable(target, tmp_path) is True
+
+    async def test_a_target_in_a_denied_tree_reads_as_covered(
+        self, monkeypatch, tmp_path, original_home
+    ):
+        """Against the real home, so the deny is why it fails rather than the path
+        being absent. Opens for append and writes nothing, so nothing is modified
+        even on the branch where the answer is "writable"."""
+        _seatbelt_or_skip()
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        target = original_home / ".claude" / "CLAUDE.md"
+        if not target.is_file():
+            pytest.skip("no ~/.claude/CLAUDE.md on this host")
+        before = target.read_bytes()
+        assert await sandbox._symlink_target_is_writable(target, tmp_path) is False
+        assert target.read_bytes() == before
 
 
 # --- the write probe: state/ must not be writable from inside the jail ---
@@ -3012,8 +4016,7 @@ def test_the_shared_codex_tree_stays_write_denied_without_scoped_sessions(
     says nothing about this deny. The probe is a file of its own with a unique name,
     never one of the operator's real files, and it is removed either way.
     """
-    if not shutil.which("sandbox-exec"):
-        pytest.skip("macOS only")
+    _seatbelt_or_skip()
     codex = original_home / ".codex"
     if not codex.is_dir():
         pytest.skip("no real ~/.codex on this machine to probe")
@@ -3100,6 +4103,8 @@ def test_the_cross_thread_session_denies_come_after_the_operator_allows():
         '(deny file-read* (subpath (param "_CODEX_SESSIONS")))',
         '(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") '
         '"/history.jsonl")))',
+        '(deny file-read* (literal (string-append (param "_CLAUDE_CONFIG") '
+        '"/.credentials.json")))',
     ):
         index = _rule_index(profile, deny)
         assert index > last_allow, f"an operator or runtime allow can re-open {deny}"
@@ -3118,3 +4123,1352 @@ def test_the_daemon_state_write_deny_comes_after_the_project_write_allow():
     for suffix in ('"/.claude-on-the-fly/state"', '(param "_DATA_DIR") "/state"'):
         index = _rule_index(profile, "(deny file-write*", suffix)
         assert index > allow, f"the _PROJECT_DIR write allow re-opens state/ ({suffix})"
+
+
+# --- a dotenv inside an operator grant ---
+
+
+def test_the_profile_dotenv_regexes_have_no_end_anchor():
+    """Pinning an unstated behaviour the denies depend on.
+
+    `(.*/)?\\.env` with no `$` matches `.env` and everything starting with it:
+    `.env.local`, `.env.bak`, `.env.sync-conflict-...`. That is the shape a backup
+    or a syncer actually leaves, and the Linux half globs `.env*` to match. Adding
+    an end anchor here would look like tidying and would silently narrow every
+    dotenv deny in both profiles, so it is asserted rather than assumed.
+    """
+    for profile in (sandbox._DENY_MOST_PROFILE, sandbox._BASE_PROFILE):
+        text = profile.read_text()
+        for line in text.splitlines():
+            if "\\\\.env" in line and "deny file-read*" in line:
+                assert '\\\\.env")' in line or '\\\\.env"' in line, line
+                assert "\\\\.env$" not in line, f"end anchor narrows the deny: {line}"
+
+
+def test_deny_most_denies_a_dotenv_inside_an_operator_grant(monkeypatch, tmp_path):
+    """An `sandbox.extra_paths` entry is a subpath allow, so without this the token
+    file beside the files the operator wanted granted comes back readable."""
+    _seatbelt_or_skip()
+    granted = tmp_path / "config-repo"
+    (granted / "skills" / "tool").mkdir(parents=True)
+    secret = granted / "skills" / "tool" / ".env"
+    secret.write_text("TOKEN=xoxp-not-a-real-token")
+    variant = granted / "skills" / "tool" / ".env.local"
+    variant.write_text("TOKEN=xoxp-not-a-real-token")
+    ordinary = granted / "skills" / "tool" / "run.sh"
+    ordinary.write_text("echo hello")
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(granted))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def read(path):
+        argv = sandbox.wrap(["/bin/cat", str(path)], workspace)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+    assert read(secret).returncode != 0, "the dotenv was readable inside the grant"
+    assert read(variant).returncode != 0, ".env.local was readable inside the grant"
+    # The control: the grant itself still works, so the test above is the deny
+    # firing rather than the whole tree being unreachable.
+    assert read(ordinary).returncode == 0, "the operator grant itself did not apply"
+
+
+def test_dotenv_sweep_finds_variants_and_prunes_heavy_directories(tmp_path):
+    (tmp_path / "sub").mkdir()
+    for name in (".env", ".env.local", ".env.sync-conflict-x"):
+        (tmp_path / "sub" / name).write_text("x")
+    (tmp_path / "sub" / "ordinary.txt").write_text("x")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / ".env").write_text("never descended into")
+
+    found = {path.name for path in sandbox._dotenvs_under([tmp_path])}
+    assert found == {".env", ".env.local", ".env.sync-conflict-x"}
+    assert all(".git" not in path.parts for path in sandbox._dotenvs_under([tmp_path]))
+
+
+def test_dotenv_sweep_refuses_a_grant_it_cannot_cover(tmp_path, caplog):
+    """A partial mask list fails open, which is the one direction a deny must never
+    fail. `extra_paths` may drop an entry and carry on because that only ever grants
+    less; this cannot."""
+    (tmp_path / "many").mkdir()
+    for index in range(sandbox._MAX_SWEPT_DOTENVS + 2):
+        (tmp_path / "many" / f".env.{index}").write_text("x")
+    with caplog.at_level(logging.ERROR), pytest.raises(sandbox._SweepTooBroad):
+        sandbox._dotenvs_under([tmp_path])
+    assert "refusing to mask a partial list" in caplog.text
+
+
+def test_deny_most_denies_a_dotenv_behind_a_codex_link(monkeypatch, tmp_path):
+    """The codex link grant is a subpath allow over a tree cotf did not choose, so
+    it needs the same dotenv deny an operator grant gets.
+
+    Measured on a real home before this: granting `~/.agents/skills` for
+    `~/.codex/skills` made `~/.agents/skills/<skill>/.env` -- a live API token --
+    readable to a jailed turn.
+    """
+    _seatbelt_or_skip()
+    home = tmp_path / "home"
+    codex = home / ".codex"
+    codex.mkdir(parents=True)
+    shared = home / ".agents" / "skills"
+    (shared / "tool").mkdir(parents=True)
+    secret = shared / "tool" / ".env"
+    secret.write_text("TOKEN=placeholder")
+    variant = shared / "tool" / ".env.local"
+    variant.write_text("TOKEN=placeholder")
+    ordinary = shared / "tool" / "SKILL.md"
+    ordinary.write_text("# skill")
+    (codex / "skills").symlink_to(shared)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    workspace = home / "ws"
+    workspace.mkdir()
+
+    def read(path):
+        argv = sandbox.wrap(["/bin/cat", str(path)], workspace)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+    assert read(secret).returncode != 0, "the dotenv was readable behind the link"
+    assert read(variant).returncode != 0, ".env.local was readable behind the link"
+    # The control: without it, a denied read proves nothing about the deny.
+    assert read(ordinary).returncode == 0, "the codex link grant itself did not apply"
+
+
+def test_linux_masked_covers_dotenvs_behind_a_codex_link(monkeypatch, tmp_path):
+    """The Linux half of the case above. `_linux_grants` mounts every link target
+    read-only, so a dotenv inside one needs a mask the same way an operator grant
+    does. A mount namespace has no patterns, so the file is named."""
+    home = tmp_path / "home"
+    codex = home / ".codex"
+    codex.mkdir(parents=True)
+    shared = home / ".agents" / "skills"
+    shared.mkdir(parents=True)
+    secret = shared / ".env"
+    secret.write_text("TOKEN=placeholder")
+    (codex / "skills").symlink_to(shared)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    assert secret in sandbox._linux_masked(tmp_path / "data")
+
+
+def test_one_rule_covers_every_read_grant_in_the_profile():
+    """Each grant used to carry its own dotenv deny, which meant a tree nobody
+    thought to name kept its tokens readable -- measured on `~/.claude` and
+    `~/.codex`, both of which get a blanket subpath grant. Pinning that the
+    per-grant rules did not come back, because adding one would read as
+    thoroughness while leaving the gap it replaced."""
+    text = sandbox._DENY_MOST_PROFILE.read_text()
+    denies = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("(deny file-read*") and "\\.env" in line
+    ]
+    assert len(denies) == 1, f"the dotenv deny is meant to be one rule: {denies}"
+    assert "param" not in denies[0], f"a scoped rule covers one tree only: {denies[0]}"
+
+
+def test_linux_masked_covers_dotenvs_under_an_operator_grant(monkeypatch, tmp_path):
+    granted = tmp_path / "config-repo"
+    granted.mkdir()
+    secret = granted / ".env"
+    secret.write_text("TOKEN=xoxp-not-a-real-token")
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(granted))
+    assert secret in sandbox._linux_masked(tmp_path / "data")
+
+
+def test_linux_masked_skips_a_single_file_grant(monkeypatch, tmp_path):
+    """`extra_paths` may name one file, a tool binary say, rather than a tree.
+    There is nothing under it to sweep, and walking it must not stop the sweep of
+    the directory grant listed after it."""
+    tool = tmp_path / "bin" / "tool"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\n")
+    granted = tmp_path / "config-repo"
+    granted.mkdir()
+    secret = granted / ".env"
+    secret.write_text("TOKEN=not-a-real-token")
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", f"{tool}:{granted}")
+
+    masked = sandbox._linux_masked(tmp_path / "data")
+
+    assert secret in masked
+    assert tool not in masked
+
+
+# --- the pane socket is the one unix socket a jailed turn may reach ---
+
+
+def test_the_only_unix_socket_allow_is_cotfs_own_pane_socket():
+    """`(deny network-outbound)` covers unix sockets as well as IP, so a pty turn
+    could not reach cotf's tmux server and silently fell back to `script`. The
+    remedy has to stay a single literal: `(remote unix)` would re-open the docker
+    socket and the ssh-agent, both of which are a jail escape."""
+    lines = [
+        line.strip()
+        for line in sandbox._JAIL_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    socket_allows = [
+        line
+        for line in lines
+        if line.startswith("(allow network-outbound") and "remote ip" not in line
+    ]
+    assert socket_allows == [
+        '(allow network-outbound (literal (param "_PANE_SOCKET")))'
+    ]
+
+
+def test_the_pane_socket_allow_comes_after_the_outbound_deny():
+    """SBPL is last-match-wins, so an allow written above the blanket deny buys
+    nothing. Stated as a test because the deny reads like a header and invites a
+    later rule being tucked in above it."""
+    profile = sandbox._JAIL_PROFILE
+    deny = _rule_index(profile, "(deny network-outbound)")
+    allow = _rule_index(
+        profile, '(allow network-outbound (literal (param "_PANE_SOCKET")))'
+    )
+    assert deny > 0 and allow > deny
+
+
+def test_the_pane_socket_param_names_the_server_tmux_actually_uses(monkeypatch):
+    """A literal allow is only as good as the path in it. The jail resolves symlinks
+    on every other path it names, so this one does too -- a DATA_DIR reached through
+    a symlink would otherwise be granted under a name the kernel never sees."""
+    from claude_on_the_fly import tmux
+
+    assert sandbox._pane_socket() == Path(os.path.realpath(tmux.socket_path()))
+
+
+# --- codex's prompt history is denied the way claude's is ---
+
+
+@pytest.mark.parametrize("profile", [sandbox._BASE_PROFILE, sandbox._DENY_MOST_PROFILE])
+def test_the_codex_history_deny_comes_after_the_codex_read_grant(profile):
+    """history.jsonl is every prompt the operator typed into codex on this host, the
+    same data claude's own history.jsonl holds. The read grant on the codex home is a
+    subpath, so ordering is what makes the file-level deny hold."""
+    if profile is sandbox._DENY_MOST_PROFILE:
+        allow = _rule_index(
+            profile, '(allow file-read* (subpath (param "_CODEX_HOME")))'
+        )
+        assert allow > 0
+    deny = _rule_index(
+        profile,
+        '(deny file-read* (literal (string-append (param "_CODEX_OPERATOR_HOME") '
+        '"/history.jsonl")))',
+    )
+    assert deny > 0
+    if profile is sandbox._DENY_MOST_PROFILE:
+        assert deny > allow
+
+
+def test_the_codex_operator_home_follows_a_relocated_codex_home(monkeypatch, tmp_path):
+    """The profiles used to name `$HOME/.codex` literally in 25 places, so a
+    deployment that moved CODEX_HOME matched none of them: the denies protected a
+    directory codex no longer used, and the reads it did need were refused."""
+    relocated = tmp_path / "elsewhere" / "codex"
+    relocated.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(relocated))
+    assert sandbox._codex_operator_home() == Path(os.path.realpath(relocated))
+
+
+def test_the_operators_codex_prompt_history_is_unreadable_in_the_jail(
+    monkeypatch, tmp_path, original_home
+):
+    """The codex half of the claude history probe. Live read against the real file,
+    so the deny is the reason it fails and not an absent path."""
+    _seatbelt_or_skip()
+    history = original_home / ".codex" / "history.jsonl"
+    if not history.is_file():
+        pytest.skip("no real codex history.jsonl on this machine to probe")
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("HOME", str(original_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    done = _run_jailed(["/bin/cat", str(history)], tmp_path)
+    assert done.returncode != 0, "the operator's codex prompt history was readable"
+    assert "not permitted" in done.stderr.lower(), done.stderr
+
+
+@pytest.fixture
+def codex_home_outside_tmpdir(original_home, monkeypatch):
+    """The codex twin of `config_dir_outside_tmpdir`, and for the same reason: a
+    directory under TMPDIR is granted wholesale, so a probe there proves nothing."""
+    monkeypatch.setenv("HOME", str(original_home))
+    home = original_home / f"cotf-test-codex-home-{os.getpid()}"
+    home.mkdir(parents=True)
+    yield home
+    shutil.rmtree(home, ignore_errors=True)
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_a_relocated_codex_home_is_readable_under_the_jail(
+    monkeypatch, tmp_path, fs_base, codex_home_outside_tmpdir
+):
+    """The profiles named `$HOME/.codex` literally, so a deployment that moved
+    CODEX_HOME matched none of those rules. Under deny-most that left codex unable
+    to read its own config. Measured failing before `_CODEX_OPERATOR_HOME`:
+    "Operation not permitted" on <codex-home>/config.toml."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    config = codex_home_outside_tmpdir / "config.toml"
+    config.write_text("probe = true\n")
+    done = _run_jailed(["/bin/cat", str(config)], tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "probe" in done.stdout
+
+
+@pytest.mark.parametrize("fs_base", ["", "deny-most"])
+async def test_the_relocated_codex_grant_keeps_the_history_deny_below_it(
+    monkeypatch, tmp_path, fs_base, codex_home_outside_tmpdir
+):
+    """What makes that grant a capability rather than a hole: the prompt history
+    moves with CODEX_HOME too, and its deny is written after the read grant."""
+    _seatbelt_or_skip()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_outside_tmpdir))
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", fs_base)
+    history = codex_home_outside_tmpdir / "history.jsonl"
+    history.write_text("every prompt ever typed into codex\n")
+    done = _run_jailed(["/bin/cat", str(history)], tmp_path)
+    assert done.returncode != 0, f"codex prompt history was readable: {done.stdout!r}"
+
+
+# --- the claude-pty startup gate on Linux ---
+
+
+def test_linux_hands_the_pty_startup_lock_to_the_daemon(linux):
+    """claude-pty's lock is a mkdir in the config directory, which the Linux jail
+    mounts read-only. Measured in a container: "mkdir: cannot create directory
+    '/root/.claude/.pty-lock': Read-only file system", then a spin to the wait
+    timeout. So the daemon takes the script's documented escape hatch."""
+    assert sandbox.claude_pty_startup_is_delegated() is True
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["CLAUDE_PTY_NO_LOCK"] == "1"
+
+
+def test_macos_leaves_the_pty_startup_lock_where_it_is(monkeypatch):
+    """The seatbelt profiles grant the lock directory, so the script keeps its own
+    machine-wide lock there. Delegating on macOS too would narrow the guarantee to
+    this daemon's turns for nothing."""
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    assert sandbox.claude_pty_startup_is_delegated() is False
+    env = sandbox.agent_env()
+    assert env is not None
+    assert "CLAUDE_PTY_NO_LOCK" not in env
+
+
+def test_the_gate_is_not_delegated_when_there_is_no_jail(monkeypatch):
+    """Unjailed, the config directory is the operator's own and the mkdir works."""
+    monkeypatch.setenv("COTF_SANDBOX", "off")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    assert sandbox.claude_pty_startup_is_delegated() is False
+
+
+async def test_the_daemon_side_gate_serializes_the_boot_window(monkeypatch):
+    """What replaces the lock has to actually exclude. Released on a timer rather
+    than by the caller, because a turn outlives the race by minutes."""
+    from claude_on_the_fly.backends import claude as claude_backend
+
+    monkeypatch.setattr(claude_backend, "_PTY_STARTUP_WINDOW_SECONDS", 0.05)
+    monkeypatch.setattr(claude_backend, "_PTY_STARTUP_GATE", asyncio.Lock())
+    await claude_backend._hold_pty_startup_gate()
+    assert claude_backend._PTY_STARTUP_GATE.locked()
+    second = asyncio.ensure_future(claude_backend._hold_pty_startup_gate())
+    await asyncio.sleep(0)
+    assert not second.done(), "the second boot was not held back"
+    await asyncio.wait_for(second, timeout=2)
+    assert claude_backend._PTY_STARTUP_GATE.locked()
+    await asyncio.sleep(0.1)
+    assert not claude_backend._PTY_STARTUP_GATE.locked(), "the gate never reopened"
+
+
+# --- the credential hand-off is a macOS concept ---
+
+
+def test_the_keychain_is_never_consulted_off_macos(linux, monkeypatch):
+    """`read_keychain` shells out to `security`, which only macOS has. Without the
+    platform guard the missing binary raises FileNotFoundError out of agent_env and
+    takes down every jailed turn on Linux. Found by running the Linux jail in a
+    container, not by reading the code."""
+    from claude_on_the_fly import broker
+
+    def explode(_service):
+        raise FileNotFoundError(2, "No such file or directory", "security")
+
+    monkeypatch.setattr(broker, "read_keychain", explode)
+    assert sandbox._claude_oauth_token() is None
+    env = sandbox.agent_env()
+    assert env is not None
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+def test_a_keychain_that_cannot_be_read_is_not_fatal(monkeypatch):
+    """Same shape on macOS: an OSError from the `security` call is a missing
+    credential, not a reason to fail the daemon."""
+    from claude_on_the_fly import broker
+
+    monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+    monkeypatch.setattr(
+        broker, "read_keychain", lambda _s: (_ for _ in ()).throw(OSError("nope"))
+    )
+    assert sandbox._claude_oauth_token() is None
+
+
+# --- the claude credential file on Linux ---
+
+
+@pytest.fixture
+def claude_credentials(monkeypatch, tmp_path):
+    """Writes the credential file into a config dir of the test's own."""
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+    def write(content: str) -> Path:
+        path = config / ".credentials.json"
+        path.write_text(content)
+        return path
+
+    return write
+
+
+def test_a_jailed_linux_turn_gets_the_access_token_not_the_file(
+    linux, claude_credentials
+):
+    """The file holds the refresh token too, and the jail used to leave it
+    readable. The daemon reads it outside and hands over the access token only,
+    the way macOS does from the keychain."""
+    claude_credentials(
+        json.dumps(
+            {"claudeAiOauth": {"accessToken": "access-x", "refreshToken": "refresh-x"}}
+        )
+    )
+    env = sandbox.agent_env()
+    assert env is not None
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "access-x"
+    assert "refresh-x" not in json.dumps(env)
+
+
+def test_the_credential_file_is_masked_in_the_linux_jail(
+    linux, claude_credentials, tmp_path
+):
+    credentials = claude_credentials("{}")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    assert credentials in sandbox._linux_grants(workspace)["masked"]
+
+
+def test_an_unjailed_linux_turn_keeps_its_own_credential(
+    monkeypatch, claude_credentials
+):
+    """Under env the CLI still reads and refreshes its own file. An env token
+    would shadow a credential that refreshes with one that expires."""
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "linux")
+    claude_credentials(json.dumps({"claudeAiOauth": {"accessToken": "access-x"}}))
+    assert sandbox._claude_oauth_token() is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "[]",
+        "{}",
+        '{"claudeAiOauth": {}}',
+        '{"claudeAiOauth": {"accessToken": ""}}',
+    ],
+)
+def test_a_malformed_credential_file_is_not_fatal(linux, claude_credentials, content):
+    claude_credentials(content)
+    assert sandbox._claude_oauth_token() is None
+
+
+def test_no_other_platform_has_a_claude_credential_to_hand_over(monkeypatch):
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setattr(sandbox, "_platform", lambda: "win32")
+    assert sandbox._claude_oauth_token() is None
+
+
+def test_no_credential_file_means_no_token(linux, claude_credentials):
+    assert sandbox._claude_oauth_token() is None
+
+
+def test_an_expired_linux_credential_is_passed_with_a_warning(
+    linux, claude_credentials, caplog
+):
+    claude_credentials(
+        json.dumps({"claudeAiOauth": {"accessToken": "access-x", "expiresAt": 1000}})
+    )
+    assert sandbox._claude_oauth_token() == "access-x"
+    assert "expired" in caplog.text
+
+
+# --- runtime read paths are granted as written and as resolved ---
+
+
+def test_a_symlinked_interpreter_prefix_is_granted_by_its_resolved_name(
+    monkeypatch, tmp_path
+):
+    """seatbelt matches the path the kernel arrives at, so a grant naming a symlink
+    covers nothing. uv is the measured case: sys.base_prefix is
+    `.../cpython-3.12-macos-aarch64-none`, a symlink to the same name with the
+    patch version, and the interpreter died on SIGABRT unable to load its own
+    libpython."""
+    import sys as sys_module
+
+    real = tmp_path / "cpython-3.12.9"
+    (real / "lib").mkdir(parents=True)
+    link = tmp_path / "cpython-3.12"
+    link.symlink_to(real)
+    monkeypatch.setattr(sys_module, "base_prefix", str(link))
+    paths = {str(path) for path in sandbox._runtime_read_paths(["/bin/echo"])}
+    assert str(link) in paths, "the name as written is still needed for execvp"
+    assert str(real) in paths, "the resolved name is what the kernel matches"
+
+
+def _live_rules(profile, needle):
+    return [
+        line.strip()
+        for line in profile.read_text().splitlines()
+        if not line.strip().startswith(";;") and needle in line
+    ]
+
+
+def test_every_runtime_slot_gets_both_of_its_rules():
+    """Each slot needs two: the subpath read, and metadata on the directories
+    above it. A slot with only the read is the node failure -- the binary's own
+    directory granted and `lstat '/Users/hoss/.local'` refused on the way to it."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, sandbox_macos._RUNTIME_SLOTS + 1):
+        param = f'(param "_RUNTIME_{index}")'
+        assert f"(allow file-read* (subpath {param}))" in _live_rules(profile, param)
+        assert f"(allow file-read-metadata (path-ancestors {param}))" in _live_rules(
+            profile, param
+        )
+    reads = _live_rules(profile, '(allow file-read* (subpath (param "_RUNTIME_')
+    assert len(reads) == sandbox_macos._RUNTIME_SLOTS, "a slot with no rule is dead"
+
+
+def test_operator_grants_get_ancestor_metadata_too():
+    """`extra_paths` is the remedy an agent is told to ask for when a read is
+    blocked, so it has to actually work. A grant on a deep directory under the
+    opaque home is unreachable without metadata on the path down to it."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, 4):
+        param = f'(param "_EXTRA_{index}")'
+        assert f"(allow file-read-metadata (path-ancestors {param}))" in _live_rules(
+            profile, param
+        )
+
+
+def test_linux_drops_the_symlinked_form_of_a_runtime_path(linux, tmp_path, monkeypatch):
+    """bwrap mounts rather than matches, and refuses a symlink destination
+    outright: "Can't mount on symlink destination /bin", which aborts the whole
+    jail rather than dropping one grant. Merged-usr makes /bin a symlink on most
+    Linux hosts, so this is the normal layout and not an exotic one."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    real = tmp_path / "real-bin"
+    real.mkdir()
+    link = tmp_path / "link-bin"
+    link.symlink_to(real)
+    monkeypatch.setattr(shutil, "which", lambda name: str(link / name))
+    argv = sandbox._linux_wrap(["agent"], workspace)
+    mounted = {
+        argv[index + 1]
+        for index, item in enumerate(argv)
+        if item in ("--ro-bind", "--ro-bind-try")
+    }
+    assert str(link) not in mounted, "bwrap cannot mount on a symlink destination"
+    assert str(real) in mounted, "the resolved twin has to be granted instead"
+
+
+async def test_a_jailed_probe_runs_in_the_workspace_it_was_granted(tmp_path):
+    """`_run_jailed` used to inherit whatever directory the daemon was started
+    from, which `deny-most` grants no more than any other home path. Measured: the
+    egress probe died on `getcwd()` before importing `socket`, because python
+    resolves the empty sys.path entry against the cwd, and the error named neither
+    a path nor a rule -- `PermissionError: [Errno 1] Operation not permitted` out
+    of importlib. Every turn then refused to start."""
+    _seatbelt_or_skip()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    # sandbox._run_jailed, not the synchronous helper in this file: the cwd is
+    # the product's, and only the real one carries it.
+    code, out = await sandbox._run_jailed(["/bin/pwd"], workspace)
+    assert code == 0, out
+    assert out.strip() == os.path.realpath(workspace)
+
+
+def test_runtime_paths_past_the_slot_count_are_reported(caplog, tmp_path):
+    """A dropped grant surfaces as a dead interpreter rather than as a denial, so
+    silence here is the expensive kind. Warn, naming what was dropped."""
+    overflow = [
+        str(tmp_path / f"r{index}") for index in range(sandbox_macos._RUNTIME_SLOTS + 1)
+    ]
+    with caplog.at_level(logging.WARNING):
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=tmp_path,
+            data_dir=tmp_path / "d",
+            project=tmp_path / "p",
+            tmpdir=tmp_path / "t",
+            claude_config=tmp_path / "c",
+            claude_projects=tmp_path / "c/projects",
+            claude_project=tmp_path / "c/projects/x",
+            codex_sessions=tmp_path / "codex/sessions",
+            codex_home=tmp_path / "codex",
+            codex_operator_home=tmp_path / "codex",
+            pane_socket=tmp_path / "panes/tmux-501/default",
+            base=sandbox_macos._DENY_MOST_PROFILE,
+            loopback=("a", "b", "c", "d", "e"),
+            extra_paths=[],
+            runtime_paths=overflow,
+        )
+    assert "runtime paths but only" in caplog.text
+    assert overflow[-1] in caplog.text
+    granted = {arg for arg in argv if arg.startswith("_RUNTIME_")}
+    assert len(granted) == sandbox_macos._RUNTIME_SLOTS
+
+
+# --- what a runtime grant reaches beyond the binary's own directory ---
+
+
+class TestTheLibraryDirBesideABinInstall:
+    """A CLI in `bin/` keeps its code in a sibling, not beside itself."""
+
+    def test_a_bin_install_contributes_its_sibling_lib(self, tmp_path):
+        """Measured before this: codex started and then died with "Cannot read
+        package config .../@openai/codex/package.json: operation not permitted",
+        because node keeps the package under `<prefix>/lib/node_modules`."""
+        prefix = tmp_path / "node" / "20.18.1"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "lib").mkdir()
+        assert sandbox._install_library_dir(prefix / "bin" / "codex") == prefix / "lib"
+
+    def test_a_layout_with_no_sibling_lib_costs_no_slot(self, tmp_path):
+        prefix = tmp_path / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        assert sandbox._install_library_dir(prefix / "bin" / "agent") is None
+
+    def test_a_binary_outside_a_bin_directory_is_left_alone(self, tmp_path):
+        (tmp_path / "lib").mkdir()
+        assert sandbox._install_library_dir(tmp_path / "sbin" / "agent") is None
+
+    def test_it_never_hands_back_the_home_directory(self, original_home, monkeypatch):
+        """`~/bin/agent` would make the prefix `$HOME` itself. Asking for `lib/`
+        rather than the prefix is what makes that structurally impossible, so this
+        pins the property rather than a guard that could be deleted."""
+        monkeypatch.setenv("HOME", str(original_home))
+        answer = sandbox._install_library_dir(original_home / "bin" / "agent")
+        assert answer != original_home
+        assert answer is None or not original_home.is_relative_to(answer)
+
+
+def test_every_codex_link_slot_gets_both_of_its_rules():
+    """Same pair as a runtime slot, for the same reason: the subpath read grants
+    the tree, and the metadata rule grants the walk down to it under an opaque
+    $HOME. A slot with only the read is reachable by name and not by path."""
+    profile = sandbox._DENY_MOST_PROFILE
+    for index in range(1, sandbox_macos._CODEX_LINK_SLOTS + 1):
+        param = f'(param "_CODEX_LINK_{index}")'
+        assert f"(allow file-read* (subpath {param}))" in _live_rules(profile, param)
+        assert f"(allow file-read-metadata (path-ancestors {param}))" in _live_rules(
+            profile, param
+        )
+    reads = _live_rules(profile, '(allow file-read* (subpath (param "_CODEX_LINK_')
+    assert len(reads) == sandbox_macos._CODEX_LINK_SLOTS, "a slot with no rule is dead"
+
+
+def test_the_codex_link_grants_come_before_the_cross_thread_denies():
+    """SBPL is last-match-wins. A grant placed after the session-store denies
+    would reopen every other thread's transcripts whenever a link named an
+    ancestor of them, which is the one thing these grants must not be able to do."""
+    lines = [
+        line.strip()
+        for line in sandbox._DENY_MOST_PROFILE.read_text().splitlines()
+        if not line.strip().startswith(";;")
+    ]
+    grant = next(i for i, line in enumerate(lines) if "_CODEX_LINK_1" in line)
+    deny = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("(deny file-read*") and "_CODEX_SESSIONS" in line
+    )
+    assert grant < deny
+
+
+class TestWhereTheCodexHomeLinksOut:
+    """The codex home's read grant covers the links, never what is behind them.
+
+    Seatbelt matches the path the kernel resolves, so an entry symlinked
+    elsewhere under the opaque $HOME reads as missing while the profile still
+    looks like it granted it. Measured with `~/.codex/agents -> ~/.agents/agents`:
+    codex exited 1 with "Operation not permitted (os error 1)" and named no path,
+    and the kernel logged `deny(1) file-read-data .../.agents/agents`.
+    """
+
+    @pytest.fixture
+    def codex_home(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / ".codex").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+        return home / ".codex"
+
+    def test_a_link_out_of_the_codex_home_is_granted(self, codex_home, tmp_path):
+        shared = tmp_path / "home" / ".agents" / "agents"
+        shared.mkdir(parents=True)
+        (codex_home / "agents").symlink_to(shared)
+        assert sandbox._codex_link_read_paths() == [shared]
+
+    def test_a_link_out_of_the_claude_config_dir_is_granted_too(
+        self, codex_home, tmp_path, monkeypatch
+    ):
+        """The same trap one directory over. Linux mounts these targets read-only
+        already, so `~/.claude/skills -> ~/<repo>/skills` left a macOS turn
+        with no skills while the same layout worked on Linux."""
+        config = tmp_path / "home" / ".claude"
+        (config / "skills").mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        shared = tmp_path / "home" / "soul" / "skills" / "review"
+        shared.mkdir(parents=True)
+        (config / "skills" / "review").symlink_to(shared)
+        assert sandbox._codex_link_read_paths() == [shared]
+
+    def test_an_entry_inside_the_codex_home_costs_no_slot(self, codex_home):
+        """The grant on that home already covers it, and a slot is scarce."""
+        (codex_home / "agents").mkdir()
+        assert sandbox._codex_link_read_paths() == []
+
+    def test_a_link_outside_the_home_costs_no_slot(self, codex_home, tmp_path):
+        """deny-most allows reads globally and carves out $HOME alone, so a
+        target anywhere else is readable without spending anything on it."""
+        outside = tmp_path / "opt" / "agents"
+        outside.mkdir(parents=True)
+        (codex_home / "agents").symlink_to(outside)
+        assert sandbox._codex_link_read_paths() == []
+
+    def test_children_collapse_into_the_root_that_covers_them(
+        self, codex_home, tmp_path
+    ):
+        """`skills/` is merged entry by entry, so every child resolves separately
+        and a real home produced 54 targets. A subpath grant on the parent covers
+        all of them, and eight slots do not survive being spent one per child."""
+        shared = tmp_path / "home" / ".agents" / "skills"
+        (shared / "one").mkdir(parents=True)
+        (shared / "two").mkdir()
+        (codex_home / "skills").symlink_to(shared)
+        assert sandbox._codex_link_read_paths() == [shared]
+
+    def test_a_link_at_the_home_itself_is_refused_and_logged(
+        self, codex_home, tmp_path, caplog
+    ):
+        """An operator who points an entry at `$HOME` would otherwise hand back
+        every read deny-most exists to make, through a rule that looks routine."""
+        (codex_home / "agents").symlink_to(tmp_path / "home")
+        with caplog.at_level(logging.ERROR):
+            assert sandbox._codex_link_read_paths() == []
+        assert "cannot be granted" in caplog.text
+
+    def test_a_link_into_a_credential_store_is_refused(
+        self, codex_home, tmp_path, caplog
+    ):
+        ssh = tmp_path / "home" / ".ssh"
+        ssh.mkdir(parents=True)
+        (codex_home / "agents").symlink_to(ssh)
+        with caplog.at_level(logging.ERROR):
+            assert sandbox._codex_link_read_paths() == []
+        assert ".ssh" in caplog.text
+
+
+class TestTheCodexLinkSlots:
+    def test_the_slots_carry_the_links_under_deny_most(self, tmp_path):
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=str(tmp_path),
+            data_dir=str(tmp_path / "data"),
+            project=str(tmp_path / "ws"),
+            tmpdir=str(tmp_path / "tmp"),
+            claude_config=str(tmp_path / ".claude"),
+            claude_projects=str(tmp_path / "projects"),
+            claude_project=str(tmp_path / "projects" / "one"),
+            codex_sessions=str(tmp_path / "sessions"),
+            codex_home=str(tmp_path / "codex"),
+            codex_operator_home=str(tmp_path / ".codex"),
+            pane_socket=str(tmp_path / "pane"),
+            base=sandbox_macos._DENY_MOST_PROFILE,
+            loopback=("localhost:1",) * 5,
+            extra_paths=[],
+            codex_link_paths=[str(tmp_path / "shared")],
+        )
+        assert f"_CODEX_LINK_1={tmp_path / 'shared'}" in argv
+        # The rest pad to the project dir, which is already granted.
+        assert f"_CODEX_LINK_8={tmp_path / 'ws'}" in argv
+
+    def test_the_other_base_is_passed_none_of_them(self, tmp_path):
+        """fs-allow-reads.sb never names the parameter, and sandbox-exec refuses a
+        profile handed a -D it does not use."""
+        argv = sandbox_macos.jail_argv(
+            ["/bin/echo"],
+            home=str(tmp_path),
+            data_dir=str(tmp_path / "data"),
+            project=str(tmp_path / "ws"),
+            tmpdir=str(tmp_path / "tmp"),
+            claude_config=str(tmp_path / ".claude"),
+            claude_projects=str(tmp_path / "projects"),
+            claude_project=str(tmp_path / "projects" / "one"),
+            codex_sessions=str(tmp_path / "sessions"),
+            codex_home=str(tmp_path / "codex"),
+            codex_operator_home=str(tmp_path / ".codex"),
+            pane_socket=str(tmp_path / "pane"),
+            base=sandbox_macos._BASE_PROFILE,
+            loopback=("localhost:1",) * 5,
+            extra_paths=[],
+            codex_link_paths=[str(tmp_path / "shared")],
+        )
+        assert not [item for item in argv if item.startswith("_CODEX_LINK_")]
+
+    def test_an_overflow_warns_and_names_what_it_dropped(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """Dropping one silently hides an instruction file the operator believes
+        is in force, and codex reports it as missing rather than as denied."""
+        monkeypatch.setattr(sandbox_macos, "_CODEX_LINK_SLOTS", 2)
+        with caplog.at_level(logging.WARNING):
+            argv = sandbox_macos.jail_argv(
+                ["/bin/echo"],
+                home=str(tmp_path),
+                data_dir=str(tmp_path / "data"),
+                project=str(tmp_path / "ws"),
+                tmpdir=str(tmp_path / "tmp"),
+                claude_config=str(tmp_path / ".claude"),
+                claude_projects=str(tmp_path / "projects"),
+                claude_project=str(tmp_path / "projects" / "one"),
+                codex_sessions=str(tmp_path / "sessions"),
+                codex_home=str(tmp_path / "codex"),
+                codex_operator_home=str(tmp_path / ".codex"),
+                pane_socket=str(tmp_path / "pane"),
+                base=sandbox_macos._DENY_MOST_PROFILE,
+                loopback=("localhost:1",) * 5,
+                extra_paths=[],
+                codex_link_paths=["/a", "/b", "/dropped"],
+            )
+        assert "/dropped" in caplog.text
+        assert "/dropped" not in argv
+
+
+class TestCollapsingToTheShortestRoots:
+    def test_a_child_of_a_kept_root_is_dropped(self, tmp_path):
+        parent = tmp_path / "skills"
+        assert sandbox._shortest_roots([parent / "one", parent, parent / "two"]) == [
+            parent
+        ]
+
+    def test_unrelated_roots_all_survive(self, tmp_path):
+        roots = [tmp_path / "a", tmp_path / "b"]
+        assert sorted(sandbox._shortest_roots(roots)) == sorted(roots)
+
+    def test_the_same_path_twice_costs_one_slot(self, tmp_path):
+        assert sandbox._shortest_roots([tmp_path / "a", tmp_path / "a"]) == [
+            tmp_path / "a"
+        ]
+
+
+class TestTheBinariesAWrapperExecs:
+    def test_claude_pty_contributes_claude_and_tmux(self, monkeypatch, tmp_path):
+        """`argv[0]` is the wrapper, a shell script. Under deny-most neither the
+        claude it runs nor the tmux it hosts the turn in was granted, and the
+        script died rc 127 -- which reads as "command not found", not as a jail."""
+        seen: list[str] = []
+
+        def fake_which(name):
+            seen.append(name)
+            return str(tmp_path / "bin" / name)
+
+        (tmp_path / "bin").mkdir()
+        monkeypatch.setattr(shutil, "which", fake_which)
+        sandbox._runtime_read_paths(["/somewhere/bin/claude-pty"])
+        assert "claude" in seen and "tmux" in seen
+
+    def test_a_plain_binary_brings_nothing_extra(self, monkeypatch, tmp_path):
+        seen: list[str] = []
+
+        def fake_which(name):
+            seen.append(name)
+            return str(tmp_path / name)
+
+        monkeypatch.setattr(shutil, "which", fake_which)
+        sandbox._runtime_read_paths(["codex"])
+        assert seen == ["codex"]
+
+
+# --------------------------------------------------------------------------
+# sandbox.write_paths
+# --------------------------------------------------------------------------
+
+
+def test_write_paths_grants_a_plain_directory(monkeypatch):
+    """The setting's actual job: one tree the agent may change."""
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", "/opt/notes:/usr/local/share")
+    assert sandbox._extra_write_paths() == [
+        os.path.realpath("/opt/notes"),
+        os.path.realpath("/usr/local/share"),
+    ]
+
+
+def test_write_paths_are_absent_by_default(monkeypatch):
+    """An operator who never sets it keeps exactly the previous write set, so
+    this cannot widen an existing deployment on upgrade."""
+    monkeypatch.delenv("COTF_SANDBOX_WRITE_PATHS", raising=False)
+    assert sandbox._extra_write_paths() == []
+
+
+@pytest.mark.parametrize("entry", ["~", "~/.ssh", "~/.aws", "~/.netrc"])
+def test_write_paths_refuse_everything_a_read_grant_refuses(monkeypatch, caplog, entry):
+    """A write grant is strictly more dangerous than a read grant, so every
+    refusal on the read side has to hold here. Asserted through the same helper
+    rather than restated, so the two cannot drift apart."""
+    resolved = os.path.expanduser(entry)
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{resolved}:/opt/notes")
+    with caplog.at_level("ERROR"):
+        granted = sandbox._extra_write_paths()
+    assert granted == [os.path.realpath("/opt/notes")]
+    assert resolved in caplog.text
+
+
+@pytest.mark.parametrize("entry", sandbox._WRITE_ESCAPE_PATHS)
+def test_write_paths_refuse_every_escape_path(entry):
+    """These are the paths that turn a contained write into host execution: a
+    shell rc the operator's next login sources, a unit init starts, a name on
+    PATH, a hook an agent runs. None of them is a credential store, so the read
+    check passes them and only this one stops them. Checked both directions, the
+    same way the credential lists are."""
+    resolved = Path(os.path.realpath(Path(entry).expanduser()))
+    assert sandbox._write_path_refusal(resolved) is not None, entry
+    assert sandbox._write_path_refusal(resolved.parent) is not None, entry
+
+
+def test_write_paths_refuse_a_symlink_to_an_escape_path(monkeypatch, caplog, tmp_path):
+    """Resolved before judging, for the same reason the read grant resolves: a
+    link is the ordinary case, and judging the unresolved name is how one gets
+    used to smuggle a grant past the check."""
+    link = tmp_path / "looks-harmless"
+    link.symlink_to(Path.home() / ".claude")
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(link))
+    with caplog.at_level("ERROR"):
+        assert sandbox._extra_write_paths() == []
+    assert str(link) in caplog.text
+
+
+def test_write_paths_are_uncapped_on_linux(monkeypatch):
+    """Same reasoning as the read grant: the cap is a seatbelt artifact."""
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", "/a:/b:/c:/d:/e")
+    assert len(sandbox._extra_write_paths(cap=None)) == 5
+    assert len(sandbox._extra_write_paths()) == sandbox._MAX_EXTRA_PATHS
+
+
+def test_linux_grants_include_the_operator_write_paths(monkeypatch, tmp_path):
+    """The whole point: a granted tree lands in the read-write mount list, which
+    is what bwrap turns into a writable bind."""
+    granted = tmp_path / "soul"
+    granted.mkdir()
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+    grants = sandbox._linux_grants(tmp_path / "ws")
+    assert Path(os.path.realpath(granted)) in grants["read_write"]
+
+
+def test_a_refused_write_path_never_reaches_the_linux_mount_list(
+    monkeypatch, tmp_path, caplog
+):
+    """The refusal has to hold where it matters -- in the mounts -- not only in
+    the helper that computes them."""
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(Path.home() / ".claude"))
+    with caplog.at_level("ERROR"):
+        grants = sandbox._linux_grants(tmp_path / "ws")
+    assert Path(os.path.realpath(Path.home() / ".claude")) not in grants["read_write"]
+
+
+def test_the_dotenv_sweep_follows_a_symlinked_directory(tmp_path):
+    """`--ro-bind / /` exposes a link's target whatever the link is called, so a
+    sweep that stops at the link reports a tree as covered while its token file
+    stays readable. Measured on a real home: `~/.claude/skills` is a symlink to a
+    skills repository, and one skill keeps its token in a `.env` beside itself."""
+    real = tmp_path / "repo" / "skills" / "slacker"
+    real.mkdir(parents=True)
+    (real / ".env").write_text("TOKEN=x\n")
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "skills").symlink_to(tmp_path / "repo" / "skills")
+
+    swept = sandbox._dotenvs_under([config], cap=None)
+
+    # The real name, not the link's: a mask is a bind mount over a path, so
+    # covering the link leaves the same file readable under its real name.
+    assert swept == [Path(os.path.realpath(real / ".env"))]
+
+
+def test_the_dotenv_sweep_survives_a_symlink_loop(tmp_path):
+    """Following links makes a cycle possible, so the visited set has to end the
+    walk rather than the walk ending the spawn."""
+    root = tmp_path / "tree"
+    (root / "inner").mkdir(parents=True)
+    (root / "inner" / ".env").write_text("TOKEN=x\n")
+    (root / "inner" / "back").symlink_to(root)
+
+    swept = sandbox._dotenvs_under([root], cap=None)
+
+    assert swept == [Path(os.path.realpath(root / "inner" / ".env"))]
+
+
+def test_unused_write_slots_do_not_re_open_the_project_write_denies(
+    monkeypatch, tmp_path
+):
+    """The `_WRITE_*` allows sit below the project write denies, so padding an
+    unused slot with `_PROJECT_DIR` -- which is what every other slot pads with --
+    re-opens `.git/hooks`, `.mcp.json` and the shell rc files. That is the
+    `_CODEX_HOME` finding a second time, so the padding value is asserted rather
+    than left to a comment."""
+    monkeypatch.delenv("COTF_SANDBOX_WRITE_PATHS", raising=False)
+    project = tmp_path / "ws"
+    project.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    argv = sandbox_macos.jail_argv(
+        ["/bin/true"],
+        home=tmp_path / "home",
+        data_dir=tmp_path / "data",
+        project=project,
+        tmpdir=tmpdir,
+        claude_config=tmp_path / "home/.claude",
+        claude_projects=tmp_path / "home/.claude/projects",
+        claude_project=tmp_path / "home/.claude/projects/ws",
+        codex_sessions=tmp_path / "home/.codex/sessions",
+        codex_home=tmp_path / "data/codex",
+        codex_operator_home=tmp_path / "home/.codex",
+        pane_socket=tmp_path / "pane.sock",
+        base=sandbox._DENY_MOST_PROFILE,
+        loopback=sandbox_macos._loopback_specs(["1", "2", "3", "4", "5"]),
+        extra_paths=[],
+        write_paths=[],
+    )
+    slots = [arg for arg in argv if arg.startswith("_WRITE_")]
+    assert slots, "the write slots must be passed to the profile"
+    for slot in slots:
+        padded = Path(slot.split("=", 1)[1])
+        assert padded != project, slot
+        # Nor any real directory. The slots also carry a scoped `.env` write deny,
+        # so padding with something writable applies that deny to all of it --
+        # measured with TMPDIR, where creating a `.env` in a workspace under it
+        # was refused.
+        assert not padded.exists(), slot
+
+
+def test_a_write_grant_that_merely_contains_an_escape_path_is_refused(
+    monkeypatch, tmp_path
+):
+    """The bidirectional half of the check. Granting a parent of a shell rc is the
+    same escape as granting the file, written one directory up.
+
+    The escape list is monkeypatched because every real entry's parent is already
+    refused by the read check for a different reason -- `~/.local` contains a
+    credential store, `~/bin`'s parent is the home -- so no real path reaches this
+    branch and the escape it guards would go untested."""
+    escape = tmp_path / "somewhere" / "bin"
+    escape.mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "_WRITE_ESCAPE_PATHS", (str(escape),))
+
+    refusal = sandbox._write_path_refusal(
+        Path(os.path.realpath(tmp_path / "somewhere"))
+    )
+
+    assert refusal is not None
+    assert "contains" in refusal
+
+
+def test_a_write_grant_does_not_re_open_a_masked_dotenv(monkeypatch, tmp_path):
+    """The grant and the mask overlap on purpose: the tree an operator grants is
+    exactly where a skill keeps its token beside itself. The mask is deeper, so it
+    must still win. Measured on a real Linux host before this was asserted -- with
+    the whole tree granted, the token stayed unreadable and unwritable."""
+    granted = tmp_path / "soul"
+    (granted / "skills" / "slacker").mkdir(parents=True)
+    token = granted / "skills" / "slacker" / ".env"
+    token.write_text("TOKEN=x\n")
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+    # Deliberately NOT in extra_paths. The write list is swept on its own, and
+    # asserting through a read grant would pass while a write-only grant leaked.
+    monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
+
+    grants = sandbox._linux_grants(tmp_path / "ws")
+
+    assert Path(os.path.realpath(granted)) in grants["read_write"]
+    assert Path(os.path.realpath(token)) in grants["masked"]
+
+
+class TestWriteGrantProtection:
+    """A write grant keeps what runs outside the jail read-only. git runs the
+    hooks and honours the config of any repo in the grant, and the unjailed cron
+    daemon and broker read the data dir's `cron.yaml` and `config.yaml`, which a
+    deployment can keep as links into the granted tree."""
+
+    @staticmethod
+    def _repo(path: Path) -> Path:
+        (path / ".git" / "hooks").mkdir(parents=True)
+        (path / ".git" / "config").write_text("[core]\n")
+        return Path(os.path.realpath(path))
+
+    def test_a_granted_repo_keeps_its_hooks_and_config(self, monkeypatch, tmp_path):
+        repo = self._repo(tmp_path / "soul")
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(repo))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert repo in grants["read_write"]
+        assert repo / ".git" / "hooks" in grants["write_denied"]
+        assert repo / ".git" / "config" in grants["write_denied"]
+
+    def test_a_repo_one_level_down_is_covered(self, monkeypatch, tmp_path):
+        """A grant can be a folder of repositories rather than one."""
+        repo = self._repo(tmp_path / "projects" / "tool")
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(tmp_path / "projects"))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert repo / ".git" / "hooks" in grants["write_denied"]
+
+    def test_nothing_is_invented_inside_the_operators_tree(self, monkeypatch, tmp_path):
+        """The workspace gets placeholders for absent denies; an operator's own
+        tree must not collect them, so only paths that exist are protected."""
+        plain = tmp_path / "notes"
+        plain.mkdir()
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(plain))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        resolved = Path(os.path.realpath(plain))
+        assert not any(p.is_relative_to(resolved) for p in grants["write_denied"])
+
+    def test_a_linked_cron_file_inside_the_grant_stays_read_only(
+        self, monkeypatch, tmp_path
+    ):
+        soul = tmp_path / "soul"
+        (soul / "config").mkdir(parents=True)
+        schedule = soul / "config" / "cotf-cron.yaml"
+        schedule.write_text("jobs: []\n")
+        settings_file = soul / "config" / "cotf.yaml"
+        settings_file.write_text("sandbox: {}\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        (data / "config.yaml").symlink_to(settings_file)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(soul))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert Path(os.path.realpath(schedule)) in grants["write_denied"]
+        assert Path(os.path.realpath(settings_file)) in grants["write_denied"]
+
+    def test_a_data_dir_file_that_is_not_a_link_adds_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").write_text("jobs: []\n")
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        assert sandbox._data_dir_link_targets() == []
+
+    def test_naming_a_protected_path_allows_it(self, monkeypatch, tmp_path):
+        """Naming the path itself is the operator's consent; the rest of the
+        repo's protection stays."""
+        repo = self._repo(tmp_path / "soul")
+        hooks = repo / ".git" / "hooks"
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{repo}:{hooks}")
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert hooks in grants["read_write"]
+        assert hooks not in grants["write_denied"]
+        assert repo / ".git" / "config" in grants["write_denied"]
+
+    def test_the_directories_above_a_protected_path_cannot_be_renamed(
+        self, monkeypatch, tmp_path
+    ):
+        """A read-only bind moves with its parent. Measured under bwrap: `mv
+        .git moved` succeeded, and a fresh `.git/hooks` would then be the one
+        git runs. A mount point refuses rename with EBUSY, so every directory
+        between the grant and a protected path is bound onto itself."""
+        repo = self._repo(tmp_path / "projects" / "tool")
+        projects = Path(os.path.realpath(tmp_path / "projects"))
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(projects))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert repo in grants["read_write"]
+        assert repo / ".git" in grants["read_write"]
+        assert grants["read_write"].count(repo / ".git") == 1
+
+    def test_a_nested_grant_is_not_bound_twice(self, monkeypatch, tmp_path):
+        repo = self._repo(tmp_path / "projects" / "tool")
+        projects = Path(os.path.realpath(tmp_path / "projects"))
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{projects}:{repo}")
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        assert grants["read_write"].count(repo) == 1
+        assert repo / ".git" in grants["read_write"]
+
+    def test_a_linked_repo_inside_the_grant_is_not_swept(self, monkeypatch, tmp_path):
+        """A link is reached by its own path. Binding through it would mount
+        over wherever it points, which is not inside the grant."""
+        repo = self._repo(tmp_path / "elsewhere")
+        granted = tmp_path / "notes"
+        granted.mkdir()
+        (granted / "tool").symlink_to(repo)
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+        grants = sandbox._linux_grants(tmp_path / "ws")
+        resolved = Path(os.path.realpath(granted))
+        assert not any(p.is_relative_to(resolved) for p in grants["write_denied"])
+
+
+class TestMacosWriteProtection:
+    """The seatbelt half. The profile denies `.git`, `.git/hooks` and
+    `.git/config` under every write slot by pattern, so only the data dir's link
+    targets and the operator's own consent are computed here."""
+
+    def test_a_link_target_inside_a_grant_is_protected(self, monkeypatch, tmp_path):
+        soul = tmp_path / "soul"
+        soul.mkdir()
+        schedule = soul / "cron.yaml"
+        schedule.write_text("jobs: []\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        granted = str(Path(os.path.realpath(soul)))
+        protect, unprotect = sandbox._macos_write_protection([granted])
+        assert protect == [str(Path(os.path.realpath(schedule)))]
+        assert unprotect == []
+
+    def test_a_link_target_outside_every_grant_is_left_alone(
+        self, monkeypatch, tmp_path
+    ):
+        """Outside a grant it is not writable anyway, and the profile denies the
+        target's ancestors too, which is only sound inside a tree the operator
+        handed over."""
+        schedule = tmp_path / "elsewhere" / "cron.yaml"
+        schedule.parent.mkdir()
+        schedule.write_text("jobs: []\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        notes = tmp_path / "notes"
+        notes.mkdir()
+        protect, _ = sandbox._macos_write_protection([str(notes)])
+        assert protect == []
+
+    def test_naming_a_protected_path_re_opens_it(self, monkeypatch, tmp_path):
+        data = tmp_path / "data"
+        data.mkdir()
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        repo = tmp_path / "soul"
+        granted = [str(repo), str(repo / ".git" / "hooks"), str(repo / "notes")]
+        _, unprotect = sandbox._macos_write_protection(granted)
+        assert unprotect == [str(repo / ".git" / "hooks")]
+
+    def test_naming_the_link_target_re_opens_it(self, monkeypatch, tmp_path):
+        soul = tmp_path / "soul"
+        soul.mkdir()
+        schedule = soul / "cron.yaml"
+        schedule.write_text("jobs: []\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "cron.yaml").symlink_to(schedule)
+        monkeypatch.setattr("claude_on_the_fly.agent.DATA_DIR", data)
+        real = str(Path(os.path.realpath(schedule)))
+        granted = [str(Path(os.path.realpath(soul))), real]
+        protect, unprotect = sandbox._macos_write_protection(granted)
+        assert unprotect == [real]
+        # Still passed: its ancestors stay pinned against a rename either way.
+        assert protect == [real]
+
+    def test_the_protection_reaches_the_profile(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sandbox, "_platform", lambda: "darwin")
+        monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+        repo = tmp_path / "soul"
+        (repo / ".git" / "hooks").mkdir(parents=True)
+        hooks = Path(os.path.realpath(repo / ".git" / "hooks"))
+        monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{repo}:{hooks}")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        argv = sandbox.wrap(["/bin/true"], workspace)
+        assert f"_UNPROTECT_1={hooks}" in argv
+
+
+def test_unused_protect_slots_are_inert(tmp_path):
+    """`_UNPROTECT_*` are write allows after every deny in the file, so a pad
+    that exists would be a write grant nobody made."""
+    project = tmp_path / "ws"
+    project.mkdir()
+    argv = sandbox_macos.jail_argv(
+        ["/bin/true"],
+        home=tmp_path / "home",
+        data_dir=tmp_path / "data",
+        project=project,
+        tmpdir=tmp_path,
+        claude_config=tmp_path / "home/.claude",
+        claude_projects=tmp_path / "home/.claude/projects",
+        claude_project=tmp_path / "home/.claude/projects/ws",
+        codex_sessions=tmp_path / "home/.codex/sessions",
+        codex_home=tmp_path / "data/codex",
+        codex_operator_home=tmp_path / "home/.codex",
+        pane_socket=tmp_path / "pane.sock",
+        base=sandbox._DENY_MOST_PROFILE,
+        loopback=sandbox_macos._loopback_specs(["1", "2", "3", "4", "5"]),
+        extra_paths=[],
+        write_paths=[],
+        protect_paths=["/soul/cron.yaml"],
+    )
+    slots = [a for a in argv if a.startswith(("_PROTECT_", "_UNPROTECT_"))]
+    assert "_PROTECT_1=/soul/cron.yaml" in slots
+    assert len(slots) == sandbox_macos._PROTECT_SLOTS + sandbox_macos._MAX_EXTRA_PATHS
+    for slot in slots[1:]:
+        assert not Path(slot.split("=", 1)[1]).exists(), slot
+
+
+def test_a_redirected_claude_config_dir_is_still_an_escape_path(monkeypatch, tmp_path):
+    """`_WRITE_ESCAPE_PATHS` names `~/.claude`, which is where that tree is by
+    default and not where it has to be. The profile write-denies the configured
+    directory, and the `_WRITE_*` allows are written after those denies, so a
+    redirected tree missing from the escape list is a grant that re-opens its own
+    deny."""
+    redirected = tmp_path / "elsewhere" / "claude-config"
+    redirected.mkdir(parents=True)
+    monkeypatch.setattr(
+        "claude_on_the_fly.envfile.claude_config_dir", lambda: redirected
+    )
+
+    refusal = sandbox._write_path_refusal(Path(os.path.realpath(redirected)))
+
+    assert refusal is not None
+    assert "runs outside the sandbox" in refusal
+
+
+def test_the_write_grant_sweep_does_not_follow_a_planted_symlink(monkeypatch, tmp_path):
+    """A write grant is the one swept tree the agent can write, so a link it
+    plants pointing at `/` would make every later spawn walk the whole filesystem
+    before the agent starts, permanently. Not following costs nothing: the target
+    is reached by its own path, and under deny-most `$HOME` is an opaque tmpfs, so
+    a link into it resolves to nothing inside the namespace."""
+    granted = tmp_path / "notes"
+    outside = tmp_path / "outside"
+    granted.mkdir()
+    outside.mkdir()
+    (outside / ".env").write_text("TOKEN=x\n")
+    (granted / "everything").symlink_to(outside)
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(granted))
+    monkeypatch.delenv("COTF_SANDBOX_EXTRA_PATHS", raising=False)
+
+    grants = sandbox._linux_grants(tmp_path / "ws")
+
+    assert Path(os.path.realpath(outside / ".env")) not in grants["masked"]

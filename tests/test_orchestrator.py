@@ -22,13 +22,15 @@ from claude_on_the_fly import turns as turns_mod
 from claude_on_the_fly.agent import ClaudeUnavailableError, Compaction, Response
 from claude_on_the_fly.events import EventLog
 from claude_on_the_fly.orchestrator import (
+    MAX_SUGGESTION_WIDTH,
     SUGGESTIONS_TEMPLATE,
     Orchestrator,
     Turn,
+    _display_width,
     _extract_suggestions,
     _parse_suggestion_block,
 )
-from claude_on_the_fly.protocol import Frontend, interrupted_notice
+from claude_on_the_fly.protocol import Frontend, LegacyWorkspace, interrupted_notice
 from claude_on_the_fly.turns import PendingTurn
 
 # ---------------------------------------------------------------------------
@@ -44,6 +46,7 @@ class StubFrontend(Frontend):
         self.start_notifications: list[int] = []
         self.complete_notifications: list[int] = []
         self.progress: list[tuple[int, str]] = []
+        self.progress_ended: list[tuple[int, bool]] = []
 
     async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
         pass
@@ -66,6 +69,9 @@ class StubFrontend(Frontend):
 
     async def send_progress(self, chat_id: int, text: str) -> None:
         self.progress.append((chat_id, text))
+
+    async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
+        self.progress_ended.append((chat_id, succeeded))
 
     async def stop(self) -> None:
         pass
@@ -114,6 +120,260 @@ def orch(frontend: StubFrontend, event_log: EventLog) -> Orchestrator:
 # ---------------------------------------------------------------------------
 # session_uuid
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The model pin
+# ---------------------------------------------------------------------------
+
+
+class TestModelPin:
+    """`$model` from a frontend down to the run that honours it.
+
+    The grammar itself is tested in `test_model_command.py`. What is tested here
+    is the wiring: that a pin reaches the turn, the compaction and the rows a
+    dashboard reads, that it is per conversation, and that it survives a restart.
+    """
+
+    def test_the_resolved_profile_is_the_configured_one_with_nothing_pinned(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_pins_the_model_for_one_conversation_only(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus"])
+
+        assert orch.current_profile(1).model == "opus"
+        assert orch.current_profile(2).model != "opus"
+
+    def test_pins_the_effort_with_the_model(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+
+        assert orch.current_profile(1).model == "opus"
+        assert orch.current_profile(1).effort == "high"
+
+    def test_a_model_only_command_keeps_the_pinned_effort(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+        orch.on_model(1, ["sonnet"])
+
+        assert orch.current_profile(1).model == "sonnet"
+        assert orch.current_profile(1).effort == "high"
+
+    def test_default_goes_back_to_the_configured_agent(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """Asserted on the store, not only on the resolved profile.
+
+        The first version of this test compared two profiles and nothing else,
+        and it passed on a machine whose configured effort happened to equal the
+        level it pinned (`CLAUDE_EFFORT=high` there). In CI that variable is
+        unset, the leftover effort pin stopped matching the configured value, and
+        the same assertion failed. The empty store is what actually says the
+        conversation is back on config."""
+        orch.on_model(1, ["opus", "high"])
+        orch.on_model(1, ["default"])
+
+        assert json.loads(orch._model_store.read_text()) == {}
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_a_refusal_changes_nothing(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        text = orch.on_model(1, ["sonet"])
+
+        assert "`sonet`" in text
+        assert orch.current_profile(1).model != "sonet"
+
+    def test_a_bare_command_reports_the_state(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+
+        text = orch.on_model(1, [])
+
+        assert "Model: opus" in text
+        assert "Effort: high" in text
+
+    def test_the_report_says_when_a_conversation_is_pinned(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus"])
+
+        assert "(pinned)" in orch.on_model(1, [])
+
+    def test_an_unreadable_configuration_is_reported_not_raised(
+        self, orch: Orchestrator, monkeypatch
+    ) -> None:
+        def explode(profile=None):
+            raise ValueError("AGENT_BACKEND: nope")
+
+        monkeypatch.setattr(agent_mod, "resolve_profile", explode)
+
+        text = orch.on_model(1, ["opus"])
+
+        assert "I cannot read the agent configuration" in text
+        assert "AGENT_BACKEND: nope" in text
+
+    def test_a_pin_survives_a_restart(
+        self, orch: Orchestrator, frontend: StubFrontend, event_log: EventLog
+    ) -> None:
+        orch.on_model(1, ["opus", "high"])
+
+        restarted = Orchestrator(frontend, "test", event_log=event_log)
+
+        assert restarted.current_profile(1).model == "opus"
+        assert restarted.current_profile(1).effort == "high"
+
+    def test_the_store_is_per_frontend(
+        self, orch: Orchestrator, frontend: StubFrontend, event_log: EventLog
+    ) -> None:
+        """Two daemons share a chat id space, so one table would collide."""
+        orch.on_model(1, ["opus"])
+
+        other = Orchestrator(frontend, "somewhere-else", event_log=event_log)
+
+        assert other.current_profile(1).model != "opus"
+
+    def test_clearing_a_pin_leaves_no_entry_behind(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        orch.on_model(1, ["opus"])
+        orch.on_model(1, ["default"])
+
+        assert json.loads(orch._model_store.read_text()) == {}
+
+    def test_the_store_ignores_what_it_cannot_use(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """A hand-edited file must not take down the turn that reads it."""
+        store = orch._model_store
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(
+            json.dumps(
+                {
+                    "not-a-chat-id": {"model": "opus"},
+                    "2": "not-a-mapping",
+                    "3": {"nonsense": "opus"},
+                    "4": {"model": "opus", "nonsense": "x"},
+                }
+            )
+        )
+
+        assert orch.current_profile(4).model == "opus"
+        assert orch.current_profile(2) == agent_mod.resolve_profile()
+        assert orch.current_profile(3) == agent_mod.resolve_profile()
+
+    def test_a_store_that_is_not_a_mapping_is_ignored(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        store = orch._model_store
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("[1, 2, 3]")
+
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_a_store_that_is_not_json_is_ignored(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        store = orch._model_store
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("{ not json")
+
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_the_store_is_read_once_per_process(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """A second read cannot change the answer, so it is not paid for."""
+        orch.on_model(1, ["opus"])
+        orch._model_store.write_text("{}")
+
+        assert orch.current_profile(1).model == "opus"
+
+    def test_a_failed_write_is_logged_and_the_pin_still_applies(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path, caplog
+    ) -> None:
+        """A botched install, not a hypothetical: `state` exists as a file."""
+        (tmp_path / "state").write_text("not a directory")
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.orchestrator"):
+            text = orch.on_model(1, ["opus"])
+
+        assert "Model: opus" in text
+        assert orch.current_profile(1).model == "opus"
+        assert "could not write" in caplog.text
+
+    def test_a_model_change_drops_the_stale_context_reading(
+        self, orch: Orchestrator, operator_settings
+    ) -> None:
+        """The reading describes the model's window, which just changed."""
+        orch._context[1] = (1000, 200_000)
+
+        orch.on_model(1, ["opus"])
+
+        assert 1 not in orch._context
+
+    def test_the_turn_runs_on_the_pinned_profile(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path
+    ) -> None:
+        orch.on_model(1, ["opus"])
+        run = AsyncMock(return_value=Response(body="answer"))
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "run", run),
+        ):
+            asyncio.run(orch._process(1, Turn("question")))
+
+        assert run.await_args.kwargs["profile"].model == "opus"
+
+    def test_the_compaction_runs_on_the_pinned_profile(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path
+    ) -> None:
+        orch.on_model(1, ["opus"])
+        compact = AsyncMock(return_value=None)
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "compact", compact),
+        ):
+            asyncio.run(orch._process(1, Turn("", compact=True)))
+
+        assert compact.await_args.kwargs["profile"].model == "opus"
+
+    def test_the_event_row_names_the_pinned_agent(
+        self, orch: Orchestrator, operator_settings, tmp_path: Path
+    ) -> None:
+        orch.on_model(1, ["opus"])
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(
+                agent_mod, "run", AsyncMock(return_value=Response(body="answer"))
+            ),
+        ):
+            asyncio.run(orch._process(1, Turn("question")))
+
+        assert orch._event_log.tail(10)[-1]["backend"].endswith(":opus")
+
+    def test_the_heartbeat_row_names_the_pinned_agent(self, orch: Orchestrator) -> None:
+        orch._in_flight[1] = {
+            "identifier": "test/1",
+            "label": "a thread",
+            "started_at_monotonic": time.monotonic(),
+            "session_uuid": "u",
+            "backend": "claude:native:opus",
+        }
+
+        row = orch.heartbeat_extra()["running_jobs"][0]
+
+        assert row["backend"] == "claude:native:opus"
 
 
 class TestSessionUUID:
@@ -313,6 +573,22 @@ class TestDrain:
 
 
 class TestProcess:
+    async def test_a_host_without_tmux_says_why_the_turn_is_unmirrored(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """The one cause of "the live view shows a transcript" that an operator
+        can actually fix, so it is INFO rather than a silent skip."""
+        monkeypatch.setattr(orchestrator_mod.tmux, "available", lambda: False)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"),
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        assert "runs unmirrored" in caplog.text
+
     async def test_creates_workspace_and_calls_agent(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
@@ -336,6 +612,10 @@ class TestProcess:
             channel_context="dm",
             timeout=None,
             nudge_prompt=None,
+            # The turn runs on the resolved profile, not on a fresh global read
+            # inside the backend: that is what lets one conversation pin a model.
+            profile=mock_agent.apply_override.return_value,
+            facts={},
         )
 
         # Response was sent
@@ -396,6 +676,21 @@ class TestProcess:
         assert '<suggestions>["Tell me more about its history"' in SUGGESTIONS_TEMPLATE
         assert "The block is mandatory in every reply" in SUGGESTIONS_TEMPLATE
 
+    def test_template_does_not_demand_a_fixed_option_count(self) -> None:
+        """The template used to ask for "3 short follow-up options", and 96.2%
+        of two weeks of real offers came back with exactly three (audit,
+        2026-08-28). Widening the count is the one change that removes padding
+        without suppressing an offer somebody would have clicked."""
+        assert "1 to 3 short follow-up options" in SUGGESTIONS_TEMPLATE
+        assert "Never invent one to reach a count" in SUGGESTIONS_TEMPLATE
+
+    def test_template_ranks_and_bans_filler(self) -> None:
+        """First position takes 71.5% of clicks, so ordering is worth stating.
+        Monitor and wait labels clicked at 4.0% against 25.9% for
+        authorization, so they are named as filler (audit, 2026-08-28)."""
+        assert "Put the most concrete executable step first" in SUGGESTIONS_TEMPLATE
+        assert '"monitor"' in SUGGESTIONS_TEMPLATE
+
     async def test_malformed_block_yields_no_suggestions(
         self,
         orch: Orchestrator,
@@ -438,7 +733,7 @@ class TestProcess:
         sent = frontend.sent[0][1]
         # Not "Suggestions:" — the labels are dropped below, so naming them
         # would promise buttons that are not there.
-        assert sent.body == "No response"
+        assert sent.body == agent_mod.EMPTY_REPLY_NOTICE
         # A reply that is only buttons is a skipped reply: no body to pair
         # the buttons with, so they are dropped rather than shown blind.
         assert sent.suggestions == []
@@ -486,6 +781,41 @@ class TestProcess:
         command_broker.agent_env.assert_called_once_with(workspace)
         command_broker.revoke_token.assert_called_once_with(f"token:{workspace}")
 
+    async def test_the_relay_bridges_the_turns_model_server(
+        self,
+        orch: Orchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ollama turn names its server before the relay opens. Opened after,
+        the Linux jail has no route to it and the model never starts."""
+        seen: dict = {}
+
+        def model_endpoint_env(profile_mode):
+            seen["mode"] = profile_mode
+            return {"OLLAMA_HOST": "http://127.0.0.1:11434"}
+
+        async def open_session_relay(overrides, key):
+            seen["overrides"] = dict(overrides)
+            return orchestrator_mod.sandbox.SessionRelay(None, None)
+
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "model_endpoint_env", model_endpoint_env
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "open_session_relay", open_session_relay
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+            profile = mock_agent.apply_override.return_value
+
+        assert seen["mode"] is profile.mode
+        assert seen["overrides"]["OLLAMA_HOST"] == "http://127.0.0.1:11434"
+
     async def test_sends_error_on_agent_failure(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
@@ -497,7 +827,38 @@ class TestProcess:
             await orch._process(1, Turn("bad prompt"))
 
         assert len(frontend.sent) == 1
-        assert "Error: boom" in frontend.sent[0][1].body
+        assert frontend.sent[0][1].body == agent_mod.AGENT_FAILURE_NOTICE
+
+    async def test_agent_failure_uses_only_its_safe_public_message(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        failure = agent_mod.AgentTurnError(
+            "private provider detail", "The model service rejected authentication."
+        )
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=failure)
+            await orch._process(1, Turn("bad prompt"))
+
+        assert frontend.sent[0][1].body == failure.public_message
+        assert "private provider detail" not in frontend.sent[0][1].body
+
+    async def test_terminal_capture_is_never_sent_as_an_error_reply(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        capture = "\x1b[31m" + "terminal screen " * 1000
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=RuntimeError(capture))
+            await orch._process(1, Turn("bad prompt"))
+
+        assert len(frontend.sent) == 1
+        assert frontend.sent[0][1].body == agent_mod.AGENT_FAILURE_NOTICE
+        assert "terminal screen" not in frontend.sent[0][1].body
 
     async def test_notifies_complete_on_success(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
@@ -579,8 +940,11 @@ class TestProcess:
 
         orch = Orchestrator(frontend, "slack", event_log=event_log)
         outbox = tmp_path / "workspaces" / "test/1" / "outbox"
-        outbox.mkdir(parents=True)
-        (outbox / "report.csv").write_text("data")
+        session_dir = outbox / orch.session_uuid(1)
+        session_dir.mkdir(parents=True)
+        (session_dir / "report.csv").write_text("data")
+        # Another thread's file in the shared outbox root is not this turn's.
+        (outbox / "theirs.csv").write_text("not mine")
 
         with (
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
@@ -590,8 +954,51 @@ class TestProcess:
 
         sent = frontend.sent[0][1]
         assert [p.name for p in sent.attachments] == ["report.csv"]
-        assert not (outbox / "report.csv").exists()  # archived, not left behind
+        assert not session_dir.exists()  # archived, then retired
         assert list((outbox / ".sent").rglob("report.csv"))
+        assert (outbox / "theirs.csv").is_file()
+
+    async def test_the_frontends_session_facts_reach_the_agent(
+        self, frontend: StubFrontend, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        from claude_on_the_fly import agent
+
+        frontend.session_facts = lambda chat_id: {"thread": "1.2"}  # type: ignore[method-assign]
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        run = AsyncMock(return_value=Response(body="ok"))
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", run),
+        ):
+            await orch._process(1, Turn("hello"))
+        assert run.call_args.kwargs["facts"] == {"thread": "1.2"}
+
+    async def test_the_turn_names_its_own_outbox_and_makes_it(
+        self, frontend: StubFrontend, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        """claude never re-reads the system prompt on a healthy resume, so the
+        path has to ride the turn or a session from before the move delivers
+        into a directory nothing collects."""
+        from claude_on_the_fly import agent
+
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        expected = tmp_path / "workspaces" / "test/1" / "outbox" / orch.session_uuid(1)
+        seen: dict[str, object] = {}
+
+        async def run(workspace, session, prompt, *args, **kwargs):
+            seen["prompt"] = prompt
+            seen["exists"] = expected.is_dir()
+            return Response(body="ok")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent, "run", run),
+        ):
+            await orch._process(1, Turn("hello"))
+
+        assert seen["exists"] is True
+        assert agent.outbox_note(expected) in str(seen["prompt"])
+        assert not expected.exists()  # empty after the turn, so retired
 
     async def test_does_not_archive_when_send_reports_nothing_delivered(
         self, event_log: EventLog, tmp_path: Path
@@ -607,7 +1014,7 @@ class TestProcess:
 
         frontend = UndeliveredFrontend()
         orch = Orchestrator(frontend, "slack", event_log=event_log)
-        outbox = tmp_path / "workspaces" / "test/1" / "outbox"
+        outbox = tmp_path / "workspaces" / "test/1" / "outbox" / orch.session_uuid(1)
         outbox.mkdir(parents=True)
         (outbox / "report.csv").write_text("data")
 
@@ -626,17 +1033,20 @@ class TestProcess:
         from claude_on_the_fly import agent
 
         outbox = tmp_path / "workspaces" / "test/1" / "outbox"
-        outbox.mkdir(parents=True)
-        (outbox / "report.csv").write_text("data")
+        session_dir = outbox / orch.session_uuid(1)
+        session_dir.mkdir(parents=True)
+        (session_dir / "report.csv").write_text("data")
 
+        run = AsyncMock(return_value=Response(body="ok"))
         with (
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
-            patch.object(agent, "run", AsyncMock(return_value=Response(body="ok"))),
+            patch.object(agent, "run", run),
         ):
             await orch._process(1, Turn("hi"))
 
         assert frontend.sent[0][1].attachments == []
-        assert (outbox / "report.csv").exists()  # untouched
+        assert (session_dir / "report.csv").exists()  # untouched
+        assert "<cotf-outbox>" not in run.call_args.args[2]
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +1254,26 @@ class TestShutdown:
         # A finished drain task is not interrupted work; an unstarted queue is.
         assert orch.interrupted_chats() == {4: (False, 1)}
 
+    async def test_a_running_idle_compaction_is_not_interrupted_work(
+        self, orch: Orchestrator
+    ) -> None:
+        """Nobody asked for it and nothing replays it, so a stop must not post
+        "work interrupted" into the quiet chat. A message queued behind it
+        still counts."""
+        gate: asyncio.Future = asyncio.get_event_loop().create_future()
+        running = asyncio.ensure_future(_hang(gate))
+        orch._running[5] = running
+        orch._background.add(5)
+        orch._running[6] = running
+        orch._background.add(6)
+        orch._queues[6] = asyncio.Queue()
+        orch._queues[6].put_nowait(Turn("a"))
+        try:
+            assert orch.interrupted_chats() == {6: (False, 1)}
+        finally:
+            gate.set_result(None)
+            await running
+
 
 # ---------------------------------------------------------------------------
 # Event log emission (cross-frontend audit trail)
@@ -956,6 +1386,9 @@ class TestEventEmission:
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
         ):
             mock_agent.run = AsyncMock(side_effect=hang)
+            # The dashboard row reads the frontend's label, not the workspace
+            # name, so a Slack row can name the channel behind the id.
+            frontend.display_label = lambda chat_id: f"test/{chat_id} #general"
             task = asyncio.create_task(orch._process(9, Turn("hi")))
             # Yield until the orchestrator has registered the in-flight slot.
             for _ in range(20):
@@ -967,6 +1400,7 @@ class TestEventEmission:
             assert len(extra["running_jobs"]) == 1
             job = extra["running_jobs"][0]
             assert job["identifier"] == "test/9"
+            assert job["label"] == "test/9 #general"
             assert job["chat_id"] == 9
             assert "session_uuid" in job
 
@@ -997,6 +1431,11 @@ def _watch_send_ordering(frontend: StubFrontend) -> list[int]:
 
     frontend.send = recording_send  # type: ignore[method-assign]
     return seen
+
+
+def _progress_lines(frontend: StubFrontend) -> list[tuple[int, list[str]]]:
+    """Each progress message without its elapsed-time header line."""
+    return [(chat_id, text.splitlines()[1:]) for chat_id, text in frontend.progress]
 
 
 class SilentFrontend(StubFrontend):
@@ -1066,8 +1505,11 @@ class TestProcessInterim:
         ):
             await orch._process(1, Turn("hi"))
 
-        assert frontend.progress == [(1, "盤點完成")]
+        assert _progress_lines(frontend) == [(1, ["盤點完成"])]
         assert order == [1]
+        # After the reply, and told the turn succeeded, so the frontend removes
+        # the progress message rather than leaving it above the answer.
+        assert frontend.progress_ended == [(1, True)]
 
     async def test_toggle_off_is_identical_to_today(
         self,
@@ -1093,6 +1535,7 @@ class TestProcessInterim:
 
         assert seen == [None]
         assert frontend.progress == []
+        assert frontend.progress_ended == []
         assert frontend.sent == [(1, response)]
         done = event_log.tail(10)[-1]
         assert done["type"] == "worker_done"
@@ -1154,9 +1597,13 @@ class TestProcessInterim:
         ):
             await orch._process(1, Turn("hi"))
 
-        assert frontend.progress == [(1, "halfway"), (1, "and then it broke")]
+        assert _progress_lines(frontend) == [
+            (1, ["halfway"]),
+            (1, ["and then it broke"]),
+        ]
         assert order == [2]
-        assert "Error: boom" in frontend.sent[0][1].body
+        assert frontend.sent[0][1].body == agent_mod.AGENT_FAILURE_NOTICE
+        assert frontend.progress_ended == [(1, False)]
         assert event_log.tail(10)[-1]["type"] == "worker_failed"
 
     async def test_an_unavailable_backend_takes_the_same_flush_path(
@@ -1188,9 +1635,13 @@ class TestProcessInterim:
         ):
             await orch._process(1, Turn("hi"))
 
-        assert frontend.progress == [(1, "halfway"), (1, "and then it broke")]
+        assert _progress_lines(frontend) == [
+            (1, ["halfway"]),
+            (1, ["and then it broke"]),
+        ]
         assert order == [2]
         assert "Claude unavailable" in frontend.sent[0][1].body
+        assert frontend.progress_ended == [(1, False)]
         assert event_log.tail(10)[-1]["reason"] == "unavailable"
 
     async def test_an_aborted_turn_cancels_the_relay_without_awaiting(
@@ -1229,6 +1680,7 @@ class TestProcessInterim:
         assert relay._closed is True
         await asyncio.sleep(0)
         assert relay._task.done()
+        assert frontend.progress_ended == [(1, False)]
 
 
 # ---------------------------------------------------------------------------
@@ -1413,7 +1865,9 @@ class TestRunCompaction:
     async def test_reports_the_numbers_to_the_user(
         self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
     ) -> None:
-        outcome = Compaction(ok=True, pre_tokens=48939, post_tokens=5162, duration=10.8)
+        outcome = Compaction(
+            ok=True, pre_tokens=48939, conversation_tokens_after=5162, duration=10.8
+        )
         with (
             patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
             patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
@@ -1542,6 +1996,476 @@ class TestContextIsForgottenOnSessionChange:
 
         assert orch._context.get(8) == (650_000, 1_000_000)
 
+    def test_a_session_change_drops_the_idle_reading_too(
+        self, orch: Orchestrator
+    ) -> None:
+        """The idle loop would otherwise compact a session with nothing in it."""
+        orch._idle[7] = orchestrator_mod.IdleReading(0.0, 300_000, 1800)
+
+        orch.set_session_token(7, "fresh")
+
+        assert 7 not in orch._idle
+
+
+# ---------------------------------------------------------------------------
+# Idle compaction
+# ---------------------------------------------------------------------------
+
+
+def _events(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _profile(backend: str = "claude", mode: str = "native") -> agent_mod.AgentProfile:
+    return agent_mod.AgentProfile(backend=backend, mode=mode, model="m", effort="")
+
+
+class TestIdleCompactSettings:
+    def test_off_unless_the_toggle_is_on(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT", raising=False)
+        assert orchestrator_mod._idle_compact_enabled() is False
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "maybe")
+        assert orchestrator_mod._idle_compact_enabled() is False
+        monkeypatch.setenv("COTF_IDLE_COMPACT", " On ")
+        assert orchestrator_mod._idle_compact_enabled() is True
+
+    def test_the_threshold_defaults_to_200k(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT_TOKENS", raising=False)
+        assert orchestrator_mod._idle_compact_tokens() == 200_000
+        monkeypatch.setenv("COTF_IDLE_COMPACT_TOKENS", "150000")
+        assert orchestrator_mod._idle_compact_tokens() == 150_000
+
+    def test_the_lead_defaults_to_five_minutes(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT_LEAD_MIN", raising=False)
+        assert orchestrator_mod._idle_compact_lead_min() == 5
+        monkeypatch.setenv("COTF_IDLE_COMPACT_LEAD_MIN", "10")
+        assert orchestrator_mod._idle_compact_lead_min() == 10
+
+    @pytest.mark.parametrize("raw", ["lots", "0", "-5"])
+    def test_a_bad_tuning_value_keeps_the_default_rather_than_switching_off(
+        self, monkeypatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT_TOKENS", raw)
+        assert orchestrator_mod._idle_compact_tokens() == 200_000
+
+    def test_all_three_read_from_config(self, operator_settings) -> None:
+        operator_settings.write_text(
+            "agent:\n  idle_compact: true\n  idle_compact_tokens: 300000\n"
+            "  idle_compact_lead_min: 3\n"
+        )
+        assert orchestrator_mod._idle_compact_enabled() is True
+        assert orchestrator_mod._idle_compact_tokens() == 300_000
+        assert orchestrator_mod._idle_compact_lead_min() == 3
+
+
+class TestCacheTtl:
+    def test_codex_caches_for_thirty_minutes(self) -> None:
+        assert orchestrator_mod._cache_ttl_s(_profile("codex"), {}) == 1800
+
+    def test_claude_defaults_to_five_minutes(self) -> None:
+        assert orchestrator_mod._cache_ttl_s(_profile(), {}) == 300
+
+    def test_claude_takes_the_one_hour_setting_from_the_agent_env(self) -> None:
+        env = {"CLAUDE_CODE_PROMPT_CACHE_TTL": " 1H "}
+        assert orchestrator_mod._cache_ttl_s(_profile(), env) == 3600
+
+    def test_ollama_has_no_window_unless_declared(self) -> None:
+        env = {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+        assert orchestrator_mod._cache_ttl_s(_profile(mode="ollama"), env) is None
+        assert orchestrator_mod._cache_ttl_s(_profile("codex", "ollama"), {}) is None
+
+    def test_ollama_uses_the_declared_lifetime(self) -> None:
+        env = {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+        declared = agent_mod.AgentProfile(
+            backend="codex", mode="ollama", model="m", effort="", ollama_cache_ttl_s=600
+        )
+        assert orchestrator_mod._cache_ttl_s(declared, env) == 600
+
+
+class TestCacheTtlEnv:
+    def test_off_adds_nothing(self, monkeypatch) -> None:
+        monkeypatch.delenv("COTF_IDLE_COMPACT", raising=False)
+        assert orchestrator_mod._cache_ttl_env(_profile()) == {}
+
+    def test_on_gives_claude_the_one_hour_cache(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        monkeypatch.delenv("CLAUDE_CODE_PROMPT_CACHE_TTL", raising=False)
+        env = orchestrator_mod._cache_ttl_env(_profile())
+        assert env == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+        assert orchestrator_mod._cache_ttl_s(_profile(), env) == 3600
+
+    def test_an_operator_value_wins(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        monkeypatch.setenv("CLAUDE_CODE_PROMPT_CACHE_TTL", "5m")
+        env = orchestrator_mod._cache_ttl_env(_profile())
+        assert env == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "5m"}
+
+    def test_codex_and_ollama_are_left_alone(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        assert orchestrator_mod._cache_ttl_env(_profile("codex")) == {}
+        assert orchestrator_mod._cache_ttl_env(_profile(mode="ollama")) == {}
+
+
+class TestIdleReadingIsRecorded:
+    async def _run_turn(
+        self, orch: Orchestrator, tmp_path: Path, response: Response, turn: Turn
+    ) -> None:
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            patch.object(orch, "current_profile", return_value=_profile("codex")),
+        ):
+            mock_agent.run = AsyncMock(return_value=response)
+            mock_agent.compact = AsyncMock(return_value=Compaction(ok=True))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, turn)
+
+    async def test_a_turn_with_a_reading_records_it(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        response = Response(body="hi", context_tokens=250_000, context_window_size=1)
+        before = time.monotonic()
+        await self._run_turn(orch, tmp_path, response, Turn("hi"))
+
+        reading = orch._idle[1]
+        assert reading.context_tokens == 250_000
+        assert reading.cache_ttl_s == 1800
+        assert reading.ended_at >= before
+
+    async def test_a_turn_without_a_reading_leaves_none(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        """A stale reading would outlive the turn that made the cache warm again."""
+        orch._idle[1] = orchestrator_mod.IdleReading(0.0, 300_000, 1800)
+        await self._run_turn(orch, tmp_path, Response(body="hi"), Turn("hi"))
+
+        assert 1 not in orch._idle
+
+    async def test_an_ollama_turn_records_nothing(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        response = Response(body="hi", context_tokens=250_000, context_window_size=1)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            patch.object(orch, "current_profile", return_value=_profile(mode="ollama")),
+        ):
+            mock_agent.run = AsyncMock(return_value=response)
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("hi"))
+
+        assert 1 not in orch._idle
+
+    async def test_a_compaction_consumes_it(
+        self, orch: Orchestrator, tmp_path: Path
+    ) -> None:
+        orch._idle[1] = orchestrator_mod.IdleReading(0.0, 300_000, 1800)
+        response = Response(
+            body="unused", context_tokens=250_000, context_window_size=1
+        )
+        await self._run_turn(orch, tmp_path, response, Turn("", compact=True))
+
+        assert 1 not in orch._idle
+
+
+class TestCompactIdleChats:
+    NOW = 10_000.0
+
+    @pytest.fixture(autouse=True)
+    def enabled(self, monkeypatch) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "1")
+        monkeypatch.delenv("COTF_IDLE_COMPACT_TOKENS", raising=False)
+        monkeypatch.delenv("COTF_IDLE_COMPACT_LEAD_MIN", raising=False)
+
+    @pytest.fixture
+    def queued(self, orch: Orchestrator) -> list[tuple[int, Turn]]:
+        seen: list[tuple[int, Turn]] = []
+
+        async def capture(chat_id: int, turn: Turn) -> None:
+            seen.append((chat_id, turn))
+
+        orch._enqueue = capture  # type: ignore[method-assign]
+        return seen
+
+    def _idle(
+        self, orch: Orchestrator, chat_id: int, idle_s: float, tokens=250_000, ttl=1800
+    ) -> None:
+        orch._idle[chat_id] = orchestrator_mod.IdleReading(
+            self.NOW - idle_s, tokens, ttl
+        )
+
+    async def test_queues_a_silent_compaction_inside_the_window(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == [(1, Turn("", compact=True, background=True))]
+        assert 1 not in orch._idle
+        assert orch._background == {1}
+
+    async def test_queueing_drops_the_context_reading_too(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """A message landing before the pass pops `_context` itself would read
+        the pre-compaction size and queue a second, visible compaction."""
+        self._idle(orch, 1, idle_s=26 * 60)
+        orch._context[1] = (250_000, 1_000_000)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert 1 not in orch._context
+
+    async def test_does_nothing_while_the_toggle_is_off(
+        self, orch: Orchestrator, queued, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("COTF_IDLE_COMPACT", "0")
+        self._idle(orch, 1, idle_s=26 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 in orch._idle
+
+    async def test_waits_until_the_window_opens(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """Too early would compact a conversation somebody is still in."""
+        self._idle(orch, 1, idle_s=20 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 in orch._idle
+
+    async def test_drops_a_reading_whose_cache_already_expired(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=31 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 not in orch._idle
+
+    async def test_leaves_a_small_context_alone(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60, tokens=199_999)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+        assert 1 in orch._idle
+
+    async def test_the_five_minute_claude_cache_has_no_window(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """A lead as long as the cache would compact straight after every turn."""
+        self._idle(orch, 1, idle_s=60, ttl=300)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+
+    async def test_skips_a_chat_with_work_queued(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+        orch._queues[1] = asyncio.Queue()
+        orch._queues[1].put_nowait(Turn("hi"))
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert queued == []
+
+    async def test_skips_a_busy_chat(self, orch: Orchestrator, queued) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+        orch._running[1] = asyncio.create_task(asyncio.sleep(3600))
+        try:
+            await orch.compact_idle_chats(now=self.NOW)
+        finally:
+            orch._running[1].cancel()
+
+        assert queued == []
+
+    async def test_caps_the_run_and_takes_the_nearest_expiry_first(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        self._idle(orch, 1, idle_s=26 * 60)
+        self._idle(orch, 2, idle_s=29 * 60)
+        self._idle(orch, 3, idle_s=28 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert [chat for chat, _turn in queued] == [2, 3]
+        assert 1 in orch._idle
+
+    async def test_a_dropped_compaction_does_not_hold_the_cap(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        """`abort` can drop a queued compaction before `_process` discards it."""
+        orch._background = {8, 9}
+        self._idle(orch, 1, idle_s=26 * 60)
+
+        await orch.compact_idle_chats(now=self.NOW)
+
+        assert [chat for chat, _turn in queued] == [1]
+
+    async def test_reads_the_clock_when_not_given_one(
+        self, orch: Orchestrator, queued
+    ) -> None:
+        orch._idle[1] = orchestrator_mod.IdleReading(
+            time.monotonic() - 26 * 60, 250_000, 1800
+        )
+
+        await orch.compact_idle_chats()
+
+        assert [chat for chat, _turn in queued] == [1]
+
+
+class TestBackgroundCompaction:
+    async def _process(
+        self, orch: Orchestrator, tmp_path: Path, compact: AsyncMock
+    ) -> None:
+        orch._background.add(1)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = compact
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._process(1, Turn("", compact=True, background=True))
+
+    async def test_says_nothing_and_records_the_outcome(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+    ) -> None:
+        outcome = Compaction(
+            ok=True, pre_tokens=250_000, conversation_tokens_after=30_000
+        )
+        with patch.object(orch, "_report_config_restarts") as report:
+            await self._process(orch, tmp_path, AsyncMock(return_value=outcome))
+
+        report.assert_not_called()
+        assert frontend.sent == []
+        assert frontend.start_notifications == []
+        assert frontend.complete_notifications == []
+        assert frontend.typing_sent == []
+        assert orch._background == set()
+        [event] = [
+            e for e in _events(event_log.path) if e["type"] == "session_compacted"
+        ]
+        assert event["source"] == "test"
+        assert event["identifier"] == "test/1"
+        assert event["tokens_before"] == 250_000
+        assert event["conversation_tokens_after"] == 30_000
+        # Nothing measures the whole prompt after, so the field stays absent.
+        assert "tokens_after" not in event
+        assert event["outcome"] == "compacted"
+        assert event["duration_s"] >= 0
+        assert "backend" in event
+
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [(Compaction(ok=False, error="nope"), "failed"), (None, "unsupported")],
+    )
+    async def test_names_a_compaction_that_did_not_happen(
+        self,
+        orch: Orchestrator,
+        event_log: EventLog,
+        tmp_path: Path,
+        outcome,
+        expected: str,
+    ) -> None:
+        await self._process(orch, tmp_path, AsyncMock(return_value=outcome))
+
+        [event] = [
+            e for e in _events(event_log.path) if e["type"] == "session_compacted"
+        ]
+        assert event["outcome"] == expected
+
+    async def test_an_unsupported_compaction_carries_no_counts(
+        self, orch: Orchestrator, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        await self._process(orch, tmp_path, AsyncMock(return_value=None))
+
+        [event] = [
+            e for e in _events(event_log.path) if e["type"] == "session_compacted"
+        ]
+        # The log leaves a None out, so absent reads the same as "no count".
+        assert "tokens_before" not in event
+        assert "conversation_tokens_after" not in event
+
+    @pytest.mark.parametrize(
+        "error", [ClaudeUnavailableError("down"), RuntimeError("boom")]
+    )
+    async def test_a_failure_is_logged_not_posted(
+        self,
+        orch: Orchestrator,
+        frontend: StubFrontend,
+        event_log: EventLog,
+        tmp_path: Path,
+        error: Exception,
+    ) -> None:
+        await self._process(orch, tmp_path, AsyncMock(side_effect=error))
+
+        assert frontend.sent == []
+        assert frontend.complete_notifications == []
+        assert [e["type"] for e in _events(event_log.path)][-1] == "worker_failed"
+        assert orch._background == set()
+
+    async def test_a_message_arriving_meanwhile_waits_behind_it(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        """The hourglass is the only thing the person sees of the compaction."""
+        release = asyncio.Event()
+
+        async def slow_compact(*_args, **_kwargs) -> Compaction:
+            await release.wait()
+            return Compaction(ok=True, pre_tokens=250_000)
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.compact = slow_compact
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            mock_agent.ATTACHMENT_PLATFORMS = ()
+            await orch._enqueue(1, Turn("", compact=True, background=True))
+            await asyncio.sleep(0)
+            await orch.on_message(1, "hi")
+            assert frontend.queued_notifications == [(1, 1)]
+            release.set()
+            await orch._running[1]
+
+        assert [r.body for _chat, r in frontend.sent] == ["answer"]
+        assert frontend.start_notifications == [1]
+
+
+class TestIdleCompactLoop:
+    async def test_ticks_and_survives_a_failed_tick(
+        self, orch: Orchestrator, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(orchestrator_mod, "IDLE_COMPACT_TICK_S", 0)
+        calls: list[int] = []
+
+        async def tick() -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("one bad tick")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(orch, "compact_idle_chats", tick)
+        with pytest.raises(asyncio.CancelledError):
+            await orch.idle_compact_loop()
+
+        assert len(calls) == 2
+
 
 # ---------------------------------------------------------------------------
 # Per-session egress
@@ -1638,9 +2562,8 @@ class TestEgressStartupFailure:
 
         assert orch._in_flight == {}, "in-flight slot leaked"
         assert frontend.complete_notifications == [1], "frontend left thinking"
-        # Reported to the user rather than swallowed: a turn that produced nothing
-        # with no message is indistinguishable from the daemon being asleep.
-        assert "address in use" in frontend.sent[-1][1].body
+        # Reported without forwarding raw exception text to the chat.
+        assert frontend.sent[-1][1].body == agent_mod.AGENT_FAILURE_NOTICE
 
     async def test_the_drain_loop_survives_it(self, frontend: StubFrontend) -> None:
         """The queue must keep draining: one failed turn is not a reason to strand
@@ -1673,6 +2596,29 @@ class TestStartSandbox:
         exactly what they saw before any of this existed."""
         monkeypatch.delenv("COTF_SANDBOX", raising=False)
         assert await orchestrator_mod._start_sandbox(frontend) == (None, None, None)
+
+    async def test_the_codex_login_is_brokered_alone_when_sandboxing_is_off(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        """An operator can broker the ChatGPT login before turning the jail on.
+        Only the credential broker starts, and without the keychain routes."""
+        from claude_on_the_fly import codex_auth
+
+        monkeypatch.delenv("COTF_SANDBOX", raising=False)
+        monkeypatch.setattr(codex_auth, "enabled", lambda: True)
+        seen: dict = {}
+        started = object()
+
+        async def start_default_broker(approvals=None, *, keychain=True):
+            seen["approvals"], seen["keychain"] = approvals, keychain
+            return started
+
+        monkeypatch.setattr(
+            orchestrator_mod.broker, "start_default_broker", start_default_broker
+        )
+        assert await orchestrator_mod._start_sandbox(frontend) == (started, None, None)
+        assert seen["keychain"] is False
+        assert seen["approvals"] is not None
 
     async def test_a_command_broker_that_cannot_start_revokes_the_credentials(
         self, frontend: StubFrontend, monkeypatch, operator_settings
@@ -1734,9 +2680,6 @@ class TestStartSandbox:
         command_broker.start = AsyncMock()
         command_broker.stop = AsyncMock()
         command_broker.shimmed = ["gh"]
-        command_broker.agent_env = lambda: {
-            "COTF_COMMAND_ENDPOINT": "http://127.0.0.1:1"
-        }
         monkeypatch.setattr(
             orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
         )
@@ -1749,13 +2692,105 @@ class TestStartSandbox:
             egress_manager,
             got_commands,
         ) = await orchestrator_mod._start_sandbox(frontend)
+        assert got_broker is credential_broker
+        assert got_commands is command_broker
+        assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
+        command_broker.publish_endpoint.assert_called_once_with()
+
+    async def _start_with(self, frontend, monkeypatch):
+        """Start the sandbox with both brokers stubbed. Returns the triple."""
+        credential_broker = MagicMock()
+        credential_broker.stop = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.broker,
+            "start_default_broker",
+            AsyncMock(return_value=credential_broker),
+        )
+        command_broker = MagicMock()
+        command_broker.start = AsyncMock()
+        command_broker.stop = AsyncMock()
+        command_broker.shimmed = ["gh"]
+        command_broker.agent_env = lambda: {
+            "COTF_COMMAND_ENDPOINT": "http://127.0.0.1:1"
+        }
+        monkeypatch.setattr(
+            orchestrator_mod.commands, "CommandBroker", lambda *_a: command_broker
+        )
+        monkeypatch.setattr(
+            orchestrator_mod.sandbox, "verify_denials", AsyncMock(return_value={})
+        )
+        return await orchestrator_mod._start_sandbox(frontend)
+
+    async def test_egress_off_keeps_the_brokers_and_skips_the_proxy(
+        self, frontend: StubFrontend, monkeypatch, operator_settings, caplog
+    ) -> None:
+        """What it must not do is weaken the part that keeps credentials out of
+        the agent, so the credential broker and the shims are asserted here."""
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "off")
+        with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+            got_broker, egress_manager, got_commands = await self._start_with(
+                frontend, monkeypatch
+            )
         try:
-            assert got_broker is credential_broker
-            assert got_commands is command_broker
-            assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
-            assert os.environ["COTF_COMMAND_ENDPOINT"] == "http://127.0.0.1:1"
+            assert egress_manager is None
+            assert got_broker is not None
+            assert got_commands is not None
+            assert "egress=off" in "\n".join(r.getMessage() for r in caplog.records)
         finally:
             os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_egress_open_builds_a_proxy_that_does_not_ask(
+        self, frontend: StubFrontend, monkeypatch, operator_settings, caplog
+    ) -> None:
+        """The proxy must still be built -- that is what keeps the jail's
+        namespace free of the host's loopback services -- with its question off."""
+        monkeypatch.setenv("COTF_SANDBOX", "env")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "open")
+        with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
+            _, egress_manager, _ = await self._start_with(frontend, monkeypatch)
+        try:
+            assert isinstance(egress_manager, orchestrator_mod.SessionEgress)
+            proxy_env = await egress_manager.env_for(1, "sess")
+            assert "HTTPS_PROXY" in proxy_env
+            assert egress_manager._proxies[1][1]._ask is False
+            assert "egress=open" in "\n".join(r.getMessage() for r in caplog.records)
+            await egress_manager.close_all()
+        finally:
+            os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_the_jail_accepts_every_egress_posture(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """`off` under the jail is broker-only, not broken: the relay still
+        bridges the credential broker. An earlier version refused it outright."""
+        for value, wants_proxy in (("gated", True), ("open", True), ("off", False)):
+            monkeypatch.setenv("COTF_SANDBOX", "jail")
+            monkeypatch.setenv("COTF_SANDBOX_EGRESS", value)
+            _, egress_manager, _ = await self._start_with(frontend, monkeypatch)
+            try:
+                assert (egress_manager is not None) is wants_proxy, value
+                if egress_manager is not None:
+                    await egress_manager.close_all()
+            finally:
+                os.environ.pop("COTF_COMMAND_ENDPOINT", None)
+
+    async def test_a_refused_egress_setting_starts_nothing(
+        self, frontend: StubFrontend, monkeypatch, operator_settings
+    ) -> None:
+        """Resolved before the first bind. A refusal raised afterwards would leave
+        a credential-holding broker listening for a daemon already exiting."""
+        monkeypatch.setenv("COTF_SANDBOX", "jail")
+        monkeypatch.setenv("COTF_SANDBOX_EGRESS", "banana")
+        start_broker = AsyncMock()
+        monkeypatch.setattr(
+            orchestrator_mod.broker, "start_default_broker", start_broker
+        )
+
+        with pytest.raises(orchestrator_mod.sandbox.SandboxModeError):
+            await orchestrator_mod._start_sandbox(frontend)
+
+        start_broker.assert_not_awaited()
 
     async def test_start_sandbox_no_longer_seeds_the_policy_file(
         self, frontend: StubFrontend, monkeypatch, operator_settings
@@ -2296,7 +3331,7 @@ class TestFrontendApprovalDefault:
 async def test_session_permissions_is_inert_when_approvals_are_off(operator_settings):
     """Off is the default, so this is the path almost every deployment takes: no
     service, no env, nothing added to the spawn."""
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     assert await manager.env_for(1, "sess-a", Path("/tmp/ws")) == {}
 
 
@@ -2304,7 +3339,7 @@ async def test_session_permissions_hands_the_agent_its_endpoint(operator_setting
     from claude_on_the_fly import cotf_approve
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         env = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
         url = env[cotf_approve.ENDPOINT_ENV]
@@ -2322,7 +3357,7 @@ async def test_existing_session_reloads_approval_timing(operator_settings):
     operator_settings.write_text(
         "permissions:\n  mode: ask\n  ttl_seconds: 60\n  timeout_seconds: 30\n"
     )
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         first = await manager.env_for(7, "sess-a", Path("/tmp/ws"))
         service = manager._services[7][1]
@@ -2343,7 +3378,7 @@ async def test_the_service_can_reach_the_conversation_it_belongs_to(operator_set
     ERROR alone left a stuck turn looking like a slow one."""
     operator_settings.write_text("permissions:\n  mode: ask\n")
     frontend = StubFrontend()
-    manager = orchestrator_mod.SessionPermissions(frontend)
+    manager = orchestrator_mod.SessionPermissions(frontend, "slack")
     try:
         await manager.env_for(11, "sess-a", Path("/tmp/ws"))
         service = manager._services[11][1]
@@ -2363,7 +3398,7 @@ async def test_a_new_session_drops_the_previous_grants(operator_settings, caplog
     from claude_on_the_fly import cotf_approve
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         first = await manager.env_for(9, "sess-a", Path("/tmp/ws"))
         with caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"):
@@ -2380,7 +3415,7 @@ async def test_each_chat_gets_its_own_grant_store(operator_settings):
     from claude_on_the_fly import cotf_approve
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         one = await manager.env_for(1, "s", Path("/tmp/ws"))
         two = await manager.env_for(2, "s", Path("/tmp/ws"))
@@ -2392,7 +3427,7 @@ async def test_each_chat_gets_its_own_grant_store(operator_settings):
 async def test_check_turn_is_silent_for_a_chat_with_no_service(operator_settings):
     """A chat that never started a service cannot have been gated, and there is
     nothing to compare against."""
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     manager.check_turn(404, Response(body="x", tool_counts={"Bash": 2}), "codex")
 
 
@@ -2403,7 +3438,7 @@ async def test_check_turn_reports_a_turn_that_never_reached_the_gate(
     and runs the command, so an ungated turn is otherwise indistinguishable from a
     supervised one."""
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         await manager.env_for(3, "s", Path("/tmp/ws"))
         with caplog.at_level("ERROR", logger="claude_on_the_fly.permissions"):
@@ -2427,7 +3462,7 @@ async def test_the_spawn_env_carries_both_egress_and_approval_routing(
     egress_manager.env_for = AsyncMock(
         return_value={"HTTPS_PROXY": "http://127.0.0.1:1"}
     )
-    permissions_manager = orchestrator_mod.SessionPermissions(frontend)
+    permissions_manager = orchestrator_mod.SessionPermissions(frontend, "slack")
     orch = Orchestrator(
         frontend,
         "test",
@@ -2543,7 +3578,7 @@ async def test_the_guard_catches_a_gate_that_breaks_after_working_once(
     """
 
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         await manager.env_for(5, "s", Path("/tmp/ws"))
         service = manager._services[5][1]
@@ -2571,7 +3606,7 @@ async def test_a_new_session_resets_the_guards_baseline(operator_settings, caplo
     """The replacement service counts from zero, so a stale baseline would make the
     first turn's delta negative and silently pass."""
     operator_settings.write_text("permissions:\n  mode: ask\n")
-    manager = orchestrator_mod.SessionPermissions(StubFrontend())
+    manager = orchestrator_mod.SessionPermissions(StubFrontend(), "slack")
     try:
         await manager.env_for(6, "first", Path("/tmp/ws"))
         manager._services[6][1].requests_seen = 7
@@ -2601,7 +3636,7 @@ class TestSuggestionsParsing:
     def test_block_only_reply_gets_placeholder_and_drops_labels(self, caplog):
         with caplog.at_level("WARNING", logger="claude_on_the_fly.orchestrator"):
             body, labels = _extract_suggestions('<suggestions>["x?"]</suggestions>')
-        assert body == "No response"
+        assert body == agent_mod.EMPTY_REPLY_NOTICE
         assert labels == []
         assert "reply body empty" in "\n".join(r.getMessage() for r in caplog.records)
 
@@ -2618,6 +3653,33 @@ class TestSuggestionsParsing:
         assert _parse_suggestion_block('{"x": 1}') == []
         assert _parse_suggestion_block('"just a string"') == []
 
+    def test_label_at_the_cjk_cap_is_kept_whole(self):
+        # 16 CJK characters = 32 display columns: exactly at the cap, no cut.
+        label = "字" * 16
+        assert _parse_suggestion_block(f'["{label}"]') == [label]
+
+    def test_overlong_cjk_label_is_cut_with_the_ellipsis_counted(self):
+        # 17 CJK chars = 34 columns. 15 chars (30 columns) + "…" (1) stays in.
+        [fitted] = _parse_suggestion_block(f'["{"字" * 17}"]')
+        assert fitted == "字" * 15 + "…"
+        assert _display_width(fitted) <= MAX_SUGGESTION_WIDTH
+
+    def test_label_at_the_ascii_cap_is_kept_whole(self):
+        label = "x" * 32
+        assert _parse_suggestion_block(f'["{label}"]') == [label]
+
+    def test_overlong_ascii_label_is_cut(self):
+        assert _parse_suggestion_block(f'["{"y" * 40}"]') == ["y" * 31 + "…"]
+
+    def test_mixed_width_label_is_measured_width_aware(self):
+        # 15 CJK chars fill 30 columns; two ASCII chars still fit the cap, but
+        # an ASCII char plus anything else does not.
+        base = "選" * 15
+        assert _parse_suggestion_block(f'["{base}ab"]') == [base + "ab"]
+        [fitted] = _parse_suggestion_block(f'["{base}abc"]')
+        assert fitted == base + "a" + "…"
+        assert _display_width(fitted) == MAX_SUGGESTION_WIDTH
+
     def test_garbage_yields_nothing(self):
         assert _parse_suggestion_block("whatever") == []
 
@@ -2626,10 +3688,11 @@ class TestSuggestionsParsing:
         assert _parse_suggestion_block(json.dumps(labels)) == labels[:5]
 
     def test_overlong_labels_are_truncated(self):
-        # 75, not 80: Slack's block-kit button text hard cap is 75 characters,
-        # and a longer label would reject the whole message.
+        # The template asks for 16 CJK / 32 ASCII characters, and the parser
+        # enforces the same 32-column cap width-aware: a 201-character label
+        # is cut at 31 columns with an ellipsis counted inside the cap.
         long = "x" * 200
-        assert _parse_suggestion_block(f'["{long}?"]') == ["x" * 75]
+        assert _parse_suggestion_block(f'["{long}?"]') == ["x" * 31 + "…"]
 
     def test_single_quoted_json_is_parsed(self):
         # LLMs emit single-quoted lists despite the template; the parser
@@ -3058,3 +4121,144 @@ class TestResumingPendingTurns:
 
         assert (replayed, nudged) == (0, 1)
         assert "could not offer" in caplog.text
+
+
+class TestPaneCanBeSwitchedOff:
+    async def test_hosting_off_runs_the_turn_as_a_plain_child(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """Switching it off is not a failure, so it says nothing: the live view
+        falls back to the transcript and the turn is otherwise unchanged."""
+        monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: False)
+        monkeypatch.setattr(orchestrator_mod.tmux, "available", lambda: True)
+
+        def refuse(_name):
+            raise AssertionError("built a pane with hosting switched off")
+
+        monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", refuse)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+            caplog.at_level("INFO", logger="claude_on_the_fly.orchestrator"),
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        assert "runs unmirrored" not in caplog.text
+
+
+class TestPaneLifecycleAcrossATurn:
+    async def test_a_hosted_turn_publishes_its_pane_and_reaps_it(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch
+    ) -> None:
+        """pytest's own tmp_path is deep enough that pane_for correctly refuses it,
+        so the hosted path needs a root a socket address can actually fit."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = tmux_mod.Pane(session="cotf-pty-1-abcd")
+        killed: list[str] = []
+        monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", lambda _name: pane)
+        monkeypatch.setattr(
+            orchestrator_mod.tmux, "kill", lambda p: killed.append(p.session)
+        )
+        seen: dict = {}
+
+        async def capture_env(*_args, **_kwargs):
+            seen["env"] = dict(orchestrator_mod.sandbox.agent_env() or {})
+            return Response(body="answer")
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(side_effect=capture_env)
+            await orch._process(1, Turn("question"))
+
+        assert seen["env"]["TMUX_TMPDIR"] == str(tmux_mod.panes_root())
+        assert seen["env"]["CLAUDE_PTY_TMUX_SESSION"] == "cotf-pty-1-abcd"
+        # Reaped in the finally: the server outlives a process-group kill.
+        assert killed == ["cotf-pty-1-abcd"]
+
+    async def test_a_socket_path_that_will_not_fit_runs_the_turn_unhosted(
+        self, orch: Orchestrator, tmp_path: Path, monkeypatch
+    ) -> None:
+        """pane_for returns None rather than hosting anyway, or the agent's own
+        tmux fails with "File name too long" and costs the turn."""
+        monkeypatch.setattr(orchestrator_mod.tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(orchestrator_mod.tmux, "pane_for", lambda _name: None)
+
+        def refuse(_pane):
+            raise AssertionError("reaped a pane that was never created")
+
+        monkeypatch.setattr(orchestrator_mod.tmux, "kill", refuse)
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch("claude_on_the_fly.orchestrator.agent") as mock_agent,
+        ):
+            mock_agent.run = AsyncMock(return_value=Response(body="answer"))
+            await orch._process(1, Turn("question"))
+
+        assert mock_agent.run.await_count == 1
+
+
+class TestLegacyWorkspaceFolding:
+    """A session's first turn after the upgrade folds its old per-thread
+    directory into the shared workspace, before anything runs there."""
+
+    async def _turn(self, orch, tmp_path):
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "run", AsyncMock(return_value=Response(body="ok"))),
+        ):
+            await orch._process(1, Turn("hello"))
+
+    async def test_default_frontend_migrates_nothing(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        assert frontend.legacy_workspace(1) is None
+        with patch("claude_on_the_fly.orchestrator.migration") as migrate:
+            await self._turn(orch, tmp_path)
+        migrate.migrate_thread.assert_not_called()
+        assert (tmp_path / "workspaces" / "test" / "1" / "memory").is_dir()
+
+    async def test_legacy_directory_is_folded_into_the_workspace(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path
+    ) -> None:
+        old = tmp_path / "workspaces" / "test" / "1-old"
+        old.mkdir(parents=True)
+        (old / "report.pdf").write_text("pdf")
+        frontend.legacy_workspace = lambda chat_id: LegacyWorkspace(  # type: ignore[method-assign]
+            "test/1-old", "old"
+        )
+        await self._turn(orch, tmp_path)
+        moved = tmp_path / "workspaces" / "test" / "1" / "report.pdf"
+        assert moved.read_text() == "pdf"
+        assert not old.exists()
+
+    async def test_a_legacy_name_that_escapes_the_tree_is_refused(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path, caplog
+    ) -> None:
+        # `..` is reduced to `_` by `workspace_path`; an empty name is what it
+        # refuses outright.
+        frontend.legacy_workspace = lambda chat_id: LegacyWorkspace(  # type: ignore[method-assign]
+            "/", "old"
+        )
+        with patch("claude_on_the_fly.orchestrator.migration") as migrate:
+            await self._turn(orch, tmp_path)
+        migrate.migrate_thread.assert_not_called()
+        assert "refused" in caplog.text
+
+    async def test_a_migration_that_raises_does_not_cost_the_turn(
+        self, orch: Orchestrator, frontend: StubFrontend, tmp_path: Path, caplog
+    ) -> None:
+        frontend.legacy_workspace = lambda chat_id: LegacyWorkspace(  # type: ignore[method-assign]
+            "test/1-old", "old"
+        )
+        with patch(
+            "claude_on_the_fly.orchestrator.migration.migrate_thread",
+            side_effect=RuntimeError("boom"),
+        ):
+            await self._turn(orch, tmp_path)
+        assert frontend.sent[0][1].body == "ok"
+        assert "not migrated" in caplog.text

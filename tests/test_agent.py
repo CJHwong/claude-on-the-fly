@@ -39,17 +39,21 @@ from claude_on_the_fly.agent import (
     current_backend_key,
     ensure_persona,
     get_backend,
+    inbox_path,
+    outbox_note,
     parse_stream,
     persona_for,
     read_attachment,
     reset_progress_sink,
+    retire_outbox,
     run,
+    session_outbox,
     set_progress_sink,
     stats_mode,
+    unique_path,
     write_attachment,
 )
-from claude_on_the_fly.backends import codex as codex_mod
-from claude_on_the_fly.backends.claude import ClaudeBackend
+from claude_on_the_fly.backends.claude import ClaudeBackend, _discard_system_prompt
 from claude_on_the_fly.transcript import Turn
 
 
@@ -68,11 +72,11 @@ def _result_line(**overrides) -> dict:
     return base
 
 
-def _assistant_line(*content_blocks: dict) -> dict:
-    return {
-        "type": "assistant",
-        "message": {"id": "msg_x", "content": list(content_blocks)},
-    }
+def _assistant_line(*content_blocks: dict, model: str | None = None) -> dict:
+    message: dict = {"id": "msg_x", "content": list(content_blocks)}
+    if model is not None:
+        message["model"] = model
+    return {"type": "assistant", "message": message}
 
 
 def _tool_use(name: str, **input_fields) -> dict:
@@ -110,18 +114,15 @@ class TestDataDirFrom:
 
 
 class TestCompaction:
-    def test_saved_tokens_is_the_difference(self):
-        c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162)
-        assert c.saved_tokens == 48939 - 5162
-
-    def test_saved_tokens_never_goes_negative(self):
-        """A compaction that grew the conversation is nonsense, not a credit."""
-        assert Compaction(ok=True, pre_tokens=100, post_tokens=500).saved_tokens == 0
-
-    def test_summary_reports_both_sides_and_the_wait(self):
-        c = Compaction(ok=True, pre_tokens=48939, post_tokens=5162, duration=10.8)
+    def test_summary_names_the_conversation_part_and_the_wait(self):
+        """The two numbers count different things, so the line never puts an
+        arrow between them."""
+        c = Compaction(
+            ok=True, pre_tokens=48939, conversation_tokens_after=5162, duration=10.8
+        )
         assert c.summary() == (
-            "Compacted the conversation: 48,939 → 5,162 tokens in 11s."
+            "Compacted the conversation in 11s (it was 48,939 tokens). "
+            "The conversation part is now 5,162 tokens."
         )
 
     def test_summary_without_numbers_still_says_it_happened(self):
@@ -326,6 +327,59 @@ class TestBuildSystemPrompt:
         assert "alice" in result
         assert "#general" in result
 
+    def test_workspace_memory_is_the_workspaces_own_directory(self, tmp_path):
+        result = build_system_prompt("slack", "alice", "dm", workspace=tmp_path)
+        assert f"{tmp_path / 'memory'}/notes.md" in result
+
+    def test_everything_above_the_session_marker_is_the_same_for_every_session(
+        self, tmp_path
+    ):
+        """The prefix is what the prompt cache can reuse across sessions, so
+        nothing per conversation may appear before the marker."""
+        one = build_system_prompt("slack", "alice", "dm", tmp_path / "a", "s1")
+        two = build_system_prompt("slack", "bob", "channel:#x", tmp_path / "b", "s2")
+        marker = "## This session"
+        assert one[: one.index(marker)] == two[: two.index(marker)]
+
+    def test_where_you_are_closes_the_prompt_with_every_id(self, tmp_path):
+        """The memory rules bind to a real path only here: left to guess, one
+        deployment keyed a person's memory on the display name in one thread
+        and on the platform id in the next."""
+        facts = {
+            "conversation": "dm D1 ",
+            "thread": "1789360541.993339",
+            "sender_id": "U_HOSS",
+            "sender_name": "hoss",
+        }
+        result = build_system_prompt(
+            "slack", "U_HOSS", "dm (private)", tmp_path, "s1", facts
+        )
+        block = result[result.index("Where you are") :]
+        assert "platform:" in block and " slack" in block
+        assert "conversation:" in block and "dm D1" in block
+        assert "thread:" in block and "1789360541.993339" in block
+        assert "session:" in block and " s1" in block
+        assert "sender:" in block and 'U_HOSS (display "hoss")' in block
+        assert f"{tmp_path} (your cwd)" in block
+        assert "users/U_HOSS/" in block
+        assert "uploads:" in block and "inbox/ in the workspace" in block
+        assert str(tmp_path / "outbox" / "s1") in block
+        assert result.rstrip().endswith(block.rstrip())
+
+    def test_where_you_are_falls_back_to_what_the_frontend_gave(self, tmp_path):
+        result = build_system_prompt("cron", "profile-x", "cron", tmp_path)
+        block = result[result.index("Where you are") :]
+        assert "conversation:" in block and " cron" in block
+        assert "users/profile-x/" in block
+        assert "thread:" not in block
+        assert "deliveries:" not in block
+
+    def test_memory_rules_name_no_placeholder_directory(self):
+        result = build_system_prompt("slack", "U1", "dm")
+        assert "[sender]" not in result
+        assert "Never list `" in result
+        assert "other than your own memory directory" in result
+
     def test_unknown_platform_falls_back_to_telegram(self):
         result = build_system_prompt("discord", "charlie", "dm")
         assert FORMAT_HINTS["telegram"] in result
@@ -349,6 +403,28 @@ class TestBuildSystemPrompt:
             assert "You CAN send files" in result
             assert "{outbox_dir}" not in result  # placeholder fully substituted
 
+    def test_outbox_rules_are_the_operators(self, tmp_path: Path):
+        """Lifted from a deployed persona that had to correct the old text: no
+        announcing, no zipping, no touching the archive."""
+        result = build_system_prompt("slack", "hoss", "dm", tmp_path)
+        assert "do not announce the delivery" in result
+        assert "never zipped" in result
+        assert f"more than {MAX_ATTACHMENTS} files" in result
+        assert "Never touch `.sent/`" in result
+        assert "{max_attachments}" not in result
+
+    def test_outbox_is_the_sessions_own_when_a_session_is_named(self, tmp_path: Path):
+        """Two threads of one conversation share the workspace and can run at
+        once; a shared outbox handed one thread's file to the other's reply."""
+        result = build_system_prompt("slack", "hoss", "dm", tmp_path, "sess-1")
+        assert str(tmp_path / OUTBOX_DIRNAME / "sess-1") in result
+        assert f"{tmp_path / OUTBOX_DIRNAME}\n" not in result
+
+    def test_the_prompt_explains_the_shared_directory(self, tmp_path: Path):
+        result = build_system_prompt("slack", "hoss", "dm", tmp_path)
+        assert "every thread of it works here" in result
+        assert "`inbox/`" in result
+
     def test_outbox_instruction_absent_for_non_attachment_platforms(
         self, tmp_path: Path
     ):
@@ -367,16 +443,62 @@ class TestBuildSystemPrompt:
 # ---------------------------------------------------------------------------
 
 
+class TestSessionOutbox:
+    def test_lives_under_the_workspace_outbox(self, tmp_path: Path):
+        assert (
+            session_outbox(tmp_path, "sess-1") == tmp_path / OUTBOX_DIRNAME / "sess-1"
+        )
+
+    def test_the_turn_note_names_the_path_and_overrides_the_old_one(self, tmp_path):
+        note = outbox_note(tmp_path / OUTBOX_DIRNAME / "sess-1")
+        assert str(tmp_path / OUTBOX_DIRNAME / "sess-1") in note
+        assert "replaces any outbox path given earlier" in note
+        assert note.startswith("<cotf-outbox>") and note.endswith("</cotf-outbox>")
+
+    def test_retire_removes_an_empty_outbox_only(self, tmp_path: Path):
+        empty = tmp_path / "a"
+        empty.mkdir()
+        retire_outbox(empty)
+        assert not empty.exists()
+        kept = tmp_path / "b"
+        kept.mkdir()
+        (kept / "undelivered.txt").write_text("x")
+        retire_outbox(kept)
+        assert (kept / "undelivered.txt").is_file()
+        retire_outbox(tmp_path / "never-made")  # no error
+
+
+class TestInboxPath:
+    def test_creates_the_inbox_and_keeps_the_name(self, tmp_path: Path):
+        assert inbox_path(tmp_path, "report.pdf") == tmp_path / "inbox" / "report.pdf"
+        assert (tmp_path / "inbox").is_dir()
+
+    def test_a_taken_name_gets_a_numeric_suffix(self, tmp_path: Path):
+        """Every thread of the conversation shares the inbox; two uploads of
+        `report.pdf` must both survive."""
+        (tmp_path / "inbox").mkdir()
+        (tmp_path / "inbox" / "report.pdf").write_text("first")
+        (tmp_path / "inbox" / "report-2.pdf").write_text("second")
+        assert inbox_path(tmp_path, "report.pdf") == tmp_path / "inbox" / "report-3.pdf"
+
+    def test_only_the_basename_is_used(self, tmp_path: Path):
+        assert inbox_path(tmp_path, "../../etc/passwd") == tmp_path / "inbox" / "passwd"
+
+    def test_a_dangling_symlink_counts_as_taken(self, tmp_path: Path):
+        (tmp_path / "x.txt").symlink_to(tmp_path / "nowhere")
+        assert unique_path(tmp_path, "x.txt") == tmp_path / "x-2.txt"
+
+
 class TestCollectOutbox:
     def test_no_outbox_dir_returns_empty(self, tmp_path: Path):
-        assert collect_outbox(tmp_path) == []
+        assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
 
     def test_collects_regular_files_sorted_by_name(self, tmp_path: Path):
         outbox = tmp_path / OUTBOX_DIRNAME
         outbox.mkdir()
         (outbox / "b.txt").write_text("b")
         (outbox / "a.txt").write_text("a")
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert [p.name for p in result] == ["a.txt", "b.txt"]
 
     def test_skips_dotfiles_subdirs_and_archive(self, tmp_path: Path):
@@ -387,7 +509,7 @@ class TestCollectOutbox:
         (outbox / "sub").mkdir()
         (outbox / OUTBOX_ARCHIVE).mkdir()
         (outbox / OUTBOX_ARCHIVE / "old.txt").write_text("x")
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert [p.name for p in result] == ["keep.txt"]
 
     def test_skips_oversize_file(self, tmp_path: Path):
@@ -395,7 +517,7 @@ class TestCollectOutbox:
         outbox.mkdir()
         (outbox / "small.txt").write_text("x")
         (outbox / "big.bin").write_bytes(b"0" * (MAX_ATTACHMENT_BYTES + 1))
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert [p.name for p in result] == ["small.txt"]
 
     def test_enforces_count_cap(self, tmp_path: Path):
@@ -403,7 +525,7 @@ class TestCollectOutbox:
         outbox.mkdir()
         for i in range(MAX_ATTACHMENTS + 3):
             (outbox / f"f{i:02d}.txt").write_text("x")
-        result = collect_outbox(tmp_path)
+        result = collect_outbox(tmp_path / OUTBOX_DIRNAME)
         assert len(result) == MAX_ATTACHMENTS
 
     def test_rejects_symlinks_at_collection_and_read(self, tmp_path: Path):
@@ -414,7 +536,7 @@ class TestCollectOutbox:
         link = outbox / "report.txt"
         link.symlink_to(target)
 
-        assert collect_outbox(tmp_path) == []
+        assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
         with pytest.raises(OSError):
             read_attachment(link)
 
@@ -447,7 +569,7 @@ class TestArchiveOutbox:
         assert len(archived) == 1
         assert archived[0].read_text() == "data"
         # A fresh scan finds nothing left to re-send.
-        assert collect_outbox(tmp_path) == []
+        assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
 
 
 # ---------------------------------------------------------------------------
@@ -510,27 +632,10 @@ def _make_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
     proc.stderr = MagicMock()
     proc.stderr.read = _AsyncChunkReader(stderr)
     proc.wait = AsyncMock(return_value=returncode)
-    return proc
-
-
-def _codex_item_event(event_type: str, item_type: str, text: str | None = None) -> dict:
-    item = {"type": item_type}
-    if text is not None:
-        item["text"] = text
-    return {"type": event_type, "item": item}
-
-
-def _make_codex_chunked_proc(stdout: bytes):
-    split_points = (7, 31, 67, 103, len(stdout))
-    chunks = [
-        stdout[start:end]
-        for start, end in zip((0, *split_points[:-1]), split_points, strict=True)
-    ]
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.stdout = _ChunkedStreamReader(chunks)
-    proc.stderr = _ChunkedStreamReader([b""])
-    proc.wait = AsyncMock(return_value=0)
+    # A StreamWriter as asyncio hands it over: `write` and `close` are plain
+    # calls, only `drain` is awaited.
+    proc.stdin = MagicMock()
+    proc.stdin.drain = AsyncMock()
     return proc
 
 
@@ -798,69 +903,6 @@ class TestExec:
         assert "progress relay failed" in caplog.text
 
 
-class TestCodexInterimProgress:
-    def test_observer_ignores_blank_and_malformed_lines(self, caplog):
-        observer = codex_mod._CodexStreamObserver(
-            codex_mod._StreamWatch(), lambda _text: None
-        )
-
-        with caplog.at_level("ERROR", logger=codex_mod.__name__):
-            observer.feed(b"\nnot-json\n[]\n")
-            observer.finish()
-
-        assert "progress relay failed" in caplog.text
-
-    async def test_forwards_narration_across_chunk_boundaries_without_final_duplication(
-        self,
-    ):
-        stream = b"\n".join(
-            json.dumps(event).encode()
-            for event in (
-                {"type": "thread.started", "thread_id": "thread-1"},
-                _codex_item_event("item.completed", "agent_message", "first step"),
-                _codex_item_event("item.started", "command_execution"),
-                _codex_item_event("item.completed", "command_execution"),
-                _codex_item_event("item.completed", "agent_message", "final answer"),
-                {"type": "turn.completed", "usage": {}},
-            )
-        )
-        proc = _make_codex_chunked_proc(stream)
-        emitted: list[str] = []
-        token = set_progress_sink(emitted.append)
-        try:
-            captured, _stderr = await codex_mod._collect_codex_output(proc)
-        finally:
-            reset_progress_sink(token)
-
-        assert emitted == ["first step"]
-        assert codex_mod.parse_codex_stream(captured)["body"] == "final answer"
-
-    async def test_a_broken_progress_sink_does_not_break_codex_output(self, caplog):
-        stream = b"\n".join(
-            json.dumps(event).encode()
-            for event in (
-                _codex_item_event("item.completed", "agent_message", "working"),
-                _codex_item_event("item.started", "command_execution"),
-                _codex_item_event("item.completed", "agent_message", "done"),
-                {"type": "turn.completed", "usage": {}},
-            )
-        )
-        proc = _make_codex_chunked_proc(stream)
-
-        def fail(_text: str) -> None:
-            raise RuntimeError("progress sink failed")
-
-        token = set_progress_sink(fail)
-        try:
-            with caplog.at_level("ERROR", logger=codex_mod.__name__):
-                captured, _stderr = await codex_mod._collect_codex_output(proc)
-        finally:
-            reset_progress_sink(token)
-
-        assert codex_mod.parse_codex_stream(captured)["body"] == "done"
-        assert "progress relay failed" in caplog.text
-
-
 def _never_ending_proc() -> MagicMock:
     class _NeverEnds:
         def __aiter__(self) -> _NeverEnds:
@@ -877,6 +919,159 @@ def _never_ending_proc() -> MagicMock:
     proc.stderr.read = _AsyncChunkReader(b"")
     proc.wait = AsyncMock(return_value=-9)
     return proc
+
+
+class TestExecStdin:
+    """The turn's prompt travels on stdin, not as an argv element.
+
+    One argv element is capped at MAX_ARG_STRLEN (32 pages, 131072 bytes, on
+    Linux). A Slack reply in a long thread replays up to 50 prior messages ahead
+    of the prompt, which measured 131360-142743 bytes on the thread that broke,
+    so the spawn died in execve with E2BIG before the CLI ever started.
+    """
+
+    async def test_prompt_is_written_to_stdin_and_the_pipe_closed(self):
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await _exec(
+                Path("/tmp"), ["claude", "-p"], stdin_text="the prompt"
+            )
+
+        assert result["result"] == "hi"
+        proc.stdin.write.assert_called_once_with(b"the prompt")
+        proc.stdin.drain.assert_awaited()
+        proc.stdin.close.assert_called_once()
+
+    async def test_a_prompt_is_piped(self):
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await _exec(Path("/tmp"), ["claude", "-p"], stdin_text="x")
+
+        assert mock_exec.call_args.kwargs["stdin"] is asyncio.subprocess.PIPE
+
+    async def test_no_prompt_is_devnull_not_inherited(self):
+        """An inherited open pipe costs the CLI's 3-second stdin probe."""
+        proc = _make_proc(0, _ndjson(_result_line(result="hi")))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await _exec(Path("/tmp"), ["claude", "-p"])
+
+        assert mock_exec.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
+
+    async def test_a_cli_that_exits_before_reading_keeps_its_own_error(self):
+        """The broken pipe is a symptom; the exit status is the failure."""
+        proc = _make_proc(1, b"", stderr=b"unknown option")
+        proc.stdin.drain = AsyncMock(side_effect=BrokenPipeError)
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="unknown option"),
+        ):
+            await _exec(Path("/tmp"), ["claude", "-p"], stdin_text="x")
+
+
+class TestPromptOffArgv:
+    """No argv element carries the prompt, whatever the thread's history is."""
+
+    async def test_a_prompt_over_the_arg_limit_reaches_the_cli(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """The regression: 200 KB of replayed thread history in argv is E2BIG."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        # A resume, which is the shape that failed in production: the CLI reads
+        # the transcript itself, and the prompt rides alongside it.
+        (session_dir / "sess-long.jsonl").write_text('{"type":"user"}\n')
+        long_prompt = "x" * 200_000
+
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=_cli_output(),
+        ) as mock:
+            await ClaudeBackend().run(
+                workspace, "sess-long", long_prompt, "slack", "hoss", "dm"
+            )
+
+        cmd = mock.call_args_list[0][0][1]
+        assert max(len(part) for part in cmd) < 131072
+        assert mock.call_args_list[0][1]["stdin_text"] == long_prompt
+
+    async def test_pty_still_carries_the_prompt_in_argv(self, tmp_path, monkeypatch):
+        """claude-pty takes its prompt from argv, so pty is unchanged."""
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setenv("CLAUDE_MODE", "pty")
+        with (
+            patch.object(
+                claude_mod, "resolve_pty_binary", return_value="/bin/claude-pty"
+            ),
+            patch.object(
+                claude_mod,
+                "_exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(pty=True, model="sonnet").run(
+                workspace, "sess-pty", "the prompt", "telegram"
+            )
+
+        assert mock.call_args[0][1][-1] == "the prompt"
+        assert mock.call_args.kwargs["stdin_text"] is None
+
+
+class TestStagedSystemPromptCleanup:
+    """Cleanup runs in a `finally`, so it must never raise.
+
+    The agent works in this directory with permissions bypassed, so by the time
+    the turn ends the staged path can be something else entirely.
+    """
+
+    def test_the_file_is_removed(self, tmp_path):
+        path = tmp_path / "prompt"
+        path.write_text("system prompt", encoding="utf-8")
+        _discard_system_prompt(path)
+        assert not path.exists()
+
+    def test_a_missing_file_is_not_an_error(self, tmp_path):
+        _discard_system_prompt(tmp_path / "never-staged")
+
+    def test_a_path_that_is_not_a_file_is_reported_not_raised(self, tmp_path, caplog):
+        directory = tmp_path / "prompt"
+        directory.mkdir()
+        _discard_system_prompt(directory)
+        assert directory.exists()
+        assert "could not remove the staged system prompt" in caplog.text
+
+    async def test_a_failed_cleanup_does_not_replace_the_turns_result(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        from claude_on_the_fly.backends import claude as claude_mod
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        blocker = workspace / "blocked"
+        blocker.mkdir()  # unlink() raises on a directory
+        with (
+            patch.object(claude_mod, "_stage_system_prompt", return_value=blocker),
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(result="kept"),
+            ),
+        ):
+            resp = await ClaudeBackend().run(workspace, "sess-x", "hi", "telegram")
+
+        assert resp.body == "kept"
 
 
 class TestClassify:
@@ -1122,6 +1317,26 @@ class TestParseStream:
         out = parse_stream(stream)
         assert out["last_assistant_text"] == "the real summary"
 
+    def test_last_assistant_model_names_the_model_that_answered(self):
+        """`modelUsage` is keyed in first-touched order, so an auxiliary call
+        that ran first would name itself. The last assistant message is the one
+        that produced the answer."""
+        stream = _ndjson(
+            _assistant_line(_tool_use("Task"), model="claude-haiku-4-5-20251001"),
+            _assistant_line({"type": "text", "text": "391"}, model="claude-opus-5"),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_model"] == "claude-opus-5"
+
+    def test_last_assistant_model_is_empty_when_no_message_names_one(self):
+        stream = _ndjson(
+            _assistant_line({"type": "text", "text": "hi"}),
+            _result_line(),
+        )
+        out = parse_stream(stream)
+        assert out["last_assistant_model"] == ""
+
     def test_a_suggestions_only_message_does_not_count_as_text(self):
         stream = _ndjson(
             _assistant_line(
@@ -1234,6 +1449,15 @@ class TestMergeCliOutput:
         b = {"result": "done", "total_cost_usd": 0.02}
         assert _merge_cli_output(a, b)["result"] == "done"
 
+    def test_retry_model_wins_but_an_empty_retry_keeps_the_first(self):
+        """Same rule as `last_assistant_text`: the retry answered, so name its
+        model, but a retry that produced no assistant message must not blank
+        the name the first run established."""
+        a = {"last_assistant_model": "claude-opus-5"}
+        b = {"last_assistant_model": "claude-sonnet-5"}
+        assert _merge_cli_output(a, b)["last_assistant_model"] == "claude-sonnet-5"
+        assert _merge_cli_output(a, {})["last_assistant_model"] == "claude-opus-5"
+
     def test_cost_and_duration_summed(self):
         a = {"total_cost_usd": 0.10, "duration_ms": 1500}
         b = {"total_cost_usd": 0.25, "duration_ms": 2500}
@@ -1335,6 +1559,31 @@ class TestRun:
         assert resp.tokens_in == 150  # 100 + 50 cache_read
         assert resp.tokens_out == 200
         assert resp.model == "claude-sonnet-4-20250514"
+
+    async def test_answering_model_beats_the_first_modelUsage_key(self):
+        """`modelUsage` is keyed in first-touched order. When a turn touched an
+        auxiliary model first, the first key is not the model that answered."""
+        output = _cli_output(model="claude-haiku-4-5-20251001")
+        output["last_assistant_model"] = "claude-opus-5"
+
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hello", "telegram", "hoss")
+
+        assert resp.model == "claude-opus-5"
+
+    async def test_modelUsage_still_answers_when_no_assistant_model(self):
+        """An envelope with no assistant message keeps the old behaviour rather
+        than reporting nothing."""
+        output = _cli_output(model="claude-sonnet-5")
+
+        with patch(
+            "claude_on_the_fly.agent._exec", new_callable=AsyncMock, return_value=output
+        ):
+            resp = await run(Path("/tmp"), "sess-1", "hello", "telegram", "hoss")
+
+        assert resp.model == "claude-sonnet-5"
 
     async def test_session_not_found_falls_back_to_new(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -1459,7 +1708,7 @@ class TestRun:
         assert resp.model == ""
 
     async def test_missing_result_triggers_retry_then_defaults(self):
-        """Missing result key → retry → retry also empty → 'No response'."""
+        """Missing result key → retry → retry also empty → useful fallback."""
         first = {"total_cost_usd": 0.01}
         retry = {"result": ""}
 
@@ -1470,10 +1719,12 @@ class TestRun:
         ) as mock:
             resp = await run(Path("/tmp"), "sess-1", "hi", "telegram")
 
-        assert resp.body == "No response"
+        assert resp.body == agent_mod.EMPTY_REPLY_NOTICE
         assert mock.await_count == 2
-        # Second call is the nudge.
-        assert NUDGE_PROMPT in mock.call_args_list[1][0][1]
+        # Second call is the nudge, and it rides stdin like the first call: the
+        # retry exists for the turn that produced nothing, so it must not be the
+        # arm that dies on a long prompt.
+        assert mock.call_args_list[1][1]["stdin_text"] == NUDGE_PROMPT
 
     async def test_empty_result_triggers_retry(self):
         """Empty-string result fires a retry; retry's body is returned."""
@@ -1492,7 +1743,7 @@ class TestRun:
         retry_cmd = mock.call_args_list[1][0][1]
         assert "--resume" in retry_cmd
         assert "sess-1" in retry_cmd
-        assert NUDGE_PROMPT in retry_cmd
+        assert mock.call_args_list[1][1]["stdin_text"] == NUDGE_PROMPT
 
     async def test_whitespace_result_triggers_retry(self):
         first = _cli_output(result="   \n  ")
@@ -1647,8 +1898,8 @@ class TestRun:
         self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
         """Pre-create the session JSONL so the backend takes the --resume
-        branch (not --session-id), then verify the uuid+prompt make it
-        through."""
+        branch (not --session-id), then verify the uuid reaches argv and the
+        prompt reaches the CLI another way."""
         from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
         output = _cli_output()
@@ -1666,7 +1917,9 @@ class TestRun:
         cmd = mock.call_args[0][1]
         assert "--resume" in cmd
         assert "my-uuid" in cmd
-        assert "hi" in cmd
+        # The prompt is not an argv element any more (see TestPromptOffArgv).
+        assert "hi" not in cmd
+        assert mock.call_args.kwargs["stdin_text"] == "hi"
 
 
 # ---------------------------------------------------------------------------
@@ -1817,6 +2070,31 @@ class TestEnsurePersona:
         assert not (workspace / "CLAUDE.md").exists()
         assert not (workspace / "AGENTS.md").is_symlink()
 
+    def test_a_stale_link_through_a_symlinked_personas_dir_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        """The binding was removed while personas/ was a link to somewhere else.
+        Judging ownership by the resolved target would call the link somebody
+        else's and leave the chat running a persona nothing configures."""
+        data_root = tmp_path / "cotf-data"
+        data_root.mkdir()
+        source = tmp_path / "elsewhere" / "personas"
+        source.mkdir(parents=True)
+        persona = source / "old.md"
+        persona.write_text("retired")
+        (data_root / "personas").symlink_to(source)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", data_root):
+            ensure_persona(workspace, data_root / "personas" / "old.md")
+            assert (workspace / "CLAUDE.md").is_symlink()
+            persona.unlink()
+            ensure_persona(workspace)
+
+        assert not (workspace / "CLAUDE.md").is_symlink()
+        assert not (workspace / "AGENTS.md").is_symlink()
+
     def test_a_real_file_is_left_alone_when_nothing_resolves(
         self, tmp_path: Path
     ) -> None:
@@ -1955,6 +2233,67 @@ class TestPersonaFor:
         with caplog.at_level(logging.ERROR):
             assert persona_for("slack", ("C07ABCDEF",)) is None
         assert "escapes" in caplog.text
+
+    def test_a_symlinked_personas_directory_is_followed(
+        self, operator_settings: Path, tmp_path: Path
+    ) -> None:
+        """The operator keeps personas in a version-controlled directory elsewhere
+        and links it in. Resolving the leaf would put every entry outside the data
+        root and drop the chat to the global persona."""
+        source = tmp_path / "elsewhere" / "personas"
+        source.mkdir(parents=True)
+        (source / "oncall.md").write_text("# oncall")
+        (operator_settings.parent / "personas").symlink_to(source)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        found = persona_for("slack", ("C07ABCDEF",))
+        assert found is not None
+        assert found.read_text() == "# oncall"
+
+    def test_a_symlinked_persona_file_is_followed(
+        self, operator_settings: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "elsewhere" / "oncall.md"
+        outside.parent.mkdir(parents=True)
+        outside.write_text("# oncall")
+        link = operator_settings.parent / "personas" / "oncall.md"
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(outside)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        found = persona_for("slack", ("C07ABCDEF",))
+        assert found is not None
+        assert found.read_text() == "# oncall"
+
+    def test_a_symlink_does_not_reopen_dot_dot_traversal(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        """Following symlinks is the new behavior; collapsing `..` is the old
+        containment property, and it still holds."""
+        outside = operator_settings.parent.parent / "elsewhere.md"
+        outside.write_text("someone else's file")
+        (operator_settings.parent / "personas").mkdir(exist_ok=True)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/../../elsewhere.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "escapes" in caplog.text
+
+    def test_a_dangling_symlink_is_reported_as_missing(
+        self, operator_settings: Path, tmp_path: Path, caplog
+    ) -> None:
+        link = operator_settings.parent / "personas" / "oncall.md"
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(tmp_path / "never-created.md")
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "does not exist" in caplog.text
 
     def test_a_non_string_value_is_refused(
         self, operator_settings: Path, caplog
@@ -2117,6 +2456,20 @@ class TestCurrentBackendKey:
         monkeypatch.delenv("CODEX_MODEL", raising=False)
         assert current_backend_key() == "codex:native:default"
 
+    def test_codex_pty_includes_model(self, clear_backend_env, monkeypatch):
+        """A distinct key from native: the same runtime, a different interface, so
+        a mode switch must not resume a thread recorded under the other one."""
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        monkeypatch.setenv("CODEX_MODEL", "gpt-5")
+        assert current_backend_key() == "codex:pty:gpt-5"
+
+    def test_codex_pty_blank_model_defaults(self, clear_backend_env, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("CODEX_MODE", "pty")
+        monkeypatch.delenv("CODEX_MODEL", raising=False)
+        assert current_backend_key() == "codex:pty:default"
+
     def test_codex_ollama_includes_model(self, clear_backend_env, monkeypatch):
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.setenv("CODEX_MODE", "ollama")
@@ -2154,22 +2507,22 @@ class TestCurrentBackendKey:
 
 
 class TestClaudeBackendLauncher:
-    async def test_model_flag_follows_env(self, monkeypatch):
+    async def test_model_flag_follows_the_configured_model(self):
         output = _cli_output()
-        # Explicit CLAUDE_MODEL → --model present.
-        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        # A model was resolved → --model present.
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+            await ClaudeBackend(model="opus").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
         cmd = mock.call_args[0][1]
         assert cmd[0] == "claude"
         assert "--model" in cmd and "opus" in cmd
 
-        # Unset CLAUDE_MODEL → --model omitted (claude CLI picks its default).
-        monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+        # No model resolved → --model omitted (claude CLI picks its default).
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
@@ -2224,10 +2577,11 @@ class TestClaudeBackendLauncher:
         assert model_indices == [3]
 
     async def test_effort_flag_only_under_launcher(self, monkeypatch):
-        """OLLAMA_EFFORT must not reach native argv: native inherits the CLI's
-        own settings.json effortLevel, and a flag here would override it."""
+        """OLLAMA_EFFORT belongs to the mode that swapped the model out. It must
+        not leak into native argv, which has a key of its own."""
         output = _cli_output()
         monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
@@ -2236,18 +2590,76 @@ class TestClaudeBackendLauncher:
             await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
         assert "--effort" not in mock.call_args[0][1]
 
-    async def test_effort_flag_under_launcher(self, monkeypatch):
-        """Ollama mode: the served model differs from the CLI's native provider,
-        so the operator's effort setting is passed explicitly."""
+    async def test_native_effort_flag_from_the_resolved_effort(self):
+        """A resolved effort reaches native argv, so an operator can override
+        effort for cotf's own spawns without touching their interactive claude."""
         output = _cli_output()
-        monkeypatch.setenv("OLLAMA_EFFORT", "max")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(effort="xhigh").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        cmd = mock.call_args[0][1]
+        assert cmd[cmd.index("--effort") + 1] == "xhigh"
+
+    async def test_native_effort_omitted_when_its_key_is_unset(self, monkeypatch):
+        """Unset means "inherit": no flag, so the CLI reads effortLevel from the
+        operator's own settings.json exactly as it did before this key existed."""
+        output = _cli_output()
+        monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend().run(Path("/tmp"), "sess-1", "hi", "telegram")
+        assert "--effort" not in mock.call_args[0][1]
+
+    async def test_resolved_effort_reaches_argv_under_a_launcher(self):
+        """The resolver decides which effort a launcher run uses; the backend
+        passes exactly what it was handed, with no second opinion."""
+        output = _cli_output()
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend(launcher=launcher).run(
+            await ClaudeBackend(launcher=launcher, effort="max").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        cmd = mock.call_args[0][1]
+        assert cmd[cmd.index("--effort") + 1] == "max"
+
+    async def test_native_effort_level_out_of_set_skipped(self, caplog):
+        """A typo in config.yaml warns here rather than failing the turn in the
+        CLI's own validation."""
+        output = _cli_output()
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(effort="enormous").run(
+                Path("/tmp"), "sess-1", "hi", "telegram"
+            )
+        assert "--effort" not in mock.call_args[0][1]
+        assert "ignoring unknown effort 'enormous'" in caplog.text
+
+    async def test_effort_flag_under_launcher(self):
+        """Ollama mode: the served model differs from the CLI's native provider,
+        so the operator's effort setting is passed explicitly."""
+        output = _cli_output()
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.agent._exec",
+            new_callable=AsyncMock,
+            return_value=output,
+        ) as mock:
+            await ClaudeBackend(launcher=launcher, effort="max").run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
         cmd = mock.call_args[0][1]
@@ -2269,18 +2681,17 @@ class TestClaudeBackendLauncher:
             )
         assert "--effort" not in mock.call_args[0][1]
 
-    async def test_effort_level_not_in_claude_set_skipped(self, monkeypatch, caplog):
+    async def test_effort_level_not_in_claude_set_skipped(self, caplog):
         """`minimal` is codex-only; claude must skip it rather than pass it to
         the CLI, which would reject the turn."""
         output = _cli_output()
-        monkeypatch.setenv("OLLAMA_EFFORT", "minimal")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
             return_value=output,
         ) as mock:
-            await ClaudeBackend(launcher=launcher).run(
+            await ClaudeBackend(launcher=launcher, effort="minimal").run(
                 Path("/tmp"), "sess-1", "hi", "telegram"
             )
         assert "--effort" not in mock.call_args[0][1]
@@ -2426,7 +2837,7 @@ class TestClaudeBackendHandoff:
         # No prior session JSONL → backend goes straight to --session-id.
         cmd = mock.call_args_list[0][0][1]
         assert "--session-id" in cmd
-        prompt_arg = cmd[-1]
+        prompt_arg = mock.call_args_list[0][1]["stdin_text"]
         assert "[Prior conversation via codex" in prompt_arg
         assert "prior codex msg" in prompt_arg
         assert "prior codex reply" in prompt_arg
@@ -2447,9 +2858,9 @@ class TestClaudeBackendHandoff:
         ):
             await run(self._workspace, "sess-2", "JUST_THIS", "telegram")
 
-        cmd = mock.call_args_list[0][0][1]
-        assert "[Prior conversation" not in cmd[-1]
-        assert cmd[-1] == "JUST_THIS"
+        prompt_arg = mock.call_args_list[0][1]["stdin_text"]
+        assert "[Prior conversation" not in prompt_arg
+        assert prompt_arg == "JUST_THIS"
 
     async def test_extractor_exception_falls_through_silently(self):
         output = _cli_output(result="new session reply")
@@ -2468,7 +2879,7 @@ class TestClaudeBackendHandoff:
 
         # Daemon must keep serving the user even when transcript extraction breaks.
         assert resp.body == "new session reply"
-        assert mock.call_args_list[0][0][1][-1] == "TEXT"
+        assert mock.call_args_list[0][1]["stdin_text"] == "TEXT"
 
     async def test_resume_skips_extractor_when_session_exists(self):
         """When the JSONL is present, backend takes the resume branch and
@@ -2634,12 +3045,10 @@ def _pty_envelope(
 
 class TestClaudeBackendPty:
     async def test_argv_uses_pty_binary_and_drops_p_flags(
-        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
     ):
         from claude_on_the_fly.transcript import _workspace_to_claude_hash
 
-        # Explicit model so --model is in the argv (it's omitted when unset).
-        monkeypatch.setenv("CLAUDE_MODEL", "sonnet")
         workspace = tmp_path / "ws"
         workspace.mkdir()
         # Pre-create the session JSONL so the backend takes the --resume
@@ -2659,7 +3068,10 @@ class TestClaudeBackendPty:
                 return_value=_pty_envelope(),
             ) as mock,
         ):
-            await ClaudeBackend(pty=True).run(workspace, "sess-1", "hi", "telegram")
+            # Explicit model so --model is in the argv (it's omitted when empty).
+            await ClaudeBackend(pty=True, model="sonnet").run(
+                workspace, "sess-1", "hi", "telegram"
+            )
 
         cmd = mock.call_args[0][1]
         assert cmd[0] == "/fake/bin/claude-pty"
@@ -2674,6 +3086,122 @@ class TestClaudeBackendPty:
         assert "--system-prompt" not in cmd
         assert "--resume" in cmd
         assert cmd[-1] == "hi"
+
+    async def test_effort_reaches_pty_argv(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """`--effort` is a session flag in claude's own help, not a -p flag, so
+        pty passes it exactly as it already passes `--model`."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(pty=True, effort="max").run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        argv = mock.call_args[0][1]
+        assert argv[argv.index("--effort") + 1] == "max"
+
+    async def test_pty_skips_an_effort_claude_does_not_accept(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """The same validation the native argv applies. A typo in config.yaml
+        warns here rather than failing the turn inside the CLI."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(),
+            ) as mock,
+        ):
+            await ClaudeBackend(pty=True, effort="ludicrous").run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        assert "--effort" not in mock.call_args[0][1]
+
+    async def test_pty_names_the_model_from_the_session_not_modelUsage(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """The bug as observed: the envelope's first `modelUsage` key was an
+        auxiliary haiku call while opus produced the answer. pty's envelope has
+        no per-message model, so the session claude wrote is the source."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-1.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "model": "claude-opus-5",
+                        "content": [{"type": "text", "text": "hi"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(model="claude-haiku-4-5-20251001"),
+            ),
+        ):
+            resp = await ClaudeBackend(pty=True).run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        assert resp.model == "claude-opus-5"
+
+    async def test_pty_falls_back_to_modelUsage_with_no_session_on_disk(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.resolve_pty_binary",
+                return_value="/fake/bin/claude-pty",
+            ),
+            patch(
+                "claude_on_the_fly.backends.claude._exec_pty",
+                new_callable=AsyncMock,
+                return_value=_pty_envelope(model="claude-sonnet-5"),
+            ),
+        ):
+            resp = await ClaudeBackend(pty=True).run(
+                workspace, "sess-1", "hi", "telegram"
+            )
+
+        assert resp.model == "claude-sonnet-5"
 
     async def test_response_carries_rate_limits_and_context_window(self):
         envelope = _pty_envelope(
@@ -2793,8 +3321,27 @@ class TestClaudeBackendPty:
             ClaudeBackend(launcher=OllamaLauncher(model="qwen"), pty=True)
 
 
+class _StagedSystemPrompt:
+    """An `_exec` side effect that reads the staged prompt mid-turn.
+
+    The file is unlinked by the time `run` returns, so the call it was staged
+    for is the only place it can be observed at all.
+    """
+
+    def __init__(self) -> None:
+        self.path = ""
+        self.text = ""
+        self.mode = 0
+
+    def __call__(self, workspace, cmd, timeout=None, stdin_text=None) -> dict:
+        self.path = cmd[cmd.index("--system-prompt-file") + 1]
+        self.text = Path(self.path).read_text(encoding="utf-8")
+        self.mode = os.stat(self.path).st_mode & 0o777
+        return _cli_output()
+
+
 class TestResumeSystemPrompt:
-    """--system-prompt is attached only when (re-)establishing a session.
+    """The system prompt is attached only when (re-)establishing a session.
 
     A healthy resume reuses the prompt claude persisted into the session, so
     re-sending it every turn is wasted tokens. But the session file merely
@@ -2808,15 +3355,24 @@ class TestResumeSystemPrompt:
     ):
         workspace = tmp_path / "ws"
         workspace.mkdir()
+        staged = _StagedSystemPrompt()
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
-            return_value=_cli_output(),
+            side_effect=staged,
         ) as mock:
             await ClaudeBackend().run(workspace, "sess-missing", "hi", "telegram")
         cmd = mock.call_args_list[0][0][1]
         assert "--session-id" in cmd
-        assert "--system-prompt" in cmd
+        assert "--system-prompt-file" in cmd
+        # Not the inline flag: the prompt is a file in the workspace, 0600,
+        # readable by the CLI while it starts and by nobody else.
+        assert "--system-prompt" not in cmd
+        assert staged.text.startswith("You are an autonomous assistant")
+        assert Path(staged.path).parent == workspace
+        assert staged.mode == 0o600
+        # And gone once the turn is over.
+        assert not Path(staged.path).exists()
 
     async def test_empty_session_resumes_with_system_prompt(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -2829,15 +3385,17 @@ class TestResumeSystemPrompt:
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "sess-empty.jsonl").write_text("")  # exists, no content
 
+        staged = _StagedSystemPrompt()
         with patch(
             "claude_on_the_fly.agent._exec",
             new_callable=AsyncMock,
-            return_value=_cli_output(),
+            side_effect=staged,
         ) as mock:
             await ClaudeBackend().run(workspace, "sess-empty", "hi", "telegram")
         cmd = mock.call_args_list[0][0][1]
         assert "--resume" in cmd
-        assert "--system-prompt" in cmd
+        assert "--system-prompt-file" in cmd
+        assert not Path(staged.path).exists()
 
     async def test_content_session_resumes_without_system_prompt(
         self, tmp_path, claude_projects_dir, codex_sessions_dir
@@ -2859,6 +3417,32 @@ class TestResumeSystemPrompt:
         cmd = mock.call_args_list[0][0][1]
         assert "--resume" in cmd
         assert "--system-prompt" not in cmd
+
+    async def test_a_healthy_resume_never_builds_the_system_prompt(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir
+    ):
+        """Building it enumerates the jail's grants, and a resume discards it."""
+        from claude_on_the_fly.transcript import _workspace_to_claude_hash
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        session_dir = claude_projects_dir / _workspace_to_claude_hash(workspace)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "sess-real.jsonl").write_text('{"type":"user"}\n')
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.claude.build_system_prompt"
+            ) as mock_build,
+            patch(
+                "claude_on_the_fly.agent._exec",
+                new_callable=AsyncMock,
+                return_value=_cli_output(),
+            ),
+        ):
+            await ClaudeBackend().run(workspace, "sess-real", "hi", "telegram")
+
+        mock_build.assert_not_called()
 
 
 class TestHandoffByPlatform:
@@ -3112,7 +3696,7 @@ class TestResolveSessionLog:
 
 
 class TestKillProcessTree:
-    async def test_reaps_grandchild(self):
+    async def test_reaps_grandchild(self, process_gone):
         import os
 
         from claude_on_the_fly.agent import _kill_process_tree
@@ -3135,14 +3719,9 @@ class TestKillProcessTree:
 
         await _kill_process_tree(proc)
 
-        for _ in range(30):
-            try:
-                os.kill(grandchild, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail("grandchild survived the process-tree kill")
+        assert await process_gone(grandchild), (
+            "grandchild survived the process-tree kill"
+        )
 
     async def test_noop_on_exited_process(self):
         from claude_on_the_fly.agent import _kill_process_tree
@@ -3429,7 +4008,7 @@ class TestOutboxSurvivesAFilesystemThatSaysNo:
 
         monkeypatch.setattr(Path, "stat", stat_then_vanish)
         with caplog.at_level("WARNING", logger="claude_on_the_fly.agent"):
-            assert collect_outbox(tmp_path) == []
+            assert collect_outbox(tmp_path / OUTBOX_DIRNAME) == []
         assert "cannot stat" in "\n".join(r.getMessage() for r in caplog.records)
 
     def test_an_unwritable_archive_dir_leaves_the_files_where_they_are(
@@ -3487,18 +4066,24 @@ class TestOutboxSurvivesAFilesystemThatSaysNo:
     ("compaction", "expected"),
     [
         (
-            Compaction(ok=True, pre_tokens=0, post_tokens=0),
+            Compaction(ok=True, pre_tokens=0),
             "Compacted the conversation.",
         ),
         (
-            # codex publishes no duration, and "in 0s" reads as a suspiciously
-            # fast compaction rather than as a missing figure.
-            Compaction(ok=True, pre_tokens=120_000, post_tokens=8_000),
-            "Compacted the conversation: 120,000 → 8,000 tokens.",
+            # codex: no size after, and no duration, since "in 0s" reads as a
+            # suspiciously fast compaction rather than as a missing figure.
+            Compaction(ok=True, pre_tokens=120_000),
+            "Compacted the conversation (it was 120,000 tokens).",
         ),
         (
-            Compaction(ok=True, pre_tokens=120_000, post_tokens=8_000, duration=42.4),
-            "Compacted the conversation: 120,000 → 8,000 tokens in 42s.",
+            Compaction(
+                ok=True,
+                pre_tokens=120_000,
+                conversation_tokens_after=8_000,
+                duration=42.4,
+            ),
+            "Compacted the conversation in 42s (it was 120,000 tokens). "
+            "The conversation part is now 8,000 tokens.",
         ),
     ],
 )
@@ -3591,15 +4176,15 @@ async def test_compact_returns_none_when_the_backend_cannot_do_it(
     """codex has no compaction, so the caller gets None rather than an error, and
     reports "not supported" instead of "failed"."""
     backend = MagicMock(spec=[])
-    monkeypatch.setattr(agent_mod, "get_backend", lambda: backend)
+    monkeypatch.setattr(agent_mod, "get_backend", lambda _profile=None: backend)
     assert await agent_mod.compact(tmp_path, "session-uuid") is None
 
 
 async def test_compact_delegates_when_the_backend_supports_it(monkeypatch, tmp_path):
-    expected = Compaction(ok=True, pre_tokens=10, post_tokens=1)
+    expected = Compaction(ok=True, pre_tokens=10)
     backend = MagicMock()
     backend.compact = AsyncMock(return_value=expected)
-    monkeypatch.setattr(agent_mod, "get_backend", lambda: backend)
+    monkeypatch.setattr(agent_mod, "get_backend", lambda _profile=None: backend)
     assert await agent_mod.compact(tmp_path, "session-uuid", timeout=5) is expected
     backend.compact.assert_awaited_once_with(tmp_path, "session-uuid", timeout=5)
 
@@ -3984,7 +4569,7 @@ class TestAttachmentHandoffRefusesWhatItCannotVouchFor:
             patch.object(Path, "lstat", flaky),
             caplog.at_level("WARNING"),
         ):
-            collected = collect_outbox(workspace)
+            collected = collect_outbox(workspace / OUTBOX_DIRNAME)
 
         assert [p.name for p in collected] == ["good.txt"]
         assert "cannot inspect gone.txt" in caplog.text
@@ -3996,7 +4581,7 @@ class TestAttachmentHandoffRefusesWhatItCannotVouchFor:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         (workspace / OUTBOX_DIRNAME).write_text("a file, not a directory")
-        assert collect_outbox(workspace) == []
+        assert collect_outbox(workspace / OUTBOX_DIRNAME) == []
 
     def test_reading_a_non_regular_file_is_refused(self, tmp_path):
         """`os.open` on a fifo would block on a reader; the fstat check is what
@@ -4224,26 +4809,69 @@ class TestOllamaContextWindowSetting:
     """Unset or unusable leaves ollama reporting nothing, which is how the
     feature behaved before the setting existed."""
 
-    def _resolve(self, monkeypatch, raw):
+    def _resolve(self, raw):
         from claude_on_the_fly import agent as agent_mod
 
-        monkeypatch.setattr(agent_mod.settings, "get", lambda *a, **k: raw)
-        return agent_mod._ollama_context_window()
+        return agent_mod._ollama_context_window(raw)
 
-    def test_unset_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "") is None
+    def test_unset_is_none(self):
+        assert self._resolve("") is None
 
-    def test_blank_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "   ") is None
+    def test_blank_is_none(self):
+        assert self._resolve("   ") is None
 
-    def test_junk_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "wide") is None
+    def test_junk_is_none(self):
+        assert self._resolve("wide") is None
 
-    def test_zero_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "0") is None
+    def test_zero_is_none(self):
+        assert self._resolve("0") is None
 
-    def test_negative_is_none(self, monkeypatch):
-        assert self._resolve(monkeypatch, "-1") is None
+    def test_negative_is_none(self):
+        assert self._resolve("-1") is None
 
-    def test_positive_is_used(self, monkeypatch):
-        assert self._resolve(monkeypatch, "200000") == 200000
+    def test_positive_is_used(self):
+        assert self._resolve("200000") == 200000
+
+
+class TestArgvForLog:
+    """The debug line that records what was actually spawned.
+
+    Its predecessor kept the first N tokens, which under a jail were all
+    wrapper, so the line named no binary and no flag. See `argv_for_log`.
+    """
+
+    def test_a_short_argv_is_unchanged(self):
+        assert agent_mod.argv_for_log(["claude", "--model", "opus"]) == (
+            "claude --model opus"
+        )
+
+    def test_a_long_token_is_elided_and_reports_its_length(self):
+        rendered = agent_mod.argv_for_log(["--system-prompt", "P" * 40000])
+        assert rendered.startswith("--system-prompt " + "P" * 60 + "...")
+        assert "[40000 chars]" in rendered
+        assert len(rendered) < 200, "the whole point is that the prompt stays out"
+
+    def test_the_flags_survive_a_jail_wrapper(self):
+        """The regression this replaced: every token below except the first four
+        was dropped, and the first four are seatbelt's."""
+        argv = [
+            "sandbox-exec",
+            "-f",
+            "/long/path/to/jail.sb",
+            "-D",
+            "_HOME=/Users/someone",
+            "claude-pty",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]
+        rendered = agent_mod.argv_for_log(argv)
+        for token in ("claude-pty", "--model", "opus", "--effort", "high"):
+            assert token in rendered, f"{token} missing from {rendered}"
+
+    def test_the_cap_is_adjustable(self):
+        assert agent_mod.argv_for_log(["abcdef"], cap=3) == "abc...[6 chars]"
+
+    def test_an_empty_argv_renders_empty(self):
+        assert agent_mod.argv_for_log([]) == ""

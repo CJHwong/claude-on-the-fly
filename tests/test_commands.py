@@ -22,11 +22,14 @@ from claude_on_the_fly.commands import (
     CommandBroker,
     ShimmedTool,
     allowed_command,
+    hidden_by_a_leading_flag,
     leading_tokens,
+    refused_as_write,
     refuses_readback,
 )
 
 GH = next(t for t in commands.load_tools() if t.name == "gh")
+AWS = next(t for t in commands.load_tools() if t.name == "aws")
 
 
 # --- argv parsing: the basis of every refusal ---
@@ -94,6 +97,154 @@ def test_bundled_gh_allowlist_blocks_alias_api_and_unknown_commands():
     assert not allowed_command(GH, ["alias", "set", "x", "!cat /etc/passwd"])
     assert not allowed_command(GH, ["api", "--method", "DELETE", "/repos/x"])
     assert not allowed_command(GH, ["arbitrary-alias"])
+
+
+# --- a help request needs no allow entry ---
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--help"],
+        ["-h"],
+        ["--version"],
+        # A group the allowlist only names deeper, the common probe.
+        ["repo", "--help"],
+        # A verb the allowlist refuses: cobra and commander print help and exit.
+        ["repo", "delete", "o/r", "--help"],
+        ["help", "repo", "delete"],
+    ],
+)
+def test_a_help_request_is_admitted_without_an_allow_entry(argv):
+    """An agent learns a CLI by asking it. Refusing `acli jira --help` because only
+    `jira workitem view` is listed sent 1,113 of avery's calls back as refusals,
+    and the help text never reaches the server."""
+    assert allowed_command(GH, argv) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # A flag before `--help` may take it as its value. gh then runs the DELETE
+        # with `--jq --help`, so no flag may come first.
+        ["api", "-X", "DELETE", "repos/o/r", "--jq", "--help"],
+        ["pr", "comment", "1", "--body", "--help"],
+        # `--help` has to be last, or the argv is more than a question.
+        ["repo", "delete", "o/r", "--help", "--yes"],
+        # A trailing `help` word is an argument to gh: `repo delete help` deletes
+        # a repository named help.
+        ["repo", "delete", "help"],
+        # And `--help` is not a help request when a word follows it.
+        ["--help", "repo", "delete", "o/r"],
+    ],
+)
+def test_a_help_flag_does_not_admit_a_command_that_can_still_run(argv):
+    assert allowed_command(GH, argv) is False
+
+
+def test_a_help_request_still_meets_the_readback_refusal():
+    """Admitted past the allowlist, not past the credential check behind it."""
+    assert allowed_command(GH, ["auth", "token", "--help"]) is True
+    assert refuses_readback(GH, ["auth", "token", "--help"]) is True
+
+
+# --- the read-only method gate ---
+
+# `gh api` is one prefix covering the whole REST API, so an operator who wants
+# the reads cannot have them without the writes. This tool opts `api` into the
+# gate and leaves `pr view` on the ordinary allowlist, which is the shape the
+# feature exists for.
+REST = ShimmedTool(name="gh", allow=(("pr", "view"),), allow_read_only=(("api",),))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["api", "repos/o/r"], id="bare-endpoint-defaults-to-get"),
+        pytest.param(
+            ["api", "repos/o/r/contents/x", "--jq", ".content"], id="read-a-file"
+        ),
+        pytest.param(
+            ["api", "--method", "GET", "search/repositories", "-f", "q=x"],
+            id="explicit-get-keeps-its-parameters",
+        ),
+        pytest.param(["api", "--method=get", "repos/o/r"], id="lowercase-equals-form"),
+        pytest.param(["api", "-X", "HEAD", "repos/o/r"], id="head-is-a-read"),
+    ],
+)
+def test_a_read_only_prefix_allows_a_read(argv):
+    assert allowed_command(REST, argv)
+    assert not refused_as_write(REST, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(
+            [
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/r",
+                "-f",
+                "security_and_analysis[secret_scanning_push_protection][status]=enabled",
+            ],
+            id="the-real-patch-from-the-transcripts",
+        ),
+        pytest.param(["api", "--method", "DELETE", "/repos/x"], id="explicit-delete"),
+        pytest.param(["api", "--method=post", "repos/o/r"], id="equals-form-post"),
+        # gh's own help: "The default HTTP request method is GET normally and
+        # POST if any parameters were added." A gate that only reads --method
+        # would wave this through as a read.
+        pytest.param(["api", "repos/o/r", "-f", "a=b"], id="parameters-imply-post"),
+        pytest.param(["api", "repos/o/r", "--field", "a=b"], id="long-field-form"),
+        pytest.param(["api", "repos/o/r", "-F", "a=@f"], id="short-typed-field"),
+        pytest.param(
+            ["api", "graphql", "-f", "query=mutation{}"], id="graphql-is-a-post"
+        ),
+        # A flag with no value is a malformed invocation, not a read.
+        pytest.param(["api", "repos/o/r", "-X"], id="method-flag-without-a-value"),
+    ],
+)
+def test_a_read_only_prefix_refuses_a_write(argv):
+    assert not allowed_command(REST, argv)
+    assert refused_as_write(REST, argv)
+
+
+def test_the_gate_does_not_widen_the_ordinary_allowlist():
+    assert allowed_command(REST, ["pr", "view", "1"])
+    # `pr view` is on `allow`, so the method is irrelevant to it.
+    assert allowed_command(REST, ["pr", "view", "-X", "DELETE"])
+    assert not allowed_command(REST, ["repo", "delete", "o/r"])
+    assert not refused_as_write(REST, ["repo", "delete", "o/r"])
+
+
+def test_a_tool_without_the_gate_is_unchanged():
+    plain = ShimmedTool(name="gh", allow=(("api",),))
+    assert allowed_command(plain, ["api", "-X", "DELETE", "repos/o/r"])
+    assert not refused_as_write(plain, ["api", "-X", "DELETE", "repos/o/r"])
+
+
+def test_the_gate_alone_is_enough_to_admit_a_command():
+    only = ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert allowed_command(only, ["api", "repos/o/r"])
+    assert not allowed_command(only, ["pr", "view"])
+
+
+def test_allow_read_only_is_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {"tools": [{"name": "gh", "allow_read_only": ["api", "gist view"]}]},
+        source="test",
+    )
+    assert tool.allow_read_only == (("api",), ("gist", "view"))
+    assert tool.allow == ()
+
+
+def test_a_malformed_allow_read_only_is_refused():
+    with pytest.raises(ValueError, match="allow_read_only"):
+        commands.parse_tools(
+            {"tools": [{"name": "gh", "allow_read_only": "api"}]}, source="test"
+        )
 
 
 # --- broker lifecycle and dispatch ---
@@ -253,6 +404,29 @@ async def test_command_allowlist_denies_unlisted_subcommands(tmp_path):
         assert allowed["rc"] == 0
         assert denied["rc"] == 126
         assert denied["refused"] is True
+    finally:
+        await broker.stop()
+
+
+async def test_the_broker_says_why_it_refused_a_write(tmp_path):
+    """A refused write must not read as a missing allowlist entry.
+
+    The generic wording sends the agent to ask for a prefix the operator has
+    already configured, which is a question nobody can act on.
+    """
+    tool = ShimmedTool(name="echo", allow_read_only=(("api",),))
+    broker, _port = await start(tmp_path, (tool,))
+    try:
+        read = await post(broker, {"tool": "echo", "argv": ["api", "repos/o/r"]})
+        write = await post(
+            broker, {"tool": "echo", "argv": ["api", "repos/o/r", "-X", "PATCH"]}
+        )
+        unlisted = await post(broker, {"tool": "echo", "argv": ["gist", "create"]})
+        assert read["rc"] == 0
+        assert write["rc"] == 126 and write["refused"] is True
+        assert "asks the server to write" in write["stderr"]
+        assert unlisted["rc"] == 126
+        assert "not allowlisted" in unlisted["stderr"]
     finally:
         await broker.stop()
 
@@ -484,6 +658,7 @@ def test_path_untouched_when_no_shims_exist(monkeypatch, tmp_path):
 
     monkeypatch.setenv("COTF_SANDBOX", "env")
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(ENDPOINT_ENV, "http://127.0.0.1:9999")
     monkeypatch.setattr(sandbox, "shim_dir", lambda: tmp_path / "absent")
     assert (sandbox.agent_env() or {})["PATH"] == "/usr/bin"
 
@@ -496,8 +671,23 @@ def test_path_gets_the_shim_dir_when_populated(monkeypatch, tmp_path):
     (shims / "gh").write_text("#!/bin/sh\n")
     monkeypatch.setenv("COTF_SANDBOX", "env")
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(ENDPOINT_ENV, "http://127.0.0.1:9999")
     monkeypatch.setattr(sandbox, "shim_dir", lambda: shims)
     assert (sandbox.agent_env() or {})["PATH"] == f"{shims}:/usr/bin"
+
+
+def test_a_daemon_without_a_broker_gets_the_real_binaries(monkeypatch, tmp_path):
+    """A daemon that shares the shim dir but runs no broker."""
+    from claude_on_the_fly import sandbox
+
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    (shims / "gh").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("COTF_SANDBOX", "env")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv(ENDPOINT_ENV, raising=False)
+    monkeypatch.setattr(sandbox, "shim_dir", lambda: shims)
+    assert (sandbox.agent_env() or {})["PATH"] == "/usr/bin"
 
 
 def test_endpoint_var_survives_env_curation(monkeypatch):
@@ -698,8 +888,83 @@ def test_acli_has_no_token_readback_because_none_exists():
 
 def test_bundled_config_parses_and_ships_gh_and_acli():
     tools = {t.name: t for t in commands.load_tools()}
-    assert "gh" in tools and "acli" in tools
+    assert "gh" in tools and "acli" in tools and "aws" in tools
     assert ("auth", "token") in tools["gh"].readback
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "diff", "12", "--name-only"],
+        ["pr", "checks", "12"],
+        ["pr", "status"],
+        ["issue", "status"],
+        ["label", "list"],
+        ["workflow", "view", "ci.yml", "--yaml"],
+        ["release", "view", "v1.0"],
+        ["search", "code", "func main", "--repo", "o/r"],
+    ],
+)
+def test_bundled_gh_allows_common_reads(argv):
+    gh = {t.name: t for t in commands.load_tools()}["gh"]
+    assert allowed_command(gh, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "checkout", "12"],
+        ["run", "download", "1"],
+        ["release", "download", "v1.0"],
+        ["release", "create", "v1.0"],
+        ["api", "repos/o/r"],
+        ["secret", "list"],
+    ],
+)
+def test_bundled_gh_still_refuses_writes_and_api(argv):
+    gh = {t.name: t for t in commands.load_tools()}["gh"]
+    assert not allowed_command(gh, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sts", "get-caller-identity"],
+        ["s3", "ls", "s3://bucket/prefix/"],
+        ["logs", "tail", "/aws/lambda/fn", "--since", "1h", "--profile", "prod"],
+        ["ecs", "describe-services", "--cluster", "c", "--services", "s"],
+        ["cloudformation", "describe-stack-events", "--stack-name", "s"],
+    ],
+)
+def test_bundled_aws_allows_reads(argv):
+    assert allowed_command(AWS, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["s3", "cp", "s3://bucket/key", "."],
+        ["lambda", "get-function-configuration", "--function-name", "fn"],
+        ["secretsmanager", "get-secret-value", "--secret-id", "x"],
+        ["ssm", "get-parameter", "--name", "x", "--with-decryption"],
+        ["ec2", "terminate-instances", "--instance-ids", "i-1"],
+    ],
+)
+def test_bundled_aws_refuses_writes_and_secret_reads(argv):
+    assert not allowed_command(AWS, argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["configure", "export-credentials"],
+        ["--profile", "prod", "sts", "get-session-token"],
+        ["--debug", "ecr", "get-login-password"],
+        ["eks", "get-token", "--cluster-name", "c"],
+    ],
+)
+def test_bundled_aws_refuses_credential_readback(argv):
+    assert refuses_readback(AWS, argv)
 
 
 def test_readback_is_written_as_words_not_nested_lists(operator_settings):
@@ -894,6 +1159,29 @@ async def test_a_directory_in_the_shim_dir_is_left_alone(tmp_path, echo_tool):
     (shim_dir / "operator-notes").mkdir()
     CommandBroker(shim_dir, (echo_tool,)).write_shims()
     assert (shim_dir / "operator-notes").is_dir()
+
+
+async def test_a_shim_is_replaced_not_rewritten_in_place(tmp_path, echo_tool):
+    """The chat and jobs daemons share this directory and both write it at
+    start. Rewriting in place lets an agent exec a half-written shim; a rename
+    hands every reader either the old file or the new one."""
+    shim_dir = tmp_path / "shims"
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    before = (shim_dir / "echo").stat().st_ino
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    assert (shim_dir / "echo").stat().st_ino != before
+    assert sorted(p.name for p in shim_dir.iterdir()) == ["echo"]
+
+
+async def test_the_sweep_spares_another_writers_temp_file(tmp_path, echo_tool):
+    """A temp file is not a tool. Sweeping one out from under the other daemon
+    fails its rename and its start."""
+    shim_dir = tmp_path / "shims"
+    shim_dir.mkdir()
+    in_flight = shim_dir / ".echo.4242.tmp"
+    in_flight.write_text("#!/bin/sh\n")
+    CommandBroker(shim_dir, (echo_tool,)).write_shims()
+    assert in_flight.is_file()
 
 
 # --- subprocess failure modes ---
@@ -1108,3 +1396,545 @@ class TestTerminateAlwaysReaps:
         monkeypatch.setattr(type(proc), "kill", lambda self: killed.__setitem__("n", 1))
         await commands._terminate(proc)
         assert killed["n"] == 0
+
+
+# --------------------------------------------------------------------------
+# allow_paths: broker roots outside the workspace
+# --------------------------------------------------------------------------
+
+
+def test_an_absolute_path_inside_the_workspace_is_allowed(tmp_path):
+    """Judged by where it lands, not by its leading slash. The relative spelling
+    of this exact file was always allowed, so refusing the absolute one guarded
+    nothing and only taught the agent to rewrite the argument."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("x\n")
+    argv = [str(workspace / "notes.md")]
+    assert commands._unsafe_path_argument(argv, str(workspace), [workspace]) is None
+
+
+def test_a_client_declared_cwd_is_not_an_allow_root(tmp_path):
+    """`_workspace_cwd` only vets the cwd when there is a workspace to vet it
+    against. Without one it accepts whatever the client said, so promoting that to
+    a root would make a declared cwd of `/` admit every absolute path on the host.
+    The workspace is passed in explicitly for exactly this reason."""
+    assert commands._unsafe_path_argument(["/etc/passwd"], "/") == "/etc/passwd"
+
+
+def test_an_absolute_path_outside_the_workspace_still_needs_a_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    argv = [str(outside / "secret.txt")]
+    assert commands._unsafe_path_argument(argv, str(workspace)) == argv[0]
+    assert (
+        commands._unsafe_path_argument(argv, str(workspace), [outside.resolve()])
+        is None
+    )
+
+
+def test_a_root_does_not_admit_its_sibling(tmp_path):
+    """Containment, not prefix matching: `/tmp/a` must not admit `/tmp/ab`."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "ab").mkdir()
+    argv = [str(tmp_path / "ab" / "f.txt")]
+    assert (
+        commands._unsafe_path_argument(
+            argv, str(workspace), [(tmp_path / "a").resolve()]
+        )
+        == argv[0]
+    )
+
+
+def test_a_symlink_cannot_lead_out_of_an_allowed_root(tmp_path):
+    """The agent's workspace is writable, so it can plant a link. Containment is
+    checked after resolving for exactly this reason."""
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "root"
+    secret = tmp_path / "secret"
+    workspace.mkdir()
+    root.mkdir()
+    secret.mkdir()
+    (secret / "token").write_text("x\n")
+    (root / "escape").symlink_to(secret)
+    argv = [str(root / "escape" / "token")]
+    assert (
+        commands._unsafe_path_argument(argv, str(workspace), [root.resolve()])
+        == argv[0]
+    )
+
+
+def test_allowed_roots_refuses_a_credential_store(caplog, tmp_path):
+    """The broker runs outside the sandbox with the operator's real credential, so
+    a root reaching a key store is sharper here than the same entry would be in
+    `sandbox.extra_paths`. Checked against that same list rather than a copy.
+
+    The surviving root is a `tmp_path` child rather than `/tmp` itself: the suite
+    puts its fake home under the system temp directory, so `/tmp` contains that
+    home and is refused for a real reason. Naming it here made the test pass on
+    macOS, where TMPDIR is elsewhere, and fail on Linux CI.
+    """
+    keep = tmp_path / "reports"
+    keep.mkdir()
+    tool = ShimmedTool(name="gh", allow_paths=frozenset({"~/.ssh", str(keep)}))
+    with caplog.at_level("ERROR"):
+        roots = commands.allowed_roots(tool)
+    assert roots == [Path(os.path.realpath(keep))]
+    assert ".ssh" in caplog.text
+
+
+def test_allowed_roots_is_empty_without_configuration():
+    """Absent the key, the guard behaves exactly as it did before."""
+    assert commands.allowed_roots(ShimmedTool(name="gh")) == []
+
+
+def test_allow_paths_is_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {"tools": [{"name": "gh", "allow": ["pr view"], "allow_paths": ["/tmp"]}]},
+        source="test",
+    )
+    assert tool.allow_paths == frozenset({"/tmp"})
+
+
+# --------------------------------------------------------------------------
+# boolean_flags: flags that never take the next token as their value
+# --------------------------------------------------------------------------
+
+SYSTEMCTL = ShimmedTool(
+    name="systemctl",
+    allow=(("status",), ("is-active",)),
+    boolean_flags=frozenset({"--user", "--quiet"}),
+)
+
+
+def test_boolean_flags_are_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {
+            "tools": [
+                {"name": "systemctl", "allow": ["status"], "boolean_flags": ["--user"]}
+            ]
+        },
+        source="test",
+    )
+    assert tool.boolean_flags == frozenset({"--user"})
+
+
+def test_a_declared_boolean_flag_does_not_swallow_the_subcommand():
+    """`systemctl --user status x` is the everyday spelling, and reading
+    `--user` as taking a value hid `status` from the allowlist."""
+    assert leading_tokens(
+        ["--user", "status", "x"], boolean_flags=frozenset({"--user"})
+    ) == ("status", "x")
+    assert allowed_command(SYSTEMCTL, ["--user", "status", "cotf"]) is True
+    assert allowed_command(SYSTEMCTL, ["--user", "--quiet", "is-active", "x"]) is True
+
+
+def test_an_undeclared_flag_still_takes_a_value():
+    """Only the listed flags change; every other bare flag keeps the reading
+    the allowlist had before, so a tool without the key behaves as it did."""
+    assert allowed_command(SYSTEMCTL, ["-H", "status", "is-active"]) is True
+    assert allowed_command(SYSTEMCTL, ["--user", "stop", "cotf"]) is False
+    assert (
+        allowed_command(
+            ShimmedTool(name="systemctl", allow=(("status",),)),
+            [
+                "--user",
+                "status",
+                "x",
+            ],
+        )
+        is False
+    )
+
+
+def test_a_write_refusal_reads_boolean_flags_too():
+    tool = ShimmedTool(
+        name="gh",
+        allow_read_only=(("api",),),
+        boolean_flags=frozenset({"--paginate"}),
+    )
+    assert refused_as_write(tool, ["--paginate", "api", "-f", "a=b", "x"]) is True
+
+
+def test_boolean_flags_keep_the_second_readback_reading():
+    """The declared table sharpens the first reading; the reading where no
+    flag takes a value still runs, so a wrong declaration cannot open a
+    readback."""
+    tool = ShimmedTool(
+        name="gh",
+        readback=frozenset({("auth", "token")}),
+        boolean_flags=frozenset({"--verbose"}),
+    )
+    assert refuses_readback(tool, ["--verbose", "auth", "token"]) is True
+    assert refuses_readback(tool, ["--hostname", "auth", "token"]) is True
+
+
+# --------------------------------------------------------------------------
+# value_flags: flags that always take the next token as their value
+# --------------------------------------------------------------------------
+
+TWG = ShimmedTool(
+    name="twg",
+    allow=(("jira", "workitem", "get"),),
+    readback=frozenset({("auth",)}),
+    value_flags=frozenset({"-o", "--output-summary", "-s"}),
+)
+
+
+def test_value_flags_are_parsed_from_configuration():
+    (tool,) = commands.parse_tools(
+        {"tools": [{"name": "twg", "allow": ["jira"], "value_flags": ["-o"]}]},
+        source="test",
+    )
+    assert tool.value_flags == frozenset({"-o"})
+
+
+def test_a_flag_cannot_be_both_boolean_and_value():
+    with pytest.raises(ValueError, match="both boolean_flags and value_flags"):
+        commands.parse_tools(
+            {
+                "tools": [
+                    {
+                        "name": "twg",
+                        "boolean_flags": ["-o"],
+                        "value_flags": ["-o"],
+                    }
+                ]
+            },
+            source="test",
+        )
+
+
+def test_a_declared_value_flag_before_the_subcommand_is_admitted():
+    """`twg -o json --output-summary inline jira workitem get` is how avery's
+    skill writes it: 35 of its twg calls were refused only because the reading
+    where no flag takes a value saw `json inline jira` as the subcommand."""
+    argv = ["-o", "json", "--output-summary", "inline", "jira", "workitem", "get", "X"]
+    assert allowed_command(TWG, argv) is True
+    assert hidden_by_a_leading_flag(TWG, argv) is False
+
+
+def test_an_undeclared_flag_before_the_subcommand_is_still_refused():
+    """Only the listed flags change. `--agent-fields` is not declared here, so
+    the command stays refused and the agent is told to move the flag."""
+    argv = ["--agent-fields", "data.key", "jira", "workitem", "get", "X"]
+    assert allowed_command(TWG, argv) is False
+    assert hidden_by_a_leading_flag(TWG, argv) is True
+
+
+def test_a_declared_value_flag_does_not_hide_a_verb_from_the_allowlist():
+    """The value is skipped, not the verb after it. `-o delete jira workitem
+    get` reads as `jira workitem get` with `-o delete`, which is what the CLI
+    does with a flag that takes a value."""
+    assert allowed_command(TWG, ["-o", "json", "jira", "workitem", "delete"]) is False
+
+
+def test_value_flags_keep_the_second_readback_reading():
+    """A wrong declaration must not open a readback. If `-s` were really
+    boolean, `twg -s auth` runs `auth`, so the readback check still reads
+    every flag both ways."""
+    assert refuses_readback(TWG, ["-s", "auth"]) is True
+    assert refuses_readback(TWG, ["-s", "site", "auth"]) is True
+
+
+# --------------------------------------------------------------------------
+# path introducers: @file and file:// URLs
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["@/etc/passwd"], id="curl-style @file"),
+        pytest.param(["file:///etc/passwd"], id="file URL"),
+        pytest.param(["-F", "body=@/etc/passwd"], id="typed field on a bare token"),
+        pytest.param(["--field=body=@/etc/passwd"], id="typed field inside a flag"),
+        pytest.param(["body=@file:///etc/passwd"], id="both forms nested"),
+        pytest.param(["file://localhost/etc/passwd"], id="file URL with an authority"),
+        pytest.param(["file://./etc/passwd"], id="file URL with a dot authority"),
+        pytest.param(["@file://localhost/etc/passwd"], id="authority behind an @"),
+        pytest.param(["@~/.ssh/id_rsa"], id="@ with a home-relative path"),
+        pytest.param(["@../../etc/passwd"], id="@ with a traversal"),
+    ],
+)
+def test_a_path_behind_an_introducer_is_refused(tmp_path, argv):
+    """`@` and `file://` mean "what follows is a file" to curl, gh, http and jq,
+    and neither makes the argument start with `/`. Before this, `gh api -F
+    body=@/etc/passwd` arrived as one token that read as an ordinary relative
+    name inside the workspace, so the guard passed it."""
+    assert commands._unsafe_path_argument(argv, str(tmp_path)) == argv[-1]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["--from", "@alice"], id="a slack handle"),
+        pytest.param(["whois", "@carol"], id="a handle as a subcommand argument"),
+        pytest.param(["--to", "a@b.com"], id="an email address"),
+        pytest.param(["@notes.md"], id="@ with a workspace-relative file"),
+        pytest.param(["send", "#chan", "text with an @ in it"], id="prose"),
+    ],
+)
+def test_an_introducer_does_not_refuse_an_ordinary_argument(tmp_path, argv):
+    """Emitting an extra candidate rather than refusing the argument is what
+    keeps this cheap to be wrong about: the extra form only matters when it is
+    absolute or traversing, so a handle yields a relative name and is allowed."""
+    assert commands._unsafe_path_argument(argv, str(tmp_path)) is None
+
+
+def test_a_file_url_authority_does_not_hide_the_path(tmp_path):
+    """RFC 8089 makes `file://localhost/etc/passwd` mean `/etc/passwd`, and curl
+    reads it -- measured against a real file. Stripping only the scheme leaves
+    `localhost/etc/passwd`, which is relative, so the guard passed it."""
+    assert commands._introduced_paths("file://localhost/etc/passwd") == [
+        "file://localhost/etc/passwd",
+        "localhost/etc/passwd",
+        "/etc/passwd",
+    ]
+
+
+def test_an_introduced_path_inside_an_allowed_root_still_runs(tmp_path):
+    """The introducer changes what the guard *sees*, not what it permits: a root
+    the operator granted still admits the file behind an `@`."""
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "shared"
+    workspace.mkdir()
+    root.mkdir()
+    argv = ["--file", "@" + str(root / "report.md")]
+    assert commands._unsafe_path_argument(argv, str(workspace)) == argv[-1]
+    assert commands._unsafe_path_argument(argv, str(workspace), [root]) is None
+
+
+# --------------------------------------------------------------------------
+# attached short-flag values, and the spellings a parser accepts for a flag
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["api", "repos/o/r", "-X", "POST"], id="separated method"),
+        pytest.param(["api", "repos/o/r", "-X=POST"], id="equals method"),
+        pytest.param(["api", "repos/o/r", "-XPOST"], id="attached method"),
+        pytest.param(["api", "repos/o/r", "-f", "name=x"], id="separated field"),
+        pytest.param(["api", "repos/o/r", "-fname=x"], id="attached raw field"),
+        pytest.param(["api", "repos/o/r", "-F", "name=x"], id="separated typed field"),
+        pytest.param(["api", "repos/o/r", "-Fname=x"], id="attached typed field"),
+        pytest.param(["api", "repos/o/r", "--input", "/dev/null"], id="input file"),
+        pytest.param(["api", "repos/o/r", "--input=/dev/null"], id="input file equals"),
+        pytest.param(["api", "repos/o/r", "--raw-field=name=x"], id="raw field equals"),
+    ],
+)
+def test_a_write_is_refused_in_every_spelling_gh_accepts(argv):
+    """Each of these makes real gh send POST, measured against gh 2.100.0 pointed
+    at a local server that reports the method it received. Reading only the
+    separated spellings let `-XPOST` and `-fname=x` through a read-only
+    allowlist, which is a write performed with the operator's credential."""
+    tool = commands.ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert commands.allowed_command(tool, argv) is False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["api", "repos/o/r"], id="no flags"),
+        pytest.param(["api", "repos/o/r", "-i"], id="include headers"),
+        pytest.param(["api", "repos/o/r", "--paginate"], id="paginate"),
+        pytest.param(["api", "repos/o/r", "-q", ".name"], id="jq filter, short"),
+        pytest.param(["api", "repos/o/r", "--jq", ".name"], id="jq filter, long"),
+        pytest.param(["api", "repos/o/r", "-X", "GET"], id="explicit GET"),
+        pytest.param(["api", "repos/o/r", "-XGET"], id="attached explicit GET"),
+    ],
+)
+def test_a_read_still_runs(argv):
+    """Measured as GET by the same harness. A guard that refuses these is broken,
+    not secure."""
+    tool = commands.ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert commands.allowed_command(tool, argv) is True
+
+
+def test_an_attached_value_is_only_read_off_a_short_flag():
+    """A long flag never carries its value glued on, so reading `--methodological`
+    as `--method` with the value `ological` would invent a flag gh does not have."""
+    assert commands._attached_short_value("-XPOST", "-X") == "POST"
+    assert commands._attached_short_value("-X", "-X") is None
+    assert commands._attached_short_value("--methodological", "--method") is None
+    assert commands._attached_short_value("-YPOST", "-X") is None
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("--show-token", id="bare"),
+        pytest.param("--show-token=true", id="equals true"),
+        pytest.param("--show-token=false", id="equals false"),
+    ],
+)
+def test_a_readback_flag_is_refused_in_every_spelling(token):
+    """Real gh accepts `--show-token=true`: checked against gh 2.100.0, which
+    rejects an invented flag but takes this one. Matching the bare token only let
+    the credential-printing flag through under the spelling nobody wrote down."""
+    tool = commands.ShimmedTool(name="gh", readback_flags=(token.split("=")[0],))
+    assert commands.refuses_readback(tool, ["pr", "list", token]) is True
+
+
+def test_an_ordinary_flag_is_not_read_as_a_readback_flag():
+    tool = commands.ShimmedTool(name="gh", readback_flags=("--show-token",))
+    assert commands.refuses_readback(tool, ["pr", "list", "--json", "number"]) is False
+
+
+# --------------------------------------------------------------------------
+# file URL parsing: scheme case, and percent-decoding
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        pytest.param("FILE:///etc/passwd", id="uppercase scheme"),
+        pytest.param("FiLe:///etc/passwd", id="mixed-case scheme"),
+        pytest.param("@FILE:///etc/passwd", id="uppercase behind an @"),
+        pytest.param("FILE://localhost/etc/passwd", id="uppercase with an authority"),
+    ],
+)
+def test_a_url_scheme_is_matched_whatever_its_case(tmp_path, argument):
+    """RFC 3986 makes a scheme case-insensitive and curl honours it: measured,
+    `curl FILE:///tmp/x` reads the file. Matching only lowercase meant one shift
+    key walked past the guard."""
+    assert commands._unsafe_path_argument([argument], str(tmp_path)) == argument
+
+
+def test_a_percent_encoded_traversal_cannot_leave_the_workspace(tmp_path):
+    """curl percent-decodes a file URL's path, measured: `%2e%2e` becomes `..`.
+    Undecoded, `file://<workspace>/%2e%2e/%2e%2e/etc/passwd` is lexically inside
+    the workspace, so the guard allowed it and curl then read `/etc/passwd`."""
+    argument = f"file://{tmp_path}/%2e%2e/%2e%2e/etc/passwd"
+    assert commands._unsafe_path_argument([argument], str(tmp_path)) == argument
+
+
+def test_decoding_runs_to_a_fixed_point(tmp_path):
+    """A decoded form no longer starts with `file://`, so it would never re-enter
+    the decode branch and a doubly-encoded path would stop one step short of
+    `..`. Past what curl itself does, and taken because over-refusing is the
+    trade this guard makes everywhere."""
+    assert commands._fully_decoded("%252e%252e") == ".."
+    argument = f"file://{tmp_path}/%252e%252e/%252e%252e/etc/passwd"
+    assert commands._unsafe_path_argument([argument], str(tmp_path)) == argument
+
+
+def test_an_ordinary_percent_in_a_name_is_not_a_traversal(tmp_path):
+    assert commands._unsafe_path_argument(["100%-done.md"], str(tmp_path)) is None
+    assert commands._unsafe_path_argument(["report%20final.md"], str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------
+# both flag readings have to admit a command
+# --------------------------------------------------------------------------
+
+
+def test_an_undeclared_boolean_flag_cannot_hide_a_refused_verb():
+    """systemctl reads `--quiet` as boolean, so the verb that runs is `stop`.
+    The value-taking reading swallowed it and matched `status` instead."""
+    tool = ShimmedTool(name="systemctl", allow=(("status",),))
+    assert allowed_command(tool, ["--quiet", "stop", "status"]) is False
+    assert allowed_command(tool, ["status", "--quiet", "cotf"]) is True
+
+
+def test_a_value_flag_before_the_subcommand_is_the_cost():
+    """The one spelling the second reading refuses. None of 1884 real gh, gws
+    and slacker.sh calls on the deployed host used it."""
+    tool = ShimmedTool(name="gh", allow=(("pr", "view"),))
+    assert allowed_command(tool, ["--repo", "o/r", "pr", "view"]) is False
+    assert allowed_command(tool, ["pr", "view", "12", "--repo", "o/r"]) is True
+
+
+def test_a_read_only_prefix_needs_both_readings_too():
+    tool = ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert allowed_command(tool, ["api", "--method", "GET", "repos/o/r"]) is True
+    assert allowed_command(tool, ["--verbose", "delete", "api"]) is False
+
+
+def test_a_split_reading_is_not_reported_as_a_write():
+    """The write wording tells the agent to drop the write. When the readings
+    disagree the request may be a read, so the generic wording is the true one."""
+    tool = ShimmedTool(name="gh", allow_read_only=(("api",),))
+    assert refused_as_write(tool, ["--verbose", "delete", "api"]) is False
+    assert refused_as_write(tool, ["api", "-f", "a=b", "x"]) is True
+
+
+# --------------------------------------------------------------------------
+# paths inside a JSON argument
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--params", '{"body":"/etc/passwd"}'],
+        ["--params", '{"a":[{"b":"../../etc/passwd"}]}'],
+        ['--json={"q":"a=b","f":"/etc/passwd"}'],
+        ["--json", '{"f":"\\u002fetc\\u002fpasswd"}'],
+        ["--json", '{"f":"@/etc/passwd"}'],
+        ["--json", '{"f":"file:///etc/passwd"}'],
+        ["-p" + '{"f":"/etc/passwd"}'],
+        ['body={"f":"/etc/passwd"}'],
+        ["--json", '["~/.ssh/id_ed25519"]'],
+        ["--json", "[" * 5000 + '"/etc/passwd"' + "]" * 5000],
+        # An escape JSON rejects still leaves the literal to check as written.
+        ["--json", '{"f":"/etc/\\q"}'],
+    ],
+)
+def test_a_path_inside_a_json_argument_is_refused(argv):
+    assert commands._unsafe_path_argument(argv) == argv[-1]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--params", '{"q":"name contains \'x\'","pageSize":10}'],
+        ["--params", '{"range":"Sheet1!A1:B2","userId":"me"}'],
+        ["--json", '{"text":"see a/b and c.d"}'],
+        ["--json", "[1, 2, true, null]"],
+        ["--json", "{not json"],
+    ],
+)
+def test_ordinary_json_arguments_still_run(argv):
+    assert commands._unsafe_path_argument(argv) is None
+
+
+async def test_a_leading_flag_refusal_says_to_move_the_flag(tmp_path):
+    """`aws --profile prod logs tail` is refused because the broker cannot tell
+    whether `--profile` takes a value. The CLI accepts the flag after the
+    subcommand, so that is the fix to name, not a trip to the operator."""
+    tool = ShimmedTool(name="echo", allow=(("logs", "tail"),))
+    broker, _port = await start(tmp_path, (tool,))
+    try:
+        leading = await post(
+            broker, {"tool": "echo", "argv": ["--profile", "prod", "logs", "tail", "g"]}
+        )
+        moved = await post(
+            broker, {"tool": "echo", "argv": ["logs", "tail", "g", "--profile", "prod"]}
+        )
+        assert leading["rc"] == 126 and leading["refused"] is True
+        assert "after the subcommand" in leading["stderr"]
+        assert moved["rc"] == 0
+    finally:
+        await broker.stop()
+
+
+def test_bundled_aws_names_the_fix_for_a_leading_profile():
+    aws = {t.name: t for t in commands.load_tools()}["aws"]
+    argv = ["--profile", "prod", "logs", "tail", "/aws/lambda/fn"]
+    assert not allowed_command(aws, argv)
+    assert commands.hidden_by_a_leading_flag(aws, argv)
+
+
+def test_the_move_hint_does_not_fire_for_an_unlisted_subcommand():
+    tool = ShimmedTool(name="aws", allow=(("logs", "tail"),))
+    assert commands.hidden_by_a_leading_flag(tool, ["--profile", "p", "logs", "tail"])
+    assert not commands.hidden_by_a_leading_flag(tool, ["s3", "rm", "x"])
+    assert not commands.hidden_by_a_leading_flag(tool, ["logs", "tail", "g"])

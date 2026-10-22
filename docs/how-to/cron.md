@@ -12,12 +12,14 @@ entries:
     cron: "30 6 * * 1-5"          # Mon-Fri 06:30
     prompt: "Summarise yesterday's merged PRs and post them to the team channel."
     timeout: 1800                 # optional, default 1800s, max 86400
+    profile: cheap                # optional, an agent.profiles block in config.yaml
 
   # 2. producer: the command lists work items, each becomes its own job
   - name: jira
     cron: "*/2 * * * *"
     max_concurrent: 3             # how many of THIS entry's items run at once
     max_fires: 3                  # fires against an unchanged item before parking
+    producer_timeout: 300         # seconds for the command below; default 120, max 3600
     prompt_file: ./prompts/jira.md
     command: |
       acli jira workitem search --jql 'assignee = currentUser() AND status not in (Done)' \
@@ -39,14 +41,19 @@ uv run claude-jobs    # runs the queued work
 
 Output goes to `~/.claude-on-the-fly/logs/cron-<name>-<host>-<date>.log`, agent
 replies included. Config edits are picked up within a minute, no restart.
-`prompt_file` is re-read on every fire, so editing a brief takes effect next fire.
+`prompt_file` is re-read on every fire, so editing a brief takes effect next fire. The
+dashboard's cron tab shows the highlighted entry's command and prompt, with a
+`prompt_file` inlined, so you can read what an entry runs without opening the file. Press
+`v` there for the daemon log instead.
+
+For entries a real deployment runs, see [Cron recipes](cron-recipes.md).
 
 ## The three shapes
 
 | Keys | What happens |
 |---|---|
 | `prompt` or `prompt_file` | One job per fire. Keyed to the entry, so a slow run blocks the next fire instead of overlapping. Fresh session every time. |
-| `command` + a prompt | Producer. Each stdout line is one work item; each becomes a job whose session **resumes** across fires. |
+| `command` + a prompt | Producer. Each stdout line is one work item; each becomes a job whose session **resumes** across fires. Runs in the background, one at a time per entry. |
 | `command` alone | Subprocess run for its side effects. No job, no agent. |
 
 `prompt` and `prompt_file` are mutually exclusive. `max_concurrent` above 1 needs
@@ -78,6 +85,19 @@ you have, and it works: if your workflow moves a ticket's status as the agent
 progresses, progress is visible. An agent that only comments will park after
 `max_fires`, which is usually the right outcome — three attempts with no movement
 is when a human should look.
+
+**One producer runs at a time per entry.** The command runs in the background, so
+it does not hold up any other entry due in the same minute, but a fire that
+arrives while the previous run is still going is skipped and logged:
+
+```
+cron jira: producer from a previous fire is still running, skipping this fire
+```
+
+Nothing is lost, since the next fire polls again. Seeing that line repeatedly
+means the command takes longer than the gap between fires: widen the cron
+expression, or make the command faster. Raise `producer_timeout` only if the
+command is being killed part-way, which logs `timed out after Ns` instead.
 
 Emit the object's fields consistently. Templates render strictly, so an item
 missing a field the template references is skipped with a warning. Give optional
@@ -125,6 +145,45 @@ uv run claude-tui   # then `d` for doctor
 Doctor parses the config and compiles every template, so a bad cron expression, a
 missing `prompt_file`, or a template typo shows up before you start the daemon.
 `claude-cron` also refuses to start on a config it cannot load.
+
+## Running one entry on a different model
+
+Every entry shares the daemon's agent config by default. A job that reads three
+files and posts a line does not need the same model as one that reviews a diff, and
+one global setting cannot serve both.
+
+Name the difference in `~/.claude-on-the-fly/config.yaml`:
+
+```yaml
+agent:
+  backend: codex
+  codex:
+    model: gpt-5
+    effort: high
+
+  profiles:
+    cheap:
+      codex:
+        model: gpt-5-mini
+        effort: low
+```
+
+Then point the entry at it with `profile: cheap`. Keys the profile leaves out are
+inherited, so `cheap` above changes the model and the effort and nothing else. See
+[config.yaml](../reference/config-yaml.md) for the full rules.
+
+Two things to know before you use it:
+
+- A bare `command:` entry cannot take a profile. It runs a shell and never reaches
+  an agent, so the config refuses it rather than accepting a setting that would do
+  nothing.
+- Changing a profile's **model** changes the session identity. A producer entry,
+  whose items resume across fires, starts a fresh transcript on the next fire.
+  Changing only the **effort** does not.
+
+An unknown profile name fails when the daemon loads the config, and a profile
+naming a backend whose CLI is not installed stops the daemon from starting. Neither
+waits for the entry to fire.
 
 ## Concurrency
 

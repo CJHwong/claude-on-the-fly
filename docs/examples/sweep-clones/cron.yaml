@@ -1,0 +1,6 @@
+# Copy this entry into the `entries:` list of ~/.claude-on-the-fly/cron.yaml.
+# Run the script once without --apply first: see sweep_workspace_clones.py.
+- name: sweep-clones
+  cron: "10 3 * * *"
+  timeout: 900
+  command: uv run --script ~/claude-on-the-fly-src/docs/examples/sweep-clones/sweep_workspace_clones.py --apply

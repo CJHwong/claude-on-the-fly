@@ -108,3 +108,40 @@ async def test_only_the_upgrade_button_confirms():
             await pilot.pause()
 
         assert answers == [expected]
+
+
+TWO_STEP_PLAN = Plan(
+    command="git merge --ff-only && uv sync",
+    source="git checkout at /src",
+    prepare="git fetch",
+)
+
+
+async def _rendered(plan: Plan) -> str:
+    app = _Host()
+    async with app.run_test() as pilot:
+        screen = UpgradeScreen(plan, [])
+        await app.push_screen(screen)
+        await pilot.pause()
+        return " ".join(str(node.content) for node in screen.query(Static).results())
+
+
+async def test_a_two_step_upgrade_says_which_step_needs_the_daemons_down():
+    """The fetch costs nobody an answer, and the operator deciding whether to
+    upgrade now is exactly who needs to know that."""
+    rendered = await _rendered(TWO_STEP_PLAN)
+
+    assert "1. git fetch" in rendered
+    assert "daemons keep running" in rendered
+    assert "2. git merge --ff-only && uv sync" in rendered
+    assert "daemons stop for this one" in rendered
+    assert "Step 1 runs live" in rendered
+
+
+async def test_a_one_step_upgrade_does_not_invent_a_first_step():
+    """The uv-tool shape resolves to a single command. The modal must not imply
+    a live step that will not happen."""
+    rendered = await _rendered(PLAN)
+
+    assert "daemons keep running" not in rendered
+    assert "Step 1" not in rendered

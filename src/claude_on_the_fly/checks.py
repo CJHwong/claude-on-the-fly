@@ -216,6 +216,125 @@ def check_config_file(frontend: str) -> list[CheckResult]:
     ]
 
 
+def check_commands() -> list[CheckResult]:
+    """Validate the operator's `commands:` section the way the broker reads it.
+
+    Every failure this catches is silent at runtime, which is why doctor is where
+    it has to surface. A malformed section does not stop a daemon: `load_tools`
+    logs an ERROR, falls back to the bundled tools, and every tool the operator
+    added is simply absent -- the agent then meets an unshimmed binary and fails
+    on its own credential store, which reads as a broken tool rather than as a
+    config error. A tool that is not on PATH is skipped just as quietly, and
+    deliberately so (shimming an absent binary would turn "command not found"
+    into a confusing broker error), but an operator who just added it reads that
+    silence as "configured". And an override that drops a bundled readback
+    refusal is the one edit in this section that can hand the agent a credential.
+
+    Takes no env: what the broker will do is decided by the file and by PATH.
+    """
+    # Deferred like the import in `fix_hint`: commands reaches agent through
+    # logs, and checks is imported at TUI startup, where that chain is dead
+    # weight for every screen that never opens doctor.
+    from claude_on_the_fly import commands, settings
+
+    raw = settings.operator("commands")
+    if not raw:
+        return []
+
+    path = settings.operator_settings()
+    try:
+        tools = commands.parse_tools(raw, source=str(path))
+    except ValueError as exc:
+        return [
+            CheckResult(
+                name="commands",
+                status="invalid",
+                detail=(
+                    f"{exc}; the broker falls back to the bundled tools, so every "
+                    "tool added here is unavailable"
+                ),
+                fix_hint=f"fix the commands: section in {path}",
+            )
+        ]
+
+    bundled_tools = {
+        tool.name: tool
+        for tool in commands.parse_tools(settings.bundled("commands"), source="bundled")
+    }
+
+    results: list[CheckResult] = []
+    for tool in tools:
+        base = bundled_tools.get(tool.name)
+        if shutil.which(tool.name) is None:
+            results.append(
+                CheckResult(
+                    name=tool.name,
+                    status="warn",
+                    detail="not on PATH, so it is skipped and never shimmed",
+                    fix_hint=(
+                        f"install {tool.name} on the daemon's PATH, or drop it "
+                        "from commands.tools"
+                    ),
+                )
+            )
+        elif not tool.allow:
+            # An override with no `allow` is the documented way to disable a
+            # packaged tool, so it is only worth a warning when the operator
+            # added the entry themselves and cannot have meant "refuse always".
+            if base is not None:
+                results.append(
+                    CheckResult(
+                        name=tool.name,
+                        status="ok",
+                        detail="bundled tool disabled by an override with no allow",
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        name=tool.name,
+                        status="warn",
+                        detail="allow is empty, so every invocation is refused",
+                        fix_hint=(
+                            "list the safe leading subcommands under "
+                            f"commands.tools.allow in {path}"
+                        ),
+                    )
+                )
+        else:
+            plural = "" if len(tool.allow) == 1 else "es"
+            results.append(
+                CheckResult(
+                    name=tool.name,
+                    status="ok",
+                    detail=f"shimmed, {len(tool.allow)} allowed prefix{plural}",
+                )
+            )
+
+        if base is None:
+            continue
+        lost = (base.readback - tool.readback) | {
+            (flag,) for flag in base.readback_flags - tool.readback_flags
+        }
+        if lost:
+            names = ", ".join(sorted(" ".join(item) for item in lost))
+            results.append(
+                CheckResult(
+                    name=tool.name,
+                    status="warn",
+                    detail=(
+                        f"the override no longer refuses {names}, which the "
+                        "bundled entry kept out of the sandbox"
+                    ),
+                    fix_hint=(
+                        f"restore the readback refusal for {tool.name} in {path} "
+                        "unless you meant to forward the credential"
+                    ),
+                )
+            )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -366,6 +485,13 @@ def _job_command_error(value: str) -> tuple[Status, str] | None:
         # Same shape as $stop: exact-match, intercepted before the job branch, so
         # a bare "$compact" compacts while "$compact <task>" queues a job.
         return "invalid", "collides with the $compact turn-control prefix"
+    if value == "$model":
+        # Worse than the two above, because $model matches on a prefix: a
+        # trigger equal to it is not merely shadowed for the bare word, it
+        # swallows every message that opens with it. "$model do the thing"
+        # would be read as a model change and refused, and the job its author
+        # meant to queue would never be queued at all.
+        return "invalid", "collides with the $model turn-control prefix"
     if value == "$continue":
         # Intercepted *after* the job branch, so a trigger equal to it shadows
         # the reply soft-limit reset entirely — a gated thread could never be
@@ -663,9 +789,11 @@ def _slack_job_producer_note(env: Mapping[str, str]) -> CheckResult:
 # ---------------------------------------------------------------------------
 
 _VALID_BACKENDS = ("claude", "codex")
-_VALID_MODES = ("native", "ollama")
-# claude-pty is claude-only; codex has no equivalent wrapper.
-_VALID_CLAUDE_MODES = ("native", "ollama", "pty")
+# One list for both backends. They reach pty by different routes -- claude wraps
+# itself in claude-pty, while codex's own backend hosts the interactive binary
+# (see `docs/agent/panes.md`) -- but an operator picks from the same three names
+# either way. A second list only drifted from this one.
+_VALID_MODES = ("native", "ollama", "pty")
 
 
 def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
@@ -688,15 +816,14 @@ def check_backend(env: Mapping[str, str]) -> list[CheckResult]:
     )
 
     mode_var = f"{backend.upper()}_MODE"
-    valid_modes = _VALID_CLAUDE_MODES if backend == "claude" else _VALID_MODES
     mode = env.get(mode_var, "native").lower()
-    if mode not in valid_modes:
+    if mode not in _VALID_MODES:
         results.append(
             CheckResult(
                 name=mode_var,
                 status="invalid",
-                detail=f"{mode!r} (supported: {', '.join(valid_modes)})",
-                fix_hint=f"Set {mode_var}={' or '.join(valid_modes)}",
+                detail=f"{mode!r} (supported: {', '.join(_VALID_MODES)})",
+                fix_hint=f"Set {mode_var}={' or '.join(_VALID_MODES)}",
             )
         )
         return results
@@ -797,13 +924,16 @@ def check_backend_runtime_access(env: Mapping[str, str]) -> list[CheckResult]:
 # withholds the window on purpose (see `ClaudeBackend.run`) because the claude
 # CLI reports one for whichever model it thinks is answering rather than the one
 # ollama routed to — so the gate there has nothing trustworthy to compare
-# against however the threshold is set. codex reports both in its rollout.
+# against however the threshold is set. Every codex mode reports both in its
+# rollout, and pty is no exception: compaction runs on the plain `exec` arm
+# whether or not the turn has a pane.
 _AUTO_COMPACT_CAPABLE: frozenset[tuple[str, str]] = frozenset(
     {
         ("claude", "native"),
         ("claude", "pty"),
         ("codex", "native"),
         ("codex", "ollama"),
+        ("codex", "pty"),
     }
 )
 
@@ -839,14 +969,21 @@ def _check_auto_compact(
     )
 
 
-# Backend/mode pairs whose output we read line by line as it is produced. Not the
-# same set as _AUTO_COMPACT_CAPABLE and not derivable from it: claude's ollama
-# mode streams exactly as native does (the launcher only prepends an argv
-# prefix), while pty returns a single envelope from claude-pty and codex buffers
-# all of stdout before parsing it. Auto-compact's gap is ollama, for an unrelated
-# reason — the window figure describes the wrong model there.
+# Backend/mode pairs whose output we read as the turn produces it. Not the same
+# set as _AUTO_COMPACT_CAPABLE and not derivable from it: claude's ollama mode
+# streams exactly as native does (the launcher only prepends an argv prefix),
+# while claude's pty returns a single envelope from claude-pty. codex reads the
+# rollout as it is written and feeds the same sink from either arm, so both its
+# hosted and unhosted turns narrate. Auto-compact's gap is ollama, for an
+# unrelated reason -- the window figure describes the wrong model there.
 _INTERIM_CAPABLE: frozenset[tuple[str, str]] = frozenset(
-    {("claude", "native"), ("claude", "ollama")}
+    {
+        ("claude", "native"),
+        ("claude", "ollama"),
+        ("codex", "native"),
+        ("codex", "ollama"),
+        ("codex", "pty"),
+    }
 )
 
 
@@ -1250,6 +1387,7 @@ def check_all(env: Mapping[str, str] | None = None) -> dict[str, list[CheckResul
         **{name: check_frontend(name, e) for name in SUPERVISABLE_FRONTENDS},
         "backend": check_backend(e) + check_backend_runtime_access(e),
         "binaries": check_binaries(e),
+        "commands": check_commands(),
     }
 
 

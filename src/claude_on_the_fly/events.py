@@ -41,6 +41,9 @@ EVENT_WORKER_DONE = "worker_done"  # turn loop exited normally
 EVENT_CANCELLED = "cancelled"  # reason in extra: "terminal" | "inactive" | "stall"
 EVENT_RETRY_SCHEDULED = "retry_scheduled"
 EVENT_WORKER_FAILED = "worker_failed"  # unhandled exception in worker
+# A compaction the daemon started on its own, shortly before the prompt cache
+# expired. Same name and fields as rhapsody's, so one report reads both.
+EVENT_SESSION_COMPACTED = "session_compacted"
 
 
 class EventLog:

@@ -38,18 +38,51 @@ _JAIL_PROFILE = _SEATBELT_DIR / "jail.sb"
 _MAX_EXTRA_PATHS = 3
 # Default loopback allow: every loopback port (agent dev servers/tests work).
 _DEFAULT_LOOPBACK = "localhost:*"
-# Fixed loopback allow slots in the jail profile, since SBPL has no arrays. Four
+# Fixed loopback allow slots in the jail profile, since SBPL has no arrays. Five
 # because each loopback grant is a separate parameter, so the profile has to
 # declare a fixed number of slots. The services are the credential broker, the
-# command broker, the CONNECT egress proxy, and -- when permissions mode is
-# `ask` -- the approval service the backends ask about tool calls. A fifth
-# service would need a fifth slot here and in both profiles.
-_LOOPBACK_SLOTS = 4
+# command broker, the CONNECT egress proxy, the approval service when
+# permissions mode is `ask`, and the ollama server for an ollama turn. A sixth
+# service would need a sixth slot here and in jail.sb.
+_LOOPBACK_SLOTS = 5
 # Runtime read slots in fs-deny-most.sb: the launcher's directory, the resolved
 # binary's directory, sys.prefix, sys.base_prefix, package dir. Five because a
 # launcher and the code it runs need not share a directory: `claude` is a symlink
 # in ~/.local/bin pointing into ~/.local/share/claude/versions/<v>.
-_RUNTIME_SLOTS = 5
+# Sixteen. Five silently truncated the list, and a dropped grant reads as a
+# missing binary or a dead interpreter rather than as a denial, so the ceiling
+# has to clear the worst case rather than the common one. Measured on the widest
+# real argv, `claude-pty`, which contributes itself plus the `claude` and `tmux`
+# it execs, each as written and as resolved, each with the `lib/` beside it, plus
+# sys.prefix, sys.base_prefix and the package directory: eleven. The rest is
+# headroom for a deeper layout, and the overflow still warns.
+_RUNTIME_SLOTS = 16
+# Metadata slots for the directories between $HOME and the project dir. A read
+# grant on the project subpath says nothing about its parents, and an opaque
+# $HOME denies even stat() on them, which breaks any tool that canonicalizes its
+# cwd: git's repository discovery realpath()s every component, so `git init`,
+# `git clone` and `git status` inside the workspace all died with "Operation not
+# permitted" on the home directory (measured on macOS 26 with the stock profile).
+# Eight covers `$HOME/.claude-on-the-fly/workspaces/<platform>/<kind>/<name>`
+# with room for a data dir a few levels deeper; a longer chain is truncated from
+# the top and logged, since every link is needed for the walk to succeed.
+_ANCESTOR_SLOTS = 8
+# Read slots for what the operator's codex home links *out* to. A grant on that
+# home covers the links themselves and nothing behind them, because seatbelt
+# matches the path the kernel resolves, so an entry symlinked elsewhere under the
+# opaque $HOME is unreadable while the profile still claims to grant it. The
+# Linux jail has always mounted these targets read-only; this is the macOS half
+# of the same grant. Measured on a real home where `~/.codex/agents` points at
+# `~/.agents/agents`: codex exited 1 with "Operation not permitted (os error 1)"
+# and the kernel logged `deny(1) file-read-data /Users/<user>/.agents/agents`.
+# Eight because the list is collapsed to its shortest roots first, which took a
+# home with 54 link targets down to 3; the rest is headroom, and an overflow
+# warns and names what it dropped.
+_CODEX_LINK_SLOTS = 8
+
+# The data dir's `cron.yaml` and `config.yaml`, when either is a link into a
+# write grant. One slot each, so this never overflows.
+_PROTECT_SLOTS = 2
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -61,7 +94,7 @@ def _fs_base_profile() -> Path:
     return _BASE_PROFILE
 
 
-def _loopback_specs(ports: list[str]) -> tuple[str, str, str, str]:
+def _loopback_specs(ports: list[str]) -> tuple[str, str, str, str, str]:
     """The remote-ip values for the jail's loopback allows, one per slot.
 
     Narrows to just the local services the agent was handed when
@@ -93,7 +126,7 @@ def _loopback_specs(ports: list[str]) -> tuple[str, str, str, str]:
         )
     specs = [f"localhost:{port}" for port in ports[:_LOOPBACK_SLOTS]]
     specs += [specs[0]] * (_LOOPBACK_SLOTS - len(specs))
-    return specs[0], specs[1], specs[2], specs[3]
+    return specs[0], specs[1], specs[2], specs[3], specs[4]
 
 
 def jail_argv(
@@ -108,10 +141,18 @@ def jail_argv(
     claude_project: Path | str,
     codex_sessions: Path | str,
     codex_home: Path | str,
+    codex_operator_home: Path | str,
+    pane_socket: Path | str,
     base: Path,
-    loopback: tuple[str, str, str, str],
+    loopback: tuple[str, str, str, str, str],
     extra_paths: list[str],
+    write_paths: list[str] | None = None,
+    protect_paths: list[str] | None = None,
+    unprotect_paths: list[str] | None = None,
+    codex_link_paths: list[str] | None = None,
     runtime_paths: list[str] | None = None,
+    ancestor_paths: list[str] | None = None,
+    codex_auth_file: Path | str | None = None,
     profile: Path | None = None,
     sandbox_exec: str = "sandbox-exec",
 ) -> list[str]:
@@ -133,7 +174,7 @@ def jail_argv(
     # leave this one pointing at the original and the substitution would silently
     # not happen.
     profile = profile or _JAIL_PROFILE
-    first, second, third, fourth = loopback
+    first, second, third, fourth, fifth = loopback
     params = [
         "-D",
         f"_HOME={home}",
@@ -158,6 +199,10 @@ def jail_argv(
         "-D",
         f"_CODEX_HOME={codex_home}",
         "-D",
+        f"_CODEX_OPERATOR_HOME={codex_operator_home}",
+        "-D",
+        f"_PANE_SOCKET={pane_socket}",
+        "-D",
         f"_BASE={base}",
         "-D",
         f"_LOOPBACK={first}",
@@ -167,6 +212,12 @@ def jail_argv(
         f"_LOOPBACK_ALT2={third}",
         "-D",
         f"_LOOPBACK_ALT3={fourth}",
+        "-D",
+        f"_LOOPBACK_ALT4={fifth}",
+        # jail.sb denies this path, and every name that starts with it, after both
+        # bases. A path nothing uses when the broker does not hold the login.
+        "-D",
+        f"_CODEX_AUTH={codex_auth_file or '/.cotf-unused-codex-auth'}",
     ]
     # fs-allow-reads.sb does not reference _EXTRA_*; only fs-deny-most.sb does,
     # so only pass them there. Pad unused slots with the project dir (a no-op).
@@ -175,14 +226,95 @@ def jail_argv(
         extra += [str(project)] * (_MAX_EXTRA_PATHS - len(extra))
         for index, path in enumerate(extra, start=1):
             params += ["-D", f"_EXTRA_{index}={path}"]
+        # Operator write grants (COTF_SANDBOX_WRITE_PATHS). Same fixed-slot trade
+        # as _EXTRA_*, but padded with a name under the project rather than the
+        # project itself, and not with a real directory either. Both of the
+        # obvious pads are wrong, and each was measured wrong:
+        #
+        #   _PROJECT_DIR, which every read slot pads with, is a *write* allow here
+        #   sitting below the project write denies, so it re-opens `.git/hooks`,
+        #   `.mcp.json`, `.vscode` and the shell rc files. That is the
+        #   `_CODEX_HOME` bug in docs/agent/security-findings.md a second time;
+        #   tests/test_sandbox_parity.py fails on all seven denies.
+        #
+        #   _TMPDIR looks inert because it is already writable, but the slots now
+        #   carry a scoped `.env` write deny as well as an allow, and that deny
+        #   then applies to the whole temp directory. Measured: creating a `.env`
+        #   in a workspace under TMPDIR was refused.
+        #
+        # A path that does not exist is inert for both halves, and keeping it
+        # under the project means it is inside an already-writable tree if the
+        # agent ever creates it.
+        writes = [*(write_paths or [])]
+        unused = str(Path(project) / ".cotf-unused-write-slot")
+        writes += [unused] * (_MAX_EXTRA_PATHS - len(writes))
+        for index, path in enumerate(writes, start=1):
+            params += ["-D", f"_WRITE_{index}={path}"]
+        # Unprotect pads with the same inert name. `_UNPROTECT_*` are write allows after
+        # every deny, so a real directory there would be a grant nobody made.
+        # Capped like the write slots they re-open a part of.
+        # The protect pad is off the project: the profile denies its ancestors
+        # as nodes too, and every ancestor of `/x` is `/`, already unwritable.
+        protects = [*(protect_paths or [])]
+        protects += ["/.cotf-unused-protect-slot"] * (_PROTECT_SLOTS - len(protects))
+        for index, path in enumerate(protects, start=1):
+            params += ["-D", f"_PROTECT_{index}={path}"]
+        unprotects = [*(unprotect_paths or [])][:_MAX_EXTRA_PATHS]
+        unprotects += [unused] * (_MAX_EXTRA_PATHS - len(unprotects))
+        for index, path in enumerate(unprotects, start=1):
+            params += ["-D", f"_UNPROTECT_{index}={path}"]
+        # Where the operator's codex home links out to. Caller-filtered and
+        # caller-collapsed, so a full list here is a real layout rather than
+        # noise, and dropping one hides an instruction file the operator
+        # believes is in force.
+        links = [*(codex_link_paths or [])]
+        if len(links) > _CODEX_LINK_SLOTS:
+            logger.warning(
+                "sandbox: the codex home and claude config link out to %d places "
+                "but there are only %d slots; dropping %s. The backend will report "
+                "those as missing rather than as denied. Name them in "
+                "sandbox.extra_paths",
+                len(links),
+                _CODEX_LINK_SLOTS,
+                links[_CODEX_LINK_SLOTS:],
+            )
+        links = links[:_CODEX_LINK_SLOTS]
+        links += [str(project)] * (_CODEX_LINK_SLOTS - len(links))
+        for index, path in enumerate(links, start=1):
+            params += ["-D", f"_CODEX_LINK_{index}={path}"]
         # Without these the profile cannot exec a backend or interpreter living
         # under the opaque $HOME, which is where npm globals and uv virtualenvs
-        # normally are. Truncated rather than warned on: the caller supplies a
-        # fixed, known set, unlike operator-supplied extra paths.
+        # normally are. The set is caller-supplied and fixed, unlike operator
+        # extra paths, but it is not fixed in *size*: a symlinked install
+        # contributes two entries where a plain one contributes one. Silence here
+        # cost a day, because a dropped grant surfaces as a dead interpreter
+        # rather than as a denial.
+        if len(runtime_paths or []) > _RUNTIME_SLOTS:
+            logger.warning(
+                "sandbox: %d runtime paths but only %d slots; dropping %s. The "
+                "backend or its interpreter may fail to start with an error that "
+                "does not name the sandbox",
+                len(runtime_paths or []),
+                _RUNTIME_SLOTS,
+                [str(path) for path in (runtime_paths or [])[_RUNTIME_SLOTS:]],
+            )
         runtime = [*(runtime_paths or [])][:_RUNTIME_SLOTS]
         runtime += [str(project)] * (_RUNTIME_SLOTS - len(runtime))
         for index, path in enumerate(runtime, start=1):
             params += ["-D", f"_RUNTIME_{index}={path}"]
+        ancestors = [*(ancestor_paths or [])]
+        if len(ancestors) > _ANCESTOR_SLOTS:
+            logger.warning(
+                "sandbox: the project dir sits %d levels below the home; only the "
+                "deepest %d get a metadata grant, so path resolution inside the "
+                "workspace may fail",
+                len(ancestors),
+                _ANCESTOR_SLOTS,
+            )
+            ancestors = ancestors[-_ANCESTOR_SLOTS:]
+        ancestors += [str(project)] * (_ANCESTOR_SLOTS - len(ancestors))
+        for index, path in enumerate(ancestors, start=1):
+            params += ["-D", f"_ANCESTOR_{index}={path}"]
     # The one positive record that the jail was applied. Without it a run with an
     # unset sandbox mode produces a log indistinguishable from a jailed one: both
     # are simply free of denials, and no denials also reads as success.
@@ -195,6 +327,22 @@ def jail_argv(
     )
     logger.debug("sandbox: seatbelt params %s", params)
     return [sandbox_exec, "-f", str(profile), *params, *argv]
+
+
+def home_ancestors(project: str, home: str) -> list[str]:
+    """The directories from `home` down to the parent of `project`, both resolved.
+
+    Empty when the project is not under the home: reads outside `$HOME` are
+    allowed by the profile already, so there is nothing to re-grant. The project
+    itself is excluded because its subpath grant covers it.
+    """
+    project_path, home_path = Path(project), Path(home)
+    if not project_path.is_relative_to(home_path) or project_path == home_path:
+        return []
+    chain = [home_path]
+    for part in project_path.relative_to(home_path).parts[:-1]:
+        chain.append(chain[-1] / part)
+    return [str(directory) for directory in chain]
 
 
 def realpaths(workspace: Path, data_dir: Path) -> dict[str, str]:

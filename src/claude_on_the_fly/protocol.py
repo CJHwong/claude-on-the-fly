@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.approvals import ApprovalRequest
@@ -49,6 +50,11 @@ def nudge_notice(text: str) -> str:
         "I keep failing on this one, so I have stopped retrying it:\n\n"
         f"{strip_sender_markers(text)}\n\nSend it again if you want me to try once more."
     )
+
+
+class LegacyWorkspace(NamedTuple):
+    name: str
+    thread_key: str
 
 
 class Frontend(ABC):
@@ -134,13 +140,17 @@ class Frontend(ABC):
     async def notify_nudge(self, chat_id: int, text: str) -> None:
         """Offer back a turn the daemon has stopped retrying.
 
-        Rare by design: everything else resumes silently, and this is reached
-        only for a turn that hit the replay limit. Default posts the prompt as
+        Recent recoverable work resumes silently. Stale turns and turns that
+        fail or exhaust their replay limit are preserved and offered back.
+        Default posts the prompt as
         text for the person to resend. A frontend with a tappable affordance
         should override and offer it as one, since a button carries the text back
         verbatim with no copy and paste.
         """
         await self.send(chat_id, Response(body=nudge_notice(text)))
+
+    async def retire_failed_turn(self, chat_id: int, route: dict) -> None:
+        """Remove only this failed source from frontend queue bookkeeping."""
 
     async def notify_start(self, chat_id: int) -> None:
         """Signal that processing has started for the next pending message.
@@ -161,10 +171,14 @@ class Frontend(ABC):
 
         Called only while a turn is running, only when `interim.progress` is on,
         and only with the main agent's own text — not thinking, not sub-agent
-        output. The caller has already coalesced and rate-limited it, so one call
-        is one message the user should see. Implementations must mark it as machine
-        progress, distinct from the reply `send()` will post, and must not count it
-        against any reply budget.
+        output. The caller has already coalesced and rate-limited it, and each call
+        carries ONLY what is new since the last one, led by its own elapsed-time
+        header: an implementation that can edit a message should APPEND the chunk
+        to the turn's progress message rather than replace what is there, so the
+        message grows into a timeline of the turn. What scrolled past is what
+        somebody reading a long turn actually wants, and a replace throws it away.
+        Implementations must mark it as machine progress, distinct from the reply
+        `send()` will post, and must not count it against any reply budget.
 
         No-op by default, so a frontend with no thread to put it in — or no wish
         to — behaves exactly as it did before this existed.
@@ -174,6 +188,21 @@ class Frontend(ABC):
         next rate-limiting gap by the time this runs. A dropped message therefore
         costs a whole gap of silence rather than being retried — the accepted
         price of not putting a delivery-outcome contract on every frontend.
+        """
+
+    async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
+        """Close the turn's progress message. No-op by default.
+
+        Called once at the end of every turn that started a progress relay,
+        after the turn's own message. `succeeded` is True when the agent
+        answered. The message is a timeline of what the agent did on the way to
+        that answer, which the answer itself does not carry, so an implementation
+        should keep it either way; `succeeded` is passed for a frontend whose
+        surface cannot afford to.
+
+        Whatever it keeps, the implementation must forget the message, so the next
+        turn's `send_progress` starts a new one instead of editing this one.
+        Best-effort, like `send_progress`.
         """
 
     async def ask_approval(
@@ -214,7 +243,37 @@ class Frontend(ABC):
 
     @abstractmethod
     def workspace_name(self, chat_id: int) -> str:
-        """Human-readable workspace path segment, e.g. 'telegram/hoss'."""
+        """Workspace path segment, e.g. 'telegram/123' or 'slack/dm/U123'.
+
+        One workspace per conversation, not per session: every thread of a Slack
+        DM, group DM or channel, and every `/new` of a Telegram chat, runs in the
+        same directory. The session is what `chat_id` keys; the directory is what
+        the conversation keys.
+        """
+
+    def display_label(self, chat_id: int) -> str:
+        """The workspace name plus the human name of the conversation.
+
+        What an operator reads in the dashboard's running-request column. The
+        workspace name alone is a platform id, so a Slack row says
+        `slack/channel/C09AB…` and nothing about which channel that is. A
+        frontend that can resolve the name appends it and keeps the id in
+        front, because the id is what the workspace path and the tmux session
+        are keyed on. Default is the workspace name, so a frontend with no
+        second name to give is unchanged.
+        """
+        return self.workspace_name(chat_id)
+
+    def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
+        """Where this session's files lived before workspaces were shared.
+
+        Workspaces used to be one directory per session. A frontend that had
+        that layout returns the old name so the orchestrator can fold that
+        directory into the shared one on the session's next turn (`migration`).
+        `thread_key` names the subdirectory the old files go under. None means
+        nothing to migrate, which is right for a frontend born after the change.
+        """
+        return None
 
     @abstractmethod
     def sender_name(self, chat_id: int) -> str:
@@ -223,6 +282,20 @@ class Frontend(ABC):
     @abstractmethod
     def channel_context(self, chat_id: int) -> str:
         """Where this conversation is happening, e.g. 'dm', 'channel:#general'."""
+
+    def account_subjects(self, chat_id: int) -> tuple[str, str]:
+        """Stable channel and user identifiers for account rules."""
+        facts = self.session_facts(chat_id)
+        return str(chat_id), facts.get("sender_id", str(chat_id))
+
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        """Platform ids for the "Where you are" block that closes the system
+        prompt: `conversation` (kind and id, e.g. "dm D0…" or "channel C0… #name"),
+        `thread` (the platform's thread id, or "root"), `sender_id` and
+        `sender_name`. All optional; the block falls back to `sender_name` and
+        `channel_context` for what a frontend leaves out.
+        """
+        return {}
 
     def persona_source(self, chat_id: int) -> Path | None:
         """Per-chat persona file, or None for the global CLAUDE.md.

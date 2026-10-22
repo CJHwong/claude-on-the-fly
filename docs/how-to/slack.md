@@ -116,7 +116,7 @@ next one without a restart.
 - Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
 - A `slack.bot_policies` entry can narrow an allowed bot before agent dispatch. Under `selective`, a message reaches the agent only if it mentions the agent or matches one of your `process_if` patterns; everything else is dropped without consuming an agent turn
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
-- Each thread = one Claude session with memory
+- Each thread = one Claude session. All threads of a DM, group DM or channel share one working directory and one conversation memory (`memory/notes.md` in that directory), on top of the per-person memory
 - The app must be invited to private channels (`/invite @your-app-name`)
 - A restart reloads recent active-conversation watermarks and asks Slack history
   for messages sent while Socket Mode was down. The scan is bounded to the 50
@@ -125,3 +125,20 @@ next one without a restart.
   processed-event ledger.
 
 See the [`slack` reference](../reference/config-yaml.md#slack) for every field.
+
+## Unfinished requests and recovery
+
+Recent unfinished requests resume after a restart, keeping their original source
+and bounded retry count. The journal retains them until their replies land, so a
+crash between reserving and requeuing work does not erase the request.
+
+Requests older than 30 minutes, requests that exhaust their restart retries, and
+requests that fail unexpectedly are preserved in
+`~/.claude-on-the-fly/state/slack.turns.recovery.json`. They are offered back for
+explicit recovery rather than silently discarded or automatically retried. The
+recovery file is owner-only and retains the original text, route, and session.
+Check whether a request was already fulfilled or cancelled before resending it.
+
+One failed request does not stop later messages in the same conversation from
+being processed. Its queue markers are retired without consuming a later
+message's reaction target or reply-suppression setting.

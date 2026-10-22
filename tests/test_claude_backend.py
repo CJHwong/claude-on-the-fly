@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from claude_on_the_fly import transcript
 from claude_on_the_fly.backends import claude as claude_mod
 
 
@@ -131,7 +132,7 @@ class TestCompactionFrom:
         path = tmp_path / "s.jsonl"
         _write_transcript(path, pre=48939, post=5162, ms=10842)
         outcome = claude_mod._compaction_from(_compact_stream(), path)
-        assert (outcome.ok, outcome.pre_tokens, outcome.post_tokens) == (
+        assert (outcome.ok, outcome.pre_tokens, outcome.conversation_tokens_after) == (
             True,
             48939,
             5162,
@@ -144,6 +145,23 @@ class TestCompactionFrom:
         )
         assert outcome.ok is False
         assert outcome.error == "Not enough messages to compact."
+
+    def test_a_boundary_without_a_post_count_reports_none(self, tmp_path):
+        """None, not 0: a zero would read as a conversation that vanished."""
+        path = tmp_path / "s.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "compactMetadata": {"preTokens": 900},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        outcome = claude_mod._compaction_from(_compact_stream(), path)
+        assert (outcome.pre_tokens, outcome.conversation_tokens_after) == (900, None)
 
     def test_absent_status_events_read_as_failure_not_success(self):
         """A claude build that stops emitting them must not be reported as a
@@ -164,6 +182,8 @@ class TestClaudeBackendCompact:
         backend.launcher = None
         backend.pty = True
         backend._pty_path = "/somewhere/claude-pty"
+        backend.model = ""
+        backend.effort = ""
 
         with (
             patch.object(backend, "session_log_path", return_value=session),
@@ -395,13 +415,12 @@ class TestNativeContextFields:
         )
         assert out["context_window_size"] == 1000000
 
-    def test_no_window_means_no_reading_rather_than_zero(self):
-        assert (
-            claude_mod._native_context_fields(
-                {"last_assistant_usage": {"input_tokens": 100}}
-            )
-            == {}
-        )
+    def test_no_window_still_reports_the_tokens(self):
+        """The idle compaction thresholds on the count alone. Everything that
+        needs a percentage checks for the window itself."""
+        assert claude_mod._native_context_fields(
+            {"last_assistant_usage": {"input_tokens": 100}}
+        ) == {"context_tokens": 100}
 
     def test_no_usage_means_no_reading(self):
         assert (
@@ -433,6 +452,8 @@ class TestCompactRefusals:
         backend = claude_mod.ClaudeBackend.__new__(claude_mod.ClaudeBackend)
         backend.launcher, backend.pty = None, True
         backend._pty_path = "/somewhere/claude-pty"
+        backend.model = ""
+        backend.effort = ""
         return backend
 
     async def test_no_session_is_not_reported_as_unsupported(self, tmp_path):
@@ -601,12 +622,14 @@ class TestOllamaContextWindow:
         assert response.context_tokens == 38_502
         assert response.context_window_size == 200000
 
-    async def test_ollama_reports_none(self, tmp_path, monkeypatch):
+    async def test_ollama_reports_the_tokens_but_no_window(self, tmp_path, monkeypatch):
+        """The count is the routed model's own; only the window is claude's
+        guess. Without the count the idle compaction never sees the chat."""
         backend = claude_mod.ClaudeBackend(
             launcher=claude_mod.OllamaLauncher("glm-5.2:cloud")
         )
         response = await self._run(backend, tmp_path, monkeypatch)
-        assert response.context_tokens is None
+        assert response.context_tokens == 38_502
         assert response.context_window_size is None, (
             "a made-up denominator is worse than none"
         )
@@ -1064,3 +1087,112 @@ class TestPtySpawnTrustsItsWorkspace:
             await claude_mod._exec_pty(tmp_path / "ws", ["claude-pty"], timeout=None)
 
         assert events == ["trusted:ws", "spawned"]
+
+
+class TestPtyTokensAreThisTurnOnly:
+    """pty's envelope has no per-turn figure, so the turn is read off the file.
+
+    `modelUsage` is pty's own pass over the whole session. A footer built from
+    it grew monotonically across a conversation and reported `990272` in beside
+    a context reading of 8 percent: the session's running total, posted as one
+    turn's bill.
+    """
+
+    def _session(self, claude_projects_dir, workspace_slug, *lines) -> Path:
+        session_dir = claude_projects_dir / workspace_slug
+        session_dir.mkdir(exist_ok=True)
+        path = session_dir / "s1.jsonl"
+        path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
+        return path
+
+    def _priced(self, inp: int, out: int) -> dict:
+        return {
+            "type": "assistant",
+            "message": {"usage": {"input_tokens": inp, "output_tokens": out}},
+        }
+
+    # The envelope claims the whole session, which is what must NOT be used.
+    _SESSION_TOTAL = {
+        "modelUsage": {"m": {"inputTokens": 990_272, "outputTokens": 400}}
+    }
+
+    @staticmethod
+    def _pty_backend():
+        with patch(
+            "claude_on_the_fly.backends.claude.resolve_pty_binary",
+            return_value="/usr/bin/claude-pty",
+        ):
+            return claude_mod.ClaudeBackend(pty=True)
+
+    def test_the_turns_own_records_win_over_the_session_total(
+        self, claude_projects_dir
+    ):
+        workspace = Path("/private/tmp/ws-pty")
+        self._session(claude_projects_dir, "-private-tmp-ws-pty", self._priced(900, 90))
+        offset = transcript.claude_session_size(workspace, "s1")
+        path = claude_projects_dir / "-private-tmp-ws-pty" / "s1.jsonl"
+        with path.open("ab") as handle:
+            handle.write(json.dumps(self._priced(12, 3)).encode() + b"\n")
+
+        backend = self._pty_backend()
+        assert backend._extract_tokens(
+            self._SESSION_TOTAL, workspace, "s1", offset
+        ) == (12, 3)
+
+    def test_an_unreadable_transcript_falls_back_to_the_envelope(self):
+        """A number that is too large beats no number at all."""
+        backend = self._pty_backend()
+        assert backend._extract_tokens(
+            self._SESSION_TOTAL, Path("/private/tmp/nope"), "s1", 0
+        ) == (990_272, 400)
+
+    def test_native_mode_still_reads_the_envelope(self, claude_projects_dir):
+        """Native's top-level `usage` is already this turn's aggregate, so the
+        transcript detour must not apply to it."""
+        workspace = Path("/private/tmp/ws-native")
+        self._session(claude_projects_dir, "-private-tmp-ws-native", self._priced(1, 1))
+
+        backend = claude_mod.ClaudeBackend(pty=False)
+        assert backend._extract_tokens(
+            {"usage": {"input_tokens": 5, "output_tokens": 2}}, workspace, "s1", 0
+        ) == (5, 2)
+
+
+class TestTheDelegatedPtyStartupGate:
+    """On Linux the config dir is a read-only mount, so claude-pty cannot take its
+    own startup lock and the daemon holds the equivalent gate around the spawn."""
+
+    def _proc(self) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b'{"result": "hi"}', b""))
+        return proc
+
+    async def _run(self, monkeypatch, delegated: bool) -> list[str]:
+        taken: list[str] = []
+
+        async def record() -> None:
+            taken.append("held")
+
+        monkeypatch.setattr(
+            claude_mod.sandbox, "claude_pty_startup_is_delegated", lambda: delegated
+        )
+        monkeypatch.setattr(claude_mod, "_hold_pty_startup_gate", record)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=self._proc()),
+            patch.object(
+                claude_mod.agent, "_kill_process_tree", new_callable=AsyncMock
+            ),
+        ):
+            await claude_mod._exec_pty(Path("/tmp"), ["claude-pty"])
+        return taken
+
+    async def test_the_gate_is_taken_when_the_lock_is_delegated(
+        self, monkeypatch
+    ) -> None:
+        assert await self._run(monkeypatch, delegated=True) == ["held"]
+
+    async def test_the_gate_is_left_alone_when_claude_pty_locks_for_itself(
+        self, monkeypatch
+    ) -> None:
+        assert await self._run(monkeypatch, delegated=False) == []

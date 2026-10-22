@@ -33,7 +33,7 @@ import re
 import shlex
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,9 +45,9 @@ from croniter import croniter
 from liquid import Environment, StrictUndefined
 from liquid.exceptions import LiquidError, LiquidSyntaxError
 
-from claude_on_the_fly import logs
+from claude_on_the_fly import agent, logs
 from claude_on_the_fly.agent import DATA_DIR
-from claude_on_the_fly.jobs.core import AlertSink, Job, JobQueue, Result
+from claude_on_the_fly.jobs.core import AlertSink, Job, JobQueue, Result, parse_when
 from claude_on_the_fly.jobs.key_state import (
     DEFAULT_MAX_FIRES,
     KeyStateStore,
@@ -55,6 +55,13 @@ from claude_on_the_fly.jobs.key_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Sentinel next_fire for a one-shot entry after its single attempt: never again
+# in this process, whatever the clock does.
+_NEVER_FIRE = datetime.max
+# Fingerprint every one-shot fire is recorded under, so `should_skip` sees an
+# unchanged item no matter how many times it fires.
+_ONE_SHOT_FINGERPRINT = "one-shot"
 
 LOG_DIR = DATA_DIR / "logs"
 DEFAULT_CONFIG = DATA_DIR / "cron.yaml"
@@ -67,10 +74,15 @@ DEFAULT_TIMEOUT = 1800
 MAX_TIMEOUT = 86400
 DEFAULT_MAX_CONCURRENT = 1
 NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-# A producer command only has to print a work list, so it gets a fixed short
-# limit rather than the entry's `timeout` — that one bounds the *agent* run each
-# emitted item turns into, and is measured in tens of minutes.
+# A producer command only has to print a work list, so it gets a short limit of
+# its own rather than the entry's `timeout` — that one bounds the *agent* run
+# each emitted item turns into, and is measured in tens of minutes. An entry
+# whose producer is genuinely slow raises its own with `producer_timeout`; this
+# is the default, not the ceiling.
 PRODUCER_TIMEOUT_S = 120
+# A producer that needs longer than an hour to print a work list is doing the
+# work rather than listing it, which belongs in the job the item becomes.
+MAX_PRODUCER_TIMEOUT_S = 3600
 # Longest producer stdout we will parse, so a command that accidentally streams a
 # log file cannot exhaust memory.
 MAX_PRODUCER_BYTES = 4 * 1024 * 1024
@@ -116,11 +128,27 @@ EXAMPLE_YAML = """\
 # Optional on any entry:
 #   timeout          seconds for the agent run (or for a bare command); default
 #                    1800, max 86400
+#   producer_timeout seconds for the producer COMMAND to print its work list;
+#                    default 120, max 3600. A different limit from `timeout`,
+#                    which bounds the agent run each printed item becomes. Needs
+#                    a producer - a command paired with a prompt.
 #   max_concurrent   how many of THIS entry's items may be outstanding at once;
 #                    default 1. Needs a command - without one there is only ever
 #                    a single item, the entry itself.
 #   max_fires        fires against an unchanged item before parking; default 3,
 #                    0 disables
+#   profile          name of an `agent.profiles` entry in config.yaml, to run
+#                    THIS entry on its own backend/model/effort. Needs a prompt.
+#   min_tool_calls   fewest tool calls a fire must make to count as a success;
+#                    default 0, meaning no floor. A run below it is recorded
+#                    FAILED and alerts, which is how an agent that refused or
+#                    answered without acting stops reading as a green run. Needs
+#                    a prompt. Leave it unset on an entry that legitimately has
+#                    nothing to do on some fires, or every such fire alerts.
+#
+# Any other key is REJECTED when this file loads. A key nobody reads would sit on
+# a live entry doing nothing and saying nothing, which reads exactly like a
+# setting that works.
 #
 # PROMPT TEMPLATES are Liquid. A producer's item arrives as `item`:
 #     Work on {{ item.key }}: {{ item.summary }}   (status: {{ item.status }})
@@ -163,13 +191,20 @@ entries: []  # add at least one entry - an empty list won't load
 @dataclass(frozen=True)
 class CronEntry:
     name: str
-    cron: str
+    cron: str | None = None
+    # One-shot fire time (naive local), mutually exclusive with `cron`. The
+    # entry runs once at this time and is then spent -- the fire is recorded in
+    # the key-state store, so a daemon restart cannot run it a second time.
+    at: datetime | None = None
     prompt: str | None = None
     prompt_file: Path | None = None
     command: str | None = None
     timeout: int = DEFAULT_TIMEOUT
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_fires: int = DEFAULT_MAX_FIRES
+    profile: str | None = None
+    producer_timeout: int = PRODUCER_TIMEOUT_S
+    min_tool_calls: int = 0
 
     @property
     def kind(self) -> Literal["prompt", "producer", "command"]:
@@ -191,6 +226,10 @@ class CronEntry:
         if self.prompt_file is not None:
             return self.prompt_file.read_text(encoding="utf-8")
         return self.prompt or ""
+
+
+# What `CronDaemon._spawn` runs in a task: a coroutine function taking the entry.
+_EntryWork = Callable[["CronEntry"], Coroutine[Any, Any, None]]
 
 
 @dataclass
@@ -237,6 +276,71 @@ def _translate_legacy_entry(data: dict[str, object], where: str) -> dict[str, ob
     return translated
 
 
+def _entry_profile(
+    data: dict[str, object], has_command: bool, has_prompt: bool, where: str
+) -> str | None:
+    """Validate the optional `profile` key against the defined agent profiles.
+
+    Checked at load so a typo fails when the operator saves the file, not at 3am
+    on the first fire. A command-only entry is refused rather than ignored: it
+    runs a shell and never reaches an agent, so a model named on it would do
+    nothing and say nothing.
+    """
+    if "profile" not in data:
+        return None
+    profile = _require_str(data, "profile", where)
+    if has_command and not has_prompt:
+        raise ValueError(
+            f"{where}: 'profile' needs a 'prompt' or 'prompt_file' - a bare "
+            "command runs no agent"
+        )
+    known = agent.profile_names()
+    if profile not in known:
+        defined = ", ".join(known) or "none"
+        raise ValueError(
+            f"{where}: unknown profile {profile!r} (defined in agent.profiles: "
+            f"{defined})"
+        )
+    return profile
+
+
+# Every key an entry may carry, after `_translate_legacy_entry` has consumed the
+# legacy `script` and `args`. This is the whole schema: see `_reject_unknown_keys`
+# for why an unlisted key is an error rather than a shrug.
+ENTRY_KEYS = frozenset(
+    {
+        "name",
+        "cron",
+        "at",
+        "prompt",
+        "prompt_file",
+        "command",
+        "timeout",
+        "producer_timeout",
+        "max_concurrent",
+        "max_fires",
+        "profile",
+        "min_tool_calls",
+    }
+)
+
+
+def _reject_unknown_keys(data: dict[str, object], where: str) -> None:
+    """Refuse a key this schema does not define.
+
+    Ignoring one is the worst failure this config has: the operator wrote a
+    setting, the file loaded, and nothing said the setting does nothing. That is
+    indistinguishable from a working entry until somebody audits the behaviour
+    by hand, so a typo can sit on a live entry for months.
+    """
+    unknown = sorted(set(data) - ENTRY_KEYS)
+    if not unknown:
+        return
+    named = ", ".join(repr(key) for key in unknown)
+    valid = ", ".join(sorted(ENTRY_KEYS))
+    raise ValueError(f"{where}: unknown key {named} (valid keys: {valid})")
+
+
 def _validate_entry(
     raw: object, index: int, seen: set[str], config_dir: Path
 ) -> CronEntry:
@@ -253,13 +357,30 @@ def _validate_entry(
     seen.add(name)
     where = f"{where} ({name})"
 
-    cron_expr = _require_str(data, "cron", where)
-    try:
-        croniter(cron_expr, datetime.now())
-    except (ValueError, KeyError) as exc:
-        raise ValueError(f"{where}: invalid cron {cron_expr!r}: {exc}") from exc
+    # One-shot `at` or recurring `cron`: exactly one. Validated here so a
+    # mistyped time fails when the file is saved, not at the moment the entry
+    # should have fired.
+    at: datetime | None = None
+    raw_at = data.get("at")
+    if raw_at is not None:
+        if not isinstance(raw_at, str):
+            raise ValueError(f"{where}: 'at' must be a string")
+        try:
+            at = parse_when(raw_at)
+        except ValueError as exc:
+            raise ValueError(f"{where}: invalid 'at': {exc}") from exc
+    if at is not None and "cron" in data:
+        raise ValueError(f"{where}: specify 'cron' OR 'at', not both")
+    cron_expr: str | None = None
+    if at is None:
+        cron_expr = _require_str(data, "cron", where)
+        try:
+            croniter(cron_expr, datetime.now())
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"{where}: invalid cron {cron_expr!r}: {exc}") from exc
 
     data = _translate_legacy_entry(data, where)
+    _reject_unknown_keys(data, where)
 
     has_prompt = "prompt" in data
     has_file = "prompt_file" in data
@@ -280,6 +401,12 @@ def _validate_entry(
             raise ValueError(f"{where}: prompt_file not found at {prompt_file}")
 
     command = _require_str(data, "command", where) if has_command else None
+    if at is not None and (has_command or not (has_prompt or has_file)):
+        # A one-shot entry runs an agent once at a set time; a shell command on
+        # it would have no schedule to recur against and nothing to fire it.
+        raise ValueError(
+            f"{where}: 'at' needs a 'prompt' or 'prompt_file' and no 'command'"
+        )
 
     timeout = _positive_int(data, "timeout", DEFAULT_TIMEOUT, where)
     if not 0 < timeout <= MAX_TIMEOUT:
@@ -297,16 +424,46 @@ def _validate_entry(
             f"{where}: 'max_concurrent' above 1 needs a 'command' to produce items"
         )
     max_fires = _positive_int(data, "max_fires", DEFAULT_MAX_FIRES, where)
+    producer_timeout = _positive_int(
+        data, "producer_timeout", PRODUCER_TIMEOUT_S, where
+    )
+    if not 0 < producer_timeout <= MAX_PRODUCER_TIMEOUT_S:
+        raise ValueError(
+            f"{where}: 'producer_timeout' must be 1..{MAX_PRODUCER_TIMEOUT_S}"
+        )
+    if "producer_timeout" in data and not (
+        command is not None and (has_prompt or has_file)
+    ):
+        # Same rule as 'profile': an entry with no producer never runs one, so
+        # accepting the key would promise a limit that applies to nothing.
+        raise ValueError(
+            f"{where}: 'producer_timeout' needs a producer - a 'command' paired "
+            "with a 'prompt' or 'prompt_file'"
+        )
+    profile = _entry_profile(data, command is not None, has_prompt or has_file, where)
+
+    min_tool_calls = _positive_int(data, "min_tool_calls", 0, where)
+    if "min_tool_calls" in data and not (has_prompt or has_file):
+        # Same rule as 'profile': a bare command runs a shell and never reaches
+        # an agent, so a floor on its tool calls would bound nothing.
+        raise ValueError(
+            f"{where}: 'min_tool_calls' needs a 'prompt' or 'prompt_file' - a "
+            "bare command runs no agent"
+        )
 
     entry = CronEntry(
         name=name,
         cron=cron_expr,
+        at=at,
         prompt=prompt,
         prompt_file=prompt_file,
         command=command,
         timeout=timeout,
         max_concurrent=max_concurrent,
         max_fires=max_fires,
+        profile=profile,
+        producer_timeout=producer_timeout,
+        min_tool_calls=min_tool_calls,
     )
     _validate_template(entry, where)
     return entry
@@ -649,16 +806,24 @@ class CronDaemon:
         fresh: dict[str, EntryState] = {}
         for entry in entries:
             previous = self._state.get(entry.name)
-            if previous is not None and previous.entry.cron == entry.cron:
+            if (
+                previous is not None
+                and previous.entry.cron == entry.cron
+                and previous.entry.at == entry.at
+            ):
                 # Keep the pending fire time so editing an unrelated field does
                 # not silently reschedule the entry.
                 fresh[entry.name] = EntryState(
                     entry=entry, next_fire=previous.next_fire
                 )
             else:
-                fresh[entry.name] = EntryState(
-                    entry=entry, next_fire=next_fire(entry.cron, now)
-                )
+                if entry.at is not None:
+                    first_fire = entry.at
+                else:
+                    # Validation guarantees a cron expression when 'at' is absent.
+                    assert entry.cron is not None
+                    first_fire = next_fire(entry.cron, now)
+                fresh[entry.name] = EntryState(entry=entry, next_fire=first_fire)
         added = set(fresh) - set(self._state)
         removed = set(self._state) - set(fresh)
         changed = {
@@ -700,13 +865,38 @@ class CronDaemon:
             await self._drain_triggers()
             now = datetime.now()
             for state in list(self._state.values()):
-                if state.next_fire <= now:
+                if state.next_fire > now:
+                    continue
+                if state.entry.at is not None:
+                    # One-shot: one attempt, then never again in this process.
+                    # Setting _NEVER_FIRE before the check keeps a spent entry
+                    # from re-entering here every minute after a restart.
+                    state.next_fire = _NEVER_FIRE
+                    if self._at_spent(state.entry):
+                        continue
+                    await self._fire(state.entry)
+                    self._key_state.record_fire(state.entry.name, _ONE_SHOT_FINGERPRINT)
+                else:
+                    # Validation guarantees a cron expression when 'at' is absent.
+                    assert state.entry.cron is not None
                     state.next_fire = next_fire(state.entry.cron, now)
                     await self._fire(state.entry)
 
     def _running_command_names(self) -> list[str]:
         """Entry names of the commands running right now."""
         return sorted(task.get_name() for task in self._command_tasks)
+
+    def _is_running(self, name: str) -> bool:
+        """Whether this entry has a command or producer in flight.
+
+        Asks each task rather than reading `_running_command_names`, because a
+        finished task stays in the set until its done-callback runs on the next
+        loop iteration. Naming it in a log line one tick late costs nothing;
+        letting it veto the next fire would drop a poll for no reason.
+        """
+        return any(
+            task.get_name() == name and not task.done() for task in self._command_tasks
+        )
 
     def heartbeat_extra(self) -> dict:
         """The commands running right now, by entry name.
@@ -802,9 +992,32 @@ class CronDaemon:
             logger.info("cron: run-now firing %s", name)
             await self._fire(state.entry)
 
+    def _at_spent(self, entry: CronEntry) -> bool:
+        """Whether this one-shot entry already fired, per the key-state store.
+
+        The store is durable across restarts, which the in-memory `EntryState`
+        is not: without it, a daemon restart after the fire time would run the
+        entry a second time. The same store backs the producers' once-only
+        bookkeeping, so this adds no new state format.
+        """
+        reason = self._key_state.should_skip(
+            entry.name, _ONE_SHOT_FINGERPRINT, max_fires=1
+        )
+        if reason:
+            logger.info("cron %s: one-shot already fired (%s)", entry.name, reason)
+            return True
+        return False
+
     # --- firing ---
 
     async def _fire(self, entry: CronEntry) -> None:
+        """Start an entry's work and return. No kind of entry blocks the caller.
+
+        The scheduling loop awaits this once per due entry, so anything slow here
+        delays every entry due in the same minute. A producer's shell command is
+        the slow one: it used to be awaited inline, and a 38s poll pushed the
+        other entries due at `:00` 38s late.
+        """
         logger.info("cron: firing %s (%s)", entry.name, entry.kind)
         try:
             if entry.kind == "command":
@@ -812,7 +1025,7 @@ class CronDaemon:
             elif entry.kind == "prompt":
                 self._enqueue_plain(entry)
             else:
-                await self._fire_producer(entry)
+                self._spawn_producer(entry)
         except Exception:
             # One broken entry must not take the daemon down; the next fire of
             # every other entry is still due.
@@ -840,7 +1053,7 @@ class CronDaemon:
     async def _fire_producer(self, entry: CronEntry) -> None:
         assert entry.command is not None
         stdout, rc = await self._run_command(
-            entry.command, timeout=PRODUCER_TIMEOUT_S, capture=True
+            entry.command, timeout=entry.producer_timeout, capture=True
         )
         if rc != 0:
             logger.error(
@@ -933,18 +1146,68 @@ class CronDaemon:
             session_key=session_key,
             timeout=float(entry.timeout),
             platform="cron",
+            profile=entry.profile,
+            min_tool_calls=entry.min_tool_calls,
         )
         self._queue.enqueue(job)
         logger.info("cron %s: queued %s as %s", entry.name, key, job.id)
 
+    # --- running a command off the loop ---
+
+    def _spawn(self, entry: CronEntry, work: _EntryWork) -> None:
+        """Run `work(entry)` as a task named after its entry.
+
+        `work` is the coroutine *function*, not a coroutine: a task cancelled
+        before its first step never calls it, and a coroutine built by the caller
+        would then be left unawaited. `stop` cancels exactly that way.
+
+        The name is the only route back from the task to the entry, and three
+        things read it: `stop` to say what it cancelled, `heartbeat_extra` to
+        publish what a stop *would* cancel, and `_is_running` to tell whether
+        this entry is already working.
+        """
+        task = asyncio.create_task(self._logged(entry, work), name=entry.name)
+        self._command_tasks.add(task)
+        task.add_done_callback(self._command_tasks.discard)
+
+    async def _logged(self, entry: CronEntry, work: _EntryWork) -> None:
+        """Report a failure the task's caller is no longer around to catch.
+
+        `_fire`'s own try/except only covers starting the task now, so without
+        this an exception would sit unretrieved in a Task object until the
+        garbage collector mentioned it, with no entry name attached. A swallowed
+        failure in a poll is the failure this daemon can least afford.
+        """
+        try:
+            await work(entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("cron %s: fire failed", entry.name)
+
+    def _spawn_producer(self, entry: CronEntry) -> None:
+        """Run the producer off the loop, one at a time per entry.
+
+        Two overlapping runs of the same poll would emit the same work list
+        twice, so a fire that arrives while the previous producer is still
+        running is dropped rather than queued: a producer that cannot keep up
+        with its own schedule is a config problem, and the next scheduled fire
+        picks the work up anyway. It logs at INFO because the operator's fix is
+        to widen the cron expression or speed the command up.
+        """
+        if self._is_running(entry.name):
+            logger.info(
+                "cron %s: producer from a previous fire is still running, "
+                "skipping this fire",
+                entry.name,
+            )
+            return
+        self._spawn(entry, self._fire_producer)
+
     # --- side-effect commands ---
 
     def _spawn_command(self, entry: CronEntry) -> None:
-        # Named so `stop` can say which entry it cancelled; the task object
-        # itself carries no other route back to the entry.
-        task = asyncio.create_task(self._run_side_effect(entry), name=entry.name)
-        self._command_tasks.add(task)
-        task.add_done_callback(self._command_tasks.discard)
+        self._spawn(entry, self._run_side_effect)
 
     async def _run_side_effect(self, entry: CronEntry) -> None:
         assert entry.command is not None
@@ -1035,11 +1298,18 @@ class CronDaemon:
         if not rows:
             return
         name_width = max(len(s.entry.name) for s in rows)
-        cron_width = max(len(s.entry.cron) for s in rows)
+
+        def schedule(entry: CronEntry) -> str:
+            # A one-shot has no cron expression; show its at-time instead, the
+            # same way the entry table in the docs shows both fields.
+            return entry.cron if entry.cron is not None else f"at {entry.at:%H:%M}"
+
+        sched_width = max(len(schedule(s.entry)) for s in rows)
         for state in rows:
+            sched = schedule(state.entry)
             print(
                 f"  {state.entry.name:<{name_width}}  "
-                f"{state.entry.cron:<{cron_width}}  "
+                f"{sched:<{sched_width}}  "
                 f"{state.entry.kind:<8}  next: {state.next_fire:%a %H:%M}",
                 file=sys.stderr,
             )
@@ -1054,8 +1324,7 @@ def main() -> int:
     import argparse
     import signal
 
-    from dotenv import load_dotenv
-
+    from claude_on_the_fly import envfile
     from claude_on_the_fly.heartbeat import (
         HeartbeatWriter,
         InstanceAlreadyClaimed,
@@ -1073,7 +1342,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    load_dotenv()
+    envfile.load_into_process()
     setup_daemon_logging("cron")
 
     # Before resolving: an install that predates the rename gets its config

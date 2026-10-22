@@ -7,5 +7,6 @@ These pages describe implementation seams and invariants rather than operator ta
 - [Cron producer](cron.md)
 - [Frontend protocol](frontend.md)
 - [Background worker](jobs.md)
+- [Panes](panes.md)
 
 Operator documentation starts at [`docs/index.md`](../index.md).

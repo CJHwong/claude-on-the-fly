@@ -37,9 +37,96 @@ jobs:
           uv tool install prek
           prek run --all-files || (git --no-pager diff && false)
 
+  # The other half of the boundary suite. tests/test_sandbox.py holds 32 cases
+  # that spawn a real `sandbox-exec` against the real home, and they can only
+  # skip on Linux -- so until this job existed they ran on nobody's CI and the
+  # seatbelt profile was covered by argv assertions alone. Measured on the
+  # Linux job: 195 passed, 32 skipped.
+  #
+  # Run boundary probes and account simulations here. The remaining suite runs
+  # on Linux.
+  macos-seatbelt:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0 # hatch-vcs derives the version from git tags
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Sync dev env
+        run: uv sync --locked
+
+      # Without this the runner's home is clean, so 16 boundary cases report
+      # "not present on this host" and prove nothing -- which is the exact
+      # failure this job was added to stop. The probe is `cat <path>` under the
+      # live profile, so only existence gates it and the content is irrelevant.
+      # Planting a file at each probed path turns every one of those skips into
+      # a real deny the profile has to enforce.
+      #
+      # Runner-only, and it refuses rather than overwrites: a developer machine
+      # already holds the real files, and this must never be the thing that
+      # clobbers one. Nothing here resembles a credential; a probe cannot tell
+      # the difference and a reader should not have to.
+      - name: Plant probe fixtures in the runner home
+        run: |
+          set -euo pipefail
+          plant() {
+            if [ -e "$1" ]; then
+              echo "refusing to overwrite existing $1" >&2
+              exit 1
+            fi
+            mkdir -p "$(dirname "$1")"
+            printf 'not-a-real-credential, planted by CI so the jail has something to deny\n' > "$1"
+            echo "planted $1"
+          }
+          plant "$HOME/.config/gh/hosts.yml"
+          plant "$HOME/.aws/credentials"
+          plant "$HOME/.ssh/id_rsa"
+          plant "$HOME/.docker/config.json"
+          plant "$HOME/.config/gcloud/credentials.db"
+          plant "$HOME/.sentryclirc"
+          plant "$HOME/.claude-on-the-fly/.env"
+          plant "$HOME/.claude/history.jsonl"
+          plant "$HOME/.codex/config.toml"
+          mkdir -p "$HOME/.claude/projects"
+          echo "planted $HOME/.claude/projects/"
+
+      # Serial, for the same reason the Linux job runs this file serially: each
+      # xdist worker gets its own empty temp HOME, so a probe asserting the jail
+      # *denies* ~/.aws/credentials finds the path merely absent and the
+      # boundary goes untested.
+      #
+      # No `timeout 300` wrapper, unlike the Linux steps. `timeout` is GNU
+      # coreutils and macOS does not ship it, so the wrapper would fail as
+      # "command not found" rather than bound anything. `timeout-minutes` on the
+      # step is the portable equivalent, and faulthandler still names a case
+      # that stops making progress. The file runs serially in about 2 seconds.
+      - name: Seatbelt boundary contracts must actually run
+        timeout-minutes: 5
+        env:
+          # Turns "no sandbox-exec here" from 32 skips into a collection error.
+          # A skipped boundary case is indistinguishable from a passing one, and
+          # a macOS runner without seatbelt means the job is testing nothing.
+          COTF_REQUIRE_SEATBELT: "1"
+          COTF_REQUIRE_JAIL: "1"
+        run: |
+          uv run --no-sync pytest -q tests/test_sandbox.py \
+            tests/test_account_fallback_cli.py tests/test_account_fallback_codex_cli.py \
+            -rs -o faulthandler_timeout=60
+
+  # Deliberately not `needs: lint`. Nothing here consumes anything lint
+  # produces, so gating on it only added lint's wall clock to the front of every
+  # run. The two jobs now start together and the slower one sets the total.
   test:
     runs-on: ubuntu-latest
-    needs: lint
     timeout-minutes: 15
     steps:
       - name: checkout repo
@@ -97,7 +184,9 @@ jobs:
           COTF_REQUIRE_JAIL: "1"
         run: |
           uv run --no-sync pytest \
-            tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py -q -rs
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
+            tests/test_sandbox_jail_live.py tests/test_sandbox_parity.py \
+            tests/test_account_fallback_cli.py tests/test_account_fallback_codex_cli.py -q -rs
 
       # A hung test must name itself. Left to the job's own `timeout-minutes`,
       # the step is *cancelled* rather than failed, and GitHub archives no log
@@ -109,6 +198,82 @@ jobs:
       #   faulthandler_timeout  dumps every thread's stack once a single test
       #                         passes 60s, which names the offender directly.
       #
-      # The suite runs in ~3 minutes, so neither bound is near normal operation.
+      # Neither bound is near normal operation.
+      #
+      # Split in two because the suite does not parallelise uniformly.
+      #
+      # A fixed `-n 4` rather than `auto`, so the worker count is a property of
+      # this file and not of whatever the runner happens to offer. `auto` would
+      # re-tune itself when the hosted runner's size changes, moving the
+      # baseline silently and with no commit to point at.
+      #
+      # Coverage rides on the runs that already happen rather than repeating the
+      # suite: instrumenting costs seconds, a second full run costs minutes.
+      # `--cov-fail-under=0` overrides the 100 in pyproject on purpose. The
+      # number is reported, not enforced, so a drop is visible without a red
+      # tick blocking work that is otherwise fine.
+      #
+      # Every pytest step appends, including the first. Whichever runs first has
+      # no data to append to, and making one of them authoritative would mean a
+      # later reordering silently erases an earlier step's measurements.
       - name: pytest
-        run: timeout 600 uv run --no-sync pytest -q -o faulthandler_timeout=60
+        run: |
+          timeout 600 uv run --no-sync pytest -q -n 4 \
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
+            --ignore=tests/test_sandbox.py -o faulthandler_timeout=60
+
+      # test_sandbox.py cannot run under xdist, and fails loudly rather than
+      # quietly when it tries -- which is the whole point of how those probes
+      # are written. They assert the jail *denies* a real path (~/.aws/
+      # credentials, ~/.codex, a real .env). Each xdist worker gets its own
+      # empty temp HOME, so those paths are merely absent there, the probe
+      # answers "absent" instead of "denied", and the boundary goes untested.
+      # Nine cases fail on that and fifteen more downgrade to skips.
+      #
+      # Serial it is 227 tests in about 2 seconds, so there is nothing to win by
+      # forcing it into a worker. A separate step, not appended to the command
+      # above, so a failure here names the boundary rather than the bulk suite.
+      - name: pytest (sandbox probes, serial)
+        run: |
+          timeout 300 uv run --no-sync pytest -q tests/test_sandbox.py \
+            --cov=claude_on_the_fly --cov-append --cov-report= --cov-fail-under=0 \
+            -o faulthandler_timeout=60
+
+      # Reports, never blocks. The repo claims 100% of statements and enforces it
+      # in pyproject, but nothing ran that gate in CI, so `main` could fall below
+      # it silently -- and did read as covered while two tests were dying at the
+      # call, because coverage counts lines, not whether the test asserting them
+      # got that far. Saying the number out loud is what makes a drop visible.
+      #
+      # It reports the number and does NOT compare it to 100. This runner is
+      # Linux and the suite's macOS-only seatbelt cases skip here, so the ceiling
+      # reachable on this platform is below 100 by construction. Warning against
+      # 100 fired on every single run, and a warning that always fires is one
+      # nobody reads within a fortnight. The figure to watch is `missed`: it is
+      # stable for a given platform, so a diff in it is a real change.
+      #
+      # `continue-on-error` is deliberately not used: it would still paint the
+      # run with a red tick. The step exits 0 itself.
+      - name: Coverage (report only, does not fail the build)
+        run: |
+          uv run --no-sync coverage report --fail-under=0 \
+            --show-missing --skip-covered > coverage.txt || true
+          total="$(uv run --no-sync coverage report --fail-under=0 \
+            --format=total 2>/dev/null || echo unknown)"
+          # Scanned over the whole file, not its last line: `--skip-covered`
+          # prints "N files skipped due to complete coverage." after TOTAL, so
+          # a tail lands on the note rather than the numbers.
+          missed="$(awk '$1=="TOTAL" {print $3}' coverage.txt)"
+          if [ -z "$missed" ]; then missed="unknown"; fi
+          echo "::notice::coverage ${total}% on this runner, ${missed} statements missed"
+          {
+            echo "### Coverage: ${total}% (${missed} statements missed)"
+            echo ""
+            echo "Linux skips the macOS-only sandbox cases, so this is below the"
+            echo "100% a local run reports. Watch \`missed\` for movement."
+            echo ""
+            echo '```'
+            head -40 coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0

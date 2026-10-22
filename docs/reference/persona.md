@@ -16,6 +16,11 @@ The symlink is re-created on every message, so even if removed mid-session it se
 
 If no `CLAUDE.md` exists, Claude runs with the default system prompt only.
 
+The system prompt applies to every chat, whatever persona it runs. It already covers the
+final reply, memory and its privacy, sender identity, untrusted content, approvals, when to
+confirm before acting, and secrets, so a persona does not need to restate them. A persona
+can make them stricter, for example by asking for confirmation more often.
+
 ## Per-chat persona
 
 One Slack channel, one Telegram chat, or one background job can run different
@@ -66,7 +71,7 @@ it, slashes included. A job filed by `$job` or `claude-jobs enqueue` has no key 
 all and only ever matches `default`.
 
 A Slack channel is never keyed on the sender, only on the channel. Its workspace is
-per thread while its sender changes per message, so a sender key would flip the
+per conversation while its sender changes per message, so a sender key would flip the
 persona mid-conversation.
 
 Values are paths relative to the data root and must stay inside it. A value that

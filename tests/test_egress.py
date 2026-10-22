@@ -41,6 +41,8 @@ from claude_on_the_fly.egress import (
         ("localhost:8080", ("localhost", 8080)),
         ("host:1", ("host", 1)),
         ("host:65535", ("host", 65535)),
+        ("[::1]:443", ("::1", 443)),
+        ("[2001:DB8::1]:8443", ("2001:db8::1", 8443)),  # canonical, as every lookup is
     ],
 )
 def test_parse_connect_target_accepts_authority_form(target, expected):
@@ -57,6 +59,12 @@ def test_parse_connect_target_accepts_authority_form(target, expected):
         "host:65536",
         "host:notaport",
         "",
+        "::1:443",  # an IPv6 literal must be bracketed, or the port is ambiguous
+        "[::1]",
+        "[::1]443",
+        "[::1]:",
+        "[not-an-ip]:443",
+        "[fe80::1%eth0]:443",  # a zone id brings `%` back into the host
     ],
 )
 def test_parse_connect_target_rejects_malformed(target):
@@ -85,6 +93,38 @@ def test_dns_safe_accepts_hostnames(host):
 )
 def test_dns_safe_rejects_smuggling_vectors(host):
     assert is_dns_safe_host(host) is False
+
+
+@pytest.mark.parametrize(
+    ("host", "canonical"),
+    [
+        ("::1", "::1"),
+        ("[::1]", "::1"),
+        ("0:0:0:0:0:0:0:1", "::1"),
+        ("2001:DB8::1", "2001:db8::1"),
+        ("10.0.0.1", "10.0.0.1"),
+        ("API.GitHub.com.", "api.github.com"),
+    ],
+)
+def test_an_ip_literal_has_one_canonical_form(host, canonical):
+    """Every policy decision is an exact set lookup, so `0:0::1` and `::1` must
+    not be two different hosts."""
+    assert egress.canonical_host(host) == canonical
+    assert egress.is_valid_host(egress.canonical_host(host))
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "fe80::1%eth0",  # a zone id carries `%`, the byte the grammar exists to refuse
+        "::1%25",
+        "evil.com\x00.allowed.com",
+        "host:extra",
+        "",
+    ],
+)
+def test_a_valid_host_is_a_dns_name_or_a_plain_ip_literal(host):
+    assert egress.is_valid_host(egress.canonical_host(host)) is False
 
 
 def test_default_never_ask_covers_metadata_hostnames():
@@ -160,10 +200,50 @@ async def connect_through(
 # --- tunnelling ---
 
 
+async def test_an_ipv6_literal_in_private_allow_tunnels_end_to_end():
+    """`[::1]` used to die as "not a valid hostname" before any policy ran, and
+    `::1` in the list emptied it. Measured with the real proxy both ways."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        writer.write((await reader.read(1024)).upper())
+        await writer.drain()
+        writer.close()
+
+    echo = await asyncio.start_server(handle, "::1", 0)
+    echo_port = echo.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=False)),
+        private_allowed_hosts=frozenset({"::1"}),
+        ask=False,
+    )
+    port = await proxy.start()
+    try:
+        status, body = await connect_through(port, f"[::1]:{echo_port}", b"hi v6")
+        assert status.startswith(b"HTTP/1.1 200")
+        assert body == b"HI V6"
+    finally:
+        await proxy.stop()
+        echo.close()
+
+
+async def test_an_ipv6_literal_is_still_refused_without_the_opt_in():
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=False)), ask=False)
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "[::1]:443")
+        assert b"no usable public address" in status
+    finally:
+        await proxy.stop()
+
+
 async def test_preapproved_host_tunnels_bytes_end_to_end():
     echo_port, echo = await start_echo_server()
     approvals = ApprovalBroker(RecordingGate(default=False))
-    proxy = EgressProxy(approvals, allowed_hosts=frozenset({"127.0.0.1"}))
+    proxy = EgressProxy(
+        approvals,
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
+    )
     port = await proxy.start()
     try:
         status, body = await connect_through(
@@ -241,6 +321,32 @@ async def test_hostname_resolving_to_loopback_is_refused_without_asking(monkeypa
         assert gate.seen == []
     finally:
         await proxy.stop()
+
+
+@pytest.mark.parametrize("spelling", ["[::ffff:127.0.0.1]", "0.0.0.0"])
+async def test_another_spelling_of_loopback_is_refused_without_asking(spelling):
+    """Real resolution, not a stub: both spellings reach a listener on
+    127.0.0.1, which is where the broker's own services are."""
+    gate = RecordingGate(default=True)
+    listener = await asyncio.start_server(
+        lambda reader, writer: writer.close(), "127.0.0.1", 0
+    )
+    target_port = listener.sockets[0].getsockname()[1]
+    proxy = EgressProxy(ApprovalBroker(gate))
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, f"{spelling}:{target_port}")
+        assert status.startswith(b"HTTP/1.1 403")
+        assert gate.seen == []
+    finally:
+        await proxy.stop()
+        listener.close()
+
+
+def test_a_mapped_metadata_address_is_not_an_explicit_private_one():
+    """`private_allow` never covers link-local, in either spelling."""
+    assert egress._explicit_private_address("::ffff:127.0.0.1")
+    assert not egress._explicit_private_address("::ffff:169.254.169.254")
 
 
 async def test_mixed_public_and_private_resolution_fails_closed(monkeypatch):
@@ -342,6 +448,66 @@ async def test_denied_host_gets_403_with_actionable_body():
         await proxy.stop()
 
 
+async def test_ungated_tunnels_an_unknown_host_without_asking(monkeypatch):
+    """`sandbox.egress: open`. The host is in no allowlist and the operator is
+    never consulted, yet the tunnel opens and carries bytes."""
+    echo_port, echo = await start_echo_server()
+    pin_public_resolution(monkeypatch, echo_port)
+    gate = RecordingGate(default=False)
+    proxy = EgressProxy(ApprovalBroker(gate), ask=False)
+    port = await proxy.start()
+    try:
+        status, body = await connect_through(
+            port, f"never.seen.example:{echo_port}", b"ungated"
+        )
+        assert status.startswith(b"HTTP/1.1 200")
+        assert body == b"UNGATED"
+        assert gate.seen == [], "ungated egress must not reach the operator"
+    finally:
+        await proxy.stop()
+        echo.close()
+
+
+async def test_ungated_still_refuses_a_metadata_endpoint():
+    """`open` drops the allowlist question and nothing else. An instance
+    metadata endpoint hands credentials to whatever can reach it, and no
+    legitimate task needs one, so it is not a question the operator was
+    answering in the first place."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)), ask=False)
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "metadata.google.internal:80")
+        assert status.startswith(b"HTTP/1.1 403")
+    finally:
+        await proxy.stop()
+
+
+async def test_ungated_still_refuses_a_private_address():
+    """The SSRF guard is not an allowlist decision either. Without this, `open`
+    would hand the agent the operator's whole loopback and LAN."""
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)), ask=False)
+    port = await proxy.start()
+    try:
+        assert (await connect_through(port, "169.254.169.254:80"))[0].startswith(
+            b"HTTP/1.1 403"
+        )
+        assert (await connect_through(port, "192.168.1.10:443"))[0].startswith(
+            b"HTTP/1.1 403"
+        )
+    finally:
+        await proxy.stop()
+
+
+async def test_ungated_still_refuses_a_malformed_host():
+    proxy = EgressProxy(ApprovalBroker(RecordingGate(default=True)), ask=False)
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "evil.com%2e.ok.com:443")
+        assert status.startswith(b"HTTP/1.1 403")
+    finally:
+        await proxy.stop()
+
+
 async def test_never_ask_host_is_refused_without_asking():
     gate = RecordingGate(default=True)
     proxy = EgressProxy(ApprovalBroker(gate))
@@ -411,6 +577,7 @@ async def test_unreachable_upstream_gets_502_after_approval():
     proxy = EgressProxy(
         ApprovalBroker(RecordingGate(default=True)),
         allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
     )
     port = await proxy.start()
     try:
@@ -512,7 +679,9 @@ async def test_stop_does_not_hang_on_an_open_tunnel():
     quiet = await asyncio.start_server(silent, "127.0.0.1", 0)
     quiet_port = quiet.sockets[0].getsockname()[1]
     proxy = EgressProxy(
-        ApprovalBroker(RecordingGate()), allowed_hosts=frozenset({"127.0.0.1"})
+        ApprovalBroker(RecordingGate()),
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
     )
     port = await proxy.start()
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -675,14 +844,36 @@ def test_hosts_are_lowercased_and_stripped(operator_settings):
         "",  # empty
     ],
 )
-def test_a_bad_host_is_rejected_at_load_not_at_connect_time(operator_settings, entry):
+def test_a_bad_host_is_named_at_load_and_the_rest_still_apply(
+    operator_settings, caplog, entry
+):
     """A silently dead entry would surface months later as an approval prompt for
-    a host the operator believes they already allowed."""
-    operator_settings.write_text(f'egress:\n  allow:\n    - "{entry}"\n')
-    with pytest.raises(ValueError, match="is not a hostname"):
-        egress.parse_hosts({"allow": [entry]}, "allow", source=str(operator_settings))
-    # And the loader falls back rather than propagating.
-    assert "api.anthropic.com" in default_allowed_hosts()
+    a host the operator believes they already allowed, so it is logged at load.
+    Only that entry goes: dropping the whole list for one typo took the good
+    entries beside it too, the way `sandbox.extra_paths` does not."""
+    operator_settings.write_text(
+        f'egress:\n  allow:\n    - "{entry}"\n    - pypi.org\n'
+    )
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.egress"):
+        hosts = default_allowed_hosts()
+    assert "pypi.org" in hosts
+    assert "api.anthropic.com" in hosts
+    assert f"entry {entry!r} is not a hostname or IP address" in caplog.text
+
+
+def test_a_dropped_entry_is_logged_once_not_on_every_reload(operator_settings, caplog):
+    """The lists are re-read on every CONNECT, so an unguarded ERROR repeats per
+    request; measured at three lines per CONNECT."""
+    operator_settings.write_text('egress:\n  allow:\n    - "pypi org"\n')
+    with caplog.at_level("ERROR", logger="claude_on_the_fly.egress"):
+        default_allowed_hosts()
+        default_allowed_hosts()
+    assert caplog.text.count("is not a hostname or IP address") == 1
+
+
+def test_an_ipv6_entry_loads_in_canonical_form(operator_settings):
+    operator_settings.write_text('egress:\n  private_allow:\n    - "0:0::1"\n')
+    assert "::1" in egress.default_private_hosts()
 
 
 def test_a_malformed_egress_section_falls_back_to_bundled(operator_settings, caplog):
@@ -1151,3 +1342,56 @@ class TestExplicitPrivateAddress:
     )
     def test_classification(self, address, expected):
         assert egress._explicit_private_address(address) is expected
+
+
+async def test_the_plain_allowlist_is_not_an_ssrf_exception(monkeypatch):
+    """`egress.allow` says the operator will talk to a name. It does not say the
+    name may resolve to the internal network -- that is `egress.private_allow`,
+    and the shipped `config.yaml` promises the two are separate opt-ins.
+
+    Folding `allowed_hosts` into the private set made every ordinary allowlist
+    entry a DNS-rebinding exception. Measured against the real proxy with
+    `localtest.me`, a public name that resolves to 127.0.0.1: on `allow` alone
+    the CONNECT was permitted and dialled loopback, while the same name off the
+    list was refused "no usable public address".
+    """
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=True)),
+        allowed_hosts=frozenset({"rebound.example"}),
+        ask=False,
+    )
+
+    async def resolves_to_loopback(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "getaddrinfo", resolves_to_loopback, raising=False
+    )
+    port = await proxy.start()
+    try:
+        status, _ = await connect_through(port, "rebound.example:443")
+        assert status.startswith(b"HTTP/1.1 403")
+        assert b"no usable public address" in status
+    finally:
+        await proxy.stop()
+
+
+async def test_private_allow_is_what_admits_a_private_address(monkeypatch):
+    """The opt-in still works, so the fix above narrows rather than removes."""
+    echo_port, echo = await start_echo_server()
+    proxy = EgressProxy(
+        ApprovalBroker(RecordingGate(default=True)),
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        private_allowed_hosts=frozenset({"127.0.0.1"}),
+        ask=False,
+    )
+    port = await proxy.start()
+    try:
+        status, body = await connect_through(
+            port, f"127.0.0.1:{echo_port}", b"opted in"
+        )
+        assert status.startswith(b"HTTP/1.1 200")
+        assert body == b"OPTED IN"
+    finally:
+        await proxy.stop()
+        echo.close()

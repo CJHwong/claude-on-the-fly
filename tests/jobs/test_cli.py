@@ -53,7 +53,9 @@ def test_enqueue_writes_job_to_queue(monkeypatch, tmp_path: Path, capsys) -> Non
     monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
     monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
 
-    rc = cli._cmd_enqueue("summarize the logs", channel="C1", thread_ts="1699.5")
+    rc = cli._cmd_enqueue(
+        "summarize the logs", channel="C1", thread_ts="1699.5", at=None
+    )
     assert rc == 0
 
     out = capsys.readouterr().out
@@ -85,17 +87,27 @@ def test_resolve_jobs_token_falls_back_to_slack_token() -> None:
 
 
 def test_loop_warning_fires_for_inherited_user_token() -> None:
-    # Inheriting a user token from SLACK_TOKEN is the loop-prone default.
-    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxp-abc") is not None
+    # Inheriting a user token from SLACK_TOKEN is the loop-prone default, and
+    # the Slack job trigger is on (default $job, no SLACK_JOB_COMMAND set) so
+    # a kind="slack" job can actually reach this worker.
+    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxp-abc", {}) is not None
 
 
 def test_loop_warning_silent_for_bot_token() -> None:
-    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxb-abc") is None
+    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxb-abc", {}) is None
 
 
 def test_loop_warning_silent_for_explicit_override() -> None:
     # Deployer chose JOBS_SLACK_TOKEN explicitly — even a user token is their call.
-    assert cli._notifier_loop_warning("JOBS_SLACK_TOKEN", "xoxp-abc") is None
+    assert cli._notifier_loop_warning("JOBS_SLACK_TOKEN", "xoxp-abc", {}) is None
+
+
+def test_loop_warning_silent_when_slack_producer_disabled() -> None:
+    # SLACK_JOB_COMMAND="" opts out of the Slack trigger entirely (cron/enqueue-
+    # only install), so no job can ever carry kind="slack" and the notifier's
+    # Slack route never fires — the loop-prone token is moot.
+    env = {"SLACK_JOB_COMMAND": ""}
+    assert cli._notifier_loop_warning("SLACK_TOKEN", "xoxp-abc", env) is None
 
 
 def test_run_refuses_to_start_beside_a_live_worker(monkeypatch, capsys) -> None:
@@ -163,6 +175,8 @@ def test_run_without_a_token_refuses_and_names_both_vars(monkeypatch, capsys) ->
 
 
 def test_run_warns_about_an_inherited_user_token(monkeypatch, caplog) -> None:
+    # Slack's job trigger is on (default $job) so the warning's hazard is real.
+    monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
     monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
     monkeypatch.setattr(cli, "_setup_logging", lambda: None)
     monkeypatch.setattr(cli, "check_backend", lambda: None)
@@ -173,6 +187,23 @@ def test_run_warns_about_an_inherited_user_token(monkeypatch, caplog) -> None:
     with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
         assert cli._cmd_run() == 0
     assert caplog.records, "an inherited user token deserves a warning"
+
+
+def test_run_silent_when_slack_job_trigger_is_disabled(monkeypatch, caplog) -> None:
+    # SLACK_JOB_COMMAND="" is an enqueue-only install (cron, a git hook,
+    # `claude-jobs enqueue`); no job can carry kind="slack" so the loop-prone
+    # token is moot and the worker must not warn about it on every start.
+    monkeypatch.setenv("SLACK_JOB_COMMAND", "")
+    monkeypatch.setattr(cli, "live_pid", lambda frontend: None)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setattr(cli, "check_backend", lambda: None)
+    monkeypatch.setattr(
+        cli.checks, "resolve_jobs_token", lambda env: ("SLACK_TOKEN", "xoxp-user")
+    )
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro: coro.close())
+    with caplog.at_level("WARNING", logger="claude_on_the_fly.jobs.cli"):
+        assert cli._cmd_run() == 0
+    assert not caplog.records, "no Slack producer means no loop hazard to warn about"
 
 
 class TestDoctor:
@@ -217,13 +248,13 @@ class TestDoctor:
 
 class TestMainDispatch:
     def test_doctor_is_dispatched(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
         monkeypatch.setattr(cli.sys, "argv", ["claude-jobs", "doctor"])
         monkeypatch.setattr(cli, "_cmd_doctor", lambda: 7)
         assert cli.main() == 7
 
     def test_enqueue_is_dispatched_with_its_options(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
         monkeypatch.setattr(
             cli.sys,
             "argv",
@@ -235,6 +266,8 @@ class TestMainDispatch:
                 "C1",
                 "--thread-ts",
                 "1.1",
+                "--at",
+                "30m",
             ],
         )
         seen: list[tuple] = []
@@ -242,10 +275,10 @@ class TestMainDispatch:
             cli, "_cmd_enqueue", lambda *args: (seen.append(args), 0)[1]
         )
         assert cli.main() == 0
-        assert seen == [("do it", "C1", "1.1")]
+        assert seen == [("do it", "C1", "1.1", "30m")]
 
     def test_a_bare_invocation_runs_the_worker(self, monkeypatch) -> None:
-        monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+        monkeypatch.setattr(cli.envfile, "load_into_process", lambda: None)
         monkeypatch.setattr(cli.sys, "argv", ["claude-jobs"])
         monkeypatch.setattr(cli, "_cmd_run", lambda: 3)
         assert cli.main() == 3
@@ -432,6 +465,64 @@ class TestRunLoopWiring:
 
         assert order == ["verify_boundary", "build", "sweep", "run_loop"]
 
+    async def test_the_brokers_start_after_the_boundary_and_stop_last(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A job's agent needs the brokers a chat turn has, and nothing may claim
+        work before the jail is proven, so they start between the two. They reach
+        the runner through build_components and stop when the worker does."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        order: list[str] = []
+
+        class FakeBrokers:
+            async def start(self):
+                order.append("brokers.start")
+
+            async def stop(self):
+                order.append("brokers.stop")
+
+        fake = FakeBrokers()
+        monkeypatch.setattr(cli, "JobBrokers", lambda: fake)
+        handed: list = []
+        monkeypatch.setattr(
+            cli,
+            "build_components",
+            lambda *args: (
+                handed.append(args[2]),
+                order.append("build"),
+                (MagicMock(), MagicMock(), MagicMock(), MagicMock(), None),
+            )[2],
+        )
+
+        async def verify(*_args, **_kwargs):
+            order.append("verify_boundary")
+
+        monkeypatch.setattr(cli.sandbox, "verify_boundary", verify)
+        ledger = MagicMock()
+        ledger.sweep.return_value = 0
+        monkeypatch.setattr(cli, "ProcessLedger", lambda _path: ledger)
+
+        async def fake_run_loop(*_args, **_kwargs):
+            order.append("run_loop")
+
+        monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+        heartbeat = MagicMock()
+        heartbeat.run = AsyncMock()
+        heartbeat.path = tmp_path / "hb.json"
+        monkeypatch.setattr(cli, "HeartbeatWriter", lambda _role, **kwargs: heartbeat)
+
+        await cli._run("xoxb-token")
+
+        assert order == [
+            "verify_boundary",
+            "brokers.start",
+            "build",
+            "run_loop",
+            "brokers.stop",
+        ]
+        assert handed == [fake]
+
 
 @pytest.mark.parametrize(
     "error",
@@ -569,3 +660,60 @@ def test_workspace_keep_days_falls_back_when_unparseable(monkeypatch) -> None:
     """A typo must not delete everything by resolving to 0, nor stop the worker."""
     monkeypatch.setenv("JOBS_WORKSPACE_KEEP_DAYS", "a month")
     assert cli._workspace_keep_days() == 30
+
+
+def test_enqueue_with_at_writes_available_at(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from claude_on_the_fly import agent
+
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+
+    rc = cli._cmd_enqueue(
+        "summarize the logs", channel="C1", thread_ts=None, at="2026-09-19 09:00"
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not before 2026-09-19T09:00:00" in out
+
+    (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+    payload = json.loads(queued.read_text())
+    assert payload["available_at"] == "2026-09-19T09:00:00"
+
+
+def test_enqueue_with_relative_at_resolves_against_now(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from datetime import datetime
+
+    from claude_on_the_fly import agent
+
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+
+    before = datetime.now()
+    rc = cli._cmd_enqueue("look again", channel="", thread_ts=None, at="30m")
+    after = datetime.now()
+    assert rc == 0
+    capsys.readouterr()
+
+    (queued,) = (tmp_path / "jobs" / "new").glob("*.json")
+    payload = json.loads(queued.read_text())
+    available = datetime.fromisoformat(payload["available_at"])
+    assert (available - before).total_seconds() >= 29 * 60
+    assert (available - after).total_seconds() <= 31 * 60
+
+
+def test_enqueue_with_a_bad_at_fails_without_queueing(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from claude_on_the_fly import agent
+
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("JOBS_QUEUE_KIND", raising=False)
+
+    rc = cli._cmd_enqueue("nope", channel="", thread_ts=None, at="someday")
+    assert rc == 2
+    assert "cannot parse time" in capsys.readouterr().err
+    assert list((tmp_path / "jobs" / "new").glob("*.json")) == []

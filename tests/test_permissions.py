@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -630,12 +631,39 @@ async def test_stop_is_safe_before_start():
 # --- wiring a backend up ---
 
 
-def test_claude_argv_is_the_old_pair_when_off():
-    """The off path has to be byte-identical to the behaviour before this feature,
-    or enabling nothing still changes how every session is spawned."""
+def test_disallowed_tools_default_list():
+    """Short-lived turn processes cannot honor session-lifetime timers, so the
+    built-in scheduling tools ship disallowed by default."""
+    assert permissions.disallowed_tools_argv() == [
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
+    ]
+
+
+def test_disallowed_tools_override(monkeypatch):
+    monkeypatch.setenv("COTF_DISALLOWED_TOOLS", "CronCreate Monitor")
+    assert permissions.disallowed_tools_argv() == [
+        "--disallowed-tools",
+        "CronCreate,Monitor",
+    ]
+    monkeypatch.setenv("COTF_DISALLOWED_TOOLS", "")
+    assert permissions.disallowed_tools_argv() == []
+
+
+def test_claude_argv_is_the_old_pair_when_off(monkeypatch):
+    """The off path keeps the historical pair plus the disallowed-tools flag;
+    the flag itself is what keeps unrunnable in-process timers out."""
+    monkeypatch.setenv("COTF_DISALLOWED_TOOLS", "")
     assert permissions.claude_argv(permissions.Permissions()) == [
         "--permission-mode",
         "bypassPermissions",
+    ]
+    monkeypatch.delenv("COTF_DISALLOWED_TOOLS")
+    assert permissions.claude_argv(permissions.Permissions()) == [
+        "--permission-mode",
+        "bypassPermissions",
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
     ]
 
 
@@ -762,7 +790,12 @@ def test_pty_gets_the_permission_mode_but_not_the_prompt_tool():
     argv = permissions.claude_argv(
         permissions.Permissions(mode="ask", claude_mode="manual"), pty=True
     )
-    assert argv == ["--permission-mode", "manual"]
+    assert argv == [
+        "--permission-mode",
+        "manual",
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
+    ]
     assert "--permission-prompt-tool" not in argv
     assert "--mcp-config" not in argv
 
@@ -777,7 +810,12 @@ def test_native_still_gets_the_prompt_tool():
 def test_pty_with_approvals_off_is_silent(caplog):
     with caplog.at_level("WARNING", logger="claude_on_the_fly.permissions"):
         argv = permissions.claude_argv(permissions.Permissions(), pty=True)
-    assert argv == ["--permission-mode", "bypassPermissions"]
+    assert argv == [
+        "--permission-mode",
+        "bypassPermissions",
+        "--disallowed-tools",
+        "CronCreate,CronDelete,CronList,ScheduleWakeup",
+    ]
     assert caplog.text == ""
 
 
@@ -1048,7 +1086,7 @@ def fake_tmux(monkeypatch):
     sent: list[list[str]] = []
     pane = {"text": REAL_BASH_DIALOG}
 
-    async def fake(*args: str):
+    async def fake(*args: str, session: str = ""):
         sent.append(list(args))
         if args[0] == "capture-pane":
             return 0, pane["text"]
@@ -1191,7 +1229,7 @@ async def test_a_cancel_that_tmux_rejects_is_reported(monkeypatch, caplog):
     """If the keystroke does not land there is nothing more cotf can do, and the
     return value must not claim the dialog was dealt with."""
 
-    async def refusing(*args: str):
+    async def refusing(*args: str, session: str = ""):
         if args[0] == "send-keys":
             return 1, ""
         return 0, ""
@@ -1209,7 +1247,7 @@ async def test_a_missing_pane_tells_the_operator_how_to_fix_it(monkeypatch, capl
     names the deployment fix rather than reporting a one-off refusal."""
     from claude_on_the_fly.approvals import RecordingGate
 
-    async def dead(*args: str):
+    async def dead(*args: str, session: str = ""):
         if args[0] == "has-session":
             return 1, ""
         return 0, "just ordinary output"
@@ -1258,7 +1296,7 @@ async def test_a_relayed_dialog_counts_toward_the_ungated_turn_guard(fake_tmux):
 async def test_tmux_refusing_the_keystroke_is_reported(monkeypatch, caplog):
     from claude_on_the_fly.approvals import RecordingGate
 
-    async def broken(*args: str):
+    async def broken(*args: str, session: str = ""):
         if args[0] == "capture-pane":
             return 0, REAL_BASH_DIALOG
         return 1, ""
@@ -1276,7 +1314,7 @@ async def test_read_dialog_waits_for_the_prompt_to_finish_painting(monkeypatch):
     prompt has rendered."""
     calls = {"n": 0}
 
-    async def slow(*args: str):
+    async def slow(*args: str, session: str = ""):
         if args[0] != "capture-pane":
             return 0, ""
         calls["n"] += 1
@@ -1290,7 +1328,7 @@ async def test_read_dialog_waits_for_the_prompt_to_finish_painting(monkeypatch):
 
 
 async def test_read_dialog_gives_up_rather_than_polling_forever(monkeypatch):
-    async def blank(*_args: str):
+    async def blank(*_args: str, session: str = ""):
         return 0, "nothing"
 
     monkeypatch.setattr(permissions, "_tmux", blank)
@@ -1364,10 +1402,18 @@ async def test_a_malformed_notify_is_rejected(body):
 def test_the_pane_name_is_unique_per_chat_and_session():
     """claude-pty's own default is PID-based, which the daemon cannot predict, and a
     shared name would let one chat's approval land in another chat's pane."""
-    first = permissions.tmux_session_name(1, "aaaaaaaa-1111")
-    assert first != permissions.tmux_session_name(2, "aaaaaaaa-1111")
-    assert first != permissions.tmux_session_name(1, "bbbbbbbb-2222")
-    assert first == permissions.tmux_session_name(1, "aaaaaaaa-9999")[: len(first)]
+    first = permissions.tmux_session_name("slack", 1, "aaaaaaaa-1111")
+    assert first != permissions.tmux_session_name("slack", 2, "aaaaaaaa-1111")
+    assert first != permissions.tmux_session_name("slack", 1, "bbbbbbbb-2222")
+    assert (
+        first
+        == permissions.tmux_session_name("slack", 1, "aaaaaaaa-9999")[: len(first)]
+    )
+    # Segmented per frontend: one shared tmux server means a restarting
+    # orchestrator reaps by prefix, and slack must not reap telegram's live panes.
+    assert first != permissions.tmux_session_name("telegram", 1, "aaaaaaaa-1111")
+    assert first.startswith(permissions.tmux_session_prefix("slack"))
+    assert not first.startswith(permissions.tmux_session_prefix("telegram"))
 
 
 def test_pty_settings_install_only_the_permission_prompt_hook(operator_settings):
@@ -1454,7 +1500,7 @@ async def test_a_missing_pane_is_reported_as_the_script_fallback(monkeypatch, ca
     no session at all means claude-pty never used tmux."""
     from claude_on_the_fly.approvals import RecordingGate
 
-    async def no_session(*args: str):
+    async def no_session(*args: str, session: str = ""):
         if args[0] == "has-session":
             return 1, ""
         return 0, "no dialog on this pane"
@@ -1473,7 +1519,7 @@ async def test_a_missing_pane_is_reported_as_the_script_fallback(monkeypatch, ca
 async def test_a_live_pane_with_no_dialog_is_reported_differently(monkeypatch, caplog):
     from claude_on_the_fly.approvals import RecordingGate
 
-    async def alive_but_blank(*args: str):
+    async def alive_but_blank(*args: str, session: str = ""):
         if args[0] == "has-session":
             return 0, ""
         return 0, "just ordinary output"
@@ -1494,3 +1540,54 @@ async def test_a_live_pane_with_no_dialog_is_reported_differently(monkeypatch, c
     assert "could not read the permission dialog" in caplog.text
     assert "script backend" not in caplog.text
     assert told == [permissions.UNREADABLE_DIALOG_NOTICE]
+
+
+class TestApprovalsReachTheHostedServer:
+    """A hosted turn puts claude-pty's session on its own tmux server. A tmux run
+    without TMUX_TMPDIR talks to the operator's default server instead, where the
+    dialog does not exist -- so the turn parks on a question nobody can read,
+    answer, or cancel."""
+
+    async def test_the_probe_is_pointed_at_the_run_s_own_server(self, monkeypatch):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        monkeypatch.setattr(
+            tmux_mod, "session_env", lambda _s: {"TMUX_TMPDIR": "/run/pane"}
+        )
+        seen: dict = {}
+
+        async def record(*_args, **kwargs):
+            seen["env"] = kwargs.get("env")
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+
+        await permissions._tmux(
+            "has-session", "-t", "cotf-pty-1-abcd", session="cotf-pty-1-abcd"
+        )
+
+        assert seen["env"]["TMUX_TMPDIR"] == "/run/pane"
+
+    async def test_an_unhosted_session_keeps_the_default_server(self, monkeypatch):
+        """With hosting off claude-pty uses the default server, and forcing
+        TMUX_TMPDIR would look for the pane on a server that does not have it."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        monkeypatch.setattr(tmux_mod, "session_env", lambda _s: {})
+        seen: dict = {}
+
+        async def record(*_args, **kwargs):
+            seen["env"] = kwargs.get("env")
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+
+        await permissions._tmux("has-session", "-t", "x", session="x")
+
+        assert seen["env"] is None

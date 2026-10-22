@@ -7,6 +7,7 @@ import pytest
 from claude_on_the_fly.tui import render
 from claude_on_the_fly.tui.render import (
     cron_header,
+    mode_strip,
 )
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,25 @@ class TestSchedulerHeader:
     def test_the_default_sort_is_next_fire(self):
         line = cron_header(state="running", count=2, next_fire_str=None)
         assert "sort: next fire" in line
+
+
+class TestModeStrip:
+    """The bottom viewport's mode selector."""
+
+    def test_the_active_mode_is_reverse_video(self):
+        line = mode_strip("live", ("log", "live"))
+        assert "[reverse] LIVE [/reverse]" in line
+        assert "log" in line
+
+    def test_a_mode_with_nothing_to_show_is_dimmed(self):
+        line = mode_strip("log", ("log", "live"), {"live"})
+        assert "[dim]live[/dim]" in line
+
+    def test_the_active_mode_stays_lit_even_with_nothing_to_show(self):
+        """Dimming the mode you are looking at would say it is unreachable."""
+        line = mode_strip("live", ("log", "live"), {"live"})
+        assert "[reverse] LIVE [/reverse]" in line
+        assert "[dim]live[/dim]" not in line
 
 
 class TestReadNewLines:

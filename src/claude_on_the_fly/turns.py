@@ -20,9 +20,8 @@ Two phases. Both resume; the difference is what the resumed turn is told:
   says it is a resume so the agent can check what is already there before
   repeating anything (`orchestrator.RESUME_TEMPLATE`).
 
-A turn that has been replayed to its limit is the one exception, and it is where
-the phases stop mattering: running it again is the likeliest reason the daemon
-keeps going down, so it is offered back instead.
+A stale turn or one replayed to its limit is preserved for explicit recovery
+and offered back instead. Neither disappears because of its age or retry count.
 
 There is deliberately no third "started but has not acted yet" phase. Both
 backends only build their tool-event relay when interim progress is enabled
@@ -51,9 +50,8 @@ logger = logging.getLogger(__name__)
 QUEUED = "queued"
 DISPATCHED = "dispatched"
 
-# How old a pending turn may be and still be worth acting on. A restart takes
-# seconds and an upgrade a minute; a machine that was off overnight should not
-# resurrect yesterday's half-finished question at breakfast.
+# Automatic replay window. Older work is preserved for explicit recovery;
+# it must not silently disappear or execute potentially stale instructions.
 DEFAULT_TTL_S = 30 * 60
 
 # How many times one turn may be replayed before it is parked. A turn that kills
@@ -84,6 +82,11 @@ class PendingTurn:
     compact: bool = False
     phase: str = QUEUED
     turn_id: str = ""
+    # The clock the TTL runs against, not a permanent record of arrival:
+    # `mark_dispatched` restarts it, so the gate measures how long this attempt
+    # has been unanswered rather than how long the person has been waiting.
+    # The JSON key is unchanged, so a journal written by an older build still
+    # loads and still ages out on its own acceptance time.
     recorded_at: float = 0.0
     replays: int = 0
 
@@ -218,6 +221,38 @@ class TurnJournal:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def recovery_path(self) -> Path:
+        """Unanswered turns held for explicit recovery, never automatic replay."""
+        return self._path.with_suffix(".recovery.json")
+
+    def parked(self) -> list[PendingTurn]:
+        return TurnJournal(self.recovery_path).pending()
+
+    def park(self, turn: PendingTurn) -> bool:
+        """Keep the original source, route and replay count before retiring it."""
+        archive = TurnJournal(self.recovery_path)
+        # Do not replace an unreadable recovery file with a partial inventory.
+        try:
+            raw = json.loads(archive.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = []
+        except (OSError, ValueError):
+            logger.exception("turns: cannot read recovery file %s", archive.path)
+            return False
+        entries: dict[str, PendingTurn] = {}
+        if not isinstance(raw, list):
+            logger.error("turns: invalid recovery inventory %s", archive.path)
+            return False
+        for row in raw:
+            entry = PendingTurn.from_dict(row) if isinstance(row, dict) else None
+            if entry is None:
+                logger.error("turns: invalid recovery entry %s", archive.path)
+                return False
+            entries[entry.turn_id] = entry
+        entries[turn.turn_id] = turn
+        return archive._write(list(entries.values()))
+
     # -- writing ---------------------------------------------------------
 
     def record(self, turn: PendingTurn) -> None:
@@ -226,15 +261,25 @@ class TurnJournal:
         entries[turn.turn_id] = turn
         self._write(list(entries.values()))
 
-    def mark_dispatched(self, turn_id: str) -> None:
+    def mark_dispatched(self, turn_id: str, now: float | None = None) -> None:
         """Note that an agent was started for this turn, so a resume of it has to
-        assume work may already have happened. Silent if the entry is gone."""
+        assume work may already have happened. Silent if the entry is gone.
+
+        This also restarts the TTL clock, because dispatch is the point the clock
+        is meant to measure from. It used to keep the acceptance time, and a turn
+        could then age out while it was running: accepted 29 minutes ago behind
+        other work in the same chat, dispatched a second ago, still going when
+        the daemon died -- and `take()` returned it in neither list, so it was
+        dropped and nobody was told. A queue that long is ordinary, since one
+        chat drains serially.
+        """
+        moment = time.time() if now is None else now
         entries = self._read()
         found = False
         updated = []
         for entry in entries:
             if entry.turn_id == turn_id and entry.phase != DISPATCHED:
-                updated.append(replace(entry, phase=DISPATCHED))
+                updated.append(replace(entry, phase=DISPATCHED, recorded_at=moment))
                 found = True
             else:
                 updated.append(entry)
@@ -253,49 +298,64 @@ class TurnJournal:
     def take(
         self, *, ttl_s: float = DEFAULT_TTL_S, now: float | None = None
     ) -> tuple[list[PendingTurn], list[PendingTurn]]:
-        """Empty the journal and return (to replay, to nudge about).
+        """Reserve bounded replays and preserve stale/failed work for recovery.
 
-        Emptying *before* anything runs is what stops a turn that kills the
-        daemon from being replayed at every start; the replay counter it carries
-        forward is what parks it if it manages to be recorded again. Same
-        reasoning as cron renaming its trigger file before it reads it.
-
-        Both phases replay. The phase is not what decides that any more -- it
-        travels so the caller can tell a resumed turn that it may be repeating
-        itself (`orchestrator.RESUME_TEMPLATE`) -- and the only thing held back is
-        a turn that has already been replayed to its limit, where running it again
-        is the likeliest reason the daemon keeps going down. Expired entries are
-        returned in neither list: nothing is owed to a question from another day.
+        The incremented replay count is persisted before returning. The same
+        turn id stays journaled until its reply lands, including a crash between
+        this read and the orchestrator's enqueue. Stale or exhausted turns are
+        archived before being removed from the runnable journal and offered back.
         """
         entries = self._read()
         if not entries:
             return [], []
-        self._write([])
         moment = time.time() if now is None else now
         replay: list[PendingTurn] = []
         nudge: list[PendingTurn] = []
+        retained: list[PendingTurn] = []
         for entry in entries:
             if entry.recorded_at and moment - entry.recorded_at > ttl_s:
                 logger.info(
-                    "turns: dropping %s for chat_id=%s, older than %.0fs",
+                    "turns: parking %s for chat_id=%s, older than %.0fs",
                     entry.turn_id,
                     entry.chat_id,
                     ttl_s,
                 )
-                continue
-            if entry.replays >= MAX_REPLAYS:
+                if self.park(entry):
+                    nudge.append(entry)
+                else:
+                    retained.append(entry)
+            elif entry.replays >= MAX_REPLAYS:
                 logger.warning(
                     "turns: parking %s for chat_id=%s after %d replays",
                     entry.turn_id,
                     entry.chat_id,
                     entry.replays,
                 )
-                nudge.append(entry)
+                if self.park(entry):
+                    nudge.append(entry)
+                else:
+                    retained.append(entry)
             else:
-                replay.append(replace(entry, replays=entry.replays + 1))
+                reserved = replace(entry, replays=entry.replays + 1)
+                retained.append(reserved)
+                replay.append(reserved)
+        if not self._write(retained):
+            # No unrecorded replay and no notice for work whose handoff failed.
+            return [], []
         replay.sort(key=lambda t: t.turn_id)
         nudge.sort(key=lambda t: t.turn_id)
         return replay, nudge
+
+    def pending(self) -> list[PendingTurn]:
+        """Every unanswered turn, as recorded. Read-only.
+
+        For an observer: the dashboard shows a running turn's own text, which
+        lives nowhere else — a chat frontend's heartbeat carries the identifier
+        and the uptime, not the message. `take()` is the daemon's path and this
+        is not a substitute for it: nothing here marks, replays, or forgets a
+        turn.
+        """
+        return self._read()
 
     def _read(self) -> list[PendingTurn]:
         try:
@@ -315,7 +375,7 @@ class TurnJournal:
         ]
         return [turn for turn in rebuilt if turn is not None]
 
-    def _write(self, entries: list[PendingTurn]) -> None:
+    def _write(self, entries: list[PendingTurn]) -> bool:
         try:
             payload = json.dumps([entry.to_dict() for entry in entries], indent=2)
         except (TypeError, ValueError):
@@ -323,7 +383,7 @@ class TurnJournal:
             # That is the frontend's bug, and the turn it describes must still be
             # served: this journal is a safety net, not a gate on the message path.
             logger.exception("turns: cannot serialize the journal for %s", self._path)
-            return
+            return False
         # A fixed temp name, kept on purpose. One daemon owns one frontend's
         # journal, so there is no second writer to collide with, and a fixed name
         # is reclaimed by the next write after a SIGKILL -- a pid-suffixed one
@@ -340,10 +400,14 @@ class TurnJournal:
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
             with os.fdopen(os.open(tmp, flags, 0o600), "wb") as handle:
                 handle.write(payload.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.chmod(tmp, 0o600)
             tmp.replace(self._path)
+            return True
         except OSError:
             # The turn matters more than the record of it. Logged rather than
             # swallowed: losing the journal means a stop stops being recoverable,
             # which the operator should be able to find out about.
             logger.exception("turns: could not write %s", self._path)
+            return False

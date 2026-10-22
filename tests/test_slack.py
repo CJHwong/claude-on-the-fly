@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
@@ -16,58 +17,110 @@ from slack_sdk.errors import SlackApiError
 from claude_on_the_fly import settings
 from claude_on_the_fly import slack as slack_mod
 from claude_on_the_fly.agent import Response
+from claude_on_the_fly.protocol import LegacyWorkspace
 from claude_on_the_fly.slack import (
     CONTINUE_COMMAND,
     DEFAULT_JOB_COMMAND,
     DEFAULT_REPLY_SOFT_LIMIT,
     JOB_LIST_LIMIT,
+    RATE_LIMIT_RETRIES,
     SlackFrontend,
-    _build_response_blocks,
     _render_job_list,
+    _reply_messages,
     _session_key,
     _split_blocks,
 )
-from claude_on_the_fly.slack_mrkdwn import SLACK_MARKDOWN_LIMIT
+from claude_on_the_fly.slack_mrkdwn import (
+    SLACK_MARKDOWN_LIMIT,
+    SLACK_MESSAGE_CHAR_LIMIT,
+    SLACK_TEXT_FIELD_BYTES,
+    fit_text_field,
+)
 from claude_on_the_fly.slack_watermarks import SlackWatermarks
 
 # ---------------------------------------------------------------------------
-# _build_response_blocks
+# _reply_messages
 # ---------------------------------------------------------------------------
 
 
-class TestBuildResponseBlocks:
+class TestReplyMessages:
     """The body ships as Markdown for Slack to parse, not as pre-cooked mrkdwn.
 
     Slack's `markdown` block gives back a real `rich_text_list` that indents and
     a real `table`. Converting first would flatten both, which is what the old
     `section` path did.
+
+    A message cap sits below the per-block cap, so a long reply becomes several
+    messages, and the footer and buttons close the last one only.
     """
 
     def test_body_is_a_markdown_block(self):
-        blocks = _build_response_blocks("hello", Response(body="hello"))
+        text, blocks = _reply_messages("hello", Response(body="hello"))[0]
+        assert text == "hello"
         assert blocks[0] == {"type": "markdown", "text": "hello"}
 
     def test_nested_list_reaches_slack_unconverted(self):
         body = "- top\n  - child"
-        blocks = _build_response_blocks(body, Response(body=body))
+        _, blocks = _reply_messages(body, Response(body=body))[0]
         assert blocks[0]["text"] == body
 
     def test_table_is_not_flattened_into_a_code_fence(self):
         body = "| a | b |\n| --- | --- |\n| 1 | 2 |"
-        blocks = _build_response_blocks(body, Response(body=body))
+        _, blocks = _reply_messages(body, Response(body=body))[0]
         assert blocks[0]["text"] == body
         assert "```" not in blocks[0]["text"]
 
     def test_bold_keeps_its_markdown_spelling(self):
-        blocks = _build_response_blocks("**bold**", Response(body="**bold**"))
+        _, blocks = _reply_messages("**bold**", Response(body="**bold**"))[0]
         assert blocks[0]["text"] == "**bold**"
 
-    def test_a_long_body_is_laid_across_several_markdown_blocks(self):
-        body = "x" * (SLACK_MARKDOWN_LIMIT + 10)
-        blocks = _build_response_blocks(body, Response(body=body))
-        bodies = [b for b in blocks if b["type"] == "markdown"]
-        assert len(bodies) == 2
-        assert "".join(b["text"] for b in bodies) == body
+    def test_a_long_body_goes_out_as_several_messages(self):
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+        messages = _reply_messages(body, Response(body=body))
+        assert len(messages) == 2
+        assert "".join(blocks[0]["text"] for _, blocks in messages) == body
+        for _, blocks in messages:
+            assert [b["type"] for b in blocks] == ["markdown"]
+
+    def test_each_message_carries_its_own_text(self):
+        """`text` is the fallback Slack shows for a message, so a part must not
+        claim the whole reply. The fallback is fitted under chat.update's
+        4,000-byte cap, so a long part's text is a prefixed truncation of its
+        markdown block rather than a copy."""
+        body = "".join(f"line {i}\n\n" for i in range(800))
+        messages = _reply_messages(body, Response(body=body))
+        assert len(messages) > 1
+        for text, blocks in messages:
+            assert len(text.encode()) <= SLACK_TEXT_FIELD_BYTES
+            chunk = blocks[0]["text"]
+            assert text == fit_text_field(chunk)
+
+    def test_a_short_part_keeps_its_text_whole(self):
+        body = "just a line"
+        [text, blocks] = _reply_messages(body, Response(body=body))[0]
+        assert text == body == blocks[0]["text"]
+
+    def test_footer_closes_the_last_message_only(self):
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+        response = Response(body=body, cost=0.01, model="sonnet")
+        messages = _reply_messages(body, response)
+        types = [[b["type"] for b in blocks] for _, blocks in messages]
+        assert types[0] == ["markdown"]
+        assert "context" in types[-1]
+
+    def test_buttons_ride_the_last_message_only(self):
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+        response = Response(body=body, suggestions=["more", "stop"])
+        messages = _reply_messages(body, response)
+        actions = [
+            b for _, blocks in messages for b in blocks if b["type"] == "actions"
+        ]
+        assert len(actions) == 1
+        assert [b["type"] for b in messages[-1][1]][-1] == "actions"
+
+    def test_no_suggestions_means_no_actions_block(self):
+        messages = _reply_messages("hello", Response(body="hello"))
+        assert not any(b["type"] == "actions" for b in messages[0][1])
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +174,45 @@ class TestSplitBlocks:
         result = _split_blocks(text)
         assert result[0] == short
         assert all(len(chunk) <= SLACK_MARKDOWN_LIMIT for chunk in result)
-        assert "".join(result) == text
+
+    def test_a_table_is_not_cut_at_a_row_boundary(self):
+        """A table cut at a row boundary loses its header row, and Slack renders
+        the rows below the split as plain text."""
+        text = "intro line\n| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\noutro line"
+        chunks = _split_blocks(text, limit=60)
+        holders = [chunk for chunk in chunks if "| a | b |" in chunk]
+        assert len(holders) == 1
+        assert "| 3 | 4 |" in holders[0]
+
+    def test_a_fence_that_fits_is_not_cut_at_a_blank_line_inside_it(self):
+        text = "x" * 10 + "\n```\n" + "a" * 10 + "\n\n" + "b" * 10 + "\n```"
+        chunks = _split_blocks(text, limit=30)
+        # The fence does not fit beside the prose, so the split lands before it
+        # opens rather than on the blank line inside it.
+        assert chunks[0] == "x" * 10
+
+    def test_a_fence_that_fits_beside_the_prose_is_kept_whole(self):
+        text = "before\n```\nline one\nline two\n```\nafter"
+        chunks = _split_blocks(text, limit=30)
+        holders = [chunk for chunk in chunks if "```" in chunk]
+        assert len(holders) == 1
+        assert "line two" in holders[0]
+
+    def test_a_block_boundary_beats_a_later_line_boundary(self):
+        first, second, third = "x" * 20, "y" * 20, "z" * 20
+        text = f"{first}\n\n{second}\n{third}"
+        assert _split_blocks(text, limit=55) == [
+            f"{first}\n",
+            f"\n{second}\n{third}",
+        ]
+
+    def test_a_table_longer_than_the_limit_is_still_cut(self):
+        rows = "\n".join(f"| row {i} | value {i} |" for i in range(20))
+        text = f"| a | b |\n| --- | --- |\n{rows}"
+        chunks = _split_blocks(text, limit=100)
+        assert len(chunks) > 1
+        assert all(len(chunk) <= 100 for chunk in chunks)
+        assert "".join(chunks) == text
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +302,18 @@ class TestSlackFrontendInit:
         _, kwargs = mock_app_cls.call_args
         assert kwargs["ignoring_self_events_enabled"] is True
 
+    def test_rate_limited_calls_are_retried(self):
+        """A real client, because the point is what slack_sdk ships by default:
+        one handler, for connection errors. A 429 is not one, so without this the
+        reaction or the menu edit is dropped and only logged."""
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        handlers = {type(h).__name__: h for h in frontend._app.client.retry_handlers}
+        assert "AsyncRateLimitErrorRetryHandler" in handlers
+        assert (
+            handlers["AsyncRateLimitErrorRetryHandler"].max_retry_count
+            == RATE_LIMIT_RETRIES
+        )
+
 
 # ---------------------------------------------------------------------------
 # workspace_name / sender_name / channel_context
@@ -228,6 +331,37 @@ class TestMetadataAccessors:
         fe = SlackFrontend("xapp", "xoxp", "U1")
         fe._workspace_names[42] = "dm-user-123"
         assert fe.workspace_name(42) == "slack/dm-user-123"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_names_a_channel(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "channel/C1"
+        fe._channel_names[42] = "general"
+        assert fe.display_label(42) == "slack/channel/C1 #general"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_names_the_person_in_a_dm(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "dm/U9"
+        fe._sender_names[42] = "hoss"
+        assert fe.display_label(42) == "slack/dm/U9 hoss"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_falls_back_to_the_id_alone(self, mock_app_cls):
+        """A DM before the message path has learned who is talking, and a
+        channel whose name lookup failed (the id is stored as the name)."""
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[1] = "dm/U9"
+        fe._workspace_names[2] = "channel/C99"
+        fe._channel_names[2] = "C99"
+        assert fe.display_label(1) == "slack/dm/U9"
+        assert fe.display_label(2) == "slack/channel/C99"
+
+    @patch("claude_on_the_fly.slack.AsyncApp")
+    def test_display_label_labels_a_group_dm_by_kind(self, mock_app_cls):
+        fe = SlackFrontend("xapp", "xoxp", "U1")
+        fe._workspace_names[42] = "mpim/G1"
+        assert fe.display_label(42) == "slack/mpim/G1 group-dm"
 
     @patch("claude_on_the_fly.slack.AsyncApp")
     def test_sender_name_default(self, mock_app_cls):
@@ -263,6 +397,7 @@ def frontend(monkeypatch):
         mock_app = MagicMock()
         mock_app.client = MagicMock()
         mock_app.client.chat_postMessage = AsyncMock()
+        mock_app.client.chat_postEphemeral = AsyncMock()
         mock_app.client.users_info = AsyncMock()
         mock_app.client.conversations_info = AsyncMock()
         mock_app.client.conversations_members = AsyncMock()
@@ -295,6 +430,30 @@ class TestIngestEvent:
     async def test_skips_non_allowed_subtype(self, frontend):
         await frontend._ingest_event({"subtype": "bot_message", "ts": "1"})
         frontend._on_message.assert_not_awaited()
+
+    async def test_a_trusted_bot_is_the_sender_of_its_own_dm(self, frontend):
+        """A bot post has no `user`, and an empty sender named `users//` in the
+        prompt; once a restart dropped the empty journaled value the fallback
+        was the numeric chat id. The bot id is what the allowlist trusted and
+        what the DM workspace is named after, so it is the sender too."""
+        frontend._pinned_allowed_bot_ids = {"B_ALERT"}
+        event = {
+            "subtype": "bot_message",
+            "bot_id": "B_ALERT",
+            "username": "Alerts",
+            "ts": "1.1",
+            "text": "deploy finished",
+            "channel": "D_BOT",
+            "channel_type": "im",
+        }
+
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_awaited_once()
+        chat_id = frontend._on_message.await_args.args[0]
+        assert frontend.sender_identity(chat_id) == "B_ALERT"
+        assert frontend.workspace_name(chat_id) == "slack/dm/B_ALERT"
+        assert frontend._session_metadata(chat_id)["sender_id"] == "B_ALERT"
 
     async def test_allows_file_share_subtype(self, frontend):
         event = {
@@ -394,6 +553,7 @@ class TestIngestEvent:
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
         session_id = _session_key("C1", "5.1")
         frontend._sessions[session_id] = ("C1", "5.1")
+        frontend._mention_taggers[session_id] = {"U_ALLOWED"}
         event = {
             "ts": "5.2",
             "thread_ts": "5.1",
@@ -407,8 +567,8 @@ class TestIngestEvent:
 
         frontend._on_message.assert_not_awaited()
         frontend._app.client.chat_postMessage.assert_not_called()
-        assert session_id in frontend._mention_notices
-        frontend._cancel_mention_notice(session_id)
+        assert (session_id, "U_ALLOWED") in frontend._mention_notices
+        frontend._cancel_mention_notice(session_id, "U_ALLOWED")
 
     async def test_an_untagged_message_in_an_unknown_thread_is_silent(self, frontend):
         """Ordinary channel chatter the bot was never part of. Answering it would make
@@ -540,6 +700,39 @@ class TestIngestEvent:
 # ---------------------------------------------------------------------------
 
 
+class TestReactionVocabulary:
+    def test_every_state_has_its_own_glyph(self):
+        """Two states sharing a glyph is the failure the names exist to prevent: an
+        interrupted turn wearing the queue's hourglass cannot be told from one
+        merely waiting its turn, and a gated message wearing :eyes: cannot be told
+        from one being worked on."""
+        glyphs = [
+            slack_mod.QUEUED_EMOJI,
+            slack_mod.RUNNING_EMOJI,
+            slack_mod.INTERRUPTED_EMOJI,
+            slack_mod.GATED_EMOJI,
+        ]
+        assert len(set(glyphs)) == len(glyphs)
+
+
+class TestContinueButtonRouting:
+    """The button carries its own routing, so a tap outlives the process."""
+
+    def test_round_trips_a_thread(self):
+        value = slack_mod._continue_button_value("C1", "t1")
+        assert slack_mod._parse_continue_value(value) == ("C1", "t1")
+
+    def test_round_trips_a_channel_root(self):
+        value = slack_mod._continue_button_value("C1", None)
+        assert slack_mod._parse_continue_value(value) == ("C1", None)
+
+    @pytest.mark.parametrize("value", ["", "|t1", "C1|t1|extra", "C1|t1|"])
+    def test_malformed_values_are_refused(self, value):
+        """A card can outlive the build that drew it, so a shape this code never
+        wrote is dropped rather than guessed at."""
+        assert slack_mod._parse_continue_value(value) is None
+
+
 class TestNotifyQueued:
     async def test_reacts_with_hourglass_on_latest_pending(self, frontend):
         from collections import deque
@@ -607,6 +800,13 @@ class TestNotifyStart:
         frontend._app.client.reactions_add.assert_not_awaited()
         frontend._app.client.reactions_remove.assert_not_awaited()
 
+    async def test_no_pending_is_logged_at_warning(self, frontend, caplog):
+        """A turn that reacts to nothing is the one trace of a dropped :eyes:.
+        At debug it left none, so it could not be told from an API failure."""
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.notify_start(99999)
+        assert "no pending reaction msg for chat_id=99999" in caplog.text
+
 
 class TestNotifyComplete:
     async def test_removes_eyes_from_in_flight(self, frontend):
@@ -653,6 +853,147 @@ class TestSend:
         blocks = call_kwargs["blocks"]
         assert any(b["type"] == "markdown" for b in blocks)
         assert any(b["type"] == "context" for b in blocks)
+
+    async def test_a_long_reply_posts_one_message_per_part(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        body = "x" * (SLACK_MESSAGE_CHAR_LIMIT + 10)
+
+        delivered = await frontend.send(session_id, Response(body=body))
+
+        assert frontend._app.client.chat_postMessage.await_count == 2
+        # The full body rides the markdown blocks; the `text` fallback of each
+        # part is fitted under chat.update's 4,000-byte cap.
+        posted = [
+            call[1]["blocks"][0]["text"]
+            for call in frontend._app.client.chat_postMessage.call_args_list
+        ]
+        assert "".join(posted) == body
+        for call in frontend._app.client.chat_postMessage.call_args_list:
+            assert len(call[1]["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
+        assert delivered == []
+
+    async def test_footer_and_buttons_close_the_last_message_only(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+        response = Response(
+            body="x" * (SLACK_MESSAGE_CHAR_LIMIT + 10),
+            cost=0.01,
+            model="sonnet",
+            suggestions=["more"],
+        )
+
+        await frontend.send(session_id, response)
+
+        calls = frontend._app.client.chat_postMessage.call_args_list
+        first = [b["type"] for b in calls[0][1]["blocks"]]
+        last = [b["type"] for b in calls[-1][1]["blocks"]]
+        assert first == ["markdown"]
+        assert last == ["markdown", "context", "actions"]
+
+    async def test_every_part_records_its_timestamp(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.side_effect = [
+            {"ok": True, "ts": "1.0"},
+            {"ok": True, "ts": "2.0"},
+        ]
+
+        await frontend.send(
+            session_id, Response(body="x" * (SLACK_MESSAGE_CHAR_LIMIT + 10))
+        )
+
+        assert "1.0" in frontend._our_sent_timestamps
+        assert "2.0" in frontend._our_sent_timestamps
+
+    async def test_a_failed_part_stops_the_rest(self, frontend, caplog):
+        """The failure that cost a reply: Slack rejects one part and the send
+        path drops the rest, so the log has to name the part that failed."""
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if len(posts) == 2:
+                raise SlackApiError(
+                    "too long", {"ok": False, "error": "msg_blocks_too_long"}
+                )
+            return {"ok": True, "ts": "1.0"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+        body = "x" * 3000 + "\n\n" + "y" * 3000 + "\n\n" + "z" * 3000
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            delivered = await frontend.send(session_id, Response(body=body))
+
+        assert posts[0]["text"].startswith("x")
+        assert posts[1]["text"].lstrip("\n").startswith("y")
+        assert delivered == []
+        assert "msg_blocks_too_long on part 2/3" in caplog.text
+
+    async def test_an_uncovered_error_tells_the_user_to_report(self, frontend):
+        """A code Slack returns that this frontend has no path for leaves the user
+        with silence, so the notice names the code and asks for a report."""
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if len(posts) == 1:
+                raise SlackApiError(
+                    "too long", {"ok": False, "error": "msg_blocks_too_long"}
+                )
+            return {"ok": True, "ts": "9.0"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+
+        await frontend.send(session_id, Response(body="hello"))
+
+        assert posts[1]["channel"] == "C1"
+        assert posts[1]["thread_ts"] == "t1"
+        assert "msg_blocks_too_long" in posts[1]["text"]
+        assert "Please report this" in posts[1]["text"]
+        assert "9.0" in frontend._our_sent_timestamps
+
+    async def test_the_notice_names_the_part_that_failed(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        posts: list[dict] = []
+
+        async def post(**kwargs):
+            posts.append(kwargs)
+            if len(posts) == 2:
+                raise SlackApiError("nope", {"ok": False, "error": "invalid_blocks"})
+            return {"ok": True, "ts": "1.0"}
+
+        frontend._app.client.chat_postMessage = AsyncMock(side_effect=post)
+        body = "x" * 3000 + "\n\n" + "y" * 3000 + "\n\n" + "z" * 3000
+
+        await frontend.send(session_id, Response(body=body))
+
+        assert "part 2 of 3" in posts[2]["text"]
+
+    async def test_a_notice_that_cannot_be_posted_is_logged_not_raised(
+        self, frontend, caplog
+    ):
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage = AsyncMock(
+            side_effect=[
+                SlackApiError("nope", {"ok": False, "error": "invalid_blocks"}),
+                RuntimeError("socket reset"),
+            ]
+        )
+
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            delivered = await frontend.send(session_id, Response(body="hello"))
+
+        assert delivered == []
+        assert "failed to post the failure notice" in caplog.text
 
     async def test_suppressed_bot_reply_omits_slack_post(self, frontend):
         session_id = _session_key("C1", "t1")
@@ -846,6 +1187,8 @@ def _seed_progress_route(frontend, channel_type: str | None = "im") -> int:
     if channel_type is not None:
         frontend._channel_types["C1"] = channel_type
     frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+    frontend._app.client.chat_update = AsyncMock(return_value={"ok": True})
+    frontend._app.client.chat_delete = AsyncMock(return_value={"ok": True})
     return session_id
 
 
@@ -869,6 +1212,7 @@ class TestSendProgress:
 
         await frontend.send_progress(session_id, "working")
         assert "99.0" in frontend._our_sent_timestamps
+        assert "99.0" in frontend._processed_ts
 
         await frontend._ingest_event(
             {"ts": "99.0", "channel": "C1", "user": "U_ALLOWED", "text": "working"}
@@ -876,13 +1220,25 @@ class TestSendProgress:
         frontend._on_message.assert_not_awaited()
 
     async def test_does_not_count_against_the_reply_budget(self, frontend):
+        """The budget is charged where a message becomes a turn, so neither the
+        narration nor the reply that follows it spends anything on its own."""
         session_id = _seed_progress_route(frontend)
 
         for _ in range(3):
             await frontend.send_progress(session_id, "working")
+        await frontend.send(session_id, Response(body="x"))
         assert frontend._reply_counts.get(session_id, 0) == 0
 
-        await frontend.send(session_id, Response(body="x"))
+        await frontend._ingest_event(
+            {
+                "ts": "1.0",
+                "text": "hi",
+                "channel": "C1",
+                "channel_type": "im",
+                "thread_ts": "t1",
+                "user": "U_ALLOWED",
+            }
+        )
         assert frontend._reply_counts[session_id] == 1
 
     async def test_a_group_dm_is_allowed(self, frontend):
@@ -963,6 +1319,191 @@ class TestSendProgress:
 
         assert "failed to post" in caplog.text
 
+    async def test_the_second_chunk_is_appended_to_the_first_one(self, frontend):
+        """The message is a timeline of the turn, so an edit keeps what it held."""
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "still working")
+        await frontend.send_progress(session_id, "still working, more")
+
+        client = frontend._app.client
+        client.chat_postMessage.assert_awaited_once()
+        client.chat_update.assert_awaited_once()
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["channel"] == "C1"
+        assert kwargs["ts"] == "99.0"
+        rendered = kwargs["blocks"][0]["elements"][0]["text"]
+        assert "still working" in rendered
+        assert "still working, more" in rendered
+        assert rendered.index("still working") < rendered.index("still working, more")
+        assert kwargs["text"] == rendered
+
+    async def test_a_third_chunk_keeps_both_earlier_ones(self, frontend):
+        """The whole turn, not the last two gaps: the body grows, never rotates."""
+        session_id = _seed_progress_route(frontend)
+
+        for chunk in ("first", "second", "third"):
+            await frontend.send_progress(session_id, chunk)
+
+        rendered = frontend._app.client.chat_update.await_args.kwargs["blocks"][0][
+            "elements"
+        ][0]["text"]
+        assert [word for word in ("first", "second", "third") if word in rendered] == [
+            "first",
+            "second",
+            "third",
+        ]
+
+    async def test_a_body_over_the_block_character_cap_starts_a_new_message(
+        self, frontend
+    ):
+        """A context block's text is capped at 2,900 characters. In ASCII that is
+        the ceiling a growing body reaches first, well under the byte cap, and it
+        is the one the old replace-only size check never looked at."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "x" * 2880)
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        await frontend.send_progress(session_id, "y" * 100)
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+
+    async def test_a_body_over_the_edit_byte_cap_starts_a_new_message(self, frontend):
+        """`chat.update` rejects a `text` over 4,000 bytes with `msg_too_long`. CJK
+        passes that byte cap long before the block's character cap, so a body that
+        grew past it goes out as a new message rather than a cut-down edit."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        # 3,600 bytes: a chunk that fits a message of its own and leaves the body
+        # with no room for the next one.
+        await frontend.send_progress(session_id, "進度" * 600)
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        await frontend.send_progress(session_id, "繼續" * 100)
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+        assert "繼續繼續" in client.chat_postMessage.await_args.kwargs["text"]
+        await frontend.send_progress(session_id, "還在")
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+
+    async def test_one_chunk_too_big_for_any_message_is_cut_to_fit_one(self, frontend):
+        """A chunk is bounded by both caps, so the message a full body rolls into
+        always accepts it. Unbounded, it would arrive over the cap there too and
+        every later chunk would roll again: a message per gap, which is what
+        appending replaces."""
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.send_progress(session_id, "進度" * 1400)
+
+        posted = frontend._app.client.chat_postMessage.await_args.kwargs["text"]
+        assert len(posted.encode("utf-8")) <= slack_mod.SLACK_TEXT_FIELD_BYTES
+        assert posted.endswith("…")
+
+    async def test_the_message_a_full_one_rolls_into_carries_only_the_new_chunk(
+        self, frontend
+    ):
+        """Otherwise the body that did not fit is what the new message starts with,
+        and it does not fit there either: every later chunk would roll again."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "x" * 2880)
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        await frontend.send_progress(session_id, "the newest chunk")
+
+        posted = client.chat_postMessage.await_args.kwargs["text"]
+        assert "the newest chunk" in posted
+        assert "xxxxxxxxxx" not in posted
+        await frontend.send_progress(session_id, "one more")
+        grown = client.chat_update.await_args.kwargs["text"]
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+        assert "the newest chunk" in grown
+        assert "one more" in grown
+
+    async def test_end_progress_on_success_keeps_every_message_of_the_turn(
+        self, frontend
+    ):
+        """The reply says what the agent concluded. Only these say how it got
+        there, so a successful turn is exactly when the timeline is worth reading."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "開始")
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+        await frontend.send_progress(session_id, "進度" * 1400)
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        client.chat_delete.assert_not_awaited()
+
+    async def test_a_failed_edit_posts_a_fresh_message_and_edits_that_one_next(
+        self, frontend, caplog
+    ):
+        """The message can be gone (deleted by a person) or refuse the edit. A
+        progress line that cannot land in place still lands."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "one")
+        client.chat_update.side_effect = SlackApiError(
+            "gone", {"ok": False, "error": "message_not_found"}
+        )
+        client.chat_postMessage.return_value = {"ok": True, "ts": "100.0"}
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.send_progress(session_id, "two")
+
+        assert client.chat_postMessage.await_count == 2
+        assert "could not edit" in caplog.text
+        # "one" stays in the message the edit could not reach, so the fresh one
+        # starts from "two" rather than repeating a chunk already in the thread.
+        assert "one" not in client.chat_postMessage.await_args.kwargs["text"]
+        client.chat_update.side_effect = None
+        await frontend.send_progress(session_id, "three")
+        assert client.chat_update.await_args.kwargs["ts"] == "100.0"
+        assert "two" in client.chat_update.await_args.kwargs["text"]
+
+    async def test_end_progress_on_success_keeps_the_message(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        frontend._app.client.chat_delete.assert_not_awaited()
+
+    async def test_end_progress_on_failure_keeps_the_message(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+
+        await frontend.end_progress(session_id, succeeded=False)
+
+        frontend._app.client.chat_delete.assert_not_awaited()
+
+    @pytest.mark.parametrize("succeeded", [True, False])
+    async def test_a_new_turn_never_appends_to_an_earlier_turn_message(
+        self, frontend, succeeded
+    ):
+        """Every turn keeps its message now, so this holds on both outcomes: one
+        turn's timeline must not grow a later turn's narration onto its end."""
+        session_id = _seed_progress_route(frontend)
+        client = frontend._app.client
+        await frontend.send_progress(session_id, "turn one")
+        await frontend.end_progress(session_id, succeeded=succeeded)
+
+        await frontend.send_progress(session_id, "turn two")
+
+        client.chat_update.assert_not_awaited()
+        assert client.chat_postMessage.await_count == 2
+        assert "turn one" not in client.chat_postMessage.await_args.kwargs["text"]
+
+    async def test_end_progress_without_a_message_does_nothing(self, frontend):
+        session_id = _seed_progress_route(frontend)
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        frontend._app.client.chat_delete.assert_not_awaited()
+
     async def test_a_not_ok_response_records_nothing(self, frontend):
         session_id = _seed_progress_route(frontend)
         frontend._app.client.chat_postMessage.return_value = {
@@ -1008,53 +1549,77 @@ class TestResolveSender:
 class TestResolveSessionMetadata:
     async def test_noop_if_already_resolved(self, frontend):
         frontend._workspace_names[42] = "already-set"
-        await frontend._resolve_session_metadata(42, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            42, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         frontend._app.client.conversations_info.assert_not_awaited()
 
     async def test_dm_sets_workspace_and_context(self, frontend):
-        await frontend._resolve_session_metadata(100, "hoss", "D1", "im", "123.456")
-        assert frontend._workspace_names[100] == "dm-hoss-123-456"
+        await frontend._resolve_session_metadata(
+            100, "hoss", "U_SENDER", "D1", "im", "123.456"
+        )
+        assert frontend._workspace_names[100] == "dm/U_SENDER"
+        assert frontend._legacy_workspace_names[100] == "dm-hoss-123-456"
+        assert frontend._thread_keys[100] == "123-456"
         assert frontend._channel_contexts[100] == "dm (private)"
+        assert frontend.legacy_workspace(100) == ("slack/dm-hoss-123-456", "123-456")
 
-    async def test_two_messages_in_one_second_get_separate_workspaces(self, frontend):
+    async def test_dm_without_a_user_id_keys_on_the_channel(self, frontend):
+        """A trusted bot's DM has no `user`; the im channel id is stable too."""
+        await frontend._resolve_session_metadata(100, "bot", None, "D1", "im", "1.0")
+        assert frontend._workspace_names[100] == "dm/D1"
+
+    async def test_unresolved_session_has_no_legacy_workspace(self, frontend):
+        assert frontend.legacy_workspace(404) is None
+
+    async def test_two_messages_in_one_second_share_a_workspace_not_a_thread_key(
+        self, frontend
+    ):
         """`_session_key` hashes the full thread_ts, so sub-second-apart
-        messages are separate sessions. Their workspaces must be separate too:
-        the directory is the agent's cwd and where `_save_files` writes Slack
-        attachments, so sharing one lets concurrent sessions overwrite or
-        cross-read each other's downloads. Slack emits duplicate notifications
-        inside one second routinely."""
+        messages are separate sessions. They share the conversation's directory
+        now, so the thread key is what keeps their attachments apart, and it must
+        carry the fraction: Slack emits duplicate notifications inside one second
+        routinely."""
         await frontend._resolve_session_metadata(
-            101, "bot", "D1", "im", "1786342813.662689"
+            101, "bot", "U_SENDER", "D1", "im", "1786342813.662689"
         )
         await frontend._resolve_session_metadata(
-            102, "bot", "D1", "im", "1786342813.872239"
+            102, "bot", "U_SENDER", "D1", "im", "1786342813.872239"
         )
-        assert frontend._workspace_names[101] != frontend._workspace_names[102]
+        assert frontend._workspace_names[101] == frontend._workspace_names[102]
+        assert frontend._thread_keys[101] != frontend._thread_keys[102]
 
-    async def test_thread_ts_fraction_survives_in_a_channel_workspace(self, frontend):
-        """Every workspace name runs through the same `short_ts`, so the
-        channel and mpim branches must not collide either."""
+    async def test_thread_ts_fraction_survives_in_a_channel_legacy_name(self, frontend):
+        """The legacy name is the per-thread directory as it was written then,
+        fraction included, or the migration would look for a directory that
+        never existed."""
         frontend._app.client.conversations_info.return_value = {
             "channel": {"name": "general", "is_mpim": False, "is_private": False}
         }
         await frontend._resolve_session_metadata(
-            203, "hoss", "C1", "channel", "1786342813.662689"
+            203, "hoss", "U_SENDER", "C1", "channel", "1786342813.662689"
         )
-        assert frontend._workspace_names[203] == "general-1786342813-662689"
+        assert frontend._workspace_names[203] == "channel/C1"
+        assert frontend._legacy_workspace_names[203] == "general-1786342813-662689"
 
     async def test_channel_resolves_name_and_visibility_public(self, frontend):
         frontend._app.client.conversations_info.return_value = {
             "channel": {"name": "general", "is_mpim": False, "is_private": False}
         }
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
-        assert "general" in frontend._workspace_names[200]
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
+        assert frontend._workspace_names[200] == "channel/C1"
+        assert "general" in frontend._channel_contexts[200]
         assert "public" in frontend._channel_contexts[200]
 
     async def test_channel_resolves_private(self, frontend):
         frontend._app.client.conversations_info.return_value = {
             "channel": {"name": "secret", "is_mpim": False, "is_private": True}
         }
-        await frontend._resolve_session_metadata(201, "hoss", "C2", "group", "1.0")
+        await frontend._resolve_session_metadata(
+            201, "hoss", "U_SENDER", "C2", "group", "1.0"
+        )
         assert "private" in frontend._channel_contexts[201]
 
     async def test_mpim_resolves_members(self, frontend):
@@ -1065,14 +1630,21 @@ class TestResolveSessionMetadata:
             "members": ["U_SELF", "U_OTHER"]
         }
         frontend._app.client.users_info.return_value = {"user": {"name": "other_user"}}
-        await frontend._resolve_session_metadata(300, "hoss", "G1", "mpim", "1.0")
+        await frontend._resolve_session_metadata(
+            300, "hoss", "U_SENDER", "G1", "mpim", "1.0"
+        )
+        assert frontend._workspace_names[300] == "mpim/G1"
+        assert frontend._legacy_workspace_names[300] == "mpdm-a-b-1-0"
         assert "group-dm" in frontend._channel_contexts[300]
         assert "other_user" in frontend._channel_contexts[300]
 
     async def test_api_failure_sets_fallback(self, frontend):
         frontend._app.client.conversations_info.side_effect = Exception("boom")
-        await frontend._resolve_session_metadata(400, "hoss", "C99", "channel", "5.0")
-        assert "C99" in frontend._workspace_names[400]
+        await frontend._resolve_session_metadata(
+            400, "hoss", "U_SENDER", "C99", "channel", "5.0"
+        )
+        assert frontend._workspace_names[400] == "channel/C99"
+        assert frontend._legacy_workspace_names[400] == "C99-5-0"
         assert "C99" in frontend._channel_contexts[400]
 
 
@@ -1092,7 +1664,9 @@ class TestPersonaSource:
 
     async def test_a_channel_is_keyed_by_id_then_name(self, frontend):
         frontend._remember_session(200, "C1", "1.0")
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         assert self._keys(frontend, 200) == ("C1", "general")
 
     async def test_an_unresolvable_channel_is_still_keyed_by_id(self, frontend):
@@ -1101,13 +1675,17 @@ class TestPersonaSource:
         frontend._app.client.conversations_info.side_effect = Exception("boom")
         frontend._remember_session(400, "C99", "5.0")
         frontend._session_sender_ids[400] = "U_ALLOWED"
-        await frontend._resolve_session_metadata(400, "hoss", "C99", "channel", "5.0")
+        await frontend._resolve_session_metadata(
+            400, "hoss", "U_SENDER", "C99", "channel", "5.0"
+        )
         assert self._keys(frontend, 400) == ("C99", "C99")
 
     async def test_a_dm_is_keyed_by_channel_then_sender_then_dm(self, frontend):
         frontend._remember_session(100, "D1", None)
         frontend._session_sender_ids[100] = "U_ALLOWED"
-        await frontend._resolve_session_metadata(100, "hoss", "D1", "im", "")
+        await frontend._resolve_session_metadata(
+            100, "hoss", "U_SENDER", "D1", "im", ""
+        )
         assert self._keys(frontend, 100) == ("D1", "U_ALLOWED", "dm")
 
     async def test_a_group_dm_is_keyed_like_a_dm(self, frontend):
@@ -1117,14 +1695,18 @@ class TestPersonaSource:
         frontend._app.client.conversations_members.return_value = {"members": ["U_A"]}
         frontend._remember_session(300, "G1", "1.0")
         frontend._session_sender_ids[300] = "U_A"
-        await frontend._resolve_session_metadata(300, "hoss", "G1", "mpim", "1.0")
+        await frontend._resolve_session_metadata(
+            300, "hoss", "U_SENDER", "G1", "mpim", "1.0"
+        )
         assert self._keys(frontend, 300) == ("G1", "U_A", "dm")
 
     async def test_a_dm_with_no_known_sender_drops_that_key(self, frontend):
         """A message with no `user` field (a bot post) resolves the session without
         a sender id. The empty key must not reach the config lookup."""
         frontend._remember_session(101, "D2", None)
-        await frontend._resolve_session_metadata(101, "hoss", "D2", "im", "")
+        await frontend._resolve_session_metadata(
+            101, "hoss", "U_SENDER", "D2", "im", ""
+        )
         assert self._keys(frontend, 101) == ("D2", "dm")
 
     def test_an_unknown_session_asks_for_the_dm_default(self, frontend):
@@ -1134,13 +1716,17 @@ class TestPersonaSource:
         persona = tmp_path / "oncall.md"
         persona.write_text("# oncall")
         frontend._remember_session(200, "C1", "1.0")
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         with patch("claude_on_the_fly.slack.persona_for", return_value=persona):
             assert frontend.persona_source(200) == persona
 
     async def test_a_forgotten_session_drops_its_channel_name(self, frontend):
         frontend._remember_session(200, "C1", "1.0")
-        await frontend._resolve_session_metadata(200, "hoss", "C1", "channel", "1.0")
+        await frontend._resolve_session_metadata(
+            200, "hoss", "U_SENDER", "C1", "channel", "1.0"
+        )
         frontend._forget_session(200)
         assert 200 not in frontend._channel_names
 
@@ -1243,6 +1829,10 @@ class TestOnHello:
         SlackWatermarks(path).record("D1", previous_ts, "im")
         frontend._processed_ts.add(previous_ts)
         frontend._remember_sent_timestamp(own_reply_ts)
+        # Simulate a new process: both echo suppression and dedupe must survive
+        # without the previous frontend's in-memory caches.
+        frontend._our_sent_timestamps.clear()
+        frontend._processed_events_cache = None
         frontend._app.client.conversations_history.return_value = {
             "messages": [
                 {"ts": missed_ts, "text": "sent during restart", "user": "U_ALLOWED"},
@@ -1406,8 +1996,37 @@ class TestSaveFiles:
         ):
             result = await frontend._save_files(42, files)
 
-        assert result == ["[File saved: doc.pdf]", "[File saved: img.png]"]
+        assert result == [
+            "[File saved: inbox/doc.pdf]",
+            "[File saved: inbox/img.png]",
+        ]
         assert mock_dl.await_count == 2
+
+    async def test_files_land_flat_in_the_inbox(self, frontend, tmp_path):
+        files = [{"id": "F1", "name": "report.pdf", "url_private_download": "u"}]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(frontend, "_download_file", new_callable=AsyncMock) as dl,
+        ):
+            result = await frontend._save_files(42, files)
+        assert result == ["[File saved: inbox/report.pdf]"]
+        assert dl.await_args[0][1] == tmp_path / "inbox" / "report.pdf"
+
+    async def test_a_second_upload_of_the_same_name_keeps_both(
+        self, frontend, tmp_path
+    ):
+        """Every thread of a conversation shares the inbox, so two of them
+        uploading `report.pdf` must not overwrite each other."""
+        (tmp_path / "inbox").mkdir()
+        (tmp_path / "inbox" / "report.pdf").write_text("the other thread's")
+        files = [{"id": "F1", "name": "report.pdf", "url_private_download": "u"}]
+        with (
+            patch.object(frontend, "_workspace_path", return_value=tmp_path),
+            patch.object(frontend, "_download_file", new_callable=AsyncMock) as dl,
+        ):
+            result = await frontend._save_files(42, files)
+        assert result == ["[File saved: inbox/report-2.pdf]"]
+        assert dl.await_args[0][1] == tmp_path / "inbox" / "report-2.pdf"
 
     async def test_skips_file_without_url(self, frontend, tmp_path):
         files = [{"id": "F1", "name": "no_url.txt"}]
@@ -1438,7 +2057,7 @@ class TestSaveFiles:
             ),
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: good.txt]"]
+        assert result == ["[File saved: inbox/good.txt]"]
 
     async def test_fallback_name_when_name_missing(self, frontend, tmp_path):
         files = [{"id": "F99", "url_private_download": "https://example.com/f99"}]
@@ -1447,7 +2066,7 @@ class TestSaveFiles:
             patch.object(frontend, "_download_file", new_callable=AsyncMock),
         ):
             result = await frontend._save_files(42, files)
-        assert result == ["[File saved: file_F99]"]
+        assert result == ["[File saved: inbox/file_F99]"]
 
 
 class TestDownloadFile:
@@ -1737,7 +2356,6 @@ class TestNoticeToggles:
         )
 
         assert not frontend._mention_notices
-        assert not frontend._mention_hinted
         frontend._app.client.chat_postMessage.assert_not_called()
         frontend._on_message.assert_not_awaited()
 
@@ -1749,6 +2367,7 @@ class TestNoticeToggles:
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = _session_key("C1", "t1")
         frontend._sessions[session_id] = ("C1", "t1")
+        frontend._mention_taggers[session_id] = {"U_ALLOWED"}
         frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
 
         await frontend._ingest_event(
@@ -1761,9 +2380,9 @@ class TestNoticeToggles:
                 "user": "U_ALLOWED",
             }
         )
-        pending = frontend._mention_notices[session_id]
+        pending = frontend._mention_notices[session_id, "U_ALLOWED"]
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0)
-        frontend._cancel_mention_notice(session_id)
+        frontend._cancel_mention_notice(session_id, "U_ALLOWED")
 
         with pytest.raises(asyncio.CancelledError):
             await pending
@@ -1771,7 +2390,7 @@ class TestNoticeToggles:
 
 
 class TestMentionNotice:
-    """One notice, and only for somebody who forgot the tag *and* left. While they
+    """A notice for each slip, and only for somebody who forgot the tag *and* left. While they
     are still typing they are still watching, and a notice read on arrival is one
     they never register."""
 
@@ -1788,6 +2407,8 @@ class TestMentionNotice:
     def _live_thread(self, frontend) -> int:
         session_id = _session_key("C1", "t1")
         frontend._sessions[session_id] = ("C1", "t1")
+        # A live thread is one somebody tagged into being.
+        frontend._mention_taggers[session_id] = {"U_ALLOWED"}
         frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
         return session_id
 
@@ -1799,13 +2420,17 @@ class TestMentionNotice:
 
         await frontend._ingest_event(self._event("t2"))
         # Held back, not posted inline.
-        frontend._app.client.chat_postMessage.assert_not_called()
-        await frontend._mention_notices[session_id]
+        frontend._app.client.chat_postEphemeral.assert_not_called()
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
 
-        note = frontend._app.client.chat_postMessage.call_args[1]["text"]
-        assert note.startswith("<@U_ALLOWED> ")  # pings whoever forgot
-        assert "<@U_SELF>" in note  # and names the tag to use
-        assert session_id in frontend._mention_hinted
+        sent = frontend._app.client.chat_postEphemeral.call_args[1]
+        assert sent["user"] == "U_ALLOWED"  # only whoever forgot sees it
+        assert sent["thread_ts"] == "t1"  # in the thread, not at channel root
+        assert "<@U_SELF>" in sent["text"]  # and it names the tag to use
+        # Cosmetic, not a ping: an ephemeral message cannot notify anyone.
+        assert sent["text"].startswith("<@U_ALLOWED> ")
+        # Never the public form: the whole point is that the thread stays clean.
+        frontend._app.client.chat_postMessage.assert_not_called()
         frontend._on_message.assert_not_awaited()
 
     async def test_the_wait_is_the_configured_one(self, frontend, monkeypatch):
@@ -1819,7 +2444,7 @@ class TestMentionNotice:
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
-        await frontend._mention_notices[session_id]
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
 
         assert slept == [120.0]
 
@@ -1830,16 +2455,16 @@ class TestMentionNotice:
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
-        first = frontend._mention_notices[session_id]
+        first = frontend._mention_notices[session_id, "U_ALLOWED"]
         await asyncio.sleep(0)
         await frontend._ingest_event(self._event("t3", "hello?"))
-        second = frontend._mention_notices[session_id]
+        second = frontend._mention_notices[session_id, "U_ALLOWED"]
 
         assert second is not first
         with pytest.raises(asyncio.CancelledError):
             await first
         # The replaced task's cleanup must not take the reschedule down with it.
-        assert frontend._mention_notices[session_id] is second
+        assert frontend._mention_notices[session_id, "U_ALLOWED"] is second
         frontend._app.client.chat_postMessage.assert_not_called()
 
     async def test_a_tagged_message_cancels_it(self, frontend, monkeypatch):
@@ -1848,33 +2473,54 @@ class TestMentionNotice:
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
-        pending = frontend._mention_notices[session_id]
+        pending = frontend._mention_notices[session_id, "U_ALLOWED"]
         await asyncio.sleep(0)
         await frontend._ingest_event(self._event("t3", "<@U_SELF> sorry, this"))
 
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert not frontend._mention_notices
-        assert session_id not in frontend._mention_hinted  # still tellable later
         frontend._on_message.assert_awaited_once()
 
-    async def test_it_is_said_once_per_thread(self, frontend, monkeypatch):
+    async def test_it_is_said_every_time_they_forget(self, frontend, monkeypatch):
+        """A reminder that stops after the first one leaves the next slip sitting
+        unanswered in a thread the person thinks the bot is reading. The delay is
+        what keeps this quiet: a burst of untagged messages still gets one."""
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
-        await frontend._mention_notices[session_id]
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
         await frontend._ingest_event(self._event("t3", "still forgetting"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
 
-        assert not frontend._mention_notices
-        assert frontend._app.client.chat_postMessage.call_count == 1
+        assert frontend._app.client.chat_postEphemeral.call_count == 2
 
-    async def test_a_thread_the_bot_is_not_in_gets_nothing(self, frontend):
+    async def test_a_later_slip_after_a_tag_is_said_again(self, frontend, monkeypatch):
+        """Tagging correctly in between does not use the reminder up either."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+        await frontend._ingest_event(self._event("t3", "<@U_SELF> this one tagged"))
+        await frontend._ingest_event(self._event("t4", "forgot again"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+
+        assert frontend._app.client.chat_postEphemeral.call_count == 2
+
+    async def test_a_thread_the_bot_is_not_in_gets_nothing(self, frontend, monkeypatch):
         """Ordinary channel chatter. Answering it would make the bot talk in
-        threads nobody invited it into."""
+        threads nobody invited it into.
+
+        The notice is switched on deliberately: with it off this passes on the
+        `delay <= 0` return and proves nothing about the session check."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+
         await frontend._ingest_event(self._event("t2"))
 
         assert not frontend._mention_notices
+        frontend._app.client.chat_postEphemeral.assert_not_called()
         frontend._app.client.chat_postMessage.assert_not_called()
 
     async def test_an_evicted_thread_drops_its_notice(self, frontend, monkeypatch):
@@ -1882,7 +2528,7 @@ class TestMentionNotice:
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
-        pending = frontend._mention_notices[session_id]
+        pending = frontend._mention_notices[session_id, "U_ALLOWED"]
         frontend._forget_session(session_id)
 
         with pytest.raises(asyncio.CancelledError):
@@ -1894,12 +2540,261 @@ class TestMentionNotice:
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
-        pending = frontend._mention_notices[session_id]
+        pending = frontend._mention_notices[session_id, "U_ALLOWED"]
         await frontend.stop()
 
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert not frontend._mention_notices
+
+    async def test_a_failed_post_is_logged_not_raised(self, frontend, monkeypatch):
+        """The notice is a courtesy. A Slack error here must not surface as a task
+        exception on a thread that is otherwise working."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+        frontend._app.client.chat_postEphemeral.side_effect = RuntimeError("nope")
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+
+        frontend._app.client.chat_postEphemeral.assert_awaited_once()
+
+    async def test_only_the_person_who_tagged_is_nudged(self, frontend, monkeypatch):
+        """A thread the bot was pulled into still carries other conversations.
+        Somebody answering their colleague did not forget a tag, so telling them
+        to add one is the bot talking over a conversation it is not in."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        self._live_thread(frontend)
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_OTHER"}
+        event = self._event("t2") | {"user": "U_OTHER"}
+
+        await frontend._ingest_event(event)
+
+        assert not frontend._mention_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._on_message.assert_not_awaited()
+
+    async def test_an_app_posting_into_the_thread_is_not_nudged(
+        self, frontend, monkeypatch
+    ):
+        """The same guard covers a Slack app with a bot user: it posts with a
+        `user` id and no `bot_message` subtype, so it reaches the tag gate like a
+        human would. It has never tagged anyone, and it cannot read a nudge."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        self._live_thread(frontend)
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_APP"}
+        event = self._event("t2") | {"user": "U_APP", "bot_id": "B_APP"}
+
+        await frontend._ingest_event(event)
+
+        assert not frontend._mention_notices
+        frontend._app.client.chat_postMessage.assert_not_called()
+
+    async def test_tagging_records_the_tagger(self, frontend, monkeypatch):
+        """End to end: the tag that opens the thread is what later licenses the
+        notice, so a real conversation needs no hand-placed state."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+
+        await frontend._ingest_event(self._event("t1", "<@U_SELF> have a look"))
+        assert frontend._mention_taggers[session_id] == {"U_ALLOWED"}
+
+        await frontend._ingest_event(self._event("t2"))
+        assert (session_id, "U_ALLOWED") in frontend._mention_notices
+        frontend._cancel_mention_notice(session_id, "U_ALLOWED")
+
+    async def test_the_notice_carries_a_button_for_this_thread(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+
+        sent = frontend._app.client.chat_postEphemeral.call_args[1]
+        section, actions = sent["blocks"]
+        # Slack stops rendering `text` once blocks are present.
+        assert section["text"]["text"] == sent["text"]
+        button = actions["elements"][0]
+        assert button["action_id"] == slack_mod.REPLAY_ACTION_ID
+        assert slack_mod._parse_continue_value(button["value"]) == ("C1", "t1")
+
+    async def test_untagged_messages_are_held_until_a_tag(self, frontend, monkeypatch):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+        key = (session_id, "U_ALLOWED")
+
+        await frontend._ingest_event(self._event("t2", "first"))
+        await frontend._ingest_event(self._event("t3", "second"))
+        # A reconnect's catch-up hands the same message back.
+        await frontend._ingest_event(self._event("t3", "second"))
+        assert [e["ts"] for e in frontend._untagged_msgs[key]] == ["t2", "t3"]
+
+        await frontend._ingest_event(self._event("t4", "<@U_SELF> tagged now"))
+        assert key not in frontend._untagged_msgs
+
+    async def test_the_held_backlog_is_capped(self, frontend, monkeypatch, caplog):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        monkeypatch.setattr(slack_mod, "GATED_MSG_BACKLOG_MAX", 2)
+        session_id = self._live_thread(frontend)
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            for ts in ("t2", "t3", "t4"):
+                await frontend._ingest_event(self._event(ts))
+
+        held = frontend._untagged_msgs[session_id, "U_ALLOWED"]
+        assert [e["ts"] for e in held] == ["t3", "t4"]
+        assert "dropped the oldest (t2)" in caplog.text
+        frontend._cancel_mention_notice(session_id, "U_ALLOWED")
+
+    async def test_a_disabled_notice_holds_nothing(self, frontend):
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+
+        assert not frontend._untagged_msgs
+        assert session_id in frontend._sessions
+
+    async def test_forgetting_the_thread_drops_the_held_messages(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._live_thread(frontend)
+        frontend._untagged_msgs[_session_key("C9", "t9"), "U_ALLOWED"] = []
+
+        await frontend._ingest_event(self._event("t2"))
+        frontend._forget_session(session_id)
+
+        assert list(frontend._untagged_msgs) == [
+            (_session_key("C9", "t9"), "U_ALLOWED")
+        ]
+
+    async def test_forgetting_the_thread_drops_the_tagger(self, frontend):
+        session_id = self._live_thread(frontend)
+
+        frontend._forget_session(session_id)
+
+        assert session_id not in frontend._mention_taggers
+
+
+class TestMentionNoticePerPerson:
+    """Two people can each be mid-conversation with the bot in one thread, and
+    both can forget the tag. Neither the tagger set nor the once-only gate is
+    allowed to let one of them stand in for the other."""
+
+    def _event(self, ts: str, user: str, text: str = "and one more thing") -> dict:
+        return {
+            "ts": ts,
+            "thread_ts": "t1",
+            "text": text,
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": user,
+        }
+
+    def _two_taggers(self, frontend) -> int:
+        frontend._pinned_allowed_user_ids = {"U_ALICE", "U_BOB"}
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        return _session_key("C1", "t1")
+
+    async def test_both_taggers_are_told_once_each(self, frontend, monkeypatch):
+        """The flow this exists for: both tag, both forget, both hear about it."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._two_taggers(frontend)
+
+        await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
+        await frontend._ingest_event(self._event("t2", "U_BOB", "<@U_SELF> me too"))
+        assert frontend._mention_taggers[session_id] == {"U_ALICE", "U_BOB"}
+
+        await frontend._ingest_event(self._event("t3", "U_ALICE"))
+        await frontend._mention_notices[session_id, "U_ALICE"]
+        await frontend._ingest_event(self._event("t4", "U_BOB"))
+        await frontend._mention_notices[session_id, "U_BOB"]
+
+        told = [
+            call[1]["user"]
+            for call in frontend._app.client.chat_postEphemeral.call_args_list
+        ]
+        assert told == ["U_ALICE", "U_BOB"]
+
+    async def test_each_is_told_on_every_slip(self, frontend, monkeypatch):
+        """Alice being told again does not use up Bob's telling, and Bob still
+        gets his own."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._two_taggers(frontend)
+        await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
+        await frontend._ingest_event(self._event("t2", "U_BOB", "<@U_SELF> me too"))
+
+        await frontend._ingest_event(self._event("t3", "U_ALICE"))
+        await frontend._mention_notices[session_id, "U_ALICE"]
+        await frontend._ingest_event(self._event("t4", "U_ALICE", "still nothing?"))
+        await frontend._mention_notices[session_id, "U_ALICE"]
+        await frontend._ingest_event(self._event("t5", "U_BOB"))
+        await frontend._mention_notices[session_id, "U_BOB"]
+
+        told = [
+            call.kwargs["user"]
+            for call in frontend._app.client.chat_postEphemeral.call_args_list
+        ]
+        assert told == ["U_ALICE", "U_ALICE", "U_BOB"]
+
+    async def test_one_persons_tag_leaves_the_others_notice_pending(
+        self, frontend, monkeypatch
+    ):
+        """A tagged message only clears the sender's own pending notice. Alice
+        still forgot, and Bob getting it right does nothing about that."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._two_taggers(frontend)
+        await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
+        await frontend._ingest_event(self._event("t2", "U_BOB", "<@U_SELF> me too"))
+
+        await frontend._ingest_event(self._event("t3", "U_ALICE"))
+        pending = frontend._mention_notices[session_id, "U_ALICE"]
+        await frontend._ingest_event(self._event("t4", "U_BOB", "<@U_SELF> still here"))
+
+        assert frontend._mention_notices[session_id, "U_ALICE"] is pending
+        assert not pending.cancelled()
+        frontend._cancel_mention_notice(session_id, "U_ALICE")
+
+    async def test_a_persons_own_tag_clears_their_notice(self, frontend, monkeypatch):
+        """The other half: they corrected themselves, so drop it."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._two_taggers(frontend)
+        await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
+
+        await frontend._ingest_event(self._event("t2", "U_ALICE"))
+        pending = frontend._mention_notices[session_id, "U_ALICE"]
+        await frontend._ingest_event(self._event("t3", "U_ALICE", "<@U_SELF> sorry"))
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not frontend._mention_notices
+
+    async def test_evicting_the_thread_drops_every_pending_notice(
+        self, frontend, monkeypatch
+    ):
+        """Eviction is the thread going away, not one person correcting himself,
+        so it takes both."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = self._two_taggers(frontend)
+        await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
+        await frontend._ingest_event(self._event("t2", "U_BOB", "<@U_SELF> me too"))
+        await frontend._ingest_event(self._event("t3", "U_ALICE"))
+        await frontend._ingest_event(self._event("t4", "U_BOB"))
+        waiting = [
+            frontend._mention_notices[session_id, "U_ALICE"],
+            frontend._mention_notices[session_id, "U_BOB"],
+        ]
+
+        frontend._forget_session(session_id)
+
+        for task in waiting:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not frontend._mention_notices
+        assert session_id not in frontend._mention_taggers
 
 
 # ---------------------------------------------------------------------------
@@ -1926,27 +2821,52 @@ class TestReplySoftLimit:
     async def test_gates_inbound_when_over_limit(self, frontend, no_notice_delay):
         session_id = _session_key("D1", "200.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
-        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.0"}
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.chat_postEphemeral.return_value = {"ok": True}
 
         await frontend._ingest_event(self._dm_event("200.0", "another question"))
 
         frontend._on_message.assert_not_awaited()
+        # The lock is not held back with the notice: the sender sees the message
+        # was taken the moment it was gated, whatever the delay is set to.
+        frontend._app.client.reactions_add.assert_awaited_once_with(
+            channel="D1", timestamp="200.0", name=slack_mod.GATED_EMOJI
+        )
         # Held back, not posted inline: `_ingest_event` returns before the notice
         # task has had a chance to run.
-        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._app.client.chat_postEphemeral.assert_not_called()
 
         await frontend._gate_notices[session_id]
 
-        warning = frontend._app.client.chat_postMessage.call_args[1]["text"]
-        assert CONTINUE_COMMAND in warning
-        # Addressed to the sender, so it pings instead of relying on the thread
-        # being unread.
-        assert warning.startswith("<@U_ALLOWED> ")
+        kwargs = frontend._app.client.chat_postEphemeral.call_args.kwargs
+        assert kwargs["channel"] == "D1"
+        assert kwargs["user"] == "U_ALLOWED"
+        assert kwargs["thread_ts"] == "200.0"
+        assert CONTINUE_COMMAND in kwargs["text"]
+        # Cosmetic here, exactly as in the mention notice: an ephemeral message
+        # never enters channel history, so the mention cannot ping anybody.
+        assert kwargs["text"].startswith("<@U_ALLOWED> ")
+        # The note has to be in a block, not only in `text`: Slack stops
+        # rendering `text` once blocks are present, so a card with just the
+        # actions block showed a bare button that explained nothing.
+        section = kwargs["blocks"][0]
+        assert section["type"] == "section"
+        assert section["text"]["text"] == kwargs["text"]
+        buttons = [
+            element
+            for block in kwargs["blocks"]
+            if block["type"] == "actions"
+            for element in block["elements"]
+        ]
+        assert [b["action_id"] for b in buttons] == [slack_mod.CONTINUE_ACTION_ID]
+        # The routing rides in the value: channel and the thread to resume.
+        assert buttons[0]["value"] == "D1|200.0"
         assert session_id not in frontend._gate_notices
 
     async def test_the_notice_waits_the_configured_delay(self, frontend, monkeypatch):
-        """The delay is the whole point of the change: a notice that lands while the
-        sender is still in the thread is marked read on arrival and never seen."""
+        """The delay is what keeps the card out of the middle of a burst. A notice
+        that lands between two messages is read on arrival, and the sender is
+        still typing, so they never register that the thread stopped."""
         slept: list[float] = []
 
         async def fake_sleep(seconds):
@@ -1956,7 +2876,7 @@ class TestReplySoftLimit:
         monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 4.2)
         session_id = _session_key("D1", "204.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
-        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.1"}
+        frontend._app.client.chat_postEphemeral.return_value = {"ok": True}
 
         await frontend._ingest_event(self._dm_event("204.0", "hello?"))
         await frontend._gate_notices[session_id]
@@ -1973,7 +2893,9 @@ class TestReplySoftLimit:
         monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 3600)
         session_id = _session_key("D1", "205.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
-        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.2"}
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._app.client.chat_postEphemeral.return_value = {"ok": True}
 
         await frontend._ingest_event(self._dm_event("205.0", "one"))
         first = frontend._gate_notices[session_id]
@@ -1988,14 +2910,14 @@ class TestReplySoftLimit:
             await first
         # The replaced task's cleanup must not take the reschedule down with it.
         assert frontend._gate_notices[session_id] is second
-        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._app.client.chat_postEphemeral.assert_not_called()
 
         monkeypatch.setattr(slack_mod, "reply_limit_notice_seconds", lambda: 0)
         await frontend._ingest_event(
             self._dm_event("205.2", "three") | {"thread_ts": "205.0"}
         )
         await frontend._gate_notices[session_id]
-        assert frontend._app.client.chat_postMessage.call_count == 1
+        assert frontend._app.client.chat_postEphemeral.call_count == 1
         assert session_id not in frontend._gate_deadlines
 
     async def test_the_debounce_cannot_defer_past_the_ceiling(
@@ -2013,20 +2935,22 @@ class TestReplySoftLimit:
         monkeypatch.setattr(slack_mod, "REPLY_LIMIT_NOTICE_MAX_HOLD", 0.0)
         session_id = _session_key("D1", "209.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
-        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "w.3"}
+        frontend._app.client.chat_postEphemeral.return_value = {"ok": True}
 
         await frontend._ingest_event(self._dm_event("209.0", "hello?"))
         await frontend._gate_notices[session_id]
 
         # Ceiling already spent, so the notice goes out now rather than in 4.2s.
         assert slept == [0.0]
-        frontend._app.client.chat_postMessage.assert_called_once()
+        frontend._app.client.chat_postEphemeral.assert_called_once()
 
     async def test_continue_cancels_a_pending_notice(self, frontend):
         """Otherwise it arrives after the thread resumed and tells the user to send
         what they just sent."""
         session_id = _session_key("D1", "206.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
 
         await frontend._ingest_event(self._dm_event("206.0", "hello?"))
         pending = frontend._gate_notices[session_id]
@@ -2037,11 +2961,85 @@ class TestReplySoftLimit:
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert session_id not in frontend._gate_notices
-        frontend._app.client.chat_postMessage.assert_not_called()
+        frontend._app.client.chat_postEphemeral.assert_not_called()
+        # The lock comes off the gated message: the thread is open again, and a
+        # lock left behind says the opposite.
+        frontend._app.client.reactions_remove.assert_awaited_once_with(
+            channel="D1", timestamp="206.0", name=slack_mod.GATED_EMOJI
+        )
+        # Typing the command is somebody asking to carry on, not asking for what
+        # they missed. The backlog goes with the notice and is not replayed; the
+        # button is the path that replays it.
+        assert session_id not in frontend._gated_msgs
+        frontend._on_message.assert_not_awaited()
+
+    async def test_a_burst_keeps_the_backlog_and_moves_the_lock(
+        self, frontend, no_notice_delay
+    ):
+        """One lock per session, on the newest gated message, because that is the
+        one the notice is about. The earlier ones are kept: the card belongs to
+        the thread, and one press has to recover everything the gate dropped."""
+        session_id = _session_key("D1", "210.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._app.client.chat_postEphemeral.return_value = {"ok": True}
+
+        await frontend._ingest_event(self._dm_event("210.0", "one"))
+        await frontend._ingest_event(
+            self._dm_event("210.1", "two") | {"thread_ts": "210.0"}
+        )
+        await frontend._gate_notices[session_id]
+
+        assert frontend._app.client.reactions_add.await_args_list[-1].kwargs == {
+            "channel": "D1",
+            "timestamp": "210.1",
+            "name": slack_mod.GATED_EMOJI,
+        }
+        frontend._app.client.reactions_remove.assert_awaited_once_with(
+            channel="D1", timestamp="210.0", name=slack_mod.GATED_EMOJI
+        )
+        assert [e["ts"] for e in frontend._gated_msgs[session_id]] == ["210.0", "210.1"]
+        assert [e["text"] for e in frontend._gated_msgs[session_id]] == ["one", "two"]
+
+    async def test_the_same_message_is_held_once(self, frontend, no_notice_delay):
+        """A gated message returns before the `_processed_ts` bookkeeping, so a
+        re-delivery or a `_catchup` after a reconnect hands it back. One entry
+        per message, or the button runs the same one twice."""
+        session_id = _session_key("D1", "213.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._app.client.chat_postEphemeral.return_value = {"ok": True}
+
+        for _ in range(2):
+            await frontend._ingest_event(self._dm_event("213.0", "hello?"))
+
+        assert [e["ts"] for e in frontend._gated_msgs[session_id]] == ["213.0"]
+
+    async def test_the_backlog_is_capped(self, frontend, monkeypatch, caplog):
+        """Otherwise a thread pins memory for as long as somebody keeps typing
+        past the gate. Past the cap the oldest is dropped and never runs."""
+        monkeypatch.setattr(slack_mod, "GATED_MSG_BACKLOG_MAX", 2)
+        session_id = _session_key("D1", "212.0")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            for ts in ("212.0", "212.1", "212.2"):
+                await frontend._ingest_event(
+                    self._dm_event(ts, f"m{ts}") | {"thread_ts": "212.0"}
+                )
+
+        assert [e["ts"] for e in frontend._gated_msgs[session_id]] == ["212.1", "212.2"]
+        assert "gated backlog over 2, dropped the oldest (212.0)" in caplog.text
 
     async def test_stop_cancels_pending_notices(self, frontend):
         session_id = _session_key("D1", "207.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
 
         await frontend._ingest_event(self._dm_event("207.0", "hello?"))
         pending = frontend._gate_notices[session_id]
@@ -2050,10 +3048,17 @@ class TestReplySoftLimit:
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert not frontend._gate_notices
+        assert session_id not in frontend._gated_msgs
+        # The entry goes, the reaction stays: a Slack call in teardown can hang
+        # the loop, and a stale lock after a shutdown is already the accepted
+        # shape here (a force-killed daemon leaves :eyes: behind the same way).
+        frontend._app.client.reactions_remove.assert_not_awaited()
 
     async def test_forgetting_a_session_cancels_its_notice(self, frontend):
         session_id = _session_key("D1", "208.0")
         frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
 
         await frontend._ingest_event(self._dm_event("208.0", "hello?"))
         pending = frontend._gate_notices[session_id]
@@ -2062,6 +3067,8 @@ class TestReplySoftLimit:
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert not frontend._gate_notices
+        assert session_id not in frontend._gated_msgs
+        frontend._app.client.reactions_remove.assert_not_awaited()
 
     async def test_under_limit_processes_normally(self, frontend):
         session_id = _session_key("D1", "201.0")
@@ -2079,7 +3086,8 @@ class TestReplySoftLimit:
             self._dm_event("202.0", f"{CONTINUE_COMMAND} now do X")
         )
 
-        assert frontend._reply_counts[session_id] == 0
+        # Reset to zero, then charged again as the remainder becomes a turn.
+        assert frontend._reply_counts[session_id] == 1
         frontend._on_message.assert_awaited_once()
         _, text = frontend._on_message.call_args[0]
         assert "now do X" in text
@@ -2094,14 +3102,126 @@ class TestReplySoftLimit:
         assert frontend._reply_counts[session_id] == 0
         frontend._on_message.assert_not_awaited()
 
-    async def test_send_increments_reply_count(self, frontend):
-        session_id = _session_key("C1", "t1")
-        frontend._sessions[session_id] = ("C1", "t1")
-        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+    async def test_a_queued_message_is_counted_before_it_runs(
+        self, frontend, monkeypatch
+    ):
+        """The count is kept where a message becomes a turn, not where its reply
+        posts. Kept at the reply, a message already running and a second one
+        queued behind it both saw a count of zero, and the thread went over
+        budget without the gate ever firing."""
+        monkeypatch.setattr(slack_mod, "reply_soft_limit", lambda: 1)
+        session_id = _session_key("D1", "211.0")
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
 
-        await frontend.send(session_id, Response(body="hello"))
+        await frontend._ingest_event(self._dm_event("211.0", "one"))
+        # No reply has posted for the first turn yet. That is the point.
+        await frontend._ingest_event(
+            self._dm_event("211.1", "two") | {"thread_ts": "211.0"}
+        )
+
+        assert frontend._on_message.await_count == 1
+        assert [e["ts"] for e in frontend._gated_msgs[session_id]] == ["211.1"]
+
+    async def test_a_suggestion_tap_pays_the_budget(self, frontend):
+        """A tap is a turn like a typed message, so it must not be a way to run
+        past the limit."""
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.reactions_add = AsyncMock()
+
+        await frontend._on_suggestion_action(
+            {
+                "user": {"id": "U_ALLOWED", "name": "testuser"},
+                "channel": {"id": "C1"},
+                "message": {"ts": "300.0", "thread_ts": "t1"},
+                "actions": [{"text": {"text": "Do the thing"}}],
+            }
+        )
 
         assert frontend._reply_counts[session_id] == 1
+
+    async def test_a_suggestion_tap_writes_an_inbound_log_line(self, frontend, caplog):
+        """A tap leaves no Slack message, so this line is the only record that it
+        happened at all."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_ALLOWED", "name": "testuser"},
+                    "channel": {"id": "C1"},
+                    "message": {"ts": "300.0", "thread_ts": "t1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        lines = [r.getMessage() for r in caplog.records]
+        inbound = [ln for ln in lines if ln.startswith("slack C1/t1: ")]
+        assert inbound, f"no inbound line for the tap; got {lines}"
+        line = inbound[0]
+        # The same shape a typed message writes, so one grep finds both...
+        assert "U_ALLOWED" in line
+        assert "Do the thing" in line
+        # ...and a marker, so a reader never goes looking for a Slack message
+        # that a tap does not leave behind.
+        assert line.endswith("(button)"), line
+
+    async def test_a_tap_log_line_names_the_menu_it_answered(self, frontend, caplog):
+        """The prefix names the thread, which can hold many menus; the line
+        also names the menu message the tap answered."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_ALLOWED", "name": "testuser"},
+                    "channel": {"id": "C1"},
+                    "message": {"ts": "300.0", "thread_ts": "t1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        lines = [r.getMessage() for r in caplog.records]
+        inbound = [ln for ln in lines if ln.startswith("slack C1/t1: ")]
+        assert inbound, f"no inbound line for the tap; got {lines}"
+        assert "[menu-ts: 300.0] Do the thing (button)" in inbound[0]
+
+    async def test_a_tap_without_a_message_logs_no_menu_ts(self, frontend, caplog):
+        """No message in the payload means no menu to name: the field is left
+        out rather than printed empty."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_ALLOWED", "name": "testuser"},
+                    "channel": {"id": "C1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        lines = [r.getMessage() for r in caplog.records if "(button)" in r.getMessage()]
+        assert lines, "no inbound line for the tap"
+        assert "menu-ts" not in lines[0]
+        assert lines[0].endswith('"testuser"] Do the thing (button)'), lines[0]
+
+    async def test_a_dropped_tap_writes_no_inbound_line(self, frontend, caplog):
+        """Logged at dispatch, not on arrival: a tap from someone who may not
+        send never reached the agent, so it must not read as an inbound
+        message."""
+        frontend._app.client.reactions_add = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(
+                {
+                    "user": {"id": "U_NOT_ALLOWED", "name": "stranger"},
+                    "channel": {"id": "C1"},
+                    "message": {"ts": "300.0", "thread_ts": "t1"},
+                    "actions": [{"text": {"text": "Do the thing"}}],
+                }
+            )
+
+        assert not [r for r in caplog.records if r.getMessage().endswith("(button)")]
 
 
 # ---------------------------------------------------------------------------
@@ -2363,8 +3483,12 @@ class TestStartGatesOnToken:
     async def test_user_token_still_registers_suggestion_handler(self, frontend):
         """Buttons render on every reply and block_actions payloads reach a
         user-token install too, so the suggestion handler must be registered
-        regardless of token kind (a tap was previously a 404)."""
+        regardless of token kind (a tap was previously a 404). The gate notice's
+        Continue button rides the same rule: it lives on an ephemeral message,
+        which both installs receive."""
         frontend._on_suggestion_action = AsyncMock()
+        frontend._on_continue_action = AsyncMock()
+        frontend._on_replay_action = AsyncMock()
         with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
             handler_cls.return_value.start_async = AsyncMock()
             await frontend.start(AsyncMock())
@@ -2372,16 +3496,24 @@ class TestStartGatesOnToken:
             call.args[0].pattern for call in frontend._app.action.call_args_list
         ]
         assert r"^cotf-sugg:" in patterns
+        assert r"^cotf-continue$" in patterns
+        assert r"^cotf-replay$" in patterns
         action_cbs = [
             call.args[0]
             for call in frontend._app.action.return_value.call_args_list
             if not isinstance(call.args[0], MagicMock)
         ]
-        assert len(action_cbs) == 1
+        assert len(action_cbs) == 3
         ack = AsyncMock()
         await action_cbs[0](ack, {"user": {"id": "U_ALLOWED"}})
         assert ack.await_count == 1
         frontend._on_suggestion_action.assert_awaited_once()
+        await action_cbs[1](ack, {"user": {"id": "U_ALLOWED"}})
+        assert ack.await_count == 2
+        frontend._on_continue_action.assert_awaited_once()
+        await action_cbs[2](ack, {"user": {"id": "U_ALLOWED"}})
+        assert ack.await_count == 3
+        frontend._on_replay_action.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2521,6 +3653,138 @@ class TestCompactPrefix:
         await frontend._ingest_event(event)
         orch.on_compact.assert_not_awaited()
         frontend._on_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# $model text prefix
+# ---------------------------------------------------------------------------
+
+
+class TestModelPrefix:
+    """The Slack half of the model command. The grammar is tested elsewhere;
+    what matters here is that the words reach the orchestrator and that the
+    command is never also sent to the agent as a prompt."""
+
+    async def test_posts_what_the_orchestrator_answers(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: opus. Effort: high.")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model opus high",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_called_once_with(
+            _session_key("D1", "9.0"), ["opus", "high"]
+        )
+        frontend._on_message.assert_not_awaited()
+        posted = frontend._app.client.chat_postMessage.await_args.kwargs["text"]
+        assert posted == "Model: opus. Effort: high."
+
+    async def test_a_bare_command_asks_for_the_report(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="Model: sonnet. Effort: unset.")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_called_once_with(_session_key("D1", "9.0"), [])
+        frontend._on_message.assert_not_awaited()
+
+    async def test_targets_the_threads_own_session(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.9",
+            "thread_ts": "5.0",
+            "text": "$model opus",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_called_once_with(_session_key("D1", "5.0"), ["opus"])
+
+    async def test_a_refusal_still_does_not_reach_the_agent(self, frontend):
+        orch = MagicMock()
+        orch.on_model = MagicMock(
+            return_value="I do not know the model `sonet`. Try:\n- `opus`"
+        )
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model sonet",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_awaited()
+
+    async def test_a_prefix_of_a_longer_word_is_an_ordinary_message(self, frontend):
+        """`$model2` and `$models` are not this command. Matched on the whole
+        first word, so a message that merely starts with the same letters is
+        still answered."""
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$models are expensive",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        orch.on_model.assert_not_called()
+        frontend._on_message.assert_awaited_once()
+
+    async def test_without_an_orchestrator_it_says_so(self, frontend):
+        frontend._orchestrator = None
+        event = {
+            "ts": "9.0",
+            "text": "$model opus",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        frontend._on_message.assert_not_awaited()
+        frontend._app.client.chat_postMessage.assert_awaited()
+
+    async def test_the_command_is_marked_processed(self, frontend):
+        """A reconnect re-fetches the thread, so an unmarked command would run
+        twice."""
+        orch = MagicMock()
+        orch.on_model = MagicMock(return_value="ok")
+        frontend._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "text": "$model opus",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+        }
+        await frontend._ingest_event(event)
+
+        assert "9.0" in frontend._processed_ts
+        assert frontend._active_channels["D1"] == "9.0"
 
 
 # ---------------------------------------------------------------------------
@@ -3273,8 +4537,13 @@ class TestCompactResolvesTheWorkspace:
 
         name = frontend.workspace_name(session)
         assert name != f"slack/{session}", "fell back to the session key"
-        # sender + the whole thread ts, fraction included
-        assert name == "slack/dm-testuser-1784899718-993159"
+        assert name == "slack/dm/U_ALLOWED"
+        # the per-thread directory it had before: sender display name + the
+        # whole thread ts, fraction included
+        assert frontend.legacy_workspace(session) == (
+            "slack/dm-testuser-1784899718-993159",
+            "1784899718-993159",
+        )
 
     async def test_it_matches_what_an_ordinary_message_would_produce(self, frontend):
         """Same thread, same workspace, whichever path got there first — else the
@@ -3766,6 +5035,41 @@ class TestSuggestionActions:
         labels = [e["text"]["text"] for e in actions["elements"]]
         assert labels == ["alpha?", "beta?"]
 
+    async def test_send_fits_the_text_fallback_under_the_update_cap(self, frontend):
+        # The suggestion-menu retire re-sends the stored text through
+        # chat.update, whose 4,000-byte cap Slack counts in bytes. The markdown
+        # block keeps the chunk whole; only the `text` fallback shrinks.
+        session_id = _session_key("C1", "t1")
+        frontend._sessions[session_id] = ("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.0"}
+
+        body = "字" * 2000  # 6,000 bytes of body
+        await frontend.send(session_id, Response(body=body, suggestions=[]))
+
+        kwargs = frontend._app.client.chat_postMessage.call_args[1]
+        assert len(kwargs["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
+        assert kwargs["text"].endswith("…")
+        # The visible content is untouched: the markdown block carries the
+        # chunk in full.
+        assert kwargs["blocks"][0]["text"] == body
+
+    async def test_the_retire_re_sends_a_fitted_text(self, frontend):
+        # A message stored before the fit-at-post change still carries
+        # full-length text; the retire must fit it or Slack rejects the update
+        # with msg_too_long and the menu never collapses.
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        tap = self._tap(label="alpha?")
+        tap["message"]["text"] = "字" * 2000  # 6,000 bytes of stored text
+
+        await frontend._on_suggestion_action(tap)
+
+        kwargs = frontend._app.client.chat_update.await_args.kwargs
+        assert len(kwargs["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
+        assert kwargs["text"].endswith("…")
+        status = next(b for b in kwargs["blocks"] if b["type"] == "context")
+        assert status["elements"][0]["text"] == "✓ alpha?"
+
     async def test_send_no_buttons_when_suggestions_empty(self, frontend):
         session_id = _session_key("C1", "t1")
         frontend._sessions[session_id] = ("C1", "t1")
@@ -3786,6 +5090,35 @@ class TestSuggestionActions:
         text = frontend._on_message.await_args.args[1]
         assert "what can you do?" in text
         assert text.startswith("[from-id: U_ALLOWED]")
+
+    async def test_a_tap_after_a_restart_resolves_the_workspace(self, frontend):
+        """A tap is the first contact for a thread the restart forgot. It used
+        to register only the route, so the turn ran in `slack/<session key>`."""
+        frontend._app.client.chat_update = AsyncMock()
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"is_im": True}
+        }
+        chat_id = _session_key("D1", "t1")
+
+        await frontend._on_suggestion_action(self._tap(channel="D1"))
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U_ALLOWED"
+        assert frontend.sender_identity(chat_id) == "U_ALLOWED"
+        assert frontend._sessions[chat_id] == ("D1", "t1")
+        frontend._on_message.assert_awaited_once()
+
+    async def test_a_tap_on_a_known_thread_does_not_ask_slack_again(self, frontend):
+        chat_id = _session_key("C1", "t1")
+        frontend._remember_session(chat_id, "C1", "t1")
+        frontend._workspace_names[chat_id] = "channel/C1"
+        frontend._app.client.chat_update = AsyncMock()
+        frontend._app.client.conversations_info.reset_mock()
+
+        await frontend._on_suggestion_action(self._tap())
+
+        frontend._app.client.conversations_info.assert_not_awaited()
+        assert frontend.workspace_name(chat_id) == "slack/channel/C1"
+        assert frontend._sessions[chat_id] == ("C1", "t1")
 
     async def test_tap_uses_thread_ts_for_session_match(self, frontend):
         frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
@@ -3878,16 +5211,20 @@ class TestSuggestionActions:
         assert status["elements"][0]["text"] == "✓ what can you do?"
         frontend._on_message.assert_awaited_once()
 
-    async def test_tap_without_message_blocks_skips_the_mark(self, frontend):
+    async def test_tap_without_message_blocks_skips_the_mark(self, frontend, caplog):
+        """The one path that dropped the ✓ with no trace. The tap still routes,
+        so this log line is the only evidence the menu was never retired."""
         frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
         frontend._app.client.chat_update = AsyncMock()
         body = self._tap()
         del body["message"]["blocks"]
 
-        await frontend._on_suggestion_action(body)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(body)
 
         frontend._app.client.chat_update.assert_not_awaited()
         frontend._on_message.assert_awaited_once()
+        assert "cannot retire suggestion menu, incomplete payload" in caplog.text
 
     async def test_mark_failure_is_logged_and_tap_still_sends(
         self, frontend, caplog
@@ -3940,6 +5277,465 @@ class TestSuggestionActions:
         assert ("C0", "1.0") not in frontend._spent_menus
         assert ("C1", "99.1") in frontend._spent_menus
         frontend._on_message.assert_awaited_once()
+
+
+class TestContinueAction:
+    """The gate notice's Continue button. It resumes and re-runs the dropped
+    message, so the sender never retypes it."""
+
+    @staticmethod
+    def _tap(
+        value: str = "C1|t1",
+        user_id: str = "U_ALLOWED",
+        response_url: str = "https://hooks.slack.test/actions/1",
+    ) -> dict:
+        return {
+            "user": {"id": user_id, "name": "hoss"},
+            "channel": {"id": "C1"},
+            "response_url": response_url,
+            "actions": [{"action_id": slack_mod.CONTINUE_ACTION_ID, "value": value}],
+        }
+
+    @staticmethod
+    def _thread_event(ts: str, text: str = "<@U_SELF> hi") -> dict:
+        return {
+            "ts": ts,
+            "text": text,
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+            "thread_ts": "t1",
+        }
+
+    @staticmethod
+    def _gated(ts: str = "90.0", text: str = "the dropped question") -> dict:
+        """The event the gate stored. The button replays this, not a fetch."""
+        return TestContinueAction._thread_event(ts, text)
+
+    async def test_tap_resumes_and_clears_the_lock(self, frontend):
+        session_id = _session_key("C1", "t1")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._gated_msgs[session_id] = [self._gated()]
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._replay_gated = AsyncMock()
+
+        await frontend._on_continue_action(self._tap())
+
+        assert frontend._reply_counts[session_id] == 0
+        assert session_id not in frontend._gated_msgs
+        frontend._app.client.reactions_remove.assert_awaited_once_with(
+            channel="C1", timestamp="90.0", name=slack_mod.GATED_EMOJI
+        )
+        frontend._delete_ephemeral.assert_awaited_once_with(
+            "https://hooks.slack.test/actions/1"
+        )
+        # The stored events are what get replayed. The newest one's timestamp
+        # names the lock to take off, and the events carry the messages.
+        frontend._replay_gated.assert_awaited_once_with("C1", [self._gated()])
+
+    async def test_tap_replays_the_dropped_message(self, frontend):
+        """The button's promise is that the message was not lost."""
+        session_id = _session_key("C1", "t1")
+        frontend._gated_msgs[session_id] = [self._gated()]
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_continue_action(self._tap())
+
+        replay = frontend._ingest_event.await_args.args[0]
+        assert replay["channel"] == "C1"
+        assert replay["ts"] == "90.0"
+        # The prefix is what a typed `$continue <text>` carries, and the branch
+        # that strips it is also the one that resets the reply budget.
+        assert replay["text"] == f"{CONTINUE_COMMAND} the dropped question"
+
+    async def test_a_burst_replays_in_the_order_it_was_typed(self, frontend):
+        """A burst is a conversation, and the agent has to see it as one. Every
+        replay carries the prefix, not only the first: otherwise a backlog longer
+        than the limit re-gates its own tail on the way through."""
+        session_id = _session_key("C1", "t1")
+        frontend._gated_msgs[session_id] = [
+            self._gated("90.0", "first"),
+            self._gated("90.1", "second"),
+            self._gated("90.2", "third"),
+        ]
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_continue_action(self._tap())
+
+        # The lock is on the newest only, so only the newest is unreacted.
+        frontend._app.client.reactions_remove.assert_awaited_once_with(
+            channel="C1", timestamp="90.2", name=slack_mod.GATED_EMOJI
+        )
+        assert [c.args[0]["text"] for c in frontend._ingest_event.await_args_list] == [
+            f"{CONTINUE_COMMAND} first",
+            f"{CONTINUE_COMMAND} second",
+            f"{CONTINUE_COMMAND} third",
+        ]
+
+    async def test_any_allowed_person_can_drain_the_thread_backlog(self, frontend):
+        """The card is the thread's, not the sender's. There is one notice per
+        thread, so when a second person trips the gate the notice moves to them
+        and the first is left with no card of their own — the backlog has to be
+        reachable by whoever does press it, or their message is stranded."""
+        session_id = _session_key("C1", "t1")
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_OTHER"}
+        frontend._gated_msgs[session_id] = [self._gated()]
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_continue_action(self._tap(user_id="U_OTHER"))
+
+        assert session_id not in frontend._gated_msgs
+        frontend._ingest_event.assert_awaited_once()
+
+    async def test_the_replay_leaves_the_stored_events_alone(self, frontend):
+        """`_ingest_event` mutates the dict it is handed, so each replay gets a
+        copy. Handing it a stored one would corrupt a later replay."""
+        session_id = _session_key("C1", "t1")
+        stored = self._gated()
+        frontend._gated_msgs[session_id] = [stored]
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_continue_action(self._tap())
+
+        assert stored["text"] == "the dropped question"
+
+    async def test_tap_replay_reaches_the_agent(self, frontend, no_notice_delay):
+        """End to end through the real `_ingest_event`, both ways. The replayed
+        message has to survive every gate the live path applies, or the button
+        silently does nothing while the card disappears."""
+        session_id = _session_key("C1", "t1")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._ingest_event(
+            self._thread_event("90.0", "<@U_SELF> do the thing")
+        )
+        await frontend._gate_notices[session_id]
+        assert frontend._gated_msgs[session_id][0]["ts"] == "90.0"
+
+        await frontend._on_continue_action(self._tap())
+
+        frontend._on_message.assert_awaited_once()
+        _, replayed = frontend._on_message.call_args.args
+        assert "do the thing" in replayed
+        assert CONTINUE_COMMAND not in replayed
+
+    async def test_tap_cancels_a_pending_notice(self, frontend):
+        """A tap that lands while the notice is still waiting out its delay must
+        take the task down with it, or the card posts after the thread resumed."""
+        session_id = _session_key("C1", "t1")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_add = AsyncMock()
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._replay_gated = AsyncMock()
+
+        await frontend._ingest_event(self._thread_event("90.0"))
+        pending = frontend._gate_notices[session_id]
+
+        await frontend._on_continue_action(self._tap())
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert session_id not in frontend._gate_notices
+
+    async def test_tap_after_a_restart_just_resumes(self, frontend):
+        """The card outlives the process that drew it. _gated_msgs is empty after a
+        restart, so nothing names a message to replay and the tap can only resume.
+        A tap that follows a typed `$continue` lands here too, which is what stops
+        the same message from being run twice."""
+        session_id = _session_key("C1", "t1")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._replay_gated = AsyncMock()
+
+        await frontend._on_continue_action(self._tap())
+
+        assert frontend._reply_counts[session_id] == 0
+        frontend._app.client.reactions_remove.assert_not_awaited()
+        frontend._delete_ephemeral.assert_awaited_once()
+        frontend._replay_gated.assert_not_awaited()
+
+    async def test_unauthorized_tap_changes_nothing(self, frontend):
+        """The payload is client-supplied, so the clicker is checked rather than
+        assumed from who the card was addressed to."""
+        session_id = _session_key("C1", "t1")
+        frontend._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        frontend._gated_msgs[session_id] = [self._gated()]
+        frontend._app.client.reactions_remove = AsyncMock()
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._on_continue_action(self._tap(user_id="U_STRANGER"))
+
+        assert frontend._reply_counts[session_id] == DEFAULT_REPLY_SOFT_LIMIT
+        assert frontend._gated_msgs[session_id][0]["ts"] == "90.0"
+        frontend._app.client.reactions_remove.assert_not_awaited()
+        # The card is left alone, so the sender it was addressed to can still use it.
+        frontend._delete_ephemeral.assert_not_awaited()
+
+    async def test_malformed_value_is_dropped(self, frontend, caplog):
+        frontend._delete_ephemeral = AsyncMock()
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_continue_action(self._tap(value="C1|t1|extra"))
+
+        assert "unusable routing" in "\n".join(r.getMessage() for r in caplog.records)
+        frontend._delete_ephemeral.assert_not_awaited()
+
+    async def test_a_payload_with_no_actions_is_ignored(self, frontend):
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._on_continue_action({"user": {"id": "U_ALLOWED"}})
+
+        frontend._delete_ephemeral.assert_not_awaited()
+
+
+class TestReplayAction:
+    """The mention notice's button. It runs what the sender forgot to tag, so
+    they never retype it."""
+
+    @staticmethod
+    def _tap(value: str = "C1|t1", user_id: str = "U_ALLOWED") -> dict:
+        return {
+            "user": {"id": user_id, "name": "hoss"},
+            "response_url": "https://hooks.slack.test/actions/2",
+            "actions": [{"action_id": slack_mod.REPLAY_ACTION_ID, "value": value}],
+        }
+
+    @staticmethod
+    def _untagged(ts: str, text: str) -> dict:
+        return {
+            "ts": ts,
+            "thread_ts": "t1",
+            "text": text,
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+    def _hold(self, frontend, *events: dict, user: str = "U_ALLOWED") -> tuple:
+        key = (_session_key("C1", "t1"), user)
+        frontend._untagged_msgs[key] = list(events)
+        frontend._delete_ephemeral = AsyncMock()
+        return key
+
+    async def test_a_burst_replays_in_order_with_the_tag(self, frontend):
+        """The tag is added to every replay, not only the first: a replayed
+        message goes back through the mention gate like a live one."""
+        stored = self._untagged("90.0", "first")
+        key = self._hold(frontend, stored, self._untagged("90.1", "second"))
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_replay_action(self._tap())
+
+        assert [c.args[0]["text"] for c in frontend._ingest_event.await_args_list] == [
+            "<@U_SELF> first",
+            "<@U_SELF> second",
+        ]
+        assert stored["text"] == "first"  # a copy was replayed, not the stored event
+        assert key not in frontend._untagged_msgs
+        frontend._delete_ephemeral.assert_awaited_once_with(
+            "https://hooks.slack.test/actions/2"
+        )
+
+    async def test_every_message_reaches_the_agent(self, frontend, monkeypatch):
+        """End to end through the real `_ingest_event`: each replay has to pass
+        every gate the live path applies, or the card goes and nothing runs."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        await frontend._ingest_event(self._untagged("t1", "<@U_SELF> have a look"))
+        await frontend._ingest_event(self._untagged("t2", "do the first thing"))
+        await frontend._ingest_event(self._untagged("t3", "and the second"))
+        pending = frontend._mention_notices[session_id, "U_ALLOWED"]
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._on_replay_action(self._tap())
+
+        prompts = [c.args[1] for c in frontend._on_message.await_args_list]
+        assert len(prompts) == 3
+        assert "do the first thing" in prompts[1]
+        assert "and the second" in prompts[2]
+        assert "<@U_SELF>" not in prompts[2]
+        # The replay is a tag, so the still-pending notice goes too.
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        await frontend._on_replay_action(self._tap())
+        assert frontend._on_message.await_count == 3  # a second tap runs nothing
+
+    async def test_a_replay_is_not_re_gated_by_the_reply_limit(
+        self, frontend, monkeypatch
+    ):
+        """Somebody who has been typing untagged is often at the reply limit
+        already. Each replay charges a turn on its way to the agent, so without
+        a reset the first message runs and the rest land in the reply gate's
+        backlog, with this card already spent and nothing left to tap."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        session_id = _session_key("C1", "t1")
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "n.0"}
+        await frontend._ingest_event(self._untagged("t1", "<@U_SELF> have a look"))
+        await frontend._ingest_event(self._untagged("t2", "do the first thing"))
+        await frontend._ingest_event(self._untagged("t3", "and the second"))
+        frontend._delete_ephemeral = AsyncMock()
+        # The thread is already at its budget when the card is tapped.
+        frontend._reply_counts[session_id] = slack_mod.reply_soft_limit()
+
+        await frontend._on_replay_action(self._tap())
+
+        prompts = [c.args[1] for c in frontend._on_message.await_args_list]
+        assert len(prompts) == 3
+        assert "do the first thing" in prompts[1]
+        assert "and the second" in prompts[2]
+        # Nothing was pushed back into the reply gate on the way through.
+        assert session_id not in frontend._gated_msgs
+
+    async def test_a_replay_leaves_the_reply_gates_backlog_alone(self, frontend):
+        """`_replay_gated` resets the same budget by prefixing `$continue`, and
+        that branch also empties `_gated_msgs`. Borrowing it here would make a
+        tap on this card silently discard the tagged messages the reply card was
+        still holding."""
+        session_id = _session_key("C1", "t1")
+        self._hold(frontend, self._untagged("90.0", "mine"))
+        frontend._ingest_event = AsyncMock()
+        gated = {"ts": "91.0", "channel": "C1", "thread_ts": "t1", "text": "budget"}
+        frontend._gated_msgs[session_id] = [gated]
+
+        await frontend._on_replay_action(self._tap())
+
+        assert frontend._gated_msgs[session_id] == [gated]
+
+    async def test_a_tap_only_replays_the_tappers_own_messages(self, frontend):
+        """Keyed by who pressed, so a forged payload cannot run somebody else's."""
+        frontend._pinned_allowed_user_ids = {"U_ALLOWED", "U_OTHER"}
+        key = self._hold(frontend, self._untagged("90.0", "mine"))
+        frontend._ingest_event = AsyncMock()
+
+        await frontend._on_replay_action(self._tap(user_id="U_OTHER"))
+
+        frontend._ingest_event.assert_not_awaited()
+        assert key in frontend._untagged_msgs
+
+    async def test_tap_after_a_restart_only_removes_the_card(self, frontend, caplog):
+        frontend._delete_ephemeral = AsyncMock()
+        frontend._ingest_event = AsyncMock()
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_replay_action(self._tap())
+
+        frontend._ingest_event.assert_not_awaited()
+        frontend._delete_ephemeral.assert_awaited_once()
+        assert "found no untagged messages" in caplog.text
+
+    async def test_unauthorized_tap_changes_nothing(self, frontend):
+        key = self._hold(frontend, self._untagged("90.0", "mine"), user="U_STRANGER")
+
+        await frontend._on_replay_action(self._tap(user_id="U_STRANGER"))
+
+        assert key in frontend._untagged_msgs
+        frontend._delete_ephemeral.assert_not_awaited()
+
+    async def test_malformed_value_is_dropped(self, frontend, caplog):
+        frontend._delete_ephemeral = AsyncMock()
+
+        with caplog.at_level("INFO", logger="claude_on_the_fly.slack"):
+            await frontend._on_replay_action(self._tap(value="C1|t1|extra"))
+
+        assert "unusable routing" in caplog.text
+        frontend._delete_ephemeral.assert_not_awaited()
+
+    async def test_a_payload_with_no_actions_is_ignored(self, frontend):
+        frontend._delete_ephemeral = AsyncMock()
+
+        await frontend._on_replay_action({"user": {"id": "U_ALLOWED"}})
+
+        frontend._delete_ephemeral.assert_not_awaited()
+
+
+class TestDeleteEphemeral:
+    """Taking the card back through the interaction's response_url."""
+
+    @staticmethod
+    def _mock_aiohttp(status: int = 200, text: str = "ok"):
+        mock_resp = MagicMock()
+        mock_resp.status = status
+        mock_resp.text = AsyncMock(return_value=text)
+
+        mock_post_ctx = MagicMock()
+        mock_post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_post_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_post_ctx)
+
+        mock_client_ctx = MagicMock()
+        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
+        return mock_client_ctx, mock_session
+
+    async def test_posts_delete_original(self, frontend):
+        mock_ctx, mock_session = self._mock_aiohttp()
+
+        with patch(
+            "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+        ):
+            await frontend._delete_ephemeral("https://hooks.slack.test/actions/1")
+
+        assert mock_session.post.call_args.args[0] == (
+            "https://hooks.slack.test/actions/1"
+        )
+        assert mock_session.post.call_args.kwargs["json"] == {"delete_original": True}
+
+    async def test_an_error_status_is_logged_with_what_slack_said(
+        self, frontend, caplog
+    ):
+        mock_ctx, _ = self._mock_aiohttp(status=500, text="invalid_response_url")
+
+        with (
+            patch(
+                "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._delete_ephemeral("https://hooks.slack.test/actions/1")
+
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "500" in logged
+        assert "invalid_response_url" in logged
+
+    async def test_a_dead_response_url_is_logged_not_raised(self, frontend, caplog):
+        """Best-effort by design: the thread is already resumed when this runs, and
+        a card that will not go away must not take that back."""
+        with (
+            patch(
+                "claude_on_the_fly.slack.aiohttp.ClientSession",
+                side_effect=RuntimeError("no route to host"),
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._delete_ephemeral("https://hooks.slack.test/actions/1")
+
+        assert "could not reach response_url" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    async def test_a_missing_response_url_is_logged(self, frontend, caplog):
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._delete_ephemeral("")
+
+        assert "no response_url" in "\n".join(r.getMessage() for r in caplog.records)
 
 
 class TestApprovalCardDoesNotUnfurl:
@@ -4413,6 +6209,31 @@ class TestWatermarkDurability:
         assert frontend._restore_watermarks() == 1
         assert frontend._restore_watermarks() == 0
 
+    @pytest.mark.parametrize("event_ts", ["not-a-timestamp", "nan", "inf", "-1", "0"])
+    def test_invalid_first_timestamp_is_not_recorded(self, frontend, event_ts):
+        frontend._record_watermark("D1", event_ts, "im")
+
+        assert "D1" not in frontend._active_channels
+        assert len(frontend._watermarks) == 0
+
+    def test_restoring_a_position_does_not_move_a_live_channel_backward(self, frontend):
+        latest = str(time.time())
+        SlackWatermarks(slack_mod.DATA_DIR / "state" / "slack.watermarks.json").record(
+            "D1", str(float(latest) - 10), "im"
+        )
+        frontend._active_channels["D1"] = latest
+
+        assert frontend._restore_watermarks() == 1
+        assert frontend._active_channels["D1"] == latest
+
+    def test_recording_an_older_event_keeps_both_positions(self, frontend):
+        frontend._record_watermark("D1", "200.0", "im")
+        frontend._record_watermark("D1", "100.0")
+
+        assert frontend._active_channels["D1"] == "200.0"
+        restored = frontend._watermarks.recent(now=201)[0]
+        assert (restored.ts, restored.channel_type) == ("200.0", "im")
+
 
 class TestSenderLists:
     """Access control, read per message so an edit needs no restart.
@@ -4758,6 +6579,7 @@ class TestRegisteredHandlers:
             call.args[0].pattern for call in frontend._app.action.call_args_list
         ]
         assert r"^cotf-sugg:" not in patterns
+        assert r"^cotf-continue$" not in patterns
         ack = AsyncMock()
         await action_cbs[0](ack, {"user": {"id": "U_ALLOWED"}})
         assert ack.await_count == 1
@@ -4785,6 +6607,274 @@ class TestIngestSubtypeFiltering:
         assert "skipped: subtype=channel_join" in "\n".join(
             r.getMessage() for r in caplog.records
         )
+
+
+def _thread_reply(user: str, text: str, *, broadcast: bool) -> dict:
+    """One reply in thread 100.0 of channel C1, sent plainly or with "Also send
+    to channel". A broadcast carries `subtype` and the parent as `root`; the
+    rest of the payload is the same message."""
+    event = {
+        "type": "message",
+        "ts": "100.5",
+        "thread_ts": "100.0",
+        "text": text,
+        "channel": "C1",
+        "channel_type": "channel",
+        "user": user,
+    }
+    if broadcast:
+        event["subtype"] = "thread_broadcast"
+        event["root"] = {
+            "type": "message",
+            "ts": "100.0",
+            "text": "the parent message",
+            "user": "U_ALLOWED",
+            "thread_ts": "100.0",
+            "reply_count": 1,
+        }
+    return event
+
+
+@contextlib.contextmanager
+def _fresh_frontend(data_dir: Path, **kwargs):
+    """A frontend like the `frontend` fixture, so one test can run the plain and
+    the broadcast reply through two identical, independent instances. Each gets
+    its own data dir: the processed-event set persists there, and a shared one
+    would have the second instance skip the first one's ts as already seen."""
+    with (
+        patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls,
+        patch.object(slack_mod, "DATA_DIR", data_dir),
+    ):
+        mock_app = MagicMock()
+        mock_app.client.users_info = AsyncMock(
+            return_value={"user": {"name": "testuser"}}
+        )
+        mock_app.client.conversations_info = AsyncMock(
+            return_value={
+                "channel": {"name": "general", "is_mpim": False, "is_private": False}
+            }
+        )
+        mock_app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {"ts": "100.0", "text": "the parent message", "user": "U_ALLOWED"}
+                ]
+            }
+        )
+        mock_app.client.chat_postMessage = AsyncMock()
+        mock_app.client.chat_postEphemeral = AsyncMock()
+        mock_app_cls.return_value = mock_app
+        kwargs.setdefault("allowed_user_ids", {"U_ALLOWED"})
+        fe = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF", **kwargs)
+        fe._on_message = AsyncMock()
+        fe._hint_mention_required = AsyncMock()
+        yield fe
+
+
+async def _ingest_pair(tmp_path: Path, plain: dict, broadcast: dict, **kwargs):
+    """Ingest a plain reply and its broadcast form, each through its own
+    frontend; return both so a test can compare what they did."""
+    results = []
+    for name, event in (("plain", plain), ("broadcast", broadcast)):
+        with _fresh_frontend(tmp_path / name, **kwargs) as fe:
+            await fe._ingest_event(event)
+            results.append(fe)
+    return results
+
+
+async def _ingest_both(tmp_path: Path, user: str, text: str, **kwargs):
+    """Ingest the plain and the broadcast form of one person's reply."""
+    return await _ingest_pair(
+        tmp_path,
+        _thread_reply(user, text, broadcast=False),
+        _thread_reply(user, text, broadcast=True),
+        **kwargs,
+    )
+
+
+def _bot_thread_reply(bot_id: str, text: str, *, broadcast: bool) -> dict:
+    """A bot's reply in thread 100.0: no `user` field, only `bot_id`. Sent
+    plainly it is a `bot_message`; with "Also send to channel" it is a
+    `thread_broadcast` carrying the same bot fields."""
+    event = _thread_reply("", text, broadcast=broadcast)
+    del event["user"]
+    event["bot_id"] = bot_id
+    event["username"] = "Alerts"
+    if not broadcast:
+        event["subtype"] = "bot_message"
+    return event
+
+
+async def _ingest_bot_pair(tmp_path: Path, bot_id: str, text: str, **kwargs):
+    return await _ingest_pair(
+        tmp_path,
+        _bot_thread_reply(bot_id, text, broadcast=False),
+        _bot_thread_reply(bot_id, text, broadcast=True),
+        **kwargs,
+    )
+
+
+class TestThreadBroadcastIsAThreadReply:
+    """A reply sent with "Also send to channel" arrives as
+    subtype=thread_broadcast. On 2026-09-30 a colleague's reply sent that way was
+    dropped at the subtype filter and never reached the relay; it must be
+    handled exactly like the same reply sent plainly."""
+
+    async def test_an_allowed_broadcast_reaches_the_agent_like_a_plain_reply(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_both(
+            tmp_path, "U_ALLOWED", "<@U_SELF> please check"
+        )
+
+        plain._on_message.assert_awaited_once()
+        broadcast._on_message.assert_awaited_once()
+        assert broadcast._on_message.await_args == plain._on_message.await_args
+        chat_id, text = broadcast._on_message.await_args.args
+        assert chat_id == _session_key("C1", "100.0")
+        assert "please check" in text
+        assert "<thread_context>" in text
+        assert (
+            broadcast._pending_reply_suppressed[chat_id]
+            == plain._pending_reply_suppressed[chat_id]
+            == deque([False])
+        )
+
+    async def test_a_broadcast_from_a_sender_not_allowed_is_refused_the_same_way(
+        self, tmp_path, caplog
+    ):
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            plain, broadcast = await _ingest_both(tmp_path, "U_RANDOM", "<@U_SELF> hi")
+        plain._on_message.assert_not_awaited()
+        broadcast._on_message.assert_not_awaited()
+        refusals = [
+            r.getMessage()
+            for r in caplog.records
+            if "U_RANDOM not in allowed_user_ids" in r.getMessage()
+        ]
+        assert len(refusals) == 2
+
+    async def test_a_broadcast_from_a_silent_sender_is_silenced_the_same_way(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_both(
+            tmp_path, "U_ALLOWED", "<@U_SELF> fyi", silent_sender_ids={"U_ALLOWED"}
+        )
+        chat_id = _session_key("C1", "100.0")
+        broadcast._on_message.assert_awaited_once()
+        assert broadcast._on_message.await_args == plain._on_message.await_args
+        assert (
+            broadcast._pending_reply_suppressed[chat_id]
+            == plain._pending_reply_suppressed[chat_id]
+            == deque([True])
+        )
+
+    async def test_an_untagged_broadcast_meets_the_mention_gate_the_same_way(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_both(tmp_path, "U_ALLOWED", "no tag here")
+        plain._on_message.assert_not_awaited()
+        broadcast._on_message.assert_not_awaited()
+        plain._hint_mention_required.assert_awaited_once()
+        broadcast._hint_mention_required.assert_awaited_once()
+        # Same channel, thread and sender; the event itself is held for the
+        # replay card as received, subtype and all, which the filter now admits.
+        plain_args = plain._hint_mention_required.await_args.args
+        broadcast_args = broadcast._hint_mention_required.await_args.args
+        assert broadcast_args[:3] == plain_args[:3] == ("C1", "100.0", "U_ALLOWED")
+        assert broadcast_args[3]["subtype"] == "thread_broadcast"
+
+    @pytest.mark.parametrize(
+        "subtype", ["bot_message", "message_changed", "message_deleted", "made_up"]
+    )
+    async def test_other_subtypes_are_still_skipped(self, subtype, tmp_path, caplog):
+        event = _thread_reply("U_ALLOWED", "<@U_SELF> please check", broadcast=False)
+        event["subtype"] = subtype
+        with _fresh_frontend(tmp_path) as fe:
+            with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+                await fe._ingest_event(event)
+            fe._on_message.assert_not_awaited()
+        assert any(
+            "skipped:" in r.getMessage() and subtype in r.getMessage()
+            for r in caplog.records
+        )
+
+
+class TestABotsThreadBroadcastIsABotReply:
+    """A bot's broadcast reply has `bot_id` and no `user`, like its
+    `bot_message`. Sent down the person path it was refused where the plain
+    reply was accepted, and with `*` in the allowlist any bot that tagged us got
+    through as a person, past the trusted-bot list and its bot policy."""
+
+    async def test_a_trusted_bots_broadcast_is_handled_like_its_bot_message(
+        self, tmp_path
+    ):
+        plain, broadcast = await _ingest_bot_pair(
+            tmp_path, "B_BOT", "deploy finished", allowed_bot_ids={"B_BOT"}
+        )
+        chat_id = _session_key("C1", "100.0")
+        plain._on_message.assert_awaited_once()
+        broadcast._on_message.assert_awaited_once()
+        assert broadcast._on_message.await_args == plain._on_message.await_args
+        assert broadcast.sender_identity(chat_id) == "B_BOT"
+        assert broadcast.sender_identity(chat_id) == plain.sender_identity(chat_id)
+
+    @pytest.mark.parametrize(
+        "allowed_user_ids", [{"U_ALLOWED"}, {"*"}], ids=["listed", "wildcard"]
+    )
+    async def test_an_untrusted_bots_broadcast_is_refused_like_its_bot_message(
+        self, tmp_path, caplog, allowed_user_ids
+    ):
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            plain, broadcast = await _ingest_bot_pair(
+                tmp_path,
+                "B_STRANGER",
+                "<@U_SELF> run this",
+                allowed_user_ids=allowed_user_ids,
+            )
+        plain._on_message.assert_not_awaited()
+        broadcast._on_message.assert_not_awaited()
+        refusals = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("skipped: untrusted")
+            and "bot_id=B_STRANGER" in r.getMessage()
+        ]
+        assert len(refusals) == 2
+
+    async def test_a_trusted_bots_broadcast_meets_its_bot_policy(
+        self, tmp_path, caplog
+    ):
+        with caplog.at_level("DEBUG", logger="claude_on_the_fly.slack"):
+            plain, broadcast = await _ingest_bot_pair(
+                tmp_path,
+                "B_BOT",
+                "<@U_SELF> routine noise",
+                allowed_user_ids={"*"},
+                allowed_bot_ids={"B_BOT"},
+                bot_policies={"B_BOT": {"mode": "drop"}},
+            )
+        plain._on_message.assert_not_awaited()
+        broadcast._on_message.assert_not_awaited()
+        drops = [
+            r.getMessage()
+            for r in caplog.records
+            if "pre-agent gate: decision=drop bot_id=B_BOT" in r.getMessage()
+        ]
+        assert len(drops) == 2
+
+    async def test_a_broadcast_with_a_user_stays_on_the_person_path(self, tmp_path):
+        """A person, or an app bot posting with its own bot-user id, has a
+        `user`; that broadcast is the plain reply of that user, bot_id or not."""
+        plain = _thread_reply("U_ALLOWED", "<@U_SELF> please check", broadcast=False)
+        cast = _thread_reply("U_ALLOWED", "<@U_SELF> please check", broadcast=True)
+        plain["bot_id"] = cast["bot_id"] = "B_APP"
+        plain_fe, broadcast_fe = await _ingest_pair(tmp_path, plain, cast)
+        chat_id = _session_key("C1", "100.0")
+        plain_fe._on_message.assert_awaited_once()
+        broadcast_fe._on_message.assert_awaited_once()
+        assert broadcast_fe._on_message.await_args == plain_fe._on_message.await_args
+        assert broadcast_fe.sender_identity(chat_id) == "U_ALLOWED"
 
 
 class TestSetStatusWithoutAThread:
@@ -4865,7 +6955,7 @@ class TestSendFallsBackToDm:
         )
         with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
             assert await frontend.send(1, Response(body="x")) == []
-        assert "failed to post message" in "\n".join(
+        assert "failed to post part 1/1" in "\n".join(
             r.getMessage() for r in caplog.records
         )
 
@@ -5026,7 +7116,7 @@ class TestReplyLimitWarning:
         )
         with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
             await frontend._warn_reply_limit("C1", None)
-        assert "failed to post warning" in "\n".join(
+        assert "post_notice: failed to post" in "\n".join(
             r.getMessage() for r in caplog.records
         )
 
@@ -5037,6 +7127,36 @@ class TestReplyLimitWarning:
         )
         await frontend._warn_reply_limit("C1", None)
         assert "1785382999.1" in frontend._our_sent_timestamps
+
+    async def test_a_sender_with_an_id_gets_an_ephemeral_card(self, frontend):
+        """The thread is not notified. A thread reply reaches every participant,
+        and the budget belongs to one person."""
+        frontend._app.client.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+
+        await frontend._warn_reply_limit("C1", "t1", "U_ALLOWED")
+
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+        kwargs = frontend._app.client.chat_postEphemeral.call_args.kwargs
+        assert kwargs["channel"] == "C1"
+        assert kwargs["user"] == "U_ALLOWED"
+        assert kwargs["thread_ts"] == "t1"
+        assert CONTINUE_COMMAND in kwargs["text"]
+        assert kwargs["blocks"][0]["text"]["text"] == kwargs["text"]
+        button = kwargs["blocks"][1]["elements"][0]
+        assert button["action_id"] == slack_mod.CONTINUE_ACTION_ID
+        assert button["value"] == "C1|t1"
+
+    async def test_a_trusted_bot_has_no_recipient_so_the_thread_is_told(self, frontend):
+        """A trusted bot carries no user id, so there is no recipient for an
+        ephemeral. This is the one path that still notifies the thread."""
+        frontend._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1785382999.1"}
+        )
+
+        await frontend._warn_reply_limit("C1", "t1")
+
+        frontend._app.client.chat_postEphemeral.assert_not_awaited()
+        assert frontend._app.client.chat_postMessage.call_args.kwargs["channel"] == "C1"
 
 
 class TestAnchorPost:
@@ -5323,6 +7443,154 @@ class TestRouteForAndRestore:
         assert frontend._sessions[chat_id] == ("C1", None)
 
 
+class TestSessionFacts:
+    async def test_a_dm_thread_reports_its_ids(self, frontend):
+        chat_id = _session_key("D1", "111.222")
+        frontend._remember_session(chat_id, "D1", "111.222")
+        frontend._sender_names[chat_id] = "hoss"
+        frontend._session_sender_ids[chat_id] = "U_HOSS"
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "D1", "im", "111.222"
+        )
+        assert frontend.session_facts(chat_id) == {
+            "conversation": "dm D1",
+            "thread": "111.222",
+            "sender_id": "U_HOSS",
+            "sender_name": "hoss",
+        }
+
+    async def test_a_channel_root_reports_its_name(self, frontend):
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "general", "is_private": False}
+        }
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "C1", "channel", ""
+        )
+        facts = frontend.session_facts(chat_id)
+        assert facts["conversation"] == "channel C1 #general"
+        assert facts["thread"] == "root"
+
+    def test_an_unknown_session_reports_nothing(self, frontend):
+        assert frontend.session_facts(4242) == {}
+
+
+class TestRouteCarriesTheWorkspace:
+    """A replay runs before any message resolves the thread, and `restore_route`
+    has no Slack client to ask. Without the resolved names in the journal a
+    replayed turn ran in `slack/<session key>`, a directory nothing else uses:
+    nine of them on one deployment, each holding one orphaned transcript."""
+
+    async def _resolved_dm(self, frontend) -> int:
+        chat_id = _session_key("D1", "111.222")
+        frontend._remember_session(chat_id, "D1", "111.222")
+        frontend._sender_names[chat_id] = "hoss"
+        frontend._session_sender_ids[chat_id] = "U_HOSS"
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "D1", "im", "111.222"
+        )
+        return chat_id
+
+    async def test_a_resolved_session_journals_its_workspace(self, frontend):
+        chat_id = await self._resolved_dm(frontend)
+
+        assert frontend.route_for(chat_id)["workspace"] == {
+            "name": "dm/U_HOSS",
+            "legacy": "dm-hoss-111-222",
+            "thread_key": "111-222",
+            "sender_id": "U_HOSS",
+            "sender_name": "hoss",
+            "context": "dm (private)",
+            "channel_name": "",
+        }
+
+    def test_an_unresolved_session_journals_no_workspace(self, frontend):
+        chat_id = _session_key("C1", "1.0")
+        frontend._remember_session(chat_id, "C1", "1.0")
+
+        assert "workspace" not in frontend.route_for(chat_id)
+
+    async def test_a_replayed_turn_runs_in_the_conversation_workspace(self, frontend):
+        chat_id = await self._resolved_dm(frontend)
+        route = frontend.route_for(chat_id)
+        frontend._forget_session(chat_id)  # what a restart leaves behind
+
+        frontend.restore_route(chat_id, route)
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U_HOSS"
+        assert frontend.legacy_workspace(chat_id) == LegacyWorkspace(
+            "slack/dm-hoss-111-222", "111-222"
+        )
+        assert frontend.sender_identity(chat_id) == "U_HOSS"
+        assert frontend.sender_name(chat_id) == "hoss"
+        assert frontend.channel_context(chat_id) == "dm (private)"
+
+    async def test_a_channel_route_round_trips_its_name(self, frontend):
+        chat_id = _session_key("C1", None)
+        frontend._remember_session(chat_id, "C1", None)
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "general", "is_private": False}
+        }
+        await frontend._resolve_session_metadata(
+            chat_id, "hoss", "U_HOSS", "C1", "channel", ""
+        )
+        route = frontend.route_for(chat_id)
+        frontend._forget_session(chat_id)
+
+        frontend.restore_route(chat_id, route)
+
+        assert frontend.workspace_name(chat_id) == "slack/channel/C1"
+        assert frontend._channel_names[chat_id] == "general"
+        assert frontend._thread_keys[chat_id] == "root"
+
+    def test_a_route_from_before_the_field_keeps_the_old_fallback(self, frontend):
+        chat_id = _session_key("C1", "1.0")
+
+        frontend.restore_route(chat_id, {"channel": "C1", "thread_ts": "1.0"})
+
+        assert frontend.workspace_name(chat_id) == f"slack/{chat_id}"
+
+    @pytest.mark.parametrize(
+        "workspace", ["dm/U1", {"name": 7}, {"name": ""}, {"legacy": "x"}]
+    )
+    def test_a_junk_workspace_is_ignored(self, frontend, workspace):
+        chat_id = _session_key("C1", "1.0")
+
+        frontend.restore_route(
+            chat_id, {"channel": "C1", "thread_ts": "1.0", "workspace": workspace}
+        )
+
+        assert chat_id not in frontend._workspace_names
+
+    def test_optional_fields_missing_leave_their_defaults(self, frontend):
+        chat_id = _session_key("C1", "1.0")
+
+        frontend.restore_route(
+            chat_id,
+            {"channel": "C1", "thread_ts": "1.0", "workspace": {"name": "dm/U1"}},
+        )
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U1"
+        assert frontend.legacy_workspace(chat_id) is None
+        assert frontend.sender_identity(chat_id) == str(chat_id)
+        assert frontend._thread_keys[chat_id] == "root"
+
+    async def test_a_known_session_is_not_overwritten(self, frontend):
+        chat_id = await self._resolved_dm(frontend)
+
+        frontend.restore_route(
+            chat_id,
+            {
+                "channel": "D1",
+                "thread_ts": "111.222",
+                "workspace": {"name": "dm/U_OTHER"},
+            },
+        )
+
+        assert frontend.workspace_name(chat_id) == "slack/dm/U_HOSS"
+
+
 class TestResumedReactions:
     async def test_a_leftover_eyes_reaction_is_not_a_warning(self, frontend, caplog):
         """A force-killed daemon leaves its :eyes: on the message, so the resume
@@ -5432,3 +7700,39 @@ class TestInterruptedIsAReactionNotAMessage:
             slack_mod.INTERRUPTED_EMOJI,
         ]
         assert added == [slack_mod.INTERRUPTED_EMOJI, slack_mod.RUNNING_EMOJI]
+
+
+class TestRefusalsAreTraceable:
+    """A refused message has to leave a record a deployed daemon actually keeps.
+
+    Every branch that drops a message used to log at DEBUG, and this install
+    runs at INFO, so a message refused in production left nothing to read.
+    """
+
+    def test_a_refusal_that_can_eat_a_human_message_is_logged_at_info(self, caplog):
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(True, "sender %s in blocked_senders", "U123")
+
+        assert "skipped: sender U123 in blocked_senders" in caplog.text
+        assert [r.levelname for r in caplog.records] == ["INFO"]
+
+    def test_routine_refusals_stay_at_debug(self, caplog):
+        """An untrusted bot posted 88 times in one day on this install. At INFO
+        that volume would bury the refusals worth reading."""
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(False, "untrusted bot_message bot_id=%s", "B9")
+
+        assert caplog.records == []
+
+        with caplog.at_level(logging.DEBUG, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(False, "untrusted bot_message bot_id=%s", "B9")
+
+        assert "skipped: untrusted bot_message bot_id=B9" in caplog.text
+
+    def test_the_arguments_are_left_for_the_logger_to_interpolate(self, caplog):
+        """Not pre-formatted: a message body reaching a skip reason could carry
+        a stray `%s`, and eager formatting would raise inside the log call."""
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            SlackFrontend._skip(True, "already processed ts=%s", "100%s.5")
+
+        assert "ts=100%s.5" in caplog.text

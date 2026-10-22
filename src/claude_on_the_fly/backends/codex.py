@@ -3,25 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
+
+from rich.text import Text
 
 from claude_on_the_fly import (
     agent,
+    codex_auth,
     codex_state,
     permissions,
     pricing,
+    quota,
     sandbox,
-    settings,
+    tmux,
     transcript,
 )
 from claude_on_the_fly.agent import (
+    COMPACT_TIMEOUT,
     DEFAULT_TIMEOUT,
     NUDGE_PROMPT,
     Compaction,
@@ -39,9 +46,17 @@ logger = logging.getLogger(__name__)
 # this is small enough to always trip and non-zero to stay a plausible limit.
 COMPACT_TOKEN_LIMIT = 2000
 # Codex compaction is checked *before* a turn, so it needs one to hang off — it
-# cannot be a standalone operation the way claude's `/compact` is. Keep the reply
-# tiny: it lands in the conversation the compaction just summarized.
-COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
+# cannot be a standalone operation the way claude's `/compact` is. `compact`
+# stops codex before the model reads this, so it is only a backstop: if it does
+# reach the model, it asks for nothing. An earlier "Reply with the single word:
+# compacted" did reach one, and the model took it as the task — it replied
+# "compacted" to the user's next question, and one model made tool calls that
+# compacted the thread again in a loop.
+COMPACT_TRIGGER_PROMPT = "Automatic context checkpoint. No action is needed."
+# How often `compact` reads the rollout for the compacted history. The trigger's
+# user message follows the `turn_context` record by about 0.3s, and the model
+# request follows that, so a slow poll lets the model start.
+COMPACT_POLL_S = 0.1
 
 # How long to let codex exit on its own after it has gone quiet on a finished
 # turn, before killing it.
@@ -57,167 +72,51 @@ COMPACT_TRIGGER_PROMPT = "Reply with the single word: compacted"
 # After that, continued silence is teardown rather than work, so kill it and let
 # the caller deliver the reply already in hand.
 POST_TURN_EXIT_GRACE = 30.0
-_TURN_COMPLETED_MARKER = b'"turn.completed"'
-
-
-class _StreamWatch:
-    """Tracks whether the turn finished and when output was last seen."""
-
-    def __init__(self) -> None:
-        self.turn_completed = asyncio.Event()
-        self.last_output_at = time.monotonic()
-        # Enough of the previous chunk to still match a marker split across a
-        # chunk boundary, without retaining the whole stream a second time.
-        self._carry = b""
-
-    def feed(self, chunk: bytes) -> None:
-        """Note output, and whether it completed the turn. Never raises."""
-        self.last_output_at = time.monotonic()
-        if self.turn_completed.is_set():
-            return
-        if _TURN_COMPLETED_MARKER in self._carry + chunk:
-            self.turn_completed.set()
-            self._carry = b""
-            return
-        self._carry = (self._carry + chunk)[-(len(_TURN_COMPLETED_MARKER) - 1) :]
-
-
-class _CodexProgressRelay:
-    """Hold Codex messages until a tool event proves they were narration."""
-
-    def __init__(self, emit: Callable[[str], None]) -> None:
-        self._emit = emit
-        self._pending: list[str] = []
-
-    def feed(self, msg: dict) -> None:
-        kind = msg.get("type")
-        if kind == "item.completed":
-            item = msg.get("item") or {}
-            item_type = item.get("type")
-            if item_type == "agent_message":
-                text = (item.get("text") or "").strip()
-                if text:
-                    self._pending.append(text)
-            elif self._is_tool_item(item_type):
-                self._flush()
-        elif kind == "item.started":
-            item_type = (msg.get("item") or {}).get("type")
-            if self._is_tool_item(item_type):
-                self._flush()
-        elif kind == "turn.completed":
-            # The pending message is the final answer. Response.body will carry
-            # it after the stream is parsed, so forwarding it would duplicate it.
-            self._pending.clear()
-
-    def finish(self) -> None:
-        """Drop any unproven text when the stream ends without another tool."""
-        self._pending.clear()
-
-    @staticmethod
-    def _is_tool_item(item_type: object) -> bool:
-        return (
-            isinstance(item_type, str)
-            and item_type != "agent_message"
-            and item_type not in _NON_TOOL_ITEMS
-        )
-
-    def _flush(self) -> None:
-        pending, self._pending = self._pending, []
-        for text in pending:
-            try:
-                self._emit(text)
-            except Exception:
-                # Progress is best effort. A broken frontend must not abort the
-                # Codex turn or stop the JSONL reader.
-                logger.exception("codex: progress relay failed")
-
-
-class _CodexStreamObserver:
-    """Observe Codex chunks for progress without changing final parsing."""
-
-    def __init__(self, watch: _StreamWatch, emit: Callable[[str], None] | None) -> None:
-        self._watch = watch
-        self._line_buffer = b""
-        self._relay = _CodexProgressRelay(emit) if emit is not None else None
-
-    def feed(self, chunk: bytes) -> None:
-        self._watch.feed(chunk)
-        relay = self._relay
-        if relay is None:
-            return
-        self._line_buffer += chunk
-        while b"\n" in self._line_buffer:
-            line, self._line_buffer = self._line_buffer.split(b"\n", 1)
-            self._feed_line(line, relay)
-
-    def finish(self) -> None:
-        relay = self._relay
-        if relay is None:
-            return
-        if self._line_buffer.strip():
-            self._feed_line(self._line_buffer, relay)
-        relay.finish()
-
-    def _feed_line(self, raw: bytes, relay: _CodexProgressRelay) -> None:
-        line = raw.strip()
-        if not line:
-            return
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            return
-        try:
-            relay.feed(msg)
-        except Exception:
-            # Keep the callback non-raising: it runs inside the bounded stdout
-            # reader, where an exception would discard the whole turn.
-            logger.exception("codex: progress relay failed")
 
 
 async def _kill_once_quiet_after_turn(
-    proc: asyncio.subprocess.Process, watch: _StreamWatch
+    proc: asyncio.subprocess.Process, follower: _RolloutFollower
 ) -> None:
-    """Kill `proc` once it has been silent for the grace period post-turn."""
-    await watch.turn_completed.wait()
+    """Kill `proc` once it has been silent for the grace period post-turn.
+
+    "Silent" is measured on the rollout rather than on stdout: without `--json`
+    stdout carries only the closing reply, so a codex wedged after finishing
+    would look silent from the moment it started.
+    """
+    await follower.turn_completed.wait()
     while True:
-        idle = time.monotonic() - watch.last_output_at
+        idle = time.monotonic() - follower.last_output_at
         if idle >= POST_TURN_EXIT_GRACE:
             break
         # Re-armed by any further output, so a second turn in one exec
         # (auto-compaction) is never cut short.
         await asyncio.sleep(POST_TURN_EXIT_GRACE - idle)
     logger.warning(
-        "codex exec: silent for %ss after turn.completed and still running; "
+        "codex exec: silent for %ss after task_complete and still running; "
         "killing it so the finished reply can be delivered",
         POST_TURN_EXIT_GRACE,
     )
     await agent._kill_process_tree(proc)
 
 
-async def _collect_codex_output(proc) -> tuple[bytes, bytes]:
-    """`communicate_capped`, but not hostage to a codex that won't exit."""
-    watch = _StreamWatch()
-    observer = _CodexStreamObserver(watch, agent.progress_sink())
-    watchdog = asyncio.create_task(_kill_once_quiet_after_turn(proc, watch))
-    try:
-        return await agent.communicate_capped(proc, on_stdout_chunk=observer.feed)
-    finally:
-        observer.finish()
-        watchdog.cancel()
-
-
-# `model_reasoning_effort` choices, from codex's config reference. The shared
-# OLLAMA_EFFORT setting is validated against this before it reaches codex
-# (claude's accepted set differs: no `minimal`, plus `max`).
-_CODEX_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
-
-
-# item.completed types that are not tool calls. "reasoning" never was; "error"
-# joined the list when permissions mode `ask` started passing
-# --dangerously-bypass-hook-trust, which codex announces as an error item -- and
-# counting it produced a phantom tool named "error" in the response footer of every
-# gated codex turn.
-_NON_TOOL_ITEMS = frozenset({"reasoning", "error"})
+# `model_reasoning_effort` choices, from codex's config reference. Whichever key
+# the resolver read it from is validated against this before it reaches codex,
+# because the shared `agent.ollama.effort` is also claude's, and claude's
+# accepted set differs: no `minimal`.
+#
+# `max` is codex's too, not claude-only, and `ultra` sits above it. Codex's own
+# model catalog is the source: `supported_reasoning_levels` reads
+# [low, medium, high, xhigh, max] for gpt-5.6-luna and gpt-reserve, and adds
+# `ultra` for gpt-5.6-sol and gpt-5.6-terra. Omitting them here made
+# `effort: max` a silently dropped setting -- warned, replaced with no `-c`,
+# leaving the turn on whatever ~/.codex/config.toml said.
+#
+# Levels are per-model in that catalog (gpt-5.5 stops at xhigh), so this one
+# flat set is a lower bound on correctness: it can still accept a level the
+# chosen model lacks, and codex rejects that itself.
+_CODEX_EFFORT_LEVELS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 
 
 def _merge_codex_results(first: dict, second: dict) -> dict:
@@ -244,12 +143,10 @@ _CODEX_USAGE_FIELDS = (
 )
 
 
-def _usage_delta(current: dict, previous: dict | None) -> dict:
-    """Return one turn's counts from Codex's cumulative usage snapshots."""
-    if previous is None:
-        return dict(current)
+def _usage_from_events(events: list[dict]) -> dict:
+    """Sum a run of per-call usage records into one turn's counts."""
     return {
-        field: current.get(field, 0) - previous.get(field, 0)
+        field: sum(int(event.get(field, 0) or 0) for event in events)
         for field in _CODEX_USAGE_FIELDS
     }
 
@@ -269,129 +166,1112 @@ def _billable_usage(usage: dict) -> tuple[int, int, int, int]:
     )
 
 
-def parse_codex_stream(stdout: bytes) -> dict:
-    """Parse the JSONL emitted by `codex exec --json`.
+# --- rollout reading -------------------------------------------------------
+#
+# The rollout, not stdout, is this backend's machine data. `codex exec --json`
+# would put the same events on stdout, but a `--json` run renders JSONL into the
+# terminal, and the terminal is what the tmux pane mirrors — so the flag buys a
+# parser and costs the live view. Reading the rollout instead serves both arms
+# from one source, which is also the only way the hosted and unhosted arms can be
+# guaranteed to report a turn identically.
+#
+# The rollout names items in PascalCase where the `--json` stream used
+# snake_case, so this is a second vocabulary rather than the same one. Both sets
+# are observed, not guessed: this one comes from every item type present across
+# 400 local rollouts (Reasoning, CommandExecution, AgentMessage,
+# CollabAgentToolCall, UserMessage, FileChange, Extension, ImageView,
+# ContextCompaction). An unknown type counts as a tool, which is the safe
+# direction — a new tool shows up in the footer rather than vanishing from it.
+_NON_TOOL_ROLLOUT_ITEMS = frozenset(
+    {"AgentMessage", "ContextCompaction", "Reasoning", "UserMessage"}
+)
 
-    Returns a dict with `thread_id`, `body`, `usage`, `completed`,
-    `tool_counts`, and `error` keys. `error` is set only when codex emits
-    `turn.failed`. `completed` says codex emitted `turn.completed`, which it
-    does after the turn's final `agent_message` — the only in-band proof that
-    a `body` is the whole reply rather than one the stream was cut short of.
+# The `response_item` shapes that are a tool call. These are the model's own
+# conversation history, which codex has to persist to resume a thread, so a call
+# cannot go missing from here. The item stream above is a UI notification and is
+# best-effort: it dropped at least one record on 393 of the 602 September
+# rollouts on the host that runs these turns, and every record on 2 of them.
+#
+# `local_shell_call` is the pre-0.149 spelling and carries no `name`, so the
+# record type is the fallback label.
+_RESPONSE_TOOL_TYPES = frozenset(
+    {"custom_tool_call", "function_call", "local_shell_call"}
+)
+
+# `phase` on an AgentMessage says what the message was for: codex marks its
+# closing reply `final_answer` and everything it says along the way
+# `commentary`. The stream had no such field, which is why the old relay had to
+# infer narration by waiting for a tool call to prove it. Reading the phase is
+# the same judgement made by the producer instead of reconstructed here.
+_PHASE_FINAL = "final_answer"
+
+# How often a running turn's rollout is re-read. Progress is the only thing
+# waiting on it, and a chat frontend coalesces what it forwards anyway
+# (`interim.py`), so a faster poll would buy nothing a reader could see and
+# would stat the file for the whole length of a turn.
+ROLLOUT_POLL_S = 1.0
+
+# What codex takes as "read the prompt from stdin", per `codex exec --help`.
+_STDIN_PROMPT = "-"
+
+# Keep a small diagnostic from a failed pane. TUI frames can be one enormous
+# line of ANSI controls, so a row limit alone does not bound the exception.
+_PANE_ERROR_ROWS = 40
+_PANE_ERROR_BYTES = 8192
+_PANE_ERROR_CHARS = 2000
+
+# How often the hosted arm asks whether the turn is done. The answer comes from
+# the rollout follower, which polls once a second itself, so anything finer only
+# adds `tmux has-session` calls.
+_PANE_POLL_S = 0.5
+
+
+def _rollout_content_text(content: Any) -> str:
+    """The text of a rollout `content` list, which holds typed parts.
+
+    Codex writes `[{"type": "Text", "text": ...}]` on an item and
+    `[{"type": "output_text", "text": ...}]` on a response_item. Both are read
+    because both name the same thing, and a part with no text is skipped rather
+    than rendered as "None".
     """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        part.get("text") or ""
+        for part in content
+        if isinstance(part, dict) and part.get("text")
+    ]
+    return "".join(parts)
+
+
+def _count_tool_calls(
+    items: list[tuple[str, str]], calls: list[tuple[str, str]]
+) -> dict[str, int]:
+    """Fold both of a rollout's tool-call streams into one count per tool.
+
+    `items` is `(item type, item id)` per tool-typed `item_completed`, `calls` is
+    `(call_id, label)` per `response_item` tool call. The same call appears in
+    both, so neither stream can be added to the other, and neither can be read
+    alone: the item stream drops records, and the unified `exec` tool starts more
+    than one command per call, so items outnumbered calls on 113 of the 602
+    September rollouts measured. Reading either one alone undercounts.
+
+    Two id namespaces meet here. An orchestration item carries the model's own
+    `call_id` as its id, and every one of those on that host (418 of 418) matched
+    a `response_item` call_id, so that pair joins exactly. Anything the local
+    executor ran carries an id it minted itself (`exec-<uuid4>`), which is never
+    a call_id, so those cannot be joined at all.
+
+    What is left after the exact join is a count of the same calls from two
+    lossy angles, so the larger of the two readings is taken. That cannot
+    double-count a call both streams reported, and it cannot report zero while
+    either stream holds a record.
+
+    An item names its own count, because an item type (`CommandExecution`) is
+    what this footer has always shown. A call only names the shortfall the item
+    stream left, and it names it with the tool the model asked for (`exec`) --
+    the item that would have named it better is exactly what went missing.
+    """
+    call_ids = {call_id for call_id, _ in calls if call_id}
+    item_ids = {item_id for _, item_id in items if item_id}
+    counts: dict[str, int] = {}
+    unjoined_items = 0
+    for item_type, item_id in items:
+        counts[item_type] = counts.get(item_type, 0) + 1
+        if item_id not in call_ids:
+            unjoined_items += 1
+    unjoined_calls = [label for call_id, label in calls if call_id not in item_ids]
+    shortfall = max(len(unjoined_calls) - unjoined_items, 0)
+    for label in unjoined_calls[:shortfall]:
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def parse_codex_rollout(records: Iterable[dict]) -> dict:
+    """One turn's rollout records folded into the same dict `run` consumes.
+
+    The keys match what the `--json` stream parser produced, so nothing
+    downstream had to learn a second shape: `thread_id`, `body`,
+    `last_assistant_text`, `usage`, `completed`, `tool_counts`, `error`.
+
+    `completed` comes from `task_complete`, which codex writes after the final
+    message — the same in-band proof the stream's `turn.completed` gave, and what
+    the nudge retry keys on. A failed `task_complete` also carries `error`; it
+    must win over an empty body so a rejected model call is never nudged.
+    `turn_aborted` is the other terminal failure record.
+
+    `usage` is a fallback here rather than the source of truth: `run` diffs the
+    rollout's cumulative `total_token_usage` across the call, which is what makes
+    a resumed thread's numbers per-turn instead of running totals.
+    """
+    records = list(records)
     thread_id: str | None = None
     body = ""
     last_assistant_text = ""
     usage: dict = {}
     error: str | None = None
     completed = False
-    tool_counts: dict[str, int] = {}
-    for raw in stdout.splitlines():
-        line = raw.strip()
-        if not line:
+    tool_items: list[tuple[str, str]] = []
+    tool_calls: list[tuple[str, str]] = []
+    for record in records:
+        kind = record.get("type")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
             continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            logger.warning("codex: skipping malformed line: %s", line[:120])
+        if kind == "session_meta":
+            thread_id = payload.get("session_id") or thread_id
             continue
-        kind = msg.get("type")
-        if kind == "thread.started":
-            thread_id = msg.get("thread_id")
-        elif kind == "item.completed":
-            item = msg.get("item") or {}
+        if kind == "response_item":
+            item_type = payload.get("type")
+            if item_type == "message" and payload.get("role") == "assistant":
+                text = _rollout_content_text(payload.get("content"))
+                # A lone <suggestions> block is the protocol token the prompt
+                # asked for, not something the agent said. Keeping the last real
+                # text is what lets a block-only reply fall back to it.
+                if strip_suggestions_blocks(text).strip():
+                    last_assistant_text = text
+            elif item_type in _RESPONSE_TOOL_TYPES:
+                tool_calls.append(
+                    (payload.get("call_id") or "", payload.get("name") or item_type)
+                )
+            continue
+        if kind != "event_msg":
+            continue
+        sub = payload.get("type")
+        if sub == "item_completed":
+            item = payload.get("item") or {}
             item_type = item.get("type")
-            if item_type == "agent_message":
-                text = item.get("text") or ""
-                if text:
-                    body = text
-                    # The last agent_message is the reply, but a lone
-                    # <suggestions> block is the protocol token, not content.
-                    # Keep the last real text so a block-only reply can fall
-                    # back to what the agent actually said.
-                    if strip_suggestions_blocks(text).strip():
-                        last_assistant_text = text
-            elif item_type and item_type not in _NON_TOOL_ITEMS:
-                tool_counts[item_type] = tool_counts.get(item_type, 0) + 1
-        elif kind == "turn.completed":
-            usage = msg.get("usage") or {}
+            if item_type and item_type not in _NON_TOOL_ROLLOUT_ITEMS:
+                tool_items.append((item_type, item.get("id") or ""))
+        elif sub == "token_count":
+            usage = (payload.get("info") or {}).get("last_token_usage") or usage
+        elif sub == "task_complete":
             completed = True
-        elif kind == "turn.failed":
-            error = (msg.get("error") or {}).get("message") or "codex turn failed"
-        # "error" events are reconnect noise; only turn.failed is terminal
+            body = payload.get("last_agent_message") or body
+            failure = payload.get("error")
+            if failure is not None:
+                detail = (
+                    failure.get("message") if isinstance(failure, dict) else failure
+                )
+                error = str(detail) if detail else "codex turn failed"
+        elif sub == "turn_aborted":
+            error = payload.get("reason") or "codex turn aborted"
     return {
+        **_quota_evidence(records),
         "thread_id": thread_id,
         "body": body,
         "last_assistant_text": last_assistant_text,
         "usage": usage,
         "error": error,
         "completed": completed,
-        "tool_counts": tool_counts,
+        "tool_counts": _count_tool_calls(tool_items, tool_calls),
     }
 
 
+def _quota_evidence(records: list[dict]) -> dict:
+    """Require durable tool outputs before another account can resume work."""
+    calls: set[str] = set()
+    results: set[str] = set()
+    item_ids: set[str] = set()
+    started = False
+    exhausted = False
+    for record in records:
+        payload = record.get("payload") or {}
+        kind = payload.get("type")
+        if record.get("type") == "response_item":
+            if kind in _RESPONSE_TOOL_TYPES:
+                started = True
+                calls.add(payload.get("call_id") or "")
+            elif kind in {"function_call_output", "custom_tool_call_output"}:
+                results.add(payload.get("call_id") or "")
+        if record.get("type") != "event_msg":
+            continue
+        if kind in {"item_started", "item_completed"}:
+            item_kind = (payload.get("item") or {}).get("type")
+            if item_kind and item_kind not in _NON_TOOL_ROLLOUT_ITEMS:
+                started = True
+                item_ids.add((payload.get("item") or {}).get("id") or "")
+        if kind == "task_complete":
+            exhausted = quota.provider_exhausted(payload.get("error"))
+        elif kind == "error":
+            exhausted = exhausted or quota.provider_exhausted(payload)
+    return {
+        "account_exhausted": exhausted,
+        "tools_started": started,
+        "resume_ready": (
+            bool(calls)
+            and "" not in (calls | item_ids)
+            and (calls | item_ids) <= results
+        ),
+    }
+
+
+def read_rollout(path: Path, offset: int) -> tuple[list[dict], int]:
+    """Records appended to `path` after `offset`, and where reading stopped.
+
+    Byte offsets rather than a line count because the rollout is append-only
+    across `codex exec resume`: a resumed thread's file already holds every
+    previous turn, and parsing from the top would fold an old turn's tool counts
+    and final message into this one.
+
+    A trailing partial line is left unread — the offset stops before it — so a
+    follower polling a file codex is still writing never sees half a record.
+    """
+    records: list[dict] = []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read()
+    except OSError:
+        return records, offset
+    consumed = 0
+    for raw in data.splitlines(keepends=True):
+        if not raw.endswith(b"\n"):
+            break
+        consumed += len(raw)
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.warning("codex: skipping malformed rollout line: %s", line[:120])
+    return records, offset + consumed
+
+
+def rollout_size(path: Path | None) -> int:
+    """`path`'s current size, or 0 when it does not exist yet.
+
+    0 is right for the missing case rather than an error: a fresh thread has no
+    rollout until codex creates one, and everything in it then belongs to the
+    turn being started.
+    """
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+class _RolloutFollower:
+    """Watch one turn's rollout while it runs.
+
+    Two jobs the run itself cannot do: forward the agent's commentary to the
+    conversation as it happens, and notice that the turn is finished. Both used
+    to come from the `--json` stream. They come from the rollout now, so the
+    hosted and unhosted arms behave identically and neither has to read a
+    terminal it may not own.
+
+    Locating the file is the awkward part of a first turn: codex names a rollout
+    after a thread id it has not told anyone yet, so a new thread is found by the
+    cwd in its `session_meta`, and only once codex has written it. Polling is
+    therefore for the file as well as for its contents.
+    """
+
+    def __init__(
+        self,
+        workspace: Path,
+        thread_id: str | None,
+        emit: Callable[[str], None] | None,
+        known_rollouts: frozenset[Path] = frozenset(),
+        on_resolved: Callable[[], None] | None = None,
+    ) -> None:
+        self._workspace = workspace
+        self._thread_id = thread_id
+        self._emit = emit
+        # Fired once, the moment this turn owns a rollout path. Discovery is the
+        # only part of a first turn that cannot run beside another one, so the
+        # caller uses this to stop serialising and let the next turn start.
+        self._on_resolved = on_resolved
+        # A first turn finds its rollout by cwd, and the cwd is shared with every
+        # other thread of the conversation. The rollouts that existed before this
+        # turn spawned are theirs, whatever their mtime says.
+        self._known_rollouts = known_rollouts
+        self._path = transcript._find_codex_rollout(thread_id) if thread_id else None
+        # Everything already in a resumed thread's file belongs to earlier turns.
+        # Starting at its current size is what keeps their tool counts and their
+        # final messages out of this turn's result.
+        self._offset = rollout_size(self._path)
+        self.records: list[dict] = []
+        self.turn_completed = asyncio.Event()
+        self.last_output_at = time.monotonic()
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._follow())
+
+    async def aclose(self) -> None:
+        """Stop polling, then read whatever landed after the last poll.
+
+        The final read is not optional: codex writes `task_complete` and exits,
+        so the last records routinely arrive between two polls, and they are the
+        ones carrying the reply.
+        """
+        task = self._task
+        self._task = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._drain()
+
+    def _resolve(self) -> None:
+        if self._path is not None:
+            return
+        found = (
+            transcript._find_codex_rollout(self._thread_id)
+            if self._thread_id
+            # The matcher resolves both sides, so either form works here. It
+            # did not always: codex writes back the `-C` argument verbatim, so
+            # comparing one resolved name against one unresolved one matched
+            # nothing and the turn returned "No response" with the work already
+            # done and billed.
+            else transcript._find_codex_rollout_by_cwd(
+                str(self._workspace), exclude=self._known_rollouts
+            )
+        )
+        if found is not None:
+            self._path = found
+            # Only a thread with no id starts at the top. A resumed one already
+            # holds every earlier turn, so reading from 0 folds their tool counts
+            # and their last reply into this turn -- and fires turn_completed on
+            # a task_complete that happened before this turn began. Starting at
+            # the current size can miss a few of this turn's opening records; it
+            # cannot invent a finished turn.
+            self._offset = 0 if not self._thread_id else rollout_size(found)
+            if self._on_resolved is not None:
+                self._on_resolved()
+
+    def _drain(self) -> None:
+        """Read new records once, feeding progress and completion. Never raises."""
+        self._resolve()
+        if self._path is None:
+            return
+        try:
+            records, self._offset = read_rollout(self._path, self._offset)
+        except Exception:
+            logger.exception("codex: could not read the rollout")
+            return
+        if not records:
+            return
+        self.last_output_at = time.monotonic()
+        self.records.extend(records)
+        for record in records:
+            self._observe(record)
+
+    def _observe(self, record: dict) -> None:
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") == "task_complete":
+            self.turn_completed.set()
+            return
+        if payload.get("type") != "item_completed":
+            return
+        item = payload.get("item") or {}
+        if item.get("type") != "AgentMessage":
+            return
+        # The closing reply is delivered as the turn's answer, so forwarding it
+        # here too would post it twice. Commentary is the part nobody would
+        # otherwise see until the turn ended.
+        if item.get("phase") == _PHASE_FINAL:
+            return
+        text = _rollout_content_text(item.get("content")).strip()
+        if not text or self._emit is None:
+            return
+        try:
+            self._emit(text)
+        except Exception:
+            # Progress is best effort. A broken frontend must not abort the turn.
+            logger.exception("codex: progress relay failed")
+
+    async def _follow(self) -> None:
+        while True:
+            self._drain()
+            await asyncio.sleep(ROLLOUT_POLL_S)
+
+
+def _ensure_workspace_trusted(workspace: Path, codex_home: Path) -> None:
+    """Record the workspace as trusted in `codex_home`, so the TUI does not park.
+
+    The interactive binary asks "do you trust the contents of this directory?"
+    before it will do anything, and nobody is there to answer: the turn would
+    spend its whole timeout on a keystroke that never comes. `codex exec` never
+    asks, which is why this is only needed by the hosted arm.
+
+    The key is the **resolved** path. Codex records the directory it actually
+    resolved, so on macOS a workspace under `/tmp` is stored as `/private/tmp/...`
+    and a stanza written under the unresolved name matches nothing — measured,
+    the dialog still appeared.
+
+    Append-only and idempotent: this is codex's own config file, and when session
+    scoping is off it is the operator's. Adding a stanza for a directory cotf
+    created is the same thing codex would write had somebody answered the dialog.
+    """
+    real = os.path.realpath(workspace)
+    stanza = f'[projects."{real}"]'
+    config = codex_home / "config.toml"
+    try:
+        current = config.read_text()
+    except OSError:
+        current = ""
+    if stanza in current:
+        return
+    separator = "" if current.endswith("\n") or not current else "\n"
+    try:
+        with config.open("a") as handle:
+            handle.write(f'{separator}\n{stanza}\ntrust_level = "trusted"\n')
+    except OSError as exc:
+        # Best effort, like every other pane concern: an unwritable CODEX_HOME
+        # costs the interactive UI (the turn parks on the trust dialog and the
+        # timeout ends it), and raising here would cost the turn outright even
+        # where the plain arm would have run it.
+        logger.warning(
+            "codex: could not record workspace trust in %s (%s)", config, exc
+        )
+        return
+    logger.debug("codex: trusted %s for the interactive pane", real)
+
+
+# Narration includes tool output and can grow throughout a long report run.
+# The rollout is the durable record; retain only enough diagnostics for errors.
+_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+
+
+async def _read_diagnostic_tail(stream: asyncio.StreamReader) -> bytes:
+    tail = bytearray()
+    while chunk := await stream.read(64 * 1024):
+        tail.extend(chunk)
+        del tail[:-_DIAGNOSTIC_TAIL_BYTES]
+    return bytes(tail)
+
+
+async def _communicate_plain(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    """Cap the final reply while draining narration with bounded memory."""
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    if not isinstance(stdout_stream, asyncio.StreamReader) or not isinstance(
+        stderr_stream, asyncio.StreamReader
+    ):
+        # Embedders and lightweight test processes may only offer communicate.
+        stdout, stderr = await proc.communicate()
+        stderr = stderr[-_DIAGNOSTIC_TAIL_BYTES:]
+    else:
+        stdout_task = asyncio.create_task(agent._read_to_eof_capped(stdout_stream))
+        stderr_task = asyncio.create_task(_read_diagnostic_tail(stderr_stream))
+        try:
+            # Both readers run concurrently: narration must never fill its pipe
+            # while we await the final reply. Check its cap before awaiting EOF
+            # on stderr, which may still be held by a descendant.
+            stdout = await stdout_task
+            if len(stdout) > agent.MAX_AGENT_OUTPUT_BYTES:
+                await agent._kill_process_tree(proc)
+                raise agent.AgentOutputLimitError(
+                    f"agent stdout exceeded {agent.MAX_AGENT_OUTPUT_BYTES} bytes"
+                )
+            stderr = await stderr_task
+        finally:
+            stdout_task.cancel()
+            stderr_task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    if len(stdout) > agent.MAX_AGENT_OUTPUT_BYTES:
+        await agent._kill_process_tree(proc)
+        raise agent.AgentOutputLimitError(
+            f"agent stdout exceeded {agent.MAX_AGENT_OUTPUT_BYTES} bytes"
+        )
+    return stdout, stderr
+
+
+async def _wait_for_exit(
+    proc: asyncio.subprocess.Process, follower: _RolloutFollower
+) -> tuple[bytes, bytes]:
+    """Collect codex's output, without being held hostage by a codex that won't exit."""
+    watchdog = asyncio.create_task(_kill_once_quiet_after_turn(proc, follower))
+    try:
+        return await _communicate_plain(proc)
+    finally:
+        watchdog.cancel()
+
+
+async def _run_codex_plain(
+    wrapped: list[str],
+    workspace: Path,
+    env: dict[str, str],
+    follower: _RolloutFollower,
+    timeout: float | None,
+) -> tuple[int, str]:
+    """Run codex as a direct child. Returns `(returncode, stderr text)`.
+
+    The arm taken when tmux is absent, or when the daemon did not host this run.
+    Without `--json`, codex writes its closing reply to stdout and its narration
+    to stderr — neither is parsed, because the rollout is the machine data. The
+    stderr text is kept only to explain a failing exit.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *wrapped,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        # DEVNULL, not inherited. `codex exec` appends piped stdin to the prompt
+        # as a `<stdin>` block, so a spawn that inherits an open pipe prints
+        # "Reading additional input from stdin..." and blocks there until the
+        # turn's whole timeout expires (measured, codex 0.151.0; the same is true
+        # with `--json`). A supervised daemon is safe because `supervisor.spawn`
+        # passes DEVNULL, which is exactly why this never bit in production and
+        # bit immediately anywhere else. The prompt is in argv; codex has no
+        # business reading this process's stdin.
+        stdin=asyncio.subprocess.DEVNULL,
+        cwd=workspace,
+        start_new_session=True,
+        env=env,
+    )
+    agent.track_agent_process(proc, wrapped)
+    try:
+        if timeout is not None:
+            _, stderr_bytes = await asyncio.wait_for(
+                _wait_for_exit(proc, follower), timeout=timeout
+            )
+        else:
+            _, stderr_bytes = await _wait_for_exit(proc, follower)
+    except TimeoutError:
+        logger.warning("codex exec: timed out after %ss", timeout)
+        raise RuntimeError(f"Codex CLI timed out after {timeout}s") from None
+    finally:
+        await agent._kill_process_tree(proc)
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        stderr_bytes.decode(errors="replace").strip(),
+    )
+
+
+def _pane_env_file(env: dict[str, str], path: Path) -> Path | None:
+    """Write the curated env for a pane to sourceable 0600 file. None on failure.
+
+    A pane on a tmux server that was already running does not see the client's
+    environment at all (measured on tmux 3.7c), and cotf's panes now share one
+    server, so `env=` on the `new-session` client reaches the pane only for
+    whichever turn happened to start the server. The obvious fix, `-e KEY=VALUE`
+    per pair, is not available here: it would put `COTF_CMD_TOKEN` into a command
+    line any local `ps` can read, and that token reaches credentialed CLIs
+    *outside* the jail.
+
+    So the pane sources a file instead, which is what `claude-pty` has always
+    done. 0600, daemon-owned, and named per turn (`tmux.turn_file`) rather than in
+    the agent-writable workspace. The agent can read its own file, which is no new
+    exposure -- it is the agent's own environment, and it is about to have it.
+    Another turn reading it would be, which is why the name carries the session.
+
+    Only the keys cotf actually set are written. Forwarding all of `os.environ`
+    would be hundreds of pairs, and the ones that matter are exactly the ones
+    that differ from what the daemon inherited.
+    """
+    curated = {
+        key: value
+        for key, value in env.items()
+        if os.environ.get(key) != value and "\0" not in key
+    }
+    try:
+        # Opened through os.open so the mode is set at creation: a write_text
+        # followed by chmod leaves a window where the token is world-readable.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for key, value in sorted(curated.items()):
+                handle.write(f"export {key}={shlex.quote(value)}\n")
+    except OSError as exc:
+        logger.warning(
+            "codex exec: could not stage the pane env (%s); the pane runs with "
+            "whatever the tmux server inherited",
+            exc,
+        )
+        return None
+    return path
+
+
+def _write_pane_script(body: str, path: Path) -> Path:
+    """Stage the pane's shell script at `path`, 0600. Raises OSError.
+
+    The script is a file rather than `bash -c <string>` because a tmux client
+    packs its whole argv into one imsg, and tmux refuses anything over 16KB with
+    `command too long`. The turn's prompt rides in that argv (`exec codex ...
+    <prompt>`), so a long enough prompt used to kill the turn -- measured on tmux
+    3.7c, 16300 bytes went through and 16400 did not, and a first codex turn
+    carries the system prompt and the claude handoff before the user types a
+    word. Off the command line the length stops mattering.
+
+    0600 and daemon-owned for the same reason the env file is: it carries this
+    turn's prompt, and the pane it belongs to is the only reader.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(body + "\n")
+    return path
+
+
+# Names of the tmux server a daemon was started under. Dropped from every spawn
+# env: they would aim claude-pty at the operator's server, and nothing cotf runs
+# needs them (see `tmux.argv_prefix`).
+_INHERITED_TMUX = frozenset({"TMUX", "TMUX_PANE"})
+
+# One lock per workspace directory, held across a first turn's rollout discovery.
+#
+# A first turn has no thread id until codex has written its rollout, so the
+# follower finds the file by cwd, and the cwd is shared by every thread of the
+# conversation. Two first turns in one directory at once would race to claim the
+# same new rollout: the loser delivers the winner's reply and records the winner's
+# thread id as its own. A resumed turn takes no lock, because it already holds the
+# thread id and reads its own file by name.
+_first_turn_locks: dict[str, asyncio.Lock] = {}
+
+
+class _FirstTurnGate:
+    """Serialise a first turn until it owns a rollout, then step aside.
+
+    The race above lasts from the spawn to the moment codex writes the file.
+    That is about a second. The turn behind it is the whole reply, which is
+    minutes. So this releases on `release()` -- the follower calls it the moment
+    it binds a path -- and again on exit, for a turn that never got that far.
+
+    Holding it for the whole turn instead is one line shorter and was what cotf
+    did. It cost real concurrency: three new threads in one Slack DM ran back to
+    back, 41m40s then 1m37s then the rest, and the two behind the first waited
+    36 and 32 minutes for a file that already existed one second in.
+
+    Releasing on exit as well is what removes the need for a discovery timeout.
+    A codex that dies without ever writing a rollout still ends its turn, and
+    the exit path frees the next one.
+    """
+
+    def __init__(self, lock: asyncio.Lock) -> None:
+        self._lock = lock
+        self._held = False
+
+    async def __aenter__(self) -> _FirstTurnGate:
+        await self._lock.acquire()
+        self._held = True
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.release()
+
+    def release(self) -> None:
+        """Let the next first turn in. Safe to call twice, and from the follower.
+
+        The `_held` flag is not decoration: `asyncio.Lock` has no notion of an
+        owner, so a second release would free whichever turn acquired it next.
+        """
+        if not self._held:
+            return
+        self._held = False
+        self._lock.release()
+
+
+class _ResumedTurnGate:
+    """The no-op gate a resumed turn gets. It races with nobody."""
+
+    async def __aenter__(self) -> _ResumedTurnGate:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    def release(self) -> None:
+        return None
+
+
+def _first_turn_guard(
+    workspace: Path, thread_id: str | None
+) -> _FirstTurnGate | _ResumedTurnGate:
+    if thread_id:
+        return _ResumedTurnGate()
+    key = os.path.realpath(workspace)
+    lock = _first_turn_locks.get(key)
+    if lock is None:
+        lock = _first_turn_locks[key] = asyncio.Lock()
+    return _FirstTurnGate(lock)
+
+
+class _PaneUnavailable(Exception):
+    """The pane did not land on cotf's server, so this turn runs unhosted.
+
+    Private and caught one frame up. Not a `RuntimeError`: the caller has a
+    working fallback in `codex exec`, so this must not travel the same path as a
+    failure that costs the turn.
+    """
+
+
+async def _run_codex_in_pane(
+    pane: tmux.Pane,
+    argv: list[str],
+    workspace: Path,
+    env: dict[str, str],
+    follower: _RolloutFollower,
+    timeout: float | None,
+) -> tuple[int, str]:
+    """Run codex's interactive TUI inside its pane. Returns `(returncode, detail)`.
+
+    The pane runs the **interactive** binary, not `codex exec`. That is the whole
+    point of hosting it: exec is non-interactive by definition, so a mirror of it
+    shows plain lines rather than the agent's screen, and the pane reads as dead
+    next to claude-pty's. Interactive codex draws its own UI, and the mirror shows
+    exactly what somebody sitting at the terminal would see.
+
+    Two things follow from that, and they are why this arm is not just a different
+    argv:
+
+    - **It never exits.** The TUI returns to its prompt when the turn is done and
+      waits for the next one. So the end of a turn is read from the rollout
+      (`task_complete`, via the follower) rather than from a process exit, and the
+      session is killed once it lands. A `tmux wait-for` on the command finishing
+      would never fire here, which is why this polls rather than blocks.
+    - **There is no exit code.** A turn that completed is a success by definition,
+      because the reply is already in the rollout. A pane that vanished before
+      completing is the failure, and the tap explains it.
+
+    Nothing this builds may land on the tmux command line, which is capped at
+    16KB (`_write_pane_script`). And a pane that cannot be built is not a failed
+    turn: every arm here raises `_PaneUnavailable`, and the caller runs the turn
+    through `codex exec` instead.
+
+    Every tmux call goes through `tmux.argv_prefix()`. Addressing the server by
+    name rather than by `TMUX_TMPDIR` is what stops an inherited `TMUX` -- which a
+    daemon started inside the operator's tmux has -- from putting the pane on the
+    operator's server while `tmux.alive` looks for it on cotf's, a split that read
+    a working agent as a dead pane and left it running unsupervised.
+    """
+    tmux_argv = tmux.argv_prefix()
+    output_path = tmux.turn_file(pane.session, "out")
+    channel = f"{pane.session}-start"
+    env_file = _pane_env_file(env, tmux.turn_file(pane.session, "env"))
+    # The pane blocks on `start` first so the tap below cannot miss codex's
+    # opening output, then sources the curated env, then execs. `exec` so the
+    # pane's process is codex itself rather than a bash holding it: a
+    # `kill-session` reaps the process group either way, but the mirror and any
+    # `ps` read straighter without the shell in between.
+    inner = f"tmux wait-for {shlex.quote(channel)}; "
+    if env_file is not None:
+        inner += f". {shlex.quote(str(env_file))}; "
+    inner += f"exec {shlex.join(argv)}"
+    script_file = tmux.turn_file(pane.session, "sh")
+    try:
+        _write_pane_script(inner, script_file)
+    except OSError as exc:
+        logger.warning(
+            "codex exec: could not stage the pane script (%s); this turn runs unhosted",
+            exc,
+        )
+        if env_file is not None:
+            with contextlib.suppress(OSError):
+                env_file.unlink()
+        raise _PaneUnavailable from exc
+    create = [
+        *tmux_argv,
+        "new-session",
+        "-d",
+        "-s",
+        pane.session,
+        "-c",
+        str(workspace),
+        # tmux's default for a detached session is 80x24. Starting at the floor
+        # the mirror reflows to means the first captured frame is already usable,
+        # and the TUI lays itself out for a width worth reading.
+        "-x",
+        "120",
+        "-y",
+        str(tmux.MIRROR_MIN_ROWS),
+        # bash explicitly rather than whatever /bin/sh is: on a Debian-family
+        # host that is dash, and this is the one place the backend depends on a
+        # shell it did not choose.
+        "bash",
+        str(script_file),
+    ]
+    try:
+        create_proc = await asyncio.create_subprocess_exec(
+            *create,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace,
+            env=env,
+        )
+        _, create_err = await create_proc.communicate()
+        if create_proc.returncode != 0:
+            # Not a failed turn: `codex exec` is a working fallback, and refusing to
+            # host is exactly what tmux does to a duplicate session name or a
+            # command it will not carry. Raising here cost the turn instead.
+            logger.warning(
+                "codex exec: tmux refused to host the turn (%s); running unhosted",
+                (create_err or b"").decode(errors="replace").strip(),
+            )
+            raise _PaneUnavailable
+
+        # A zero exit from `new-session` is not proof the session landed on our
+        # server: tmux reports success for a session it created somewhere else. Ask
+        # the address we will poll, so a mismatch degrades to an unhosted turn here
+        # instead of being read as a dead pane forty lines below. That misread is the
+        # bug this check exists for -- it reported `Exit code -1` on turns whose agent
+        # was still running, and left them running.
+        if not await asyncio.to_thread(tmux.alive, pane):
+            logger.warning(
+                "codex exec: the session did not land on %s, so this turn runs "
+                "unmirrored; check for TMUX in the daemon's environment",
+                tmux.socket_path(),
+            )
+            raise _PaneUnavailable
+
+        # Tap the pane, then release it. A failed tap costs the failure detail, not
+        # the run, so it is logged and released anyway rather than wedging the pane.
+        tap = await asyncio.create_subprocess_exec(
+            *tmux_argv,
+            "pipe-pane",
+            "-t",
+            pane.session,
+            f"cat >> {shlex.quote(str(output_path))}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        _, tap_err = await tap.communicate()
+        if tap.returncode != 0:
+            logger.warning(
+                "codex exec: could not tap the pane (%s); a failure will have no detail",
+                (tap_err or b"").decode(errors="replace").strip(),
+            )
+        release = await asyncio.create_subprocess_exec(
+            *tmux_argv,
+            "wait-for",
+            "-S",
+            channel,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        await release.wait()
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if follower.turn_completed.is_set():
+                # End the session here, not at the end of the run. The TUI does
+                # not exit on its own, and a nudge retry opens a session with this
+                # same name -- `tmux new-session` refuses a duplicate, so leaving
+                # it alive turned every retry into "tmux refused to host the codex
+                # turn".
+                tmux.kill(pane)
+                return 0, ""
+            if not await asyncio.to_thread(tmux.alive, pane):
+                # The TUI went away without finishing. Whatever it printed on the
+                # way out is the only account of why.
+                return -1, _pane_output_tail(output_path)
+            if deadline is not None and time.monotonic() > deadline:
+                logger.warning("codex exec: timed out after %ss", timeout)
+                raise RuntimeError(f"Codex CLI timed out after {timeout}s")
+            await asyncio.sleep(_PANE_POLL_S)
+    finally:
+        # This turn's files go as soon as the pane can no longer need them -- on
+        # the timeout and the crash paths too, not just the clean one. The env
+        # file holds the turn's `COTF_CMD_TOKEN` and the script holds its prompt.
+        # The tap output goes with them: `pipe-pane` appends, so keeping it would
+        # both grow without bound and let one turn's failure be explained by an
+        # older turn's rows. `_pane_output_tail` has already read whatever the
+        # caller is about to report.
+        for path in (env_file, script_file, output_path):
+            if path is not None:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+
+def _pane_output_tail(path: Path) -> str:
+    """A bounded, plain-text diagnostic from a failed terminal pane."""
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - _PANE_ERROR_BYTES))
+            text = stream.read(_PANE_ERROR_BYTES).decode(errors="replace")
+    except OSError:
+        return ""
+    # `pipe-pane` commonly writes CRLF. The pane renderer treats a row ending
+    # in carriage return as blank, so normalize it before trimming rows.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    rows = tmux.trim_trailing_blank_rows(text).splitlines()
+    plain = Text.from_ansi("\n".join(rows[-_PANE_ERROR_ROWS:])).plain
+    printable = "".join(c for c in plain if c.isprintable() or c in "\n\t")
+    return printable[-_PANE_ERROR_CHARS:].strip()
+
+
 async def _run_codex_exec(
-    workspace: Path, cmd: list[str], timeout: float | None
+    workspace: Path,
+    cmd: list[str],
+    timeout: float | None,
+    thread_id: str | None = None,
+    interactive: list[str] | None = None,
+    gate: _FirstTurnGate | _ResumedTurnGate | None = None,
 ) -> dict:
-    """Run codex, collect stdout, parse JSONL. Raises RuntimeError on failure."""
+    """Run one codex turn and return its result. Raises RuntimeError on failure.
+
+    Two arms, one result. When the daemon hosted this run in a tmux pane, codex
+    runs inside it so the pane mirrors the real terminal; otherwise it runs as a
+    direct child. Both read the turn from the rollout through the same parser,
+    which is what keeps a hosted turn and an unhosted one from reporting
+    differently.
+
+    `thread_id` is codex's own id for a resumed thread, and only decides where
+    the follower starts reading. A fresh thread has none until codex writes one.
+
+    `gate` is the caller's first-turn gate, released here rather than at the
+    call site: the rollout snapshot below has to be taken under it, and the
+    follower is the first thing that knows discovery is over.
+
+    `interactive` is the argv for the hosted arm. It is a second argv rather than
+    a flag because the two arms run different programs: `codex exec` for a plain
+    child, and the interactive binary for a pane worth mirroring. Omitting it
+    (compaction does) keeps a run on the plain arm even where a pane exists.
+    """
     # Before the wrap: the jail grants this path by name, and on Linux it is a
     # mount source, which has to exist. Set on the child rather than through a
     # session override so every spawn path gets it -- the jobs and cron daemons
     # never open a session, and a codex turn there would otherwise write its
     # rollout into the shared tree that the jail no longer grants.
     codex_home = codex_state.ensure_home(workspace)
-    cmd = sandbox.wrap(cmd, workspace)
-    logger.debug("codex exec: cwd=%s cmd=%s", workspace, " ".join(cmd[:8]) + "...")
-    env = sandbox.agent_env()
-    env = {**(os.environ if env is None else env), "CODEX_HOME": str(codex_home)}
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=workspace,
-        start_new_session=True,
-        env=env,
-    )
-    agent.track_agent_process(proc, cmd)
-    try:
-        if timeout is not None:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                _collect_codex_output(proc), timeout=timeout
-            )
-        else:
-            stdout_bytes, stderr_bytes = await _collect_codex_output(proc)
-    except TimeoutError:
-        logger.warning("codex exec: timed out after %ss", timeout)
-        raise RuntimeError(f"Codex CLI timed out after {timeout}s") from None
-    finally:
-        await agent._kill_process_tree(proc)
+    wrapped = sandbox.wrap(cmd, workspace)
+    logger.debug("codex exec: cwd=%s cmd=%s", workspace, agent.argv_for_log(wrapped))
+    curated = sandbox.agent_env()
+    # `TMUX` names a server, and a tmux client obeys it over every other hint. A
+    # daemon started from inside the operator's tmux carries it into every child,
+    # so forwarding it sends claude-pty -- which takes no `-S` and can only be
+    # aimed with `TMUX_TMPDIR` -- to the operator's server instead of cotf's.
+    # cotf's own calls use `tmux.argv_prefix()` and are already immune.
+    env: dict[str, str] = {
+        key: value
+        for key, value in (os.environ if curated is None else curated).items()
+        if key not in _INHERITED_TMUX
+    }
+    env["CODEX_HOME"] = str(codex_home)
+    pane = tmux.pane_from_env(env) if interactive else None
+    if interactive and pane is None:
+        logger.info(
+            "codex pty mode needs a hosted pane and this turn has none, so it "
+            "runs `codex exec`; install tmux, or check agent.pane"
+        )
+    if pane is not None:
+        # Before the spawn: the interactive TUI will not act until the directory
+        # is trusted, and nobody is watching the pane to answer it.
+        _ensure_workspace_trusted(workspace, codex_home)
 
-    parsed = parse_codex_stream(stdout_bytes)
+    logger.debug(
+        "codex exec: %s",
+        f"hosted in pane {pane.session}" if pane is not None else "not hosted",
+    )
+    # Under the gate: a snapshot taken after another first turn's rollout landed
+    # would treat that file as pre-existing and skip past it, which is the race
+    # the gate exists to stop.
+    known = frozenset() if thread_id else transcript.snapshot_rollouts()
+    follower = _RolloutFollower(
+        workspace,
+        thread_id,
+        agent.progress_sink(),
+        known,
+        on_resolved=gate.release if gate is not None else None,
+    )
+    follower.start()
+    try:
+        hosted = pane is not None and interactive is not None
+        if hosted:
+            try:
+                returncode, stderr_text = await _run_codex_in_pane(
+                    pane,
+                    sandbox.wrap(interactive, workspace),
+                    workspace,
+                    env,
+                    follower,
+                    timeout,
+                )
+            except _PaneUnavailable:
+                hosted = False
+        if not hosted:
+            returncode, stderr_text = await _run_codex_plain(
+                wrapped, workspace, env, follower, timeout
+            )
+    finally:
+        await follower.aclose()
+
+    parsed = parse_codex_rollout(follower.records)
+    if parsed.get("account_exhausted"):
+        raise quota.AccountExhaustedError(
+            "codex",
+            tools_started=parsed.get("tools_started", False),
+            resume_ready=parsed.get("resume_ready", False),
+            thread_id=parsed.get("thread_id") or thread_id,
+        )
     if parsed.get("error"):
-        raise RuntimeError(parsed["error"])
-    if proc.returncode != 0:
-        stderr_text = stderr_bytes.decode(errors="replace").strip()
-        # A non-zero exit *after* `turn.completed` means the turn's work is done
-        # and only codex's own teardown failed. That happens: codex can deadlock
-        # at exit (main thread parked in pthread_join on a runtime thread that
-        # never finishes), leaving a process that has already written its
-        # complete reply to stdout but never exits, until something kills it.
-        # Raising here would discard a reply we are holding in `parsed` and post
-        # an exit code to the chat instead, so deliver it and log the exit.
+        detail = parsed["error"]
+        if "401 Unauthorized" in detail:
+            raise agent.AgentTurnError(
+                "Codex model authentication rejected (401)",
+                "I couldn't finish this request because the model service rejected "
+                "authentication (401). The failure was logged.",
+            )
+        if "403 Forbidden" in detail:
+            raise agent.AgentTurnError(
+                "Codex model access denied (403)",
+                "I couldn't finish this request because the model service denied "
+                "access (403). The failure was logged.",
+            )
+        if "selected model is at capacity" in detail.casefold():
+            raise agent.AgentTurnError(
+                "Codex selected model is at capacity",
+                "The selected model is at capacity, so this request stopped "
+                "without a final answer. Try again shortly, or ask me to use "
+                "a different model.",
+            )
+        raise RuntimeError(detail)
+    if returncode != 0:
+        # A non-zero exit *after* the turn completed means the turn's work is
+        # done and only codex's own teardown failed. That happens: codex can
+        # deadlock at exit (main thread parked in pthread_join on a runtime
+        # thread that never finishes), leaving a process that has already
+        # finished its reply but never exits, until something kills it. Raising
+        # here would discard a reply we are holding in `parsed` and post an exit
+        # code to the chat instead, so deliver it and log the exit.
         #
-        # `body` alone would not be enough to gate on: codex overwrites it on
-        # every agent_message, so a turn killed mid-work leaves an intermediate
-        # message sitting there that reads exactly like a final answer. Only
-        # `turn.completed` distinguishes "finished, then died" from "died".
+        # `body` alone would not be enough to gate on: a turn killed mid-work can
+        # leave an intermediate message that reads exactly like a final answer.
+        # Only `task_complete` distinguishes "finished, then died" from "died".
         if parsed.get("completed") and parsed.get("body"):
             logger.warning(
-                "codex exec: exit %s after turn.completed; delivering the "
-                "parsed reply anyway. stderr: %s",
-                proc.returncode,
+                "codex exec: exit %s after task_complete; delivering the "
+                "parsed reply anyway. output: %s",
+                returncode,
                 stderr_text[:500] or "(empty)",
             )
             return parsed
-        raise RuntimeError(stderr_text or f"Exit code {proc.returncode}")
+        raise RuntimeError(stderr_text or f"Exit code {returncode}")
     return parsed
+
+
+class _CompactionWatch:
+    """Reads the records a compaction run appends to a rollout.
+
+    Reading from the pre-run size, not by timestamp, keeps an older compaction
+    in a long thread from counting as this one.
+    """
+
+    def __init__(self, path: Path, offset: int) -> None:
+        self.path = path
+        self.offset = offset
+        self.compacted = False
+        self.settled = False
+
+    def poll(self) -> None:
+        records, self.offset = read_rollout(self.path, self.offset)
+        for record in records:
+            kind = record.get("type")
+            if kind == "compacted":
+                self.compacted = True
+            elif kind == "turn_context":
+                # The turn's `turn_context` comes before its model request, and
+                # a compaction before the turn comes ahead of it. So whether or
+                # not codex compacted, nothing more is coming that matters.
+                self.settled = True
 
 
 def _codex_prompts_dir() -> Path:
@@ -491,8 +1371,26 @@ class CodexBackend:
     the agent-writable workspace.
     """
 
-    def __init__(self, launcher: OllamaLauncher | None = None) -> None:
+    def __init__(
+        self,
+        launcher: OllamaLauncher | None = None,
+        pty: bool = False,
+        model: str = "",
+        effort: str = "",
+    ) -> None:
         self.launcher = launcher
+        # Both already resolved by `agent.resolve_profile`, which is also where
+        # the ollama/native key routing lives. Binding them here rather than
+        # reading settings at argv time is what lets one process run two jobs
+        # under different models without them reading each other's.
+        self.model = model
+        self.effort = effort
+        # `pty` picks the interface, not the runtime: the interactive binary
+        # rather than `codex exec`. Kept separate from hosting so a break in
+        # codex's UI or its trust format costs this backend its TUI and nothing
+        # else -- `agent.pane` is global, so using it as the escape hatch would
+        # take claude-pty's mirror away too.
+        self._pty = pty
 
     async def run(
         self,
@@ -504,6 +1402,7 @@ class CodexBackend:
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response:
         logger.info(
             "session: id=%s platform=%s user=%s context=%s workspace=%s",
@@ -546,10 +1445,10 @@ class CodexBackend:
             user_payload = prompt
             if platform not in agent.NO_HANDOFF_PLATFORMS:
                 user_payload = transcript.prepend_latest_handoff(
-                    workspace, prompt, exclude_uuid=session_uuid
+                    workspace, prompt, session_uuid=session_uuid, platform=platform
                 )
             system_prompt = build_system_prompt(
-                platform, user_name, channel_context, workspace
+                platform, user_name, channel_context, workspace, session_uuid, facts
             )
             composed_prompt = f"{system_prompt}\n\n---\n\n{user_payload}"
 
@@ -569,14 +1468,43 @@ class CodexBackend:
         # Snapshot the thread's cumulative token usage before invoking codex
         # so we can compute this exec's per-turn delta afterward. For fresh
         # threads there's no prior session, so pre-totals are zero.
-        pre_totals = (
-            transcript.extract_codex_cumulative_tokens(existing_thread)
+        # Pin the file the baseline came from. Reading the pair by thread id
+        # alone lets the newest-by-mtime lookup return a different rollout
+        # after the exec than before it, and the two do not share a history.
+        # Count the per-call usage records this thread already has, and pin the
+        # file they were counted in. What the exec appends is its own cost. A
+        # before/after subtraction of `total_token_usage` cannot give that:
+        # codex writes each call's own figures there, not a running total.
+        pre_rollout = (
+            transcript.codex_rollout_path(existing_thread) if existing_thread else None
+        )
+        pre_event_count = (
+            len(transcript.extract_codex_usage_events(existing_thread))
             if existing_thread
-            else None
+            else 0
         )
 
         started_at = time.monotonic()
-        result = await _run_codex_exec(workspace, cmd, timeout=timeout)
+        try:
+            async with _first_turn_guard(workspace, existing_thread) as gate:
+                result = await _run_codex_exec(
+                    workspace,
+                    cmd,
+                    timeout=timeout,
+                    thread_id=existing_thread,
+                    interactive=(
+                        self._interactive_argv(
+                            workspace, existing_thread, composed_prompt
+                        )
+                        if self._pty
+                        else None
+                    ),
+                    gate=gate,
+                )
+        except quota.AccountExhaustedError as failure:
+            if failure.thread_id and not existing_thread:
+                codex_state.write_thread_id(workspace, session_uuid, failure.thread_id)
+            raise
         duration = time.monotonic() - started_at
 
         new_thread = result.get("thread_id")
@@ -624,23 +1552,46 @@ class CodexBackend:
                     nudge_prompt or NUDGE_PROMPT,
                 ]
                 retry_started = time.monotonic()
-                retry_result = await _run_codex_exec(
-                    workspace, retry_cmd, timeout=timeout
-                )
+                retry_thread = result.get("thread_id") or existing_thread
+                try:
+                    retry_result = await _run_codex_exec(
+                        workspace,
+                        retry_cmd,
+                        timeout=timeout,
+                        thread_id=retry_thread,
+                        interactive=(
+                            self._interactive_argv(
+                                workspace, retry_thread, nudge_prompt or NUDGE_PROMPT
+                            )
+                            if self._pty
+                            else None
+                        ),
+                    )
+                except quota.AccountExhaustedError as failure:
+                    previous_tools = result.get("tools_started") or bool(
+                        result.get("tool_counts")
+                    )
+                    current_safe = not failure.tools_started or failure.resume_ready
+                    previous_safe = not previous_tools or result.get(
+                        "resume_ready", False
+                    )
+                    failure.tools_started = failure.tools_started or previous_tools
+                    failure.resume_ready = bool(
+                        current_safe and previous_safe and failure.tools_started
+                    )
+                    raise
                 duration += time.monotonic() - retry_started
                 result = _merge_codex_results(result, retry_result)
-                body = (result.get("body") or "").strip() or "No response"
+                body = (result.get("body") or "").strip() or agent.EMPTY_REPLY_NOTICE
             else:
-                body = "No response"
+                body = agent.EMPTY_REPLY_NOTICE
 
         # Prefer the model codex actually recorded in its session file; fall
-        # back to whatever the user configured. In native mode without
-        # CODEX_MODEL the configured value is just the literal "codex", which
-        # is uninformative — the session-file lookup gives us the real name.
+        # back to whatever the profile resolved. With no model configured that
+        # is the literal "codex", which is uninformative — the session-file
+        # lookup gives us the real name.
         configured_label = (
-            self.launcher.model
-            if self.launcher
-            else (settings.get("CODEX_MODEL").strip() or "codex")
+            self.launcher.model if self.launcher else (self.model or "codex")
         )
         thread_for_lookup = result.get("thread_id") or existing_thread
         model_label = (
@@ -648,20 +1599,21 @@ class CodexBackend:
             if thread_for_lookup
             else None
         ) or configured_label
-        # Codex's stdout `turn.completed.usage` re-reports the thread's
-        # running total on every exec, not per-turn. Diff cumulative totals
-        # from the session file to get this exec's true contribution. Falls
-        # back to stdout usage when the session file isn't reachable (mocked
-        # tests, rare race) — accepted to be cumulative in that path.
-        post_totals = (
-            transcript.extract_codex_cumulative_tokens(thread_for_lookup)
+        post_rollout = (
+            transcript.codex_rollout_path(thread_for_lookup)
             if thread_for_lookup
             else None
         )
-        if post_totals is not None:
-            usage = _usage_delta(post_totals, pre_totals)
-        else:
-            usage = result.get("usage") or {}
+        events = (
+            transcript.extract_codex_usage_events(thread_for_lookup)
+            if thread_for_lookup
+            else []
+        )
+        # A rollout that moved under the turn makes the earlier count refer to
+        # another file's history, so only this exec's own last record is safe.
+        start = pre_event_count if pre_rollout == post_rollout else len(events) - 1
+        fresh = events[max(start, 0) :]
+        usage = _usage_from_events(fresh) if fresh else (result.get("usage") or {})
         tokens_in = usage.get("input_tokens", 0)
         tokens_out = usage.get("output_tokens", 0) + usage.get(
             "reasoning_output_tokens", 0
@@ -713,24 +1665,8 @@ class CodexBackend:
         # subcommand. Skip the binary when the launcher is set.
         prefix = self.launcher.prefix("codex") if self.launcher else []
         binary = [] if self.launcher else ["codex"]
-        model_env = settings.get("CODEX_MODEL").strip()
-        model_args = [] if self.launcher else (["-m", model_env] if model_env else [])
-        # Reasoning effort is passed only for the ollama-served model. Native
-        # mode inherits the operator's own model_reasoning_effort in
-        # ~/.codex/config.toml; an override here would silently trump it. Quoted
-        # as TOML per the `-c` contract. Responses-API-only in codex, so it
-        # reaches the model only when the ollama endpoint honors it — harmless
-        # either way. OLLAMA_EFFORT is shared with the claude backend, whose
-        # accepted levels differ (no `minimal`), so a value codex doesn't accept
-        # is skipped, not passed through to die in codex's own config parse.
-        effort = settings.get("OLLAMA_EFFORT").strip() if self.launcher else ""
-        if effort and effort not in _CODEX_EFFORT_LEVELS:
-            logger.warning(
-                "codex: ignoring unknown effort %r (minimal|low|medium|high|xhigh)",
-                effort,
-            )
-            effort = ""
-        effort_args = ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
+        model_args = self._model_args()
+        effort_args = self._effort_args()
         # --yolo stays whether approvals are on or not. codex exec overrides
         # approval_policy to `never` regardless (measured: request untrusted, get
         # never), so there is no CLI-side gate to leave enabled -- the PreToolUse
@@ -739,7 +1675,10 @@ class CodexBackend:
             *prefix,
             *binary,
             "exec",
-            "--json",
+            # No `--json`, deliberately. It puts the same events on stdout that
+            # the rollout already records, and renders JSONL into the terminal —
+            # which is the terminal the tmux mirror shows. The rollout costs
+            # nothing to read and leaves the pane human-readable.
             "--skip-git-repo-check",
             "--yolo",
             *permissions.codex_argv(),
@@ -748,6 +1687,83 @@ class CodexBackend:
             *model_args,
             *effort_args,
         ]
+
+    def _model_args(self) -> list[str]:
+        """How the model is chosen: `-m`, or nothing when a launcher chose it.
+
+        Under ollama, also switch off the hosted web_search tool. codex sends it
+        by default, and ollama's endpoint refuses the whole request over it with
+        `the web_search tool is not supported`, so no ollama turn got a token.
+        The agent still reaches the web through its shell.
+
+        Natively, a ChatGPT login the broker holds (`codex_auth`) adds the
+        provider overrides that point codex at the broker. Keyed on the URL the
+        broker published rather than on the setting, so a turn and the jail both
+        follow what started, not an edit that has not been applied yet.
+        """
+        if self.launcher:
+            return ["-c", 'web_search="disabled"']
+        model = ["-m", self.model] if self.model else []
+        brokered = codex_auth.published_url()
+        return [*model, *codex_auth.provider_args(brokered)] if brokered else model
+
+    def _effort_args(self) -> list[str]:
+        """`-c model_reasoning_effort=...`, or [] when no effort is configured.
+
+        Unset means inherit: no `-c` is passed and codex reads
+        model_reasoning_effort from ~/.codex/config.toml exactly as it did
+        before this setting existed. Quoted as TOML per the `-c` contract.
+
+        Responses-API-only in codex, so under ollama it reaches the model only
+        when that endpoint honors it -- harmless either way. Under ollama the
+        value came from the shared `ollama.effort`, whose accepted levels differ
+        from codex's (claude has no `minimal`), so a value codex doesn't accept
+        is skipped rather than passed through to die in codex's own config
+        parse. A native value takes the same check: a typo in config.yaml should
+        warn here rather than fail the turn.
+
+        Shared by both argv builders because `-c` is a global codex option, not
+        an `exec` one. The interactive entry point honours it: driven under tmux
+        with `-c model_reasoning_effort="low"` against a config.toml saying
+        `medium`, codex's own statusline reads `gpt-5.6-luna low` and its
+        rollout records `effort: low`.
+        """
+        effort = self.effort
+        if effort and effort not in _CODEX_EFFORT_LEVELS:
+            logger.warning(
+                "codex: ignoring unknown effort %r "
+                "(minimal|low|medium|high|xhigh|max|ultra)",
+                effort,
+            )
+            return []
+        return ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
+
+    def _interactive_argv(
+        self, workspace: Path, thread_id: str | None, prompt: str
+    ) -> list[str]:
+        """Argv for the interactive binary, which is what a hosted turn runs.
+
+        Not `_base_argv` with a flag removed: the interactive entry point takes
+        no `exec` subcommand and no `--skip-git-repo-check`, and it resumes with
+        `codex resume <id>` rather than `codex exec resume <id>`. Autonomy comes
+        from `--dangerously-bypass-approvals-and-sandbox` rather than `--yolo`,
+        because that is the spelling both the interactive entry point and
+        `resume` document; `--yolo` is undocumented on `resume`.
+        """
+        prefix = self.launcher.prefix("codex") if self.launcher else []
+        binary = [] if self.launcher else ["codex"]
+        model_args = self._model_args()
+        flags = [
+            "--dangerously-bypass-approvals-and-sandbox",
+            *permissions.codex_argv(),
+            "-C",
+            str(workspace),
+            *model_args,
+            *self._effort_args(),
+        ]
+        if thread_id:
+            return [*prefix, *binary, "resume", *flags, thread_id, prompt]
+        return [*prefix, *binary, *flags, prompt]
 
     def _thread_id(self, workspace: Path, session_uuid: str) -> str | None:
         """Codex's own thread id for one of our sessions, or None if unmapped."""
@@ -777,8 +1793,20 @@ class CodexBackend:
         only, leaving the user's `~/.codex/config.toml` alone. Same thread, that
         took 46,357 → 18,507 and it survived later plain resumes.
 
-        The cost is that codex compaction needs a turn to hang off, so it spends
-        one cheap exchange where claude spends none.
+        That check runs before a turn, so it needs a prompt, and the model then
+        answers the prompt. So the run is stopped at the first `turn_context`
+        it writes: past that point any compacted history is on disk and the
+        model has not been called yet. It stops there even with no `compacted`
+        record, because a run that skipped the compaction (the provider ignored
+        the lowered limit, or the compaction failed) would otherwise send the
+        trigger to the model and run a turn in the chat's session. The
+        `compacted` record is the evidence of success. A token drop is not, and
+        an earlier build that judged by it failed real compactions, because codex
+        re-sends its developer instructions after compacting.
+
+        The size after compaction is unknown: codex writes no count for it, and
+        no request runs on the compacted context before codex is stopped. So
+        the result carries `pre_tokens` only.
         """
         thread_id = self._thread_id(workspace, session_uuid)
         if thread_id is None:
@@ -787,8 +1815,13 @@ class CodexBackend:
                 ok=False,
                 error="this thread has no session yet, so there is nothing to compact",
             )
+        rollout = transcript._find_codex_rollout(thread_id)
+        if rollout is None:
+            return Compaction(ok=False, error="couldn't find the thread's rollout")
 
         before = transcript.extract_codex_prompt_tokens(thread_id)
+        pre_tokens = before[0] if before is not None else 0
+        watch = _CompactionWatch(rollout, rollout_size(rollout))
         argv = [
             *self._base_argv(workspace),
             "-c",
@@ -797,26 +1830,35 @@ class CodexBackend:
             thread_id,
             COMPACT_TRIGGER_PROMPT,
         ]
-        logger.info("compact: codex thread=%s", thread_id)
-        await _run_codex_exec(workspace, argv, timeout=timeout)
-        after = transcript.extract_codex_prompt_tokens(thread_id)
-
-        if before is None or after is None:
-            return Compaction(ok=False, error="couldn't read the thread's token usage")
-        pre_tokens, _ = before
-        post_tokens, _ = after
-        if post_tokens >= pre_tokens:
-            # No in-band signal exists, so the token count is the only evidence.
-            # A context that didn't shrink means the threshold found nothing worth
-            # summarizing — reporting success off the trigger alone would be the
-            # same lie `/compact` tells.
-            logger.info(
-                "compact: codex context did not shrink (%s → %s)",
-                pre_tokens,
-                post_tokens,
-            )
-            return Compaction(ok=False, error="nothing to compact")
-        return Compaction(ok=True, pre_tokens=pre_tokens, post_tokens=post_tokens)
+        deadline = timeout if timeout is not None else COMPACT_TIMEOUT
+        logger.info("compact: codex thread=%s timeout=%s", thread_id, deadline)
+        run = asyncio.create_task(
+            _run_codex_exec(workspace, argv, timeout=deadline, thread_id=thread_id)
+        )
+        try:
+            while not run.done():
+                await asyncio.wait({run}, timeout=COMPACT_POLL_S)
+                watch.poll()
+                if watch.settled:
+                    logger.info("compact: turn context written, stopping codex")
+                    break
+        finally:
+            # Cancelling the run is what kills codex: `_run_codex_plain` reaps
+            # the process group in its `finally`.
+            run.cancel()
+            (result,) = await asyncio.gather(run, return_exceptions=True)
+        watch.poll()
+        if watch.compacted:
+            return Compaction(ok=True, pre_tokens=pre_tokens)
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            # Its text is codex's stderr. `_process` owns failures: it logs the
+            # traceback, records the turn as failed and posts the public text.
+            raise result
+        error = "codex did not compact the thread"
+        logger.info("compact: codex thread=%s failed: %s", thread_id, error)
+        return Compaction(ok=False, pre_tokens=pre_tokens, error=error)
 
     def takeover_command(self, workspace: Path, session_uuid: str) -> str | None:
         """`codex resume <thread_id>` when a thread mapping exists for this uuid."""

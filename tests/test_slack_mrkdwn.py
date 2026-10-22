@@ -4,7 +4,11 @@ import string
 
 import pytest
 
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
+from claude_on_the_fly.slack_mrkdwn import (
+    SLACK_TEXT_FIELD_BYTES,
+    fit_text_field,
+    to_mrkdwn,
+)
 
 
 def test_bold_becomes_single_asterisk():
@@ -389,3 +393,39 @@ def test_slack_link_syntax_written_by_the_agent_survives():
     assert to_mrkdwn("<https://example.com|click here>") == (
         "<https://example.com|click here>"
     )
+
+
+class TestFitTextField:
+    def test_short_text_passes_through_untouched(self):
+        assert fit_text_field("hello") == "hello"
+
+    def test_overlong_cjk_text_is_cut_under_the_byte_cap(self):
+        # 2,000 CJK chars = 6,000 bytes: over the 4,000-byte chat.update cap
+        # the character count never notices.
+        text = "字" * 2000
+        fitted = fit_text_field(text)
+        assert len(fitted.encode()) <= SLACK_TEXT_FIELD_BYTES
+        assert fitted.endswith("…")
+        assert fitted.startswith("字")
+
+    def test_the_cut_lands_on_a_codepoint_boundary(self):
+        # A pure-CJK cut with no boundary handling would end mid-character and
+        # decode to replacement characters. 1,500 chars = 4,500 bytes; the cut
+        # steps back to the last char that fits, 1,265 of them.
+        fitted = fit_text_field("選" * 1500)
+        assert "�" not in fitted
+        assert fitted == "選" * 1265 + "…"
+
+    def test_overlong_ascii_text_is_cut(self):
+        fitted = fit_text_field("x" * 5000)
+        assert fitted == "x" * (SLACK_TEXT_FIELD_BYTES - 3) + "…"
+
+    def test_mixed_text_keeps_the_tail_intact_when_it_fits(self):
+        head = "字" * 1200  # 3,600 bytes
+        tail = " plain ascii tail"
+        assert fit_text_field(head + tail) == head + tail
+
+    def test_a_custom_cap_is_respected(self):
+        # 6 bytes of input against a 5-byte cap: 2 bytes kept, ellipsis counted
+        # inside the cap.
+        assert fit_text_field("abcdef", max_bytes=5) == "ab…"

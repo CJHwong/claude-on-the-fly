@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from claude_on_the_fly import (
@@ -15,11 +16,12 @@ from claude_on_the_fly import (
     permissions,
     pricing,
     pty_install,
+    quota,
     sandbox,
-    settings,
     transcript,
 )
 from claude_on_the_fly.agent import (
+    COMPACT_TIMEOUT,
     DEFAULT_TIMEOUT,
     Compaction,
     OllamaLauncher,
@@ -29,6 +31,7 @@ from claude_on_the_fly.agent import (
 )
 from claude_on_the_fly.transcript import (
     _workspace_to_claude_hash,
+    extract_claude_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,16 +45,15 @@ PTY_INSTALL_HINT = (
 # claude's own slash command, sent as the prompt. Runs the real compaction and
 # writes a `compact_boundary` into the session transcript.
 COMPACT_PROMPT = "/compact"
-# Cap for a compaction when the caller sets none. The chat frontends all leave
-# `timeout_for` at its default of None, which the executors read as "wait with no
-# deadline" — fine for a turn a human is watching, wrong for this: a compaction
-# is a single summarization pass (measured at 8-22s, minutes on a very large
-# thread), and the drain loop is serial per chat, so an unbounded one wedges
-# every message queued behind it.
-COMPACT_TIMEOUT = 900.0
-# `--effort` choices, from `claude --help`. The shared OLLAMA_EFFORT setting is
-# validated against this before it reaches the CLI (codex's accepted set differs).
+# `--effort` choices, from `claude --help`. Whichever key the resolver read it
+# from -- the shared `agent.ollama.effort` or this backend's own
+# `agent.claude.effort` -- it is validated against this before reaching the CLI,
+# because codex's accepted set differs and the ollama key is shared with it.
 _CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+# Staging name for the system prompt a session-establishing turn hands to
+# `--system-prompt-file`. Dotted so it reads as machinery beside the user's
+# files, and never a fixed name: two threads of one DM share a workspace.
+SYSTEM_PROMPT_FILE_PREFIX = ".cotf-system-prompt-"
 
 
 def _last_compact_boundary(path: Path | None) -> dict:
@@ -104,8 +106,10 @@ def _native_context_fields(
     `modelUsage` lists every model a turn touched, sub-agents included. Pair
     the prompt with the widest window listed: a sub-agent's smaller one would
     overstate how full the context is, and for a feature that spends money to
-    act, over-reading is the costly direction. Empty dict when either number is
-    missing, which reads downstream as "no reading" rather than as zero.
+    act, over-reading is the costly direction. The window is left out when it is
+    unknown, and everything that needs a percentage checks for it. The count
+    alone is still a reading: the idle compaction thresholds on it. Empty dict
+    when there is no count, which reads downstream as "no reading", not zero.
 
     `window_override` replaces that lookup with a number the operator declared.
     Ollama mode needs it: the CLI still prints a `contextWindow`, but it comes
@@ -127,8 +131,10 @@ def _native_context_fields(
             for entry in (cli_output.get("modelUsage") or {}).values()
             if isinstance(entry, dict) and entry.get("contextWindow")
         ]
-    if not tokens or not windows:
+    if not tokens:
         return {}
+    if not windows:
+        return {"context_tokens": tokens}
     return {"context_tokens": tokens, "context_window_size": max(windows)}
 
 
@@ -165,7 +171,11 @@ def _compaction_from(cli_output: dict, session_path: Path | None) -> Compaction:
     return Compaction(
         ok=True,
         pre_tokens=int(meta.get("preTokens", 0)),
-        post_tokens=int(meta.get("postTokens", 0)),
+        # The conversation only: see `Compaction` for why it is not a
+        # whole-prompt "after".
+        conversation_tokens_after=(
+            int(meta["postTokens"]) if "postTokens" in meta else None
+        ),
         duration=int(meta.get("durationMs", 0)) / 1000,
     )
 
@@ -184,6 +194,43 @@ def _session_has_content(path: Path) -> bool:
             return any(line.strip() for line in handle)
     except OSError:
         return False
+
+
+def _stage_system_prompt(workspace: Path, text: str) -> Path:
+    """Write the system prompt where the CLI will read it, and return the path.
+
+    In the workspace because that is the one directory both jail profiles grant
+    the agent (`sandbox._readable_paths`), so it is the only place the CLI can
+    open reliably. mkstemp gives it 0600 and a name no second turn can collide
+    with; the caller discards it once the turn is over.
+
+    A file at all because this is the one argv element whose size cotf does not
+    bound. One argv element is capped at MAX_ARG_STRLEN, and the system prompt
+    grows with the deployment's own prompt template.
+    """
+    fd, name = tempfile.mkstemp(prefix=SYSTEM_PROMPT_FILE_PREFIX, dir=workspace)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return Path(name)
+
+
+def _discard_system_prompt(path: Path) -> None:
+    """Remove the staged prompt, and never let that failure outlive the turn.
+
+    The agent runs with bypassPermissions inside this workspace, so by the time
+    the turn ends the path can be a directory, or the mount can be read-only.
+    An error raised from a `finally` would replace the turn's own result or its
+    own exception, which is the one thing cleanup must not do.
+
+    A daemon killed mid-turn leaves the file behind. That is accepted: it is 0600
+    in the agent's own workspace, whose transcript already carries the same
+    prompt, and the name is unique per run so a later turn neither reads nor
+    needs it.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("run: could not remove the staged system prompt: %s", exc)
 
 
 def resolve_pty_binary() -> str | None:
@@ -306,11 +353,19 @@ class ClaudeBackend:
         launcher: OllamaLauncher | None = None,
         pty: bool = False,
         ollama_context_window: int | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         if launcher is not None and pty:
             raise ValueError("ClaudeBackend: launcher and pty are mutually exclusive")
         self.launcher = launcher
         self.pty = pty
+        # Both already resolved by `agent.resolve_profile`, which is also where
+        # the ollama/native key routing lives. Binding them here rather than
+        # reading settings at argv time is what lets one process run two jobs
+        # under different models without them reading each other's.
+        self.model = model
+        self.effort = effort
         # Only meaningful in ollama mode, where the CLI's own `contextWindow`
         # describes the wrong model. Unset keeps the old behaviour: no reading,
         # so the footer omits `ctx` and the auto-compact gate stays off.
@@ -337,6 +392,7 @@ class ClaudeBackend:
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response:
         logger.info(
             "session: id=%s platform=%s user=%s context=%s workspace=%s",
@@ -346,12 +402,21 @@ class ClaudeBackend:
             channel_context,
             workspace,
         )
-        system_prompt = build_system_prompt(
-            platform, user_name, channel_context, workspace
-        )
-        # --system-prompt is only attached when (re-)establishing a session; a
-        # healthy --resume reuses the prompt already persisted in the session.
-        sysprompt_args = ["--system-prompt", system_prompt]
+
+        def session_prompt_args() -> tuple[list[str], Path | None]:
+            """The flags carrying the system prompt, for a session-establishing turn.
+
+            Built here rather than before the branch: a healthy `--resume`
+            discards it, and building it calls `sandbox.agent_guidance`, which
+            enumerates the jail's read and write grants. That is filesystem work
+            on the daemon's serial path, paid every turn for nothing.
+            """
+            return self._system_prompt_args(
+                workspace,
+                build_system_prompt(
+                    platform, user_name, channel_context, workspace, session_uuid, facts
+                ),
+            )
 
         if self.pty:
             base = self._pty_base_argv()
@@ -376,6 +441,13 @@ class ClaudeBackend:
             / _workspace_to_claude_hash(workspace)
             / f"{session_uuid}.jsonl"
         )
+        # Before the spawn: everything already in the file belongs to earlier
+        # turns, so this is the line between them and what this turn writes.
+        usage_offset = transcript.claude_session_size(workspace, session_uuid)
+        # The system prompt is carried only when (re-)establishing a session; a
+        # healthy --resume reuses the prompt already persisted in the session.
+        # `sysprompt_file` is the staged copy to remove once the turn is over.
+        sysprompt_file: Path | None = None
         if _session_has_content(session_path):
             # Healthy resume: claude already persisted the system prompt into
             # the session, so don't re-send it (cuts tokens and stops every
@@ -383,26 +455,63 @@ class ClaudeBackend:
             logger.debug(
                 "agent.run: resuming session=%s prompt=%s", session_uuid, prompt[:80]
             )
-            argv = [*base, "--resume", session_uuid, prompt]
+            argv = [*base, "--resume", session_uuid]
         elif session_path.is_file():
             # The file exists but has no content: a prior turn opened the
             # session yet the LLM never produced output (empty/synthetic reply).
             # Resume but RE-SUPPLY the system prompt — otherwise the agent runs
             # with no system prompt at all.
+            #
+            # Measured on 2.1.276, on a 0-byte session file: this branch does NOT
+            # recover the session. `--resume` answers "No conversation found with
+            # session ID: <uuid>", rc 1, so the prompt below never reaches a
+            # running CLI. `--session-id` with the empty file still in place
+            # answers "Session ID <uuid> is already in use.", rc 1. What works is
+            # unlinking the empty file first and then creating: rc 0, and the CLI
+            # writes the session. Not changed here because the repair is a
+            # decision of its own; the measurement is recorded so the next reader
+            # does not have to trust the intent this branch was written with.
             logger.warning(
                 "agent.run: session=%s exists but is empty; re-supplying system "
                 "prompt on resume",
                 session_uuid,
             )
-            argv = [*base, *sysprompt_args, "--resume", session_uuid, prompt]
+            sysprompt_args, sysprompt_file = session_prompt_args()
+            argv = [*base, *sysprompt_args, "--resume", session_uuid]
         else:
             logger.info("No existing session %s, creating new", session_uuid)
             if platform not in agent.NO_HANDOFF_PLATFORMS:
                 prompt = transcript.prepend_latest_handoff(
-                    workspace, prompt, exclude_uuid=session_uuid
+                    workspace, prompt, session_uuid=session_uuid, platform=platform
                 )
-            argv = [*base, *sysprompt_args, "--session-id", session_uuid, prompt]
-        cli_output = await executor(workspace, argv, timeout=timeout)
+            sysprompt_args, sysprompt_file = session_prompt_args()
+            argv = [*base, *sysprompt_args, "--session-id", session_uuid]
+        # Where the turn's prompt travels. Native and ollama: stdin, because one
+        # argv element is capped at MAX_ARG_STRLEN. Measured on the deployment
+        # host: a 131071-byte argument execs, a 131072-byte one dies with
+        # `OSError: [Errno 7] Argument list too long`. A Slack reply in a long
+        # thread replays up to 50 prior messages ahead of the prompt, which came
+        # to 131360-142743 bytes on the thread that failed. pty keeps it in argv:
+        # claude-pty reads its prompt from argv and its stdin is the pane's TTY.
+        if self.pty:
+            argv.append(prompt)
+        try:
+            cli_output = await executor(
+                workspace,
+                argv,
+                timeout=timeout,
+                stdin_text=None if self.pty else prompt,
+            )
+        except quota.AccountExhaustedError as failure:
+            failure.thread_id = session_uuid
+            if failure.tools_started and not self.pty:
+                failure.resume_ready = quota.claude_resume_ready(
+                    session_path, usage_offset
+                )
+            raise
+        finally:
+            if sysprompt_file is not None:
+                _discard_system_prompt(sysprompt_file)
 
         body = (cli_output.get("result") or "").strip()
         if body and not strip_suggestions_blocks(body).strip():
@@ -438,11 +547,30 @@ class ClaudeBackend:
                 "agent.run: no visible reply, retrying with nudge, session=%s",
                 session_uuid,
             )
-            retry_output = await executor(
-                workspace,
-                [*base, "--resume", session_uuid, nudge_prompt or agent.NUDGE_PROMPT],
-                timeout=timeout,
-            )
+            # The same transport as the first call: this one is taken precisely
+            # when no reply exists to fall back on, so it must not be the arm
+            # that dies on a prompt past the argv cap.
+            nudge = nudge_prompt or agent.NUDGE_PROMPT
+            retry_argv = [*base, "--resume", session_uuid]
+            if self.pty:
+                retry_argv.append(nudge)
+            try:
+                retry_output = await executor(
+                    workspace,
+                    retry_argv,
+                    timeout=timeout,
+                    stdin_text=None if self.pty else nudge,
+                )
+            except quota.AccountExhaustedError as failure:
+                failure.thread_id = session_uuid
+                failure.tools_started = failure.tools_started or bool(
+                    cli_output.get("tool_counts")
+                )
+                if failure.tools_started and not self.pty:
+                    failure.resume_ready = quota.claude_resume_ready(
+                        session_path, usage_offset
+                    )
+                raise
             if self.pty:
                 # claude-pty envelopes have no per-tool counts to merge and pty's
                 # `usage` is just the last assistant message — simpler to
@@ -450,10 +578,25 @@ class ClaudeBackend:
                 cli_output = retry_output
             else:
                 cli_output = agent._merge_cli_output(cli_output, retry_output)
-            body = (cli_output.get("result") or "").strip() or "No response"
+            body = (cli_output.get("result") or "").strip() or agent.EMPTY_REPLY_NOTICE
 
-        tokens_in, tokens_out = self._extract_tokens(cli_output)
-        model = next(iter(cli_output.get("modelUsage", {})), "")
+        tokens_in, tokens_out = self._extract_tokens(
+            cli_output, workspace, session_uuid, usage_offset
+        )
+        # The model that produced the answer, which is the last assistant
+        # message's own `model`. `modelUsage` cannot answer this: it is keyed by
+        # every model the turn touched, in first-touched order, so an auxiliary
+        # call that ran before the answer names itself instead. That is not
+        # hypothetical -- a daemon turn opus answered footered as haiku. It stays
+        # as the fallback for an envelope that carries no assistant message.
+        model = cli_output.get("last_assistant_model") or ""
+        if not model and self.pty:
+            # pty's envelope carries no per-message model, so the name comes
+            # from the session claude just wrote. This is the mode the bug was
+            # observed in, so it is the one that has to be right.
+            model = extract_claude_model(workspace, session_uuid) or ""
+        if not model:
+            model = next(iter(cli_output.get("modelUsage", {})), "")
 
         # In ollama mode the claude CLI still computes total_cost_usd from
         # Anthropic's price table, which is meaningless when ollama is
@@ -486,7 +629,7 @@ class ClaudeBackend:
 
         statusline = cli_output.get("statusline") or {}
         extra = _statusline_response_fields(statusline)
-        if not self.pty and (self.launcher is None or self.ollama_context_window):
+        if not self.pty:
             # pty already has these from the statusline, and its top-level
             # `usage` is the last assistant message only (see `_extract_tokens`),
             # so deriving them there would understate a multi-turn prompt.
@@ -498,17 +641,19 @@ class ClaudeBackend:
             # registry; a window has none the engine can derive — so the engine
             # does not invent one. `agent.ollama.context_window` lets the
             # operator state it instead, and a stated window is not a guess.
-            # Left unset, nothing is reported: the footer omits `ctx` and the
-            # auto-compact gate stays off rather than thresholding against a
-            # made-up denominator, since over-reading is the direction that
-            # spends money. `$compact` is unaffected either way: it is asked
-            # for, and the CLI does the real work.
-            extra.update(
-                _native_context_fields(
-                    cli_output,
-                    self.ollama_context_window if self.launcher is not None else None,
-                )
+            # Left unset, only the token count is reported: it is the routed
+            # model's own. The footer omits `ctx` and the auto-compact gate stays
+            # off rather than thresholding against a made-up denominator, since
+            # over-reading is the direction that spends money. The idle
+            # compaction needs the count alone. `$compact` is unaffected either
+            # way: it is asked for, and the CLI does the real work.
+            fields = _native_context_fields(
+                cli_output,
+                self.ollama_context_window if self.launcher is not None else None,
             )
+            if self.launcher is not None and not self.ollama_context_window:
+                fields.pop("context_window_size", None)
+            extra.update(fields)
 
         return Response(
             body=body,
@@ -529,25 +674,11 @@ class ClaudeBackend:
         # the prompt and silently drops the real one.
         prefix = self.launcher.prefix("claude") if self.launcher else []
         binary = [] if self.launcher else ["claude"]
-        # Empty/unset CLAUDE_MODEL → omit --model and let the claude CLI use
-        # its own default (don't pin sonnet).
-        model = "" if self.launcher else settings.get("CLAUDE_MODEL").strip()
+        # Empty model → omit --model and let the claude CLI use its own default
+        # (don't pin sonnet). Under a launcher it is always empty: `ollama launch
+        # claude --model X` already pinned it.
+        model = "" if self.launcher else self.model
         model_args = ["--model", model] if model else []
-        # Effort is passed only for the ollama-served model. Native mode inherits
-        # the operator's own settings (effortLevel in ~/.claude/settings.json),
-        # and pty resolves its own settings — a flag here would silently override
-        # both, so only the mode that swapped the model underneath gets one.
-        # OLLAMA_EFFORT is shared with the codex backend, whose accepted levels
-        # differ (no `max`), so a value claude doesn't accept is skipped, not
-        # passed through to die in the CLI's own validation.
-        effort = settings.get("OLLAMA_EFFORT").strip() if self.launcher else ""
-        if effort and effort not in _CLAUDE_EFFORT_LEVELS:
-            logger.warning(
-                "claude: ignoring unknown effort %r (low|medium|high|xhigh|max)",
-                effort,
-            )
-            effort = ""
-        effort_args = ["--effort", effort] if effort else []
         # Permission flags rather than a hardcoded bypassPermissions. With
         # approvals off this returns exactly the old pair, so argv is unchanged.
         return [
@@ -559,8 +690,53 @@ class ClaudeBackend:
             "--verbose",
             *permissions.claude_argv(),
             *model_args,
-            *effort_args,
+            *self._effort_args(),
         ]
+
+    def _effort_args(self) -> list[str]:
+        """`--effort <level>`, or [] when no effort is configured.
+
+        Unset means inherit: no flag is passed and the CLI reads effortLevel
+        from ~/.claude/settings.json exactly as it did before this setting
+        existed.
+
+        Under ollama the value came from the shared `ollama.effort`, whose
+        accepted levels differ from claude's (codex has no `max`), so a value
+        claude doesn't accept is skipped rather than passed through to die in
+        the CLI's own validation. A native value takes the same check: a typo
+        in config.yaml should warn here rather than fail the turn.
+        """
+        effort = self.effort
+        if effort and effort not in _CLAUDE_EFFORT_LEVELS:
+            logger.warning(
+                "claude: ignoring unknown effort %r (low|medium|high|xhigh|max)",
+                effort,
+            )
+            return []
+        return ["--effort", effort] if effort else []
+
+    def _system_prompt_args(
+        self, workspace: Path, text: str
+    ) -> tuple[list[str], Path | None]:
+        """The flags that carry the system prompt, and the staged file to remove.
+
+        A file rather than `--system-prompt <text>`: this is the one argv element
+        cotf cannot bound, because it grows with the deployment's own prompt
+        template, and one argv element is capped at MAX_ARG_STRLEN on Linux.
+        `--system-prompt-file` is a real claude flag, hidden from `--help` but
+        present in the binary on 2.1.276 and 2.1.281 (`hideHelp()` in the option
+        table, plus a `Cannot use both --system-prompt and --system-prompt-file`
+        guard). It reads the path as UTF-8 at startup and refuses to run when the
+        file is gone, which is why the caller unlinks it only after the turn.
+
+        pty keeps the inline flag: claude-pty forwards flags verbatim, but neither
+        its stdin nor its handling of this file has been measured, and a pty
+        deployment is not one cotf can test end to end here.
+        """
+        if self.pty:
+            return ["--system-prompt", text], None
+        path = _stage_system_prompt(workspace, text)
+        return ["--system-prompt-file", str(path)], path
 
     async def compact(
         self,
@@ -572,7 +748,7 @@ class ClaudeBackend:
 
         Runs in whichever mode this backend is in — a pty backend compacts
         through claude-pty, not through `claude -p`. Mixing them would forfeit
-        what pty is for: an operator can `tmux attach` to a live turn, and a
+        what pty is for: an operator can attach to a live turn (`a` in the TUI), and a
         compaction is the longest and priciest thing a thread does, so it is the
         worst one to make invisible. The two also resolve their own settings
         (effort, fast mode, output style), so a `-p` compaction could summarize a
@@ -621,11 +797,11 @@ class ClaudeBackend:
         cli_output = await executor(workspace, argv, timeout=deadline)
         result = _compaction_from(cli_output, session_path)
         logger.info(
-            "compact: session=%s ok=%s %s→%s tokens",
+            "compact: session=%s ok=%s before=%s conversation_after=%s tokens",
             session_uuid,
             result.ok,
             result.pre_tokens,
-            result.post_tokens,
+            result.conversation_tokens_after,
         )
         return result
 
@@ -633,26 +809,47 @@ class ClaudeBackend:
         """claude-pty argv minus the prompt and --system-prompt; the caller appends
         --system-prompt only when (re-)establishing a session."""
         assert self._pty_path is not None  # set in __init__ when pty=True
-        model = settings.get("CLAUDE_MODEL").strip()
-        model_args = ["--model", model] if model else []
+        model_args = ["--model", self.model] if self.model else []
         # claude-pty forwards every flag to claude verbatim, so the same argv
         # works here. What differs is which of them claude honours: interactive
         # mode ignores --permission-prompt-tool and draws its own dialog instead,
         # which is why the pty path also installs the Notification relay.
+        #
+        # --effort is passed for the same reason --model is: both are session
+        # flags in claude's own help ("for the current session"), neither is
+        # gated on -p. Interactive claude honours it, measured by driving the
+        # TUI under tmux -- `--effort low` and `--effort max` each banner
+        # themselves as "with <level> effort", and no flag banners the
+        # settings default. A session file cannot confirm this, since it
+        # records the model per message but never the effort.
         return [
             self._pty_path,
             *permissions.claude_argv(pty=True),
             *permissions.pty_argv(),
             *model_args,
+            *self._effort_args(),
         ]
 
-    def _extract_tokens(self, cli_output: dict) -> tuple[int, int]:
-        """Return (tokens_in, tokens_out).
+    def _extract_tokens(
+        self,
+        cli_output: dict,
+        workspace: Path | None = None,
+        session_uuid: str = "",
+        usage_offset: int = 0,
+    ) -> tuple[int, int]:
+        """Return this turn's (tokens_in, tokens_out).
 
-        claude-pty's top-level `usage` is the last assistant message only, so for
-        multi-turn pty calls we'd undercount. `modelUsage` is aggregated
-        across every assistant record by pty's transcript pass, so it's the
-        truthful cross-turn total.
+        In pty mode neither figure in the envelope is the turn. `usage` is the
+        last assistant message alone, so a turn that wrote several undercounts.
+        `modelUsage` is pty's pass over the whole session, so it reports every
+        turn the session has ever run: footers grew to `up-arrow 990272` beside
+        a context reading of 8 percent, because they were quoting the session's
+        life story as if it were one turn's bill.
+
+        So pty reads the session transcript from the size it had before the
+        spawn, and counts only what this turn appended. `modelUsage` stays as
+        the fallback for a transcript that cannot be read, where a total too
+        large beats no number at all.
 
         Native/ollama stay on `usage`: the result envelope's top-level figure
         is already the whole turn's aggregate — every API call's input summed,
@@ -661,6 +858,12 @@ class ClaudeBackend:
         `last_assistant_usage` instead (see `_native_context_fields`).
         """
         if self.pty:
+            if workspace is not None:
+                measured = transcript.extract_claude_turn_tokens(
+                    workspace, session_uuid, usage_offset
+                )
+                if measured is not None:
+                    return measured
             mu = cli_output.get("modelUsage") or {}
             tokens_in = sum(
                 int(v.get("inputTokens", 0)) + int(v.get("cacheReadInputTokens", 0))
@@ -745,8 +948,38 @@ def _statusline_response_fields(statusline: dict) -> dict:
     return out
 
 
+# claude's TUI races on a singleton supervisor lock for roughly the first second
+# of boot, and two starting together leave one hung. claude-pty normally gates
+# that with a lock directory in the claude config dir; the Linux jail mounts that
+# directory read-only, so the daemon holds the gate instead. See
+# sandbox.claude_pty_startup_is_delegated for why the mount cannot be the fix.
+_PTY_STARTUP_GATE = asyncio.Lock()
+
+# Three seconds, between the ~1s race the script documents and the 10s cap it
+# falls back to when its own release signal never arrives. cotf cannot see that
+# signal -- it is a file inside the wrapper's private temp dir -- so this is a
+# fixed window rather than an early release.
+_PTY_STARTUP_WINDOW_SECONDS = 3.0
+
+
+async def _hold_pty_startup_gate() -> None:
+    """Take the startup gate and give it up again after the boot window.
+
+    Released on a timer rather than by the caller, because the turn outlives the
+    race by minutes: releasing at the end of the turn would serialize whole turns
+    instead of the one second that needs it.
+    """
+    await _PTY_STARTUP_GATE.acquire()
+    asyncio.get_running_loop().call_later(
+        _PTY_STARTUP_WINDOW_SECONDS, _PTY_STARTUP_GATE.release
+    )
+
+
 async def _exec_pty(
-    workspace: Path, cmd: list[str], timeout: float | None = None
+    workspace: Path,
+    cmd: list[str],
+    timeout: float | None = None,
+    stdin_text: str | None = None,
 ) -> dict:
     """Run `claude-pty` and parse its single-JSON envelope on stdout.
 
@@ -754,6 +987,10 @@ async def _exec_pty(
     plus a `statusline` key carrying the pty-only subtree. tool_counts and
     skill_counts are always empty in pty mode (pty doesn't surface per-turn
     tool_use events).
+
+    `stdin_text` is accepted and ignored, because it is how the native executor
+    takes the turn's prompt. pty carries its prompt in argv instead: claude-pty
+    is handed the argv, and its stdin is the pane's TTY.
     """
     # Before the spawn, not after: claude skips its workspace trust dialog only
     # in non-interactive mode, and pty's whole job is to give it a real TTY. An
@@ -764,9 +1001,11 @@ async def _exec_pty(
     logger.debug(
         "exec_pty: cwd=%s cmd=%s timeout=%s",
         workspace,
-        " ".join(cmd[:4]) + "...",
+        agent.argv_for_log(cmd),
         timeout,
     )
+    if sandbox.claude_pty_startup_is_delegated():
+        await _hold_pty_startup_gate()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -800,6 +1039,9 @@ async def _exec_pty(
     stderr_text = stderr.decode(errors="replace").strip()
 
     if rc != 0 and not stdout_text:
+        failure = quota.claude_error({}, stderr_text, rc, {"unknown": 1})
+        if failure is not None:
+            raise failure
         raise agent._classify(stderr_text or f"claude-pty exit {rc}")
 
     if not stdout_text:
@@ -818,6 +1060,9 @@ async def _exec_pty(
         ) from exc
 
     if envelope.get("is_error") or str(envelope.get("subtype", "")).startswith("error"):
+        failure = quota.claude_error(envelope, stderr_text, rc, {"unknown": 1})
+        if failure is not None:
+            raise failure
         raise agent._classify(envelope.get("result") or stderr_text or "pty error")
 
     envelope.setdefault("tool_counts", {})

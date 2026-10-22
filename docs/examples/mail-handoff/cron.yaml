@@ -1,0 +1,15 @@
+# Copy this entry into the `entries:` list of ~/.claude-on-the-fly/cron.yaml.
+# Set up gws and seed the poll first: see the header of scripts/mail_poll.py.
+# Replace the senders, the fallback Slack user and the clone path.
+- name: mail-handoff
+  cron: "* * * * *"
+  producer_timeout: 180
+  max_fires: 1              # one hand-off per message
+  command: >-
+    uv run --script ~/claude-on-the-fly-src/docs/examples/mail-handoff/scripts/mail_poll.py
+    --senders boss@example.com,billing@example.com
+  prompt: |
+    Use the mail-handoff skill for Gmail message {{ item.key }}
+    from {{ item.from }}: "{{ item.subject }}" ({{ item.date }}).
+    If no Slack user matches the sender, hand it to <@U0123456789>.
+    No confirmation needed.

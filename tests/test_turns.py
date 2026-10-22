@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,39 @@ class TestPhases:
         replay, _nudge = journal.take(now=1000.0)
         assert [t.phase for t in replay] == [DISPATCHED]
 
+    def test_dispatch_restarts_the_ttl_clock(self, journal):
+        """A turn that waited its way to the edge of the TTL, then ran, is still
+        owed an answer. Before the clock restarted, this exact shape -- accepted
+        29 minutes ago behind other work in the same chat, dispatched a moment
+        ago, interrupted while running -- came back in neither list and nobody
+        was told. One chat drains serially, so a queue that long is ordinary."""
+        accepted = 1000.0
+        journal.record(_turn(turn_id="t1", recorded_at=accepted))
+
+        journal.mark_dispatched("t1", now=accepted + 29 * 60)
+        replay, nudge = journal.take(ttl_s=30 * 60, now=accepted + 31 * 60)
+
+        assert [t.turn_id for t in replay] == ["t1"], (replay, nudge)
+
+    def test_an_old_dispatched_turn_is_preserved_for_explicit_recovery(self, journal):
+        journal.record(_turn(turn_id="t1", recorded_at=1000.0))
+        journal.mark_dispatched("t1", now=1000.0)
+
+        replay, nudge = journal.take(ttl_s=60, now=1000.0 + 3600)
+        assert replay == []
+        assert [turn.turn_id for turn in nudge] == ["t1"]
+        assert journal.parked() == nudge
+
+    def test_the_wall_clock_is_used_when_no_moment_is_given(self, journal):
+        """The production callers pass nothing, so the default has to be the wall
+        clock. An hour-old acceptance, dispatched now, is inside a 60s TTL."""
+        journal.record(_turn(turn_id="t1", recorded_at=time.time() - 3600))
+        journal.mark_dispatched("t1")
+
+        replay, _nudge = journal.take(ttl_s=60)
+
+        assert [t.turn_id for t in replay] == ["t1"]
+
     def test_an_answered_turn_is_forgotten(self, journal):
         entry = _turn()
         journal.record(entry)
@@ -146,16 +180,14 @@ class TestPhases:
 
 
 class TestTake:
-    def test_taking_empties_the_journal(self, journal):
-        """Emptied before anything runs, so a turn that kills the daemon cannot
-        be replayed at every start. Same move as cron renaming its trigger."""
+    def test_taking_reserves_the_same_turn_until_its_reply_lands(self, journal):
         journal.record(_turn())
 
         first, _ = journal.take(now=1000.0)
-        second = journal.take(now=1000.0)
-
         assert len(first) == 1
-        assert second == ([], [])
+        assert journal.pending() == first
+        journal.forget(first[0].turn_id)
+        assert journal.take(now=1000.0) == ([], [])
 
     def test_an_absent_journal_is_empty_not_an_error(self, journal):
         assert journal.take() == ([], [])
@@ -170,14 +202,15 @@ class TestTake:
 
         assert [t.turn_id for t in replay] == sorted(t.turn_id for t in replay)
 
-    def test_an_expired_turn_is_neither_replayed_nor_mentioned(self, journal, caplog):
-        """Nothing is owed to a question from another day."""
+    def test_an_expired_turn_is_archived_and_offered_back(self, journal, caplog):
         journal.record(_turn())
 
         with caplog.at_level("INFO", logger="claude_on_the_fly.turns"):
             result = journal.take(ttl_s=60, now=1000.0 + 3600)
 
-        assert result == ([], [])
+        assert result[0] == []
+        assert result[1] == journal.parked()
+        assert len(result[1]) == 1
         assert "older than" in caplog.text
 
     def test_a_turn_with_no_timestamp_is_not_treated_as_expired(self, journal):
@@ -206,7 +239,9 @@ class TestTake:
     def test_the_default_ttl_is_used_when_none_is_given(self, journal):
         journal.record(_turn(recorded_at=1.0))
 
-        assert journal.take() == ([], [])
+        replay, nudge = journal.take()
+        assert replay == [] and len(nudge) == 1
+        assert journal.parked() == nudge
 
 
 class TestCorruptRecords:

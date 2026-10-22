@@ -18,7 +18,9 @@ src/claude_on_the_fly/
   pricing.py           # OpenRouter-backed price table (codex)
   logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
+  migration.py         # Folds a pre-shared-workspace thread directory into its workspace
   interim.py           # Mid-turn progress: coalescing + rate limiting for one turn
+  model_command.py     # The $model / /model command: grammar, catalogue checks, wording
   broker.py            # Loopback credential broker (keeps API keys out of the agent)
   egress.py            # CONNECT proxy gating outbound HTTPS by destination host
   commands.py          # Runs credentialed CLIs outside the sandbox via PATH shims
@@ -28,6 +30,7 @@ src/claude_on_the_fly/
   settings.py          # config.yaml (all settings, re-read on save); .env is secrets only
   envfile.py           # Reads DATA_DIR/.env the way a spawned daemon receives it (file wins)
   sandbox.py           # Spawn-time env curation + seatbelt jail wrapping
+  tmux.py              # Hosts a turn in a private tmux server; captures the pane
   turns.py             # Durable record of unanswered chat turns (restart recovery)
   upgrade.py           # Resolves how this install updates, and runs it
   protocol.py          # Frontend protocol (add new interfaces here)
@@ -57,13 +60,18 @@ uv run prek run --all-files    # ruff + ruff-format + ty + gitleaks + sanity
 uv run pytest                  # tests in tests/
 ```
 
-Coverage is 100% of statements and is enforced (`fail_under = 100`). It is not in
-pytest's `addopts` because it roughly triples the suite's wall clock, so run it
-explicitly when you add or change code:
+Coverage is 100% of statements. `fail_under = 100` enforces it **locally**; CI measures
+it and reports the number without failing the build, so a drop is visible rather than
+blocking. Locally it is not in pytest's `addopts` because it adds about a minute to the
+suite's wall clock, so run it explicitly when you add or change code:
 
 ```bash
 uv run pytest --cov=claude_on_the_fly --cov-report=term-missing
 ```
+
+A green coverage number is not proof a test ran. It counts lines executed, not
+assertions reached, so a test that dies at the call still leaves its lines covered by
+somebody else's test. Read the counts line as well as the percentage.
 
 New code needs a test that fails without it. If a line genuinely cannot run under
 test, `# pragma: no cover` with a comment saying why is the escape hatch. There
@@ -81,6 +89,7 @@ Each subsystem has its own notes file. Read the relevant one before touching the
 - `docs/agent/cron.md` — when touching the cron producer, its config schema, or key state
 - `docs/agent/frontend.md` — when adding a new frontend (Slack/Telegram-like)
 - `docs/agent/jobs.md` — when touching the background-job worker, a queue adapter, or anything that reads the job queue
+- `docs/agent/panes.md` — when changing how a turn is hosted in tmux, how the TUI's live view picks its source, or how a hosted turn is reaped
 - `docs/agent/broker.md` — when changing the credential broker or sandbox/jail wiring
 - `docs/agent/security-findings.md` — before changing a sandbox profile or a broker: what
   a review already found, what was accepted, and what is still open. Add findings here
@@ -93,6 +102,10 @@ Operator docs follow Diátaxis and start at `docs/index.md`:
 - `docs/reference/` is the exact schema, defaults, and lifecycle contract.
 - `docs/explanation/` describes security and design concepts.
 - `docs/agent/` remains contributor-only implementation notes.
+- `docs/examples/<name>/` holds one example each: its `cron.yaml` entry, any script, and a
+  `SKILL.md` when the agent needs instructions. They are not part of the package; their
+  tests run with the suite, and `test_cron_entries.py` loads every entry with the
+  daemon's validator.
 
 Keep each page focused on one of those jobs. A setting change must update the packaged
 `config.yaml` template and the reference lifecycle table; add how-to or explanation only
@@ -112,7 +125,8 @@ Settings live in `~/.claude-on-the-fly/config.yaml`; `.env` holds credentials an
    build does". `permissions:` is the exception and ships real values.
 3. Read it with `settings.get(NAME, default)`, which is a drop-in for
    `os.environ.get`. Never bind one to a module constant: that cannot see a value
-   `load_dotenv()` sets after import, nor a later edit to the file.
+   `envfile.load_into_process()` sets after import, nor a later edit to the file. That
+   is the only `.env` load: it reads `DATA_DIR/.env` by path, never a search upward.
 4. If acting on a change means binding a socket, writing a PATH shim, or constructing a
    service, add it to `RESTART_REQUIRED` — otherwise an operator's edit silently does
    nothing.

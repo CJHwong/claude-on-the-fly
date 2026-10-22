@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from claude_on_the_fly import checks, settings
+from claude_on_the_fly import checks, envfile, settings
 from claude_on_the_fly.tui import state as tui_state
 from claude_on_the_fly.tui import supervisor
 
@@ -144,9 +144,7 @@ def run_once(
 
 
 def main(argv: list[str] | None = None) -> int:
-    from dotenv import load_dotenv
-
-    load_dotenv()
+    envfile.load_into_process()
     parser = argparse.ArgumentParser(
         prog="claude-watchdog",
         description="Restart a daemon that is running but no longer heartbeating.",

@@ -43,11 +43,14 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
 import stat
 import sys
+import urllib.parse
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, cast
@@ -107,6 +110,28 @@ class ShimmedTool:
     :param env_passthrough: extra parent env names the real binary needs beyond
         the shared essentials. Kept narrow so the subprocess does not inherit
         every secret the daemon happens to hold.
+    :param allow_read_only: prefixes that may run only when the invocation asks
+        the server to read. For a subcommand that is a whole REST API behind one
+        word, `allow` is all-or-nothing: `gh api` covers reading a file and
+        rewriting a repository's settings. Listing it here admits the reads and
+        refuses the writes. An empty tuple keeps the previous behaviour exactly,
+        so this is opt-in per tool.
+    :param allow_paths: trees outside the session workspace this tool may be
+        given absolute path arguments for. The guard otherwise refuses every
+        absolute path, which is right for a credentialed CLI and wrong for one
+        whose job is to read a file the agent names. An entry reaching a
+        credential store is refused; see `allowed_roots`. Empty by default.
+    :param boolean_flags: flags that never take the next token as their value.
+        Without a flag table the allowlist reads every bare flag as taking one,
+        so `systemctl --user status x` looked like `x` and was refused. Listing
+        `--user` here fixes the reading for that flag only. Empty by default.
+    :param value_flags: flags that always take the next token as their value.
+        The mirror of `boolean_flags`: without it, a value flag before the
+        subcommand is refused, because the reading where no flag takes a value
+        sees `twg -o json jira` as the subcommand `json jira`. Only the allowlist
+        uses it; the readback check keeps reading every flag both ways, so a
+        boolean flag listed here by mistake cannot open a readback. Empty by
+        default.
     """
 
     name: str
@@ -114,6 +139,10 @@ class ShimmedTool:
     readback_flags: frozenset[str] = frozenset()
     env_passthrough: frozenset[str] = frozenset()
     allow: tuple[tuple[str, ...], ...] = ()
+    allow_read_only: tuple[tuple[str, ...], ...] = ()
+    allow_paths: frozenset[str] = frozenset()
+    boolean_flags: frozenset[str] = frozenset()
+    value_flags: frozenset[str] = frozenset()
 
 
 def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
@@ -153,12 +182,22 @@ def _tool_from_entry(entry: dict[str, Any]) -> ShimmedTool:
             )
         return frozenset(str(item) for item in value)
 
+    boolean_flags = names(entry.get("boolean_flags"), "boolean_flags")
+    value_flags = names(entry.get("value_flags"), "value_flags")
+    if both := sorted(boolean_flags & value_flags):
+        raise ValueError(
+            f"{name}: {', '.join(both)} listed in both boolean_flags and value_flags"
+        )
     return ShimmedTool(
         name=name,
         readback=frozenset(words(entry.get("readback"), "readback")),
         readback_flags=names(entry.get("readback_flags"), "readback_flags"),
         env_passthrough=names(entry.get("env_passthrough"), "env_passthrough"),
         allow=words(entry.get("allow"), "allow"),
+        allow_read_only=words(entry.get("allow_read_only"), "allow_read_only"),
+        allow_paths=names(entry.get("allow_paths"), "allow_paths"),
+        boolean_flags=boolean_flags,
+        value_flags=value_flags,
     )
 
 
@@ -345,7 +384,11 @@ raise SystemExit(int(payload.get("rc", 1)))
 
 
 def leading_tokens(
-    argv: list[str], *, flags_take_values: bool = True
+    argv: list[str],
+    *,
+    flags_take_values: bool = True,
+    boolean_flags: frozenset[str] = frozenset(),
+    value_flags: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """The subcommand path: leading non-flag tokens, stopping at the first flag.
 
@@ -358,7 +401,9 @@ def leading_tokens(
     tool's own flag table, so `flags_take_values=False` gives the other reading,
     where every non-flag token is a subcommand candidate. `refuses_readback`
     checks both, because assuming one of them is what lets `--verbose auth
-    logout` walk past a refusal for `auth logout`.
+    logout` walk past a refusal for `auth logout`. `boolean_flags` is the part of
+    that table an operator declared: those flags never consume the next token.
+    `value_flags` is the other part: those always do, in either reading.
     """
     tokens: list[str] = []
     skip_value = False
@@ -368,7 +413,12 @@ def leading_tokens(
             continue
         if item.startswith("-"):
             # `--flag=value` carries its value; a bare flag may take the next arg.
-            skip_value = flags_take_values and "=" not in item and item != "--"
+            skip_value = (
+                "=" not in item
+                and item != "--"
+                and item not in boolean_flags
+                and (flags_take_values or item in value_flags)
+            )
             continue
         tokens.append(item)
     return tuple(tokens)
@@ -383,19 +433,115 @@ def refuses_readback(tool: ShimmedTool, argv: list[str]) -> bool:
     bypass of the one refusal this broker has. Over-refusing the mirror case
     costs an invocation whose flag value happens to spell a refused subcommand,
     which is not a command anyone runs on purpose.
+
+    A readback flag is matched in every spelling its parser accepts, not just the
+    bare one. `gh auth status --show-token=true` is accepted by real gh, checked
+    against gh 2.100.0, so an exact-token match let the credential-printing flag
+    through under the one spelling nobody thought to write down.
     """
-    if any(flag in tool.readback_flags for flag in argv):
+    if any(
+        _carries_flag(token, flag) for token in argv for flag in tool.readback_flags
+    ):
         return True
     if not tool.readback:
         return False
     readings = (
-        leading_tokens(argv),
+        leading_tokens(argv, boolean_flags=tool.boolean_flags),
         leading_tokens(argv, flags_take_values=False),
     )
     return any(
         tokens[: len(prefix)] == prefix
         for tokens in readings
         for prefix in tool.readback
+    )
+
+
+# How a CLI says which HTTP method it wants. `-X` is the convention curl set and
+# gh, hub and http share; gh spells the long form `--method`.
+_METHOD_FLAGS = ("-X", "--method")
+
+# Flags that add request parameters. These matter because of a behaviour that is
+# easy to miss: `gh api --help` states "The default HTTP request method is GET
+# normally and POST if any parameters were added", and again under `-f`, "adding
+# request parameters will automatically switch the request method to POST". So a
+# gate that reads only `--method` would pass `gh api repos/o/r -f a=b` as a read
+# while gh performs a POST. Taken from the installed binary's own help, not from
+# memory of the documentation.
+# `--input` is here for the same reason, and was missed for longer: it supplies
+# the request body from a file (or stdin with `-`), and gh POSTs when it is
+# given. Measured against gh 2.100.0 pointed at a local server: `gh api repos/o/r
+# --input /dev/null` sends POST.
+_PARAMETER_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
+
+# HEAD is included because it is a read that returns no body. Everything else,
+# including an unrecognised or absent value, is treated as a write.
+_READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+def _flag_value(argv: list[str], flags: tuple[str, ...]) -> str | None:
+    """The last value given to any of ``flags``, or None if none was given.
+
+    Three spellings are read, `-X GET`, `--method=GET` and the attached short
+    form `-XGET`. The last one wins because that is what an argument parser does
+    with a repeated flag. A flag that ends the argv has no value, and returns the
+    empty string rather than None so the caller can tell "malformed" from
+    "absent" and refuse it.
+
+    The attached form is not a nicety. gh's parser accepts it, so `gh api
+    repos/o/r -XPOST` performs a POST while a gate reading only the separated
+    spellings called it a read -- measured against gh 2.100.0 pointed at a local
+    server, which reports the method it chose.
+    """
+    found: str | None = None
+    for index, token in enumerate(argv):
+        for flag in flags:
+            if token == flag:
+                found = argv[index + 1] if index + 1 < len(argv) else ""
+            elif token.startswith(f"{flag}="):
+                found = token[len(flag) + 1 :]
+            elif (attached := _attached_short_value(token, flag)) is not None:
+                found = attached
+    return found
+
+
+def _carries_flag(token: str, flag: str) -> bool:
+    """Whether ``token`` is ``flag``, in any spelling a parser accepts.
+
+    The bare flag, the `=value` form a boolean flag still takes (`--show-token=true`),
+    and a value glued onto a short flag.
+    """
+    return (
+        token == flag
+        or token.startswith(f"{flag}=")
+        or _attached_short_value(token, flag) is not None
+    )
+
+
+def _attached_short_value(token: str, flag: str) -> str | None:
+    """The value glued onto a short flag, as in `-XPOST`, or None.
+
+    Only for a real short flag, `-` plus one character. A long flag never carries
+    its value this way, and treating `--methodological` as `--method` with the
+    value `ological` would invent a flag the CLI does not have.
+    """
+    if len(flag) != 2 or flag.startswith("--") or not flag.startswith("-"):
+        return None
+    if not token.startswith(flag) or len(token) <= len(flag):
+        return None
+    return token[len(flag) :]
+
+
+def requests_read_only(argv: list[str]) -> bool:
+    """Whether this invocation asks the server only to read.
+
+    An explicit method decides on its own. Without one, a parameter flag means
+    the CLI will POST, so only a parameter-free invocation is a read.
+    """
+    method = _flag_value(argv, _METHOD_FLAGS)
+    if method is not None:
+        return method.strip().upper() in _READ_METHODS
+    return not any(
+        _carries_flag(token, flag) for token in argv for flag in _PARAMETER_FLAGS
     )
 
 
@@ -406,11 +552,95 @@ def allowed_command(tool: ShimmedTool, argv: list[str]) -> bool:
     options may appear before or after a vetted prefix. This is deliberately not
     a full CLI parser; a tool with no entries is deny-by-default and provider-side
     credential scope remains necessary.
+
+    A prefix on `allow_read_only` additionally has to ask for a read. `allow` is
+    checked first, so a prefix listed on both is allowed outright.
+
+    Both flag readings have to admit the command, the mirror of the rule
+    `refuses_readback` applies. Reading only the value-taking one let a boolean
+    flag the operator did not declare swallow the real verb: with `status`
+    allowed, `systemctl --quiet stop status` matched `status` and systemctl ran
+    `stop`. The cost is a value flag written before the subcommand, such as
+    `gh --repo o/r pr view`; none of 1884 real calls on the deployed host did that.
+    A flag the operator lists in `value_flags` is read as taking its value in
+    both readings, which admits that form for the listed flags only.
+
+    A help request passes without an allow entry; see `is_help_request`.
     """
-    if not tool.allow:
+    if is_help_request(argv):
+        return True
+    return all(
+        _admits(tool, tokens, argv)
+        for tokens in (
+            leading_tokens(argv, boolean_flags=tool.boolean_flags),
+            leading_tokens(argv, flags_take_values=False, value_flags=tool.value_flags),
+        )
+    )
+
+
+_HELP_FLAGS = frozenset({"--help", "-h", "--version"})
+
+
+def is_help_request(argv: list[str]) -> bool:
+    """Whether the argv only asks the CLI to describe itself.
+
+    An agent learns a CLI by probing it, and an allowlist that names `jira
+    workitem view` refuses `jira --help`. Help never reaches the server, but
+    `--help` alone does not prove the command will not run, so the shape is narrow:
+
+    - subcommand words, then one help flag as the last token. No flag may come
+      earlier, because a value flag takes `--help` as its value and the command
+      runs: `gh api -X DELETE repos/o/r --jq --help` deletes.
+    - `help` as the first word. A trailing `help` is an argument: `gh repo delete
+      help` deletes a repository named help.
+
+    Measured: gh and acli (cobra) and twg (commander) print help for `<verb> <arg>
+    --help` and exit 0 without running it; aws exits 252 with a usage error.
+    """
+    if not argv:
         return False
-    tokens = leading_tokens(argv)
-    return any(tokens[: len(prefix)] == prefix for prefix in tool.allow)
+    if argv[0] == "help":
+        return not any(item.startswith("-") for item in argv)
+    *words, last = argv
+    return last in _HELP_FLAGS and not any(item.startswith("-") for item in words)
+
+
+def _admits(tool: ShimmedTool, tokens: tuple[str, ...], argv: list[str]) -> bool:
+    """Whether one reading of the subcommand path is on the allowlist."""
+    if any(tokens[: len(prefix)] == prefix for prefix in tool.allow):
+        return True
+    if any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only):
+        return requests_read_only(argv)
+    return False
+
+
+def hidden_by_a_leading_flag(tool: ShimmedTool, argv: list[str]) -> bool:
+    """True when a flag before the subcommand is the only reason for a refusal.
+
+    Only used to choose the refusal wording. The broker cannot tell whether
+    `--profile` in `aws --profile prod logs tail` takes a value, so the command
+    is refused, but the CLI accepts the flag after the subcommand. Naming that
+    fix keeps the agent from asking the operator for a prefix already listed.
+    Moving the flag also exposes the real verb when the flag was boolean, so the
+    hint is safe to give for an attempt to hide one.
+    """
+    if allowed_command(tool, argv):
+        return False
+    tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
+    return _admits(tool, tokens, argv)
+
+
+def refused_as_write(tool: ShimmedTool, argv: list[str]) -> bool:
+    """True when the prefix is admitted for reads but this invocation writes.
+
+    Only used to choose the refusal wording. "this subcommand is not
+    allowlisted" sends the agent to ask for a prefix that is already configured,
+    and it retries or works around instead of dropping the write.
+    """
+    if allowed_command(tool, argv) or requests_read_only(argv):
+        return False
+    tokens = leading_tokens(argv, boolean_flags=tool.boolean_flags)
+    return any(tokens[: len(prefix)] == prefix for prefix in tool.allow_read_only)
 
 
 def _path_candidates(item: str) -> list[str]:
@@ -429,21 +659,201 @@ def _path_candidates(item: str) -> list[str]:
     the tail of a boolean cluster as a path over-refuses at worst: `-abc` is
     checked as the relative path `bc`, which is inside the workspace and allowed.
     """
-    if not item.startswith("-"):
-        return [item]
-    candidates = item.split("=")[1:]
-    if not item.startswith("--"):
-        candidates.append(item[2:])
-    return candidates
+    # The value after the first `=` as well as each `=` segment: a JSON value can
+    # hold an `=` of its own, and the segments then cut it into invalid halves.
+    whole_value = item.split("=", 1)[1:]
+    if item.startswith("-"):
+        candidates = [*whole_value, *item.split("=")[1:]]
+        if not item.startswith("--"):
+            candidates.append(item[2:])
+    else:
+        # A bare `key=value` token carries a path in its value for any CLI that
+        # takes typed fields: `gh api -F body=@/etc/passwd` arrives as the single
+        # token `body=@/etc/passwd`, which is not a flag, so splitting only flags
+        # read the whole thing as one relative path inside the workspace.
+        candidates = [item, *whole_value, *item.split("=")[1:]]
+    candidates += [
+        text for candidate in candidates for text in _json_strings(candidate)
+    ]
+    return [form for candidate in candidates for form in _introduced_paths(candidate)]
 
 
-def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None:
+# Every string literal in JSON text, found without parsing it. A parser gives up on
+# deep nesting (RecursionError) and on the lenient spellings some CLIs accept, and
+# either failure would hand the guard nothing to check. A literal is a literal at
+# any depth, so this reads the same strings the tool's own parser would.
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _json_strings(candidate: str) -> list[str]:
+    """The string values inside a JSON argument, each read as a path candidate.
+
+    The guard reads a token as a path, so `--params '{"body":"/etc/passwd"}'` was
+    one relative-looking token. No brokered tool is known to open a file named
+    this way, and gws measured does not, but the guard should not depend on every
+    future tool's grammar. None of 675 real JSON arguments on the deployed host
+    held a value this refuses.
+    """
+    if candidate.lstrip()[:1] not in ("{", "["):
+        return []
+    strings = []
+    for literal in _JSON_STRING.findall(candidate):
+        try:
+            strings.append(json.loads(f'"{literal}"'))
+        except json.JSONDecodeError:
+            strings.append(literal)
+    return strings
+
+
+# How an argument says "what follows is a file". `@` is the convention curl set
+# and gh, http and jq share; `file://` is the URL spelling of the same thing.
+# Neither makes the argument start with `/`, so without this a path behind one
+# reads as an ordinary relative name and the guard lets it through.
+#
+# Matched case-insensitively, because RFC 3986 makes a URL scheme
+# case-insensitive and curl honours that: `FILE:///etc/passwd` reads the file,
+# measured. The `@` is unaffected by case, so one rule covers both.
+_PATH_INTRODUCERS = ("@", "file://")
+_URL_INTRODUCER = "file://"
+
+
+def _introduced_paths(candidate: str) -> list[str]:
+    """`candidate`, plus whatever it carries after a path introducer.
+
+    Applied repeatedly, because the forms nest: `body=@file:///etc/passwd` has to
+    shed the `@` and then the scheme before the absolute path is visible.
+
+    Emitting rather than refusing keeps this cheap to be wrong about. An extra
+    candidate only matters if it is absolute or traversing, so the ordinary Slack
+    and GitHub arguments that begin with `@` cost nothing: `@alice` yields the
+    extra candidate `alice`, which is relative and inside the workspace, exactly
+    like the argument it came from.
+    """
+    forms = [candidate]
+    seen = {candidate}
+    queue = [candidate]
+    while queue:
+        current = queue.pop()
+        for introducer in _PATH_INTRODUCERS:
+            if current[: len(introducer)].lower() != introducer:
+                continue
+            rest = current[len(introducer) :]
+            for form in (rest, *_url_forms(introducer, rest)):
+                if form and form not in seen:
+                    seen.add(form)
+                    forms.append(form)
+                    queue.append(form)
+    return forms
+
+
+def _url_forms(introducer: str, rest: str) -> tuple[str, ...]:
+    """The other readings of a `file://` URL's tail: authority dropped, decoded.
+
+    Two things a URL does that a filename does not, both measured against real
+    curl rather than read from a document:
+
+    - RFC 8089 makes `file://localhost/etc/passwd` mean `/etc/passwd`. Stripping
+      only the scheme leaves `localhost/etc/passwd`, which is relative, so the
+      guard would pass it. The authority is not parsed, because nothing here
+      needs to know what a valid one looks like -- everything from the first
+      slash is the path either way.
+    - The path is percent-decoded, so `%2e%2e` is `..` and `%2f` is `/`. Without
+      decoding, `file://<workspace>/%2e%2e/%2e%2e/etc/passwd` is lexically inside
+      the workspace and allowed, and curl then reads `/etc/passwd`.
+
+    Decoding runs to a fixed point rather than once. The caller re-queues what
+    this returns, but a decoded form no longer starts with `file://`, so it would
+    never re-enter this branch and `%252e%252e` would stop one step short of
+    `..`. curl decodes once, so that step is past what curl itself does; it is
+    taken anyway because over-refusing is the trade this guard makes everywhere,
+    and the only thing it costs is a filename whose literal name contains `%25`.
+    """
+    if introducer != _URL_INTRODUCER:
+        return ()
+    slash = rest.find("/")
+    forms = [rest[slash:]] if slash > 0 else []
+    return tuple(
+        decoded for form in (rest, *forms) if (decoded := _fully_decoded(form)) != form
+    ) + tuple(forms)
+
+
+# Enough for any real argument; a doubly-encoded path needs two.
+_MAX_DECODE_PASSES = 8
+
+
+def _fully_decoded(value: str) -> str:
+    """`value` percent-decoded until it stops changing.
+
+    Terminates because a decode either shortens the string (`%2e` -> `.`) or
+    leaves it alone, and the cap is belt-and-braces against a decoder that ever
+    stops being true.
+    """
+    for _ in range(_MAX_DECODE_PASSES):
+        decoded = urllib.parse.unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value
+
+
+def allowed_roots(tool: ShimmedTool) -> list[Path]:
+    """`tool.allow_paths`, resolved, minus every entry that is refused.
+
+    Validated against the sandbox's own refusal list rather than a second copy of
+    it. A broker root is a sharper grant than a jail grant, not a softer one: the
+    broker runs the real binary *outside* the sandbox holding the operator's real
+    credential, so a root reaching `~/.ssh` hands the agent that key through a
+    CLI that was only meant to read pull requests. Sharing the list is what keeps
+    a credential added there from staying reachable here.
+
+    A refused root is dropped and the rest are kept, matching `sandbox.extra_paths`
+    for the reason recorded there: one typo should not cost an operator the roots
+    that make the tool usable.
+    """
+    from claude_on_the_fly import sandbox
+
+    roots: list[Path] = []
+    for entry in tool.allow_paths:
+        resolved = sandbox.resolve_grant_entry(entry)
+        refusal = sandbox._extra_path_refusal(resolved)
+        if refusal is not None:
+            logger.error(
+                "commands: %s allow_paths entry %r (resolved to %s) is refused: "
+                "%s. The broker runs outside the sandbox with a real credential, "
+                "so this root would be readable with the operator's identity.",
+                tool.name,
+                entry,
+                resolved,
+                refusal,
+            )
+            continue
+        roots.append(resolved)
+    return roots
+
+
+def _unsafe_path_argument(
+    argv: list[str], cwd: str | None = None, allow_roots: Iterable[Path] = ()
+) -> str | None:
     """Return the first absolute/traversing/escaping argument, or ``None``.
 
     The broker is not a file-transfer channel. Relative paths are still allowed
     for a vetted command and are resolved by the CLI from the session workspace;
     host-absolute and escaping paths are refused before process creation. The
     Windows check matters when a cross-platform config is exercised on macOS.
+
+    An absolute path is judged by where it lands, not by its leading slash. One
+    that resolves inside a root is the session's own workspace written the long
+    way, and refusing it while allowing the relative spelling of the same file
+    guarded nothing -- it only taught the agent to rewrite the argument.
+
+    `allow_roots` carries every tree an absolute argument may land in: the
+    operator's `allow_paths` entries, and the session workspace itself when the
+    caller has one. The workspace is passed in rather than taken from `cwd`,
+    because `cwd` is only vetted against a workspace when there is one to vet it
+    against. With none, `_workspace_cwd` accepts whatever the client said, and
+    treating that as a root would make a declared cwd of `/` admit every absolute
+    path on the host. Containment is checked after resolving, so a symlink planted
+    in the workspace cannot point into a root and then out the other side.
 
     With ``cwd``, each candidate is also resolved against it and required to stay
     inside. That is the only reading that catches a relative path through a
@@ -458,11 +868,16 @@ def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None
     rather than restating it.
     """
     root = Path(cwd).resolve(strict=False) if cwd else None
+    permitted = [Path(entry).resolve(strict=False) for entry in allow_roots]
     for item in argv:
         for candidate in _path_candidates(item):
             if not candidate or candidate == ".":
                 continue
-            if candidate == ".." or candidate.startswith(("/", "~/", "~\\")):
+            if candidate.startswith(("/", "~/", "~\\")):
+                if _within_any(candidate, permitted):
+                    continue
+                return item
+            if candidate == "..":
                 return item
             if (
                 PureWindowsPath(candidate).is_absolute()
@@ -472,6 +887,24 @@ def _unsafe_path_argument(argv: list[str], cwd: str | None = None) -> str | None
             if root is not None and not _contained(root, candidate):
                 return item
     return None
+
+
+def _within_any(candidate: str, allow_roots: Iterable[Path]) -> bool:
+    """Whether an absolute candidate resolves inside one of the allowed roots.
+
+    Resolved first, so `~` and a symlink are judged by where they land. A
+    candidate that resolves nowhere is not inside anything and is refused, which
+    is the opposite of `_contained`'s reading: there an unresolvable path was
+    already relative and confined, here it is the agent naming a host path that
+    does not exist yet, and a write would create it.
+    """
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):  # pragma: no cover - resolve is lexical here
+        return False
+    return any(
+        resolved == root or resolved.is_relative_to(root) for root in allow_roots
+    )
 
 
 def _contained(root: Path, candidate: str) -> bool:
@@ -641,6 +1074,17 @@ class CommandBroker:
             self._session_workspaces[token] = workspace.resolve(strict=False)
         return {ENDPOINT_ENV: self.endpoint(), TOKEN_ENV: token}
 
+    def publish_endpoint(self) -> None:
+        """Put the endpoint, and only the endpoint, in this daemon's environment.
+
+        The endpoint is harmless daemon-wide, and `sandbox.agent_env` forwards it
+        to every spawn. The bearer token must be issued per turn and bound to that
+        turn's workspace, so the private base token is kept out of the environment
+        where agent_env could forward it by accident.
+        """
+        os.environ[ENDPOINT_ENV] = self.endpoint()
+        os.environ.pop(TOKEN_ENV, None)
+
     def revoke_token(self, token: str) -> None:
         """Revoke one per-turn workspace token after its agent is reaped."""
         self._session_workspaces.pop(token, None)
@@ -700,11 +1144,19 @@ class CommandBroker:
                 # else under DATA_DIR, so it is the one place a sandboxed agent can
                 # exec a generated helper from.
                 continue
+            if stale.name.startswith("."):
+                # Another daemon's shim mid-write (see below). Both daemons
+                # write this directory, and sweeping the temp file fails that
+                # daemon's rename.
+                continue
             if stale.is_file() and stale.name not in self._tools:
                 logger.info("commands: removing stale shim %s", stale.name)
                 stale.unlink()
         for name in self._tools:
-            path = self._shim_dir / name
+            # Written aside and renamed over. The chat and jobs daemons both
+            # write here at start, and an agent may exec a shim at any moment;
+            # a rename hands it the old file or the new one, never half of one.
+            path = self._shim_dir / f".{name}.{os.getpid()}.tmp"
             path.write_text(
                 _SHIM_SOURCE.format(
                     interpreter=sys.executable,
@@ -717,6 +1169,7 @@ class CommandBroker:
                 )
             )
             path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+            os.replace(path, self._shim_dir / name)
 
     async def _handle(self, request):
         from aiohttp import web
@@ -772,10 +1225,35 @@ class CommandBroker:
     ) -> CommandResult:
         if not allowed_command(tool, argv):
             logger.warning(
-                "commands: REFUSE %s %s (not in the configured command allowlist)",
+                "commands: REFUSE %s %s (%s)",
                 tool.name,
                 logs.redact_argv(argv),
+                "write on a read-only subcommand"
+                if refused_as_write(tool, argv)
+                else "a flag before the subcommand"
+                if hidden_by_a_leading_flag(tool, argv)
+                else "not in the configured command allowlist",
             )
+            if refused_as_write(tool, argv):
+                return CommandResult(
+                    stderr=(
+                        f"[sandbox] {tool.name} may run this subcommand to read, "
+                        "but this invocation asks the server to write. Re-run it "
+                        "as a read, or ask the operator to do the write.\n"
+                    ),
+                    rc=126,
+                    refused=True,
+                )
+            if hidden_by_a_leading_flag(tool, argv):
+                return CommandResult(
+                    stderr=(
+                        f"[sandbox] {tool.name}: a flag before the subcommand "
+                        "hides it from the allowlist. Put every flag after the "
+                        "subcommand and run it again.\n"
+                    ),
+                    rc=126,
+                    refused=True,
+                )
             return CommandResult(
                 stderr=(
                     f"[sandbox] {tool.name} subcommand is not allowlisted. "
@@ -813,7 +1291,14 @@ class CommandBroker:
                 refused=True,
             )
 
-        unsafe_path = _unsafe_path_argument(argv, cwd)
+        # The workspace joins the operator's roots here rather than being taken
+        # from `cwd` inside the guard: `cwd` is only vetted when there is a
+        # workspace to vet it against, so a session without one must not have its
+        # client-declared cwd promoted to an allow root.
+        roots = allowed_roots(tool)
+        if workspace is not None:
+            roots.append(Path(cwd))
+        unsafe_path = _unsafe_path_argument(argv, cwd, roots)
         if unsafe_path is not None:
             logger.warning(
                 "commands: REFUSE %s %s (absolute or escaping path argument)",

@@ -7,11 +7,12 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from claude_on_the_fly.agent import ClaudeUnavailableError, Response
+from claude_on_the_fly.jobs import agent_runner as agent_runner_mod
 from claude_on_the_fly.jobs.agent_runner import (
     RUNS_DIRNAME,
     OrchestratorAgentRunner,
@@ -471,7 +472,7 @@ async def test_platform_rides_on_the_job(tmp_path: Path) -> None:
 async def test_in_flight_is_populated_during_the_run_and_cleared_after(
     tmp_path: Path,
 ) -> None:
-    """The heartbeat's jobs watch pane resolves a running job's live session
+    """The heartbeat's jobs live view resolves a running job's live session
     from this; it must be present while the agent runs and gone when it
     ends."""
     runner = OrchestratorAgentRunner(data_dir=tmp_path)
@@ -651,3 +652,237 @@ def test_sweep_skips_an_entry_it_cannot_stat(tmp_path: Path) -> None:
 
     assert removed == [good]
     assert not good.exists()
+
+
+class TestJobPaneLifecycle:
+    async def test_a_hosted_job_publishes_its_pane_and_reaps_it(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """pytest's tmp_path is deep enough that pane_for correctly refuses it, so
+        the hosted path needs a pane handed in."""
+        from claude_on_the_fly import sandbox, tmux
+
+        pane = tmux.Pane(session="cotf-job-run-1")
+        killed: list[str] = []
+        monkeypatch.setattr(tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux, "pane_for", lambda _name: pane)
+        monkeypatch.setattr(tmux, "kill", lambda p: killed.append(p.session))
+        seen: dict = {}
+
+        async def capture_env(*_args, **_kwargs):
+            seen["env"] = dict(sandbox.agent_env() or {})
+            return Response(body="done")
+
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with patch.object(agent_runner_mod.agent, "run", capture_env):
+            result = await runner.run(_job(prompt="hi"))
+
+        assert result.ok is True
+        assert seen["env"]["TMUX_TMPDIR"] == str(tmux.panes_root())
+        assert killed == ["cotf-job-run-1"]
+
+    async def test_an_unhosted_job_reaps_nothing(self, tmp_path: Path, monkeypatch):
+        from claude_on_the_fly import tmux
+
+        monkeypatch.setattr(tmux, "hosting_available", lambda: True)
+        monkeypatch.setattr(tmux, "pane_for", lambda _name: None)
+
+        def refuse(_pane):
+            raise AssertionError("reaped a pane that was never created")
+
+        monkeypatch.setattr(tmux, "kill", refuse)
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with patch.object(
+            agent_runner_mod.agent, "run", AsyncMock(return_value=Response(body="done"))
+        ):
+            result = await runner.run(_job(prompt="hi"))
+
+        assert result.ok is True
+
+
+class TestMinToolCalls:
+    """A per-entry floor on how much work a run had to do to count as a success.
+
+    An agent that refuses, or answers without acting, raises nothing, so the old
+    code recorded it `ok=True` and alerted nobody. The floor rides the existing
+    failure path instead of adding a second one.
+    """
+
+    async def _run(self, tmp_path: Path, response: Response, **job_kwargs):
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with (
+            patch("claude_on_the_fly.jobs.agent_runner.agent.run") as mock_run,
+            patch(
+                "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+                return_value="claude:native:sonnet",
+            ),
+        ):
+            mock_run.return_value = response
+            return await runner.run(_job("p", **job_kwargs))
+
+    async def test_the_tool_call_count_rides_on_the_result(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, Response(body="done", tool_counts={"Bash": 3, "Read": 1})
+        )
+        assert result.ok is True
+        assert result.tool_calls == 4
+
+    async def test_no_floor_keeps_a_toolless_run_green(self, tmp_path: Path):
+        """An entry whose guard acts only every other run legitimately does
+        nothing on the runs in between, so a blanket check is wrong. Unset means
+        unset."""
+        result = await self._run(tmp_path, Response(body="nothing to do"))
+        assert result.ok is True
+        assert result.tool_calls == 0
+
+    async def test_a_run_below_the_floor_fails(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, Response(body="I will not do that"), min_tool_calls=1
+        )
+        assert result.ok is False
+        assert result.tool_calls == 0
+        # The agent's own words survive, so the alert says what it actually said.
+        assert "I will not do that" in result.text
+        # ...behind the reason, which is the part the reader needs first.
+        assert result.text.startswith("Job did nothing:")
+
+    async def test_a_run_that_meets_the_floor_passes(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            Response(body="done", tool_counts={"Bash": 2}),
+            min_tool_calls=2,
+        )
+        assert result.ok is True
+        assert result.text == "done"
+
+    async def test_a_run_under_a_floor_above_one_fails(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            Response(body="had a look", tool_counts={"Read": 1}),
+            min_tool_calls=3,
+        )
+        assert result.ok is False
+        assert result.tool_calls == 1
+        assert "made 1 tool call, below the floor of 3" in result.text
+
+    async def test_a_raised_failure_still_reports_no_tool_calls(self, tmp_path: Path):
+        runner = OrchestratorAgentRunner(data_dir=tmp_path)
+        with (
+            patch("claude_on_the_fly.jobs.agent_runner.agent.run") as mock_run,
+            patch(
+                "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+                return_value="claude:native:sonnet",
+            ),
+        ):
+            mock_run.side_effect = ClaudeUnavailableError("no backend")
+            result = await runner.run(_job("p", min_tool_calls=1))
+        assert result.ok is False
+        assert result.tool_calls == 0
+
+
+class _RecordingBrokers:
+    """Stands in for JobBrokers: hands over an env and records the release."""
+
+    def __init__(self) -> None:
+        self.entered: list[tuple[Path, str]] = []
+        self.model_envs: list[dict[str, str]] = []
+        self.released = 0
+
+    def for_job(self, workspace: Path, key: str, model_env=None):
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def scope():
+            self.entered.append((workspace, key))
+            self.model_envs.append(dict(model_env or {}))
+            try:
+                yield {"COTF_CMD_TOKEN": "job-token"}
+            finally:
+                self.released += 1
+
+        return scope()
+
+
+async def test_the_brokers_get_the_jobs_model_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolved from the job's own profile, before the relay opens. A job
+    running an ollama profile otherwise had no route to its model server."""
+    from claude_on_the_fly import sandbox
+
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    monkeypatch.setattr(
+        sandbox,
+        "model_endpoint_env",
+        lambda mode: {"OLLAMA_HOST": f"for-{mode}"},
+    )
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            AsyncMock(return_value=Response(body="ok")),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.resolve_profile",
+            return_value=MagicMock(mode="ollama"),
+        ),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:ollama:glm",
+        ),
+    ):
+        await runner.run(_job())
+
+    assert brokers.model_envs == [{"OLLAMA_HOST": "for-ollama"}]
+
+
+async def test_a_job_agent_runs_with_the_brokers_env(tmp_path: Path) -> None:
+    """The jobs daemon had no broker, so a job's agent found the shim and no
+    token. The env is layered for the run and released after it."""
+    from claude_on_the_fly import sandbox
+
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    seen: dict = {}
+
+    async def _fake_run(**kwargs):
+        seen["env"] = dict(sandbox._SESSION_ENV.get() or {})
+        seen["released_during_run"] = brokers.released
+        return Response(body="ok")
+
+    with (
+        patch("claude_on_the_fly.jobs.agent_runner.agent.run", side_effect=_fake_run),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        await runner.run(_job())
+
+    assert seen["env"]["COTF_CMD_TOKEN"] == "job-token"
+    assert seen["released_during_run"] == 0
+    assert brokers.released == 1
+    workspace, _key = brokers.entered[0]
+    assert workspace.parent == tmp_path / "workspaces" / "jobs" / "__runs"
+    assert not (sandbox._SESSION_ENV.get() or {})
+
+
+async def test_a_failed_job_still_releases_its_brokers(tmp_path: Path) -> None:
+    brokers = _RecordingBrokers()
+    runner = OrchestratorAgentRunner(data_dir=tmp_path, brokers=brokers)
+    with (
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.agent.run",
+            side_effect=ClaudeUnavailableError("down"),
+        ),
+        patch("claude_on_the_fly.jobs.agent_runner.agent.ensure_persona"),
+        patch(
+            "claude_on_the_fly.jobs.agent_runner.current_backend_key",
+            return_value="claude:native:sonnet",
+        ),
+    ):
+        result = await runner.run(_job())
+    assert result.ok is False
+    assert brokers.released == 1

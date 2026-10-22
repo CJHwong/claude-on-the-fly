@@ -70,10 +70,11 @@ egress:
     - chatgpt.com
     - ab.chatgpt.com
 
-  # Hostnames allowed to resolve to a private or loopback address. This is a
-  # separate opt-in from `allow`: adding a name to the normal allowlist never
-  # disables DNS-rebinding/SSRF protection. Use this only for a known local
-  # development service, and keep the service bound to the intended interface.
+  # Hostnames, or IPv4/IPv6 addresses, allowed to resolve to a private or
+  # loopback address. This is a separate opt-in from `allow`: adding a name to
+  # the normal allowlist never disables DNS-rebinding/SSRF protection. Use this
+  # only for a known local development service, and keep the service bound to
+  # the intended interface. Link-local addresses stay refused even when listed.
   private_allow: []
 
   # Hosts refused outright, never offered to the operator. Cloud metadata
@@ -115,13 +116,46 @@ commands:
   #                    broker runs unjailed, so anything not listed stays out of
   #                    the subprocess.
   #
+  #   allow_read_only   prefixes allowed only when the invocation asks the
+  #                     server to read. For a subcommand that is an entire REST
+  #                     API behind one word, `allow` is all-or-nothing: `gh api`
+  #                     reads a file and also rewrites repository settings.
+  #                     Listing it here admits the reads and refuses the writes.
+  #                     An explicit `--method`/`-X` decides; without one, a
+  #                     parameter flag (`-f`, `-F`) counts as a write, because
+  #                     gh switches to POST as soon as a parameter is added.
+  #                     Omit the key to keep a tool exactly as it was.
+  #
+  #   allow_paths       trees outside the session workspace this tool may be
+  #                     given absolute path arguments for. Every absolute path is
+  #                     refused by default, which is right for a credentialed CLI
+  #                     and wrong for one whose job is to read a file the agent
+  #                     names. An absolute path that lands inside the session
+  #                     workspace never needed this key. The broker runs outside
+  #                     the sandbox with the real credential, so an entry that
+  #                     reaches a credential store is logged at ERROR and dropped.
+  #
+  #   boolean_flags     flags that never take a value. A command runs only when
+  #                     both flag readings admit it: a bare flag taking the next
+  #                     token, and taking none. So without this,
+  #                     `systemctl --user status x` is refused, and the agent is
+  #                     told to move the flag after the subcommand. List the
+  #                     boolean flags the agent writes first.
+  #
+  #   value_flags       flags that always take the next token as their value, so
+  #                     `twg -o json jira workitem get` reads as `jira workitem
+  #                     get`. Only list a flag that really takes one: a boolean
+  #                     flag listed here hides the next word from the allowlist.
+  #                     The readback check ignores this list.
+  #
   #   allow             safe leading subcommands. The list is deny-by-default;
   #                    flags and arguments may follow the listed words. A
   #                    credentialed CLI is not a general shell, so `gh api`,
   #                    `gh alias`, auth changes, and mutations stay unavailable
   #                    unless an operator explicitly adds a narrowly chosen
   #                    prefix. The loopback endpoint also requires a per-daemon
-  #                    bearer token.
+  #                    bearer token. A help request (`<words> --help`, `-h`,
+  #                    `--version`, or a leading `help`) needs no entry.
   tools:
     - name: gh
       # `gh auth token` and `--show-token` print the credential itself.
@@ -131,14 +165,35 @@ commands:
         - auth token
       readback_flags:
         - --show-token
+      # Reads only. Left out on purpose: `api` (all-or-nothing; see
+      # allow_read_only), `pr checkout` and the `download` subcommands (they write
+      # files), `gist`, `secret`, `variable`, and anything that mutates.
       allow:
+        # pull requests
         - pr list
         - pr view
-        - repo view
+        - pr diff
+        - pr checks
+        - pr status
+        # issues and repositories
         - issue list
         - issue view
+        - issue status
+        - repo view
+        - label list
+        # CI
         - run list
         - run view
+        - workflow list
+        - workflow view
+        # releases
+        - release list
+        - release view
+        # discovery
+        - search issues
+        - search prs
+        - search repos
+        - search code
       env_passthrough: [GH_HOST, GH_REPO, GH_PAGER, NO_COLOR]
 
     - name: acli
@@ -156,6 +211,54 @@ commands:
         - jira workitem view
         - jira workitem get
       env_passthrough: [ACLI_SITE, NO_COLOR]
+
+    - name: aws
+      # AWS CLI. The credential is whatever ~/.aws and AWS_PROFILE resolve to,
+      # so give that profile read-only IAM permissions.
+      #
+      # Every `allow` entry is one read-only API call. Matching is by whole word,
+      # so there is no `describe-*`: each call is listed. Left out on purpose:
+      # anything returning environment variables (lambda get-function*, ecs
+      # describe-task-definition), secretsmanager, ssm get-parameter*, and s3 cp /
+      # sync, which move files. `readback` refuses the calls whose output is
+      # itself a credential, so widening `allow` later cannot leak one.
+      readback:
+        - configure get
+        - configure export-credentials
+        - sts get-session-token
+        - sts get-federation-token
+        - sts assume-role
+        - sts assume-role-with-saml
+        - sts assume-role-with-web-identity
+        - sso get-role-credentials
+        - ecr get-login-password
+        - ecr get-authorization-token
+        - eks get-token
+        - codeartifact get-authorization-token
+        - rds generate-db-auth-token
+      allow:
+        # identity
+        - sts get-caller-identity
+        # storage
+        - s3 ls
+        # logs and metrics. `logs tail --follow` never returns; leave it off.
+        - logs describe-log-groups
+        - logs filter-log-events
+        - logs tail
+        - cloudwatch describe-alarms
+        - cloudwatch get-metric-statistics
+        # compute
+        - ec2 describe-instances
+        - ecs list-clusters
+        - ecs list-services
+        - ecs describe-services
+        - ecs list-tasks
+        - ecs describe-tasks
+        - lambda list-functions
+        # deployments
+        - cloudformation describe-stacks
+        - cloudformation describe-stack-events
+      env_passthrough: [AWS_PROFILE, AWS_REGION, AWS_DEFAULT_REGION, AWS_PAGER, NO_COLOR]
 
 permissions:
   # Whether a tool call can reach you for approval. Changing mode needs a restart.
@@ -238,14 +341,54 @@ sandbox:
   #   jail          as env, plus a seatbelt denying egress and keychain reads (macOS)
   # mode: "off"
 
+  # What happens to the agent's outbound HTTPS. Needs a chat-daemon restart: it
+  # decides whether the proxy is constructed at all.
+  #   gated (default) the proxy asks you about any host outside `egress.allow`
+  #   open            the proxy tunnels any public host without asking
+  #   off             no proxy
+  # Quote the value. YAML reads a bare `off` as a boolean; both spellings work.
+  #
+  # `egress.allow` matches host names exactly, with no wildcard and no suffix
+  # match, so an agent that reads the open web reaches a new host most turns and
+  # gating turns nearly every turn into a prompt. `open` is the setting for that
+  # agent. It drops only the allowlist question: a malformed name, a `never_ask`
+  # metadata endpoint, and an address resolving private or loopback without
+  # `egress.private_allow` are refused exactly as before. What it gives up is
+  # inspection -- the tunnel is not read, so a host reached this way is a covert
+  # channel. Under `mode: jail` that is the intended pairing: the filesystem
+  # denies decide what the agent can read, this decides who it can talk to.
+  #
+  # `off` under `mode: jail` is a lockdown, not a mistake. The relay still
+  # bridges the credential broker, so model calls work and the agent has no
+  # internet.
+  # egress: gated
+
   # jail mode only. deny-most makes $HOME opaque; grant the agent's own interpreter
-  # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3.
+  # (mise, nvm, ~/.local/bin) via extra_paths or the run cannot start. Capped at 3
+  # on macOS only, because SBPL has no arrays; Linux takes a list of any length.
+  # Entries are granted read-only; `write_paths` below is the one that grants
+  # writes.
   # Name a directory, not $HOME: a grant is written after the profile's denies and
   # wins over them. An entry that is the home, an ancestor of it, or a path reaching
   # a credential store or file the profile denies is logged at ERROR and dropped.
   # fs: deny-most
   # extra_paths:
   #   - /opt/homebrew
+
+  # jail mode only. Paths the agent may write as well as read. Same shape and same
+  # caps as extra_paths, and every entry extra_paths would refuse is refused here
+  # too. A write grant refuses more, because it can leave something behind that
+  # runs later outside the jail: an entry reaching a shell rc, a git config, a
+  # systemd or autostart unit, a LaunchAgent, a directory on the daemon's PATH, or
+  # an agent config tree (~/.claude, ~/.codex, ~/.agents) is logged at ERROR and
+  # dropped. That list catches the common mistakes and is not a boundary.
+  # Inside a granted tree, a repository's .git/hooks and .git/config and the file
+  # behind a linked cron.yaml or config.yaml stay read-only. Name one of those as
+  # its own entry to make it writable.
+  # Grant the narrowest tree that works. This is the setting that decides what a
+  # turn can still change after it ends.
+  # write_paths:
+  #   - ~/notes
 
   # Narrow egress to the broker's loopback port and the egress proxy's, nothing else.
   # broker_only_loopback: true
@@ -259,16 +402,25 @@ sandbox:
 
 agent:
   # backend: claude (default) | codex
-  # Per-backend mode: native | ollama; claude also has pty, the only mode that
-  # reports a context reading and can forward claude's own permission dialog.
+  # Per-backend mode: native | ollama | pty. `pty` runs the CLI's own interactive
+  # UI on a terminal, which is what makes the dashboard's watch pane worth
+  # looking at; for claude it is also the only mode that reports a context
+  # reading and can forward claude's own permission dialog. codex's `pty` needs a
+  # hosted pane (see `pane` below) and runs `codex exec` without one.
   # Leave a model unset to let the CLI pick its own.
   # backend: claude
   # claude:
   #   mode: native
   #   model: sonnet
+  #   effort: high
   # codex:
   #   mode: native
   #   model: o3
+  #   effort: high
+  #   # Codex signed in with ChatGPT: the credential broker holds auth.json and
+  #   # refreshes it, and the jail hides the file from the turn. Starts the broker
+  #   # even with the sandbox off. Restart to apply.
+  #   chatgpt_via_broker: true
   # ollama:
   #   model: deepseek-v4-flash:cloud
   #   effort: high
@@ -277,27 +429,143 @@ agent:
   #   # it is not actually talking to. State it here and both work; leave it unset
   #   # and neither does. Match it to the CLI's own limit.
   #   context_window: 200000
-  # Effort applies to the ollama-served model, whichever backend runs under it;
-  # in native (or pty) mode the CLIs inherit their own config and this setting
-  # never overrides it. Both backends accept low | medium | high | xhigh;
-  # claude additionally accepts max, codex additionally minimal. A level the
-  # active backend doesn't accept is ignored with a warning. Unset means
-  # whatever the CLI's own default is.
+  #   # How long ollama keeps a prompt cached, for idle compaction. Ollama's cache
+  #   # is implicit and documents no lifetime, and no cache_control TTL or
+  #   # keep_alive extends it. Measured on cloud models it ran from under 11
+  #   # minutes (glm-5.3-flash) to over 46 (deepseek-v4.1-flash), and a model
+  #   # could miss and then hit again, so treat this as a best estimate. Unset
+  #   # leaves ollama chats out of idle compaction.
+  #   cache_ttl_min: 10
+  # Effort is set by whichever key owns the model. `ollama.effort` applies to the
+  # ollama-served model, whichever backend runs under it, and wins whenever the
+  # launcher is in play. A backend's own `effort` applies to its native mode,
+  # where the CLI is the operator's: unset, nothing is passed and the CLI reads
+  # its own config (claude's effortLevel, codex's model_reasoning_effort); set,
+  # it overrides that for this daemon's spawns only. Both backends apply it in
+  # pty mode too: `-c` is a global codex option rather than an `exec` one, and
+  # `--effort` is a session flag interactive claude honours.
+  # Both backends accept low | medium | high | xhigh | max; codex additionally
+  # accepts minimal and ultra. A level the active backend doesn't accept is
+  # ignored with a warning.
+
+  # Named overrides of everything above, for one cron entry at a time. An entry
+  # in cron.yaml says `profile: cheap` and runs on that block; an entry that
+  # names none runs on the settings above, unchanged. Same nesting and same key
+  # names, so a profile reads like the block it overrides. Any key you leave out
+  # is inherited, which is why `local` below only has to name the two that
+  # differ. A profile also beats the matching environment variable: it is named
+  # per entry by the operator, not a daemon-wide default.
+  # Every profile is validated at daemon start, so a typo or an uninstalled CLI
+  # refuses to start rather than failing on the entry's first fire. Changing a
+  # profile's model changes the session identity, so a keyed entry starts a
+  # fresh transcript on the next fire instead of resuming its old one.
+  # profiles:
+  #   cheap:
+  #     codex:
+  #       model: gpt-5-mini
+  #       effort: low
+  #   local:
+  #     codex:
+  #       mode: ollama
+  #     ollama:
+  #       model: qwen3:30b
 
   # Compact before answering once the previous turn left the context at or above
   # this share of the window. Unset means compaction only on $compact.
   # auto_compact_pct: 80
+
+  # Compact a quiet chat shortly before its prompt cache expires, so the pass
+  # reads the context at the cached rate and the next message starts short. Off
+  # unless idle_compact is true. A chat qualifies once its last turn left at least
+  # idle_compact_tokens in the context and it has been quiet for the cache
+  # lifetime less idle_compact_lead_min: 25 minutes on codex (30-minute cache),
+  # 55 on claude, whose turns get CLAUDE_CODE_PROMPT_CACHE_TTL=1h while this is on
+  # (a value in the daemon's environment wins). That covers every claude turn, so
+  # cache writes cost about 2x base input instead of 1.25x. A value in claude's
+  # settings.json env block overrides it unseen; keep it out of there. Ollama
+  # mode needs ollama.cache_ttl_min; without it the chat is skipped. Nothing is
+  # posted; a message arriving meanwhile
+  # waits behind it under the hourglass.
+  # idle_compact: false
+  # idle_compact_tokens: 200000
+  # idle_compact_lead_min: 5
 
   # Caches. skills_cache_ttl_seconds <= 0 probes the CLI every query;
   # pricing_ttl_seconds of 0 always refreshes, negative never expires.
   # skills_cache_ttl_seconds: 3600
   # pricing_ttl_seconds: 21600
 
+  # Host each turn in its own tmux server, so the dashboard's watch pane can
+  # mirror the agent's own terminal instead of tailing its transcript. On
+  # wherever tmux is installed. Turn it off to run every turn as a plain child:
+  # the watch pane then falls back to the transcript, and codex runs
+  # `codex exec` rather than its interactive UI. Read per turn, so an edit takes
+  # effect on the next one without a restart.
+  # pane: true
+
   # claude-pty, used by claude's pty mode.
   # These controls act during startup preflight.
   # pty:
   #   auto_install: false
   #   auto_refresh: true
+
+# Account profiles select credentials when a conversation starts or resumes.
+# Definitions need a restart. Credentials stay in each CLI profile, never here.
+# Omit both sections to keep the existing daemon account behavior.
+accounts:
+#   claude_default:
+#     backend: claude
+#     home: null              # Leave CLAUDE_CONFIG_DIR unset.
+#   claude_local:
+#     backend: claude
+#     home: ~/.claude-local
+#     mode: ollama
+#     model: qwen3:30b
+#   codex_default:
+#     backend: codex
+#     home: null              # Use ~/.codex for authentication.
+#   codex_avery:
+#     backend: codex
+#     home: ~/.codex-avery
+#   codex_bela:
+#     backend: codex
+#     home: ~/.codex-bela
+#
+# Channel rule wins over initiating user rule, then the backend default.
+# A saved conversation keeps its account and fallback list through resume/restart.
+# Routing edits affect new conversations; /new selects again on Telegram.
+# A string pins one account. A list permits fallback on confirmed exhausted quota.
+# Each turn starts with its saved account and attempts each alias at most once.
+# The successful replacement stays selected. Routing edits affect new sessions.
+# Temporary rate limits, auth/network errors, and overload do not trigger fallback.
+# Partial work needs a complete native checkpoint; fallback continues from it.
+# Account profiles share workspace history. Every listed account must allow this.
+# Jobs use the backend default. A missing chosen account fails without fallback.
+routing:
+#   defaults:
+#     claude: claude_default
+#     codex:
+#       - codex_default
+#       - codex_avery
+#       - codex_bela
+#   slack:
+#     channels:
+#       C0123456789:
+#         codex:
+#           - codex_avery
+#           - codex_bela
+#     users:
+#       U0123456789:
+#         claude: claude_local
+#   telegram:
+#     channels:
+#       "-1001234567890":
+#         codex:
+#           - codex_avery
+#           - codex_bela
+#     users:
+#       "123456789":
+#         claude: claude_default
 
 watchdog:
   # `claude-watchdog` restarts a daemon whose process is alive but whose
@@ -314,8 +582,9 @@ watchdog:
 interim:
   # Forward the agent's mid-turn narration into the thread while a turn runs, so a
   # long turn is not silent. Off by default; native/ollama backends only (not
-  # claude pty); DMs and group DMs only. Pacing, in seconds: silence, then one
-  # digest per gap.
+  # claude pty); DMs and group DMs only. One message per turn, each update appended
+  # to it so it grows into a timeline, and left in the thread when the turn ends.
+  # Pacing, in seconds: silence, then one update per gap.
   # progress: true
   # warmup_seconds: 300
   # min_gap_seconds: 300
@@ -386,7 +655,7 @@ slack:
   # Failure-alert target: a Slack channel or DM id. Unset = no alerts. Needs a restart.
   # alert_target: C0123456789
 
-  # Threads retained before LRU eviction, replies per thread before the $continue gate;
+  # Threads retained before LRU eviction, turns per thread before the $continue gate;
   # seconds a gate notice is held (0 posts now), seconds a "tag me" notice waits (0 = never).
   # session_cap: 1000
   # reply_soft_limit: 10
@@ -444,6 +713,13 @@ jobs:
   # Needs a claude-jobs restart.
   # workspace_keep_days: 30
 
+  # Experimental. On a failed job, read the run's own transcript and append
+  # deterministic signals to the alert: whether the agent finished its turn, how
+  # the wall clock split between the model and its tools, whether a script the
+  # prompt named ever ran, and whether the same tool kept erroring. codex and
+  # claude; another backend alerts exactly as before.
+  # diagnose_failures: false
+
   # Per-job persona, keyed by the job key exactly as the producer set it. Only cron
   # sets one: the entry name, or <entry>/<item key> for a producer entry. A job with
   # no key ($job, claude-jobs enqueue) or an unlisted one gets `default`.
@@ -469,13 +745,40 @@ logs:
   # LOG_LEVEL stays an environment variable: logging is configured before this file
   # can be parsed, so a complaint about the file needs somewhere to go.
 
-upgrade:
-  # The command `claude-tui upgrade` (and the dashboard's [U]) runs to fetch new
-  # code, after it has drained the daemons and before it brings them back. Run
-  # through a shell, from the checkout root when there is one.
+daemons:
+  # How a frontend comes back up, when something other than this package owns
+  # it. Leave it out and the supervisor starts the daemon itself, as a child of
+  # whatever ran the command, which is right for a deployment you drive with
+  # `claude-tui start` and a terminal.
   #
-  # Leave it out and the command is derived from how this copy was installed: a
-  # git checkout gets `git pull --ff-only && uv sync`, a `uv tool install` gets
-  # `uv tool upgrade <tool>`. Set it when neither applies, or when your
-  # deployment updates some other way (a container image, a pinned tag).
-  # command: git fetch --tags && git checkout v1.4.0 && uv sync
+  # Set it when a service manager owns the daemons, which is the usual shape on
+  # a server. Stopping works either way, because systemd and launchd leave a
+  # deliberately stopped service alone. Starting does not: without this,
+  # `claude-tui start`, `claude-tui restart` and the dashboard's upgrade would
+  # leave the service manager's unit inactive while an unsupervised copy served
+  # traffic. Nothing brings that unit back on its own, because the manager reads
+  # the external stop as a clean exit.
+  #
+  # `{frontend}` is replaced with the frontend name, so one template covers
+  # every unit. The command runs through a shell. After it returns, the
+  # supervisor waits for the daemon's heartbeat and reports its pid, so a
+  # command that prints nothing is fine.
+  # restart_command: systemctl --user restart cotf-{frontend}
+
+upgrade:
+  # An upgrade is up to two commands, split by whether the daemons have to be
+  # down for them. `prepare_command` runs first, with every daemon still
+  # serving, so it is where the network round trip belongs. `command` replaces
+  # the code the daemons are running, so they stop for it and come back after.
+  #
+  # Leave it out and the commands are derived from how this copy was installed:
+  # a git checkout gets `git fetch` then `git merge --ff-only && uv sync`, and a
+  # `uv tool install` gets `uv tool upgrade <tool>` in one step, since uv builds
+  # the replacement environment itself. Set them when neither applies, or when
+  # your deployment updates some other way (a container image, a pinned tag).
+  #
+  # Set `prepare_command` only when the split is safe for your command. Anything
+  # it changes, a daemon still serving will read, so a fetch is fine and a
+  # checkout is not.
+  # prepare_command: git fetch --tags
+  # command: git checkout v1.4.0 && uv sync

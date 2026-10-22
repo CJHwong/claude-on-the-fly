@@ -29,6 +29,90 @@ workspace, so discovering a port does not by itself authorize a request or let a
 choose another cwd. `sandbox.agent_env` forwards provider base URLs but omits token-like
 daemon variables.
 
+## codex's ChatGPT login
+
+`codex_auth.py` turns codex's `auth.json` into a broker route. With
+`agent.codex.chatgpt_via_broker` on, `start_default_broker` adds a `/chatgpt` route to
+`https://chatgpt.com` whose `Route.source` is a `ChatGPTLogin`. The source is read per
+request, because the operator's own `codex` can rotate the token while the daemon runs.
+The broker publishes `COTF_CHATGPT_BASE_URL`, and two things key on that variable rather
+than on the setting: `CodexBackend._model_args` adds a custom provider pointed at it,
+and the jail denies `auth.json` (`_CODEX_AUTH` in `jail.sb`, a mask in `_linux_grants`,
+and a startup probe). The route and the deny therefore cannot disagree.
+
+The route starts with the sandbox off as well, alone, with no keychain route. That lets
+an operator run the broker on real traffic before turning the jail on. Publishing
+`ANTHROPIC_BASE_URL` there would move claude turns onto the broker as a side effect.
+
+Named Codex accounts add `/chatgpt/accounts/<name>` routes with independent path
+capabilities. The default capability cannot authorize these routes. An account's
+capability cannot authorize another route. The daemon keeps account URLs in memory;
+`codex_auth.published_url()` selects the current account. The sandbox publishes only
+that URL as `COTF_CHATGPT_BASE_URL` to the child. Account routes read their profile's
+`auth.json` and cache that source separately.
+
+Unused accounts can lack credentials. Selection checks the account's login before
+the child starts and never falls back to the default route. With named Codex
+accounts configured, the default login can also remain absent at startup.
+Refresh locks use the resolved profile path, so aliases share a lock. An alias of
+the default profile shares the existing `codex-auth.lock`.
+
+Refresh rules, from codex's own `manager.rs` and a live run against the token endpoint:
+
+- Refresh at 7 days, one day before codex's 8, or 5 minutes before the access token
+  expires, or after an upstream 401. A 401 gets one retry with the recovered token.
+- Take `DATA_DIR/state/codex-auth.lock` and re-read the file first. The chat daemon and
+  the jobs worker both run a broker, and only one should spend the token.
+- codex treats a refresh token as single-use. Measured, the endpoint accepted one that a
+  hand-run codex had spent seconds earlier, so a lost race may simply succeed. When it
+  is refused, the broker re-reads the file: a changed refresh token means another
+  process won, and nothing failed. An unchanged one is logged at
+  ERROR once, naming `codex login`, and not retried until the file changes.
+- Rewrite the file in place, the way codex does, keeping every field codex wrote. Not a
+  temporary file renamed over it: the Linux jail hides the file with a bind mount, and
+  a rename over the path on the host drops that mount in every namespace. Measured with
+  bubblewrap 0.11.1 on Linux 7.0, a jailed process read the new content a second after
+  the rename. A read that lands mid-write gets the broker's last good copy.
+
+Measured with codex 0.156 through the real route on macOS, with no placeholder headers:
+
+- `auth.json` hidden by seatbelt: a turn answered, and codex made two calls,
+  `POST backend-api/codex/responses` and `GET backend-api/plugins/featured`. Those two
+  are always needed.
+- `auth.json` visible (the jail off): a turn with a tool call answered, and codex also
+  called `codex/models`, `codex/analytics-events/events`, `ps/plugins/installed`,
+  `ps/plugins/list`, `ps/plugins/suggested/codex` and `wham/settings/user`. A
+  refusal did not affect the turn, but they are on the allowlist anyway, so the
+  jail-off stage behaves like codex without the broker. The cost is that a jailed
+  turn can reach them too with the operator's login. codex sent its own
+  `Authorization` once, and the broker stripped it.
+- codex 0.156 treats a denied `auth.json` as logged out and keeps going, rather than
+  exiting as 0.147 did.
+- With plugins on, codex's MCP client also polls `ps/mcp`, ChatGPT's apps and
+  connectors endpoint, every 10 to 30 seconds. Refused, each poll asked the operator
+  again and denied. It is on the allowlist.
+- codex closes every streamed model call after the last event and before the chunked
+  terminator. The broker logs that at DEBUG; aiohttp logged it as an unhandled error.
+  A caller can also hang up before the response headers go out, so `prepare()` has
+  the same guard.
+- The session token sits in every brokered path. The broker's `allow` line logs the
+  route path after the token is stripped, and `_RedactingAccessLogger` replaces
+  aiohttp's access line with one that shows `/_session/<redacted>/...`.
+
+Real cotf turns through `CodexBackend` (`gpt-6-luna`, `medium`), each answering
+correctly:
+
+| Case | Jail off | Jail on |
+|---|---|---|
+| exec, tool call writing a file | pass | pass, both bases |
+| exec, resume | pass | pass |
+| pty, tool call and resume | pass | pass (default `~/.codex`) |
+| resume a thread started without the broker | pass | not run |
+| `auth.json` read from a tool call | readable | refused |
+| 401 on a bad access token, then refresh and retry | | pass |
+| login 8 days old, refreshed before the call | | pass |
+| hand-run codex refreshes during the broker's refresh | pass | |
+
 ## Egress proxy
 
 `egress.py` handles HTTPS CONNECT without TLS interception. Packaged and operator host
@@ -45,6 +129,21 @@ outside the turn's workspace are rejected before process creation; readback pref
 flags prevent credential material crossing back. Tool entries merge by name; removed
 packaged refusals are warned. An operator override without `allow` therefore disables
 that tool until its safe subcommands are listed.
+
+The chat and jobs daemons each run a command broker on the one shim dir under
+`DATA_DIR`. That is safe: a shim carries no endpoint and reads `COTF_CMD_ENDPOINT` and
+`COTF_CMD_TOKEN` from its environment, so two daemons with the same config write
+identical files. `write_shims` writes each shim aside and renames it over, and the stale
+sweep skips dot files, so neither daemon can hand an agent half a shim or sweep the
+other's temp file. `sandbox._with_shims_on_path` still puts the shims on PATH only when
+the spawn env carries `COTF_CMD_ENDPOINT`, so a daemon with no broker runs the real
+binary rather than a shim with nothing to reach.
+
+`jobs/brokers.JobBrokers` gives a job what a chat turn gets: the credential broker, the
+command broker, a per-job egress proxy, and the jail relay. The token is bound to the
+job's workspace and revoked when the job ends. Nobody can answer a prompt for a job, so
+every gate is `DenyAllGate`: a command off the allowlist, a host off the egress list,
+and a credential route that would ask are all refused, and the log says so.
 
 The broker does not parse arbitrary CLI semantics after an allowed prefix. Generic API
 subcommands remain unavailable unless explicitly listed, and provider-side credential
@@ -75,7 +174,7 @@ Codex requires the hook trust bypass because inline hooks have no persisted trus
 Seatbelt therefore denies writes to Codex execution-control paths and re-grants only the
 runtime paths measured as necessary.
 
-## Per-thread session grants
+## Per-workspace session grants
 
 `sandbox.scope_sessions` gates the whole boundary and is off by default
 (`sandbox.scoped_sessions()`). Off, the granted path resolves back onto the store it
@@ -150,9 +249,11 @@ Linux wrap creates each mount source, and `mkdir` on a file target leaves a
 distinction, and same reason, as `_CODEX_PROTECTED_DIRS`.
 
 Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside the
-per-thread grant, so it is isolated by the same rule as the transcript and needs no
-grant of its own. Before the per-thread grant existed it was denied along with the
-session file, so memory was silently off under `jail` too.
+per-workspace grant, so it is isolated by the same rule as the transcript and needs no
+grant of its own. Before the per-workspace grant existed it was denied along with the
+session file, so memory was silently off under `jail` too. A workspace is one
+conversation, so every thread of a Slack channel or DM shares the grant; the boundary
+is between conversations, not between threads.
 
 Both bases reference all four, unlike `_EXTRA_*`, so `jail_argv` always passes them. A
 profile referencing an unpassed `-D` is refused outright, which is the failure worth

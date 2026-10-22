@@ -20,7 +20,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -131,7 +131,21 @@ ATTACHMENT_PLATFORMS = frozenset({"slack", "telegram"})
 # `cron` is deliberately absent: a keyed cron job resumes its own earlier session
 # on purpose, which is the whole reason it carries a session key.
 NO_HANDOFF_PLATFORMS = frozenset({"jobs"})
+# Frontends whose sessions share one workspace directory per conversation: every
+# thread of a Slack DM, group DM or channel, and every `/new` of a Telegram chat.
+# Their handoff must come from the same session on the other backend, never from
+# the newest transcript in the directory, which is a different thread's. `cron`
+# is deliberately absent: a keyed entry gets a new uuid when its profile changes
+# and picks its earlier transcript up from the same directory on purpose.
+SHARED_WORKSPACE_PLATFORMS = frozenset({"slack", "telegram"})
 OUTBOX_DIRNAME = "outbox"
+# Where a frontend puts what the person uploaded. Flat, inside the workspace, so
+# the agent's cwd-relative `inbox/<name>` in the message is the path it reads.
+INBOX_DIRNAME = "inbox"
+# The conversation's own memory, inside its workspace. Inside rather than under
+# `memory/` because the jail grants only the running workspace: a DM's notes are
+# then unreachable from a channel's session by the sandbox, not by a prompt rule.
+WORKSPACE_MEMORY_DIRNAME = "memory"
 OUTBOX_ARCHIVE = ".sent"
 MAX_ATTACHMENTS = 10
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -143,14 +157,71 @@ OUTBOX_INSTRUCTION = (
     "  {outbox_dir}\n"
     "Use that absolute path, not a relative `outbox/` — your shell's working "
     "directory may differ. Everything left in that directory is uploaded to the "
-    "user along with your reply. When the user asks for a file, deliver it this "
-    "way. Do NOT tell the user you can only send text or cannot attach files, that "
-    "is false. Keep scratch and working files out of it.\n"
-    "If you have several files to deliver, zip them into a single archive and drop "
-    "that in instead, so the user gets one file rather than a flood of separate "
-    "uploads. A lone file goes in as-is.\n"
+    "user along with your reply. Do NOT tell the user you can only send text or "
+    "cannot attach files, that is false.\n"
+    "Rules for it:\n"
+    "- Answer in your reply by default. Use the outbox when the user asks for a "
+    "file, or when what they asked for is a file (a report, an export, an image).\n"
+    "- The file arrives with your reply, so do not announce the delivery and do "
+    "not name the outbox or its path. Describe the content if that helps.\n"
+    "- One file per deliverable, never zipped: the user prefers separate files "
+    "they can open. Only bundle when there are more than {max_attachments} files, "
+    "and say so.\n"
+    "- Keep scratch and working files out of it. Never touch `.sent/` next to "
+    "it, the daemon owns that archive.\n"
     "</IMPORTANT>"
 )
+
+# Appended to every chat turn on an attachment platform. The system prompt
+# names the outbox too, but claude persists that prompt with the session and a
+# healthy `--resume` never re-reads it, so a session started before a move (or
+# before the outbox became per session) would deliver into a directory nothing
+# collects. The turn's line wins over whatever the session remembers.
+OUTBOX_TURN_NOTE = (
+    "<cotf-outbox>System instruction, not user text. Files for the user go in "
+    "{outbox_dir} (this path replaces any outbox path given earlier). Nothing "
+    "else goes there.</cotf-outbox>"
+)
+
+
+def session_outbox(workspace: Path, session_uuid: str) -> Path:
+    """This session's own outbox. Every thread of a conversation shares the
+    workspace, and two can run at once, so a shared `outbox/` would hand one
+    thread's file to the other's reply and archive it away from its author.
+    The uuid is the one key both backends know before the turn starts."""
+    return workspace / OUTBOX_DIRNAME / session_uuid
+
+
+def outbox_note(outbox: Path) -> str:
+    return OUTBOX_TURN_NOTE.format(outbox_dir=outbox)
+
+
+def retire_outbox(outbox: Path) -> None:
+    """Drop a session's outbox once collected, so a human opening the
+    workspace sees `outbox/.sent/` and at most one directory for a turn in
+    flight. Anything still inside stays, and so does the directory."""
+    with contextlib.suppress(OSError):
+        outbox.rmdir()
+
+
+def unique_path(directory: Path, name: str) -> Path:
+    """`directory/name`, or the first `name-2`, `name-3`... that is free."""
+    candidate = directory / name
+    stem, suffix = Path(name).stem, Path(name).suffix
+    counter = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def inbox_path(workspace: Path, name: str) -> Path:
+    """A free path under `inbox/` for an upload called `name`. Flat rather than
+    per thread, because a thread folder per upload made the workspace unreadable
+    for the human it belongs to; a clash gets a numeric suffix instead."""
+    inbox = workspace / INBOX_DIRNAME
+    inbox.mkdir(parents=True, exist_ok=True)
+    return unique_path(inbox, Path(name).name)
 
 
 # The per-turn suggestions block the orchestrator appends to chat prompts, and
@@ -202,14 +273,14 @@ def strip_sender_markers(text: str) -> str:
     return _SENDER_MARKER_RE.sub("", text).strip()
 
 
-def collect_outbox(workspace: Path) -> list[Path]:
-    """Files the agent left in workspace/outbox to attach to the reply.
+def collect_outbox(outbox: Path) -> list[Path]:
+    """Files the agent left in `outbox` (a session's, see `session_outbox`) to
+    attach to the reply.
 
-    Only regular files directly under outbox/ — skips the archive dir, subdirs,
-    and dotfiles. Sorted by name for a deterministic order. Enforces count/size
-    caps and logs every skip; nothing is dropped silently.
+    Only regular files directly under it — skips subdirs and dotfiles. Sorted by
+    name for a deterministic order. Enforces count/size caps and logs every
+    skip; nothing is dropped silently.
     """
-    outbox = workspace / OUTBOX_DIRNAME
     try:
         outbox_stat = outbox.lstat()
     except OSError:
@@ -378,8 +449,18 @@ def _persona_path(platform: str, key: str, value: object) -> Path | None:
     # be reached through a symlink. An absolute value lands outside DATA_DIR and is
     # rejected here too: this file decides what instructions the agent runs under,
     # so it points at the operator's own data directory or nowhere.
+    #
+    # The candidate is normalized lexically rather than with `resolve()`, because
+    # `resolve()` conflates two jobs. Collapsing `..` is the containment property
+    # and is kept. Following symlinks is not, and doing it here made a symlinked
+    # `personas/` unusable: every entry resolved to wherever the link pointed,
+    # landed outside the root, and dropped its chat to the global persona with
+    # only a log line to say so. A symlink under the root is the operator's own
+    # indirection -- the same operator who chose the path -- so it is followed, by
+    # `is_file()` below, after containment has already been decided on the path
+    # they configured.
     root = DATA_DIR.resolve()
-    path = (DATA_DIR / value).resolve()
+    path = Path(os.path.normpath(root / value))
     if not path.is_relative_to(root):
         logger.error(
             "%s.personas: `%s` -> %s escapes %s; ignoring it, so this chat falls "
@@ -470,11 +551,25 @@ def ensure_persona(workspace: Path, source: Path | None = None) -> None:
 
 def _unlink_personas(workspace: Path) -> None:
     """Remove persona symlinks pointing into DATA_DIR. A real file at either name
-    is the agent's or the operator's own and is left alone."""
-    root = DATA_DIR.resolve()
+    is the agent's or the operator's own and is left alone.
+
+    Ownership is judged from where the link points, not from where that target
+    ends up. `resolve()` would follow a symlinked `personas/` out to its real
+    location, decide the link was somebody else's, and leave a chat on a persona
+    no config still names -- the exact stale link this function exists to remove.
+    """
+    # Both spellings of the data root, because the two writers disagree: a per-chat
+    # link is written from the resolved root by `_persona_path`, the global one from
+    # DATA_DIR as configured by `ensure_persona`. On a host where DATA_DIR is itself
+    # reached through a symlink (/var on macOS) those are different strings for the
+    # same directory, and checking only one of them would strand the other's links.
+    roots = {DATA_DIR.resolve(), Path(os.path.normpath(DATA_DIR))}
     for filename in PERSONA_FILENAMES:
         target = workspace / filename
-        if target.is_symlink() and target.resolve().is_relative_to(root):
+        if not target.is_symlink():
+            continue
+        pointed_at = Path(os.path.normpath(target.parent / os.readlink(target)))
+        if any(pointed_at.is_relative_to(root) for root in roots):
             target.unlink()
 
 
@@ -527,24 +622,87 @@ FORMAT_HINTS = {
 }
 
 
+def where_you_are(
+    platform: str,
+    user_name: str,
+    channel_context: str,
+    workspace: Path | None,
+    session_uuid: str | None,
+    outbox_dir: Path | None,
+    facts: dict[str, str],
+) -> str:
+    """The block that closes the system prompt: every id the agent needs to know
+    where it is and where its own files go.
+
+    It is the one place the memory rules bind to a real path. Left to guess,
+    an agent keyed one person's memory on the display name in one thread and on
+    the platform id in the next (measured: both directories on one deployment).
+    Last in the prompt because everything in it varies per session, and the
+    prompt cache reuses the stable prefix before it.
+    """
+    sender_id = facts.get("sender_id") or user_name
+    sender = sender_id
+    if facts.get("sender_name"):
+        sender = f'{sender_id} (display "{facts["sender_name"]}")'
+    rows = [
+        ("platform", platform),
+        ("conversation", facts.get("conversation") or channel_context),
+        ("thread", facts.get("thread", "")),
+        ("session", session_uuid or ""),
+        ("sender", sender),
+        (
+            "workspace",
+            f"{workspace} (your cwd)" if workspace else "(current directory)",
+        ),
+        ("your memory", f"{MEMORY_ROOT}/users/{sender_id}/"),
+        ("uploads", f"{INBOX_DIRNAME}/ in the workspace"),
+        ("deliveries", str(outbox_dir) if outbox_dir else ""),
+    ]
+    width = max(len(label) for label, _value in rows) + 1
+    lines = [f"  {label + ':':<{width}} {value}" for label, value in rows if value]
+    return "Where you are\n" + "\n".join(lines)
+
+
 def build_system_prompt(
     platform: str,
     user_name: str,
     channel_context: str = "dm",
     workspace: Path | None = None,
+    session_uuid: str | None = None,
+    facts: dict[str, str] | None = None,
 ) -> str:
+    outbox_dir: Path | None = None
     if platform in ATTACHMENT_PLATFORMS and workspace is not None:
-        outbox = OUTBOX_INSTRUCTION.format(outbox_dir=workspace / OUTBOX_DIRNAME)
+        outbox_dir = (
+            session_outbox(workspace, session_uuid)
+            if session_uuid
+            else workspace / OUTBOX_DIRNAME
+        )
+        outbox = OUTBOX_INSTRUCTION.format(
+            outbox_dir=outbox_dir, max_attachments=MAX_ATTACHMENTS
+        )
     else:
         outbox = ""
     prompt = PROMPT_TEMPLATE.format(
         format_hint=FORMAT_HINTS.get(platform, FORMAT_HINTS["telegram"]),
         outbox_instruction=outbox,
-        user_name=user_name,
-        channel_context=channel_context,
+        location=where_you_are(
+            platform,
+            user_name,
+            channel_context,
+            workspace,
+            session_uuid,
+            outbox_dir,
+            facts or {},
+        ),
         workspace=str(workspace) if workspace is not None else "(current directory)",
         memory_root=MEMORY_ROOT,
         knowledge_dir=KNOWLEDGE_DIR,
+        workspace_memory=(
+            str(workspace / WORKSPACE_MEMORY_DIRNAME)
+            if workspace is not None
+            else WORKSPACE_MEMORY_DIRNAME
+        ),
     )
     # Backend-agnostic sandbox note (empty unless COTF_SANDBOX is on).
     guidance = sandbox.agent_guidance(workspace)
@@ -557,22 +715,20 @@ def build_system_prompt(
 class Compaction:
     """Outcome of a compaction turn.
 
-    `pre_tokens`/`post_tokens` come from the transcript's `compact_boundary`
-    record, which counts the *conversation* — not the billed prompt. The prompt
-    also carries the system prompt and tool schemas, tens of thousands of tokens
-    that compaction cannot touch, so `saved_tokens` is the ceiling on what a
-    later turn actually stops paying for, never the whole prompt.
+    `pre_tokens` is the whole prompt before the compaction: system prompt, tool
+    schemas and conversation. Nothing measures the whole prompt after it, so
+    there is no `post_tokens` beside it. claude reports one smaller number,
+    `conversation_tokens_after`, which counts the summarized conversation only
+    and leaves out the system prompt and tools. Measured on one thread: 55,161
+    before, 6,050 conversation after, and the next request was 50,171. Putting
+    the two side by side would claim a drop that the next turn does not pay.
     """
 
     ok: bool
     pre_tokens: int = 0
-    post_tokens: int = 0
+    conversation_tokens_after: int | None = None
     duration: float = 0
     error: str = ""
-
-    @property
-    def saved_tokens(self) -> int:
-        return max(0, self.pre_tokens - self.post_tokens)
 
     def summary(self) -> str:
         """One line for the user. Frontend-agnostic: no mrkdwn, no emoji."""
@@ -584,15 +740,21 @@ class Compaction:
                 if self.error
                 else "Nothing to compact."
             )
-        if not self.pre_tokens:
-            return "Compacted the conversation."
-        counts = f"{self.pre_tokens:,} → {self.post_tokens:,} tokens"
+        text = "Compacted the conversation"
         # Only claude records how long it took; codex publishes no compaction
         # duration, and "in 0s" reads as a suspiciously fast compaction rather
-        # than as a missing figure.
-        if not self.duration:
-            return f"Compacted the conversation: {counts}."
-        return f"Compacted the conversation: {counts} in {self.duration:.0f}s."
+        # than as a missing figure. The time sits by the verb it measures.
+        if self.duration:
+            text += f" in {self.duration:.0f}s"
+        if self.pre_tokens:
+            text += f" (it was {self.pre_tokens:,} tokens)"
+        text += "."
+        if self.conversation_tokens_after is not None:
+            text += (
+                f" The conversation part is now "
+                f"{self.conversation_tokens_after:,} tokens."
+            )
+        return text
 
 
 @dataclass
@@ -684,6 +846,7 @@ def _fold(
     compact: dict | None = None,
     last_usage: dict | None = None,
     last_text: dict | None = None,
+    last_model: dict | None = None,
 ) -> dict | None:
     """Apply one parsed stream-json message to running tallies.
 
@@ -698,6 +861,15 @@ def _fold(
     turn ends (see `_native_context_fields`); the last assistant message is
     the reading that reflects the context a compaction would actually see.
 
+    When last_model is given, it is replaced with each assistant message's
+    `model`, so the result line ends up naming the model that produced the
+    answer. The envelope's `modelUsage` cannot answer that: it is keyed by
+    every model the turn touched, in first-touched order, so a turn whose
+    first API call went to an auxiliary model names that one instead. A
+    measured two-model turn ordered it `['claude-sonnet-5',
+    'claude-haiku-4-5-20251001']`, and a daemon turn that opus answered
+    reported haiku.
+
     When last_text is given, it is replaced with each assistant message's
     text — but only when that text is real content, not a lone
     `<suggestions>` block. The final message of a turn is often just the
@@ -711,6 +883,10 @@ def _fold(
             usage = msg.get("message", {}).get("usage") or {}
             last_usage.clear()
             last_usage.update(usage)
+        if last_model is not None:
+            name = msg.get("message", {}).get("model")
+            if name:
+                last_model["model"] = name
         if last_text is not None:
             text = "".join(
                 block.get("text") or ""
@@ -762,6 +938,7 @@ def parse_stream(stdout: bytes) -> dict:
     compact: dict = {}
     last_usage: dict = {}
     last_text: dict = {}
+    last_model: dict = {}
     result: dict = {}
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -772,7 +949,9 @@ def parse_stream(stdout: bytes) -> dict:
         except json.JSONDecodeError:
             logger.warning("parse_stream: skipping malformed line: %s", line[:120])
             continue
-        r = _fold(msg, tool_counts, skill_counts, compact, last_usage, last_text)
+        r = _fold(
+            msg, tool_counts, skill_counts, compact, last_usage, last_text, last_model
+        )
         if r is not None:
             result = r
     if result:
@@ -780,10 +959,19 @@ def parse_stream(stdout: bytes) -> dict:
         result["skill_counts"] = skill_counts
         result["compact"] = compact
         result["last_assistant_text"] = last_text.get("text", "")
+        result["last_assistant_model"] = last_model.get("model", "")
     return result
 
 
 DEFAULT_TIMEOUT = 3600.0
+# Cap for a compaction when the caller sets none, on every backend. The chat
+# frontends all leave `timeout_for` at its default of None, which the executors
+# read as "wait with no deadline" — fine for a turn a human is watching, wrong
+# for this: a compaction is a single summarization pass (measured at 8-22s,
+# minutes on a very large thread), and the drain loop is serial per chat, so an
+# unbounded one wedges every message queued behind it. The idle loop runs one
+# with nobody watching at all.
+COMPACT_TIMEOUT = 900.0
 MAX_AGENT_OUTPUT_BYTES = 8 * 1024 * 1024
 
 
@@ -791,14 +979,20 @@ class AgentOutputLimitError(RuntimeError):
     """The CLI produced more output than a supervised turn may buffer."""
 
 
+class AgentTurnError(RuntimeError):
+    """A failed turn with a short, safe explanation for the requester."""
+
+    def __init__(self, diagnostic: str, public_message: str) -> None:
+        super().__init__(diagnostic)
+        self.public_message = public_message
+
+
 # Chunk size for the drain loop below. Any value works; this one keeps the
 # syscall count sane on an 8 MB cap without holding a large slice per read.
 _READ_CHUNK_BYTES = 64 * 1024
 
 
-async def _read_to_eof_capped(
-    stream: asyncio.StreamReader, on_chunk: Callable[[bytes], None] | None = None
-) -> bytes:
+async def _read_to_eof_capped(stream: asyncio.StreamReader) -> bytes:
     """Read a stream to EOF, stopping early once the cap is passed.
 
     `StreamReader.read(n)` with a positive `n` returns as soon as *any* byte is
@@ -812,10 +1006,6 @@ async def _read_to_eof_capped(
     different things from an over-cap stream: one reports it, one kills the
     process group. Reading one byte past the cap before stopping is what keeps
     their `len(...) > cap` test honest.
-
-    `on_chunk` sees each chunk as it lands, for a caller that needs to react to
-    output *during* the turn rather than after EOF — which a backend whose CLI
-    can finish its work and then never close the pipe has no other way to do.
     """
     chunks: list[bytes] = []
     total = 0
@@ -825,8 +1015,6 @@ async def _read_to_eof_capped(
             break
         chunks.append(chunk)
         total += len(chunk)
-        if on_chunk is not None:
-            on_chunk(chunk)
     return b"".join(chunks)
 
 
@@ -947,6 +1135,7 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     compact: dict = {}
     last_usage: dict = {}
     last_text: dict = {}
+    last_model: dict = {}
     result: dict = {}
     line_count = 0
     stdout_bytes = 0
@@ -969,7 +1158,15 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
             except json.JSONDecodeError:
                 logger.warning("exec: skipping malformed line: %s", line[:120])
                 continue
-            r = _fold(msg, tool_counts, skill_counts, compact, last_usage, last_text)
+            r = _fold(
+                msg,
+                tool_counts,
+                skill_counts,
+                compact,
+                last_usage,
+                last_text,
+                last_model,
+            )
             if relay is not None:
                 try:
                     relay.feed(msg)
@@ -1007,7 +1204,18 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
         result["skill_counts"] = skill_counts
         result["compact"] = compact
         result["last_assistant_text"] = last_text.get("text", "")
+        result["last_assistant_model"] = last_model.get("model", "")
 
+    from claude_on_the_fly import quota
+
+    exhausted = quota.claude_error(
+        result,
+        stderr_bytes.decode(errors="replace").strip(),
+        proc.returncode or 0,
+        tool_counts,
+    )
+    if exhausted is not None:
+        raise exhausted
     if proc.returncode != 0:
         err_stderr = stderr_bytes.decode().strip()
         logger.debug(
@@ -1023,15 +1231,8 @@ async def _consume(proc: asyncio.subprocess.Process) -> dict:
     return result
 
 
-async def communicate_capped(
-    proc, on_stdout_chunk: Callable[[bytes], None] | None = None
-) -> tuple[bytes, bytes]:
-    """Collect both subprocess streams without allowing unbounded buffering.
-
-    `on_stdout_chunk` is forwarded to the stdout reader; see
-    `_read_to_eof_capped`. It never fires on the `communicate()` fallback below,
-    which has no chunks to report.
-    """
+async def communicate_capped(proc) -> tuple[bytes, bytes]:
+    """Collect both subprocess streams without allowing unbounded buffering."""
     stdout_stream = getattr(proc, "stdout", None)
     stderr_stream = getattr(proc, "stderr", None)
     if not isinstance(stdout_stream, asyncio.StreamReader) or not isinstance(
@@ -1046,9 +1247,7 @@ async def communicate_capped(
             )
         return stdout, stderr
 
-    stdout_task = asyncio.create_task(
-        _read_to_eof_capped(stdout_stream, on_stdout_chunk)
-    )
+    stdout_task = asyncio.create_task(_read_to_eof_capped(stdout_stream))
     stderr_task = asyncio.create_task(_read_to_eof_capped(stderr_stream))
     tasks = {stdout_task, stderr_task}
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1149,7 +1348,37 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
         _announce_process(proc, "", running=False)
 
 
-async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -> dict:
+async def _feed_stdin(proc: asyncio.subprocess.Process, text: str) -> None:
+    """Hand `text` to the CLI on stdin, then close the pipe.
+
+    A task of its own rather than a write before the read loop: 143 KB does not
+    fit a 64 KB pipe buffer, so writing inline would wait on a child that is
+    still producing the output nobody is draining yet. Both sides move, or
+    neither does.
+
+    Errors are swallowed by design. A CLI that rejected its own arguments exits
+    before reading anything, and its exit status is the failure worth reporting;
+    a broken pipe here is only the symptom of it. `commands._collect` writes
+    stdin the same way for a brokered CLI, inline rather than as a task because
+    its payloads are small: keep the two in step.
+    """
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(text.encode("utf-8"))
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        logger.debug("exec: stdin closed before the prompt reached the CLI")
+    finally:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+            proc.stdin.close()
+
+
+async def _exec(
+    workspace: Path,
+    cmd: list[str],
+    timeout: float | None = None,
+    stdin_text: str | None = None,
+) -> dict:
     cmd = sandbox.wrap(cmd, workspace)
     logger.debug(
         "exec: cwd=%s cmd=%s timeout=%s",
@@ -1157,8 +1386,18 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         " ".join(cmd[:6]) + "...",
         timeout,
     )
+    # DEVNULL, not inherited, when there is no prompt to send. A spawn handed an
+    # open pipe that never delivers makes the CLI wait out its 3-second stdin
+    # probe first ("no stdin data received in 3s, proceeding without it",
+    # measured on 2.1.276 when stdin was an ssh channel). The codex backend
+    # learned the same lesson from the other side: see `_run_codex_exec`.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=(
+            asyncio.subprocess.PIPE
+            if stdin_text is not None
+            else asyncio.subprocess.DEVNULL
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
@@ -1167,6 +1406,11 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         env=sandbox.agent_env(),
     )
     track_agent_process(proc, cmd)
+    feed = (
+        asyncio.create_task(_feed_stdin(proc, stdin_text))
+        if stdin_text is not None
+        else None
+    )
     try:
         if timeout is not None:
             return await asyncio.wait_for(_consume(proc), timeout=timeout)
@@ -1175,10 +1419,21 @@ async def _exec(workspace: Path, cmd: list[str], timeout: float | None = None) -
         logger.warning("exec: timed out after %ss", timeout)
         raise RuntimeError(f"Claude CLI timed out after {timeout}s") from None
     finally:
+        # Kill first: that is what closes the pipe a writer may be parked on.
         await _kill_process_tree(proc)
+        if feed is not None:
+            await asyncio.gather(feed, return_exceptions=True)
 
 
 NUDGE_PROMPT = "Please provide your final reply to the user."
+EMPTY_REPLY_NOTICE = (
+    "I didn't get a usable reply from the agent, so I can't confirm whether "
+    "your request was handled."
+)
+AGENT_FAILURE_NOTICE = (
+    "I couldn't finish this request. The failure was logged, but I can't "
+    "confirm the outcome."
+)
 
 
 def _sum_counts(a: dict | None, b: dict | None) -> dict:
@@ -1225,6 +1480,12 @@ def _merge_cli_output(first: dict, second: dict) -> dict:
     merged["last_assistant_text"] = second.get("last_assistant_text") or first.get(
         "last_assistant_text"
     )
+    # `last_assistant_model` follows `last_assistant_text`, for the same reason:
+    # the retry answered, so the retry's model is the one to name, and a retry
+    # that produced no assistant message must not blank the first run's.
+    merged["last_assistant_model"] = second.get("last_assistant_model") or first.get(
+        "last_assistant_model"
+    )
     return merged
 
 
@@ -1260,6 +1521,7 @@ class AgentBackend(Protocol):
         channel_context: str = "dm",
         timeout: float | None = DEFAULT_TIMEOUT,
         nudge_prompt: str | None = None,
+        facts: dict[str, str] | None = None,
     ) -> Response: ...
 
     async def compact(
@@ -1401,14 +1663,251 @@ async def cached_skills(
         return skills
 
 
-def get_backend() -> AgentBackend:
-    """Pick a backend from the `agent:` config. Raises ValueError on misconfiguration."""
-    name = settings.get("AGENT_BACKEND", "claude").lower()
-    if name == "claude":
-        return _build_claude_backend()
-    if name == "codex":
-        return _build_codex_backend()
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+# --------------------------------------------------------------------------
+# Agent profiles
+# --------------------------------------------------------------------------
+# A profile answers "which agent, which model, how hard" once, so the factory,
+# the session key, and both argv builders read one resolved value instead of
+# re-deriving it from settings three times over. It also makes a per-entry
+# override safe: the answer travels as an argument, so two jobs interleaved in
+# one process cannot read each other's.
+
+_BACKENDS = ("claude", "codex")
+_MODES = ("native", "ollama", "pty")
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """A fully resolved agent configuration.
+
+    Every field is already routed. Under `ollama` mode the model and the effort
+    come from the `ollama:` block, and a backend reading `self.model` no longer
+    has to know that.
+    """
+
+    backend: str
+    mode: str
+    model: str
+    effort: str
+    ollama_context_window: int | None = None
+    ollama_cache_ttl_s: int | None = None
+    account: str | None = None
+    account_pool: tuple[str, ...] = ()
+    account_base: tuple[str, str] | None = None
+    overrides: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def key(self) -> str:
+        """Canonical `backend:mode:model`, folded into session UUID seeds.
+
+        This is a wire format, not a label. It seeds `uuid5`, so changing the
+        string restarts every live session that used the old one. That is why
+        codex substitutes `default` for an empty model and claude does not: the
+        asymmetry predates this type, and preserving it is what keeps sessions
+        written by an earlier build resolvable.
+        """
+        model = self.model or ("default" if self.backend == "codex" else "")
+        return f"{self.backend}:{self.mode}:{model}"
+
+
+# The fields one conversation may pin from chat, named once. The command
+# grammar, the file a daemon stores them in, and `apply_override` all have to
+# agree about these, and a key that is not here must never reach `replace`: a
+# stored file is edited by hand at least once, and `replace` would raise on the
+# typo, taking down the turn that read it.
+OVERRIDABLE_FIELDS = ("model", "effort")
+
+
+def apply_override(profile: AgentProfile, overrides: Mapping[str, str]) -> AgentProfile:
+    """`profile` with what one conversation pinned, or `profile` unchanged.
+
+    Applied to the *resolved* profile rather than to the settings, which is the
+    whole reason this is safe: the resolver has already routed each field out of
+    the right block for the mode, so a pinned value lands in the same field a
+    configured one would. Under ollama that means the shared ollama keys, and
+    nothing downstream has to know which block answered.
+
+    An unknown key is dropped rather than raising, for the reason
+    `OVERRIDABLE_FIELDS` gives.
+    """
+    pinned = {
+        key: value for key, value in overrides.items() if key in OVERRIDABLE_FIELDS
+    }
+    return (
+        replace(profile, **pinned, overrides=tuple(sorted(pinned.items())))
+        if pinned
+        else profile
+    )
+
+
+def profile_names() -> list[str]:
+    """Every defined profile name. Empty when none are configured."""
+    table = settings.operator("agent").get("profiles")
+    return sorted(str(name) for name in table) if isinstance(table, dict) else []
+
+
+def _profile_overlay(name: str) -> dict[str, object]:
+    """One named block out of `agent.profiles`. Raises when it does not exist.
+
+    A missing profile is a config error, not a reason to fall back to the
+    global settings: falling back would run the entry on the expensive model it
+    was explicitly moved off, and nothing would say so.
+    """
+    table = settings.operator("agent").get("profiles")
+    if not isinstance(table, dict):
+        raise ValueError(
+            f"agent.profiles: no profiles are defined, so {name!r} cannot resolve"
+        )
+    block = table.get(name)
+    if block is None:
+        known = ", ".join(sorted(str(k) for k in table)) or "none"
+        raise ValueError(f"Unknown agent profile: {name!r} (defined: {known})")
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"agent.profiles.{name}: must be a mapping, got {type(block).__name__}"
+        )
+    return cast("dict[str, object]", block)
+
+
+def _overlay_str(block: object, key: str, where: str, fallback: str) -> str:
+    """`block[key]` when the profile sets it, else the global value.
+
+    The profile beats the environment on purpose. The env-beats-file rule in
+    `settings` protects a daemon-wide default from a `config.yaml` nobody
+    edited; a profile is neither daemon-wide nor a default, and an operator who
+    names one on an entry means it.
+    """
+    if not isinstance(block, Mapping):
+        return fallback
+    value = block.get(key)
+    if value is None:
+        return fallback
+    if not isinstance(value, str):
+        raise ValueError(f"{where}.{key}: must be a string, got {type(value).__name__}")
+    return value
+
+
+def resolve_profile(name: str | None = None) -> AgentProfile:
+    """Resolve the agent configuration, optionally overlaid with a named profile.
+
+    `None` reproduces the global configuration exactly, so every caller that
+    does not care about profiles keeps today's behaviour.
+
+    Raises ValueError on an unknown profile, backend, or mode, and on an ollama
+    mode with no model -- the same misconfigurations `get_backend` has always
+    refused, now refused once instead of in each consumer.
+    """
+    overlay: dict[str, object] = _profile_overlay(name) if name else {}
+    # Only ever interpolated into an error, and only a profile can produce one:
+    # with no overlay every lookup falls through to the global value.
+    where = f"agent.profiles.{name}" if name else "agent"
+
+    backend = _overlay_str(
+        overlay, "backend", where, settings.get("AGENT_BACKEND", "claude")
+    ).lower()
+    if backend not in _BACKENDS:
+        raise ValueError(
+            f"Unknown AGENT_BACKEND: {backend!r} (supported: claude, codex)"
+        )
+
+    block = overlay.get(backend)
+    mode = _overlay_str(
+        block,
+        "mode",
+        f"{where}.{backend}",
+        settings.get(f"{backend.upper()}_MODE", "native"),
+    ).lower()
+    if mode not in _MODES:
+        raise ValueError(
+            f"Unknown {backend.upper()}_MODE: {mode!r} (supported: native, ollama, pty)"
+        )
+
+    if mode != "ollama":
+        return AgentProfile(
+            backend=backend,
+            mode=mode,
+            model=_overlay_str(
+                block,
+                "model",
+                f"{where}.{backend}",
+                settings.get(f"{backend.upper()}_MODEL"),
+            ).strip(),
+            effort=_overlay_str(
+                block,
+                "effort",
+                f"{where}.{backend}",
+                settings.get(f"{backend.upper()}_EFFORT"),
+            ).strip(),
+        )
+
+    ollama = overlay.get("ollama")
+    model = _overlay_str(
+        ollama, "model", f"{where}.ollama", settings.get("OLLAMA_MODEL")
+    ).strip()
+    if not model:
+        raise ValueError(
+            f"{backend.upper()}_MODE=ollama requires OLLAMA_MODEL to be set"
+        )
+    return AgentProfile(
+        backend=backend,
+        mode=mode,
+        model=model,
+        effort=_overlay_str(
+            ollama, "effort", f"{where}.ollama", settings.get("OLLAMA_EFFORT")
+        ).strip(),
+        ollama_context_window=_ollama_context_window(
+            _overlay_str(
+                ollama,
+                "context_window",
+                f"{where}.ollama",
+                settings.get("OLLAMA_CONTEXT_WINDOW"),
+            )
+        ),
+        ollama_cache_ttl_s=_ollama_cache_ttl_s(
+            _overlay_str(
+                ollama,
+                "cache_ttl_min",
+                f"{where}.ollama",
+                settings.get("OLLAMA_CACHE_TTL_MIN"),
+            )
+        ),
+    )
+
+
+def get_backend(profile: AgentProfile | None = None) -> AgentBackend:
+    """Build the backend for `profile`, or for the global `agent:` config.
+
+    Raises ValueError on misconfiguration, via `resolve_profile`.
+    """
+    from claude_on_the_fly import accounts
+
+    resolved = accounts.resolve_profile(
+        profile if profile is not None else resolve_profile()
+    )
+    if resolved.backend == "claude":
+        return _build_claude_backend(resolved)
+    return _build_codex_backend(resolved)
+
+
+def argv_for_log(argv: list[str], cap: int = 60) -> str:
+    """Render an argv for a debug line: every token kept, long ones elided.
+
+    Capping the *list* was the old approach and it hid the whole command. Under
+    a jail the wrapper comes first, so `argv[:4]` on a macOS seatbelt spawn was
+    `sandbox-exec -f <profile> -D` and the 33 tokens after it -- the binary,
+    `--model`, `--effort` -- never appeared. A model-switching bug is exactly
+    when someone reads this line, and it answered nothing.
+
+    Capping each *token* keeps the shape of the command instead. The cap is not
+    cosmetic: `--system-prompt` carries the whole system prompt as one argument,
+    tens of thousands of characters, and that is what the original truncation
+    was really protecting the log from. Eliding by token keeps it out while
+    still naming the flag it belongs to.
+    """
+    return " ".join(
+        token if len(token) <= cap else f"{token[:cap]}...[{len(token)} chars]"
+        for token in argv
+    )
 
 
 def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
@@ -1439,55 +1938,31 @@ def resolve_session_log(workspace: Path, session_uuid: str) -> Path | None:
     return None
 
 
-def current_backend_key() -> str:
-    """Canonical `backend:mode:model` string for the currently-configured agent.
+def current_backend_key(profile: AgentProfile | None = None) -> str:
+    """Canonical `backend:mode:model` string for `profile`, or for the global config.
 
     Folded into session UUID seeds so each (backend, mode, model) combo gets
     its own session JSONL. Switching between e.g. claude-native and
-    claude-via-ollama no longer poisons the saved session — the new combo
+    claude-via-ollama no longer poisons the saved session -- the new combo
     starts a fresh thread and picks up prior context via the cross-backend
-    handoff path in `transcript`.
+    handoff path in `transcript`. A job that names a profile gets the same
+    treatment, which is why changing an entry's model restarts its transcript.
 
     Raises ValueError on the same misconfigurations as `get_backend()` so
     callers fail loudly instead of silently colliding sessions.
     """
-    name = settings.get("AGENT_BACKEND", "claude").lower()
-    if name == "claude":
-        mode = settings.get("CLAUDE_MODE", "native").lower()
-        if mode == "native":
-            return f"claude:native:{settings.get('CLAUDE_MODEL').strip()}"
-        if mode == "ollama":
-            model = settings.get("OLLAMA_MODEL").strip()
-            if not model:
-                raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
-            return f"claude:ollama:{model}"
-        if mode == "pty":
-            return f"claude:pty:{settings.get('CLAUDE_MODEL').strip()}"
-        raise ValueError(
-            f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)"
-        )
-    if name == "codex":
-        mode = settings.get("CODEX_MODE", "native").lower()
-        if mode == "native":
-            return f"codex:native:{settings.get('CODEX_MODEL').strip() or 'default'}"
-        if mode == "ollama":
-            model = settings.get("OLLAMA_MODEL").strip()
-            if not model:
-                raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
-            return f"codex:ollama:{model}"
-        raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
-    raise ValueError(f"Unknown AGENT_BACKEND: {name!r} (supported: claude, codex)")
+    return (profile if profile is not None else resolve_profile()).key
 
 
-def _ollama_context_window() -> int | None:
-    """Resolve the operator-declared context window for ollama mode.
+def _ollama_context_window(raw: str) -> int | None:
+    """Parse the operator-declared context window for ollama mode.
 
     None for unset or unusable values, which leaves ollama reporting no reading
     at all — the behaviour before this setting existed. A junk value disables
     the reading rather than taking the daemon down, and is logged so a typo does
     not look like a silently working setting.
     """
-    raw = settings.get("OLLAMA_CONTEXT_WINDOW").strip()
+    raw = raw.strip()
     if not raw:
         return None
     try:
@@ -1507,37 +1982,53 @@ def _ollama_context_window() -> int | None:
     return window
 
 
-def _build_claude_backend() -> AgentBackend:
+def _ollama_cache_ttl_s(raw: str) -> int | None:
+    """Parse the operator-declared cache lifetime for ollama mode, in seconds.
+
+    Ollama's cloud cache is implicit and documents no lifetime, so the engine
+    cannot know one; unset leaves ollama chats out of idle compaction, as they
+    were before this setting existed. A junk value does the same and is logged.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        minutes = int(raw)
+    except ValueError:
+        logger.warning("OLLAMA_CACHE_TTL_MIN=%r is not a number, ignoring it", raw)
+        return None
+    if minutes <= 0:
+        logger.warning("OLLAMA_CACHE_TTL_MIN=%d is not positive, ignoring it", minutes)
+        return None
+    return minutes * 60
+
+
+def _build_claude_backend(profile: AgentProfile) -> AgentBackend:
     from claude_on_the_fly.backends.claude import ClaudeBackend
 
-    mode = settings.get("CLAUDE_MODE", "native").lower()
-    if mode == "native":
-        return ClaudeBackend()
-    if mode == "ollama":
-        model = settings.get("OLLAMA_MODEL").strip()
-        if not model:
-            raise ValueError("CLAUDE_MODE=ollama requires OLLAMA_MODEL to be set")
+    if profile.mode == "ollama":
+        # No `model`: the launcher already pins it, and passing it too would put
+        # `--model` on the claude argv that ollama is wrapping.
         return ClaudeBackend(
-            launcher=OllamaLauncher(model=model),
-            ollama_context_window=_ollama_context_window(),
+            launcher=OllamaLauncher(model=profile.model),
+            ollama_context_window=profile.ollama_context_window,
+            effort=profile.effort,
         )
-    if mode == "pty":
-        return ClaudeBackend(pty=True)
-    raise ValueError(f"Unknown CLAUDE_MODE: {mode!r} (supported: native, ollama, pty)")
+    return ClaudeBackend(
+        pty=profile.mode == "pty", model=profile.model, effort=profile.effort
+    )
 
 
-def _build_codex_backend() -> AgentBackend:
+def _build_codex_backend(profile: AgentProfile) -> AgentBackend:
     from claude_on_the_fly.backends.codex import CodexBackend
 
-    mode = settings.get("CODEX_MODE", "native").lower()
-    if mode == "native":
-        return CodexBackend()
-    if mode == "ollama":
-        model = settings.get("OLLAMA_MODEL").strip()
-        if not model:
-            raise ValueError("CODEX_MODE=ollama requires OLLAMA_MODEL to be set")
-        return CodexBackend(launcher=OllamaLauncher(model=model))
-    raise ValueError(f"Unknown CODEX_MODE: {mode!r} (supported: native, ollama)")
+    if profile.mode == "ollama":
+        return CodexBackend(
+            launcher=OllamaLauncher(model=profile.model), effort=profile.effort
+        )
+    return CodexBackend(
+        pty=profile.mode == "pty", model=profile.model, effort=profile.effort
+    )
 
 
 async def run(
@@ -1549,16 +2040,44 @@ async def run(
     channel_context: str = "dm",
     timeout: float | None = DEFAULT_TIMEOUT,
     nudge_prompt: str | None = None,
+    profile: AgentProfile | None = None,
+    facts: dict[str, str] | None = None,
 ) -> Response:
-    return await get_backend().run(
-        workspace,
-        session_uuid,
-        prompt,
-        platform,
-        user_name=user_name,
-        channel_context=channel_context,
-        timeout=timeout,
-        nudge_prompt=nudge_prompt,
+    from claude_on_the_fly import account_fallback, accounts
+
+    original = profile if profile is not None else resolve_profile()
+    resolved = accounts.resolve_profile(original)
+    if original.account is None:
+        saved = accounts.saved_selection(platform, session_uuid, original.backend)
+        if resolved.account_pool or (saved is not None and saved.pool):
+            chosen = saved or accounts.selection(
+                platform, session_uuid, original.backend, "", "", persist=True
+            )
+            resolved = replace(
+                accounts.apply_profile(original, chosen.account),
+                account_pool=chosen.pool,
+            )
+
+    async def invoke(
+        candidate: AgentProfile, attempt_prompt: str, remaining: float | None
+    ) -> Response:
+        account = accounts.for_profile(candidate)
+        with accounts.use(account, mode=candidate.mode):
+            accounts.prepare(workspace)
+            return await get_backend(candidate).run(
+                workspace,
+                session_uuid,
+                attempt_prompt,
+                platform,
+                user_name=user_name,
+                channel_context=channel_context,
+                timeout=remaining,
+                nudge_prompt=nudge_prompt if attempt_prompt == prompt else None,
+                facts=facts,
+            )
+
+    return await account_fallback.run(
+        resolved, workspace, session_uuid, prompt, platform, invoke, timeout
     )
 
 
@@ -1566,10 +2085,24 @@ async def compact(
     workspace: Path,
     session_uuid: str,
     timeout: float | None = DEFAULT_TIMEOUT,
+    profile: AgentProfile | None = None,
 ) -> Compaction | None:
-    """Compact a session's history. None when the backend doesn't support it."""
-    backend = get_backend()
-    compactor = getattr(backend, "compact", None)
-    if compactor is None:
-        return None
-    return await compactor(workspace, session_uuid, timeout=timeout)
+    """Compact a session's history. None when the backend doesn't support it.
+
+    Takes the profile because a compaction that ran under different settings
+    than the turn it compacts would summarize with a model the conversation
+    never used.
+    """
+    from claude_on_the_fly import accounts
+
+    resolved = accounts.resolve_profile(
+        profile if profile is not None else resolve_profile()
+    )
+    account = accounts.for_profile(resolved)
+    with accounts.use(account, mode=resolved.mode):
+        accounts.prepare(workspace)
+        backend = get_backend(resolved)
+        compactor = getattr(backend, "compact", None)
+        if compactor is None:
+            return None
+        return await compactor(workspace, session_uuid, timeout=timeout)

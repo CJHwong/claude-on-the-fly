@@ -5,23 +5,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from claude_on_the_fly import agent
 from claude_on_the_fly.agent import NUDGE_PROMPT, OllamaLauncher, get_backend
 from claude_on_the_fly.backends import codex as codex_mod
 from claude_on_the_fly.backends.codex import (
     CodexBackend,
     _merge_codex_results,
-    parse_codex_stream,
+    parse_codex_rollout,
+    read_rollout,
 )
 from claude_on_the_fly.transcript import Turn
-
-
-def _ndjson(*messages: dict) -> bytes:
-    return b"\n".join(json.dumps(m).encode() for m in messages)
 
 
 def _write_rollout(thread_id: str, home: Path) -> Path:
@@ -45,162 +46,348 @@ def _write_mapping(workspace: Path, session_uuid: str, thread_id: str) -> Path:
     return codex_mod.codex_state.write_thread_id(workspace, session_uuid, thread_id)
 
 
+def _session_meta(thread_id: str) -> dict:
+    return {"type": "session_meta", "payload": {"session_id": thread_id}}
+
+
+def _item(item_type: str, **fields) -> dict:
+    """One `item_completed` event, the rollout's record of a finished item."""
+    return {
+        "type": "event_msg",
+        "payload": {"type": "item_completed", "item": {"type": item_type, **fields}},
+    }
+
+
+def _tool_call(
+    name: str = "exec", call_id: str = "", kind: str = "custom_tool_call"
+) -> dict:
+    """One `response_item` tool call, the rollout's record of what the model asked for.
+
+    This is the same tool call `_item` reports finishing, under the model's
+    `call_id` rather than the local executor's own id.
+    """
+    payload: dict = {"type": kind, "name": name}
+    if call_id:
+        payload["call_id"] = call_id
+    return {"type": "response_item", "payload": payload}
+
+
+def _agent_message(text: str, phase: str = "final_answer") -> dict:
+    return _item("AgentMessage", content=[{"type": "Text", "text": text}], phase=phase)
+
+
+def _assistant_text(text: str) -> dict:
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    }
+
+
+def _task_complete(text: str = "", error: object = None) -> dict:
+    record = {
+        "type": "event_msg",
+        "payload": {"type": "task_complete", "last_agent_message": text},
+    }
+    if error is not None:
+        record["payload"]["error"] = error
+    return record
+
+
+def _token_count(**usage: int) -> dict:
+    return {
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"last_token_usage": usage}},
+    }
+
+
+def _turn_aborted(reason: str) -> dict:
+    return {
+        "type": "event_msg",
+        "payload": {"type": "turn_aborted", "reason": reason},
+    }
+
+
+def _rollout_text(*records: dict) -> str:
+    return "".join(json.dumps(r) + "\n" for r in records)
+
+
 # ---------------------------------------------------------------------------
-# parse_codex_stream
+# parse_codex_rollout
 # ---------------------------------------------------------------------------
 
 
-class TestParseCodexStream:
-    def test_empty_stdout_returns_defaults(self):
-        out = parse_codex_stream(b"")
+class TestParseCodexRollout:
+    def test_no_records_returns_defaults(self):
+        out = parse_codex_rollout([])
         assert out["thread_id"] is None
         assert out["body"] == ""
         assert out["usage"] == {}
         assert out["error"] is None
         assert out["tool_counts"] == {}
+        assert out["completed"] is False
 
     def test_happy_path_captures_thread_body_usage(self):
-        stream = _ndjson(
-            {"type": "thread.started", "thread_id": "thread-abc"},
-            {"type": "turn.started"},
-            {
-                "type": "item.completed",
-                "item": {"id": "i0", "type": "reasoning", "text": "thinking..."},
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "i1", "type": "agent_message", "text": "pong"},
-            },
-            {
-                "type": "turn.completed",
-                "usage": {
-                    "input_tokens": 100,
-                    "cached_input_tokens": 20,
-                    "cache_write_input_tokens": 10,
-                    "output_tokens": 5,
-                    "reasoning_output_tokens": 3,
-                },
-            },
+        out = parse_codex_rollout(
+            [
+                _session_meta("thread-abc"),
+                _item("Reasoning"),
+                _agent_message("pong"),
+                _token_count(
+                    input_tokens=100,
+                    cached_input_tokens=20,
+                    cache_write_input_tokens=10,
+                    output_tokens=5,
+                    reasoning_output_tokens=3,
+                ),
+                _task_complete("pong"),
+            ]
         )
-        out = parse_codex_stream(stream)
         assert out["thread_id"] == "thread-abc"
         assert out["body"] == "pong"
+        assert out["completed"] is True
         assert out["usage"]["input_tokens"] == 100
         assert out["usage"]["cache_write_input_tokens"] == 10
         assert out["usage"]["reasoning_output_tokens"] == 3
         assert out["error"] is None
-        # reasoning is not a tool
+        # Reasoning is not a tool, and neither is the agent's own message.
         assert out["tool_counts"] == {}
 
     def test_command_execution_counted_as_tool(self):
-        stream = _ndjson(
-            {"type": "thread.started", "thread_id": "t1"},
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": "i1",
-                    "type": "command_execution",
-                    "command": "ls",
-                    "exit_code": 0,
-                    "status": "completed",
-                },
-            },
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": "i2",
-                    "type": "command_execution",
-                    "command": "pwd",
-                    "exit_code": 0,
-                    "status": "completed",
-                },
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "i3", "type": "agent_message", "text": "done"},
-            },
+        out = parse_codex_rollout(
+            [
+                _session_meta("t1"),
+                _item("CommandExecution", command="ls"),
+                _item("CommandExecution", command="pwd"),
+                _agent_message("done"),
+                _task_complete("done"),
+            ]
         )
-        out = parse_codex_stream(stream)
-        assert out["tool_counts"] == {"command_execution": 2}
+        assert out["tool_counts"] == {"CommandExecution": 2}
         assert out["body"] == "done"
 
     def test_mixed_tool_types_each_counted_separately(self):
-        stream = _ndjson(
-            {
-                "type": "item.completed",
-                "item": {"id": "a", "type": "command_execution"},
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "b", "type": "file_change"},
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "c", "type": "command_execution"},
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "d", "type": "reasoning", "text": "..."},
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "e", "type": "agent_message", "text": "ok"},
-            },
+        out = parse_codex_rollout(
+            [
+                _item("CommandExecution"),
+                _item("FileChange"),
+                _item("CommandExecution"),
+                _item("Reasoning"),
+                _item("UserMessage"),
+                _agent_message("ok"),
+            ]
         )
-        out = parse_codex_stream(stream)
-        assert out["tool_counts"] == {"command_execution": 2, "file_change": 1}
+        assert out["tool_counts"] == {"CommandExecution": 2, "FileChange": 1}
 
-    def test_turn_failed_sets_error(self):
-        stream = _ndjson(
-            {"type": "thread.started", "thread_id": "t1"},
-            {"type": "turn.failed", "error": {"message": "boom"}},
-        )
-        out = parse_codex_stream(stream)
-        assert out["error"] == "boom"
+    def test_an_unknown_item_counts_as_a_tool(self):
+        """Codex adds tools. A new one belongs in the footer, not silently dropped."""
+        out = parse_codex_rollout([_item("SomeFutureTool")])
+        assert out["tool_counts"] == {"SomeFutureTool": 1}
 
-    def test_reconnect_error_event_ignored(self):
-        """Non-terminal `error` events (websocket retries) don't poison the result."""
-        stream = _ndjson(
-            {"type": "thread.started", "thread_id": "t1"},
-            {"type": "error", "message": "Reconnecting... 1/5"},
-            {
-                "type": "item.completed",
-                "item": {"id": "i1", "type": "agent_message", "text": "ok"},
-            },
-            {"type": "turn.completed", "usage": {"input_tokens": 10}},
-        )
-        out = parse_codex_stream(stream)
-        assert out["body"] == "ok"
-        assert out["error"] is None
+    def test_turn_aborted_sets_error(self):
+        out = parse_codex_rollout([_session_meta("t1"), _turn_aborted("interrupted")])
+        assert out["error"] == "interrupted"
 
-    def test_malformed_lines_skipped(self):
-        stream = (
-            json.dumps({"type": "thread.started", "thread_id": "t1"}).encode()
-            + b"\nnot-json\n"
-            + json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {"id": "i", "type": "agent_message", "text": "ok"},
-                }
-            ).encode()
+    def test_task_complete_error_is_a_failure_despite_completion(self):
+        out = parse_codex_rollout(
+            [_task_complete("partial", {"message": "401 Unauthorized"})]
         )
-        out = parse_codex_stream(stream)
+        assert out["completed"] is True
+        assert out["body"] == "partial"
+        assert out["error"] == "401 Unauthorized"
+
+    def test_task_complete_error_without_a_message_is_still_a_failure(self):
+        out = parse_codex_rollout([_task_complete(error={})])
+        assert out["error"] == "codex turn failed"
+
+    def test_task_complete_string_error_is_preserved(self):
+        out = parse_codex_rollout([_task_complete(error="model unavailable")])
+        assert out["error"] == "model unavailable"
+
+    def test_turn_aborted_without_a_reason_still_reports_an_error(self):
+        out = parse_codex_rollout(
+            [{"type": "event_msg", "payload": {"type": "turn_aborted"}}]
+        )
+        assert out["error"] == "codex turn aborted"
+
+    def test_records_that_are_not_about_the_turn_are_ignored(self):
+        """A rollout carries more than this parser needs: `world_state` and
+        `turn_context` have no payload dict, and `compacted` has one that means
+        nothing here."""
+        out = parse_codex_rollout(
+            [
+                {"type": "world_state"},
+                {"type": "turn_context", "payload": None},
+                {"type": "compacted", "payload": {"message": "..."}},
+            ]
+        )
+        assert out["body"] == ""
+        assert out["tool_counts"] == {}
+
+    def test_the_last_real_assistant_text_is_kept_for_a_block_only_reply(self):
+        out = parse_codex_rollout(
+            [
+                _assistant_text("checking the tests"),
+                _assistant_text('<suggestions>["a"]</suggestions>'),
+                _task_complete('<suggestions>["a"]</suggestions>'),
+            ]
+        )
+        # The suggestions block is the protocol token, not something it said.
+        assert out["last_assistant_text"] == "checking the tests"
+
+    def test_task_complete_without_a_message_does_not_clobber_the_body(self):
+        out = parse_codex_rollout([_task_complete("real"), _task_complete("")])
+        assert out["body"] == "real"
+
+    # -- the two tool-call streams ------------------------------------------
+    #
+    # A rollout reports one tool call twice: `item_completed` says what the
+    # local executor finished, `response_item` says what the model asked for.
+    # The item stream drops records, so it cannot be read on its own.
+
+    def test_a_dropped_item_is_recovered_from_the_response_item(self):
+        """The false zero: real exec calls, and the item stream reported none."""
+        out = parse_codex_rollout(
+            [
+                _session_meta("t1"),
+                _tool_call(call_id="call_a"),
+                _tool_call(call_id="call_b"),
+                _agent_message("done"),
+            ]
+        )
+        assert out["tool_counts"] == {"exec": 2}
+
+    def test_both_streams_reporting_one_call_counts_it_once(self):
+        """The local executor mints its own id, so the two records never join.
+        Summing them would double every call both streams did report."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(call_id="call_a"),
+                _item("CommandExecution", id="exec-1", command="ls"),
+                _tool_call(call_id="call_b"),
+                _item("CommandExecution", id="exec-2", command="pwd"),
+            ]
+        )
+        assert out["tool_counts"] == {"CommandExecution": 2}
+
+    def test_only_the_calls_the_item_stream_missed_are_added(self):
+        out = parse_codex_rollout(
+            [
+                _tool_call(call_id="call_a"),
+                _item("CommandExecution", id="exec-1"),
+                _tool_call(call_id="call_b"),
+                _tool_call(call_id="call_c"),
+            ]
+        )
+        # One of three calls arrived as an item; the other two are the shortfall.
+        assert out["tool_counts"] == {"CommandExecution": 1, "exec": 2}
+
+    def test_more_items_than_calls_keeps_the_item_count(self):
+        """One unified `exec` call starts more than one command, so the item
+        stream is the larger reading here and nothing is added to it."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(call_id="call_a"),
+                _item("CommandExecution", id="exec-1"),
+                _item("CommandExecution", id="exec-2"),
+                _item("CommandExecution", id="exec-3"),
+            ]
+        )
+        assert out["tool_counts"] == {"CommandExecution": 3}
+
+    def test_a_call_matched_by_id_is_not_counted_twice(self):
+        """An orchestration item carries the model's `call_id` as its own id,
+        so that pair joins exactly and the call adds nothing."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(name="spawn_agent", call_id="call_x", kind="function_call"),
+                _item("CollabAgentToolCall", id="call_x"),
+            ]
+        )
+        assert out["tool_counts"] == {"CollabAgentToolCall": 1}
+
+    def test_an_id_matched_call_does_not_absorb_an_unrelated_shortfall(self):
+        """The joined pair must not cover for the exec call the item stream
+        dropped; the two are different calls."""
+        out = parse_codex_rollout(
+            [
+                _tool_call(name="spawn_agent", call_id="call_x", kind="function_call"),
+                _item("CollabAgentToolCall", id="call_x"),
+                _tool_call(call_id="call_y"),
+            ]
+        )
+        assert out["tool_counts"] == {"CollabAgentToolCall": 1, "exec": 1}
+
+    def test_a_tool_call_carrying_no_call_id_still_counts(self):
+        out = parse_codex_rollout([_tool_call(name="apply_patch")])
+        assert out["tool_counts"] == {"apply_patch": 1}
+
+    def test_an_unnamed_tool_call_is_counted_under_its_record_type(self):
+        """A `local_shell_call` names the tool in its type, not in a `name`."""
+        out = parse_codex_rollout(
+            [{"type": "response_item", "payload": {"type": "local_shell_call"}}]
+        )
+        assert out["tool_counts"] == {"local_shell_call": 1}
+
+    def test_a_response_item_that_is_not_a_tool_call_is_ignored(self):
+        out = parse_codex_rollout(
+            [
+                {"type": "response_item", "payload": {"type": "function_call_output"}},
+                {"type": "response_item", "payload": {"type": "reasoning"}},
+            ]
+        )
+        assert out["tool_counts"] == {}
+
+
+class TestReadRollout:
+    def test_reading_starts_where_the_last_read_stopped(self, tmp_path: Path):
+        """A resumed thread's rollout already holds every earlier turn."""
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(_rollout_text(_task_complete("old turn")))
+        offset = path.stat().st_size
+        with path.open("a") as handle:
+            handle.write(_rollout_text(_task_complete("this turn")))
+
+        records, new_offset = read_rollout(path, offset)
+
+        assert parse_codex_rollout(records)["body"] == "this turn"
+        assert new_offset == path.stat().st_size
+
+    def test_a_half_written_record_is_left_for_the_next_read(self, tmp_path: Path):
+        """The follower polls a file codex is still writing."""
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(_rollout_text(_task_complete("done")) + '{"type": "event_')
+
+        records, offset = read_rollout(path, 0)
+
+        assert len(records) == 1
+        assert offset < path.stat().st_size
+
+        # The rest of the line lands, and the next read picks it up whole.
+        with path.open("a") as handle:
+            handle.write('msg", "payload": {"type": "turn_aborted"}}\n')
+        more, _ = read_rollout(path, offset)
+        assert parse_codex_rollout(more)["error"] == "codex turn aborted"
+
+    def test_malformed_lines_are_skipped(self, tmp_path: Path):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(
+            _rollout_text(_session_meta("t1"))
+            + "not-json\n"
+            + _rollout_text(_task_complete("ok"))
+        )
+        records, _ = read_rollout(path, 0)
+        out = parse_codex_rollout(records)
         assert out["thread_id"] == "t1"
         assert out["body"] == "ok"
 
-    def test_empty_agent_message_does_not_clobber_existing_body(self):
-        stream = _ndjson(
-            {
-                "type": "item.completed",
-                "item": {"id": "i1", "type": "agent_message", "text": "real"},
-            },
-            {
-                "type": "item.completed",
-                "item": {"id": "i2", "type": "agent_message", "text": ""},
-            },
-        )
-        out = parse_codex_stream(stream)
-        assert out["body"] == "real"
+    def test_a_missing_file_reads_as_nothing(self, tmp_path: Path):
+        records, offset = read_rollout(tmp_path / "never-written.jsonl", 0)
+        assert records == []
+        assert offset == 0
 
 
 # ---------------------------------------------------------------------------
@@ -208,32 +395,46 @@ class TestParseCodexStream:
 # ---------------------------------------------------------------------------
 
 
-def _agent_message(text: str) -> dict:
-    return {
-        "type": "item.completed",
-        "item": {"id": "i1", "type": "agent_message", "text": text},
-    }
-
-
-def _turn_completed(**usage: int) -> dict:
-    return {"type": "turn.completed", "usage": usage}
-
-
-def _exec_proc(returncode: int, stdout: bytes, stderr: bytes = b""):
+def _exec_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b""):
     proc = MagicMock()
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
     return proc
 
 
-async def _run_exec(proc, tmp_path: Path, kill: AsyncMock | None = None):
+async def _run_exec(
+    proc,
+    tmp_path: Path,
+    *,
+    records: tuple[dict, ...] = (),
+    kill: AsyncMock | None = None,
+    rollout: Path | None = None,
+    interactive: list[str] | None = None,
+):
+    """Drive `_run_codex_exec` against a fake process and a fixture rollout.
+
+    The rollout is what the turn is read from now, so a test states its records
+    rather than a stdout stream. `rollout` lets a test own the file and append to
+    it while the run is in flight.
+    """
+    path = rollout if rollout is not None else tmp_path / "rollout.jsonl"
+    if records:
+        path.write_text(_rollout_text(*records))
     with (
         patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
         patch.object(codex_mod.agent, "track_agent_process"),
         patch.object(codex_mod.agent, "_kill_process_tree", kill or AsyncMock()),
+        patch.object(
+            codex_mod.transcript,
+            "_find_codex_rollout_by_cwd",
+            lambda _cwd, **_kw: path if path.exists() else None,
+        ),
     ):
         return await codex_mod._run_codex_exec(
-            tmp_path, ["codex", "exec"], timeout=None
+            tmp_path,
+            ["codex", "exec", "prompt"],
+            timeout=None,
+            interactive=interactive,
         )
 
 
@@ -261,45 +462,83 @@ def _streamed_proc(returncode: int, stdout: asyncio.StreamReader, stderr=None):
     return proc
 
 
-class TestStreamWatch:
-    def test_marker_split_across_chunks_is_still_found(self):
-        watch = codex_mod._StreamWatch()
-        marker = codex_mod._TURN_COMPLETED_MARKER
-        watch.feed(b'{"type": ' + marker[:5])
-        assert not watch.turn_completed.is_set()
-        watch.feed(marker[5:] + b"}\n")
-        assert watch.turn_completed.is_set()
+class TestRolloutFollower:
+    """The turn's live view: progress out, completion noticed."""
 
-    def test_carry_does_not_grow_with_the_stream(self):
-        watch = codex_mod._StreamWatch()
-        for _ in range(50):
-            watch.feed(b"x" * 4096)
-        assert len(watch._carry) == len(codex_mod._TURN_COMPLETED_MARKER) - 1
+    def _follower(self, tmp_path: Path, emit=None):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text("")
+        follower = codex_mod._RolloutFollower(tmp_path, None, emit)
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: path
+        ):
+            follower._drain()
+        return follower, path
 
-    def test_further_output_after_completion_only_bumps_activity(self):
-        watch = codex_mod._StreamWatch()
-        watch.feed(codex_mod._TURN_COMPLETED_MARKER)
-        before = watch.last_output_at
-        watch.feed(b"trailing noise")
-        assert watch.turn_completed.is_set()
-        assert watch.last_output_at >= before
+    def test_commentary_is_relayed_but_the_closing_reply_is_not(self, tmp_path: Path):
+        """The reply is delivered as the turn's answer; relaying it would double it."""
+        relayed: list[str] = []
+        follower, path = self._follower(tmp_path, relayed.append)
+        path.write_text(
+            _rollout_text(
+                _agent_message("looking at the tests now", phase="commentary"),
+                _agent_message("all green", phase="final_answer"),
+            )
+        )
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: path
+        ):
+            follower._drain()
+
+        assert relayed == ["looking at the tests now"]
+
+    def test_task_complete_marks_the_turn_finished(self, tmp_path: Path):
+        follower, path = self._follower(tmp_path)
+        assert not follower.turn_completed.is_set()
+        path.write_text(_rollout_text(_task_complete("done")))
+        follower._drain()
+
+        assert follower.turn_completed.is_set()
+
+    def test_a_broken_frontend_does_not_abort_the_turn(self, tmp_path: Path):
+        def explode(_text: str) -> None:
+            raise RuntimeError("frontend is down")
+
+        follower, path = self._follower(tmp_path, explode)
+        path.write_text(_rollout_text(_agent_message("narration", phase="commentary")))
+        follower._drain()  # must not raise
+
+        assert follower.records
+
+    def test_a_resumed_thread_starts_after_what_is_already_there(self, tmp_path: Path):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(_rollout_text(_task_complete("an earlier turn")))
+        with patch.object(codex_mod.transcript, "_find_codex_rollout", lambda _t: path):
+            follower = codex_mod._RolloutFollower(tmp_path, "t1", None)
+        with path.open("a") as handle:
+            handle.write(_rollout_text(_task_complete("this turn")))
+        follower._drain()
+
+        assert parse_codex_rollout(follower.records)["body"] == "this turn"
 
 
 class TestHungCodexIsKilled:
     """codex can finish a turn and then never exit. Don't wait for it."""
 
-    async def test_hang_after_turn_completed_is_killed_and_reply_delivered(
+    async def test_hang_after_the_turn_is_killed_and_reply_delivered(
         self, tmp_path: Path, monkeypatch, caplog
     ):
         monkeypatch.setattr(codex_mod, "POST_TURN_EXIT_GRACE", 0.05)
-        stdout = _stream(
-            _ndjson(
-                {"type": "thread.started", "thread_id": "t1"},
+        monkeypatch.setattr(codex_mod, "ROLLOUT_POLL_S", 0.01)
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(
+            _rollout_text(
+                _session_meta("t1"),
                 _agent_message("PR #804 is merged."),
-                _turn_completed(input_tokens=10),
-            ),
-            eof=False,
+                _task_complete("PR #804 is merged."),
+            )
         )
+        stdout = _stream(eof=False)
         stderr = _stream(eof=False)
         proc = _streamed_proc(-9, stdout, stderr)
 
@@ -313,7 +552,7 @@ class TestHungCodexIsKilled:
 
         with caplog.at_level(logging.WARNING):
             out = await asyncio.wait_for(
-                _run_exec(proc, tmp_path, kill=kill), timeout=5
+                _run_exec(proc, tmp_path, kill=kill, rollout=rollout), timeout=5
             )
 
         assert out["body"] == "PR #804 is merged."
@@ -321,12 +560,21 @@ class TestHungCodexIsKilled:
         assert kill.await_count >= 1
         assert "silent for" in caplog.text
 
-    async def test_no_kill_when_codex_exits_on_its_own(self, tmp_path: Path):
-        proc = _streamed_proc(
-            0, _stream(_ndjson(_agent_message("done"), _turn_completed()))
-        )
+    async def test_no_kill_when_codex_exits_on_its_own(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setattr(codex_mod, "ROLLOUT_POLL_S", 0.01)
+        proc = _streamed_proc(0, _stream())
         kill = AsyncMock()
-        out = await asyncio.wait_for(_run_exec(proc, tmp_path, kill=kill), timeout=5)
+        out = await asyncio.wait_for(
+            _run_exec(
+                proc,
+                tmp_path,
+                records=(_agent_message("done"), _task_complete("done")),
+                kill=kill,
+            ),
+            timeout=5,
+        )
         assert out["body"] == "done"
         # Only the unconditional `finally` teardown, never the watchdog.
         assert kill.await_count == 1
@@ -336,24 +584,28 @@ class TestHungCodexIsKilled:
     ):
         """A second turn in one exec (auto-compaction) must not be cut short."""
         monkeypatch.setattr(codex_mod, "POST_TURN_EXIT_GRACE", 0.4)
-        stdout = _stream(
-            _ndjson(_agent_message("first"), _turn_completed(input_tokens=1)),
-            eof=False,
-        )
+        monkeypatch.setattr(codex_mod, "ROLLOUT_POLL_S", 0.01)
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_task_complete("first")))
+        stdout = _stream(eof=False)
         proc = _streamed_proc(0, stdout)
 
         async def second_turn():
             # Well inside the grace, so the timer keeps re-arming.
             await asyncio.sleep(0.1)
-            stdout.feed_data(b"\n" + _ndjson(_agent_message("second")))
+            with rollout.open("a") as handle:
+                handle.write(_rollout_text(_item("CommandExecution")))
             await asyncio.sleep(0.1)
-            stdout.feed_data(b"\n" + _ndjson(_turn_completed(input_tokens=2)))
+            with rollout.open("a") as handle:
+                handle.write(_rollout_text(_task_complete("second")))
             await asyncio.sleep(0.1)
             stdout.feed_eof()
 
         kill = AsyncMock()
         feeder = asyncio.create_task(second_turn())
-        out = await asyncio.wait_for(_run_exec(proc, tmp_path, kill=kill), timeout=5)
+        out = await asyncio.wait_for(
+            _run_exec(proc, tmp_path, kill=kill, rollout=rollout), timeout=5
+        )
         await feeder
         assert out["body"] == "second"
         assert kill.await_count == 1  # teardown only — the watchdog never fired
@@ -363,19 +615,19 @@ class TestRunCodexExec:
     async def test_nonzero_exit_after_completed_turn_still_returns_body(
         self, tmp_path: Path, caplog
     ):
-        """codex can deadlock at exit with its reply already on stdout; the
-        turn is finished, so the reply must survive being killed."""
-        proc = _exec_proc(
-            -9,
-            _ndjson(
-                {"type": "thread.started", "thread_id": "t1"},
-                _agent_message("PR #804 is merged."),
-                _turn_completed(input_tokens=100, output_tokens=5),
-            ),
-            stderr=b"ERROR codex_core::tools::router: stale noise",
-        )
+        """codex can deadlock at exit with its reply already written; the turn is
+        finished, so the reply must survive being killed."""
+        proc = _exec_proc(-9, stderr=b"ERROR codex_core::tools::router: stale noise")
         with caplog.at_level(logging.WARNING):
-            out = await _run_exec(proc, tmp_path)
+            out = await _run_exec(
+                proc,
+                tmp_path,
+                records=(
+                    _session_meta("t1"),
+                    _agent_message("PR #804 is merged."),
+                    _task_complete("PR #804 is merged."),
+                ),
+            )
         assert out["body"] == "PR #804 is merged."
         assert out["thread_id"] == "t1"
         # The deadlock is un-root-caused upstream; stderr is the only artifact
@@ -385,65 +637,112 @@ class TestRunCodexExec:
     async def test_nonzero_exit_mid_turn_raises_instead_of_shipping_a_fragment(
         self, tmp_path: Path
     ):
-        """A turn killed mid-work leaves an intermediate agent_message that
-        looks exactly like a final answer. Without turn.completed it is not
-        one, and delivering it would be a silently wrong reply."""
-        proc = _exec_proc(
-            -9,
-            _ndjson(
-                {"type": "thread.started", "thread_id": "t1"},
-                _agent_message("Let me check the tests first, then I'll open the PR"),
-            ),
-            stderr=b"killed mid-turn",
-        )
+        """A turn killed mid-work leaves an intermediate message that looks
+        exactly like a final answer. Without task_complete it is not one, and
+        delivering it would be a silently wrong reply."""
+        proc = _exec_proc(-9, stderr=b"killed mid-turn")
         with pytest.raises(RuntimeError, match="killed mid-turn"):
-            await _run_exec(proc, tmp_path)
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(
+                    _session_meta("t1"),
+                    _agent_message("Let me check the tests first"),
+                ),
+            )
 
     async def test_nonzero_exit_after_completed_turn_without_body_raises(
         self, tmp_path: Path
     ):
-        """turn.completed with nothing to say is not a reply worth delivering."""
-        proc = _exec_proc(-9, _ndjson(_turn_completed()), stderr=b"empty turn")
+        """A finished turn with nothing to say is not a reply worth delivering."""
+        proc = _exec_proc(-9, stderr=b"empty turn")
         with pytest.raises(RuntimeError, match="empty turn"):
-            await _run_exec(proc, tmp_path)
+            await _run_exec(proc, tmp_path, records=(_task_complete(""),))
 
     async def test_nonzero_exit_without_body_raises_stderr(self, tmp_path: Path):
-        proc = _exec_proc(1, b"", stderr=b"codex: command not found")
+        proc = _exec_proc(1, stderr=b"codex: command not found")
         with pytest.raises(RuntimeError, match="command not found"):
             await _run_exec(proc, tmp_path)
 
     async def test_nonzero_exit_without_body_or_stderr_raises_exit_code(
         self, tmp_path: Path
     ):
-        proc = _exec_proc(-15, b"")
+        proc = _exec_proc(-15)
         with pytest.raises(RuntimeError, match="Exit code -15"):
             await _run_exec(proc, tmp_path)
 
-    async def test_turn_failed_raises_even_with_a_body(self, tmp_path: Path):
-        """turn.failed is terminal: a partial body must not mask it."""
-        proc = _exec_proc(
-            0,
-            _ndjson(
-                _agent_message("partial"),
-                {"type": "turn.failed", "error": {"message": "context exhausted"}},
-            ),
-        )
+    async def test_turn_aborted_raises_even_with_a_body(self, tmp_path: Path):
+        """An abort is terminal: a partial body must not mask it."""
+        proc = _exec_proc(0)
         with pytest.raises(RuntimeError, match="context exhausted"):
-            await _run_exec(proc, tmp_path)
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_agent_message("partial"), _turn_aborted("context exhausted")),
+            )
 
-    async def test_turn_failed_wins_over_stderr_on_nonzero_exit(self, tmp_path: Path):
-        proc = _exec_proc(
-            1,
-            _ndjson({"type": "turn.failed", "error": {"message": "rate limited"}}),
-            stderr=b"noisy teardown",
-        )
+    async def test_turn_aborted_wins_over_stderr_on_nonzero_exit(self, tmp_path: Path):
+        proc = _exec_proc(1, stderr=b"noisy teardown")
         with pytest.raises(RuntimeError, match="rate limited"):
-            await _run_exec(proc, tmp_path)
+            await _run_exec(proc, tmp_path, records=(_turn_aborted("rate limited"),))
+
+    async def test_authentication_failure_stops_before_nudge(self, tmp_path: Path):
+        proc = _exec_proc(0)
+        private_detail = "401 Unauthorized: rejected private credential"
+        with pytest.raises(codex_mod.agent.AgentTurnError) as raised:
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_task_complete(error={"message": private_detail}),),
+            )
+        assert "private credential" not in str(raised.value)
+        assert "authentication (401)" in raised.value.public_message
+
+    async def test_access_denial_has_a_safe_message(self, tmp_path: Path):
+        proc = _exec_proc(0)
+        with pytest.raises(codex_mod.agent.AgentTurnError) as raised:
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_task_complete(error={"message": "403 Forbidden"}),),
+            )
+        assert "access (403)" in raised.value.public_message
 
     async def test_clean_exit_returns_parsed(self, tmp_path: Path):
-        proc = _exec_proc(0, _ndjson(_agent_message("done")))
-        out = await _run_exec(proc, tmp_path)
+        proc = _exec_proc(0)
+        out = await _run_exec(proc, tmp_path, records=(_task_complete("done"),))
         assert out["body"] == "done"
+
+    @pytest.mark.parametrize("aborted", [False, True])
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "Selected model is at capacity. Please try a different model.",
+            "SELECTED MODEL IS AT CAPACITY. private provider detail",
+        ],
+    )
+    async def test_capacity_failure_has_an_actionable_safe_message(
+        self, tmp_path: Path, aborted: bool, detail: str
+    ):
+        record = (
+            _turn_aborted(detail)
+            if aborted
+            else _task_complete("partial", error={"message": detail})
+        )
+        with pytest.raises(codex_mod.agent.AgentTurnError) as raised:
+            await _run_exec(
+                _exec_proc(1),
+                tmp_path,
+                records=(_agent_message("partial"), record),
+            )
+        assert str(raised.value) == "Codex selected model is at capacity"
+        assert raised.value.public_message == (
+            "The selected model is at capacity, so this request stopped "
+            "without a final answer. Try again shortly, or ask me to use "
+            "a different model."
+        )
+        assert "partial" not in raised.value.public_message
+        assert "private provider detail" not in raised.value.public_message
 
 
 # ---------------------------------------------------------------------------
@@ -511,27 +810,33 @@ class TestCodexBackendRun:
         """
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        proc = _exec_proc(
-            -9,
-            _ndjson(
-                {"type": "thread.started", "thread_id": "codex-thread-killed"},
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(
+            _rollout_text(
+                _session_meta("codex-thread-killed"),
                 _agent_message("PR #804 is merged."),
-                _turn_completed(input_tokens=100, output_tokens=5),
-            ),
-            stderr=b"stale teardown noise",
+                _token_count(input_tokens=100, output_tokens=5),
+                _task_complete("PR #804 is merged."),
+            )
         )
+        proc = _exec_proc(-9, stderr=b"stale teardown noise")
         with (
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
             patch.object(codex_mod.agent, "track_agent_process"),
             patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()),
+            patch.object(
+                codex_mod.transcript,
+                "_find_codex_rollout_by_cwd",
+                lambda _cwd, **_kw: rollout,
+            ),
         ):
             resp = await CodexBackend().run(
                 workspace, "killed-session", "hi", "telegram"
             )
 
         assert resp.body == "PR #804 is merged."
-        # turn.completed carries the usage, so gating on it also keeps the
-        # fallback token count honest instead of billing the turn as free.
+        # task_complete gates delivery, and the rollout's token_count keeps the
+        # fallback count honest instead of billing the turn as free.
         assert resp.tokens_in == 100
         assert resp.tokens_out == 5
         mapping = codex_mod.codex_state.mapping_path(workspace, "killed-session")
@@ -681,11 +986,12 @@ class TestCodexBackendRun:
         assert "o3" not in cmd
 
     async def test_effort_config_only_under_launcher(self, tmp_path, monkeypatch):
-        """OLLAMA_EFFORT must not reach native argv: native inherits the
-        operator's own model_reasoning_effort in ~/.codex/config.toml."""
+        """OLLAMA_EFFORT belongs to the mode that swapped the model out. It must
+        not leak into native argv, which has a key of its own."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         monkeypatch.setenv("OLLAMA_EFFORT", "high")
+        monkeypatch.delenv("CODEX_EFFORT", raising=False)
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
@@ -694,25 +1000,85 @@ class TestCodexBackendRun:
             await CodexBackend().run(workspace, "sess", "hi", "telegram")
         assert "-c" not in mock.call_args[0][1]
 
-    async def test_effort_config_under_launcher(self, tmp_path, monkeypatch):
-        """Ollama mode: effort is passed as a TOML-quoted -c override."""
+    async def test_native_effort_from_the_resolved_effort(self, tmp_path):
+        """A resolved effort reaches native argv, so an operator can override
+        effort for cotf's own spawns without touching ~/.codex/config.toml."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("OLLAMA_EFFORT", "high")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(effort="xhigh").run(workspace, "sess", "hi", "telegram")
+        assert 'model_reasoning_effort="xhigh"' in mock.call_args[0][1]
+
+    async def test_native_effort_omitted_when_its_key_is_unset(
+        self, tmp_path, monkeypatch
+    ):
+        """Unset means "inherit": no override, so codex reads
+        model_reasoning_effort from the operator's own config exactly as before."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.delenv("CODEX_EFFORT", raising=False)
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+        assert "-c" not in mock.call_args[0][1]
+
+    async def test_resolved_effort_reaches_argv_under_a_launcher(self, tmp_path):
+        """The resolver decides which effort a launcher run uses; the backend
+        passes exactly what it was handed, with no second opinion."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend(launcher=launcher).run(
+            await CodexBackend(launcher=launcher, effort="high").run(
+                workspace, "sess", "hi", "telegram"
+            )
+        assert 'model_reasoning_effort="high"' in mock.call_args[0][1]
+
+    async def test_native_effort_level_out_of_set_skipped(self, tmp_path, caplog):
+        """A typo in config.yaml warns here rather than dying in codex's own
+        config parse."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(effort="enormous").run(
+                workspace, "sess", "hi", "telegram"
+            )
+        assert "-c" not in mock.call_args[0][1]
+        assert "ignoring unknown effort 'enormous'" in caplog.text
+
+    async def test_effort_config_under_launcher(self, tmp_path):
+        """Ollama mode: effort is passed as a TOML-quoted -c override."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(launcher=launcher, effort="high").run(
                 workspace, "sess", "hi", "telegram"
             )
         cmd = mock.call_args[0][1]
         assert 'model_reasoning_effort="high"' in cmd
 
     async def test_effort_omitted_without_setting(self, tmp_path, monkeypatch):
-        """Unset OLLAMA_EFFORT → no -c override even under the launcher."""
+        """Unset OLLAMA_EFFORT → no effort override even under the launcher."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         monkeypatch.delenv("OLLAMA_EFFORT", raising=False)
@@ -725,41 +1091,65 @@ class TestCodexBackendRun:
             await CodexBackend(launcher=launcher).run(
                 workspace, "sess", "hi", "telegram"
             )
-        assert "-c" not in mock.call_args[0][1]
+        assert not any("model_reasoning_effort" in a for a in mock.call_args[0][1])
 
-    async def test_effort_level_not_in_codex_set_skipped(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """`max` is claude-only; codex must skip it rather than hand it to its
-        config parse, which would fail the spawn."""
+    async def test_effort_level_not_in_codex_set_skipped(self, tmp_path, caplog):
+        """A level neither CLI accepts must be skipped rather than handed to
+        codex's config parse, which would fail the spawn."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("OLLAMA_EFFORT", "max")
         launcher = OllamaLauncher(model="deepseek-v4-flash:cloud")
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend(launcher=launcher).run(
+            await CodexBackend(launcher=launcher, effort="colossal").run(
                 workspace, "sess", "hi", "telegram"
             )
-        assert "-c" not in mock.call_args[0][1]
-        assert "ignoring unknown effort 'max'" in caplog.text
+        assert not any("model_reasoning_effort" in a for a in mock.call_args[0][1])
+        assert "ignoring unknown effort 'colossal'" in caplog.text
 
-    async def test_native_with_codex_model_injects_m_flag(
-        self, tmp_path: Path, monkeypatch
-    ):
+    async def test_max_is_a_codex_level_and_reaches_argv(self, tmp_path, caplog):
+        """`max` is in codex's own catalog, so it must survive validation.
+
+        It used to be treated as claude-only: the warning fired, the `-c` was
+        dropped, and the turn silently inherited ~/.codex/config.toml's level.
+        """
         workspace = tmp_path / "ws"
         workspace.mkdir()
-        monkeypatch.setenv("CODEX_MODEL", "gpt-4.1")
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(effort="max").run(workspace, "sess", "hi", "telegram")
+        assert 'model_reasoning_effort="max"' in mock.call_args[0][1]
+        assert "ignoring unknown effort" not in caplog.text
+
+    async def test_ultra_is_a_codex_level_too(self, tmp_path, caplog):
+        """`ultra` sits above max for gpt-5.6-sol and gpt-5.6-terra."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with patch(
+            "claude_on_the_fly.backends.codex._run_codex_exec",
+            new_callable=AsyncMock,
+            return_value=_success_result(),
+        ) as mock:
+            await CodexBackend(effort="ultra").run(workspace, "sess", "hi", "telegram")
+        assert 'model_reasoning_effort="ultra"' in mock.call_args[0][1]
+        assert "ignoring unknown effort" not in caplog.text
+
+    async def test_native_with_codex_model_injects_m_flag(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
 
         with patch(
             "claude_on_the_fly.backends.codex._run_codex_exec",
             new_callable=AsyncMock,
             return_value=_success_result(),
         ) as mock:
-            await CodexBackend().run(workspace, "sess", "hi", "telegram")
+            await CodexBackend(model="gpt-4.1").run(workspace, "sess", "hi", "telegram")
 
         cmd = mock.call_args[0][1]
         m_idx = cmd.index("-m")
@@ -779,7 +1169,9 @@ class TestCodexBackendRun:
         cmd = mock.call_args[0][1]
         assert "--yolo" in cmd
         assert "--skip-git-repo-check" in cmd
-        assert "--json" in cmd
+        # No --json: it would render JSONL into the terminal the mirror shows,
+        # and the rollout already carries everything it put on stdout.
+        assert "--json" not in cmd
 
     async def test_system_prompt_prepended_to_user_prompt(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -836,29 +1228,37 @@ class TestCodexBackendRun:
         assert resp.tokens_in == 200
 
     async def test_tokens_in_uses_session_file_delta(self, tmp_path: Path):
-        """When session-file totals are available, report this exec's delta,
-        not codex stdout's cumulative running total."""
+        """Report the counts this exec appended, not codex stdout's figure.
+
+        Codex writes each model call's own usage into the session file, so a
+        turn's cost is the sum of the records it added. Subtracting two
+        `total_token_usage` snapshots undercounted input by three orders of
+        magnitude and went negative whenever a turn produced less output than
+        the one before it.
+        """
         workspace = tmp_path / "ws"
         workspace.mkdir()
         _write_mapping(workspace, "sess-resume", "existing-thread")
 
-        # Simulate: pre-exec total was 12000 in, 100 out.
-        # Post-exec total is 26000 in, 250 out. This exec contributed 14000 / 150.
-        pre = {
-            "input_tokens": 12000,
-            "output_tokens": 100,
-            "reasoning_output_tokens": 0,
-        }
-        post = {
+        # One record existed before the exec; the exec appended one of its own.
+        # Its own record is the answer, whatever the earlier turn happened to
+        # cost -- note the earlier one is larger, which is what used to render
+        # a negative.
+        earlier = {
             "input_tokens": 26000,
             "output_tokens": 250,
+            "reasoning_output_tokens": 0,
+        }
+        this_turn = {
+            "input_tokens": 14000,
+            "output_tokens": 150,
             "reasoning_output_tokens": 0,
         }
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                side_effect=[pre, post],
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                side_effect=[[earlier], [earlier, this_turn]],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -887,8 +1287,8 @@ class TestCodexBackendRun:
 
         with (
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                return_value=None,
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                return_value=[],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -918,8 +1318,8 @@ class TestCodexBackendRun:
                 return_value="gpt-test",
             ),
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                return_value=None,
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                return_value=[],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -940,19 +1340,19 @@ class TestCodexBackendRun:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         _write_mapping(workspace, "sess-resume", "existing-thread")
-        pre = {
+        earlier = {
             "input_tokens": 1000,
             "cached_input_tokens": 600,
             "cache_write_input_tokens": 100,
             "output_tokens": 100,
             "reasoning_output_tokens": 20,
         }
-        post = {
-            "input_tokens": 1200,
-            "cached_input_tokens": 700,
-            "cache_write_input_tokens": 150,
-            "output_tokens": 140,
-            "reasoning_output_tokens": 35,
+        this_turn = {
+            "input_tokens": 200,
+            "cached_input_tokens": 100,
+            "cache_write_input_tokens": 50,
+            "output_tokens": 40,
+            "reasoning_output_tokens": 15,
         }
 
         with (
@@ -961,8 +1361,8 @@ class TestCodexBackendRun:
                 return_value="gpt-test",
             ),
             patch(
-                "claude_on_the_fly.backends.codex.transcript.extract_codex_cumulative_tokens",
-                side_effect=[pre, post],
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                side_effect=[[earlier], [earlier, this_turn]],
             ),
             patch(
                 "claude_on_the_fly.backends.codex._run_codex_exec",
@@ -980,6 +1380,49 @@ class TestCodexBackendRun:
 
         assert resp.cost == 0.24
         assert cost_for.call_args.args == ("gpt-test", 50, 55, 100, 50)
+
+    async def test_a_quieter_turn_after_a_loud_one_is_not_negative(
+        self, tmp_path: Path
+    ):
+        """A turn that says less than the previous one still costs what it cost.
+
+        Measured against codex 0.150.1: `total_token_usage` carries each call's
+        own figures, not a running total, so subtracting consecutive snapshots
+        rendered `↓-285` in chat on two of four consecutive resumes. Nothing
+        about a short reply after a long one is unusual, so this is the common
+        case rather than an edge one.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "sess-resume", "existing-thread")
+        loud = {
+            "input_tokens": 17647,
+            "output_tokens": 285,
+            "reasoning_output_tokens": 5,
+        }
+        quiet = {
+            "input_tokens": 17813,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0,
+        }
+
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex.transcript.extract_codex_usage_events",
+                side_effect=[[loud], [loud, quiet]],
+            ),
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                return_value=_success_result(thread_id="existing-thread"),
+            ),
+        ):
+            resp = await CodexBackend().run(
+                workspace, "sess-resume", "next turn", "telegram"
+            )
+
+        assert resp.tokens_out == 5
+        assert resp.tokens_in == 17813
 
     async def test_response_sums_output_and_reasoning_tokens(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -1041,14 +1484,26 @@ class TestCodexBackendRun:
 
 
 class TestCodexUsageAccounting:
-    def test_new_thread_usage_has_no_previous_snapshot(self):
-        current = {
-            "input_tokens": 100,
-            "cached_input_tokens": 40,
-            "cache_write_input_tokens": 20,
+    def test_a_turn_costs_the_sum_of_the_calls_it_made(self):
+        """One exec can fan out to several model calls, and the turn's cost is
+        all of them. Reading only the last record would undercount it."""
+        calls = [
+            {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 7},
+            {"input_tokens": 250, "cached_input_tokens": 90, "output_tokens": 3},
+        ]
+
+        assert codex_mod._usage_from_events(calls) == {
+            "input_tokens": 350,
+            "cached_input_tokens": 130,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 0,
         }
 
-        assert codex_mod._usage_delta(current, None) == current
+    def test_a_thread_with_no_records_costs_nothing(self):
+        assert codex_mod._usage_from_events([]) == dict.fromkeys(
+            codex_mod._CODEX_USAGE_FIELDS, 0
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1232,6 +1687,24 @@ class TestCodexBackendNudgeRetry:
         assert mock.await_count == 1
         assert resp.body == "all good"
 
+    async def test_model_authentication_failure_is_not_nudged(self, tmp_path: Path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        failure = codex_mod.agent.AgentTurnError(
+            "Codex model authentication rejected (401)", "Authentication failed."
+        )
+        with (
+            patch(
+                "claude_on_the_fly.backends.codex._run_codex_exec",
+                new_callable=AsyncMock,
+                side_effect=failure,
+            ) as mock,
+            pytest.raises(codex_mod.agent.AgentTurnError),
+        ):
+            await CodexBackend().run(workspace, "sess-auth", "hi", "telegram")
+
+        assert mock.await_count == 1
+
     async def test_empty_first_with_no_thread_id_returns_no_response(
         self, tmp_path: Path
     ):
@@ -1248,7 +1721,7 @@ class TestCodexBackendNudgeRetry:
             resp = await CodexBackend().run(workspace, "sess-q", "hi", "telegram")
 
         assert mock.await_count == 1  # no retry attempted
-        assert resp.body == "No response"
+        assert resp.body == codex_mod.agent.EMPTY_REPLY_NOTICE
 
     async def test_whitespace_only_body_triggers_retry(self, tmp_path: Path):
         workspace = tmp_path / "ws"
@@ -1279,7 +1752,7 @@ class TestCodexBackendNudgeRetry:
         ):
             resp = await CodexBackend().run(workspace, "sess-v", "hi", "telegram")
 
-        assert resp.body == "No response"
+        assert resp.body == codex_mod.agent.EMPTY_REPLY_NOTICE
 
 
 # ---------------------------------------------------------------------------
@@ -1603,11 +2076,32 @@ class TestCodexCompact:
     """Codex has no compaction *command* we can send: `thread/compact/start` is
     app-server only, and `/compact` typed as a prompt is acknowledged
     ("Context compacted.") while changing nothing — measured 45,730 → 46,357.
-    What works is forcing codex's own pre-turn threshold via `-c`.
+    What works is forcing codex's own pre-turn threshold via `-c`, then stopping
+    codex once the compacted history is on disk and before the model runs.
     """
 
-    def _wire_thread(self, workspace: Path, session_uuid: str, thread_id: str) -> None:
-        _write_mapping(workspace, session_uuid, thread_id)
+    def _wire(self, tmp_path: Path, *records: dict) -> Path:
+        _write_mapping(tmp_path, "sid", "thread-1")
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_session_meta("thread-1"), *records))
+        return rollout
+
+    def _patches(self, rollout: Path | None, run_exec, tokens=(45_000, 258_400)):
+        return (
+            patch.object(
+                codex_mod.transcript, "_find_codex_rollout", return_value=rollout
+            ),
+            patch.object(
+                codex_mod.transcript, "extract_codex_prompt_tokens", return_value=tokens
+            ),
+            patch.object(codex_mod, "_run_codex_exec", run_exec),
+            patch.object(codex_mod, "COMPACT_POLL_S", 0.01),
+        )
+
+    async def _compact(self, tmp_path, rollout, run_exec, **kwargs):
+        first, second, third, fourth = self._patches(rollout, run_exec, **kwargs)
+        with first, second, third, fourth:
+            return await codex_mod.CodexBackend().compact(tmp_path, "sid")
 
     async def test_no_thread_yet_is_not_reported_as_unsupported(self, tmp_path):
         outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
@@ -1615,81 +2109,172 @@ class TestCodexCompact:
         assert outcome.ok is False
         assert "no session" in outcome.error
 
-    async def test_forces_the_threshold_via_a_per_invocation_override(self, tmp_path):
-        """Never writes to the user's ~/.codex/config.toml — the override is
-        scoped to this one run."""
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript,
-                "extract_codex_prompt_tokens",
-                side_effect=[(45_000, 258_400), (18_000, 258_400)],
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ) as run_exec,
-        ):
-            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+    async def test_a_missing_rollout_is_a_failure(self, tmp_path):
+        _write_mapping(tmp_path, "sid", "thread-1")
+        outcome = await self._compact(tmp_path, None, AsyncMock())
+        assert outcome is not None and outcome.ok is False
+        assert "rollout" in outcome.error
 
-        argv = run_exec.await_args[0][1]
-        assert "-c" in argv
-        assert f"model_auto_compact_token_limit={codex_mod.COMPACT_TOKEN_LIMIT}" in argv
-        assert argv[-3:-1] == ["resume", "thread-1"]
+    async def test_stops_codex_once_the_compacted_history_is_written(self, tmp_path):
+        """The rollout is written in stages, the way codex writes it. The run is
+        cancelled at `turn_context`, before the trigger reaches the model, and
+        the cancel is what reaps codex's process group."""
+        rollout = self._wire(tmp_path, _task_complete("older turn"))
+        cancelled = asyncio.Event()
+        seen: dict = {}
+
+        async def codex(_workspace, argv, **_kwargs):
+            seen["argv"] = argv
+            stages = (
+                {"type": "compacted", "payload": {}},
+                {"type": "event_msg", "payload": {"type": "token_count"}},
+                {"type": "turn_context", "payload": {}},
+            )
+            try:
+                for record in stages:
+                    await asyncio.sleep(0.02)
+                    with rollout.open("a") as handle:
+                        handle.write(json.dumps(record) + "\n")
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        outcome = await self._compact(tmp_path, rollout, codex)
+
+        assert cancelled.is_set()
         assert outcome is not None and outcome.ok is True
-        assert (outcome.pre_tokens, outcome.post_tokens) == (45_000, 18_000)
+        assert outcome.pre_tokens == 45_000
+        assert outcome.conversation_tokens_after is None
+        argv = seen["argv"]
+        assert f"model_auto_compact_token_limit={codex_mod.COMPACT_TOKEN_LIMIT}" in argv
+        assert argv[-3:] == ["resume", "thread-1", codex_mod.COMPACT_TRIGGER_PROMPT]
+        assert "/compact" not in argv
 
-    async def test_never_sends_slash_compact(self, tmp_path):
-        """It would be accepted and do nothing, which is the one outcome worse
-        than an error."""
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript,
-                "extract_codex_prompt_tokens",
-                side_effect=[(45_000, 258_400), (18_000, 258_400)],
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ) as run_exec,
-        ):
-            await codex_mod.CodexBackend().compact(tmp_path, "sid")
+    async def test_a_run_that_never_compacts_is_stopped_before_the_model(
+        self, tmp_path
+    ):
+        """If codex skips the compaction (the provider ignores the lowered limit,
+        or the compaction fails), the next record is still the turn's
+        `turn_context`. Stopping there keeps the trigger prompt away from the
+        model, where it would otherwise run a whole turn in the chat's session."""
+        rollout = self._wire(tmp_path, _task_complete("older turn"))
+        cancelled = asyncio.Event()
 
-        assert "/compact" not in run_exec.await_args[0][1]
+        async def codex(_workspace, _argv, **_kwargs):
+            try:
+                await asyncio.sleep(0.02)
+                with rollout.open("a") as handle:
+                    handle.write(json.dumps({"type": "turn_context", "payload": {}}))
+                    handle.write("\n")
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
 
-    async def test_a_context_that_did_not_shrink_is_not_success(self, tmp_path):
-        """The only evidence available is the token count — codex publishes no
-        in-band compaction signal, so trusting the trigger would repeat the exact
-        lie `/compact` tells."""
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript,
-                "extract_codex_prompt_tokens",
-                side_effect=[(45_000, 258_400), (45_100, 258_400)],
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ),
-        ):
-            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
+        outcome = await asyncio.wait_for(
+            self._compact(tmp_path, rollout, codex), timeout=5
+        )
 
+        assert cancelled.is_set()
         assert outcome is not None and outcome.ok is False
-        assert "nothing to compact" in outcome.error
+        assert outcome.error == "codex did not compact the thread"
 
-    async def test_unreadable_usage_is_reported_not_guessed(self, tmp_path):
-        self._wire_thread(tmp_path, "sid", "thread-1")
-        with (
-            patch.object(
-                codex_mod.transcript, "extract_codex_prompt_tokens", return_value=None
-            ),
-            patch.object(
-                codex_mod, "_run_codex_exec", new_callable=AsyncMock, return_value={}
-            ),
-        ):
-            outcome = await codex_mod.CodexBackend().compact(tmp_path, "sid")
-
+    async def test_an_older_compaction_in_the_thread_does_not_count(self, tmp_path):
+        """Only records written after the run starts are this compaction's."""
+        rollout = self._wire(
+            tmp_path,
+            {"type": "compacted", "payload": {}},
+            {"type": "turn_context", "payload": {}},
+        )
+        outcome = await self._compact(
+            tmp_path, rollout, AsyncMock(return_value={"body": "hi"})
+        )
         assert outcome is not None and outcome.ok is False
-        assert "token usage" in outcome.error
+        assert outcome.error == "codex did not compact the thread"
+        assert outcome.pre_tokens == 45_000, "a failure keeps the count"
+
+    async def test_a_run_that_compacted_and_exited_on_its_own_is_success(
+        self, tmp_path
+    ):
+        rollout = self._wire(tmp_path)
+
+        async def codex(*_args, **_kwargs):
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"type": "compacted", "payload": {}}) + "\n")
+            return {}
+
+        outcome = await self._compact(tmp_path, rollout, codex)
+        assert outcome is not None and outcome.ok is True
+
+    async def test_a_codex_error_propagates_to_the_turn_handler(self, tmp_path):
+        """The error text is codex's stderr. Raising lets `_process` post its
+        public message and record the failure, instead of the chat reading the
+        raw narration as a compaction result."""
+        rollout = self._wire(tmp_path)
+        with pytest.raises(RuntimeError, match="Exit code 2"):
+            await self._compact(
+                tmp_path, rollout, AsyncMock(side_effect=RuntimeError("Exit code 2"))
+            )
+
+    async def test_an_error_after_the_compacted_record_is_still_success(self, tmp_path):
+        rollout = self._wire(tmp_path)
+
+        async def codex(*_args, **_kwargs):
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"type": "compacted", "payload": {}}) + "\n")
+            raise RuntimeError("Exit code 1")
+
+        outcome = await self._compact(tmp_path, rollout, codex)
+        assert outcome is not None and outcome.ok is True
+
+    async def test_no_timeout_from_the_frontend_gets_the_compaction_cap(self, tmp_path):
+        """The chat frontends pass None, which means no deadline downstream; an
+        unattended compaction that never settles would hold the chat."""
+        rollout = self._wire(tmp_path)
+        run_exec = AsyncMock(return_value={})
+        first, second, third, fourth = self._patches(rollout, run_exec)
+        with first, second, third, fourth:
+            await codex_mod.CodexBackend().compact(tmp_path, "sid", timeout=None)
+        assert run_exec.await_args.kwargs["timeout"] == agent.COMPACT_TIMEOUT
+
+    async def test_unreadable_usage_does_not_block_the_compaction(self, tmp_path):
+        """The count is only for the report; the `compacted` record decides."""
+        rollout = self._wire(tmp_path)
+
+        async def codex(*_args, **_kwargs):
+            with rollout.open("a") as handle:
+                handle.write(json.dumps({"type": "compacted", "payload": {}}) + "\n")
+            return {}
+
+        outcome = await self._compact(tmp_path, rollout, codex, tokens=None)
+        assert outcome is not None and outcome.ok is True
+        assert outcome.pre_tokens == 0
+
+    async def test_cancelling_the_compaction_cancels_codex(self, tmp_path):
+        """$stop cancels the caller; codex must not keep running behind it."""
+        rollout = self._wire(tmp_path)
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def codex(*_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        first, second, third, fourth = self._patches(rollout, codex)
+        with first, second, third, fourth:
+            task = asyncio.create_task(
+                codex_mod.CodexBackend().compact(tmp_path, "sid")
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert cancelled.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -1709,22 +2294,27 @@ class TestCodexExec:
         proc.communicate = AsyncMock(return_value=(stdout, stderr))
         return proc
 
-    async def _run(self, proc, **kwargs):
+    async def _run(self, proc, *, records: tuple[dict, ...] = (), **kwargs):
+        rollout = Path(tempfile.mkdtemp(prefix="cotf-rollout-")) / "rollout.jsonl"
+        rollout.write_text(_rollout_text(*records))
         with (
             patch("asyncio.create_subprocess_exec", return_value=proc),
             patch.object(codex_mod.agent, "_kill_process_tree", new_callable=AsyncMock),
+            patch.object(
+                codex_mod.transcript,
+                "_find_codex_rollout_by_cwd",
+                lambda _cwd, **_kw: rollout,
+            ),
         ):
             return await codex_mod._run_codex_exec(
                 Path("/tmp"), ["codex"], kwargs.get("timeout")
             )
 
-    async def test_a_clean_run_returns_the_parsed_stream(self) -> None:
-        events = [
-            {"type": "thread.started", "thread_id": "t-1"},
-            {"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}},
-        ]
-        stdout = "\n".join(json.dumps(e) for e in events).encode()
-        parsed = await self._run(self._proc(stdout))
+    async def test_a_clean_run_returns_the_parsed_turn(self) -> None:
+        parsed = await self._run(
+            self._proc(b""),
+            records=(_session_meta("t-1"), _task_complete("hi")),
+        )
         assert parsed["thread_id"] == "t-1"
         assert parsed["body"] == "hi"
 
@@ -1774,14 +2364,14 @@ class TestCodexExec:
                 await task
         kill.assert_awaited_once_with(proc)
 
-    async def test_a_turn_failure_in_the_stream_wins_over_the_exit_code(self) -> None:
-        """codex reports the real reason in `turn.failed`; the exit code is just a
-        number, so the stream's message is the better error."""
-        stdout = json.dumps(
-            {"type": "turn.failed", "error": {"message": "model refused"}}
-        ).encode()
+    async def test_a_turn_failure_wins_over_the_exit_code(self) -> None:
+        """codex records the real reason in `turn_aborted`; the exit code is just
+        a number, so the rollout's reason is the better error."""
         with pytest.raises(RuntimeError, match="model refused"):
-            await self._run(self._proc(stdout, b"exit 1 noise", rc=1))
+            await self._run(
+                self._proc(b"", b"exit 1 noise", rc=1),
+                records=(_turn_aborted("model refused"),),
+            )
 
     async def test_stderr_is_used_when_the_stream_says_nothing(self) -> None:
         with pytest.raises(RuntimeError, match="command not found"):
@@ -1794,13 +2384,13 @@ class TestCodexExec:
             await self._run(self._proc(b"", b"", rc=3))
 
     async def test_a_turn_failure_on_a_zero_exit_still_raises(self) -> None:
-        """codex can exit 0 having failed the turn, so the stream has to be checked
-        even on a clean exit or the user gets an empty reply and no reason."""
-        stdout = json.dumps(
-            {"type": "turn.failed", "error": {"message": "context overflow"}}
-        ).encode()
+        """codex can exit 0 having failed the turn, so the rollout has to be
+        checked even on a clean exit or the user gets an empty reply and no
+        reason."""
         with pytest.raises(RuntimeError, match="context overflow"):
-            await self._run(self._proc(stdout, rc=0))
+            await self._run(
+                self._proc(b"", rc=0), records=(_turn_aborted("context overflow"),)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1915,14 +2505,17 @@ class TestCodexListSkillsFailures:
         assert await CodexBackend().list_skills() == [("review", "")]
 
 
-def test_blank_lines_in_the_stream_are_skipped():
-    """codex's JSONL has trailing and interleaved blank lines; treating one as a
-    parse failure would log a warning per turn."""
-    stdout = (
-        b'\n{"type": "thread.started", "thread_id": "t-1"}\n\n   \n'
-        b'{"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}\n\n'
+def test_blank_lines_in_the_rollout_are_skipped(tmp_path: Path):
+    """Treating a blank line as a parse failure would log a warning per turn."""
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        "\n"
+        + _rollout_text(_session_meta("t-1"))
+        + "\n   \n"
+        + _rollout_text(_task_complete("hi"))
+        + "\n"
     )
-    parsed = parse_codex_stream(stdout)
+    parsed = parse_codex_rollout(read_rollout(path, 0)[0])
     assert parsed["thread_id"] == "t-1"
     assert parsed["body"] == "hi"
     assert parsed["error"] is None
@@ -1991,22 +2584,19 @@ class TestCodexContextReading:
         assert resp.context_tokens is None
 
 
-def test_an_error_item_is_not_counted_as_a_tool():
-    """Permissions mode `ask` passes --dangerously-bypass-hook-trust, which codex
-    announces as an error item. Counting it produced a phantom tool named "error"
-    in the response footer of every gated codex turn."""
-    from claude_on_the_fly.backends.codex import parse_codex_stream
-
-    stream = b"\n".join(
+def test_the_agents_own_items_are_not_counted_as_tools():
+    """Reasoning, the user's message and the agent's own reply are things the turn
+    did, not tools it called. Counting one put a phantom tool in the footer."""
+    out = parse_codex_rollout(
         [
-            b'{"type":"item.completed","item":{"id":"i1","type":"error",'
-            b'"message":"`--dangerously-bypass-hook-trust` is enabled."}}',
-            b'{"type":"item.completed","item":{"id":"i2",'
-            b'"type":"command_execution","command":"ls"}}',
-            b'{"type":"item.completed","item":{"id":"i3","type":"reasoning"}}',
+            _item("Reasoning"),
+            _item("UserMessage"),
+            _item("ContextCompaction"),
+            _agent_message("done"),
+            _item("CommandExecution", command="ls"),
         ]
     )
-    assert parse_codex_stream(stream)["tool_counts"] == {"command_execution": 1}
+    assert out["tool_counts"] == {"CommandExecution": 1}
 
 
 class TestCodexHomeReachesEverySpawn:
@@ -2036,3 +2626,1312 @@ class TestCodexHomeReachesEverySpawn:
         # And it exists, because on Linux the jail mounts it and an absent mount
         # source takes the whole turn down.
         assert (expected / "sessions").is_dir()
+
+
+class TestCodexInAPane:
+    """The hosted arm runs the interactive TUI, which never exits on its own."""
+
+    @pytest.fixture(autouse=True)
+    def _own_socket(self, monkeypatch):
+        """A shallow panes root, held for the whole test.
+
+        The socket address is global now rather than carried on the Pane, so
+        patching it only while the pane is built left `alive` and `capture`
+        addressing the real one. Shallow because pytest's own tmp_path spends the
+        104-byte `sun_path` budget before tmux appends anything.
+        """
+        from claude_on_the_fly import tmux as tmux_mod
+
+        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
+        monkeypatch.setattr(tmux_mod, "panes_root", lambda: root)
+        yield root
+        shutil.rmtree(root, ignore_errors=True)
+
+    @staticmethod
+    def _pane(tmp_path: Path):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        return tmux_mod.pane_for("cotf-job-panearm")
+
+    @staticmethod
+    def _follower(tmp_path: Path):
+        return codex_mod._RolloutFollower(tmp_path, None, None)
+
+    @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+    async def test_the_turn_ends_when_the_rollout_says_so_not_when_the_tui_exits(
+        self, tmp_path: Path
+    ):
+        """An interactive codex returns to its prompt and waits. Waiting for it to
+        exit would spend the whole timeout on a finished turn."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        follower = self._follower(tmp_path)
+        try:
+            # Stands in for the TUI: draws, then sits there like codex does.
+            task = asyncio.create_task(
+                codex_mod._run_codex_in_pane(
+                    pane,
+                    ["/bin/sh", "-c", "echo TUI-IS-DRAWING; sleep 60"],
+                    tmp_path,
+                    {**os.environ, **pane.env},
+                    follower,
+                    timeout=30,
+                )
+            )
+            await asyncio.sleep(2)
+            assert tmux_mod.alive(pane) is True
+            grid = tmux_mod.capture(pane) or ""
+            assert "TUI-IS-DRAWING" in grid
+
+            follower.turn_completed.set()
+            returncode, detail = await asyncio.wait_for(task, timeout=10)
+        finally:
+            tmux_mod.kill(pane)
+
+        assert returncode == 0
+        assert detail == ""
+
+    @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+    async def test_a_tui_that_dies_before_finishing_reports_what_it_printed(
+        self, tmp_path: Path
+    ):
+        """No exit code to read, so the tap is the only account of why."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        try:
+            returncode, detail = await codex_mod._run_codex_in_pane(
+                pane,
+                ["/bin/sh", "-c", "echo boom-detail; exit 7"],
+                tmp_path,
+                {**os.environ, **pane.env},
+                self._follower(tmp_path),
+                timeout=30,
+            )
+        finally:
+            tmux_mod.kill(pane)
+
+        assert returncode == -1
+        assert "boom-detail" in detail
+
+    async def test_tmux_refusing_to_host_runs_the_turn_unhosted(
+        self, tmp_path: Path, caplog
+    ):
+        """A refusal is not a failed turn: `codex exec` still answers it."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.communicate = AsyncMock(return_value=(b"", b"duplicate session"))
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            caplog.at_level(logging.WARNING),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):  # new-session fails before the landing check, so alive is never asked
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                dict(os.environ),
+                self._follower(tmp_path),
+                timeout=5,
+            )
+        assert "duplicate session" in caplog.text
+        tmux_mod.kill(pane)
+
+    async def test_a_long_prompt_stays_off_the_tmux_command_line(self, tmp_path: Path):
+        """tmux packs its whole argv into one imsg and refuses over 16KB, so the
+        prompt rides in a file the pane reads instead."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        prompt = "x" * 100_000
+        seen: dict[str, tuple] = {}
+
+        async def capture(*argv, **_kwargs):
+            seen.setdefault("create", argv)
+            proc = MagicMock()
+            proc.returncode = 1
+            proc.communicate = AsyncMock(return_value=(b"", b"stop here"))
+            return proc
+
+        with (
+            patch("asyncio.create_subprocess_exec", capture),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", prompt],
+                tmp_path,
+                dict(os.environ),
+                self._follower(tmp_path),
+                timeout=5,
+            )
+
+        packed = sum(len(arg.encode()) + 1 for arg in seen["create"])
+        assert packed < 16_384
+        tmux_mod.kill(pane)
+
+    @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+    async def test_the_pane_gets_the_prompt_byte_for_byte(self, tmp_path: Path):
+        """The point of the file is that codex still receives what it was given."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        prompt = "long \U0001f600 prompt\n" * 3000 + "  trailing space \n\n"
+        landed = tmp_path / "landed.txt"
+        follower = self._follower(tmp_path)
+        try:
+            task = asyncio.create_task(
+                codex_mod._run_codex_in_pane(
+                    pane,
+                    [
+                        "/bin/sh",
+                        "-c",
+                        f'printf %s "$1" > {landed}; sleep 60',
+                        "sh",
+                        prompt,
+                    ],
+                    tmp_path,
+                    {**os.environ, **pane.env},
+                    follower,
+                    timeout=30,
+                )
+            )
+            await asyncio.sleep(2)
+            follower.turn_completed.set()
+            await asyncio.wait_for(task, timeout=10)
+        finally:
+            tmux_mod.kill(pane)
+
+        assert landed.read_text() == prompt
+
+    @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+    async def test_the_turns_scratch_files_go_with_the_turn(self, tmp_path: Path):
+        """The env file holds a broker token and the script holds the prompt, and
+        the tap file would otherwise explain one turn with an older turn's rows."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        follower = self._follower(tmp_path)
+        try:
+            task = asyncio.create_task(
+                codex_mod._run_codex_in_pane(
+                    pane,
+                    ["/bin/sh", "-c", "echo drawing; sleep 60"],
+                    tmp_path,
+                    {**os.environ, **pane.env, "COTF_CMD_TOKEN": "secret"},
+                    follower,
+                    timeout=30,
+                )
+            )
+            await asyncio.sleep(2)
+            assert tmux_mod.turn_file(pane.session, "sh").is_file()
+            follower.turn_completed.set()
+            await asyncio.wait_for(task, timeout=10)
+        finally:
+            tmux_mod.kill(pane)
+
+        for suffix in ("env", "sh", "out"):
+            assert not tmux_mod.turn_file(pane.session, suffix).exists()
+
+    async def test_a_script_that_cannot_be_staged_runs_unhosted(
+        self, tmp_path: Path, caplog
+    ):
+        """No script, no pane -- and the env file it would have sourced goes too,
+        rather than sitting there with this turn's broker token in it."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        with (
+            patch.object(
+                codex_mod, "_write_pane_script", side_effect=OSError("read-only")
+            ),
+            caplog.at_level(logging.WARNING),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                {**os.environ, "COTF_CMD_TOKEN": "secret"},
+                self._follower(tmp_path),
+                timeout=5,
+            )
+        assert "could not stage the pane script" in caplog.text
+        assert not tmux_mod.turn_file(pane.session, "env").exists()
+
+    async def test_a_hosted_run_that_overruns_names_the_limit(self, tmp_path: Path):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.communicate = AsyncMock(return_value=(b"", b""))
+        ok.wait = AsyncMock(return_value=0)
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=ok)),
+            # Alive but never finishing is the shape this guards against. This
+            # also answers the post-create landing check.
+            patch.object(tmux_mod, "alive", lambda _p: True),
+            patch.object(codex_mod, "_PANE_POLL_S", 0.01),
+            pytest.raises(RuntimeError, match=r"timed out after 0\.05s"),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                dict(os.environ),
+                self._follower(tmp_path),
+                timeout=0.05,
+            )
+        tmux_mod.kill(pane)
+
+
+class TestWorkspaceTrust:
+    """The TUI will not act until the directory is trusted, and nobody is watching
+    the pane to answer the dialog."""
+
+    def test_the_stanza_names_the_resolved_path(self, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        codex_mod._ensure_workspace_trusted(workspace, home)
+
+        written = (home / "config.toml").read_text()
+        assert f'[projects."{os.path.realpath(workspace)}"]' in written
+        assert 'trust_level = "trusted"' in written
+
+    def test_it_appends_rather_than_replacing_the_operators_config(
+        self, tmp_path: Path
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.toml").write_text('model = "gpt-5.6-luna"\n')
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        codex_mod._ensure_workspace_trusted(workspace, home)
+
+        written = (home / "config.toml").read_text()
+        assert 'model = "gpt-5.6-luna"' in written
+        assert "trust_level" in written
+
+    def test_a_workspace_already_trusted_is_left_alone(self, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        codex_mod._ensure_workspace_trusted(workspace, home)
+        once = (home / "config.toml").read_text()
+
+        codex_mod._ensure_workspace_trusted(workspace, home)
+
+        assert (home / "config.toml").read_text() == once
+
+
+class TestHostingIsChosenFromTheEnvironment:
+    async def test_a_hosted_run_takes_the_pane_arm(self, tmp_path: Path, monkeypatch):
+        """`sandbox.session_env` is how the daemon tells a backend it has a pane."""
+        seen: dict = {}
+
+        async def fake_pane_arm(pane, argv, workspace, env, follower, timeout):
+            seen["session"] = pane.session
+            seen["argv"] = argv
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_in_pane", fake_pane_arm)
+        monkeypatch.setattr(
+            codex_mod.sandbox,
+            "agent_env",
+            lambda: {
+                "TMUX_TMPDIR": str(tmp_path / "sock"),
+                "CLAUDE_PTY_TMUX_SESSION": "cotf-chat-9",
+            },
+        )
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_task_complete("hosted")))
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: rollout
+        ):
+            out = await codex_mod._run_codex_exec(
+                tmp_path,
+                ["codex", "exec", "p"],
+                None,
+                interactive=["codex", "the prompt"],
+            )
+
+        assert seen["session"] == "cotf-chat-9"
+        # The hosted arm runs the interactive binary, never `codex exec`.
+        assert "exec" not in seen["argv"]
+        assert out["body"] == "hosted"
+
+    async def test_a_pane_that_cannot_be_built_falls_back_to_the_plain_arm(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Losing the mirror must not cost the reply."""
+        taken: list[str] = []
+
+        async def fake_pane_arm(*_a, **_k):
+            raise codex_mod._PaneUnavailable
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            taken.append("plain")
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_in_pane", fake_pane_arm)
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(
+            codex_mod.sandbox,
+            "agent_env",
+            lambda: {
+                "TMUX_TMPDIR": str(tmp_path / "sock"),
+                "CLAUDE_PTY_TMUX_SESSION": "cotf-chat-9",
+            },
+        )
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_task_complete("fell back")))
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: rollout
+        ):
+            out = await codex_mod._run_codex_exec(
+                tmp_path,
+                ["codex", "exec", "p"],
+                None,
+                interactive=["codex", "the prompt"],
+            )
+
+        assert taken == ["plain"]
+        assert out["body"] == "fell back"
+
+    async def test_an_unhosted_run_takes_the_plain_arm(
+        self, tmp_path: Path, monkeypatch
+    ):
+        taken: list[str] = []
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            taken.append("plain")
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(codex_mod.sandbox, "agent_env", lambda: {})
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_task_complete("unhosted")))
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: rollout
+        ):
+            out = await codex_mod._run_codex_exec(
+                tmp_path, ["codex", "exec", "p"], None
+            )
+
+        assert taken == ["plain"]
+        assert out["body"] == "unhosted"
+
+
+async def test_codex_never_inherits_this_processes_stdin(tmp_path: Path):
+    """`codex exec` appends piped stdin to the prompt, so an inherited pipe makes
+    it print "Reading additional input from stdin..." and block there for the
+    whole turn timeout."""
+    seen: dict = {}
+
+    async def record(*_args, **kwargs):
+        seen.update(kwargs)
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        return proc
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_rollout_text(_task_complete("ok")))
+    with (
+        patch("asyncio.create_subprocess_exec", record),
+        patch.object(codex_mod.agent, "track_agent_process"),
+        patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()),
+        patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: rollout
+        ),
+    ):
+        await codex_mod._run_codex_exec(tmp_path, ["codex", "exec", "p"], None)
+
+    assert seen["stdin"] == asyncio.subprocess.DEVNULL
+
+
+class TestRolloutParsingEdges:
+    """The shapes a rollout can take that the happy path never produces."""
+
+    def test_a_content_string_is_read_as_its_own_text(self):
+        assert codex_mod._rollout_content_text("plain text") == "plain text"
+
+    def test_content_that_is_neither_a_list_nor_a_string_reads_as_empty(self):
+        assert codex_mod._rollout_content_text(None) == ""
+        assert codex_mod._rollout_content_text(7) == ""
+
+    def test_a_blank_line_between_records_is_not_a_record(self, tmp_path: Path):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(_rollout_text(_task_complete("ok")) + "\n\n")
+        records, _ = read_rollout(path, 0)
+        assert len(records) == 1
+
+    def test_a_rollout_that_cannot_be_sized_reads_as_zero(self, tmp_path: Path):
+        assert codex_mod.rollout_size(tmp_path / "nope.jsonl") == 0
+        assert codex_mod.rollout_size(None) == 0
+
+
+class TestRolloutFollowerEdges:
+    def test_an_unfindable_rollout_is_simply_nothing_to_follow(self, tmp_path: Path):
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: None
+        ):
+            follower._drain()
+        assert follower.records == []
+
+    def test_a_read_that_raises_is_logged_rather_than_taking_the_turn_down(
+        self, tmp_path: Path, caplog
+    ):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text("")
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        follower._path = path
+        with (
+            patch.object(codex_mod, "read_rollout", side_effect=OSError("disk gone")),
+            caplog.at_level(logging.ERROR, logger=codex_mod.__name__),
+        ):
+            follower._drain()
+        assert "could not read the rollout" in caplog.text
+
+    def test_records_that_say_nothing_about_the_turn_are_ignored(self, tmp_path: Path):
+        relayed: list[str] = []
+        follower = codex_mod._RolloutFollower(tmp_path, None, relayed.append)
+        for record in (
+            {"type": "world_state"},
+            {"type": "event_msg", "payload": {"type": "token_count"}},
+            _item("CommandExecution"),
+            _agent_message("", phase="commentary"),
+        ):
+            follower._observe(record)
+        assert relayed == []
+        assert not follower.turn_completed.is_set()
+
+    def test_commentary_with_no_sink_is_simply_dropped(self, tmp_path: Path):
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        follower._observe(_agent_message("narration", phase="commentary"))
+
+    async def test_closing_reads_what_landed_after_the_last_poll(self, tmp_path: Path):
+        """codex writes task_complete and exits, so the last records routinely
+        arrive between two polls — and they carry the reply."""
+        path = tmp_path / "rollout.jsonl"
+        path.write_text("")
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        follower._path = path
+        follower.start()
+        path.write_text(_rollout_text(_task_complete("arrived late")))
+        await follower.aclose()
+
+        assert parse_codex_rollout(follower.records)["body"] == "arrived late"
+
+    async def test_closing_a_follower_that_never_started_is_safe(self, tmp_path: Path):
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        await follower.aclose()
+
+
+class TestPaneArmEdges:
+    @pytest.fixture(autouse=True)
+    def _own_socket(self, monkeypatch):
+        """Held for the whole test, not just while the pane is built: the turn's
+        scratch files are written under this root while the turn runs."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
+        monkeypatch.setattr(tmux_mod, "panes_root", lambda: root)
+        yield root
+        shutil.rmtree(root, ignore_errors=True)
+
+    @staticmethod
+    def _pane(tmp_path: Path):
+        from claude_on_the_fly import tmux as tmux_mod
+
+        return tmux_mod.pane_for("cotf-job-edges")
+
+    async def test_a_failed_tap_costs_the_detail_but_not_the_run(
+        self, tmp_path: Path, caplog
+    ):
+        """`pipe-pane` is the only account of a TUI that dies, but losing it must
+        not wedge the pane until the timeout."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        created = MagicMock()
+        created.returncode = 0
+        created.communicate = AsyncMock(return_value=(b"", b""))
+        tap = MagicMock()
+        tap.returncode = 1
+        tap.communicate = AsyncMock(return_value=(b"", b"no such pane"))
+        plain = MagicMock()
+        plain.returncode = 0
+        plain.wait = AsyncMock(return_value=0)
+        procs = [created, tap, plain]
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        follower.turn_completed.set()
+        with (
+            patch(
+                "asyncio.create_subprocess_exec",
+                AsyncMock(side_effect=lambda *_a, **_k: procs.pop(0)),
+            ),
+            # No server is started here, so the post-create landing check has
+            # nothing to find; the transport is faked either way.
+            patch.object(tmux_mod, "alive", lambda _p: True),
+            caplog.at_level(logging.WARNING, logger=codex_mod.__name__),
+        ):
+            returncode, _ = await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                dict(os.environ),
+                follower,
+                timeout=None,
+            )
+
+        assert "could not tap the pane" in caplog.text
+        assert returncode == 0
+        tmux_mod.kill(pane)
+
+    def test_output_that_cannot_be_read_explains_nothing_rather_than_raising(
+        self, tmp_path: Path
+    ):
+        assert codex_mod._pane_output_tail(tmp_path / "never-written") == ""
+
+    def test_terminal_diagnostic_is_plain_text_and_byte_bounded(self, tmp_path: Path):
+        capture = tmp_path / "pane.out"
+        capture.write_bytes(b"A" * 100_000 + b"B" * 20_000 + b"\x1b[31m" + b"C" * 1000)
+        detail = codex_mod._pane_output_tail(capture)
+        assert detail == "B" * 1000 + "C" * 1000
+        assert "\x1b" not in detail
+
+    def test_an_env_that_cannot_be_staged_costs_the_env_not_the_pane(
+        self, tmp_path: Path, caplog
+    ):
+        """The pane still runs; it runs with whatever the server inherited."""
+        with caplog.at_level(logging.WARNING, logger=codex_mod.__name__):
+            staged = codex_mod._pane_env_file(
+                {"COTF_CMD_TOKEN": "secret"}, tmp_path / "nowhere" / "pane.env"
+            )
+        assert staged is None
+        assert "could not stage the pane env" in caplog.text
+
+    async def test_a_session_that_lands_elsewhere_runs_unhosted(
+        self, tmp_path: Path, caplog
+    ):
+        """`new-session` reports success for a session it created on another
+        server, so the landing check asks the address we will poll."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        created = MagicMock()
+        created.returncode = 0
+        created.communicate = AsyncMock(return_value=(b"", b""))
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=created)),
+            patch.object(tmux_mod, "alive", lambda _p: False),
+            caplog.at_level(logging.WARNING, logger=codex_mod.__name__),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                dict(os.environ),
+                codex_mod._RolloutFollower(tmp_path, None, None),
+                timeout=None,
+            )
+        assert "did not land on" in caplog.text
+
+
+class TestCodexPtyMode:
+    """`pty` picks the interface, `agent.pane` picks whether it is mirrored. Keeping
+    them apart is what stops a break in codex's UI costing claude-pty its pane."""
+
+    async def test_native_mode_never_offers_an_interactive_argv(
+        self, tmp_path: Path, monkeypatch
+    ):
+        seen: dict = {}
+
+        async def record(
+            workspace, cmd, timeout, thread_id=None, interactive=None, **_kw
+        ):
+            seen["interactive"] = interactive
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", record)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        await CodexBackend().run(workspace, "sess", "hi", "telegram")
+
+        assert seen["interactive"] is None
+
+    async def test_pty_mode_offers_the_interactive_binary(
+        self, tmp_path: Path, monkeypatch
+    ):
+        seen: dict = {}
+
+        async def record(
+            workspace, cmd, timeout, thread_id=None, interactive=None, **_kw
+        ):
+            seen["interactive"] = interactive
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", record)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        await CodexBackend(pty=True).run(workspace, "sess", "hi", "telegram")
+
+        argv = seen["interactive"]
+        assert argv is not None
+        # The interactive entry point takes no `exec` subcommand.
+        assert "exec" not in argv
+        assert "--dangerously-bypass-approvals-and-sandbox" in argv
+
+    async def test_pty_mode_resumes_with_the_interactive_subcommand(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """`codex exec resume` and `codex resume` are different entry points."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        argv = CodexBackend(pty=True)._interactive_argv(workspace, "thread-1", "go on")
+
+        assert argv[:2] == ["codex", "resume"]
+        assert argv[-2:] == ["thread-1", "go on"]
+
+    async def test_pty_mode_without_a_pane_says_it_is_running_exec(
+        self, tmp_path: Path, caplog
+    ):
+        """The operator asked for a UI. Getting plain lines instead is worth a line."""
+        proc = _exec_proc(0)
+        with caplog.at_level(logging.INFO, logger=codex_mod.__name__):
+            await _run_exec(
+                proc,
+                tmp_path,
+                records=(_task_complete("done"),),
+                interactive=["codex", "p"],
+            )
+
+        assert "runs `codex exec`" in caplog.text
+
+
+def test_get_backend_routes_codex_pty_mode(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "pty")
+    backend = get_backend()
+
+    assert isinstance(backend, CodexBackend)
+    assert backend._pty is True
+
+
+def test_an_unknown_codex_mode_still_names_the_supported_ones(monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "codex")
+    monkeypatch.setenv("CODEX_MODE", "telepathy")
+
+    with pytest.raises(ValueError, match="native, ollama, pty"):
+        get_backend()
+
+
+class TestHostedTurnCleanup:
+    """The interactive TUI never exits, so the turn has to end its own session."""
+
+    async def test_a_finished_turn_frees_the_session_for_a_nudge_retry(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """`tmux new-session` refuses a duplicate name, so leaving the session
+        alive turned every retry into "tmux refused to host the codex turn"."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        killed: list[str] = []
+        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
+        monkeypatch.setattr(tmux_mod, "panes_root", lambda: root)
+        monkeypatch.setattr(tmux_mod, "kill", lambda p: killed.append(p.session))
+        monkeypatch.setattr(tmux_mod, "alive", lambda _p: True)
+        pane = tmux_mod.Pane(session="cotf-job-retry")
+        created = MagicMock()
+        created.returncode = 0
+        created.communicate = AsyncMock(return_value=(b"", b""))
+        plain = MagicMock()
+        plain.returncode = 0
+        plain.wait = AsyncMock(return_value=0)
+        plain.communicate = AsyncMock(return_value=(b"", b""))
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        follower.turn_completed.set()
+        procs = [created, plain, plain]
+        with patch(
+            "asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=lambda *_a, **_k: procs.pop(0)),
+        ):
+            returncode, _ = await codex_mod._run_codex_in_pane(
+                pane, ["codex", "p"], tmp_path, dict(os.environ), follower, timeout=None
+            )
+
+        assert returncode == 0
+        assert killed == ["cotf-job-retry"]
+
+
+class TestFollowerResolvesLate:
+    """The rollout is looked up by mtime and cwd, so it is not always there when
+    the turn starts."""
+
+    def test_a_resumed_thread_does_not_rewind_to_the_top(self, tmp_path: Path):
+        """Reading from 0 folds every earlier turn's tool counts and last reply
+        into this one, and fires turn_completed on a task_complete that already
+        happened -- so in pty mode the turn ends before codex has answered."""
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(
+            _rollout_text(_item("CommandExecution"), _task_complete("an earlier turn"))
+        )
+        with patch.object(codex_mod.transcript, "_find_codex_rollout", lambda _t: None):
+            follower = codex_mod._RolloutFollower(tmp_path, "thread-1", None)
+        assert follower._path is None
+
+        with patch.object(codex_mod.transcript, "_find_codex_rollout", lambda _t: path):
+            follower._drain()
+
+        assert follower.turn_completed.is_set() is False
+        out = parse_codex_rollout(follower.records)
+        assert out["body"] == ""
+        assert out["tool_counts"] == {}
+
+    def test_a_fresh_thread_still_reads_the_whole_file(self, tmp_path: Path):
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(_rollout_text(_task_complete("this turn")))
+        follower = codex_mod._RolloutFollower(tmp_path, None, None)
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: path
+        ):
+            follower._drain()
+
+        assert parse_codex_rollout(follower.records)["body"] == "this turn"
+
+    def test_the_cwd_lookup_gets_the_workspace_as_the_caller_holds_it(
+        self, tmp_path: Path
+    ):
+        """Resolving belongs to the matcher, which resolves both sides, and not
+        to this caller. It used to resolve here, on the belief that codex wrote
+        back a path it had resolved. It does not: it records the `-C` argument
+        verbatim, so resolving one side only moved which spelling failed to
+        match."""
+        seen: list[str] = []
+        follower = codex_mod._RolloutFollower(Path("/tmp"), None, None)
+        with patch.object(
+            codex_mod.transcript,
+            "_find_codex_rollout_by_cwd",
+            lambda cwd, **_k: seen.append(cwd) or None,
+        ):
+            follower._drain()
+
+        assert seen == ["/tmp"]
+
+
+def test_an_unwritable_codex_home_costs_the_pane_not_the_turn(tmp_path: Path, caplog):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text("model = 'x'\n")
+    (home / "config.toml").chmod(0o400)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    try:
+        with caplog.at_level(logging.WARNING, logger=codex_mod.__name__):
+            codex_mod._ensure_workspace_trusted(workspace, home)
+    finally:
+        (home / "config.toml").chmod(0o600)
+
+    assert "could not record workspace trust" in caplog.text
+
+
+class TestEffortReachesTheInteractiveArgv:
+    """`-c` is a global codex option, not an `exec` one.
+
+    The interactive entry point honours it: driven under tmux with
+    `-c model_reasoning_effort="low"` against a config.toml saying `medium`,
+    codex's own statusline read `gpt-5.6-luna low` and its rollout recorded
+    `effort: low`. Before this, a hosted turn silently ran whatever
+    ~/.codex/config.toml said, so `agent.codex.effort` and any profile that set
+    it were dead settings for every operator running `mode: pty` with a pane.
+    """
+
+    def test_a_fresh_hosted_turn_carries_the_effort(self, tmp_path: Path) -> None:
+        argv = CodexBackend(pty=True, effort="low")._interactive_argv(
+            tmp_path, None, "hi"
+        )
+        assert 'model_reasoning_effort="low"' in argv
+        assert argv[argv.index('model_reasoning_effort="low"') - 1] == "-c"
+
+    def test_a_resumed_hosted_turn_carries_it_too(self, tmp_path: Path) -> None:
+        """The resume path builds its own argv, so it can lose the flag on its
+        own. Every turn after the first goes through here."""
+        argv = CodexBackend(pty=True, effort="high")._interactive_argv(
+            tmp_path, "thread-1", "hi"
+        )
+        assert 'model_reasoning_effort="high"' in argv
+        assert argv.index("resume") < argv.index("-c"), "global flag follows resume"
+        assert argv[-2:] == ["thread-1", "hi"]
+
+    def test_no_effort_configured_passes_no_flag(self, tmp_path: Path) -> None:
+        """Unset means inherit, so codex reads its own config exactly as before."""
+        argv = CodexBackend(pty=True)._interactive_argv(tmp_path, None, "hi")
+        assert not any("model_reasoning_effort" in part for part in argv)
+
+    def test_an_unknown_level_is_dropped_not_passed(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A level neither CLI accepts is skipped here rather than passed
+        through to die in codex's config parse."""
+        argv = CodexBackend(pty=True, effort="colossal")._interactive_argv(
+            tmp_path, None, "hi"
+        )
+        assert not any("model_reasoning_effort" in part for part in argv)
+        assert "ignoring unknown effort" in caplog.text
+
+    def test_both_builders_agree(self, tmp_path: Path) -> None:
+        """One resolution, two callers. They drifted apart once already."""
+        backend = CodexBackend(effort="xhigh")
+        exec_argv = backend._base_argv(tmp_path)
+        hosted_argv = backend._interactive_argv(tmp_path, None, "hi")
+        flag = 'model_reasoning_effort="xhigh"'
+        assert flag in exec_argv and flag in hosted_argv
+
+
+class TestOllamaWebSearch:
+    """ollama's Responses endpoint answers any request carrying the hosted
+    web_search tool with `the web_search tool is not supported`, and codex sends
+    it by default, so every ollama turn failed before its first token."""
+
+    def test_both_builders_turn_it_off_under_ollama(self, tmp_path: Path) -> None:
+        backend = CodexBackend(launcher=OllamaLauncher(model="glm-5.3-flash:cloud"))
+        flag = 'web_search="disabled"'
+        assert flag in backend._base_argv(tmp_path)
+        assert flag in backend._interactive_argv(tmp_path, None, "hi")
+
+    def test_a_native_turn_keeps_it(self, tmp_path: Path) -> None:
+        backend = CodexBackend(model="gpt-5")
+        assert not any("web_search" in part for part in backend._base_argv(tmp_path))
+
+
+class TestPlainDiagnosticCapture:
+    async def test_more_than_eight_mib_narration_preserves_success(self, tmp_path):
+        proc = _streamed_proc(
+            0,
+            _stream(b"done"),
+            _stream(b"x" * (codex_mod.agent.MAX_AGENT_OUTPUT_BYTES + 1)),
+        )
+        result = await _run_exec(proc, tmp_path, records=(_task_complete("done"),))
+        assert result["body"] == "done"
+
+    async def test_diagnostics_retain_only_error_tail(self):
+        ending = b"fatal: useful final diagnostic"
+        proc = _streamed_proc(
+            1,
+            _stream(),
+            _stream(b"x" * (codex_mod.agent.MAX_AGENT_OUTPUT_BYTES + 1) + ending),
+        )
+        stdout, stderr = await codex_mod._communicate_plain(proc)
+        assert stdout == b""
+        assert len(stderr) == codex_mod._DIAGNOSTIC_TAIL_BYTES
+        assert stderr.endswith(ending)
+
+    @pytest.mark.parametrize("streamed", [False, True])
+    async def test_final_reply_cap_kills_without_waiting_for_stderr(self, streamed):
+        output = b"x" * (codex_mod.agent.MAX_AGENT_OUTPUT_BYTES + 1)
+        proc = (
+            _streamed_proc(0, _stream(output), _stream(eof=False))
+            if streamed
+            else _exec_proc(0, stdout=output)
+        )
+        with (
+            patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()) as kill,
+            pytest.raises(codex_mod.agent.AgentOutputLimitError, match="stdout"),
+        ):
+            await asyncio.wait_for(codex_mod._communicate_plain(proc), timeout=2)
+        kill.assert_awaited_once_with(proc)
+
+    async def test_cancellation_reaps_both_readers(self):
+        stdout, stderr = _stream(eof=False), _stream(eof=False)
+        proc = _streamed_proc(0, stdout, stderr)
+        task = asyncio.create_task(codex_mod._communicate_plain(proc))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        stdout.feed_eof()
+        stderr.feed_eof()
+        assert await stdout.read() == b""
+        assert await stderr.read() == b""
+
+    async def test_communicate_only_embedder(self):
+        class Process:
+            async def communicate(self):
+                return b"reply", b"diagnostic"
+
+        assert await codex_mod._communicate_plain(Process()) == (
+            b"reply",
+            b"diagnostic",
+        )
+
+
+class TestSharedWorkspaceFirstTurns:
+    """Every thread of a conversation runs in one directory, so a first turn
+    cannot claim a rollout by cwd alone."""
+
+    async def test_a_first_turn_excludes_the_rollouts_that_predate_it(
+        self, tmp_path: Path, monkeypatch
+    ):
+        older = tmp_path / "rollout-older.jsonl"
+        seen: dict[str, object] = {}
+
+        def by_cwd(_cwd, **kwargs):
+            seen["exclude"] = kwargs.get("exclude")
+            return None
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            follower._drain()
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(
+            codex_mod.transcript, "snapshot_rollouts", lambda: frozenset({older})
+        )
+        monkeypatch.setattr(codex_mod.transcript, "_find_codex_rollout_by_cwd", by_cwd)
+        await codex_mod._run_codex_exec(tmp_path, ["codex", "exec", "p"], None)
+        assert seen["exclude"] == frozenset({older})
+
+    async def test_a_resumed_turn_takes_no_snapshot(self, tmp_path: Path, monkeypatch):
+        """It reads its own file by thread id, and the snapshot walks every home."""
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            return 0, ""
+
+        def no_snapshot():
+            raise AssertionError("snapshot taken for a resumed thread")
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(codex_mod.transcript, "snapshot_rollouts", no_snapshot)
+        monkeypatch.setattr(
+            codex_mod.transcript, "_find_codex_rollout", lambda _t: None
+        )
+        await codex_mod._run_codex_exec(
+            tmp_path, ["codex", "exec", "p"], None, thread_id="t1"
+        )
+
+    async def test_a_first_turn_waits_while_the_one_ahead_is_still_looking(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Discovery is the part that cannot overlap. Nothing is released yet."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        running: list[str] = []
+        release = asyncio.Event()
+
+        async def fake_exec(_ws, cmd, **_kw):
+            # The prompt is the argv tail; a first turn's carries the system
+            # prompt in front of the user's text.
+            running.append(cmd[-1][-3:])
+            await release.wait()
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
+        monkeypatch.setattr(
+            codex_mod.transcript, "prepend_latest_handoff", lambda _w, p, **_k: p
+        )
+        backend = CodexBackend()
+        first = asyncio.create_task(backend.run(workspace, "s1", "one", "slack"))
+        second = asyncio.create_task(backend.run(workspace, "s2", "two", "slack"))
+        await asyncio.sleep(0.05)
+        assert running == ["one"]
+        release.set()
+        await asyncio.gather(first, second)
+
+    async def test_a_first_turn_starts_once_the_one_ahead_owns_its_rollout(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The reply is not the gated part, and it is all of the wall clock.
+
+        Measured before this: three new threads in one Slack DM ran back to
+        back, and the two behind the first waited 36 and 32 minutes for a file
+        the first had already written one second in.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        running: list[str] = []
+        release = asyncio.Event()
+
+        async def fake_exec(_ws, cmd, gate=None, **_kw):
+            # Stands in for the follower binding a path: discovery is over, the
+            # long tail of the turn is not.
+            if gate is not None:
+                gate.release()
+            running.append(cmd[-1][-3:])
+            await release.wait()
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
+        monkeypatch.setattr(
+            codex_mod.transcript, "prepend_latest_handoff", lambda _w, p, **_k: p
+        )
+        backend = CodexBackend()
+        first = asyncio.create_task(backend.run(workspace, "s1", "one", "slack"))
+        second = asyncio.create_task(backend.run(workspace, "s2", "two", "slack"))
+        await asyncio.sleep(0.05)
+        assert running == ["one", "two"]
+        release.set()
+        await asyncio.gather(first, second)
+
+    async def test_the_follower_releases_the_gate_when_it_binds_a_rollout(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The wiring, not a stand-in: a real gate, freed by a real resolve."""
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("")
+        gate = codex_mod._first_turn_guard(tmp_path, None)
+        held: list[bool] = []
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            held.append(gate._lock.locked())
+            follower._drain()
+            held.append(gate._lock.locked())
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(
+            codex_mod.transcript, "snapshot_rollouts", lambda: frozenset()
+        )
+        monkeypatch.setattr(
+            codex_mod.transcript,
+            "_find_codex_rollout_by_cwd",
+            lambda _cwd, **_kw: rollout,
+        )
+        async with gate:
+            await codex_mod._run_codex_exec(
+                tmp_path, ["codex", "exec", "p"], None, gate=gate
+            )
+        assert held == [True, False]
+
+    async def test_a_turn_that_never_finds_a_rollout_still_frees_the_next_one(
+        self, tmp_path: Path
+    ):
+        """Why there is no discovery timeout: the exit path is the backstop."""
+        gate = codex_mod._first_turn_guard(tmp_path, None)
+        async with gate:
+            assert gate._lock.locked()
+        assert not gate._lock.locked()
+
+    async def test_releasing_twice_does_not_free_another_turns_lock(
+        self, tmp_path: Path
+    ):
+        """`asyncio.Lock` has no owner, so a stray release would free the next turn."""
+        first = codex_mod._first_turn_guard(tmp_path, None)
+        async with first:
+            first.release()
+            second = codex_mod._first_turn_guard(tmp_path, None)
+            await second.__aenter__()
+        # The `async with` exit is the second release. It must not free `second`.
+        assert second._lock.locked()
+        second.release()
+
+    async def test_a_resumed_turn_gate_is_inert(self, tmp_path: Path):
+        gate = codex_mod._first_turn_guard(tmp_path, "thread-1")
+        async with gate as entered:
+            assert entered is gate
+        gate.release()
+        # It never touched the lock table, so it cannot hold anyone up.
+        assert os.path.realpath(tmp_path) not in codex_mod._first_turn_locks
+
+    async def test_a_resumed_turn_is_not_held_behind_a_first_turn(
+        self, tmp_path: Path, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _write_mapping(workspace, "resumed", "thread-r")
+        monkeypatch.setattr(codex_mod.codex_state, "adopt_rollout", lambda *_a: True)
+        running: list[str] = []
+        release = asyncio.Event()
+
+        async def fake_exec(_ws, cmd, **_kw):
+            running.append(cmd[-1][-3:])
+            await release.wait()
+            return _success_result()
+
+        monkeypatch.setattr(codex_mod, "_run_codex_exec", fake_exec)
+        monkeypatch.setattr(
+            codex_mod.transcript, "prepend_latest_handoff", lambda _w, p, **_k: p
+        )
+        backend = CodexBackend()
+        first = asyncio.create_task(backend.run(workspace, "fresh", "one", "slack"))
+        second = asyncio.create_task(backend.run(workspace, "resumed", "two", "slack"))
+        await asyncio.sleep(0.05)
+        assert running == ["one", "two"]
+        release.set()
+        await asyncio.gather(first, second)
+
+
+def test_a_brokered_chatgpt_login_points_every_argv_at_the_broker(monkeypatch):
+    """Both argv builders, and so compaction too, carry the provider overrides
+    once the broker publishes its URL, and neither does before it."""
+    from claude_on_the_fly import codex_auth
+
+    backend = CodexBackend(model="gpt-test")
+    workspace = Path("/ws")
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    assert "model_provider=cotf" not in backend._base_argv(workspace)
+
+    url = "http://127.0.0.1:1/_session/t/chatgpt"
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, url)
+    overrides = codex_auth.provider_args(url)
+    base = backend._base_argv(workspace)
+    interactive = backend._interactive_argv(workspace, None, "hi")
+    for argv in (base, interactive):
+        start = argv.index("-m")
+        assert argv[start : start + 2 + len(overrides)] == [
+            "-m",
+            "gpt-test",
+            *overrides,
+        ]
+
+
+def test_an_ollama_launcher_ignores_the_brokered_chatgpt_login(monkeypatch):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    launcher = OllamaLauncher(model="m")
+    assert "model_provider=cotf" not in CodexBackend(launcher=launcher)._model_args()
+
+
+class TestQuotaExhaustion:
+    async def test_provider_error_raises_with_thread_and_durable_tool_results(
+        self, tmp_path
+    ):
+        from claude_on_the_fly.quota import AccountExhaustedError
+
+        records = (
+            _session_meta("quota-thread"),
+            _tool_call(call_id="call-1"),
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": "done",
+                },
+            },
+            _task_complete(
+                error={"code": "usage_limit_reached", "message": "Exhausted"}
+            ),
+        )
+        with pytest.raises(AccountExhaustedError) as raised:
+            await _run_exec(_exec_proc(1), tmp_path, records=records)
+        assert raised.value.thread_id == "quota-thread"
+        assert raised.value.tools_started
+        assert raised.value.resume_ready
+
+    async def test_first_turn_failure_keeps_native_thread_mapping(self, tmp_path):
+        from claude_on_the_fly.quota import AccountExhaustedError
+
+        failure = AccountExhaustedError("codex", thread_id="failed-native-thread")
+        with (
+            patch.object(codex_mod, "_run_codex_exec", AsyncMock(side_effect=failure)),
+            pytest.raises(AccountExhaustedError),
+        ):
+            await CodexBackend().run(tmp_path, "failed-session", "hello", "telegram")
+        assert (
+            codex_mod.codex_state.read_thread_id(tmp_path, "failed-session")
+            == "failed-native-thread"
+        )
+
+    def test_unfinished_tool_blocks_resume(self):
+        parsed = parse_codex_rollout(
+            [
+                _tool_call(call_id="unfinished"),
+                _task_complete(error={"code": "insufficient_quota"}),
+            ]
+        )
+        assert parsed["account_exhausted"]
+        assert parsed["tools_started"]
+        assert not parsed["resume_ready"]
+
+    def test_structured_error_event_detects_usage_limit(self):
+        parsed = parse_codex_rollout(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "error",
+                        "codex_error_info": "UsageLimitExceeded",
+                        "message": "No more usage",
+                    },
+                }
+            ]
+        )
+        assert parsed["account_exhausted"]
+
+    async def test_assistant_quota_text_cannot_trigger_switch(self, tmp_path):
+        result = await _run_exec(
+            _exec_proc(0),
+            tmp_path,
+            records=(
+                _assistant_text("You've hit your usage limit."),
+                _task_complete("You've hit your usage limit."),
+            ),
+        )
+        assert not result["account_exhausted"]
+
+    async def test_stderr_tool_output_cannot_trigger_switch(self, tmp_path):
+        from claude_on_the_fly.quota import AccountExhaustedError
+
+        with pytest.raises(RuntimeError) as raised:
+            await _run_exec(
+                _exec_proc(1, stderr=b"You've hit your usage limit."), tmp_path
+            )
+        assert not isinstance(raised.value, AccountExhaustedError)
+
+    def test_recovered_provider_error_does_not_switch_account(self):
+        parsed = parse_codex_rollout(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "error",
+                        "codex_error_info": "UsageLimitExceeded",
+                    },
+                },
+                _task_complete("Recovered successfully"),
+            ]
+        )
+        assert not parsed["account_exhausted"]
+
+    def test_unmatched_tool_item_blocks_resume_despite_another_completed_call(self):
+        parsed = parse_codex_rollout(
+            [
+                _tool_call(call_id="complete"),
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "complete",
+                        "output": "done",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_started",
+                        "item": {"type": "CommandExecution", "id": "pending"},
+                    },
+                },
+                _task_complete(error={"code": "insufficient_quota"}),
+            ]
+        )
+        assert parsed["tools_started"]
+        assert not parsed["resume_ready"]

@@ -26,10 +26,14 @@ os.environ["USERPROFILE"] = _TEST_HOME
 # now always set, so the `Path.home() / ".claude"` fallback is never taken here:
 # a test covering that branch has to delenv it first.
 os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_TEST_HOME) / ".claude")
+os.environ["CODEX_HOME"] = str(Path(_TEST_HOME) / ".codex")
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
+import asyncio  # noqa: E402
 import json  # noqa: E402
 import operator  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -245,3 +249,71 @@ def ndjson():
         return b"\n".join(json.dumps(m).encode() for m in messages) + b"\n"
 
     return _encode
+
+
+def _still_running(pid: int) -> bool:
+    """True while `pid` can still execute an instruction.
+
+    `os.kill(pid, 0)` answers a different question: whether the kernel still
+    holds a process-table entry. A killed orphan is reparented to PID 1, and
+    PID 1 decides when that entry goes away. On a developer machine, and on
+    GitHub's runner, PID 1 is an init that reaps immediately, so the signal
+    probe happens to agree. Inside a plain `docker run` PID 1 is whatever
+    command the operator gave, usually a shell that never reaps an adopted
+    child -- the entry stays in state Z forever and the signal probe keeps
+    reporting a corpse as alive. Measured in this project's Linux image: the
+    grandchild sits at `Z` with PPid 1 while `os.kill(pid, 0)` returns
+    successfully.
+
+    So read the state, and count a zombie as gone. `/proc` where it exists,
+    `ps` otherwise, which covers macOS.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # somebody else's process, so it is certainly not a corpse
+
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        try:
+            # The command name sits in parentheses and may itself hold spaces,
+            # so the state is the first field after the last ')'.
+            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except (OSError, IndexError):
+            return False
+    result = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True
+    )
+    state = result.stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+@pytest.fixture
+def process_gone():
+    """Wait for a pid to stop running, counting an unreaped zombie as gone."""
+
+    async def _gone(pid: int, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _still_running(pid):
+                return True
+            await asyncio.sleep(0.05)
+        return not _still_running(pid)
+
+    return _gone
+
+
+@pytest.fixture(params=("off", "jail"))
+def account_sandbox_mode(request, monkeypatch):
+    """Run account simulations with and without the real platform jail."""
+    if request.param == "jail":
+        from tests.test_sandbox_parity import _why_not
+
+        reason = _why_not()
+        if reason is not None:
+            pytest.skip(reason)
+    monkeypatch.setenv("COTF_SANDBOX", request.param)
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    return request.param

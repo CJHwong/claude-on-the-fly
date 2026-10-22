@@ -10,27 +10,38 @@ import os
 import re
 import signal
 import time
-from collections.abc import Awaitable, Callable
+import unicodedata
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import (
+    account_fallback,
     agent,
     broker,
+    codex_auth,
     commands,
     cotf_approve,
     egress,
     logs,
+    migration,
+    model_command,
     permissions,
+    quota,
     sandbox,
     settings,
+    tmux,
     turns,
 )
 from claude_on_the_fly import approvals as approvals_mod
 from claude_on_the_fly.agent import (
+    AGENT_FAILURE_NOTICE,
     DATA_DIR,
+    EMPTY_REPLY_NOTICE,
     SUGGESTIONS_BLOCK_RE,
+    WORKSPACE_MEMORY_DIRNAME,
+    AgentTurnError,
     ClaudeUnavailableError,
     Response,
     current_backend_key,
@@ -40,6 +51,7 @@ from claude_on_the_fly.agent import (
 from claude_on_the_fly.approvals import ApprovalBroker
 from claude_on_the_fly.events import (
     EVENT_DISPATCHED,
+    EVENT_SESSION_COMPACTED,
     EVENT_WORKER_DONE,
     EVENT_WORKER_FAILED,
     EventLog,
@@ -63,6 +75,28 @@ logger = logging.getLogger(__name__)
 # set — the manual trigger is the whole feature there.
 AUTO_COMPACT_PCT_VAR = "COTF_AUTO_COMPACT_PCT"
 
+# Idle compaction: compact a big conversation shortly before its prompt cache
+# expires, so the pass reads the context at the cached rate and the next message
+# starts from a short context instead of paying for the long one uncached. Off
+# unless the toggle is on; the other two only tune it.
+IDLE_COMPACT_VAR = "COTF_IDLE_COMPACT"
+IDLE_COMPACT_TOKENS_VAR = "COTF_IDLE_COMPACT_TOKENS"
+IDLE_COMPACT_LEAD_MIN_VAR = "COTF_IDLE_COMPACT_LEAD_MIN"
+DEFAULT_IDLE_COMPACT_TOKENS = 200_000
+DEFAULT_IDLE_COMPACT_LEAD_MIN = 5
+IDLE_COMPACT_TICK_S = 60.0
+# Per daemon. Each one is a full-context model pass, and a burst of chats going
+# idle together should not become a burst of spend.
+IDLE_COMPACT_MAX_RUNNING = 2
+
+# How long each provider keeps a prompt cached after the request that wrote it.
+# Claude's default is five minutes; `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` in the
+# agent's environment raises it to an hour. Codex caches for thirty minutes.
+CLAUDE_CACHE_TTL_VAR = "CLAUDE_CODE_PROMPT_CACHE_TTL"
+CLAUDE_CACHE_TTL_S = 300
+CLAUDE_CACHE_TTL_1H_S = 3600
+CODEX_CACHE_TTL_S = 1800
+
 # Appended to every chat turn's prompt when suggestions are enabled: the agent
 # ends its reply with the follow-ups it was asked for, wrapped so the daemon
 # can strip them and render them as buttons without the user ever seeing the
@@ -73,9 +107,26 @@ SUGGESTIONS_TEMPLATE = (
     "<cotf-suggest>\n"
     "System instruction, not user text. Answer the user first, then ALWAYS "
     "end your reply with the block. The block is mandatory in every reply: a "
-    "JSON array of 3 short follow-up options when the conversation has a "
+    "JSON array of 1 to 3 short follow-up options when the conversation has a "
     "real decision fork, or an empty array when it does not. The block is "
     "the END of your reply, never the whole reply.\n"
+    "\n"
+    "Offer as many real options as the fork actually has. Never invent one to "
+    "reach a count: two real options beat three, and one beats two padded.\n"
+    "\n"
+    "Cap each option's length: at most 16 CJK characters or 32 English "
+    "letters. Slack cannot display a longer option.\n"
+    "\n"
+    "Put the most concrete executable step first. The first option is the one "
+    "you judge most likely.\n"
+    "\n"
+    'Never offer "wait", "monitor" or "leave it as is" as filler. Offer a '
+    "cancel option only when acting would be hard to undo.\n"
+    "\n"
+    "Offer an option only when it addresses an unresolved choice or next "
+    "action tied to the user's stated goal.\n"
+    "If the reply completes the request and leaves no choice, return an "
+    "empty array.\n"
     "\n"
     "Example of a complete reply:\n"
     "The Eiffel Tower is in Paris, built for the 1889 World's Fair.\n"
@@ -95,8 +146,16 @@ SUGGESTIONS_TEMPLATE = (
 # parser agree without importing each other.
 MAX_SUGGESTIONS = 5
 MAX_SUGGESTION_LENGTH = 75
+# The template asks for short options -- 16 CJK characters or 32 English
+# letters -- because Slack cannot display an option longer than that. This
+# parser-side cap enforces the same figure width-aware: a CJK character
+# occupies two columns, so 16 CJK chars and 32 ASCII chars land on the same
+# 32-column ceiling. Truncation keeps the ellipsis inside the cap, and the
+# 75-character block-kit cap above is unreachable at this width, which is what
+# keeps a long agent label from sinking a whole actions block.
+MAX_SUGGESTION_WIDTH = 32
 
-_SUGGESTIONS_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # How long shutdown may spend telling interrupted chats their work died. Sized
 # under the supervisor's safe grace (`supervisor.SAFE_GRACE_S`) so the notices
@@ -132,6 +191,40 @@ def _session_tag(value: int | str | None) -> str | None:
     return str(value)
 
 
+def _read_json_mapping(path: Path) -> dict:
+    """A JSON mapping from disk, or an empty one.
+
+    Never raises. The file is one an operator can hand-edit, and a typo in it
+    must not cost a turn: a conversation that cannot read its pin runs on the
+    configured agent, which is where it would have been anyway.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("model pins: %s is not a mapping", path)
+        return {}
+    return raw
+
+
+def _pinned_fields(value: object) -> dict[str, str]:
+    """The overridable fields of one stored entry, ignoring everything else.
+
+    Anything unknown is dropped rather than kept, so a hand-edited key cannot
+    reach `dataclasses.replace` and raise there, on the turn that read it.
+    """
+    if not isinstance(value, dict):
+        return {}
+    # `str(name)` rather than `name`: a dict narrowed from an `object` has no key
+    # type, so its items arrive as `object` and the return type would follow.
+    return {
+        str(name): str(pinned)
+        for name, pinned in value.items()
+        if name in agent.OVERRIDABLE_FIELDS
+    }
+
+
 def _resume_prompt(entry: PendingTurn) -> str:
     """The text to replay for one pending turn.
 
@@ -146,7 +239,7 @@ def _resume_prompt(entry: PendingTurn) -> str:
 
 def _suggestions_enabled() -> bool:
     """Live gate for the suggestions template. Read per turn, not at import."""
-    return settings.get("COTF_SUGGESTIONS_ENABLED").lower() in _SUGGESTIONS_TRUTHY
+    return settings.get("COTF_SUGGESTIONS_ENABLED").lower() in _TRUTHY
 
 
 def _extract_suggestions(body: str) -> tuple[str, list[str]]:
@@ -170,8 +263,34 @@ def _extract_suggestions(body: str) -> tuple[str, list[str]]:
         # the backends' own empty-reply fallback: naming the buttons here
         # would promise an affordance the line above just deleted.
         logger.warning("suggestions: reply body empty; dropping suggestion labels")
-        return "No response", []
+        return EMPTY_REPLY_NOTICE, []
     return cleaned, _parse_suggestion_block(matches[-1].group(1))
+
+
+def _display_width(text: str) -> int:
+    """Display columns of a label: two per East-Asian-wide character, one
+    otherwise. Matches how Slack renders button text for CJK readers."""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def _fit_label(label: str) -> str:
+    """One option label at or under MAX_SUGGESTION_WIDTH display columns.
+
+    The template asks the agent for 16 CJK / 32 ASCII characters, so this only
+    bites on labels that ignore the ask. An ellipsis marks the cut, and the
+    ellipsis is counted so the fitted label stays inside the cap."""
+    if _display_width(label) <= MAX_SUGGESTION_WIDTH:
+        return label
+    keep = MAX_SUGGESTION_WIDTH - 1  # room for the ellipsis
+    fitted: list[str] = []
+    width = 0
+    for char in label:
+        char_width = 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if width + char_width > keep:
+            break
+        fitted.append(char)
+        width += char_width
+    return "".join(fitted) + "…"
 
 
 def _labels_from(data: object) -> list[str]:
@@ -179,7 +298,7 @@ def _labels_from(data: object) -> list[str]:
     if not isinstance(data, list):
         return []
     return [
-        str(item).strip()[:MAX_SUGGESTION_LENGTH]
+        _fit_label(str(item).strip())
         for item in data
         if isinstance(item, str) and item.strip()
     ]
@@ -206,7 +325,7 @@ def _parse_suggestion_block(raw: str) -> list[str]:
             for line in content.splitlines():
                 match = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
                 if match:
-                    items.append(match.group(1)[:MAX_SUGGESTION_LENGTH])
+                    items.append(_fit_label(match.group(1)))
     return items[:MAX_SUGGESTIONS]
 
 
@@ -227,6 +346,23 @@ class Turn:
     # nothing journaled (a compaction, which is daemon maintenance rather than
     # somebody's message, and which the auto-compact gate re-queues by itself).
     journal_id: str = ""
+    # A compaction the idle loop queued, not one somebody asked for. It runs
+    # through the same queue, so a message arriving meanwhile waits behind it,
+    # but it says nothing: the chat went quiet, and a reply out of nowhere
+    # would read as the agent talking to itself.
+    background: bool = False
+
+
+@dataclass(frozen=True)
+class IdleReading:
+    """What the idle loop knows about a chat's last turn."""
+
+    # Monotonic time the turn ended. It errs late against the cache clock, which
+    # starts at the request, so the loop compacts at worst a little after the
+    # lead it was given, never before.
+    ended_at: float
+    context_tokens: int
+    cache_ttl_s: int
 
 
 class SessionEgress:
@@ -247,8 +383,12 @@ class SessionEgress:
     the previous session's grants rather than inheriting them.
     """
 
-    def __init__(self, frontend: Frontend) -> None:
+    def __init__(self, frontend: Frontend, *, ask: bool = True) -> None:
         self._frontend = frontend
+        # False under `sandbox.egress: open`. Held here rather than read per
+        # session because it is startup-fixed, like the decision to build this
+        # object at all.
+        self._ask = ask
         self._proxies: dict[int, tuple[str, egress.EgressProxy]] = {}
 
     async def env_for(self, chat_id: int, session: str) -> dict[str, str]:
@@ -270,7 +410,7 @@ class SessionEgress:
             policy=approvals_mod.ApprovalPolicy(never_ask=egress.never_ask_subjects()),
             label=label,
         )
-        proxy = egress.EgressProxy(approvals, label=label)
+        proxy = egress.EgressProxy(approvals, label=label, ask=self._ask)
         await proxy.start()
         self._proxies[chat_id] = (session, proxy)
         logger.info(
@@ -298,8 +438,9 @@ class SessionPermissions:
     are `permissions.mode`, and neither implies the other.
     """
 
-    def __init__(self, frontend: Frontend) -> None:
+    def __init__(self, frontend: Frontend, platform: str) -> None:
         self._frontend = frontend
+        self._platform = platform
         self._services: dict[int, tuple[str, permissions.PermissionService]] = {}
         # chat_id -> the service's request total as of the end of the last turn.
         # The guard needs a per-turn delta, not a lifetime count: a session that
@@ -338,7 +479,9 @@ class SessionPermissions:
             workspace=workspace,
             ttl_seconds=resolved.ttl_seconds,
             label=label,
-            tmux_session=permissions.tmux_session_name(chat_id, session),
+            tmux_session=permissions.tmux_session_name(
+                self._platform, chat_id, session
+            ),
             notify=self._notifier(chat_id),
         )
         await service.start()
@@ -439,6 +582,13 @@ class Orchestrator:
         # Either feeds session_uuid's `{chat_id}-{value}` tag.
         self._session_counters: dict[int, int | str] = {}
         self._queues: dict[int, asyncio.Queue[Turn]] = {}
+        # What a conversation pinned with `$model`: a field of `AgentProfile` to
+        # its value, for the fields that differ from config.yaml. Empty means the
+        # conversation runs on the configured agent. Read from disk on first use
+        # rather than here, for the reason `_journal` gives: DATA_DIR is a module
+        # constant, so a path read in `__init__` cannot see a later redirect.
+        self._model_overrides: dict[int, dict[str, str]] = {}
+        self._models_loaded = False
         # Last turn's prompt size and window per chat, for the auto-compact gate.
         # Only pty mode populates it; elsewhere the gate never has a reading and
         # so never fires.
@@ -446,6 +596,12 @@ class Orchestrator:
         # None means use the live setting. Tests and embedders may assign an
         # explicit threshold through the compatibility property below.
         self._auto_compact_pct_override: int | None = None
+        # Chats whose last turn finished with a reading, for the idle loop. In
+        # memory only: after a restart the on-return gate above still covers a
+        # chat that went quiet before it.
+        self._idle: dict[int, IdleReading] = {}
+        # Chats with an idle compaction queued or running, to hold the cap.
+        self._background: set[int] = set()
         self._event_log = event_log if event_log is not None else EventLog()
         # chat_id -> {identifier, started_at_monotonic, session_uuid}.
         # Populated at dispatch, cleared on completion. Drives the heartbeat
@@ -505,6 +661,30 @@ class Orchestrator:
         nothing in it yet.
         """
         self._context.pop(chat_id, None)
+        self._idle.pop(chat_id, None)
+
+    def _fold_legacy_workspace(
+        self, chat_id: int, workspace: Path, session: str
+    ) -> None:
+        """Move this session out of the per-thread directory it had before
+        workspaces were shared, if that directory is still there.
+
+        Before `mkdir`, so a migration that cannot run leaves the old directory
+        exactly as it was. Never raises: a turn must run whether or not its
+        history could be carried over.
+        """
+        legacy = self._frontend.legacy_workspace(chat_id)
+        if legacy is None:
+            return
+        try:
+            old = workspace_path(legacy.name, DATA_DIR)
+        except ValueError as exc:
+            logger.warning("legacy workspace name refused: %s", exc)
+            return
+        try:
+            migration.migrate_thread(old, workspace, [session], legacy.thread_key)
+        except Exception:
+            logger.exception("legacy workspace %s not migrated", old)
 
     def is_busy(self, chat_id: int) -> bool:
         return chat_id in self._running and not self._running[chat_id].done()
@@ -550,7 +730,8 @@ class Orchestrator:
             # thread may never be spoken to again, and compacting one that isn't
             # pays a full-context pass for nothing. Waiting until someone
             # actually comes back costs them this turn's latency and saves every
-            # turn after it.
+            # turn after it. `idle_compact_loop` is the exception, and only inside
+            # the cache lifetime, where the same pass reads the context cached.
             logger.info("on_message: chat_id=%s auto-compacting first", chat_id)
             await self.on_compact(chat_id)
         await self._enqueue(chat_id, Turn(text))
@@ -558,6 +739,122 @@ class Orchestrator:
     async def on_compact(self, chat_id: int) -> None:
         """Queue a compaction for this chat. Runs in FIFO order like any turn."""
         await self._enqueue(chat_id, Turn("", compact=True))
+
+    def current_profile(
+        self, chat_id: int, *, persist: bool = False
+    ) -> agent.AgentProfile:
+        """The agent configuration this conversation runs on.
+
+        The resolved global configuration with whatever this conversation pinned
+        on top, which is the one answer a turn, a compaction, and a `$model`
+        report all read. Raises ValueError on a configuration that does not
+        resolve, exactly as `agent.resolve_profile` does: the caller that can
+        tell somebody is the one that should catch it.
+        """
+        from claude_on_the_fly import accounts
+
+        profile = agent.resolve_profile()
+        channel, user = self._frontend.account_subjects(chat_id)
+        chosen = accounts.selection(
+            self._platform,
+            self.session_uuid(chat_id),
+            profile.backend,
+            channel,
+            user,
+            persist=persist,
+        )
+        profile = accounts.apply_profile(profile, chosen.account)
+        if chosen.pool:
+            profile = replace(profile, account_pool=chosen.pool)
+        return agent.apply_override(profile, self._overrides(chat_id))
+
+    def on_model(self, chat_id: int, tokens: list[str]) -> str:
+        """Apply a `$model` request and return the reply to post for it.
+
+        Returns the text instead of sending it, because the frontends post it
+        differently and neither owns the grammar. A refusal changes nothing: the
+        reply says why, and the conversation keeps the model it had.
+        """
+        try:
+            profile = self.current_profile(chat_id)
+        except ValueError as exc:
+            return f"I cannot read the agent configuration, so I changed nothing: {exc}"
+
+        result = model_command.parse(tokens, profile)
+        if isinstance(result, model_command.Refusal):
+            return result.text
+        if isinstance(result, model_command.Report):
+            return model_command.describe(
+                profile, pinned=bool(self._overrides(chat_id))
+            )
+
+        self._apply_model_change(chat_id, result.values)
+        return model_command.ack(self.current_profile(chat_id), note=result.note)
+
+    def _apply_model_change(self, chat_id: int, values: dict[str, str | None]) -> None:
+        """Store one command's fields, and drop the reading they invalidate.
+
+        The cached context reading describes the model that produced it, and a
+        different model may have a different window. Dropping it is what stops
+        the auto-compact gate from thresholding against a window this model does
+        not have; `_run_compaction` drops it for the same reason.
+        """
+        overrides = self._overrides(chat_id)
+        for field, value in values.items():
+            if value is None:
+                overrides.pop(field, None)
+            else:
+                overrides[field] = value
+        if overrides:
+            self._model_overrides[chat_id] = overrides
+        else:
+            # Nothing is pinned any more, so the store keeps no empty entry that
+            # would claim otherwise.
+            self._model_overrides.pop(chat_id, None)
+        self._forget_context(chat_id)
+        self._save_model_overrides()
+
+    def _overrides(self, chat_id: int) -> dict[str, str]:
+        """This conversation's pinned fields, as a dict the caller may mutate."""
+        self._load_model_overrides()
+        return self._model_overrides.get(chat_id, {})
+
+    @property
+    def _model_store(self) -> Path:
+        """Where pins are kept. Resolved per call, for the reason `_journal` is."""
+        return DATA_DIR / "state" / f"{self._platform}.models.json"
+
+    def _load_model_overrides(self) -> None:
+        """Read the pins once for this process's lifetime.
+
+        Once, not per turn: only this process writes the file, so a read on every
+        turn would be a stat per message for an answer nothing else can change.
+        """
+        if self._models_loaded:
+            return
+        self._models_loaded = True
+        for key, value in _read_json_mapping(self._model_store).items():
+            fields = _pinned_fields(value)
+            if not fields:
+                continue
+            try:
+                self._model_overrides[int(key)] = fields
+            except (TypeError, ValueError):
+                logger.warning("model pins: %r is not a chat id", key)
+
+    def _save_model_overrides(self) -> None:
+        """Write the pins, best effort.
+
+        A conversation that cannot record its pin still runs on it for the rest
+        of this process's life, so a failed write is logged rather than raised:
+        it costs the pin at the next restart, not the turn that asked for it.
+        """
+        path = self._model_store
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._model_overrides, sort_keys=True))
+        except OSError:
+            logger.exception("model pins: could not write %s", path)
 
     def _journal_turn(self, chat_id: int, turn: Turn, *, replays: int = 0) -> Turn:
         """Record a turn as pending and return it carrying its journal id.
@@ -568,8 +865,9 @@ class Orchestrator:
         A compaction is not journaled. It is daemon maintenance with no text, so
         replaying it would answer nobody and offering it back would show an empty
         prompt; the auto-compact gate re-queues one when the next message arrives.
+        A replay already has a reserved record; preserve its id and source data.
         """
-        if turn.compact:
+        if turn.compact or turn.journal_id:
             return turn
         entry = PendingTurn(
             chat_id=chat_id,
@@ -645,7 +943,36 @@ class Orchestrator:
                     turn = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                await self._process(chat_id, turn)
+                try:
+                    await self._process(chat_id, turn)
+                except Exception:
+                    # One intake/adapter failure must not strand later messages.
+                    # Park instead of blindly retrying possibly completed writes.
+                    logger.exception(
+                        "turn failed: chat_id=%s turn=%s", chat_id, turn.journal_id
+                    )
+                    entry = next(
+                        (
+                            item
+                            for item in self._journal.pending()
+                            if item.turn_id == turn.journal_id
+                        ),
+                        None,
+                    )
+                    if entry is not None:
+                        parked = self._journal.park(entry)
+                        if parked:
+                            self._journal.forget(entry.turn_id)
+                        try:
+                            await self._frontend.retire_failed_turn(
+                                chat_id, entry.route
+                            )
+                        except Exception:
+                            logger.exception(
+                                "turn failed: could not retire source markers"
+                            )
+                        if parked:
+                            await self._offer_back(entry)
         finally:
             if self._running.get(chat_id) is asyncio.current_task():
                 self._running.pop(chat_id, None)
@@ -693,6 +1020,27 @@ class Orchestrator:
             logger.exception("settings: could not report the restart-required change")
 
     async def _process(self, chat_id: int, turn: Turn) -> None:
+        from claude_on_the_fly import accounts
+
+        try:
+            profile = self.current_profile(chat_id, persist=True)
+            account = accounts.for_profile(profile)
+            with accounts.use(account, mode=profile.mode):
+                workspace = workspace_path(
+                    self._frontend.workspace_name(chat_id), DATA_DIR
+                )
+                accounts.prepare(workspace)
+                await self._process_turn(chat_id, turn, profile)
+        except (accounts.AccountError, OSError) as exc:
+            logger.error("account selection failed: %s", exc)
+            self._journal.forget(turn.journal_id)
+            await self._frontend.send(
+                chat_id, Response(body=f"Account selection failed: {exc}")
+            )
+
+    async def _process_turn(
+        self, chat_id: int, turn: Turn, profile: agent.AgentProfile
+    ) -> None:
         text = turn.text
         # Before any of this turn's setup: from here on an agent may start, and a
         # turn that started is never replayed automatically. Marking early errs
@@ -700,13 +1048,36 @@ class Orchestrator:
         # safe direction for the few milliseconds of difference.
         self._journal.mark_dispatched(turn.journal_id)
         interrupted = False
-        await self._report_config_restarts(chat_id)
+        # Any turn replaces the idle reading: a normal one records a fresh one
+        # when it ends, and a compaction leaves nothing left to compact.
+        self._idle.pop(chat_id, None)
+        if not turn.background:
+            # Not into a chat nobody is in: the notice would land in whichever
+            # quiet chat the loop picked and never reach the operator.
+            await self._report_config_restarts(chat_id)
         workspace = workspace_path(self._frontend.workspace_name(chat_id), DATA_DIR)
-        workspace.mkdir(parents=True, exist_ok=True)
-        if self._platform in agent.ATTACHMENT_PLATFORMS:
-            (workspace / agent.OUTBOX_DIRNAME).mkdir(exist_ok=True)
-        agent.ensure_persona(workspace, self._frontend.persona_source(chat_id))
         session = self.session_uuid(chat_id)
+        # Resolved once per turn, before anything can report on it, so the event
+        # rows, the dashboard row, the approval check and the run itself cannot
+        # disagree about which agent this turn used. Resolving here rather than
+        # inside the try is deliberate: a configuration that does not resolve
+        # already failed on this line before this change, when the dispatch event
+        # called `current_backend_key()` for the same answer.
+        logger.info(
+            "account: platform=%s chat=%s backend=%s account=%s",
+            self._platform,
+            chat_id,
+            profile.backend,
+            profile.account or "daemon default",
+        )
+        self._fold_legacy_workspace(chat_id, workspace, session)
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / WORKSPACE_MEMORY_DIRNAME).mkdir(exist_ok=True)
+        outbox: Path | None = None
+        if self._platform in agent.ATTACHMENT_PLATFORMS:
+            outbox = agent.session_outbox(workspace, session)
+            outbox.mkdir(parents=True, exist_ok=True)
+        agent.ensure_persona(workspace, self._frontend.persona_source(chat_id))
         identifier = self._frontend.workspace_name(chat_id)
         logger.debug(
             "process: chat_id=%s workspace=%s session=%s", chat_id, workspace, session
@@ -715,13 +1086,20 @@ class Orchestrator:
         self._event_log.append(
             EVENT_DISPATCHED,
             source=self._platform,
-            backend=current_backend_key(),
+            backend=current_backend_key(profile),
             identifier=identifier,
             workspace=workspace,
             session_uuid=session,
         )
         self._in_flight[chat_id] = {
             "identifier": identifier,
+            # The agent this turn runs on, so the dashboard row names the model a
+            # pinned conversation actually uses rather than the daemon's default.
+            "backend": current_backend_key(profile),
+            # Same identifier with the conversation's human name on the end,
+            # for the dashboard row. Resolved here rather than in the TUI,
+            # which has no way to ask Slack what C09AB… is called.
+            "label": self._frontend.display_label(chat_id),
             "started_at_monotonic": time.monotonic(),
             "session_uuid": session,
             # So `abort` can drop the journal entry of the turn it cancels: a
@@ -737,7 +1115,11 @@ class Orchestrator:
         env_token = None
         relay: sandbox.SessionRelay | None = None
         command_token: str | None = None
+        pane: tmux.Pane | None = None
         interim: InterimProgress | None = None
+        # Set only once the agent answered. A failed or stopped turn keeps its
+        # progress message, because it is the last thing the agent was doing.
+        answered = False
         sink_token = None
         try:
             # Point this turn's agent at its own egress proxy. Set here rather
@@ -750,6 +1132,28 @@ class Orchestrator:
             # entirely: the in-flight slot set just above leaked, notify_complete
             # never ran, and the whole drain task died with turns still queued.
             session_overrides: dict[str, str] = {}
+            # Host this turn in its own tmux server so the TUI can mirror the
+            # pane. The name is `permissions.tmux_session_name` because the
+            # approval path addresses the same pane to type an answer into it;
+            # both call that one function, so the two cannot name different
+            # panes. Skipped entirely when tmux is absent — a turn then runs
+            # unmirrored rather than not at all.
+            if tmux.hosting_available():
+                pane = tmux.pane_for(
+                    permissions.tmux_session_name(self._platform, chat_id, session)
+                )
+            if pane is not None:
+                session_overrides.update(pane.env)
+                logger.debug("tmux: chat %s hosted in pane %s", chat_id, pane.session)
+            elif not tmux.available():
+                # INFO rather than debug: this is the whole reason a live view
+                # shows a transcript instead of the agent's terminal, and it is
+                # the one cause an operator can actually fix. Silent when they
+                # switched hosting off themselves — that one is not a surprise.
+                logger.info(
+                    "tmux is not on PATH, so this turn runs unmirrored; "
+                    "install tmux to watch the agent's own terminal"
+                )
             if self._egress is not None:
                 session_overrides.update(await self._egress.env_for(chat_id, session))
             if self._permissions is not None:
@@ -760,6 +1164,9 @@ class Orchestrator:
                 command_env = self._commands.agent_env(workspace)
                 command_token = command_env[commands.TOKEN_ENV]
                 session_overrides.update(command_env)
+            # An ollama turn's model server, so the relay below bridges it.
+            session_overrides.update(sandbox.model_endpoint_env(profile.mode))
+            session_overrides.update(_cache_ttl_env(profile))
             # Must come before the spawn and after the overrides are known: on a
             # Linux jail the agent's network namespace contains nothing until
             # this bridges the brokered ports into it, and one of those ports
@@ -768,16 +1175,25 @@ class Orchestrator:
             relay = await sandbox.open_session_relay(session_overrides, str(chat_id))
             if session_overrides:
                 env_token = sandbox.session_env(session_overrides)
-            await self._frontend.notify_start(chat_id)
-            typing_task = asyncio.create_task(self._typing_loop(chat_id))
+            if not turn.background:
+                await self._frontend.notify_start(chat_id)
+                typing_task = asyncio.create_task(self._typing_loop(chat_id))
             if turn.compact:
                 response = await self._run_compaction(
-                    chat_id, workspace, session, self._frontend.timeout_for(chat_id)
+                    chat_id,
+                    workspace,
+                    session,
+                    self._frontend.timeout_for(chat_id),
+                    profile,
                 )
             else:
                 identity = getattr(self._frontend, "sender_identity", None)
                 suggestions = _suggestions_enabled()
-                prompt = f"{text}\n\n{SUGGESTIONS_TEMPLATE}" if suggestions else text
+                prompt = text
+                if outbox is not None:
+                    prompt = f"{prompt}\n\n{agent.outbox_note(outbox)}"
+                if suggestions:
+                    prompt = f"{prompt}\n\n{SUGGESTIONS_TEMPLATE}"
                 # The backend's nudge retry (an empty or block-only reply)
                 # carries the suggestions instruction too, so the retried
                 # answer comes back with working buttons rather than a bare
@@ -804,7 +1220,11 @@ class Orchestrator:
                         channel_context=self._frontend.channel_context(chat_id),
                         timeout=self._frontend.timeout_for(chat_id),
                         nudge_prompt=nudge_prompt,
+                        profile=profile,
+                        facts=self._frontend.session_facts(chat_id),
                     )
+                    if profile.account_pool:
+                        profile = self.current_profile(chat_id)
                 except asyncio.CancelledError:
                     # FIRST, and the order is load-bearing rather than stylistic:
                     # CancelledError IS a BaseException, so the arm below would
@@ -839,14 +1259,13 @@ class Orchestrator:
                     # land after the answer it was leading up to. Discards whatever
                     # is still held rather than dumping a digest above the reply.
                     await interim.aclose()
+                    answered = True
             if self._permissions is not None:
                 # After the turn, because the tool count only exists once it is
                 # over. Reporting late beats not reporting: an ungated turn is
                 # exactly what an operator who enabled approvals must never
                 # discover by accident.
-                self._permissions.check_turn(
-                    chat_id, response, settings.get("AGENT_BACKEND", "claude")
-                )
+                self._permissions.check_turn(chat_id, response, profile.backend)
             logger.debug(
                 "process: chat_id=%s response cost=%.4f tokens_in=%s tokens_out=%s",
                 chat_id,
@@ -863,15 +1282,23 @@ class Orchestrator:
                     response.context_tokens,
                     response.context_window_size,
                 )
-            if self._platform in agent.ATTACHMENT_PLATFORMS:
-                response.attachments = agent.collect_outbox(workspace)
-            delivered = await self._frontend.send(chat_id, response)
+            if not turn.compact:
+                self._note_idle(chat_id, response, profile)
+            if outbox is not None:
+                response.attachments = agent.collect_outbox(outbox)
+            if turn.background:
+                delivered = None
+                self._log_background_compaction(chat_id, identifier, profile, response)
+            else:
+                delivered = await self._frontend.send(chat_id, response)
             if delivered:
                 agent.archive_outbox(workspace, delivered)
+            if outbox is not None:
+                agent.retire_outbox(outbox)
             self._event_log.append(
                 EVENT_WORKER_DONE,
                 source=self._platform,
-                backend=current_backend_key(),
+                backend=current_backend_key(profile),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -887,14 +1314,15 @@ class Orchestrator:
             raise
         except ClaudeUnavailableError as exc:
             logger.warning("Claude unavailable for chat %s: %s", chat_id, exc)
-            await self._frontend.send(
-                chat_id,
-                Response(body=f"Claude unavailable: {exc}"),
-            )
+            if not turn.background:
+                await self._frontend.send(
+                    chat_id,
+                    Response(body=f"Claude unavailable: {exc}"),
+                )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
-                backend=current_backend_key(),
+                backend=current_backend_key(profile),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -903,14 +1331,27 @@ class Orchestrator:
             )
         except Exception as exc:
             logger.exception("Agent error for chat %s", chat_id)
-            await self._frontend.send(
-                chat_id,
-                Response(body=f"Error: {exc}"),
+            public_message = (
+                exc.public_message
+                if isinstance(
+                    exc,
+                    (
+                        AgentTurnError,
+                        account_fallback.AccountFallbackError,
+                        quota.AccountExhaustedError,
+                    ),
+                )
+                else AGENT_FAILURE_NOTICE
             )
+            if not turn.background:
+                await self._frontend.send(
+                    chat_id,
+                    Response(body=public_message),
+                )
             self._event_log.append(
                 EVENT_WORKER_FAILED,
                 source=self._platform,
-                backend=current_backend_key(),
+                backend=current_backend_key(profile),
                 identifier=identifier,
                 workspace=workspace,
                 session_uuid=session,
@@ -931,8 +1372,18 @@ class Orchestrator:
                 # not spend INTERIM_CLOSE_GRACE before the "Stopped" ack goes out.
                 # Idempotent with the aclose/cancel above.
                 interim.cancel()
+                # After the reply, so a successful turn's progress message goes
+                # only once the answer is there to replace it. On every path, so
+                # the next turn never edits a message this one kept.
+                await self._frontend.end_progress(chat_id, succeeded=answered)
             if env_token is not None:
                 sandbox.reset_session_env(env_token)
+            if pane is not None:
+                # Ends the server, so a backend that left its pane running past
+                # the deadline is reaped here too. A process-group kill cannot
+                # reach a pane child, which is why this is not covered by the
+                # backend's own teardown.
+                tmux.kill(pane)
             if relay is not None:
                 # Closing this drops the namespace's only route to the host, so
                 # it has to outlive the spawn. Safe on every path including the
@@ -940,7 +1391,10 @@ class Orchestrator:
                 await relay.close()
             if command_token is not None and self._commands is not None:
                 self._commands.revoke_token(command_token)
-            await self._frontend.notify_complete(chat_id)
+            if turn.background:
+                self._background.discard(chat_id)
+            else:
+                await self._frontend.notify_complete(chat_id)
 
     def _start_interim(self, chat_id: int) -> InterimProgress | None:
         """This turn's progress relay, or None when nothing could come of one.
@@ -967,18 +1421,150 @@ class Orchestrator:
         return InterimProgress(post)
 
     async def _run_compaction(
-        self, chat_id: int, workspace: Path, session: str, timeout: float | None
+        self,
+        chat_id: int,
+        workspace: Path,
+        session: str,
+        timeout: float | None,
+        profile: agent.AgentProfile,
     ) -> Response:
-        """Compact the session and render the outcome as this turn's reply."""
+        """Compact the session and render the outcome as this turn's reply.
+
+        Takes the conversation's profile, not the daemon's: a compaction that ran
+        under different settings than the turn it compacts would summarize with a
+        model the conversation never used and bill it for the privilege.
+        """
         # Whatever this chat was holding describes the pre-compaction prompt and
         # is stale the moment the compaction lands. Dropping it (rather than
         # guessing the new size) is what stops a manual `$compact` from being
         # followed straight away by an automatic one on the next message.
         self._context.pop(chat_id, None)
-        outcome = await agent.compact(workspace, session, timeout=timeout)
+        outcome = await agent.compact(
+            workspace, session, timeout=timeout, profile=profile
+        )
         if outcome is None:
             return Response(body="This backend can't compact a conversation.")
         return Response(body=outcome.summary(), compaction=outcome)
+
+    def _note_idle(
+        self, chat_id: int, response: Response, profile: agent.AgentProfile
+    ) -> None:
+        """Record what the idle loop needs from the turn that just ended.
+
+        Called inside the turn, so `sandbox.agent_env()` still carries this
+        session's overrides and reads the environment the agent actually got.
+        Under the sandbox that matters: the one-hour cache setting is not on the
+        passthrough list, so the agent ran on the five-minute default whatever
+        the daemon's own environment says.
+        """
+        ttl = _cache_ttl_s(profile, sandbox.agent_env() or os.environ)
+        if not response.context_tokens or ttl is None:
+            return
+        self._idle[chat_id] = IdleReading(
+            ended_at=time.monotonic(),
+            context_tokens=response.context_tokens,
+            cache_ttl_s=ttl,
+        )
+
+    def _log_background_compaction(
+        self,
+        chat_id: int,
+        identifier: str,
+        profile: agent.AgentProfile,
+        response: Response,
+    ) -> None:
+        """Record an idle compaction where the operator looks, not in the chat."""
+        outcome = response.compaction
+        if outcome is None:
+            result = "unsupported"
+        else:
+            result = "compacted" if outcome.ok else "failed"
+        started = self._in_flight.get(chat_id, {}).get("started_at_monotonic")
+        duration = time.monotonic() - started if started is not None else 0.0
+        logger.info("idle-compact: chat_id=%s %s: %s", chat_id, result, response.body)
+        self._event_log.append(
+            EVENT_SESSION_COMPACTED,
+            source=self._platform,
+            identifier=identifier,
+            backend=current_backend_key(profile),
+            # No `tokens_after`: nothing measures the whole prompt after a
+            # compaction, and the log drops a None field anyway.
+            tokens_before=(outcome.pre_tokens or None) if outcome else None,
+            conversation_tokens_after=(
+                outcome.conversation_tokens_after if outcome else None
+            ),
+            duration_s=round(duration, 1),
+            outcome=result,
+        )
+
+    async def idle_compact_loop(self) -> None:
+        """Compact quiet chats shortly before their prompt cache expires.
+
+        This reverses the choice `on_message` records, on purpose. Compacting a
+        chat nobody returns to used to be a full-context pass for nothing; inside
+        the cache lifetime the same pass reads the context at the cached rate, so
+        it costs little, and a chat that does come back starts short.
+        """
+        while True:
+            await asyncio.sleep(IDLE_COMPACT_TICK_S)
+            try:
+                await self.compact_idle_chats()
+            except Exception:
+                # One bad tick must not end the loop for the daemon's lifetime.
+                logger.exception("idle-compact: tick failed")
+
+    async def compact_idle_chats(self, now: float | None = None) -> None:
+        """Queue a silent compaction for each chat whose window is open now."""
+        if not _idle_compact_enabled():
+            return
+        now = time.monotonic() if now is None else now
+        # A compaction that `abort` dropped before it started never reaches the
+        # discard in `_process`, so the cap counts only chats still working.
+        self._background = {chat for chat in self._background if self.is_busy(chat)}
+        due = self._idle_compact_due(
+            now, _idle_compact_tokens(), _idle_compact_lead_min() * 60
+        )
+        for chat_id in due:
+            if len(self._background) >= IDLE_COMPACT_MAX_RUNNING:
+                return
+            reading = self._idle.pop(chat_id)
+            # `_run_compaction` drops it too, but only after the awaits that
+            # set up the turn; a message landing first would read the
+            # pre-compaction size and queue a second, visible compaction.
+            self._context.pop(chat_id, None)
+            logger.info(
+                "idle-compact: chat_id=%s %s tokens, idle %.0fs of %ss cache",
+                chat_id,
+                reading.context_tokens,
+                now - reading.ended_at,
+                reading.cache_ttl_s,
+            )
+            self._background.add(chat_id)
+            await self._enqueue(chat_id, Turn("", compact=True, background=True))
+
+    def _idle_compact_due(self, now: float, threshold: int, lead_s: int) -> list[int]:
+        """Chats inside their window, the nearest cache expiry first.
+
+        A reading whose cache already expired is dropped: the pass would read
+        the context at the full rate and save nothing, and the on-return gate
+        still covers the chat when somebody writes to it.
+        """
+        due: list[tuple[float, int]] = []
+        for chat_id, reading in list(self._idle.items()):
+            idle_s = now - reading.ended_at
+            if idle_s >= reading.cache_ttl_s:
+                self._idle.pop(chat_id)
+                continue
+            if reading.context_tokens < threshold:
+                continue
+            # A lead as long as the cache (the five-minute default against a
+            # five-minute lead) leaves no window, only a compaction per turn.
+            if reading.cache_ttl_s <= lead_s or idle_s < reading.cache_ttl_s - lead_s:
+                continue
+            if self.is_busy(chat_id) or self.queue_size(chat_id):
+                continue
+            due.append((reading.ended_at + reading.cache_ttl_s, chat_id))
+        return [chat_id for _expiry, chat_id in sorted(due)]
 
     def heartbeat_extra(self) -> dict:
         """Snapshot in-flight chat jobs for the TUI's Active AI jobs pane.
@@ -990,9 +1576,15 @@ class Orchestrator:
         running_jobs = [
             {
                 "identifier": j["identifier"],
+                "label": j["label"],
                 "chat_id": chat_id,
                 "uptime_s": int(now - j["started_at_monotonic"]),
                 "session_uuid": j["session_uuid"],
+                # The turn's own agent, not the daemon's: a conversation pinned
+                # with `$model` runs a different model from the one the TUI's
+                # environment resolves, and the row would otherwise name the
+                # wrong one.
+                "backend": j.get("backend"),
             }
             for chat_id, j in self._in_flight.items()
         ]
@@ -1012,7 +1604,10 @@ class Orchestrator:
         """
         chats: dict[int, tuple[bool, int]] = {}
         for chat_id, task in self._running.items():
-            if not task.done():
+            # An idle compaction is nobody's answer and is not journaled, so
+            # nothing resumes it: saying "interrupted" would post into a quiet
+            # chat about work nobody asked for.
+            if not task.done() and chat_id not in self._background:
                 chats[chat_id] = (True, 0)
         for chat_id, queue in self._queues.items():
             queued = queue.qsize()
@@ -1029,8 +1624,8 @@ class Orchestrator:
         the frontend starts listening, so a live message cannot overtake work that
         was already waiting.
 
-        The journal is emptied by `take` before anything here runs, so a turn that
-        kills the daemon cannot be replayed at every start.
+        `take` persists each reservation before anything here runs, so a crash
+        cannot lose a handoff or reset the bounded replay count.
         """
         replay, nudge = self._journal.take()
         if not replay and not nudge:
@@ -1063,8 +1658,12 @@ class Orchestrator:
 
     async def _offer_back(self, entry: PendingTurn) -> None:
         """Hand one turn back, for the rare case a replay is the wrong answer."""
-        self._restore_chat(entry)
         try:
+            # A notice is not another queued turn. Restore its destination and
+            # session without appending a reaction target that will never run.
+            route = dict(entry.route)
+            route.pop("message_ts", None)
+            self._restore_chat(replace(entry, route=route))
             await self._frontend.notify_nudge(entry.chat_id, entry.text)
         except Exception:
             logger.exception(
@@ -1090,7 +1689,11 @@ class Orchestrator:
             self._restore_chat(entry)
             await self._enqueue(
                 chat_id,
-                Turn(_resume_prompt(entry), compact=entry.compact),
+                Turn(
+                    _resume_prompt(entry),
+                    compact=entry.compact,
+                    journal_id=entry.turn_id,
+                ),
                 replays=entry.replays,
             )
 
@@ -1168,6 +1771,73 @@ def _auto_compact_pct() -> int:
     return pct
 
 
+def _idle_compact_enabled() -> bool:
+    """Live toggle for idle compaction. Read per tick, so an edit needs no restart."""
+    return settings.get(IDLE_COMPACT_VAR).strip().lower() in _TRUTHY
+
+
+def _idle_compact_tokens() -> int:
+    return _positive_setting(IDLE_COMPACT_TOKENS_VAR, DEFAULT_IDLE_COMPACT_TOKENS)
+
+
+def _idle_compact_lead_min() -> int:
+    return _positive_setting(IDLE_COMPACT_LEAD_MIN_VAR, DEFAULT_IDLE_COMPACT_LEAD_MIN)
+
+
+def _positive_setting(name: str, default: int) -> int:
+    """A positive integer setting, or its default when unset or unusable.
+
+    The default rather than off, unlike `_auto_compact_pct`: the toggle already
+    says whether the feature runs, so a typo in a tuning value should not
+    silently switch it off. The value is logged so the typo is visible.
+    """
+    raw = settings.get(name).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value > 0:
+        return value
+    logger.warning("%s=%r is not a positive number, using %d", name, raw, default)
+    return default
+
+
+def _cache_ttl_env(profile: agent.AgentProfile) -> dict[str, str]:
+    """The one-hour cache for claude turns while idle compaction is on.
+
+    Claude's five-minute default leaves no window to compact in, so enabling the
+    feature without this would do nothing for claude. An operator value in the
+    daemon's environment wins. It is forwarded rather than left to inherit,
+    because the sandbox passthrough list does not carry it. Ollama mode is left
+    alone: that request goes to ollama, not to Anthropic's cache.
+    """
+    if (
+        not _idle_compact_enabled()
+        or profile.backend != "claude"
+        or profile.mode == "ollama"
+    ):
+        return {}
+    return {CLAUDE_CACHE_TTL_VAR: os.environ.get(CLAUDE_CACHE_TTL_VAR) or "1h"}
+
+
+def _cache_ttl_s(profile: agent.AgentProfile, env: Mapping[str, str]) -> int | None:
+    """How long this turn's prompt stays cached, or None for no idle compaction.
+
+    Under ollama it is whatever the operator declared, None when unset: the
+    hosted lifetimes say nothing about the model ollama routed the turn to, and
+    ollama's own cache is implicit, with no lifetime to read.
+    """
+    if profile.mode == "ollama":
+        return profile.ollama_cache_ttl_s
+    if profile.backend == "codex":
+        return CODEX_CACHE_TTL_S
+    if env.get(CLAUDE_CACHE_TTL_VAR, "").strip().lower() == "1h":
+        return CLAUDE_CACHE_TTL_1H_S
+    return CLAUDE_CACHE_TTL_S
+
+
 def _redact_token(token: str) -> str:
     """Mask a secret for log output."""
     if not token:
@@ -1185,7 +1855,6 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
     appends frontend-specific fields via Frontend.describe(). Secrets are
     expected to be redacted by the frontend before being returned.
     """
-    import os
 
     backend = settings.get("AGENT_BACKEND", "claude").lower()
     mode_var = f"{backend.upper()}_MODE"
@@ -1202,6 +1871,14 @@ def _log_settings_summary(platform: str, frontend: Frontend) -> None:
 
     for label, value in frontend.describe().items():
         logger.info("  %-15s = %s", label, value)
+
+
+def _route_approvals(frontend: Frontend) -> ApprovalBroker:
+    """Who answers when a turn reaches past a broker route's scope."""
+    return ApprovalBroker(
+        approvals_mod.gate_from_frontend(frontend),
+        policy=approvals_mod.ApprovalPolicy(never_ask=egress.never_ask_subjects()),
+    )
 
 
 async def _start_sandbox(
@@ -1226,7 +1903,18 @@ async def _start_sandbox(
         permissions.write_mcp_config()
         permissions.write_pty_settings()
     if not sandbox.enabled():
-        return None, None, None
+        # The ChatGPT login is brokered on its own when asked for, so an operator
+        # can run the broker for a while before turning the jail on.
+        if not codex_auth.enabled():
+            return None, None, None
+        only = await broker.start_default_broker(
+            approvals=_route_approvals(frontend), keychain=False
+        )
+        logger.info("sandbox: off, broker=on for the codex ChatGPT login only")
+        return only, None, None
+    # Resolved before anything binds a socket, so a bad value is reported by a
+    # daemon that has started nothing rather than by one already tearing down.
+    egress_mode = sandbox.egress_mode()
     broker_instance = None
     command_broker = None
     try:
@@ -1234,31 +1922,14 @@ async def _start_sandbox(
         # session earns, so one credential-holding proxy for the daemon is right.
         # Egress is the opposite -- see SessionEgress for why it is per-session.
         broker_instance = await broker.start_default_broker(
-            approvals=ApprovalBroker(
-                approvals_mod.gate_from_frontend(frontend),
-                policy=approvals_mod.ApprovalPolicy(
-                    never_ask=egress.never_ask_subjects(),
-                ),
-            )
+            approvals=_route_approvals(frontend)
         )
         # The broker is daemon-wide, but its bearer token is per turn so the
         # request can be bound to the originating workspace. Publish only the
         # harmless endpoint here; the session token is layered by _process().
         command_broker = commands.CommandBroker(sandbox.shim_dir())
         await command_broker.start()
-        # The endpoint is harmless to publish daemon-wide, but the bearer token
-        # must be issued per turn and bound to that turn's workspace. Do not leave
-        # the private base token in the daemon environment for sandbox.agent_env
-        # to forward accidentally.
-        command_env = command_broker.agent_env()
-        os.environ.update(
-            {
-                key: value
-                for key, value in command_env.items()
-                if key != commands.TOKEN_ENV
-            }
-        )
-        os.environ.pop(commands.TOKEN_ENV, None)
+        command_broker.publish_endpoint()
     except Exception:
         logger.exception("sandbox: startup failed, revoking what already started")
         if command_broker is not None:
@@ -1266,10 +1937,17 @@ async def _start_sandbox(
         if broker_instance is not None:
             await broker_instance.stop()
         raise
+    # Built before the log line so the line reports what was actually started.
+    session_egress = (
+        SessionEgress(frontend, ask=sandbox.egress_asks())
+        if sandbox.egress_proxy_enabled()
+        else None
+    )
     logger.info(
-        "sandbox: mode=%s broker=%s egress=per-session commands=%s content_log=%s",
+        "sandbox: mode=%s broker=%s egress=%s commands=%s content_log=%s",
         sandbox.mode(),
         "on" if broker_instance else "none",
+        egress_mode,
         ",".join(command_broker.shimmed) or "none",
         "on" if logs.log_content() else "redacted",
     )
@@ -1281,7 +1959,7 @@ async def _start_sandbox(
     # runs the same gate from its own composition root, so the sequence lives in
     # sandbox.verify_boundary rather than being repeated per daemon.
     await sandbox.verify_boundary()
-    return broker_instance, SessionEgress(frontend), command_broker
+    return broker_instance, session_egress, command_broker
 
 
 async def run(frontend: Frontend, platform: str) -> None:
@@ -1317,11 +1995,18 @@ async def run(frontend: Frontend, platform: str) -> None:
     process_ledger = ProcessLedger(DATA_DIR / "state" / f"{platform}.pids")
     listener_attached = False
     heartbeat_task: asyncio.Task[None] | None = None
+    idle_task: asyncio.Task[None] | None = None
 
     try:
         process_ledger.sweep()
         agent.add_process_listener(process_ledger.on_process)
         listener_attached = True
+        # Same recovery, one layer out: a pane is a child of cotf's tmux server,
+        # not of this daemon, so the process ledger above never saw it and it
+        # outlives a daemon that died mid-turn. Only this daemon's own prefix --
+        # the jobs worker reaps `cotf-job-` on its own schedule, and reaping a
+        # sibling's live turn is exactly what the prefix prevents.
+        tmux.sweep(permissions.tmux_session_prefix(platform))
 
         # When sandboxing is enabled, the broker holds the real API keys and the
         # agent reaches them only through loopback. start_default_broker publishes
@@ -1335,7 +2020,9 @@ async def run(frontend: Frontend, platform: str) -> None:
         # Approvals are independent of COTF_SANDBOX, so this is built whenever the
         # config asks for it rather than only inside the sandbox branch.
         session_permissions = (
-            SessionPermissions(frontend) if permissions.configured().enabled else None
+            SessionPermissions(frontend, platform)
+            if permissions.configured().enabled
+            else None
         )
         orch = Orchestrator(
             frontend,
@@ -1353,6 +2040,7 @@ async def run(frontend: Frontend, platform: str) -> None:
 
         heartbeat.set_extra_provider(orch.heartbeat_extra)
         heartbeat_task = asyncio.create_task(heartbeat.run())
+        idle_task = asyncio.create_task(orch.idle_compact_loop())
 
         # Between the sandbox and the listener, deliberately. A replayed turn
         # spawns a jailed agent, so it needs the broker, the proxy and the shims
@@ -1372,8 +2060,12 @@ async def run(frontend: Frontend, platform: str) -> None:
         # first can tear down the client the notice needs to post through.
         await orch.notify_interrupted()
         heartbeat_task.cancel()
+        # Before `orch.shutdown`, so no idle compaction is queued behind a stop.
+        idle_task.cancel()
         frontend_task.cancel()
-        await asyncio.gather(heartbeat_task, frontend_task, return_exceptions=True)
+        await asyncio.gather(
+            heartbeat_task, idle_task, frontend_task, return_exceptions=True
+        )
         await orch.shutdown()
         await frontend.stop()
         # Stopping these revokes every route out of the sandbox at once.
@@ -1399,5 +2091,8 @@ async def run(frontend: Frontend, platform: str) -> None:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if idle_task is not None:
+            idle_task.cancel()
+            await asyncio.gather(idle_task, return_exceptions=True)
         heartbeat.remove_owned()
         heartbeat.release()

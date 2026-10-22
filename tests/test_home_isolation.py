@@ -15,6 +15,9 @@ This module is the guard on the backstop.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from claude_on_the_fly import agent
@@ -38,3 +41,40 @@ def test_derived_constants_followed_the_redirect() -> None:
     entry already differs from HOME, making that comparison vacuous too.
     """
     assert agent.DATA_DIR.resolve().is_relative_to(Path.home().resolve())
+
+
+def test_inherited_codex_state_survives_tests_that_write_shared_state(
+    tmp_path: Path,
+) -> None:
+    inherited_home = tmp_path / "inherited-codex"
+    inherited_home.mkdir()
+    sentinels = {
+        "config.toml": 'model = "sentinel"\n',
+        "auth.json": '{"sentinel": "not-a-credential"}\n',
+    }
+    for name, contents in sentinels.items():
+        (inherited_home / name).write_text(contents)
+    environment = dict(os.environ)
+    environment["CODEX_HOME"] = str(inherited_home)
+    environment.pop("PYTEST_ADDOPTS", None)
+    test_class = "tests/test_sandbox.py::TestTheSessionBoundaryIsOptIn::"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-o",
+            "addopts=",
+            test_class + "test_off_leaves_the_shared_home_as_the_operator_wrote_it",
+            test_class + "test_retiring_a_workspace_never_reaches_the_shared_home",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name, contents in sentinels.items():
+        assert (inherited_home / name).read_text() == contents

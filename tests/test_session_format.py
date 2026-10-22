@@ -468,7 +468,7 @@ def _parses(formatted: str | None) -> bool:
 class TestMarkupSafety:
     """The live crash: a `PostCompact [/Users/…/postcompact_envelope.sh] completed`
     notice in a transcript read as an unmatched closing tag and took the whole
-    TUI down, from `_refresh_watch_pane` -> `RichLog.write` -> `Text.from_markup`.
+    TUI down, from `_refresh_live_view` -> `RichLog.write` -> `Text.from_markup`.
     """
 
     def test_the_bracketed_path_that_crashed_the_tui(self):

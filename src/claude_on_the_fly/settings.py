@@ -11,12 +11,12 @@ Now there is one file, `~/.claude-on-the-fly/config.yaml`, seeded from the bundl
 template on first run so the operator opens something commented rather than
 inventing a schema.
 
-**Why a file and not the environment.** All four entrypoints call `load_dotenv()`
-with no argument, so python-dotenv searches upward from the *cwd*: the `.env` in
-DATA_DIR is read only when `tui/supervisor` injects it into the child, or when the
-daemon happens to be launched from that directory. This file is resolved from an
-absolute path, so it reads the same however the daemon started. Credentials stay
-in `.env`, which is where a secret scanner expects them.
+**Why a file and not the environment.** An environment variable can come from the
+shell, from `DATA_DIR/.env` (`envfile.load_into_process`), or from the merge
+`tui/supervisor` does when it spawns a child, and a shell export silently beats the
+file. This file is resolved from an absolute path, so it reads the same however the
+daemon started. Credentials stay in `.env`, which is where a secret scanner expects
+them.
 
 **`.env` keeps working.** Every environment variable a setting moved from still
 overrides the file, and warns once naming where it went -- a deployment must not lose
@@ -66,6 +66,8 @@ BUNDLED_SETTINGS = Path(__file__).parent / FILENAME
 # a misspelled section, which YAML accepts happily and which would otherwise do
 # nothing at all with no diagnostic; `check_operator_settings` names them instead.
 SECTIONS = (
+    "accounts",
+    "routing",
     "egress",
     "commands",
     "permissions",
@@ -73,6 +75,7 @@ SECTIONS = (
     "agent",
     "interim",
     "watchdog",
+    "daemons",
     "slack",
     "telegram",
     "jobs",
@@ -111,21 +114,31 @@ class Field:
 # YAML path -> the environment variable it replaces. Read by `get`.
 FIELDS: dict[str, Field] = {
     "sandbox.mode": Field("COTF_SANDBOX"),
+    "sandbox.egress": Field("COTF_SANDBOX_EGRESS"),
     "sandbox.fs": Field("COTF_SANDBOX_FS"),
     "sandbox.extra_paths": Field("COTF_SANDBOX_EXTRA_PATHS", sep=":"),
+    "sandbox.write_paths": Field("COTF_SANDBOX_WRITE_PATHS", sep=":"),
     "sandbox.broker_only_loopback": Field("COTF_SANDBOX_BROKER_ONLY_LOOPBACK"),
     "sandbox.scope_sessions": Field("COTF_SANDBOX_SCOPE_SESSIONS"),
     "agent.backend": Field("AGENT_BACKEND"),
     "agent.claude.mode": Field("CLAUDE_MODE"),
     "agent.claude.model": Field("CLAUDE_MODEL"),
+    "agent.claude.effort": Field("CLAUDE_EFFORT"),
     "agent.codex.mode": Field("CODEX_MODE"),
     "agent.codex.model": Field("CODEX_MODEL"),
+    "agent.codex.effort": Field("CODEX_EFFORT"),
+    "agent.codex.chatgpt_via_broker": Field("COTF_CODEX_CHATGPT_VIA_BROKER"),
     "agent.ollama.model": Field("OLLAMA_MODEL"),
     "agent.ollama.effort": Field("OLLAMA_EFFORT"),
     "agent.ollama.context_window": Field("OLLAMA_CONTEXT_WINDOW"),
+    "agent.ollama.cache_ttl_min": Field("OLLAMA_CACHE_TTL_MIN"),
     "agent.skills_cache_ttl_seconds": Field("SKILLS_CACHE_TTL_SECONDS"),
     "agent.pricing_ttl_seconds": Field("COTF_PRICING_TTL_SECONDS"),
     "agent.auto_compact_pct": Field("COTF_AUTO_COMPACT_PCT"),
+    "agent.idle_compact": Field("COTF_IDLE_COMPACT"),
+    "agent.idle_compact_tokens": Field("COTF_IDLE_COMPACT_TOKENS"),
+    "agent.idle_compact_lead_min": Field("COTF_IDLE_COMPACT_LEAD_MIN"),
+    "agent.pane": Field("COTF_AGENT_PANE"),
     "agent.pty.auto_install": Field("COTF_AUTO_INSTALL_PTY"),
     "agent.pty.auto_refresh": Field("COTF_PTY_AUTO_REFRESH"),
     # Its own section because every section here names a module, and mid-turn
@@ -135,6 +148,7 @@ FIELDS: dict[str, Field] = {
     # Read per tick by a one-shot process, so an edit lands on the next
     # scheduler run with nothing to restart.
     "watchdog.stale_seconds": Field("WATCHDOG_STALE_SECONDS"),
+    "daemons.restart_command": Field("COTF_DAEMONS_RESTART_COMMAND"),
     "interim.progress": Field("COTF_INTERIM_PROGRESS"),
     "interim.warmup_seconds": Field("COTF_INTERIM_WARMUP_SECONDS"),
     "interim.min_gap_seconds": Field("COTF_INTERIM_MIN_GAP_SECONDS"),
@@ -157,10 +171,12 @@ FIELDS: dict[str, Field] = {
     "jobs.poll_interval_s": Field("JOBS_POLL_INTERVAL_S"),
     "jobs.timeout": Field("JOBS_TIMEOUT"),
     "jobs.workspace_keep_days": Field("JOBS_WORKSPACE_KEEP_DAYS"),
+    "jobs.diagnose_failures": Field("JOBS_DIAGNOSE_FAILURES"),
     "logs.keep_days": Field("COTF_LOG_KEEP_DAYS"),
     "logs.host_tag": Field("COTF_HOST_TAG"),
     "suggestions.enabled": Field("COTF_SUGGESTIONS_ENABLED"),
     "upgrade.command": Field("COTF_UPGRADE_COMMAND"),
+    "upgrade.prepare_command": Field("COTF_UPGRADE_PREPARE_COMMAND"),
 }
 
 # Sections and fields that are read once, at startup, because acting on them means
@@ -169,9 +185,14 @@ FIELDS: dict[str, Field] = {
 # names them rather than leaving an operator to wonder why their edit did nothing.
 # Dotted paths address one field; a bare name covers a whole section.
 RESTART_REQUIRED = (
+    "accounts",
     # The spawn path must keep using the mode whose broker/proxy/jail services
     # were constructed at startup.
     "sandbox.mode",
+    # Decides whether the per-session egress proxy is constructed at all.
+    "sandbox.egress",
+    # Adds a route to the credential broker, which is built once.
+    "agent.codex.chatgpt_via_broker",
     # PATH shims, written once into the agent's environment.
     "commands",
     # Decides whether the approval service is constructed at all, and whether the
@@ -595,7 +616,10 @@ def _remember_restart_state() -> None:
     """Record what the restart-required fields were at startup."""
     global _RESTART_STATE, _STARTUP_VALUES
     _RESTART_STATE = _restart_state()
+    from claude_on_the_fly import accounts
+
     _STARTUP_VALUES = {path: _current_value(path) for path in RESTART_REQUIRED}
+    _STARTUP_VALUES["accounts"] = accounts._configuration("accounts", startup=False)
 
 
 def _current_value(path: str) -> object:

@@ -358,9 +358,10 @@ class TestDashboardLayout:
 
         visible = {b.key for b in DashboardScreen.BINDINGS if b.show}
         hidden = {b.key for b in DashboardScreen.BINDINGS if not b.show}
-        # Footer: lifecycle (k/r), the three tab-scoped actions (filtered per
-        # tab by check_action), help, quit.
-        assert visible == {"k", "r", "n", "S", "t", "question_mark", "q"}
+        # Footer: lifecycle (k/r), the four tab-scoped actions (filtered per
+        # tab by check_action), the bottom viewport's mode switch (v), help,
+        # quit.
+        assert visible == {"k", "r", "n", "S", "v", "t", "a", "question_mark", "q"}
         # Everything else stays bound but lives in the `?` help modal.
         assert hidden == {
             "l",
@@ -369,6 +370,7 @@ class TestDashboardLayout:
             "u",
             "d",
             "c",
+            "p",
             "R",
             "K",
             "U",
@@ -396,9 +398,11 @@ class TestDashboardLayout:
                 await pilot.pause()
                 keys = footer_keys()
                 assert {"k", "r", "?", "q"} <= keys, (tab, keys)
-                # Run-now and sort belong to cron, takeover to chat.
+                # Run-now and sort belong to cron; takeover and attach act on
+                # a run, so both tabs that show one carry them.
                 assert ({"n", "S"} <= keys) is (tab == "tab-cron"), (tab, keys)
-                assert ("t" in keys) is (tab == "tab-chat"), (tab, keys)
+                run_tab = tab in ("tab-chat", "tab-jobs")
+                assert ({"t", "a"} <= keys) is run_tab, (tab, keys)
 
     @pytest.mark.asyncio
     async def test_help_modal_lists_keys_hidden_from_footer(self):
@@ -785,14 +789,12 @@ class TestJobsTab:
         assert not root.exists()
 
     @pytest.mark.asyncio
-    async def test_arrows_and_watch_pane_no_op_on_the_jobs_tab(
+    async def test_arrows_and_live_view_no_op_on_the_jobs_tab(
         self, tmp_path, monkeypatch
     ):
-        """No frontend strip to move through, and no per-job watch yet
-        (the worker doesn't publish a session uuid) — so the daemon log keeps
-        the full width."""
-        from textual.containers import Vertical
-
+        """No frontend strip to move through, and no per-job live view yet
+        (the worker doesn't publish a session uuid) — so the live mode has
+        nothing to follow and the strip dims it."""
         self._isolate(tmp_path, monkeypatch)
         app = ClaudeTuiApp()
         async with app.run_test() as pilot:
@@ -806,7 +808,7 @@ class TestJobsTab:
             await pilot.pause()
             assert screen._chat_selected_idx == before
             assert screen._active_daemon() == "jobs"
-            assert app.screen.query_one("#log-watch-col", Vertical).display is False
+            assert "live" in screen._unavailable_modes()
 
     @pytest.mark.asyncio
     async def test_log_pane_follows_the_worker_log(self, tmp_path, monkeypatch):
@@ -829,7 +831,12 @@ class TestJobsTab:
             await pilot.pause()
             await pilot.press("3")
             await pilot.pause()
-            header = str(app.screen.query_one("#log-header", Static).render())
+            screen = _dashboard(app)
+            screen._bottom_mode["tab-jobs"] = "log"
+            screen._apply_mode()
+            screen._refresh_bottom(force_reload=True)
+            await pilot.pause()
+            header = str(app.screen.query_one("#bottom-header", Static).render())
             assert log_name in header
             assert "missing" not in header
 

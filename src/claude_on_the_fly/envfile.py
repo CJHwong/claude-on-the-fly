@@ -70,6 +70,20 @@ def merged(env_file: Path | None) -> dict[str, str]:
     return values
 
 
+def load_into_process() -> None:
+    """Put `DATA_DIR/.env` into this process's environment. The shell wins.
+
+    Every entry point calls this, and nothing else loads a `.env`. A bare
+    `load_dotenv()` searches upward from the calling module's directory, so a
+    checkout nested in another one (a git worktree under `.claude/worktrees/`)
+    silently read the outer checkout's `.env`, stale token and all. Naming the
+    file makes a stray `.env` anywhere else unreachable.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(default_env_file())
+
+
 def daemon_environment() -> dict[str, str]:
     """What a supervised daemon on this machine receives, from any process."""
     return merged(default_env_file())
@@ -83,6 +97,12 @@ def claude_config_dir(env: Mapping[str, str] | None = None) -> Path:
     which is the right default for a viewer: the interesting case is precisely
     the one where this process and the daemon disagree.
     """
+    if env is None:
+        from claude_on_the_fly import accounts
+
+        account = accounts.current()
+        if account is not None and account.backend == "claude":
+            return account.source_home
     resolved = daemon_environment() if env is None else env
     return Path(resolved.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
@@ -95,5 +115,11 @@ def codex_home(env: Mapping[str, str] | None = None) -> Path:
     their config and credential back to, and where rollouts written before
     per-workspace homes existed still live.
     """
+    if env is None:
+        from claude_on_the_fly import accounts
+
+        account = accounts.current()
+        if account is not None and account.backend == "codex":
+            return account.source_home
     resolved = daemon_environment() if env is None else env
     return Path(resolved.get("CODEX_HOME") or Path.home() / ".codex")

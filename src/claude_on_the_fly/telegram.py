@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
@@ -32,6 +32,7 @@ from claude_on_the_fly.agent import (
     DATA_DIR,
     Response,
     footer_parts,
+    inbox_path,
     install_download,
     persona_for,
     read_attachment,
@@ -39,7 +40,7 @@ from claude_on_the_fly.agent import (
     workspace_path,
 )
 from claude_on_the_fly.approvals import ApprovalRequest
-from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -123,13 +124,39 @@ class TelegramFrontend(Frontend):
             self._session_tokens[chat_id] = token
 
     def workspace_name(self, chat_id: int) -> str:
-        token = self._session_tokens.get(chat_id)
         # User-controlled usernames and first names are display data, never
         # filesystem identifiers. The Telegram chat id is platform-assigned and
         # therefore cannot traverse the workspace or change the seatbelt project
         # grant. Existing name-based workspaces are intentionally not reused.
-        folder = f"{chat_id}-{token}" if token else str(chat_id)
-        return f"telegram/{folder}"
+        #
+        # One directory per chat. `/new` mints a session token that seeds the
+        # session uuid (`set_session_token`) and nothing else: a fresh session in
+        # the same directory, with the same files and the same workspace memory.
+        return f"telegram/{chat_id}"
+
+    def display_label(self, chat_id: int) -> str:
+        """`telegram/12345 hoss` — the chat id plus who is talking in it.
+
+        The id stays in front: it keys the workspace directory and the tmux
+        session, so the dashboard row still matches the rest of the dashboard.
+        A chat the bot has not seen a message from yet has no name to add, and
+        a person with neither a username nor a first name has their own chat id
+        stored as the name, which is not worth printing twice.
+        """
+        name = self.workspace_name(chat_id)
+        sender = self._chat_names.get(chat_id, "")
+        return f"{name} {sender}" if sender and sender != str(chat_id) else name
+
+    def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
+        """The `<chat_id>-<token>` directory a `/new` session used to get.
+
+        Only the pinned token's directory: the sessions before it are not
+        resumable from here either way, so their directories stay as they are.
+        """
+        token = self._session_tokens.get(chat_id)
+        if not token:
+            return None
+        return LegacyWorkspace(f"telegram/{chat_id}-{token}", token)
 
     def sender_name(self, chat_id: int) -> str:
         return self._chat_names.get(chat_id, "unknown")
@@ -140,6 +167,13 @@ class TelegramFrontend(Frontend):
 
     def channel_context(self, chat_id: int) -> str:
         return "dm"  # Telegram bot is always a DM
+
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        facts = {"conversation": f"dm chat {chat_id}", "sender_id": str(chat_id)}
+        name = self._chat_names.get(chat_id)
+        if name:
+            facts["sender_name"] = name
+        return facts
 
     def persona_source(self, chat_id: int) -> Path | None:
         """The `telegram.personas` file for this chat, or None.
@@ -196,9 +230,15 @@ class TelegramFrontend(Frontend):
         self._app.add_handler(CommandHandler("status", self._cmd_status))
         # A real bot command rather than Slack's `$compact` text prefix: Telegram
         # delivers slash commands everywhere, so the `$` workaround Slack needs
-        # (its own slash commands are blocked inside threads) buys nothing here,
-        # and a command shows up in the client's command menu.
+        # (its own slash commands are blocked inside threads) buys nothing here.
+        # The client's command menu is not part of that and this does not provide
+        # it: the menu lists only what `setMyCommands` registered, and nothing in
+        # this code calls it, so every command here is typed rather than picked.
         self._app.add_handler(CommandHandler("compact", self._cmd_compact))
+        # Model and stop, the two commands Slack spells as `$` text prefixes. Real
+        # bot commands here for the reason directly above.
+        self._app.add_handler(CommandHandler("model", self._cmd_model))
+        self._app.add_handler(CommandHandler("stop", self._cmd_stop))
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.Document.ALL | filters.PHOTO)
@@ -580,7 +620,13 @@ class TelegramFrontend(Frontend):
         """Send one message; return its id, or None when the app is absent."""
         if not self._app:
             raise RuntimeError("App not started")
-        kwargs = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        # Annotated because the values are not one type: `reply_markup` carries a
+        # Telegram markup object, and `parse_mode` is dropped entirely on retry.
+        kwargs: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
         try:
@@ -628,8 +674,11 @@ class TelegramFrontend(Frontend):
             return
 
         if file_id and file_name:
-            await self._save_file(chat_id, file_id, file_name)
-            text = f"[File saved: {file_name}]\n{caption or 'Please review the uploaded file.'}"
+            saved = await self._save_file(chat_id, file_id, file_name)
+            text = (
+                f"[File saved: {saved.relative_to(saved.parent.parent)}]\n"
+                f"{caption or 'Please review the uploaded file.'}"
+            )
         else:
             text = caption
 
@@ -688,6 +737,44 @@ class TelegramFrontend(Frontend):
             return
         await self._orchestrator.on_compact(chat_id)
 
+    async def _cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Pin this conversation to another model or effort.
+
+        The grammar and every refusal live in `model_command`, shared with
+        Slack's `$model`, so the two frontends cannot drift. Nothing is resolved
+        here but the chat id: the orchestrator owns the pin, and it answers with
+        the text to post whether the request was accepted or refused.
+        """
+        if not self._allowed(update) or not update.message or not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        if not self._orchestrator:
+            await update.message.reply_text("Not connected to a session yet.")
+            return
+        # Through _send_msg rather than reply_text: the reply marks every model
+        # name as code, and _send_msg is the path that carries a parse_mode and
+        # retries without it when Telegram rejects the markup.
+        await self._send_msg(
+            chat_id, self._orchestrator.on_model(chat_id, list(ctx.args or []))
+        )
+
+    async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Abort the turn running in this chat, and drop what waits behind it.
+
+        The same two sentences Slack's `$stop` posts, because it is the same
+        action: a person who stopped a turn learns nothing extra from different
+        wording on one platform.
+        """
+        if not self._allowed(update) or not update.message or not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        stopped = False
+        if self._orchestrator:
+            stopped = await self._orchestrator.abort(chat_id)
+        await update.message.reply_text(
+            "Stopped the current turn." if stopped else "Nothing was running."
+        )
+
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update) or not update.message or not update.effective_chat:
             return
@@ -721,8 +808,7 @@ class TelegramFrontend(Frontend):
             raise RuntimeError("App not started")
         workspace = workspace_path(self.workspace_name(chat_id), DATA_DIR)
         workspace.mkdir(parents=True, exist_ok=True)
-        safe_name = Path(file_name).name
-        dest = workspace / safe_name
+        dest = inbox_path(workspace, file_name)
         tg_file = await self._app.bot.get_file(file_id)
         fd, temp_name = tempfile.mkstemp(prefix=".cotf-download-", dir=workspace)
         os.close(fd)
@@ -766,8 +852,10 @@ class TelegramFrontend(Frontend):
         try:
             file_lines = []
             for file_id, file_name in group["files"]:
-                await self._save_file(chat_id, file_id, file_name)
-                file_lines.append(f"[File saved: {file_name}]")
+                saved = await self._save_file(chat_id, file_id, file_name)
+                file_lines.append(
+                    f"[File saved: {saved.relative_to(saved.parent.parent)}]"
+                )
             text = "\n".join(file_lines)
             text += (
                 f"\n{group['caption']}"
@@ -784,10 +872,10 @@ class TelegramFrontend(Frontend):
 
 
 def main() -> None:
+    import argparse
     import sys
 
-    from dotenv import load_dotenv
-
+    from claude_on_the_fly import envfile
     from claude_on_the_fly.heartbeat import (
         InstanceAlreadyClaimed,
         InstanceLockUnavailable,
@@ -795,7 +883,21 @@ def main() -> None:
     from claude_on_the_fly.orchestrator import run
     from claude_on_the_fly.preflight import run_telegram
 
-    load_dotenv()
+    parser = argparse.ArgumentParser(prog="claude-telegram")
+    parser.add_argument(
+        "--migrate-workspaces",
+        action="store_true",
+        help="fold every old <chat>-<token> directory into the chat's workspace "
+        "(dry run unless --apply); stop the daemon first",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="with --migrate-workspaces: move"
+    )
+    args = parser.parse_args()
+
+    envfile.load_into_process()
+    if args.migrate_workspaces:
+        raise SystemExit(migrate_workspaces(apply=args.apply))
     token, allowed_user_id = run_telegram()
     frontend = TelegramFrontend(token=token, allowed_user_id=allowed_user_id)
     try:
@@ -805,6 +907,20 @@ def main() -> None:
         # traceback. The supervisor already treats exit 2 as a clean refusal.
         sys.stderr.write(f"claude-telegram: {exc}\n")
         raise SystemExit(2) from None
+
+
+def migrate_workspaces(*, apply: bool) -> int:
+    """`claude-telegram --migrate-workspaces`: plan, print, and with `apply` move.
+    No token needed: the old names already hold the chat id."""
+    from claude_on_the_fly import migration
+
+    plans = migration.plan_telegram(DATA_DIR)
+    print(migration.render_plans(plans))
+    if not apply:
+        print("dry run; add --apply to move")
+        return 0
+    print(f"moved {migration.apply_plans(plans, DATA_DIR)} directories")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,0 +1,8 @@
+# Copy this entry into the `entries:` list of ~/.claude-on-the-fly/cron.yaml.
+# Set slack.alert_target or telegram.alert_target first: see resource_watch.py.
+- name: resource-watch
+  cron: "*/5 * * * *"
+  timeout: 45
+  command: >-
+    uv run --script ~/claude-on-the-fly-src/docs/examples/resource-watch/resource_watch.py
+    --threshold 85 --recovery-threshold 70 --sustain-seconds 300 --reminder-seconds 3600

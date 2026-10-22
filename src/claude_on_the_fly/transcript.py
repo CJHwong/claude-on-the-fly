@@ -13,12 +13,12 @@ Public surface:
   store, outside the agent-writable workspace
 - `format_handoff(turns, from_backend)` renders a labeled preamble, capped by
   turn count and char budget from the most recent backward
-- `find_latest_prior_transcript(workspace, exclude_uuid)` scans both backends'
-  per-workspace session stores and returns (turns, from_backend) for the
-  newest one, used to seed handoff after a model/backend switch mints a
-  fresh session UUID
-- `prepend_latest_handoff(workspace, prompt, exclude_uuid)` higher-level
-  wrapper that combines find + format + prepend, swallowing scan errors
+- `find_latest_prior_transcript(workspace, exclude_uuid, only_uuid)` scans both
+  backends' per-workspace session stores and returns (turns, from_backend) for
+  the newest one, used to seed handoff after a backend switch
+- `prepend_latest_handoff(workspace, prompt, session_uuid, platform)` higher-level
+  wrapper that combines find + format + prepend, swallowing scan errors. On a
+  shared chat workspace only the same session's other-backend file counts
 - `remove_workspace_sessions(workspace)` deletes the session directory a
   backend keyed to a workspace path but stored outside it
 """
@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -89,11 +92,11 @@ def claude_projects_dir() -> Path:
     answer depend on who imported the module. The daemon writing the logs is
     spawned with `DATA_DIR/.env` merged in; the TUI reading them is not, so a
     deployment that sets `CLAUDE_CONFIG_DIR` in that file had the two processes
-    looking at different directories, and the watch pane reported "agent hasn't
+    looking at different directories, and the live view reported "agent hasn't
     run a turn" over a session that was streaming. Resolving through
     `envfile` per call is what makes the reader agree with the writer.
     """
-    return envfile.claude_config_dir() / "projects"
+    return envfile.claude_config_dir(envfile.daemon_environment()) / "projects"
 
 
 @dataclass(frozen=True)
@@ -190,6 +193,107 @@ def extract_claude(workspace: Path, session_uuid: str) -> list[Turn] | None:
     return turns or None
 
 
+def claude_session_size(workspace: Path, session_uuid: str) -> int:
+    """Bytes in this session's JSONL right now. 0 when the file does not exist.
+
+    Taken before a turn spawns so `extract_claude_turn_tokens` can tell this
+    turn's assistant records from every earlier turn's. A session that does not
+    exist yet reports 0, which makes a first turn read its whole file.
+    """
+    path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def extract_claude_turn_tokens(
+    workspace: Path, session_uuid: str, offset: int
+) -> tuple[int, int] | None:
+    """Sum `(tokens_in, tokens_out)` over assistant records written after
+    `offset`. None when the file is unreadable or added no priced record.
+
+    This exists because claude-pty's envelope cannot answer it. Its `usage` is
+    the last assistant message alone, and its `modelUsage` is pty's own pass
+    over the *whole session*, so a footer built from either is wrong in a
+    different direction: the first undercounts a multi-message turn, the second
+    reports every turn the session has ever run. A daemon thread footered
+    `up-arrow 990272` while its context read 8 percent, because the number was
+    the session's life story rather than the turn's cost.
+
+    Reading by byte offset rather than re-deriving pty's total is deliberate. It
+    needs no agreement with how pty defines its sum; it counts what this turn
+    appended, the same way the codex backend reads its rollout from a
+    pre-spawn size.
+    """
+    path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            raw = handle.read()
+    except OSError:
+        return None
+    tokens_in = 0
+    tokens_out = 0
+    found = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            # A seek into the middle of a line is the ordinary cause: the
+            # snapshot was taken while claude was mid-write. Skipping it loses
+            # one record's tokens, which beats discarding the turn's whole count.
+            logger.debug("transcript: skipping malformed line in %s", path)
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        usage = (record.get("message") or {}).get("usage")
+        if not isinstance(usage, dict):
+            continue
+        found = True
+        tokens_in += _as_int(usage.get("input_tokens")) + _as_int(
+            usage.get("cache_read_input_tokens")
+        )
+        tokens_out += _as_int(usage.get("output_tokens"))
+    return (tokens_in, tokens_out) if found else None
+
+
+def _as_int(value: object) -> int:
+    """Non-negative int, or 0. A transcript is another process's output."""
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def extract_claude_model(workspace: Path, session_uuid: str) -> str | None:
+    """Return the model that produced the last assistant message, or None.
+
+    Only pty needs this. The native path reads the model off the stream it
+    already parses, but claude-pty's envelope carries no per-message model, so
+    the only name available there is `modelUsage`, which is keyed by every model
+    the turn touched in first-touched order. An auxiliary call that ran before
+    the answer therefore names itself: a daemon turn opus answered footered as
+    `claude-haiku-4-5-20251001`, and the session JSONL for the same second
+    recorded `claude-opus-5`.
+
+    The last assistant message is the one that produced the answer, so its own
+    `model` is the name to report. A long turn writes many assistant records,
+    so every one is read and the last named model wins.
+    """
+    session_path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    if not session_path.is_file():
+        return None
+    model: str | None = None
+    for msg in _iter_jsonl(session_path):
+        if msg.get("type") != "assistant":
+            continue
+        name = (msg.get("message") or {}).get("model")
+        if isinstance(name, str) and name:
+            model = name
+    return model
+
+
 def _find_codex_rollout(thread_id: str) -> Path | None:
     """Locate the codex session JSONL for a given thread_id (newest if multiple)."""
     if not thread_id:
@@ -217,7 +321,16 @@ def _read_first_jsonl(path: Path) -> dict | None:
     return record if isinstance(record, dict) else None
 
 
-def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | None:
+def snapshot_rollouts() -> frozenset[Path]:
+    """Every rollout on disk right now, for `_find_codex_rollout_by_cwd`'s
+    `exclude`. A turn takes this before it spawns, so the rollouts of the other
+    threads already running in the same directory cannot be mistaken for its own."""
+    return frozenset(_iter_rollouts("**/rollout-*.jsonl"))
+
+
+def _find_codex_rollout_by_cwd(
+    cwd: str, *, max_age_s: float = 300.0, exclude: frozenset[Path] = frozenset()
+) -> Path | None:
     """Locate the rollout codex is actively writing for a workspace, by the cwd
     in its session_meta. Needed for *live* tailing: codex only reveals its
     thread id (and we only persist the uuid->thread mapping) after the first
@@ -225,12 +338,19 @@ def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | 
 
     Bounded for a 1Hz caller: cheap stat-filter to recently-written rollouts (a
     live run keeps its mtime current), then read only the freshest candidate's
-    first line. Old rollouts are skipped without being opened."""
+    first line. Old rollouts are skipped without being opened.
+
+    A workspace is shared by every thread of one conversation, so the cwd alone
+    no longer names one session. `exclude` holds the rollouts that existed when
+    this turn started: a sibling thread resumed in the same directory keeps its
+    own rollout fresh, and it would otherwise be the freshest match."""
     if not cwd:
         return None
     cutoff = time.time() - max_age_s
     freshest: tuple[float, Path] | None = None
     for path in _iter_rollouts("**/rollout-*.jsonl"):
+        if path in exclude:
+            continue
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -242,13 +362,30 @@ def _find_codex_rollout_by_cwd(cwd: str, *, max_age_s: float = 300.0) -> Path | 
     if freshest is None:
         return None
     meta = _read_first_jsonl(freshest[1])
-    if (
-        meta is not None
-        and meta.get("type") == "session_meta"
-        and (meta.get("payload") or {}).get("cwd") == cwd
-    ):
+    if meta is None or meta.get("type") != "session_meta":
+        return None
+    recorded = (meta.get("payload") or {}).get("cwd")
+    if isinstance(recorded, str) and _same_dir(recorded, cwd):
         return freshest[1]
     return None
+
+
+def _same_dir(recorded: str, wanted: str) -> bool:
+    """Whether two cwd strings name the same directory, symlinks resolved.
+
+    A plain string equality was wrong in both directions, because codex writes
+    back the `-C` argument verbatim rather than a path it resolved. Measured on
+    codex-cli 0.155.1: a turn given `-C /private/tmp/x/link_ws`, where `link_ws`
+    is a symlink, records exactly that, so a caller comparing the resolved name
+    matched nothing and the turn returned "No response" -- after codex had run
+    the work and billed for it. The control through the real path answered
+    normally.
+
+    Resolving both sides is what makes the comparison independent of which form
+    the caller happened to hold. `realpath` needs no existing path: it resolves
+    the components that do exist and normalises the rest.
+    """
+    return os.path.realpath(recorded) == os.path.realpath(wanted)
 
 
 def extract_codex(workspace: Path, session_uuid: str) -> list[Turn] | None:
@@ -290,46 +427,66 @@ def extract_codex_model(thread_id: str) -> str | None:
     session file as `turn_context.payload.model`. Needed because our backend
     can otherwise only label runs with whatever the user configured (which is
     blank in native mode without CODEX_MODEL).
+
+    The last `turn_context` wins, not the first. A resumed thread appends one
+    per turn, so the first records the model the thread opened with and keeps
+    naming it after a switch. That is not hypothetical: a thread started on
+    `gpt-5.6-luna` and moved to `gpt-5.6-terra` ran terra, by both its argv and
+    its own rollout, and every later footer still said luna.
     """
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
         return None
+    model: str | None = None
     for msg in _iter_jsonl(rollout):
         if msg.get("type") != "turn_context":
             continue
-        model = (msg.get("payload") or {}).get("model")
-        if isinstance(model, str) and model:
-            return model
-    return None
+        name = (msg.get("payload") or {}).get("model")
+        if isinstance(name, str) and name:
+            model = name
+    return model
 
 
-def extract_codex_cumulative_tokens(thread_id: str) -> dict | None:
-    """Return the cumulative `total_token_usage` snapshot for a codex thread.
+def codex_rollout_path(thread_id: str) -> Path | None:
+    """The rollout file a token snapshot for this thread would be read from.
 
-    Codex's stdout `turn.completed.usage` re-reports the thread's running
-    total on every exec, not per-turn — so by turn N, `input_tokens` has
-    been summed N times. The session file carries the same `total_token_usage`
-    on every `event_msg/token_count` event, growing monotonically. Snapshot
-    it before and after one exec call and the delta is that exec's true
-    contribution (including any internal tool-fanout sub-calls).
+    Exposed so a caller can pin it. `_find_codex_rollout` picks the newest file
+    by mtime across every sessions root, and one thread can legitimately have a
+    copy in more than one root: `codex_state.adopt_rollout` puts one in the
+    workspace home and leaves the original in the shared tree. The two then
+    diverge, so a before/after pair read by thread id alone can come from two
+    different histories and subtract to a negative.
+    """
+    return _find_codex_rollout(thread_id)
 
-    Returns the `total_token_usage` dict from the LAST `token_count` event,
-    or None when no event exists yet.
+
+def extract_codex_usage_events(thread_id: str) -> list[dict]:
+    """Every `last_token_usage` this thread has recorded, oldest first.
+
+    Each entry is one model call's own counts. Counting how many exist before
+    an exec and summing whatever it appends gives that exec's true cost, which
+    a subtraction cannot: codex 0.150.1 writes the same figures into
+    `total_token_usage`, so that field is per-call rather than a running total.
+    Diffing it undercounted input by three orders of magnitude and rendered a
+    negative whenever one call produced fewer output tokens than the one before.
+
+    A call fanning out to several model calls appends several events, so the
+    sum covers the whole exec rather than only its last step.
     """
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
-        return None
-    latest: dict | None = None
+        return []
+    events: list[dict] = []
     for msg in _iter_jsonl(rollout):
         if msg.get("type") != "event_msg":
             continue
         payload = msg.get("payload") or {}
         if payload.get("type") != "token_count":
             continue
-        total = (payload.get("info") or {}).get("total_token_usage")
-        if isinstance(total, dict):
-            latest = total
-    return latest
+        last = (payload.get("info") or {}).get("last_token_usage")
+        if isinstance(last, dict):
+            events.append(last)
+    return events
 
 
 def extract_codex_prompt_tokens(thread_id: str) -> tuple[int, int] | None:
@@ -338,12 +495,10 @@ def extract_codex_prompt_tokens(thread_id: str) -> tuple[int, int] | None:
     Unlike `total_token_usage` above, `last_token_usage.input_tokens` is that
     turn's own prompt — so it tracks how big the thread's context has become,
     which is the number a compaction is supposed to shrink. Compaction itself
-    reports a turn with `input_tokens: 0`, so those are skipped: they describe
+    writes a count with `input_tokens: 0`, so those are skipped: they describe
     the compaction pass, not the context it left behind.
 
-    None when the rollout is missing or has no usable event. Codex publishes no
-    in-band compaction signal in `--json`, so comparing this before and after is
-    the only way to tell whether a compaction actually did anything.
+    None when the rollout is missing or has no usable event.
     """
     rollout = _find_codex_rollout(thread_id)
     if rollout is None:
@@ -444,6 +599,7 @@ def find_latest_prior_transcript(
     workspace: Path,
     *,
     exclude_uuid: str | None = None,
+    only_uuid: str | None = None,
 ) -> tuple[list[Turn], BackendName] | None:
     """Newest prior transcript for this workspace, across all backend_keys.
 
@@ -452,6 +608,11 @@ def find_latest_prior_transcript(
     current session never matches itself), runs the matching extractor, and
     returns (turns, from_backend).
 
+    `only_uuid` narrows the scan to one session's files. A chat workspace holds
+    every thread of a conversation, so "the newest transcript here" is usually a
+    different thread; the handoff a backend switch wants is this same session as
+    the other backend wrote it, and that file carries the same uuid.
+
     Returns None when no prior session exists, or the newest one yields no
     extractable turns. Used by all backends to seed a handoff preamble when
     a new (source, backend_key, ticket) combo starts fresh — typically right
@@ -459,13 +620,11 @@ def find_latest_prior_transcript(
     """
     candidates: list[tuple[float, str, BackendName, str]] = []
     for _path, uuid, mtime in _list_claude_session_files(workspace):
-        if uuid == exclude_uuid:
-            continue
-        candidates.append((mtime, uuid, "claude", uuid))
+        if _wanted(uuid, exclude_uuid, only_uuid):
+            candidates.append((mtime, uuid, "claude", uuid))
     for _path, uuid, mtime in _list_codex_session_files(workspace):
-        if uuid == exclude_uuid:
-            continue
-        candidates.append((mtime, uuid, "codex", uuid))
+        if _wanted(uuid, exclude_uuid, only_uuid):
+            candidates.append((mtime, uuid, "codex", uuid))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0], reverse=True)
@@ -488,24 +647,42 @@ def find_latest_prior_transcript(
     return None
 
 
+def _wanted(uuid: str, exclude_uuid: str | None, only_uuid: str | None) -> bool:
+    if uuid == exclude_uuid:
+        return False
+    return only_uuid is None or uuid == only_uuid
+
+
 def prepend_latest_handoff(
     workspace: Path,
     prompt: str,
     *,
-    exclude_uuid: str | None = None,
+    session_uuid: str,
+    platform: str,
 ) -> str:
-    """Return `prompt` with a preamble drawn from the newest prior transcript
-    (any backend) for this workspace. No-op when nothing prior exists.
+    """Return `prompt` with a preamble drawn from the prior transcript for this
+    session, or for this workspace. No-op when nothing prior exists.
 
     Use this from both backends after a fresh-session branch (no JSONL for
     the current uuid) so the new model picks up context written by whatever
     backend ran last — including a different mode of the *same* CLI.
 
+    Which transcript counts as prior depends on the platform. On a platform in
+    `agent.SHARED_WORKSPACE_PLATFORMS` only the same session's file on another
+    backend does. Elsewhere (cron) any other session in the workspace does, and
+    the current uuid is excluded so it never matches itself.
+
     Wraps the lookup in a broad except so a misbehaving transcript scan never
     crashes the caller; the user still gets a reply, just without handoff
     context."""
+    from claude_on_the_fly.agent import SHARED_WORKSPACE_PLATFORMS
+
+    if platform in SHARED_WORKSPACE_PLATFORMS:
+        scope: dict[str, str] = {"only_uuid": session_uuid}
+    else:
+        scope = {"exclude_uuid": session_uuid}
     try:
-        found = find_latest_prior_transcript(workspace, exclude_uuid=exclude_uuid)
+        found = find_latest_prior_transcript(workspace, **scope)
     except Exception:
         logger.exception("transcript: latest-prior lookup failed; starting clean")
         return prompt
@@ -556,3 +733,399 @@ def prepend_handoff(
         session_uuid,
     )
     return f"{handoff}{prompt}"
+
+
+# --- failure diagnosis (experimental) ---
+
+# A rollout is looked up after its run already died, so the mtime filter
+# `_find_codex_rollout_by_cwd` uses for live tailing is far too tight. A job may
+# have run for its whole timeout before failing, and the alert is built after
+# that. One hour covers the longest configured timeout with room to spare.
+DIAGNOSE_ROLLOUT_MAX_AGE_S = 3600.0
+# Upper bound on rollouts opened while looking for one run's, so a busy
+# store cannot turn a diagnosis into a full scan of the sessions tree.
+_MAX_ROLLOUT_CANDIDATES = 200
+# Below this share of the wall clock spent inside tool calls, the run was
+# waiting on the model, not doing work. Measured, not guessed: a healthy fire of
+# the same entry spends whole seconds in execs, a stalled one spends tenths.
+STALL_TOOL_SHARE = 0.05
+# A stall claim needs most of the budget consumed, or a slow-but-working run
+# reads as a stall. Runs with no configured timeout fall back to the constant.
+STALL_TIMEOUT_SHARE = 0.8
+DEFAULT_STALL_FLOOR_S = 300.0
+# One failing exec is noise; a run that keeps hitting the same wall is missing a
+# capability. Three is the smallest count that cannot be a retry pair.
+CAPABILITY_GAP_ERRORS = 3
+# Substrings that mark a tool result as a failure. Lowercased before matching.
+_TOOL_ERROR_MARKERS = (
+    "not safe to open",
+    "command not found",
+    "no such file",
+    "permission denied",
+)
+# Paths in the prompt that name something to execute. A cron entry says "run
+# this script"; if the script never appears in a tool call, the run never
+# started its actual work, which is a different failure from crashing during it.
+_PAYLOAD_PATTERN = re.compile(r"[\w./~-]+\.(?:py|sh)\b")
+
+
+def _find_finished_rollout_by_cwd(cwd: str, *, max_age_s: float) -> Path | None:
+    """The rollout a *finished* run wrote for a workspace, newest first.
+
+    Deliberately not `_find_codex_rollout_by_cwd`, which reads only the single
+    freshest rollout in the store. That is right for its 1Hz live tailer, where
+    the run being watched is by definition the freshest file. It is wrong here:
+    a failed run is diagnosed after the fact, and on a host firing cron every
+    15 minutes several newer rollouts already exist. Checking only the freshest
+    found nothing on every real failure it was tried against.
+
+    So this walks candidates newest first and stops at the first cwd match,
+    reading one line each. It runs once per failed job rather than every
+    second, and `_MAX_ROLLOUT_CANDIDATES` keeps a busy store from turning that
+    into an unbounded scan.
+    """
+    if not cwd:
+        return None
+    cutoff = time.time() - max_age_s
+    candidates: list[tuple[float, Path]] = []
+    for path in _iter_rollouts("**/rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            candidates.append((mtime, path))
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    for _, path in candidates[:_MAX_ROLLOUT_CANDIDATES]:
+        meta = _read_first_jsonl(path)
+        if (
+            meta is not None
+            and meta.get("type") == "session_meta"
+            and (meta.get("payload") or {}).get("cwd") == cwd
+        ):
+            return path
+    return None
+
+
+def _diagnose_rollout(workspace: Path, session_uuid: str) -> Path | None:
+    """The rollout for a finished run, by thread id when one was persisted.
+
+    A run that died inside its first turn never got a thread id written, which
+    is the case this feature exists to explain, so the cwd scan is the path
+    that matters rather than the fallback it looks like.
+    """
+    thread_id = codex_state.read_thread_id(workspace, session_uuid)
+    if thread_id:
+        rollout = _find_codex_rollout(thread_id)
+        if rollout is not None:
+            return rollout
+    return _find_finished_rollout_by_cwd(
+        str(workspace), max_age_s=DIAGNOSE_ROLLOUT_MAX_AGE_S
+    )
+
+
+@dataclass(frozen=True)
+class _RunFacts:
+    """What one finished run's transcript says, in the terms the rules need.
+
+    The two backends write different files, so each has its own reader; every
+    rule below reads this instead. `marker` is the backend's own name for "the
+    agent finished" -- `task_complete` for codex, `end_turn` for claude -- so a
+    signal names the event an operator will grep the transcript for.
+    """
+
+    marker: str
+    completed: bool
+    last_event: str
+    span: float
+    tool_wall: float
+    calls: int
+    outputs: int
+    failed: int
+    tool_inputs: str
+
+
+def _codex_tool_spans(rows: list[dict]) -> tuple[float, int, int, int]:
+    """`(seconds inside tool calls, calls, outputs, failed outputs)`.
+
+    Codex writes a call and its output as separate records, so the time a tool
+    actually took is the gap between the pair. Summing those and subtracting
+    from the run's span is what separates "the model was slow" from "the work
+    was slow", which no single field in the rollout answers.
+    """
+    tool_wall = 0.0
+    calls = outputs = failed = 0
+    open_calls: dict[object, float | None] = {}
+    for row in rows:
+        payload = row.get("payload") or {}
+        kind = payload.get("type")
+        if kind == "custom_tool_call":
+            calls += 1
+            open_calls[payload.get("call_id") or calls] = _row_time(row)
+        elif kind == "custom_tool_call_output":
+            outputs += 1
+            started = open_calls.pop(payload.get("call_id") or outputs, None)
+            ended = _row_time(row)
+            if started is not None and ended is not None:
+                tool_wall += max(0.0, ended - started)
+            if _looks_like_tool_error(payload.get("output")):
+                failed += 1
+    return tool_wall, calls, outputs, failed
+
+
+def _looks_like_tool_error(output: object) -> bool:
+    """Whether a tool result reads as a failure rather than a result."""
+    blob = json.dumps(output, default=str).lower()
+    return any(marker in blob for marker in _TOOL_ERROR_MARKERS)
+
+
+def _row_time(row: dict) -> float | None:
+    """A rollout record's timestamp as epoch seconds, or None if unusable."""
+    stamp = row.get("timestamp")
+    if not isinstance(stamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _span(rows: list[dict]) -> float:
+    """Wall clock across rows that carry a usable timestamp, or 0.0."""
+    stamps = [stamp for stamp in (_row_time(row) for row in rows) if stamp is not None]
+    return (max(stamps) - min(stamps)) if stamps else 0.0
+
+
+def _codex_facts(rows: list[dict]) -> _RunFacts:
+    """Read a codex rollout."""
+    last = (rows[-1].get("payload") or {}).get("type") or rows[-1].get("type")
+    tool_wall, calls, outputs, failed = _codex_tool_spans(rows)
+    inputs = "\n".join(
+        json.dumps((row.get("payload") or {}).get("input", ""), default=str)
+        for row in rows
+        if (row.get("payload") or {}).get("type") == "custom_tool_call"
+    )
+    return _RunFacts(
+        marker="task_complete",
+        completed=last == "task_complete",
+        last_event=str(last),
+        span=_span(rows),
+        tool_wall=tool_wall,
+        calls=calls,
+        outputs=outputs,
+        failed=failed,
+        tool_inputs=inputs,
+    )
+
+
+def _claude_last_fire(rows: list[dict]) -> list[dict]:
+    """The rows of the newest turn in a claude session file.
+
+    A keyed job resumes its session, so the file holds every earlier fire too,
+    and reading the lot would time the run in hours and explain today's failure
+    with last week's tool calls. The boundary is the last prompt claude was
+    given: a `user` row whose content is a plain string. A tool result is a
+    `user` row as well, but its content is a list, and a subagent's prompt is a
+    string but sits on a sidechain -- neither starts a fire.
+    """
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if row.get("type") != "user" or row.get("isSidechain"):
+            continue
+        if isinstance((row.get("message") or {}).get("content"), str):
+            return rows[index:]
+    return rows
+
+
+def _claude_blocks(row: dict, kind: str) -> list[dict]:
+    """The content blocks of one type in a claude message row."""
+    content = (row.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == kind
+    ]
+
+
+def _claude_tool_spans(rows: list[dict]) -> tuple[float, int, int, int]:
+    """`(seconds inside tool calls, calls, outputs, failed outputs)`.
+
+    Claude pairs a `tool_use` block on an assistant row with a `tool_result`
+    block on the user row that answers it, so the gap between the two rows is
+    what the tool took. Sidechain rows count: a subagent's execs are this run's
+    work, and leaving them out would read a delegating run as a stalled one.
+
+    A claude tool result says `is_error` outright, which codex's format does
+    not. The substring markers still apply on top of it: a wrapper that reports
+    a failure in its own text without setting the flag is the case they catch.
+    """
+    tool_wall = 0.0
+    calls = outputs = failed = 0
+    open_calls: dict[object, float | None] = {}
+    for row in rows:
+        for block in _claude_blocks(row, "tool_use"):
+            calls += 1
+            open_calls[block.get("id") or calls] = _row_time(row)
+        for block in _claude_blocks(row, "tool_result"):
+            outputs += 1
+            started = open_calls.pop(block.get("tool_use_id") or outputs, None)
+            ended = _row_time(row)
+            if started is not None and ended is not None:
+                tool_wall += max(0.0, ended - started)
+            if block.get("is_error") or _looks_like_tool_error(block.get("content")):
+                failed += 1
+    return tool_wall, calls, outputs, failed
+
+
+def _claude_facts(rows: list[dict]) -> _RunFacts:
+    """Read a claude session file.
+
+    Finishing is `end_turn` **anywhere** in the fire, not on its last row. A
+    completed turn is followed by rows of its own: `system` rows for the stop
+    hook and the turn duration, then untimestamped bookkeeping (`mode`,
+    `ai-title`, `last-prompt`). Reading the stop reason off the last row called
+    9 of 96 real finished fires unfinished, and `turn_duration` is written by
+    exactly the runs that did finish.
+
+    The event to report is the last message row, so an interrupted turn is named
+    by what the agent was doing -- `assistant/tool_use` for one killed holding a
+    tool call, `assistant/stop_sequence` for one the API cut off. A fire with no
+    message row at all (the agent never answered) falls back to the last row
+    that carries a timestamp.
+    """
+    spoke = [row for row in rows if row.get("type") in {"assistant", "user"}]
+    timed = [row for row in rows if _row_time(row) is not None]
+    last = (spoke or timed or rows)[-1]
+    stop = (last.get("message") or {}).get("stop_reason")
+    label = f"{last.get('type')}/{stop}" if stop else str(last.get("type"))
+    completed = any(
+        (row.get("message") or {}).get("stop_reason") == "end_turn"
+        for row in rows
+        if not row.get("isSidechain")
+    )
+    tool_wall, calls, outputs, failed = _claude_tool_spans(rows)
+    inputs = "\n".join(
+        json.dumps(block.get("input", ""), default=str)
+        for row in rows
+        for block in _claude_blocks(row, "tool_use")
+    )
+    return _RunFacts(
+        marker="end_turn",
+        completed=completed,
+        last_event=label,
+        span=_span(rows),
+        tool_wall=tool_wall,
+        calls=calls,
+        outputs=outputs,
+        failed=failed,
+        tool_inputs=inputs,
+    )
+
+
+def _signals(facts: _RunFacts, prompt: str, timeout_s: float | None) -> list[str]:
+    """The rules themselves, over whichever backend's facts."""
+    signals: list[str] = []
+    if facts.completed:
+        # The agent finished and the job still failed, so the fault is on our
+        # side of the CLI boundary. Without this the alert reads as an agent
+        # crash and sends the operator to the wrong component.
+        signals.append(
+            f"agent reached {facts.marker} in {facts.span:.0f}s, failure is ours"
+        )
+    else:
+        signals.append(f"no {facts.marker}, last event was {facts.last_event}")
+
+    floor = timeout_s * STALL_TIMEOUT_SHARE if timeout_s else DEFAULT_STALL_FLOOR_S
+    if facts.span >= floor and facts.tool_wall < facts.span * STALL_TOOL_SHARE:
+        signals.append(
+            f"{facts.span - facts.tool_wall:.0f}s model / {facts.tool_wall:.1f}s tool, "
+            "stalled upstream"
+        )
+
+    if facts.calls:
+        for payload_name in dict.fromkeys(_PAYLOAD_PATTERN.findall(prompt)):
+            if payload_name not in facts.tool_inputs:
+                signals.append(
+                    f"payload never ran, {payload_name} absent from "
+                    f"{facts.calls} tool calls"
+                )
+
+    if facts.failed >= CAPABILITY_GAP_ERRORS:
+        signals.append(
+            f"{facts.failed}/{facts.outputs} tool results were errors, capability gap?"
+        )
+    return signals
+
+
+def diagnose_codex(
+    workspace: Path,
+    session_uuid: str,
+    *,
+    prompt: str = "",
+    timeout_s: float | None = None,
+) -> list[str]:
+    """Deterministic signals about why a codex run failed, newest evidence only.
+
+    See `diagnose` for what the signals are and why they exist. This arm reads
+    a codex rollout, which is found by thread id when the run got far enough to
+    persist one and by a cwd scan when it did not.
+    """
+    rollout = _diagnose_rollout(workspace, session_uuid)
+    if rollout is None:
+        return []
+    rows = list(_iter_jsonl(rollout))
+    if not rows:
+        return []
+    return _signals(_codex_facts(rows), prompt, timeout_s)
+
+
+def diagnose_claude(
+    workspace: Path,
+    session_uuid: str,
+    *,
+    prompt: str = "",
+    timeout_s: float | None = None,
+) -> list[str]:
+    """Deterministic signals about why a claude run failed, newest fire only.
+
+    See `diagnose` for what the signals are and why they exist. This arm needs
+    no search: claude names the session file after the id cotf gave it, under
+    the directory it derives from the workspace path.
+    """
+    path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    rows = _claude_last_fire(list(_iter_jsonl(path)))
+    if not rows:
+        return []
+    return _signals(_claude_facts(rows), prompt, timeout_s)
+
+
+_DIAGNOSERS = {"codex": diagnose_codex, "claude": diagnose_claude}
+
+
+def diagnose(
+    backend: str,
+    workspace: Path,
+    session_uuid: str,
+    *,
+    prompt: str = "",
+    timeout_s: float | None = None,
+) -> list[str]:
+    """Deterministic signals about why a run failed, for either backend.
+
+    Experimental. The alert a failed job already sends says what the CLI
+    reported, which for a timeout is only that it timed out. These signals
+    answer the next question an operator asks, and they are arithmetic over
+    timestamps rather than an interpretation: whether the agent finished at all,
+    where the wall clock went, whether the job's own payload ever ran, and
+    whether the run kept hitting the same failing tool.
+
+    Returns an empty list when the backend writes neither transcript format,
+    when there is no transcript, or when nothing stands out, so a caller can
+    append unconditionally.
+    """
+    reader = _DIAGNOSERS.get(backend)
+    if reader is None:
+        return []
+    return reader(workspace, session_uuid, prompt=prompt, timeout_s=timeout_s)

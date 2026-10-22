@@ -93,7 +93,7 @@ relying on either state.
 
 The setting is off by default, because scoping the stores moves them. A codex thread
 started while it was off left its rollout in the shared tree, where `codex resume` cannot
-reach it from a per-thread `CODEX_HOME`. The backend copies that rollout into the new home
+reach it from a per-workspace `CODEX_HOME`. The backend copies that rollout into the new home
 on the first turn after the flip, so the conversation survives; a thread whose rollout is
 gone for good starts again instead of failing the turn. Turn it on deliberately, on a
 deployment where more than one person's messages reach the same host.
@@ -114,7 +114,10 @@ it stops the CLI persisting the session, the turn still completes, and nothing s
 until a later resume comes back with no memory of the conversation.
 
 Claude Code's memory lives at `<config dir>/projects/<hash>/memory/`, inside that same
-per-thread directory, so it is covered by the same grant and isolated by the same rule.
+per-workspace directory, so it is covered by the same grant and isolated by the same rule.
+A workspace is one conversation, so the boundary is the DM, group DM or channel, and every
+thread inside it shares the grant. cotf's own conversation memory sits inside the workspace
+(`<workspace>/memory/`) for the same reason: the jail already grants exactly that directory.
 That is also why a blanket deny cost more than resume: the agent's memory was off too,
 just as quietly. This is separate from cotf's own memory under `DATA_DIR/memory`, which
 has its own grant.
@@ -133,7 +136,8 @@ and no measured turn writes it.
 A codex home holds links back to the operator's `config.toml`, `AGENTS.md`, hooks, rules,
 plugins, prompts and `auth.json`. Writes through those links resolve onto the shared paths
 the profile already governs, so the execution and instruction surface stays read-only
-while token refresh keeps working.
+while token refresh keeps working. With `agent.codex.chatgpt_via_broker` on, the
+`auth.json` link resolves to a file the jail denies, and the broker refreshes it instead.
 
 Deleting a thread's workspace removes both stores, because each is named after a path
 that will never exist again.
@@ -167,10 +171,18 @@ seatbelt profile grants `process-info*` and `signal` globally, and the Linux jai
 does not unshare the PID or IPC namespaces. Linux could close this cheaply and
 deliberately does not yet; macOS cannot without revisiting the profile.
 
-**The agent can read the credential it runs on.** `~/.claude/.credentials.json`
-and `~/.codex/auth.json` must be readable or the backend cannot authenticate, so
-a hijacked turn can exfiltrate that token through the already-approved model
-host. Structural on both platforms.
+**The agent holds the credential it runs on.** A backend cannot authenticate
+without one, so a hijacked turn can exfiltrate it through the already-approved
+model host. Structural on both platforms. Under `jail`, a claude turn gets only
+the short-lived access token, in `ANTHROPIC_AUTH_TOKEN`: the daemon reads it from
+the keychain on macOS or from `.credentials.json` on Linux, and the jail hides
+both. The refresh token stays out of reach. An expired token needs a claude run
+outside the jail to refresh it. `~/.codex/auth.json` stays readable, refresh
+token included, unless `agent.codex.chatgpt_via_broker` is on. Then the credential
+broker holds codex's ChatGPT login: it adds the access token to each model call on the
+upstream leg, refreshes the login itself, and the jail hides the file, so a codex turn
+holds no credential at all. A turn can still use the login through the broker while it
+runs, on the eight ChatGPT paths codex was measured calling.
 
 **A brokered CLI is a capability grant.** It runs outside the jail with your real
 credential and only its output crosses back, so the provider-side token scope is
@@ -191,13 +203,11 @@ its own state there.
 in `git status`, which is the intended trade: the alternative is a real hole,
 since MCP config decides what later runs load.
 
-**`jail` does not support the background jobs daemon, on either platform.** That
-process runs on its own and starts no credential broker and no egress proxy, so a
-jailed job has nothing on loopback to reach and no route to the internet. macOS
-denies the outbound connection and Linux has no route at all; the outcome is the
-same. Linux appeared to work before it had a real jail, because the mode silently
-degraded. Run the jobs daemon with `sandbox.mode: env` until it grows brokers of
-its own; the jail logs a warning naming this whenever it spawns without a relay.
+**A job never asks.** The jobs daemon starts its own credential broker, command
+broker and egress proxy, so a jailed job reaches the same things a chat turn does.
+Nobody is there to answer a prompt, so anything a chat turn would ask about is
+refused for a job. A job that needs a new command or host fails until the operator
+adds it to the allowlist.
 
 **The Linux jail has an availability failure mode macOS does not.** It needs
 bubblewrap installed and unprivileged user namespaces permitted. Where they are

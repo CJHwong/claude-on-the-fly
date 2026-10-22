@@ -15,13 +15,16 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
+from slack_sdk.http_retry.builtin_async_handlers import (
+    AsyncRateLimitErrorRetryHandler,
+)
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from claude_on_the_fly import checks, logs, settings
@@ -32,6 +35,7 @@ from claude_on_the_fly.agent import (
     cached_skills,
     footer_parts,
     get_backend,
+    inbox_path,
     persona_for,
     read_attachment,
     sender_marker,
@@ -43,19 +47,26 @@ from claude_on_the_fly.event_dedupe import ProcessedEvents
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
-from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
+from claude_on_the_fly.slack_mrkdwn import (
+    SLACK_MESSAGE_CHAR_LIMIT,
+    SLACK_TEXT_FIELD_BYTES,
+    fit_text_field,
+    to_mrkdwn,
+)
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
-from claude_on_the_fly.slack_mrkdwn import to_mrkdwn
-from claude_on_the_fly.slack_watermarks import SlackWatermarks
+from claude_on_the_fly.slack_watermarks import SlackWatermarks, _event_time
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
 
-# Soft cap on agent replies per thread. Once reached, inbound messages are
+# Soft cap on turns admitted per thread. Once reached, inbound messages are
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
-# counter.
+# counter. Counted where a message becomes a turn, not where a reply posts: a
+# reply lands when the agent finishes, so a count kept there lagged the queue
+# and two messages sent back to back both passed a thread already over budget.
 DEFAULT_REPLY_SOFT_LIMIT = 10
 CONTINUE_COMMAND = "$continue"
 # How long the gate notice is held before it is posted. Off by default: 0 posts
@@ -65,6 +76,13 @@ CONTINUE_COMMAND = "$continue"
 # on arrival, and they walk away with no unread badge believing the message is
 # being worked on. Waiting until they have gone makes it an unread thread reply.
 DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 0.0
+# Ceiling on the gated-message backlog a thread keeps. The Continue button
+# replays that backlog in order, so the events have to be held somewhere, and
+# this bounds what one thread can pin on somebody who keeps typing past the gate.
+# Past the cap the oldest gated message is dropped and never runs. Not an
+# operator setting: a card that replays fifty turns is not a resume. The mention
+# notice's replay backlog uses the same cap, for the same reason.
+GATED_MSG_BACKLOG_MAX = 50
 # Ceiling on the debounce above, timed from the first gated message. Somebody
 # firing a message every three seconds would otherwise defer the notice for as
 # long as they kept typing, and never learn the thread is gated. Not an operator
@@ -88,6 +106,13 @@ STOP_COMMAND = "$stop"
 # Same prefix rationale as $stop, and on by default for the same reason: a
 # long-running thread is exactly where nobody thinks to go looking for a setting.
 COMPACT_COMMAND = "$compact"
+# Pin this thread's conversation to another model or effort. A prefix rather
+# than an exact match, unlike the two above, because the argument is the command:
+# `$model opus` is the request. Same rationale as $stop for being plain text --
+# it has to work inside threads, where Slack blocks custom slash commands, and a
+# long thread is where the expensive model hurts most. Telegram spells the same
+# command `/model`, because it delivers slash commands in every chat.
+MODEL_COMMAND = "$model"
 # Background-job trigger. The message tail is queued as a job that survives this
 # chat turn — the worker (claude-jobs) runs it in a fresh session and replies
 # into this thread when done. A plain-text prefix, same rationale as $stop: it
@@ -396,24 +421,40 @@ SPINNER_VERBS = (
 # least-recently-active thread is evicted; it re-hydrates from scratch if it
 # ever sees another message. Bounds memory in a long-running daemon.
 DEFAULT_SESSION_CAP = 1000
+# Retries a rate-limited Slack call gets before it gives up. Slack's own
+# Retry-After sets the wait, so this bounds how long one call may block the
+# turn's setup rather than how long it sleeps. Three covers the burst a queue of
+# turns produces; a limit that outlasts three backoffs is an outage, not a burst.
+RATE_LIMIT_RETRIES = 3
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
 
-# One reaction per state of a message, and three distinct states. Named rather
-# than written inline at six call sites, because the failure mode is two states
+# One reaction per state of a message, and four distinct states. Named rather
+# than written inline at each call site, because the failure mode is two states
 # sharing a glyph: an interrupted turn wearing the queue's hourglass cannot be
 # told from one that is merely waiting its turn.
 #
 # `arrows_counterclockwise` for interrupted, because the cause is a restart and
 # the recovery is automatic, which is exactly what it says.
+#
+# `lock` for gated, because the thread is closed to new turns until somebody
+# resumes it. It must not be `eyes`: a gated message never runs, and eyes on it
+# would say the work is in progress, which is the one thing the gate notice
+# exists to deny.
 QUEUED_EMOJI = "hourglass_flowing_sand"
 RUNNING_EMOJI = "eyes"
 INTERRUPTED_EMOJI = "arrows_counterclockwise"
+GATED_EMOJI = "lock"
 
 _DOWNLOAD_CHUNK = 64 * 1024
 
-_ALLOWED_SUBTYPES = {"file_share"}
+# `thread_broadcast` is a thread reply sent with "Also send to channel": the same
+# message with the parent attached as `root`, which nothing here reads. It was
+# missing until 2026-09-30, when a colleague's reply sent that way was dropped at
+# the subtype filter and never reached the relay. Everything downstream treats it
+# as the plain reply it is: same sender gates, same @mention gate, same thread.
+_ALLOWED_SUBTYPES = {"file_share", "thread_broadcast"}
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
 
@@ -495,8 +536,13 @@ def _bot_rules(
             )
             return None
 
-        name = str(item.get("name", "")).strip()
-        expression = item.get("match")
+        # Cast rather than annotate: `isinstance(item, Mapping)` narrows a bare
+        # `object` to a mapping of unknown keys, every `.get` below then fails to
+        # match an overload, and a plain assignment cannot fix it because Mapping
+        # is invariant in its key type. The check above is the runtime guarantee.
+        entry = cast("Mapping[str, Any]", item)
+        name = str(entry.get("name", "")).strip()
+        expression = entry.get("match")
         if not name or not isinstance(expression, str) or not expression.strip():
             logger.error(
                 "slack: ignoring bot policy for %s: %s entry needs a non-empty "
@@ -538,7 +584,9 @@ def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
             type(raw).__name__,
         )
         return None
-    mode = str(raw.get("mode", "all")).strip()
+    # See `_bot_rules` for why this is a cast.
+    policy = cast("Mapping[str, Any]", raw)
+    mode = str(policy.get("mode", "all")).strip()
     if mode not in _BOT_POLICY_MODES:
         logger.error(
             "slack: ignoring bot policy for %s: unknown mode %r (expected one of %s)",
@@ -549,10 +597,10 @@ def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
         return None
 
     processed = _bot_rules(
-        raw.get("process_if"), field="process_if", bot_id=bot_id, allow_mention=True
+        policy.get("process_if"), field="process_if", bot_id=bot_id, allow_mention=True
     )
     dropped = _bot_rules(
-        raw.get("drop_before_ai"),
+        policy.get("drop_before_ai"),
         field="drop_before_ai",
         bot_id=bot_id,
         allow_mention=False,
@@ -566,7 +614,7 @@ def _parse_bot_policy(bot_id: str, raw: object) -> _BotPolicy | None:
     # the first symptom of a pattern that does not match what the operator
     # expected is "the agent stopped answering my bot". At DEBUG there is nothing
     # in a normal log to explain it.
-    audit = raw.get("audit_dropped_events", True)
+    audit = policy.get("audit_dropped_events", True)
     if not isinstance(audit, bool):
         logger.error(
             "slack: ignoring bot policy for %s: audit_dropped_events must be true or false",
@@ -694,19 +742,10 @@ def _render_job_list(rows: list[QueueRow], channel: str, job_command: str) -> st
     return "\n".join(lines)
 
 
-def _build_response_blocks(body: str, response: Response) -> list[dict]:
-    """Render a Response as Slack block-kit: markdown chunks + stats/tools context.
-
-    The body goes out as the agent wrote it, in a `markdown` block. Slack parses
-    it server-side, so a list becomes a real `rich_text_list` that indents, and a
-    table becomes a real `table` block. Converting to mrkdwn first would throw
-    both away: the legacy parser has no list and no table, so a nested list
-    flattens to literal dashes and a table lands in a code fence.
-    """
-    blocks: list[dict] = []
-    for chunk in _split_blocks(body):
-        blocks.append({"type": "markdown", "text": chunk})
+def _footer_blocks(response: Response) -> list[dict]:
+    """The stats and tools lines that close a reply."""
     stats, tools = footer_parts(response, "slack")
+    blocks: list[dict] = []
     if stats:
         blocks.append(
             {"type": "context", "elements": [{"type": "mrkdwn", "text": stats}]}
@@ -716,6 +755,138 @@ def _build_response_blocks(body: str, response: Response) -> list[dict]:
             {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
         )
     return blocks
+
+
+def _suggestion_blocks(labels: list[str]) -> list[dict]:
+    """The follow-up buttons under a reply; none when the agent suggested none."""
+    if not labels:
+        return []
+    return [
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": label},
+                    "action_id": f"cotf-sugg:{i}",
+                }
+                for i, label in enumerate(labels)
+            ],
+        }
+    ]
+
+
+def _reply_messages(body: str, response: Response) -> list[tuple[str, list[dict]]]:
+    """Render a Response as the messages Slack will take, in order.
+
+    A message cap sits below the per-block one, so a long reply goes out as
+    several messages instead of one oversized post that Slack rejects whole. The
+    body goes out as the agent wrote it, in a `markdown` block: Slack parses it
+    server-side, so a list becomes a real `rich_text_list` that indents, and a
+    table becomes a real `table` block. Converting to mrkdwn first would throw
+    both away.
+
+    The stats/tools footer and the suggestion buttons ride the last message only.
+    Repeated per message they read as noise, and the buttons would sit above the
+    rest of the reply.
+    """
+    chunks = _split_blocks(body, limit=SLACK_MESSAGE_CHAR_LIMIT)
+    last = len(chunks) - 1
+    messages: list[tuple[str, list[dict]]] = []
+    for index, chunk in enumerate(chunks):
+        blocks: list[dict] = [{"type": "markdown", "text": chunk}]
+        if index == last:
+            blocks += _footer_blocks(response)
+            blocks += _suggestion_blocks(response.suggestions)
+        # The markdown block carries the chunk in full; the `text` fallback is
+        # fitted under chat.update's 4,000-byte cap, because the suggestion-menu
+        # retire re-sends it and Slack counts the cap in bytes, not characters.
+        messages.append((fit_text_field(chunk), blocks))
+    return messages
+
+
+CONTINUE_ACTION_ID = "cotf-continue"
+
+
+def _continue_button_value(channel: str, thread_ts: str | None) -> str:
+    """Routing for the gate notice's button: the thread it resumes.
+
+    Carried in the button `value` rather than derived from the tap's `message`
+    field. Whether an ephemeral message's block_actions payload carries
+    `thread_ts` is not something this code has verified, and deriving it wrong
+    resumes the wrong session. Two ids, nothing secret, and the tap survives a
+    restart for the same reason `_session_id_for` gives.
+    """
+    return f"{channel}|{thread_ts or ''}"
+
+
+def _parse_continue_value(value: str) -> tuple[str, str | None] | None:
+    """Split a button `value` back into (channel, thread_ts). None if malformed.
+
+    A card outlives the process that drew it, so this parses what a previous
+    build may have written. Anything that is not two fields is dropped by the
+    caller rather than guessed at.
+    """
+    channel, _, thread = value.partition("|")
+    if not channel or "|" in thread:
+        return None
+    return channel, thread or None
+
+
+def _reply_limit_blocks(note: str, channel: str, thread_ts: str | None) -> list[dict]:
+    """The gate notice: what happened, then one button to resume.
+
+    The note goes in a `section` block rather than only in the message `text`.
+    Slack renders `blocks` and stops rendering `text` as soon as blocks are
+    present, so a card carrying only the actions block showed a bare button and
+    never said what the limit was or what the button would do.
+
+    One button, no menu: the notice has exactly one action, and the typed
+    `$continue` prefix stays the alternative for anybody who would rather type.
+    """
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": note}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Continue"},
+                    "action_id": CONTINUE_ACTION_ID,
+                    "value": _continue_button_value(channel, thread_ts),
+                }
+            ],
+        },
+    ]
+
+
+REPLAY_ACTION_ID = "cotf-replay"
+
+
+def _mention_notice_blocks(
+    note: str, channel: str, thread_ts: str | None
+) -> list[dict]:
+    """The forgot-to-tag notice: what happened, then one button that runs the
+    untagged messages as if they had carried the tag.
+
+    Same shape as `_reply_limit_blocks`, and the note is in a `section` for the
+    same reason. The routing is the thread only: the sender is whoever taps, and
+    the card reaches nobody else.
+    """
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": note}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Pick it up"},
+                    "action_id": REPLAY_ACTION_ID,
+                    "value": _continue_button_value(channel, thread_ts),
+                }
+            ],
+        },
+    ]
 
 
 def _retire_suggestion_block(blocks: list[dict], label: str) -> list[dict]:
@@ -788,6 +959,42 @@ def _fit_block(text: str) -> str:
     return f"{text[:_BLOCK_TEXT_LIMIT]}\n[{dropped} more characters, see the log]"
 
 
+def _fit_progress_chunk(text: str) -> str:
+    """One chunk, small enough to be a whole progress message on its own.
+
+    Both caps, because a chunk that clears neither has nowhere to go. A body that
+    outgrows its message rolls into a NEW one carrying just the newest chunk, so
+    an unbounded chunk would arrive over the cap there too and roll again on
+    every later chunk — a message per gap, which is the behavior appending exists
+    to replace. `_fit_block` alone does not bound it: 2900 CJK characters clear
+    its character cap and are 8700 bytes, more than twice the byte one.
+    """
+    return fit_text_field(_fit_block(text))
+
+
+def _progress_blocks(text: str) -> list[dict]:
+    """The turn's progress message as Slack blocks: one context block."""
+    return [{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}]
+
+
+def _progress_fits(text: str) -> bool:
+    """Whether a grown progress body can still be sent as one edit.
+
+    Two ceilings in two different units, and a body has to clear BOTH: a context
+    block's text is capped in characters, and the `text` field the same request
+    carries is capped in bytes. Which one binds depends on the script — 2900 CJK
+    characters clear the character cap and are 8700 bytes, well over the byte one.
+    Checking only bytes (what this did when a message was replaced rather than
+    grown) would let `_fit_block` silently cut the tail of a body that is over the
+    character cap, and the tail of an append-only timeline is the newest chunk in
+    it: the one thing somebody watching a running turn is reading.
+    """
+    return (
+        len(text) <= _BLOCK_TEXT_LIMIT
+        and len(text.encode("utf-8")) <= SLACK_TEXT_FIELD_BYTES
+    )
+
+
 def _approval_headline(request: ApprovalRequest) -> str:
     """The card's first line.
 
@@ -858,6 +1065,10 @@ def _skill_option_groups(skills: list[tuple[str, str]]) -> list[dict]:
             {"label": {"type": "plain_text", "text": plugin[:75]}, "options": options}
         )
     return groups[:100]
+
+
+def _string_or(value: object, default: str) -> str:
+    return value if isinstance(value, str) else default
 
 
 def _session_key(channel: str, thread_ts: str | None) -> int:
@@ -1078,7 +1289,7 @@ class SlackFrontend(Frontend):
         # not switch the feature on, since the branch gated on the module
         # global, and a caller had to reach in and patch that too. Resolving at
         # construction also means a SLACK_JOB_COMMAND that only exists in .env
-        # works — `main` calls load_dotenv() before this runs, whereas the
+        # works — `main` loads DATA_DIR/.env before this runs, whereas the
         # import-time binding needed the value already in the environment.
         # `None` means "not specified, read the environment"; `""` means off.
         # Without that split a caller could rename the trigger but never
@@ -1120,13 +1331,20 @@ class SlackFrontend(Frontend):
         # filter correctly drops our reply echoes — let it. A user token (xoxp-)
         # replies as the human, and we deliberately keep self-events so messages
         # typed from another Slack client still reach the agent; dedup of our own
-        # replies then falls to _our_sent_timestamps. The durable processed-event
-        # ledger mirrors those reply timestamps too, because restart catch-up
-        # begins with an empty in-memory echo guard and fetched history bypasses
-        # Bolt's filter.
+        # replies then falls to _our_sent_timestamps (which _catchup relies on
+        # regardless, since fetched history bypasses Bolt's filter).
         self._is_bot_token = token.startswith("xoxb-")
         self._app = AsyncApp(
             token=token, ignoring_self_events_enabled=self._is_bot_token
+        )
+        # slack_sdk ships one default handler, for connection errors. A 429 is
+        # not one: without this, a rate-limited reactions.add or chat_update
+        # raises, gets logged, and the mark simply never appears -- a dropped
+        # :eyes: or a suggestion menu that stays clickable. Both are Tier 3
+        # methods, so a burst of turns can reach the limit. The handler honours
+        # Slack's own Retry-After.
+        self._app.client.retry_handlers.append(
+            AsyncRateLimitErrorRetryHandler(max_retry_count=RATE_LIMIT_RETRIES)
         )
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
@@ -1150,6 +1368,12 @@ class SlackFrontend(Frontend):
         self._own_dm_ttl = 60.0
         self._connected_once = False
         self._workspace_names: dict[int, str] = {}
+        # session -> the per-thread directory name this session had before
+        # workspaces were shared, and the key its files move under. Both come
+        # from the same resolution as the workspace name, so a thread that was
+        # never resolved has neither and migrates nothing.
+        self._legacy_workspace_names: dict[int, str] = {}
+        self._thread_keys: dict[int, str] = {}
         self._sender_names: dict[int, str] = {}
         self._channel_contexts: dict[int, str] = {}
         # session -> channel name, or "" for a DM/group DM. Set alongside the
@@ -1157,6 +1381,7 @@ class SlackFrontend(Frontend):
         # id or name) from a DM (keyed by whoever is talking).
         self._channel_names: dict[int, str] = {}
         self._user_name_cache: dict[str, str] = {}  # slack user_id -> display name
+        self._account_senders: dict[int, str] = {}
         self._session_sender_ids: dict[int, str] = {}  # session -> slack user_id
         self._dm_channels: dict[str, str] = {}  # slack user_id -> im channel id
         self._pending_msg: dict[
@@ -1169,23 +1394,68 @@ class SlackFrontend(Frontend):
         self._spent_menus: dict[tuple[str, str], None] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
-        self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
+        # session -> (channel, ts, body) of the running turn's progress messages,
+        # oldest first. `send_progress` appends each chunk to the last one, so the body
+        # it already holds is carried here beside its ts: Slack has no "append"
+        # call, only `chat.update` with a whole new body, so the adapter is the
+        # only place that can know what that body currently is. `end_progress`
+        # pops them at the end of every turn, so a later turn never edits a
+        # message an earlier one left behind.
+        self._progress_messages: dict[int, list[tuple[str, str, str]]] = {}
+        # session -> turns handed to the agent. Counted at dispatch (`_charge_turn`)
+        # rather than at the reply, so the gate reads a count that already
+        # includes every message queued ahead of the one it is looking at.
+        self._reply_counts: dict[int, int] = {}
         # session -> the gate notice waiting out its delay. One per thread, so a
         # sender who fires three messages into a gated thread gets one warning.
         self._gate_notices: dict[int, asyncio.Task[None]] = {}
         # session -> monotonic time the notice can no longer be deferred past.
         # Held across reschedules, which is what bounds the debounce.
         self._gate_deadlines: dict[int, float] = {}
-        # Threads already told that a channel needs an @mention. Once each.
-        self._mention_hinted: set[int] = set()
-        # session -> the idle reminder waiting for the thread to stay quiet.
-        self._mention_notices: dict[int, asyncio.Task[None]] = {}
+        # session -> the gated messages, oldest first, held as the events
+        # themselves so the Continue button can replay them exactly. A list
+        # because a burst is several messages, and the card belongs to the thread:
+        # one press has to recover everything the gate dropped, not just the last
+        # one. Only the newest wears GATED_EMOJI, so a burst leaves one mark. The
+        # resume paths pop the list, and that is what removes the reaction.
+        self._gated_msgs: dict[int, list[dict]] = {}
+        # session -> everyone who has tagged the bot in that thread. A set rather
+        # than the last one: a later tagger must not silently take over an earlier
+        # tagger's claim. See `_hint_mention_required`.
+        self._mention_taggers: dict[int, set[str]] = {}
+        # (session, user) -> that person's reminder waiting out its delay. Keyed
+        # per person because two of them can be pending in one thread at once.
+        self._mention_notices: dict[tuple[int, str], asyncio.Task[None]] = {}
+        # (session, user) -> that person's untagged messages since their last tag,
+        # oldest first, held as the events so the notice's button can replay them.
+        # Kept apart from `_mention_notices` because a new untagged message
+        # restarts the notice but must not lose the earlier messages.
+        self._untagged_msgs: dict[tuple[int, str], list[dict]] = {}
         # nonce -> future awaiting an approve/deny click. Keyed by nonce so the
         # button's `value` stays opaque and a subject never has to be encoded
         # into a client-supplied field.
         self._pending_approvals: dict[str, asyncio.Future[bool]] = {}
         self._status_started: dict[int, float] = {}  # session -> turn start (mono)
         self._status_verbs: dict[int, list[str]] = {}  # session -> shuffled verbs
+
+    @staticmethod
+    def _skip(loud: bool, reason: str, *args: object) -> None:
+        """Record a message the frontend will not act on.
+
+        Ten branches in `_handle_message` can refuse a message, and every one
+        of them logged at DEBUG. A deployed daemon runs at INFO -- measured on
+        this install's own log, 0 DEBUG records in a full day -- so a message
+        that was silently refused left no record at all, and "it never answered
+        me" had nothing to read back. That is why the dedupe path could never
+        be traced.
+
+        `loud` marks the refusals that can swallow something a person
+        deliberately sent, and those go to INFO. The routine ones stay at
+        DEBUG: our own replies come back on every turn, and an untrusted bot
+        posted 88 times in one day here. Promoting those too would bury the
+        five that matter, and a log nobody can skim is the same as no log.
+        """
+        logger.log(logging.INFO if loud else logging.DEBUG, "skipped: " + reason, *args)
 
     def _senders(self, key: str, pinned: set[str] | None) -> set[str]:
         """One sender set: the pinned override, else the current config.
@@ -1270,15 +1540,14 @@ class SlackFrontend(Frontend):
         self, channel: str, event_ts: str, channel_type: str = ""
     ) -> None:
         """Advance the in-memory and durable catch-up positions together."""
-        previous = self._active_channels.get(channel)
-        try:
-            advances = previous is None or float(event_ts) >= float(previous)
-        except (TypeError, ValueError):
-            advances = False
-        if advances:
-            self._active_channels[channel] = event_ts
         if channel_type:
             self._channel_types[channel] = channel_type
+        candidate_time = _event_time(event_ts)
+        if candidate_time is None:
+            return
+        previous_time = _event_time(self._active_channels.get(channel, ""))
+        if previous_time is None or candidate_time >= previous_time:
+            self._active_channels[channel] = event_ts
         self._watermarks.record(channel, event_ts, channel_type)
 
     def _restore_watermarks(self) -> int:
@@ -1288,8 +1557,8 @@ class SlackFrontend(Frontend):
         self._watermarks_restored = True
         restored = 0
         for entry in self._watermarks.recent():
-            previous = self._active_channels.get(entry.channel)
-            if previous is None or float(entry.ts) > float(previous):
+            previous_time = _event_time(self._active_channels.get(entry.channel, ""))
+            if previous_time is None or float(entry.ts) > previous_time:
                 self._active_channels[entry.channel] = entry.ts
             if entry.channel_type:
                 self._channel_types[entry.channel] = entry.channel_type
@@ -1341,8 +1610,63 @@ class SlackFrontend(Frontend):
     def workspace_name(self, chat_id: int) -> str:
         return f"slack/{self._workspace_names.get(chat_id, str(chat_id))}"
 
+    def display_label(self, chat_id: int) -> str:
+        """`slack/channel/C09AB… #general`, `slack/dm/U012… Hoss Huang`.
+
+        The id stays in front: it keys the workspace directory and the tmux
+        session, so the cell still matches what the rest of the dashboard
+        shows. A group DM has no name of its own, so it is labelled by kind.
+        A channel whose `conversations_info` call failed has its own id stored
+        as the name, and printing that twice tells the operator nothing.
+        """
+        name = self.workspace_name(chat_id)
+        kind = self._workspace_names.get(chat_id, "").split("/", 1)[0]
+        if kind == "dm":
+            sender = self._sender_names.get(chat_id, "")
+            return f"{name} {sender}" if sender else name
+        if kind == "mpim":
+            return f"{name} group-dm"
+        channel_name = self._channel_names.get(chat_id, "")
+        if channel_name and not name.endswith(channel_name):
+            return f"{name} #{channel_name}"
+        return name
+
+    def legacy_workspace(self, chat_id: int) -> LegacyWorkspace | None:
+        name = self._legacy_workspace_names.get(chat_id)
+        if name is None:
+            return None
+        return LegacyWorkspace(f"slack/{name}", self._thread_keys[chat_id])
+
     def sender_name(self, chat_id: int) -> str:
         return self._sender_names.get(chat_id, "unknown")
+
+    def account_subjects(self, chat_id: int) -> tuple[str, str]:
+        """Use immutable Slack identifiers rather than display names."""
+        entry = self._sessions.get(chat_id)
+        channel = entry[0] if entry is not None else ""
+        return channel, self._account_senders.get(
+            chat_id, self._session_sender_ids.get(chat_id, "")
+        )
+
+    def session_facts(self, chat_id: int) -> dict[str, str]:
+        facts: dict[str, str] = {}
+        entry = self._sessions.get(chat_id)
+        if entry is not None:
+            channel, thread_ts = entry
+            kind = self._workspace_names.get(chat_id, "").split("/", 1)[0]
+            label = {"dm": "dm", "mpim": "group-dm", "channel": "channel"}.get(
+                kind, "conversation"
+            )
+            name = self._channel_names.get(chat_id, "")
+            facts["conversation"] = f"{label} {channel}" + (f" #{name}" if name else "")
+            facts["thread"] = thread_ts or "root"
+        sender_id = self._session_sender_ids.get(chat_id)
+        if sender_id:
+            facts["sender_id"] = sender_id
+        sender_name = self._sender_names.get(chat_id)
+        if sender_name:
+            facts["sender_name"] = sender_name
+        return facts
 
     def sender_identity(self, chat_id: int) -> str:
         """Stable Slack user id used for prompt/memory routing."""
@@ -1436,7 +1760,56 @@ class SlackFrontend(Frontend):
             # The newest entry is this turn's: the frontend appends it before
             # dispatching, so `route_for` runs after that append.
             route["message_ts"] = pending[-1][1]
+        workspace = self._session_metadata(chat_id)
+        if workspace is not None:
+            route["workspace"] = workspace
         return route
+
+    def _session_metadata(self, chat_id: int) -> dict | None:
+        """What `_resolve_session_metadata` filled in, as one journalable dict.
+
+        A replay runs before any message arrives to resolve the thread again,
+        and `restore_route` is synchronous with no Slack client to ask. Carrying
+        the resolved names with the turn is what keeps a replayed turn in the
+        workspace the person was in: without them `workspace_name` falls back to
+        `slack/<session key>`, a directory nothing else ever uses, and the turn
+        runs in an empty one with no memory of the thread.
+        """
+        name = self._workspace_names.get(chat_id)
+        if name is None:
+            return None
+        return {
+            "name": name,
+            "legacy": self._legacy_workspace_names.get(chat_id),
+            "thread_key": self._thread_keys.get(chat_id, "root"),
+            "sender_id": self._session_sender_ids.get(chat_id),
+            "sender_name": self._sender_names.get(chat_id),
+            "context": self._channel_contexts.get(chat_id),
+            "channel_name": self._channel_names.get(chat_id),
+        }
+
+    def _restore_metadata(self, chat_id: int, workspace: object) -> None:
+        """Put back what `_session_metadata` journaled. A route from before the
+        field existed, or a junk one, leaves the tables alone: the next typed
+        message resolves the thread, the same as it always did."""
+        if chat_id in self._workspace_names or not isinstance(workspace, dict):
+            return
+        name = workspace.get("name")
+        if not isinstance(name, str) or not name:
+            return
+        self._workspace_names[chat_id] = name
+        self._thread_keys[chat_id] = _string_or(workspace.get("thread_key"), "root")
+        self._channel_names[chat_id] = _string_or(workspace.get("channel_name"), "")
+        optional = (
+            ("legacy", self._legacy_workspace_names),
+            ("sender_id", self._session_sender_ids),
+            ("sender_name", self._sender_names),
+            ("context", self._channel_contexts),
+        )
+        for key, table in optional:
+            value = workspace.get(key)
+            if isinstance(value, str) and value:
+                table[chat_id] = value
 
     def restore_route(self, chat_id: int, route: dict) -> None:
         """Re-register a journaled turn so a replay behaves like a fresh message.
@@ -1462,6 +1835,7 @@ class SlackFrontend(Frontend):
         self._remember_session(
             chat_id, channel, thread_ts if isinstance(thread_ts, str) else None
         )
+        self._restore_metadata(chat_id, route.get("workspace"))
         message_ts = route.get("message_ts")
         if isinstance(message_ts, str) and message_ts:
             # Appended in replay order, because notify_start pops from the left.
@@ -1472,14 +1846,18 @@ class SlackFrontend(Frontend):
         is reconstructable, so a re-hydrating thread just re-resolves it."""
         self._sessions.pop(session_id, None)
         self._workspace_names.pop(session_id, None)
+        self._legacy_workspace_names.pop(session_id, None)
+        self._thread_keys.pop(session_id, None)
         self._sender_names.pop(session_id, None)
         self._channel_contexts.pop(session_id, None)
         self._channel_names.pop(session_id, None)
         self._session_sender_ids.pop(session_id, None)
         self._reply_counts.pop(session_id, None)
         self._cancel_gate_notice(session_id)
-        self._cancel_mention_notice(session_id)
-        self._mention_hinted.discard(session_id)
+        self._cancel_thread_mention_notices(session_id)
+        self._mention_taggers.pop(session_id, None)
+        for key in [key for key in self._untagged_msgs if key[0] == session_id]:
+            self._untagged_msgs.pop(key)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
         self._in_flight.pop(session_id, None)
@@ -1506,6 +1884,20 @@ class SlackFrontend(Frontend):
         async def handle_suggestion_action(ack, body):
             await ack()
             await self._on_suggestion_action(body)
+
+        # The gate notice's Continue button. Same reasoning as the suggestion
+        # buttons above: it renders on an ephemeral message under either token
+        # kind, so the handler cannot live in the bot-token-only block.
+        @self._app.action(re.compile(r"^cotf-continue$"))
+        async def handle_continue_action(ack, body):
+            await ack()
+            await self._on_continue_action(body)
+
+        # The mention notice's button. Ephemeral too, so registered for both.
+        @self._app.action(re.compile(r"^cotf-replay$"))
+        async def handle_replay_action(ack, body):
+            await ack()
+            await self._on_replay_action(body)
 
         if self._is_bot_token:
             self._register_app_interactions()
@@ -1804,19 +2196,205 @@ class SlackFrontend(Frontend):
         await self._retire_suggestion_menu(body, label)
         # A tap can arrive after a restart or a cap eviction emptied _sessions,
         # so the thread is registered here exactly as a typed message registers
-        # it. Without this, send() has no route for the reply.
-        self._remember_session(
-            chat_id, channel, (body.get("message") or {}).get("thread_ts")
-        )
+        # it: the route, or send() has nowhere to reply, and the workspace, or
+        # the turn runs in `slack/<session key>` instead of the conversation's
+        # directory. The tap carries who pressed it, which is all a DM needs.
+        thread_ts = (body.get("message") or {}).get("thread_ts")
+        if chat_id in self._workspace_names:
+            self._remember_session(chat_id, channel, thread_ts)
+        else:
+            await self._enter_command_session(channel, sender_id, thread_ts)
         # Mirror the typed-message bookkeeping: one (channel, ts) and one
         # suppressed flag per dispatched turn, so notify_start pairs this
         # turn's reactions with its own message instead of the next one's.
         self._pending_msg.setdefault(chat_id, deque()).append((channel, ts))
         self._pending_reply_suppressed.setdefault(chat_id, deque()).append(False)
         display = (body.get("user") or {}).get("name", "")
+        # THE INBOUND LOG LINE, in the same shape and at the same moment a typed
+        # message writes one: at dispatch, so a tap the gate above dropped leaves
+        # no line, exactly as a dropped message leaves none.
+        #
+        # `(button)` is load-bearing rather than decoration: a tap has no Slack
+        # message behind it, so a line that looked exactly like a typed one would
+        # send the next reader to a permalink that does not exist. It goes last
+        # because the typed path already puts its own suffix there. The prefix
+        # names the thread, as a typed line does; `menu-ts` names the menu the
+        # tap answered, and is left out when the payload carries no message.
+        menu = f" [menu-ts: {ts}]" if ts else ""
+        logger.info(
+            "slack %s/%s: %s%s %s (button)",
+            channel,
+            thread_ts or ts,
+            sender_marker(sender_id, display),
+            menu,
+            label,
+        )
         # Same sender marker a typed message carries, so the agent sees who
-        # pressed the button.
+        # pressed the button. A tap is a turn like any other, so it pays the
+        # thread's budget the same way, and is charged at the same point: a tap
+        # queued behind a running turn must be counted before the next gate check.
+        self._charge_turn(chat_id)
         await self._on_message(chat_id, f"{sender_marker(sender_id, display)} {label}")
+
+    async def _on_continue_action(self, body: dict) -> None:
+        """Resume a gated thread from the gate notice's Continue button, and run
+        every message the gate dropped.
+
+        `_gated_msgs` holds the thread's backlog and is popped here, so a tap that
+        follows a typed `$continue` finds nothing to replay: that is what stops the
+        same message from being run twice. The card is the thread's, not the
+        sender's, so any allowed person who presses it drains the whole backlog.
+
+        Same dispatch gate as a typed message: the notice reaches one person, but
+        the payload is client-supplied, so an allowed sender is checked here
+        rather than assumed from who the card was addressed to.
+        """
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        sender_id = (body.get("user") or {}).get("id", "")
+        if not self._is_allowed(sender_id):
+            logger.warning("slack: ignoring continue click from %s", sender_id)
+            return
+        routing = _parse_continue_value(actions[0].get("value", ""))
+        if routing is None:
+            logger.info("slack: continue click with unusable routing, dropping")
+            return
+        channel, thread_ts = routing
+        session_id = _session_key(channel, thread_ts)
+        self._reply_counts[session_id] = 0
+        gated = self._cancel_gate_notice(session_id)
+        await self._clear_gate_lock(gated)
+        logger.info(
+            "slack %s/%s: reply count reset via continue button", channel, thread_ts
+        )
+        if gated:
+            await self._replay_gated(channel, gated)
+        # Last, and never fatal: the thread is resumed by this point, and a card
+        # that will not go away must not take that back.
+        await self._delete_ephemeral(body.get("response_url", ""))
+
+    async def _on_replay_action(self, body: dict) -> None:
+        """Run the untagged messages from the mention notice's button, as if each
+        had tagged the bot.
+
+        The backlog is the tapper's own, keyed by who pressed rather than by a
+        sender carried in the value: the card only reaches the person who forgot,
+        and keying by the tapper means a forged payload can only replay the
+        forger's own messages. The allowlist is still checked, because the
+        payload is client-supplied.
+
+        The backlog is popped, so a second tap is a no-op even when a replay was
+        refused on the way through and so never reached the tag that clears it.
+        """
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        sender_id = (body.get("user") or {}).get("id", "")
+        if not self._is_allowed(sender_id):
+            logger.warning("slack: ignoring replay click from %s", sender_id)
+            return
+        routing = _parse_continue_value(actions[0].get("value", ""))
+        if routing is None:
+            logger.info("slack: replay click with unusable routing, dropping")
+            return
+        channel, thread_ts = routing
+        session_id = _session_key(channel, thread_ts)
+        events = self._untagged_msgs.pop((session_id, sender_id), [])
+        mention = f"<@{self._user_id}>"
+        for event in events:
+            # The reply budget is reset for every message, not once before the
+            # loop. Each replay charges a turn on its way to the agent, so a
+            # backlog longer than the limit would otherwise re-gate its own
+            # tail: the first message runs, the rest land in the reply gate's
+            # backlog, and this card is already spent. Somebody who has been
+            # typing untagged is often at the limit already, which makes that
+            # the common case rather than the corner.
+            #
+            # `_replay_gated` resets the same budget by prefixing every replay
+            # with `$continue`, and that prefix is not usable here: its branch
+            # also empties `_gated_msgs`, so borrowing it would make a tap on
+            # this card silently discard the tagged messages the reply card was
+            # still holding.
+            self._reply_counts[session_id] = 0
+            replay = dict(event)
+            replay["text"] = f"{mention} {event.get('text') or ''}".strip()
+            await self._ingest_event(replay)
+            ts = str(event.get("ts") or "")
+            logger.info(
+                "replay: ran untagged message %s from %s (dispatched=%s)",
+                ts,
+                channel,
+                ts in self._processed_ts,
+            )
+        if not events:
+            logger.info(
+                "slack %s/%s: replay click found no untagged messages from %s",
+                channel,
+                thread_ts,
+                sender_id,
+            )
+        await self._delete_ephemeral(body.get("response_url", ""))
+
+    async def _replay_gated(self, channel: str, events: list[dict]) -> None:
+        """Run the messages the gate dropped, as if they had been sent again.
+
+        Oldest first, so the backlog reaches the agent in the order it was typed.
+
+        Every replay carries the `$continue` prefix, not only the first. The
+        prefix is what resets the budget, and a backlog longer than the limit
+        would otherwise re-gate its own tail on the way through.
+
+        The stored events are replayed, so the text, the files, the forwards and
+        the channel type are the ones the live path saw. The replay goes back
+        through `_ingest_event` rather than straight to the agent: that re-runs
+        the allowlist, the mention gate, the file downloads and the forwards.
+
+        A copy, because `_ingest_event` is handed a dict the caller still holds
+        and mutating the stored one would corrupt a later replay.
+        """
+        for event in events:
+            ts = str(event.get("ts") or "")
+            replay = dict(event)
+            replay["text"] = f"{CONTINUE_COMMAND} {event.get('text') or ''}".strip()
+            await self._ingest_event(replay)
+            # `_ingest_event` returns nothing whether it ran the message or
+            # dropped it, and every drop logs at debug. The ts is marked
+            # processed on the one path that reaches the agent, so this is what
+            # says which happened.
+            logger.info(
+                "continue: replayed gated message %s from %s (dispatched=%s)",
+                ts,
+                channel,
+                ts in self._processed_ts,
+            )
+
+    async def _delete_ephemeral(self, response_url: str) -> None:
+        """Take back an ephemeral card through the interaction's `response_url`.
+
+        `delete_original` is the documented way to remove an ephemeral message,
+        and it is the only handle available: the notice's `ts` is not kept, and
+        an ephemeral message never enters channel history to be found again.
+
+        Best-effort, and loud about failure. A card that outlives the thread it
+        resumed is a visible bug, so the reason Slack gave has to reach the log.
+        """
+        if not response_url:
+            logger.warning("delete_ephemeral: no response_url on the payload")
+            return
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(response_url, json={"delete_original": True}) as resp,
+            ):
+                if resp.status >= 400:
+                    logger.warning(
+                        "delete_ephemeral: response_url returned %s: %s",
+                        resp.status,
+                        await resp.text(),
+                    )
+        except Exception as exc:
+            logger.warning("delete_ephemeral: could not reach response_url: %s", exc)
 
     async def _retire_suggestion_menu(self, body: dict, label: str) -> None:
         """Rewrite the clicked message, collapsing the menu to a status line."""
@@ -1825,12 +2403,29 @@ class SlackFrontend(Frontend):
         ts = message.get("ts", "")
         blocks = message.get("blocks")
         if not (channel and ts and blocks):
+            # The one path that used to drop the ✓ with no trace anywhere. The
+            # tap still routes, so the only evidence a menu was never retired is
+            # this line.
+            logger.warning(
+                "slack: cannot retire suggestion menu, incomplete payload "
+                "(channel=%r ts=%r blocks=%s)",
+                channel,
+                ts,
+                "yes" if blocks else "no",
+            )
             return
         try:
             await self._app.client.chat_update(
                 channel=channel,
                 ts=ts,
-                text=message.get("text", ""),
+                # Slack caps chat.update's text at 4,000 UTF-8 bytes
+                # (msg_too_long) even though the character count the reference
+                # names still reads fine, so the stored fallback is fitted
+                # before it is re-sent. Replies posted since the fit-at-post
+                # change carry a text that already fits; this is the backstop
+                # for older messages still sitting in history with full-length
+                # text.
+                text=fit_text_field(message.get("text", "")),
                 blocks=_retire_suggestion_block(blocks, label),
             )
         except Exception as exc:
@@ -1887,6 +2482,7 @@ class SlackFrontend(Frontend):
         thread_ts = await self._anchor_run(channel, None, f"Running `{prompt}`…")
         session_id = await self._enter_command_session(channel, user_id, thread_ts)
         if self._on_message:
+            self._charge_turn(session_id)
             await self._on_message(session_id, prompt)
 
     async def _handle_run_skill_shortcut(self, ack, shortcut) -> None:
@@ -1984,6 +2580,7 @@ class SlackFrontend(Frontend):
         )
         session_id = await self._enter_command_session(channel, user_id, thread_ts)
         if self._on_message:
+            self._charge_turn(session_id)
             await self._on_message(session_id, prompt)
 
     async def _enter_command_session(
@@ -2002,9 +2599,10 @@ class SlackFrontend(Frontend):
         self._sender_names[session_id] = sender
         if user_id:
             self._session_sender_ids[session_id] = user_id
+            self._account_senders.setdefault(session_id, user_id)
         channel_type = await self._channel_type(channel)
         await self._resolve_session_metadata(
-            session_id, sender, channel, channel_type, thread_ts or ""
+            session_id, sender, user_id, channel, channel_type, thread_ts or ""
         )
         return session_id
 
@@ -2081,30 +2679,44 @@ class SlackFrontend(Frontend):
         bot_id = event.get("bot_id", "")
         # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
         # no user field. Only let through bots trusted by bot_id and not blocked.
+        # A bot's "Also send to channel" reply is a thread_broadcast with the same
+        # bot_id and no user, and it is that bot's reply: it takes this path too.
+        # On the person path its bot id became the sender, so a `*` allowlist let
+        # any bot that tagged us through, past this list and its bot policy. A
+        # broadcast that does carry a `user` is a person's (or an app bot's own
+        # bot-user) reply and stays on the person path, as its plain reply does.
+        is_bot_post = subtype == "bot_message" or (
+            subtype == "thread_broadcast" and bool(bot_id) and not event.get("user")
+        )
         is_trusted_bot = (
-            subtype == "bot_message"
+            is_bot_post
             and bot_id in self._allowed_bot_ids
             and bot_id not in self._blocked_senders
         )
-        if subtype == "bot_message":
+        if is_bot_post:
             if not is_trusted_bot:
-                logger.debug("skipped: untrusted bot_message bot_id=%s", bot_id)
+                self._skip(False, "untrusted %s bot_id=%s", subtype, bot_id)
                 return
         elif subtype and subtype not in _ALLOWED_SUBTYPES:
-            logger.debug("skipped: subtype=%s", subtype)
+            self._skip(False, "subtype=%s", subtype)
             return
         ts = event.get("ts", "")
-        sender_id = event.get("user", "")
+        # A trusted bot post carries no `user`, so its bot id is the sender:
+        # the same id the allowlist keyed on, and the id the DM workspace is
+        # named after. An empty sender here became `users//` in the prompt
+        # and, after a restart skipped the empty journaled value, the numeric
+        # chat id.
+        sender_id = event.get("user") or bot_id
         if ts in self._our_sent_timestamps:
-            logger.debug("skipped: our own message ts=%s", ts)
+            self._skip(False, "our own message ts=%s", ts)
             return
         if ts in self._processed_ts:
-            logger.debug("skipped: already processed ts=%s", ts)
+            self._skip(True, "already processed ts=%s", ts)
             return
         text = event.get("text", "")
         channel: str = event.get("channel", "")
         if not channel:
-            logger.debug("skipped: no channel in event")
+            self._skip(True, "no channel in event")
             return
         thread_ts: str = event.get("thread_ts") or ts
         channel_type: str = event.get("channel_type") or self._channel_types.get(
@@ -2172,21 +2784,31 @@ class SlackFrontend(Frontend):
             # so only humans reach the allow/block and @mention gates below.
             # Blocklist wins over the allowlist, so "*" can allow all but deny a few.
             if sender_id in self._blocked_senders:
-                logger.debug("skipped: sender %s in blocked_senders", sender_id)
+                self._skip(True, "sender %s in blocked_senders", sender_id)
                 return
 
             # Allowlist applies to all channel types, including DMs and group DMs.
             if not self._allow_all_senders and sender_id not in self._allowed_user_ids:
-                logger.debug("skipped: sender %s not in allowed_user_ids", sender_id)
+                self._skip(True, "sender %s not in allowed_user_ids", sender_id)
                 return
 
             # Channels and groups additionally require an @mention.
             if channel_type in TAG_REQUIRED_CHANNEL_TYPES:
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
-                    logger.debug("skipped: no mention of %s in text", self._user_id)
-                    await self._hint_mention_required(channel, thread_ts, sender_id)
+                    self._skip(False, "no mention of %s in text", self._user_id)
+                    await self._hint_mention_required(
+                        channel, thread_ts, sender_id, event
+                    )
                     return
+                # Remember who tagged, so a later untagged message can be matched
+                # against them rather than nudging whoever happened to speak next.
+                # Added, never replaced: in a thread two people are both talking to
+                # the bot in, whoever tags second must not cancel the first one's
+                # standing as somebody who could plausibly forget.
+                self._mention_taggers.setdefault(
+                    _session_key(channel, thread_ts), set()
+                ).add(sender_id)
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
 
             # Under a bot token the app also receives the authorizing user's own
@@ -2197,17 +2819,21 @@ class SlackFrontend(Frontend):
                 and channel_type in ("im", "mpim")
                 and not await self._is_bot_conversation(channel)
             ):
-                logger.debug("skipped: %s is not a DM the bot is in", channel)
+                self._skip(False, "%s is not a DM the bot is in", channel)
                 return
 
         session_id = _session_key(channel, thread_ts)
         is_new_session = session_id not in self._sessions
         is_mid_thread = bool(event.get("thread_ts")) and event["thread_ts"] != ts
         self._remember_session(session_id, channel, thread_ts)
-        # They tagged the bot, so they know how this works: drop any pending
+        # They tagged the bot, so they know how this works: drop their pending
         # "you need to tag me" notice rather than lecturing them about a mistake
-        # they have already corrected.
-        self._cancel_mention_notice(session_id)
+        # they have already corrected. Only theirs. Somebody else in the thread who
+        # forgot still has, and this message does nothing to fix that.
+        self._cancel_mention_notice(session_id, sender_id)
+        # And their untagged messages with it: the button replays what they sent
+        # since their last tag, and this is that tag.
+        self._untagged_msgs.pop((session_id, sender_id), None)
         logger.debug(
             "session: id=%s channel=%s thread_ts=%s", session_id, channel, thread_ts
         )
@@ -2262,6 +2888,39 @@ class SlackFrontend(Frontend):
             self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
             self._pending_reply_suppressed.setdefault(session_id, deque()).append(False)
             await self._orchestrator.on_compact(session_id)
+            return
+
+        # $model pins this conversation to another model or effort. A prefix match
+        # rather than the exact equality the two above use, because the argument
+        # is the whole point of the command: `$model opus` is a request, and
+        # `$model the notes` is refused with the list of names that would work
+        # instead of being answered as a message about notes. Ahead of the job
+        # branch and the soft-limit gate for the reason the two above are: a
+        # thread over budget is exactly one somebody may want to move to a
+        # cheaper model. `checks._job_command_error` refuses a job trigger that
+        # would collide with this prefix, so the two cannot both claim it.
+        model_text = text.strip()
+        if model_text == MODEL_COMMAND or model_text.startswith(MODEL_COMMAND + " "):
+            logger.info("slack %s/%s: %s", channel, thread_ts, MODEL_COMMAND)
+            # This branch returns before the normal path's catch-up bookkeeping,
+            # so mirror it here or a reconnect re-ingests the command.
+            self._processed_ts.add(ts)
+            self._record_watermark(channel, ts, channel_type)
+            if self._orchestrator is None:
+                await self._post_notice(
+                    channel, thread_ts, "Not connected to a session yet."
+                )
+                return
+            # No session identification here, unlike $compact: a pin is keyed by
+            # the conversation, not by its workspace, so nothing has to be
+            # resolved to record which model this thread runs on.
+            await self._post_notice(
+                channel,
+                thread_ts,
+                self._orchestrator.on_model(
+                    session_id, model_text[len(MODEL_COMMAND) :].split()
+                ),
+            )
             return
 
         # The job trigger queues a background job that outlives this chat turn;
@@ -2351,7 +3010,10 @@ class SlackFrontend(Frontend):
             self._reply_counts[session_id] = 0
             # A notice still waiting out its delay would land after the thread
             # has already resumed, telling the user to send what they just sent.
-            self._cancel_gate_notice(session_id)
+            # The gated messages go with it: typing the command is somebody
+            # asking to carry on, and the button is the way to ask for the
+            # backlog. See `_on_continue_action` for the other half.
+            await self._clear_gate_lock(self._cancel_gate_notice(session_id))
             text = stripped[len(CONTINUE_COMMAND) :].strip()
             logger.info(
                 "slack %s/%s: reply count reset via continue", channel, thread_ts
@@ -2363,6 +3025,7 @@ class SlackFrontend(Frontend):
                 thread_ts,
                 reply_soft_limit(),
             )
+            await self._mark_gated(session_id, event)
             self._schedule_reply_limit_warning(
                 session_id, channel, thread_ts, sender_id
             )
@@ -2382,10 +3045,11 @@ class SlackFrontend(Frontend):
             file_lines = await self._save_files(session_id, files)
 
         if not text and not forwards and not file_lines and not extra_content:
-            logger.debug("skipped: empty text after processing")
+            self._skip(True, "empty text after processing")
             return
 
         self._session_sender_ids[session_id] = sender_id
+        self._account_senders.setdefault(session_id, sender_id)
         self._processed_ts.add(ts)
         self._record_watermark(channel, ts, channel_type)
 
@@ -2424,6 +3088,9 @@ class SlackFrontend(Frontend):
             fwd_marker,
         )
         if self._on_message:
+            # Charged only on the path that reaches the agent, so a message the
+            # frontend drops never spends the thread's budget.
+            self._charge_turn(session_id)
             await self._on_message(session_id, final_text)
 
     async def _catchup(self) -> None:
@@ -2455,8 +3122,8 @@ class SlackFrontend(Frontend):
     async def stop(self) -> None:
         for session_id in list(self._gate_notices):
             self._cancel_gate_notice(session_id)
-        for session_id in list(self._mention_notices):
-            self._cancel_mention_notice(session_id)
+        for key in list(self._mention_notices):
+            self._cancel_mention_notice(*key)
         if self._handler:
             await self._handler.close_async()
 
@@ -2477,28 +3144,58 @@ class SlackFrontend(Frontend):
             return response.attachments
         logger.info("slack %s/%s => %s", channel, thread_ts, logs.redact(response.body))
 
-        blocks = _build_response_blocks(response.body, response)
-        # Suggestions parsed out of the reply; empty means no buttons.
-        labels = response.suggestions
-        if labels:
-            blocks.append(
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": label},
-                            "action_id": f"cotf-sugg:{i}",
-                        }
-                        for i, label in enumerate(labels)
-                    ],
-                }
+        messages = _reply_messages(response.body, response)
+        for index, (text, blocks) in enumerate(messages, start=1):
+            error = await self._post_reply_part(
+                channel, thread_ts, text, blocks, index, len(messages)
             )
+            if error is None:
+                continue
+            if error in _FALLBACK_ERRORS:
+                return await self._fallback_dm(chat_id, response, channel, error)
+            await self._notify_send_failure(
+                channel, thread_ts, error, index, len(messages)
+            )
+            return []
+        await self._upload_attachments(channel, thread_ts, response.attachments)
+        return response.attachments
 
+    async def _notify_send_failure(
+        self, channel: str, thread_ts: str | None, error: str, index: int, total: int
+    ) -> None:
+        """Tell the user in-thread that the reply did not go out, and why.
+
+        They cannot see the daemon log, and a reply that never arrives reads as
+        the agent ignoring them. Naming the code is what makes the failure
+        reportable instead of a mystery."""
+        where = f" (part {index} of {total})" if total > 1 else ""
+        note = f"_(couldn't deliver my reply{where}: `{error}`. Please report this.)_"
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, text=note, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("send: failed to post the failure notice: %s", exc)
+            return
+        if resp.get("ok"):
+            self._remember_sent_timestamp(resp["ts"])
+
+    async def _post_reply_part(
+        self,
+        channel: str,
+        thread_ts: str | None,
+        text: str,
+        blocks: list[dict],
+        index: int,
+        total: int,
+    ) -> str | None:
+        """Post one part of a reply. `None` means it landed; anything else is the
+        error code, with the part number in the log line so a reply that stops
+        half way is diagnosable from the log alone."""
         try:
             resp = await self._app.client.chat_postMessage(
                 channel=channel,
-                text=response.body,
+                text=text,
                 blocks=blocks,
                 thread_ts=thread_ts,
                 # A reply's links are for the user to click, not for Slack to
@@ -2508,25 +3205,24 @@ class SlackFrontend(Frontend):
             )
         except SlackApiError as exc:
             error = exc.response.get("error", "unknown_error")
-            logger.error("send: slack api error %s: %s", error, exc)
-            if error in _FALLBACK_ERRORS:
-                return await self._fallback_dm(chat_id, response, channel, error)
-            return []
+            logger.error(
+                "send: slack api error %s on part %s/%s: %s", error, index, total, exc
+            )
+            return error
         except Exception as exc:
-            logger.error("send: failed to post message: %s", exc)
-            return []
+            logger.error("send: failed to post part %s/%s: %s", index, total, exc)
+            # Not a Slack error code, so it never matches _FALLBACK_ERRORS.
+            return "transport_error"
 
         if resp.get("ok"):
             self._remember_sent_timestamp(resp["ts"])
-            self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             logger.debug("send: ok ts=%s", resp["ts"])
-            await self._upload_attachments(channel, thread_ts, response.attachments)
-            return response.attachments
+            return None
         error = resp.get("error", "unknown_error")
-        logger.warning("send: slack responded not ok: %s", resp)
-        if error in _FALLBACK_ERRORS:
-            return await self._fallback_dm(chat_id, response, channel, error)
-        return []
+        logger.warning(
+            "send: slack responded not ok on part %s/%s: %s", index, total, resp
+        )
+        return error
 
     async def _upload_attachments(
         self, channel: str, thread_ts: str | None, attachments: list[Path]
@@ -2611,10 +3307,83 @@ class SlackFrontend(Frontend):
         if task is not None:
             task.cancel()
 
-    def _cancel_gate_notice(self, session_id: int) -> None:
-        """Drop a pending notice and forget the thread's ceiling with it."""
+    def _charge_turn(self, session_id: int) -> None:
+        """Count a message as a turn, the moment it is handed to the agent.
+
+        Charged here rather than where the reply posts, which is where it used
+        to be. The reply lands when the agent finishes, so the count the gate
+        read at ingest was stale by exactly the depth of the queue: with the
+        limit at one, a message already running and a second one queued behind
+        it both saw a count of zero, and the thread went over budget without the
+        gate ever firing.
+        """
+        self._reply_counts[session_id] = self._reply_counts.get(session_id, 0) + 1
+
+    def _cancel_gate_notice(self, session_id: int) -> list[dict]:
+        """Drop a pending notice and forget the thread's ceiling with it.
+
+        Returns the thread's gated events, oldest first, and an empty list when
+        there were none, so an async caller can take the lock off and replay
+        them. Returning instead of unreacting here keeps this callable from the
+        synchronous teardown paths (`stop`, `_forget_session`), where a Slack
+        call can hang the loop.
+        """
         self._drop_gate_task(session_id)
         self._gate_deadlines.pop(session_id, None)
+        return self._gated_msgs.pop(session_id, [])
+
+    async def _clear_gate_lock(self, gated: list[dict]) -> None:
+        """Take GATED_EMOJI off a thread's gated messages.
+
+        Only the newest one wears it, because `_mark_gated` moves the mark there
+        as each message arrives, so only the newest is asked to give it up.
+        """
+        if not gated:
+            return
+        newest = gated[-1]
+        await self._unreact(newest["channel"], newest["ts"], GATED_EMOJI)
+
+    async def _mark_gated(self, session_id: int, event: dict) -> None:
+        """Lock a gated message, moving the mark off the previous one.
+
+        The whole event is kept, not just its timestamp. The Continue button
+        replays these exact messages, and the event carries everything the live
+        path had: the text, the files, the forwards, the channel type. Fetching
+        the message back from Slack instead was tried and abandoned. Both
+        `conversations.history` and `conversations.replies` return the thread's
+        parent when asked for one reply (`history` omits replies altogether, and
+        `replies` is oldest-first, so a `limit` of one lands on the parent), and
+        the fetch bought nothing anyway: this dict is in memory, so a restart
+        empties it and the tap can only resume either way.
+
+        The list is oldest-first, which is the order the Continue button drains
+        it in. One lock per thread: only the newest gated message wears
+        GATED_EMOJI, so a burst leaves one mark, on the message the notice is
+        about. Both reaction calls are best-effort -- `_react` and `_unreact`
+        already swallow the already-reacted and not-reacted errors.
+        """
+        backlog = self._gated_msgs.setdefault(session_id, [])
+        if any(stored.get("ts") == event.get("ts") for stored in backlog):
+            # The same message arriving twice. A gated message returns before the
+            # `_processed_ts` bookkeeping, so nothing else stops it: `_catchup`
+            # re-reads a channel after a reconnect and hands it back. One entry
+            # per message, or the button runs the same one twice.
+            logger.debug("slack: gated message %s is already held", event.get("ts"))
+            return
+        if backlog:
+            newest = backlog[-1]
+            await self._unreact(newest["channel"], newest["ts"], GATED_EMOJI)
+        backlog.append(event)
+        if len(backlog) > GATED_MSG_BACKLOG_MAX:
+            dropped = backlog.pop(0)
+            logger.warning(
+                "slack %s/%s: gated backlog over %d, dropped the oldest (%s)",
+                event["channel"],
+                event.get("thread_ts"),
+                GATED_MSG_BACKLOG_MAX,
+                dropped.get("ts"),
+            )
+        await self._react(event["channel"], event["ts"], GATED_EMOJI)
 
     async def _warn_reply_limit_later(
         self,
@@ -2643,16 +3412,44 @@ class SlackFrontend(Frontend):
         await self._warn_reply_limit(channel, thread_ts, sender_id)
 
     async def _hint_mention_required(
-        self, channel: str, thread_ts: str | None, sender_id: str
+        self, channel: str, thread_ts: str | None, sender_id: str, event: dict
     ) -> None:
-        """Say once, in a thread the bot is already in, that a channel message
-        without a tag is invisible to it.
+        """Say, in a thread the bot is already in, that a channel message without
+        a tag is invisible to it.
 
         Scoped to threads with a live session because those are the ones where
         somebody is talking *to* the bot and the missing tag is a slip. Without
         that check this fires on ordinary channel chatter the bot was never part
         of. Called from inside the channel/group branch, so a DM (where no tag is
         needed) can never reach it.
+
+        Narrowed further to people who have tagged. A thread the bot has been
+        pulled into carries other conversations: two people answering each other,
+        or another app posting. Those are not addressed to the bot and their
+        authors never forgot anything, so nudging them is both wrong and, for an
+        app, unreadable. Only an untagged message from somebody who tagged in this
+        thread is a plausible slip.
+
+        Everyone who tagged counts. Two people can be mid-conversation with the
+        bot in one thread, and both can forget; the one who tagged more recently
+        has no better claim to the reminder than the other. So the tagger set only
+        grows.
+
+        Each slip is told, not only the first. A reminder that gets used up leaves
+        the next slip unanswered in a thread the person believes the bot is
+        reading, and that thread just stalls. The delay below is what keeps the
+        repeats quiet: a burst of untagged messages still collapses into one.
+        That makes the delay the only cap on volume, and the cost is deliberate:
+        somebody who tagged and then keeps chatting in the thread untagged is
+        told after every pause.
+
+        Posted as an ephemeral message, so only the person who forgot sees it.
+        The thread stays clean for everyone else, which matters because this fires
+        on a mistake and a public correction reads as the bot telling somebody off
+        in front of their colleagues. The cost is real and deliberate: Slack drops
+        an ephemeral message unless the recipient is active, and clears it when
+        they reload, so the one who forgot *and* walked away never gets it. That
+        was the case the delay below was built for. Privacy won.
 
         Opt-in (`slack.mention_notice_seconds`, off by default) and, when on, held
         for that many seconds rather than posted now. Each further untagged
@@ -2667,18 +3464,56 @@ class SlackFrontend(Frontend):
         if delay <= 0:
             return
         session_id = _session_key(channel, thread_ts)
-        if session_id not in self._sessions or session_id in self._mention_hinted:
+        if session_id not in self._sessions:
             return
-        self._cancel_mention_notice(session_id)
-        self._mention_notices[session_id] = asyncio.create_task(
+        if sender_id not in self._mention_taggers.get(session_id, frozenset()):
+            logger.debug(
+                "mention notice: %s did not tag in %s/%s, staying quiet",
+                sender_id,
+                channel,
+                thread_ts,
+            )
+            return
+        self._hold_untagged(session_id, sender_id, event)
+        self._cancel_mention_notice(session_id, sender_id)
+        self._mention_notices[(session_id, sender_id)] = asyncio.create_task(
             self._notice_mention_later(session_id, channel, thread_ts, sender_id, delay)
         )
 
-    def _cancel_mention_notice(self, session_id: int) -> None:
-        """Drop a notice that has not fired yet."""
-        task = self._mention_notices.pop(session_id, None)
+    def _hold_untagged(self, session_id: int, user: str, event: dict) -> None:
+        """Keep an untagged message so the notice's button can replay it.
+
+        Deduplicated by `ts` for the reason `_mark_gated` gives: a skipped message
+        is never marked processed, so `_catchup` can hand it back after a
+        reconnect, and one entry per message stops the button running it twice.
+        """
+        backlog = self._untagged_msgs.setdefault((session_id, user), [])
+        if any(stored.get("ts") == event.get("ts") for stored in backlog):
+            logger.debug("slack: untagged message %s is already held", event.get("ts"))
+            return
+        backlog.append(event)
+        if len(backlog) > GATED_MSG_BACKLOG_MAX:
+            dropped = backlog.pop(0)
+            logger.warning(
+                "slack %s/%s: untagged backlog over %d, dropped the oldest (%s)",
+                event.get("channel"),
+                event.get("thread_ts"),
+                GATED_MSG_BACKLOG_MAX,
+                dropped.get("ts"),
+            )
+
+    def _cancel_mention_notice(self, session_id: int, user: str) -> None:
+        """Drop one person's notice in one thread, if it has not fired yet."""
+        task = self._mention_notices.pop((session_id, user), None)
         if task is not None:
             task.cancel()
+
+    def _cancel_thread_mention_notices(self, session_id: int) -> None:
+        """Drop every pending notice in a thread, whoever each was for. For the
+        cases where the thread itself is going away, not a correction by one
+        person."""
+        for key in [key for key in self._mention_notices if key[0] == session_id]:
+            self._cancel_mention_notice(*key)
 
     async def _notice_mention_later(
         self,
@@ -2692,30 +3527,47 @@ class SlackFrontend(Frontend):
         # not leave a task that wakes minutes later and posts anyway.
         try:
             await asyncio.sleep(delay)
-            self._mention_hinted.add(session_id)
         finally:
             # Deregister before posting, for the same reason the gate notice
             # does: a cancel landing inside `chat_postMessage` aborts a half-sent
-            # request. Only if this task is still the thread's notice — a restart
+            # request. Only if this task is still this person's notice — a restart
             # cancels us *after* the replacement is stored.
-            if self._mention_notices.get(session_id) is asyncio.current_task():
-                self._mention_notices.pop(session_id, None)
+            key = (session_id, sender_id)
+            if self._mention_notices.get(key) is asyncio.current_task():
+                self._mention_notices.pop(key, None)
         logger.info("slack %s/%s: told the thread it needs a tag", channel, thread_ts)
-        await self._post_notice(
+        # The leading `<@sender_id>` is cosmetic here, unlike on the other notices
+        # where it turns a thread reply into a notification: an ephemeral message
+        # has no `ts` and never enters channel history, so nothing can ping. It
+        # stays because it renders as a normal mention and marks at a glance who
+        # the bot is answering.
+        note = (
+            f"<@{sender_id}> I only see messages in a channel that tag me. "
+            f"Add <@{self._user_id}> and I'll pick it up."
+        )
+        await self._post_ephemeral_notice(
             channel,
             thread_ts,
-            f"<@{sender_id}> I only see messages in a channel that tag me. "
-            f"Add <@{self._user_id}> and I'll pick it up.",
+            sender_id,
+            note,
+            blocks=_mention_notice_blocks(note, channel, thread_ts),
         )
 
     async def _warn_reply_limit(
         self, channel: str, thread_ts: str | None, sender_id: str = ""
     ) -> None:
-        """Tell the user the thread hit the reply soft-limit and how to resume.
+        """Tell the sender the thread hit the reply soft-limit, and offer a way out.
 
-        Addressed to the sender when there is one, so it arrives as a real
-        notification rather than a thread reply Slack can mark read on arrival.
-        A trusted bot has no user id, hence the plain form.
+        Posted as an ephemeral message, so the thread is not notified: a thread
+        reply reaches every participant, and the budget belongs to one person.
+        The cost is deliberate. An ephemeral message does not badge and does not
+        reach somebody who has left the thread, so a sender who walked away
+        learns nothing. The lock reaction on the gated message is the only trace
+        left in the thread.
+
+        A trusted bot has no user id, so it has no recipient for an ephemeral.
+        That case keeps the thread notice, and is the one path that still
+        notifies the thread.
         """
         who = f"<@{sender_id}> " if sender_id else ""
         note = (
@@ -2723,15 +3575,16 @@ class SlackFrontend(Frontend):
             f"Reply `{CONTINUE_COMMAND}` to keep going, or "
             f"`{CONTINUE_COMMAND} <your next message>` to continue and ask in one go."
         )
-        try:
-            resp = await self._app.client.chat_postMessage(
-                channel=channel, text=note, thread_ts=thread_ts
-            )
-        except Exception as exc:
-            logger.error("reply-limit: failed to post warning: %s", exc)
+        if not sender_id:
+            await self._post_notice(channel, thread_ts, note)
             return
-        if resp.get("ok"):
-            self._remember_sent_timestamp(resp["ts"])
+        await self._post_ephemeral_notice(
+            channel,
+            thread_ts,
+            sender_id,
+            note,
+            blocks=_reply_limit_blocks(note, channel, thread_ts),
+        )
 
     async def _anchor_run(
         self, channel: str, thread_ts: str | None, label: str
@@ -2780,7 +3633,10 @@ class SlackFrontend(Frontend):
     async def _post_notice(
         self, channel: str, thread_ts: str | None, text: str
     ) -> None:
-        """Post a short control-command acknowledgement into the thread.
+        """Post a short notice into the thread.
+
+        Control-command acknowledgements, and the gate notice when its sender is
+        a trusted bot with no user id to address an ephemeral message to.
 
         Records the ts so a user-token deploy doesn't re-ingest our own notice
         as an inbound message (same echo guard as send/_warn_reply_limit)."""
@@ -2794,14 +3650,50 @@ class SlackFrontend(Frontend):
         if resp.get("ok"):
             self._remember_sent_timestamp(resp["ts"])
 
+    async def _post_ephemeral_notice(
+        self,
+        channel: str,
+        thread_ts: str | None,
+        user: str,
+        text: str,
+        blocks: list[dict] | None = None,
+    ) -> None:
+        """Post a notice only `user` can see.
+
+        No echo-guard bookkeeping, unlike `_post_notice`: an ephemeral message has
+        no `ts` to record and Slack never delivers it back as an inbound event, so
+        there is nothing a user-token deploy could re-ingest.
+
+        `text` is required even when `blocks` carries the real content: it is what
+        a client that cannot render blocks shows, and what a screen reader reads.
+        """
+        try:
+            await self._app.client.chat_postEphemeral(
+                channel=channel,
+                user=user,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+            )
+        except Exception as exc:
+            logger.error("post_ephemeral_notice: failed to post %r: %s", text, exc)
+
     async def send_progress(self, chat_id: int, text: str) -> None:
-        """Post one mid-turn progress message into the thread the turn runs in.
+        """Append one chunk of the turn's progress to its message in the thread.
+
+        The first call posts the message and later calls edit it with everything
+        it already held plus the new chunk, so a long turn leaves behind a
+        timeline of itself rather than a snapshot of its last moment or one
+        message per gap. A chunk that no longer fits starts a new message and
+        carries only itself, and so does an edit that fails (the message is gone,
+        or Slack refuses the edit). Later calls append to the newest message.
 
         Its own `chat_postMessage` rather than `send()`, for two reasons that are
-        both about not spending the user's allowance: `send` counts a reply against
-        `slack.reply_soft_limit` (in both its arms, `send` and `_fallback_dm`), and
-        progress must not burn a ten-message budget; and a progress line is a
-        context block, not a reply with a stats footer.
+        both about not spending the user's allowance: a progress line is a context
+        block, not a reply with a stats footer; and `send` is the tail of a turn,
+        so routing progress through it would put narration and the answer on the
+        same path for no gain. The budget is charged at dispatch instead, where a
+        message becomes a turn, and a progress line is not one.
 
         DMs and group DMs only. That exemption from the reply budget is exactly why
         — in a channel, nothing at all would cap how much narration a heavy turn
@@ -2828,17 +3720,34 @@ class SlackFrontend(Frontend):
             logger.debug("progress: omitted outside a DM/group DM in %s", channel)
             return
         logger.info("slack %s/%s ~> %s", channel, thread_ts, logs.redact(text))
-        rendered = f"{INTERIM_PREFIX} {_fit_block(to_mrkdwn(text))}"
+        chunk = _fit_progress_chunk(f"{INTERIM_PREFIX} {to_mrkdwn(text)}")
+        messages = self._progress_messages.get(chat_id)
+        if messages:
+            edit_channel, edit_ts, body = messages[-1]
+            grown = f"{body}\n{chunk}"
+            if not _progress_fits(grown):
+                logger.info("progress: message is full, starting a new one")
+            else:
+                try:
+                    await self._app.client.chat_update(
+                        channel=edit_channel,
+                        ts=edit_ts,
+                        text=grown,
+                        blocks=_progress_blocks(grown),
+                    )
+                    messages[-1] = (edit_channel, edit_ts, grown)
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "progress: could not edit %s, posting a new message: %s",
+                        edit_ts,
+                        exc,
+                    )
         try:
             resp = await self._app.client.chat_postMessage(
                 channel=channel,
-                text=rendered,
-                blocks=[
-                    {
-                        "type": "context",
-                        "elements": [{"type": "mrkdwn", "text": rendered}],
-                    }
-                ],
+                text=chunk,
+                blocks=_progress_blocks(chunk),
                 thread_ts=thread_ts,
             )
         except Exception as exc:
@@ -2846,6 +3755,21 @@ class SlackFrontend(Frontend):
             return
         if resp.get("ok"):
             self._remember_sent_timestamp(resp["ts"])
+            self._progress_messages.setdefault(chat_id, []).append(
+                (channel, resp["ts"], chunk)
+            )
+
+    async def end_progress(self, chat_id: int, *, succeeded: bool) -> None:
+        """Forget the turn's progress messages, and leave them in the thread.
+
+        Kept whatever the outcome, `succeeded` included. They were deleted on a
+        successful turn while each one was a snapshot of the turn's last moment,
+        which the reply then said better. They are now a timeline of how the turn
+        reached that reply — which tools ran, what was retried, where a long turn
+        spent its time — and the reply says none of that. Deleting it would throw
+        away the only record anybody outside the host can read.
+        """
+        self._progress_messages.pop(chat_id, None)
 
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload
@@ -2878,6 +3802,23 @@ class SlackFrontend(Frontend):
             return
         channel, ts = pending[-1]
         await self._react(channel, ts, QUEUED_EMOJI)
+
+    async def retire_failed_turn(self, chat_id: int, route: dict) -> None:
+        """Do not let an early intake failure consume the next message's marker."""
+        channel, message_ts = route.get("channel"), route.get("message_ts")
+        if not isinstance(channel, str) or not isinstance(message_ts, str):
+            return
+        target = (channel, message_ts)
+        pending = self._pending_msg.get(chat_id)
+        suppressed = self._pending_reply_suppressed.get(chat_id)
+        if pending:
+            while target in pending:
+                index = pending.index(target)
+                del pending[index]
+                if suppressed is not None and index < len(suppressed):
+                    del suppressed[index]
+        if self._in_flight.get(chat_id) == target:
+            await self.notify_complete(chat_id)
 
     async def notify_interrupted(
         self, chat_id: int, *, running: bool, queued: int
@@ -2924,7 +3865,13 @@ class SlackFrontend(Frontend):
         await self._set_status(chat_id, f"is {seq[0]}…")
         pending = self._pending_msg.get(chat_id)
         if not pending:
-            logger.debug(
+            # Warning, not debug: a slash command and the skill picker reach here
+            # with nothing to react to by design, but so does a typed message
+            # whose entry another turn already took. The two are indistinguishable
+            # from here, and only the second one costs somebody their :eyes:. At
+            # debug it left no trace at all, which is what made a dropped
+            # reaction impossible to tell from a Slack API failure.
+            logger.warning(
                 "notify_start: no pending reaction msg for chat_id=%s", chat_id
             )
             return
@@ -3045,38 +3992,38 @@ class SlackFrontend(Frontend):
             f"Here it is via DM instead.)_\n\n"
         )
         body = prefix + response.body
-        blocks = _build_response_blocks(body, response)
-        try:
-            resp = await self._app.client.chat_postMessage(
-                channel=dm_channel,
-                text=body,
-                blocks=blocks,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
-        except Exception as exc:
-            logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
-            return []
-        if resp.get("ok"):
+        for text, blocks in _reply_messages(body, response):
+            try:
+                resp = await self._app.client.chat_postMessage(
+                    channel=dm_channel,
+                    text=text,
+                    blocks=blocks,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+            except Exception as exc:
+                logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
+                return []
+            if not resp.get("ok"):
+                logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
+                return []
             self._remember_sent_timestamp(resp["ts"])
-            self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
-            await self._upload_attachments(dm_channel, None, response.attachments)
-            logger.info(
-                "fallback_dm: delivered response to %s for session %s",
-                sender_id,
-                chat_id,
-            )
-            return response.attachments
-        logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
-        return []
+        await self._upload_attachments(dm_channel, None, response.attachments)
+        logger.info(
+            "fallback_dm: delivered response to %s for session %s", sender_id, chat_id
+        )
+        return response.attachments
 
     def _workspace_path(self, session_id: int) -> Path:
         return workspace_path(self.workspace_name(session_id), DATA_DIR)
 
     async def _save_files(self, session_id: int, files: list[dict]) -> list[str]:
-        """Download Slack files to workspace. Returns '[File saved: name]' lines."""
+        """Download Slack files into the workspace's `inbox/`. Returns
+        '[File saved: inbox/name]' lines, relative to the workspace, which is
+        the agent's cwd. Every thread of the conversation shares the inbox, so
+        a name already taken gets a numeric suffix (`agent.inbox_path`).
+        """
         workspace = self._workspace_path(session_id)
-        workspace.mkdir(parents=True, exist_ok=True)
         token: str = self._app.client.token or ""
         lines: list[str] = []
         for f in files:
@@ -3085,10 +4032,10 @@ class SlackFrontend(Frontend):
             if not url:
                 logger.warning("file %s has no url_private_download, skipping", name)
                 continue
-            dest = workspace / Path(name).name
+            dest = inbox_path(workspace, name)
             try:
                 await self._download_file(url, dest, token)
-                lines.append(f"[File saved: {dest.name}]")
+                lines.append(f"[File saved: {dest.relative_to(workspace)}]")
                 logger.info("saved file %s for session %s", dest.name, session_id)
             except Exception as exc:
                 logger.warning("failed to download file %s: %s", name, exc)
@@ -3232,7 +4179,12 @@ class SlackFrontend(Frontend):
             sender = await self._resolve_sender(event.get("user", "unknown"))
         self._sender_names[session_id] = sender
         await self._resolve_session_metadata(
-            session_id, sender, channel, channel_type, thread_ts
+            session_id,
+            sender,
+            event.get("user") or bot_id,
+            channel,
+            channel_type,
+            thread_ts,
         )
         return sender
 
@@ -3240,10 +4192,26 @@ class SlackFrontend(Frontend):
         self,
         session_id: int,
         sender: str,
+        sender_id: str | None,
         channel: str,
         channel_type: str,
         thread_ts: str,
     ) -> None:
+        """Fill in the workspace, the legacy workspace, and the context.
+
+        The workspace is the conversation's directory, keyed on a platform id: a
+        DM on the sender's user id, a group DM or channel on its channel id. Ids
+        rather than names because a name changes under a rename and the
+        directory must not, and because a display name is somebody else's string
+        to put in a path. Every thread of the conversation shares it, so the
+        thread key (`_thread_keys`) is what still tells one thread's files apart.
+
+        The legacy name is the per-thread directory this same thread was given
+        before workspaces were shared, computed the way it was then so the
+        orchestrator can find and fold it. `sender_id` is passed in rather than
+        read from `_session_sender_ids`, which the message path fills in only
+        after this runs.
+        """
         if session_id in self._workspace_names:
             return
 
@@ -3251,14 +4219,16 @@ class SlackFrontend(Frontend):
         # dash so it reads as one path segment. Truncating to the integer
         # second used to look tidier and silently collided: `_session_key`
         # hashes the full ts, so two messages in the same second are two
-        # separate sessions, and both landed on one workspace directory —
-        # concurrent agents sharing a cwd, and `_save_files` overwriting or
-        # cross-reading the other conversation's attachments. Slack emits
-        # sub-second duplicates often enough for this to be routine.
+        # separate sessions, and both landed on one thread directory —
+        # `_save_files` overwriting or cross-reading the other conversation's
+        # attachments. Slack emits sub-second duplicates often enough for this
+        # to be routine.
         short_ts = thread_ts.replace(".", "-") if thread_ts else "root"
+        self._thread_keys[session_id] = short_ts
 
         if channel_type == "im":
-            self._workspace_names[session_id] = f"dm-{sender}-{short_ts}"
+            self._workspace_names[session_id] = f"dm/{sender_id or channel}"
+            self._legacy_workspace_names[session_id] = f"dm-{sender}-{short_ts}"
             self._channel_contexts[session_id] = "dm (private)"
             self._channel_names[session_id] = ""
             return
@@ -3269,7 +4239,8 @@ class SlackFrontend(Frontend):
             name = ch["name"]
         except Exception as exc:
             logger.warning("Failed to resolve channel %s: %s", channel, exc)
-            self._workspace_names[session_id] = f"{channel}-{short_ts}"
+            self._workspace_names[session_id] = f"channel/{channel}"
+            self._legacy_workspace_names[session_id] = f"{channel}-{short_ts}"
             self._channel_contexts[session_id] = f"channel:{channel}"
             # Still a channel, just an unnamed one: the id is the only key a
             # persona can match, and falling through to the DM branch would key it
@@ -3277,16 +4248,17 @@ class SlackFrontend(Frontend):
             self._channel_names[session_id] = channel
             return
 
+        self._legacy_workspace_names[session_id] = f"{name}-{short_ts}"
         if ch.get("is_mpim"):
             members = await self._resolve_mpim_members(channel)
-            self._workspace_names[session_id] = f"{name}-{short_ts}"
+            self._workspace_names[session_id] = f"mpim/{channel}"
             context = f"group-dm (private)\nParticipants: {', '.join(members)}"
             self._channel_contexts[session_id] = context
             self._channel_names[session_id] = ""
         else:
             self._channel_names[session_id] = name
             visibility = "private" if ch.get("is_private") else "public"
-            self._workspace_names[session_id] = f"{name}-{short_ts}"
+            self._workspace_names[session_id] = f"channel/{channel}"
             self._channel_contexts[session_id] = (
                 f"channel:#{name} ({visibility}) id:{channel}"
             )
@@ -3311,9 +4283,7 @@ def main() -> None:
     import argparse
     import sys
 
-    from dotenv import load_dotenv
-
-    from claude_on_the_fly import slack_manifest
+    from claude_on_the_fly import envfile, slack_manifest
     from claude_on_the_fly.heartbeat import (
         InstanceAlreadyClaimed,
         InstanceLockUnavailable,
@@ -3340,6 +4310,15 @@ def main() -> None:
     parser.add_argument(
         "--out", help="write the manifest here instead of stdout (flag mode)"
     )
+    parser.add_argument(
+        "--migrate-workspaces",
+        action="store_true",
+        help="fold every old per-thread directory into its shared workspace "
+        "(dry run unless --apply); stop the daemon first",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="with --migrate-workspaces: move"
+    )
     args = parser.parse_args()
 
     if args.manifest:
@@ -3349,7 +4328,9 @@ def main() -> None:
             )
         )
 
-    load_dotenv()
+    envfile.load_into_process()
+    if args.migrate_workspaces:
+        raise SystemExit(migrate_workspaces(apply=args.apply))
     app_token, token, user_id = run_slack()
     # Sender lists are left unset on purpose: unset means "read the config on every
     # message", which is what makes adding an allowed sender take effect without a
@@ -3363,6 +4344,48 @@ def main() -> None:
         # traceback. The supervisor already treats exit 2 as a clean refusal.
         sys.stderr.write(f"claude-slack: {exc}\n")
         raise SystemExit(2) from None
+
+
+def migrate_workspaces(*, apply: bool) -> int:
+    """`claude-slack --migrate-workspaces`: plan, print, and with `apply` move.
+
+    The lookups need only a bearer token, so the full preflight (Socket Mode app
+    token, sender lists) is not run: an operator migrating a data directory may
+    do it from a host where the daemon is not configured to start.
+
+    The token is read the way the daemon receives it, `DATA_DIR/.env` merged over
+    the shell (`envfile.daemon_environment`). `main` once loaded `.env` by
+    searching upward from this module's directory, so a hand-run CLI never saw
+    `DATA_DIR/.env`: measured on a deployed host, the dry run
+    asked for `SLACK_TOKEN` with the token sitting in `.env` beside the workspaces.
+    """
+    import sys
+
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    from claude_on_the_fly import checks, envfile, migration, settings
+
+    _, token = checks.resolve_slack_token(
+        settings.environment(envfile.daemon_environment())
+    )
+    if not token:
+        sys.stderr.write("claude-slack: set SLACK_TOKEN to resolve names to ids\n")
+        return 2
+    try:
+        directory = migration.SlackDirectory(WebClient(token))
+    except SlackApiError as exc:
+        # `token_revoked`, `missing_scope`, and the like: an operator problem
+        # with its name in it, not a traceback.
+        sys.stderr.write(f"claude-slack: Slack refused the lookup: {exc}\n")
+        return 2
+    plans = migration.plan_slack(DATA_DIR, directory)
+    print(migration.render_plans(plans))
+    if not apply:
+        print("dry run; add --apply to move")
+        return 0
+    print(f"moved {migration.apply_plans(plans, DATA_DIR)} directories")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

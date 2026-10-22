@@ -39,11 +39,15 @@ class LogsScreen(OverlayScreen):
         ("r", "refresh_now", "Refresh"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, preselect: Path | None = None) -> None:
         super().__init__()
         self._files: list[Path] = []
         self._selected: Path | None = None
         self._rendered_mtime: float | None = None
+        # Which file to open on. Set by a caller that already knows which log
+        # answers the question, so the operator does not have to find it in a
+        # list sorted by mtime.
+        self._preselect = preselect
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="overlay-box"):
@@ -64,13 +68,29 @@ class LogsScreen(OverlayScreen):
 
     def _reload_list(self) -> None:
         self._files = _available_logs()
+        # A named file is shown even when the listing rule would exclude it. The
+        # listing covers `.log` only, and the one file worth opening after a
+        # daemon refused to start is its `.stdout` capture -- the tracebacks the
+        # daemon wrote before any log handler existed. First, because it is what
+        # the caller opened this screen to show.
+        if (
+            self._preselect is not None
+            and self._preselect not in self._files
+            and self._preselect.is_file()
+        ):
+            self._files.insert(0, self._preselect)
         view = self.query_one("#logs-list", ListView)
         view.clear()
         for p in self._files:
             view.append(ListItem(Static(p.name)))
         if self._files and self._selected is None:
-            self._selected = self._files[0]
-            view.index = 0
+            # The newest log is what a bare open wants; a caller that named a
+            # file wants that one, when it is still on disk.
+            target = (
+                self._preselect if self._preselect in self._files else self._files[0]
+            )
+            self._selected = target
+            view.index = self._files.index(target)
             self._render_selected_full()
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:

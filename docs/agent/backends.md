@@ -8,7 +8,7 @@ Every backend implements the `AgentBackend` Protocol at `src/claude_on_the_fly/a
 
 - `run(workspace, session_uuid, prompt, platform, user_name, channel_context, timeout) -> Response` — execute one turn
 - `takeover_command(workspace, session_uuid) -> str | None` — interactive resume command, or `None` if no session yet
-- `session_log_path(workspace, session_uuid) -> Path | None` — live JSONL for the TUI's watch pane to tail, or `None`
+- `session_log_path(workspace, session_uuid) -> Path | None` — live JSONL for the TUI's live view to tail, or `None`
 - `list_skills() -> list[tuple[str, str]]` — `(name, description)` pairs for the Slack picker; empty when the backend has no skill concept
 
 A new backend means: implement the protocol, add a builder in `agent.py:_build_*_backend()` (see `_build_claude_backend` at `agent.py:786`), and add the env-driven switch in `get_backend()` at `agent.py:706`.
@@ -41,29 +41,150 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
   system prompt and the handoff, because `resume` on a missing rollout fails the turn
   outright (`thread/resume failed: no rollout found for thread id`).
 
+### Account profiles
+
+`accounts` names authentication profiles; `routing` selects an alias for the active backend.
+Keep account selection separate from backend and model selection.
+Resolve each account into a value passed with the turn; never change the daemon's environment for a turn.
+Concurrent conversations can select different accounts.
+
+Claude selects credentials with `CLAUDE_CONFIG_DIR`; a null home leaves that variable unset.
+Workspace transcript links preserve resume across profile contexts without sharing complete personal histories.
+Codex selects authentication from the account home and keeps the daemon's default configuration source.
+Its per-workspace, per-account home shares workspace sessions, without copying credentials.
+Transcript lookup, handoff, compaction, and sandbox grants must use the same effective paths as the spawn.
+
+Missing selected profiles fail explicitly.
+Only ordered routing lists permit fallback after provider-confirmed exhausted credits or quota.
+Keep each attempt within the saved backend and list; start with the saved alias and attempt each alias once per turn.
+Save the successful replacement. Generic rate limits, authentication errors, network errors, overload, and model capacity do not trigger fallback.
+After partial work, continue only from a durable native transcript with completed tool results.
+Unknown or incomplete checkpoints stop automatic retry. Never replay the original request after completed tool work.
+When account configuration is absent, preserve existing spawn and session behavior.
+
+### Shared workspaces
+
+Every session of a conversation runs in one directory (`protocol.Frontend.workspace_name`),
+so a workspace path no longer identifies a session. Three places used to assume it did:
+
+- **Handoff.** `transcript.prepend_latest_handoff` takes the session uuid and the platform.
+  On a platform in `agent.SHARED_WORKSPACE_PLATFORMS` it reads only the same uuid's file on
+  the other backend; the newest transcript in the directory is a different thread's.
+  `cron` keeps the old rule (newest other session in the workspace), because a profile
+  change mints a new uuid there on purpose.
+- **A codex first turn.** It has no thread id until codex writes the rollout, so the
+  follower finds the file by cwd, and the cwd is shared. `_run_codex_exec` snapshots the
+  rollouts on disk before the spawn and excludes them, and `CodexBackend.run` holds one
+  `asyncio.Lock` per directory, so the only new rollout with that cwd is its own. A resumed
+  turn takes no lock. Without both, the loser of two concurrent first turns delivered the
+  winner's reply and stored the winner's thread id.
+
+  **The lock covers discovery, not the turn.** `_FirstTurnGate` is released by the follower
+  the moment it binds a path, which is about a second after the spawn, and again on exit for
+  a turn that never got a rollout at all. That second release is why there is no discovery
+  timeout. Holding it for the whole turn was the earlier rule and it serialised a whole
+  conversation: three new threads in one Slack DM ran back to back at 41m40s, 1m37s and the
+  rest, and the two behind the first waited 36 and 32 minutes for a file that already
+  existed. New threads in one DM now start together; only their first second overlaps.
+- **The outbox and the inbox.** A turn's outbox is `outbox/<session uuid>/`, created and
+  retired by the orchestrator, so two threads' deliveries never mix; uploads land flat in
+  `inbox/` with a numeric suffix on a clash. The workspace root is the conversation's own
+  folder, for the human as much as the agent, so nothing else is split per thread.
+- **The session stores.** claude keys `projects/<hash of path>/`, codex keys the mapping
+  and `CODEX_HOME` on the path, so a moved directory orphans both. `migration.migrate_thread`
+  moves the transcript, the mapping and the rollout on a session's first turn in the new
+  layout. Measured on both CLIs: `claude --resume` and `codex exec resume` pick the
+  conversation up from the moved directory and record the new cwd from then on.
+
 ### Tool / skill counts (footer display)
 
 - **claude**: skills populated by CLI; tools from `tool_use` blocks.
-- **codex**: no skill concept in the footer (`skill_counts` always empty). Tools from `item.completed` events. `list_skills()` scans `$CODEX_HOME/prompts/*.md` for the picker.
+- **codex**: no skill concept in the footer (`skill_counts` always empty). Tools from the rollout's `item_completed` events, which name items in PascalCase (`CommandExecution`, `FileChange`). `Reasoning`, `UserMessage`, `AgentMessage` and `ContextCompaction` are what the turn did rather than tools it called, so they are excluded; an unknown type counts as a tool, so a new one appears in the footer rather than vanishing. `list_skills()` scans `$CODEX_HOME/prompts/*.md` for the picker.
 
 ### Interim progress
 
 When enabled, native and Ollama turns from both backends can forward mid-turn
 narration through the shared progress sink. Claude consumes its stream line by line
-in `agent._consume`; Codex observes its `--json` JSONL chunks incrementally and keeps
-partial lines until the next chunk arrives. An `agent_message` is held until a tool
-event proves it is narration, then the existing `InterimProgress` relay applies its
-warm-up and pacing policy. The final Codex message is discarded from the relay when
-`turn.completed` arrives because `Response.body` posts it once as the answer.
+in `agent._consume`; Codex follows its rollout file (`_RolloutFollower`), polling it
+once a second while the turn runs. An `AgentMessage` carries a `phase`, so narration is
+read from the producer rather than inferred: `commentary` is forwarded, `final_answer` is
+not, because `Response.body` posts that one once as the answer. The existing
+`InterimProgress` relay then applies its warm-up and pacing policy.
 
 Progress delivery is best effort: a parser or frontend failure is logged and never
 turns a successful agent run into an error. Claude pty has no line-oriented stream,
 and Telegram still inherits the frontend no-op, so both remain unsupported.
 
+### Where codex's machine data comes from
+
+A hosted codex turn runs the **interactive** binary rather than `codex exec`, so the
+pane mirrors codex's own UI; see [panes](panes.md). Either way it runs **without
+`--json`**. The flag would put the same events on stdout, but a
+`--json` run renders JSONL into the terminal, and the terminal is what the pane mirrors
+(see [panes](panes.md)) — so it buys a parser and costs the live view.
+
+Everything is read from the rollout instead, by `parse_codex_rollout`:
+
+| Needed | Rollout record |
+|---|---|
+| thread id | `session_meta.session_id` |
+| the reply | `event_msg/task_complete.last_agent_message` |
+| turn finished | `event_msg/task_complete` present |
+| turn failed | `event_msg/task_complete.error` or `event_msg/turn_aborted.reason` |
+| tool counts | `event_msg/item_completed.item.type` |
+| usage fallback | `event_msg/token_count.info.last_token_usage` |
+
+An `error` on `task_complete` is terminal even though the turn has a completion
+record. The backend raises it before the empty-reply nudge. Authentication
+rejections get a fixed, credential-free notice. A selected-model capacity error
+gets a fixed notice naming the capacity limit and suggesting a retry or a model
+change, without claiming that no work occurred. The provider's raw text stays
+in the Codex rollout and never becomes the Slack reply.
+
+Usage and the context reading already came from the rollout before this, so the numbers
+in the footer did not move.
+
+One parser serves both the hosted and the unhosted arm. That is the point: two readers of
+one turn drift, and a hosted turn reporting differently from an unhosted one would be
+invisible until somebody compared them.
+
+The rollout is append-only across `codex exec resume`, so the follower records the file's
+size before the spawn and reads only what arrives after it. Parsing from the top would
+fold an earlier turn's tool counts and final message into this one.
+
 ### System prompt
 
-- **claude**: `--system-prompt` flag.
+- **claude**: `--system-prompt-file <path>`, a 0600 file staged in the workspace and
+  discarded after the turn. The inline `--system-prompt <text>` is a real flag but hidden
+  from `--help`, and the file variant keeps the one argument cotf cannot bound off the
+  command line. Only sent when (re-)establishing a session; a healthy `--resume` reuses
+  the prompt claude recorded into the session (`--system-prompt-snapshot` defaults to on).
+  There is no fallback to the inline flag: a CLI release that drops the file variant makes
+  every first turn fail loudly at launch (`unknown option`), which is the intended trade
+  over quietly putting the prompt back into argv. pty mode still passes the inline flag,
+  because claude-pty's handling of the file variant has not been measured.
 - **codex**: no flag — format hint is prepended to each user message.
+
+### The turn's prompt
+
+One argv element is capped at `MAX_ARG_STRLEN` (32 pages, 131072 bytes, Linux), and a reply
+in a long Slack thread replays up to 50 prior messages ahead of the prompt. Measured on the
+thread that broke: 131360-142743 bytes, which killed the spawn in `execve` with `E2BIG`
+before the CLI started. The user saw the failure as the reply itself:
+`OSError: [Errno 7] Argument list too long: 'ollama'`.
+
+- **claude, native and ollama**: written to the CLI's stdin by `agent._exec`, which passes
+  `DEVNULL` when a turn has no prompt. An inherited open pipe would instead cost the CLI's
+  3-second stdin probe before the turn starts. Verified end to end on the deployment host
+  through `ollama launch claude`: 143072 bytes in argv reproduced the `E2BIG`, and the same
+  bytes on stdin answered correctly in one turn, so the launcher does forward its stdin.
+- **claude, pty**: stays in argv, and so does the inline system prompt. claude-pty reads
+  its prompt from argv and its stdin is the pane's TTY. **Known gap**: a pty deployment
+  still dies on a prompt past the argv cap.
+- **codex**: stays in argv on every arm, so the same gap applies. The tmux arm moves that
+  argv into the pane script (`_write_pane_script`), which lifts the 16 KB imsg limit a tmux
+  client imposes, but the script still execs codex with the prompt in argv, so codex's own
+  `execve` carries it either way.
 
 ### Permission mode
 
@@ -91,11 +212,54 @@ Reading it:
 
 Warm resumes are faster than these cold numbers and skip the first-turn system-prompt re-send.
 
+## Where the model and the effort come from
+
+One resolver decides, and the backends consume its answer. `agent.resolve_profile(name)`
+returns a frozen `AgentProfile(backend, mode, model, effort, ollama_context_window)`
+with every value already routed, and `agent.get_backend(profile)` binds the model and
+the effort onto the backend it constructs. Nothing below that line reads `settings`
+for any of the four.
+
+Two things depend on that.
+
+**The routing lives in one place.** Which key owns the effort depends on the mode:
+under a launcher it is `agent.ollama.effort`, otherwise the backend's own. The model
+is suppressed entirely under a launcher, since `ollama launch … --model X` already
+pinned it and a second `--model` would be a dead flag on the wrapped argv. Both
+backends used to re-derive that, and `current_backend_key` derived it a third time.
+
+**A per-job override is safe under concurrency.** The worker runs several jobs as
+asyncio tasks in one interpreter. The answer travels as an argument from
+`jobs/agent_runner.py` through `agent.run(profile=…)` into the constructor, so two
+jobs cannot read each other's. Any design that swapped process-global settings around
+the call would be a data race, which is why the profile is a value and not ambient
+state.
+
+**Both backends apply the effort in pty mode.** For codex, `-c` is a global option,
+not an `exec` one, so both argv builders pass it and `_effort_args` resolves it once
+for both. Verified by driving the interactive TUI under tmux with
+`-c model_reasoning_effort="low"` against a `config.toml` saying `medium`: codex's own
+statusline read `gpt-5.6-luna low`, and a `resume` with `xhigh` on the same thread
+reported `xhigh`.
+
+Claude was an exception until the same method was applied to it. `--effort` is a
+session flag in claude's own help, not a `-p` one, and the interactive TUI acts on it:
+started under tmux with `--effort low` it banners `Opus 5 (1M context) with low
+effort`, with `--effort max` it banners `max`, and with no flag it banners the
+`effortLevel` from settings. The earlier carve-out rested on the flag being untested
+rather than on any measurement, and it had grown a `$model` refusal that dropped the
+model change along with the effort.
+
+`AgentProfile.key` is the `backend:mode:model` string that seeds session uuids. It is
+a wire format: codex substitutes `default` for an empty model and claude does not, and
+that asymmetry is preserved deliberately because changing the rendering would restart
+every session an earlier build wrote.
+
 ## Transport modes
 
 ### ollama launch
 
-Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementation: `OllamaLauncher` at `src/claude_on_the_fly/agent.py:636`. Triggered by `agent.claude.mode: ollama` / `agent.codex.mode: ollama`. Requires `ollama` installed and target model pulled (`ollama pull <name>`). Session resume, tool use, and Skills behave identically to native mode — only the model provider changes. For claude, the footer cost reflects Ollama's billing (`:cloud` models) or `$0` (local).
+Wraps the agent CLI in `ollama launch <agent> --model <X> --yes --`. Implementation: `OllamaLauncher` at `src/claude_on_the_fly/agent.py:636`. Triggered by `agent.claude.mode: ollama` / `agent.codex.mode: ollama`. Requires `ollama` installed and target model pulled (`ollama pull <name>`). Session resume, tool use, and Skills behave identically to native mode — only the model provider changes. For claude, the footer cost reflects Ollama's billing (`:cloud` models) or `$0` (local). For codex, the argv also carries `-c web_search="disabled"`: codex sends its hosted web_search tool by default, and ollama's endpoint refuses the whole request over it (`the web_search tool is not supported`).
 
 ### pty (claude only)
 
@@ -125,14 +289,28 @@ Both backends compact, by unrelated mechanisms.
 
 What works is the threshold codex checks itself before each turn (`run_auto_compact`, in exec's own code path). `CodexBackend.compact` passes `-c model_auto_compact_token_limit=<low>` for that one run, so the check fires and the user's `~/.codex/config.toml` is never touched. Same thread: 46,357 → 18,507, and it survived later plain resumes.
 
-Two consequences of codex's route. It needs a turn to hang off, so it spends one cheap exchange where claude spends none. And it publishes no in-band signal, so success is judged by whether the prompt actually shrank — reporting success off the trigger alone would repeat the exact lie `/compact` tells. That also means no duration, which is why `Compaction.summary()` omits the timing when it is absent rather than printing "in 0s".
+Codex's route needs a turn to hang off, and the model then answers that turn's prompt. An earlier trigger, "Reply with the single word: compacted", did reach the model: it answered the user's next question with "compacted", and one ollama model made tool calls that compacted the thread again in a loop. So `compact` watches the rollout and cancels the run at the first `turn_context`. At that point any compacted history is on disk and the model has not been called yet. It stops there even when no `compacted` record came first, so a run that skipped the compaction never reaches the model either; it reports a failure. The trigger text is now inert ("Automatic context checkpoint. No action is needed.") as a backstop. Only records written after the run starts count, so an older compaction in a long thread does not.
+
+The `compacted` record is the evidence of success. A token drop is not: codex re-sends about 10k tokens of developer instructions after compacting, and judging by the drop failed real compactions. Codex writes no size after the compaction and no duration, so `Compaction` carries only `pre_tokens`, and `summary()` omits the timing rather than printing "in 0s".
+
+**The numbers on both backends.** `pre_tokens` is the whole prompt before. Nothing measures the whole prompt after. claude's `postTokens` counts the summarized conversation only and leaves out the system prompt and tools, so it is reported separately as `conversation_tokens_after` and never with an arrow. Measured on one thread: 55,161 before, 6,050 conversation after, and the next request was 50,171.
 
 ### Context readings
 
-Both modes report prompt size and window size, which is what the auto-compact gate thresholds on. pty reads them off the statusline (`context_window.total_input_tokens` / `context_window_size`). Native derives them in `_native_context_fields`: all three `usage` terms summed, paired with the widest `modelUsage[…].contextWindow`. codex reports both in its rollout instead of on stdout — `last_token_usage.input_tokens` for the turn's own prompt and `model_context_window` for the window, read by `transcript.extract_codex_prompt_tokens` (which skips the `input_tokens: 0` turn a compaction reports, since that describes the pass rather than the context it left behind). **ollama has none to read**: the claude CLI fills in `contextWindow` from its own table even when ollama is serving another vendor's model (200000 observed for `glm-5.2:cloud`), so the figure describes a model that is not answering. Cost has a real substitute in the OpenRouter registry; a context window has none the engine can derive, so the engine does not invent one — unset, it reports nothing, which switches the auto-compact gate off there instead of thresholding against a made-up denominator. `agent.ollama.context_window` lets the operator state the window instead. A stated window is not a guess, so with it set both `ctx N%` and the gate work in ollama mode; `_native_context_fields` takes it as `window_override` and skips the `modelUsage` lookup. `$compact` is unaffected. Note `Response.tokens_in` is **not** usable for this — it omits `cache_creation_input_tokens` by design, and on a cold cache that is most of the prompt (22k of 40k on a measured turn), which is exactly the case the feature exists for.
+Both modes report prompt size and window size, which is what the auto-compact gate thresholds on. pty reads them off the statusline (`context_window.total_input_tokens` / `context_window_size`). Native derives them in `_native_context_fields`: all three `usage` terms summed, paired with the widest `modelUsage[…].contextWindow`. codex reports both in its rollout instead of on stdout — `last_token_usage.input_tokens` for the turn's own prompt and `model_context_window` for the window, read by `transcript.extract_codex_prompt_tokens` (which skips the `input_tokens: 0` count a compaction writes, since that describes the pass rather than the context it left behind). **ollama has no window to read**: the claude CLI fills in `contextWindow` from its own table even when ollama is serving another vendor's model (200000 observed for `glm-5.2:cloud`), so the figure describes a model that is not answering. Cost has a real substitute in the OpenRouter registry; a context window has none the engine can derive, so the engine does not invent one — unset, it reports the token count and no window, which switches the auto-compact gate and `ctx N%` off there instead of thresholding against a made-up denominator. The count is the routed model's own, so the idle compaction, which thresholds on the count alone, still works. `agent.ollama.context_window` lets the operator state the window instead. A stated window is not a guess, so with it set both `ctx N%` and the gate work in ollama mode; `_native_context_fields` takes it as `window_override` and skips the `modelUsage` lookup. `$compact` is unaffected. Note `Response.tokens_in` is **not** usable for this — it omits `cache_creation_input_tokens` by design, and on a cold cache that is most of the prompt (22k of 40k on a measured turn), which is exactly the case the feature exists for.
 
 ## Persona / cross-backend handoff
 
 - `ensure_persona()` in `agent.py` symlinks a persona into every workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex) — see `PERSONA_FILENAMES`. The source is `~/.claude-on-the-fly/CLAUDE.md` unless the caller resolved a per-chat one through `agent.persona_for` (Slack channel, Telegram chat, or job key) through its `personas:` table.
 - `transcript.py` handles cross-backend handoff: when the daemon switches backends, it parses the prior backend's session JSONL into a single prompt so context carries over. If you're changing session-log paths or output schemas in a backend, this is the file that will break.
 - `remove_workspace_sessions()` deletes the session directory claude keys to a workspace path but keeps *outside* it (`~/.claude/projects/<hash>/`) and removes matching Codex mappings from the daemon-owned store.
+
+### Direct Codex diagnostic output
+
+The direct `codex exec` subprocess writes its final reply to stdout and ongoing
+narration (including tool output) to stderr. Keep the final reply subject to the
+shared 8 MiB cap, but drain stderr continuously and retain only its last 64 KiB
+for exit diagnostics. Cumulative narration is not a response-size violation.
+The rollout remains the durable execution record. Both readers must be cancelled
+and awaited when the turn is cancelled or the stdout cap is exceeded, so a
+surviving descendant holding a pipe cannot strand the reader tasks.

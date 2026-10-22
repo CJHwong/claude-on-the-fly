@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import shlex
 from collections.abc import Awaitable, Callable
@@ -665,7 +666,9 @@ class PermissionService:
         which is cotf's problem and is recoverable -- Escape refuses that one call and
         the turn carries on.
         """
-        alive, _ = await _tmux("has-session", "-t", self.tmux_session)
+        alive, _ = await _tmux(
+            "has-session", "-t", self.tmux_session, session=self.tmux_session
+        )
         if alive != 0:
             logger.error(
                 "permissions[%s]: tmux session %s does not exist, so claude-pty "
@@ -812,6 +815,26 @@ def write_mcp_config() -> Path:
     return path
 
 
+# Built-in agent-side scheduling tools. Every claude process here is
+# short-lived -- one process per turn, resumed from the transcript -- so
+# an in-process timer dies the moment the turn ends. These tools can
+# register a job and list it on later turns, but the turn that must fire
+# it is gone by then, so the scheduled work silently never runs. Scheduling
+# belongs to the resident cron daemon (claude-cron) instead.
+# Override with COTF_DISALLOWED_TOOLS (comma- or space-separated), or set
+# it empty to keep the tools.
+DEFAULT_DISALLOWED_TOOLS = ("CronCreate", "CronDelete", "CronList", "ScheduleWakeup")
+
+
+def disallowed_tools_argv() -> list[str]:
+    """The --disallowed-tools flag for built-in tools this runtime cannot honor."""
+    raw = os.environ.get("COTF_DISALLOWED_TOOLS", " ".join(DEFAULT_DISALLOWED_TOOLS))
+    tools = [t for t in re.split(r"[,\s]+", raw.strip()) if t]
+    if not tools:
+        return []
+    return ["--disallowed-tools", ",".join(tools)]
+
+
 def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> list[str]:
     """The claude flags that switch tool permissions on, or none when off.
 
@@ -827,10 +850,11 @@ def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> li
     start an MCP server nothing ever calls.
     """
     resolved = configured() if resolved is None else resolved
+    disallowed = disallowed_tools_argv()
     if resolved.enabled and pty:
-        return ["--permission-mode", resolved.claude_mode]
+        return ["--permission-mode", resolved.claude_mode, *disallowed]
     if not resolved.enabled:
-        return ["--permission-mode", "bypassPermissions"]
+        return ["--permission-mode", "bypassPermissions", *disallowed]
     return [
         "--permission-mode",
         resolved.claude_mode,
@@ -838,6 +862,7 @@ def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> li
         str(mcp_config_path()),
         "--permission-prompt-tool",
         PROMPT_TOOL,
+        *disallowed,
     ]
 
 
@@ -1144,14 +1169,30 @@ NO_PANE_NOTICE = (
 )
 
 
-async def _tmux(*args: str) -> tuple[int, str]:
-    """Run tmux and return (returncode, stdout). Never raises."""
+async def _tmux(*args: str, session: str = "") -> tuple[int, str]:
+    """Run tmux against `session`'s server and return (returncode, stdout).
+
+    `session` decides which server, which is the whole point: a hosted turn puts
+    claude-pty's session on its own server, addressed by TMUX_TMPDIR, and a tmux
+    run without it talks to the operator's default server instead. Every probe
+    here would then report the dialog missing, so the turn would park on a
+    question nobody could read, answer, or cancel.
+
+    Empty, or a session with no run directory, keeps the default server, which is
+    where claude-pty puts its session when hosting is off.
+
+    Never raises.
+    """
+    from claude_on_the_fly import tmux as tmux_mod
+
+    overrides = tmux_mod.session_env(session) if session else {}
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **overrides} if overrides else None,
         )
         out, _err = await proc.communicate()
     except (OSError, ValueError) as exc:
@@ -1162,7 +1203,7 @@ async def _tmux(*args: str) -> tuple[int, str]:
 
 async def capture_pane(session: str) -> str:
     """The visible pane of `session`, or "" when it cannot be read."""
-    code, text = await _tmux("capture-pane", "-p", "-t", session)
+    code, text = await _tmux("capture-pane", "-p", "-t", session, session=session)
     return text if code == 0 else ""
 
 
@@ -1194,7 +1235,7 @@ async def answer_dialog(session: str, dialog: Dialog, *, allowed: bool) -> bool:
     keystroke carries no text.
     """
     key = dialog.yes_key if allowed else dialog.no_key
-    code, _ = await _tmux("send-keys", "-t", session, key)
+    code, _ = await _tmux("send-keys", "-t", session, key, session=session)
     if code != 0:
         logger.error("permissions: could not answer the dialog in %s", session)
         return False
@@ -1214,9 +1255,9 @@ async def _deliver_refusal(session: str) -> None:
     by which the reason reaches the model.
     """
     await asyncio.sleep(_POLL_INTERVAL_SECONDS * 4)
-    await _tmux("send-keys", "-t", session, PTY_DENY_MESSAGE)
+    await _tmux("send-keys", "-t", session, PTY_DENY_MESSAGE, session=session)
     await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-    await _tmux("send-keys", "-t", session, "Enter")
+    await _tmux("send-keys", "-t", session, "Enter", session=session)
 
 
 async def cancel_dialog(session: str) -> bool:
@@ -1234,7 +1275,7 @@ async def cancel_dialog(session: str) -> bool:
     envelope written, terminal_reason=completed) with the model explaining what it
     would have needed.
     """
-    code, _ = await _tmux("send-keys", "-t", session, _CANCEL_KEY)
+    code, _ = await _tmux("send-keys", "-t", session, _CANCEL_KEY, session=session)
     if code != 0:
         logger.error("permissions: could not cancel the dialog in %s", session)
         return False
@@ -1251,13 +1292,29 @@ TMUX_SESSION_PREFIX = "cotf-pty"
 TMUX_SESSION_ENV = "CLAUDE_PTY_TMUX_SESSION"
 
 
-def tmux_session_name(chat_id: int, session: str) -> str:
-    """A pane name unique to one chat's current session.
+def tmux_session_name(platform: str, chat_id: int, session: str) -> str:
+    """A pane name unique to one chat's current session, on one frontend.
 
     Includes the session discriminator so `/new` cannot inherit a pane, and is short
     because tmux session names appear in every `tmux ls` the operator runs.
+
+    `platform` segments the name per daemon, which is what makes the startup sweep
+    safe. Every hosted turn now lives on one shared tmux server, so a restarting
+    orchestrator reaps by name prefix rather than by the per-run `owner.pid` a
+    private server used to carry -- and slack and telegram run as separate
+    orchestrators. Without this segment a telegram restart would reap slack's live
+    chat panes, killing turns mid-flight.
     """
-    return f"{TMUX_SESSION_PREFIX}-{chat_id}-{session[:8]}"
+    return f"{TMUX_SESSION_PREFIX}-{platform}-{chat_id}-{session[:8]}"
+
+
+def tmux_session_prefix(platform: str) -> str:
+    """Every chat pane one orchestrator owns, and no other daemon's.
+
+    The sweep's argument. Built here rather than spelled out at the call site so it
+    cannot drift from `tmux_session_name`.
+    """
+    return f"{TMUX_SESSION_PREFIX}-{platform}-"
 
 
 def pty_settings_path() -> Path:

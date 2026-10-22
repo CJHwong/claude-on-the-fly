@@ -27,6 +27,8 @@ reconfigure an already-running worker.
 
 One worker drains both producers, so delivery fans back out by where a job came from: `notifiers.RoutingNotifier` dispatches on `origin["kind"]` to the Slack thread notifier or to `LogNotifier`, which appends a cron reply to that entry's own log. It raises on an unknown kind rather than returning, so a typo'd kind shows up as a stuck reply in `undelivered()` instead of one marked delivered to nowhere.
 
+`Result` carries `ok`, `text`, and `tool_calls` — how many tool calls the run made. The count defaults to 0, so a runner that cannot know it constructs a `Result` from `ok` and `text` alone. It exists because a run that answers without acting raises nothing and so used to be recorded as a success: `Job.min_tool_calls` is the per-job floor, and `agent_runner` returns `ok=False` when the run's count is below it. See [cron.md](cron.md) for why that floor is per entry and off by default.
+
 A `Job` carries an opaque `origin` dict. The core, the queue, and the worker pass it through untouched; only the notifier reads it. That is what keeps vendor vocabulary (`channel`, `thread_ts`) out of the core.
 
 `JobQueue` also carries `mark_delivered`/`undelivered` (see delivery tracking below) and `list_unfinished(limit)`, the read half of the port, returning `QueueRow`s. A producer answering "what is already queued?" goes through it rather than reaching into `file_queue`, so the answer survives a swap to a broker-backed adapter. Rows carry `origin` for the same reason a `Job` does: the core cannot filter by channel, but the Slack frontend can.
@@ -53,13 +55,30 @@ Two properties everything else rests on:
 - **Ids are `f"{time.time_ns()}-{uuid4().hex[:8]}"`.** Time-sortable, so `sorted(new/)` is FIFO — and the enqueue time is readable straight out of the name, with no `stat()` and no reliance on an mtime a copy or a `touch` would move.
 - **A keyed job's filename carries its key**: `<id>__<entry>__<item>.json` in `new/` and `cur/` (`keys.queue_filename`). Unkeyed jobs stay `<id>.json`. The key is in the *name* so `count_unfinished` can answer a producer's dedup and concurrency questions with two globs and zero file reads — it is asked on every poll, and reading every queued job to answer it would put the cost of the whole queue on every fire. The id stays the first component, so FIFO and `_enqueued_at` are unaffected. **Anything wanting the id from a filename goes through `keys.job_id_from_filename`**; `Path.stem` is the id *plus* its key on a keyed file. `done/` deliberately does not follow the scheme — `complete()` archives to a bare `<id>.json` so `undelivered()` pairs a job with its result by id alone. That is also why the key charset excludes `.`: a key containing one could mint an id whose job file is indistinguishable from another id's `.result.json`.
 
+**A job payload carries `profile`.** It names an `agent.profiles` block, or is null for
+the daemon's global agent config, and `agent_runner` resolves it once per run for both
+the session-uuid seed and the `agent.run` call. `_load` reads it with `.get`, like the
+other dispatch fields, which means the tolerance runs both ways: a worker older than
+the field ignores a `profile` it does not understand and runs the daemon default. A
+mixed-version rollout therefore downgrades the model rather than failing, which is
+worth knowing before you deploy one half of a pair.
+
+**A job payload can carry `available_at`.** A naive local ISO timestamp: the earliest
+moment `claim()` may hand the job over. `claim()` reads it before the rename and skips a
+job whose time has not come, so future work parks in `new/` instead of running — and the
+timestamp travels in the payload, so `recover_stale` and a restart both leave it intact.
+A worker older than the field ignores it and runs the job immediately, the same downgrade
+direction as `profile`. Unparseable or offset-carrying values are poison, not tolerated:
+a silently ignored "not before" runs early, which is the one failure this field exists
+to prevent.
+
 **Delivery is tracked separately from completion.** `complete()` archives the result, and a `<id>.delivered.json` marker is written only once a notifier returns. A result with no marker is a reply somebody is still waiting for — the worker was cancelled between finishing and posting, or the post failed — and `redeliver_pending` re-posts it at the next start, before claiming new work. Only the *reply* is retried: the job's agent run already happened, and re-running it would repeat every side effect it had. Bounded by `DELIVERY_RETRY_WINDOW_S` (24h), so a permanently undeliverable result is not retried on every start until the archive prunes it.
 
 That is why `Notifier.notify` **raises** on a failed post rather than swallowing it: returning normally is what marks a result delivered, so an adapter that hides a failure turns a retryable miss into a reply nobody ever receives.
 
 **Outcomes are reported back to the producer.** `OutcomeRecorder` is the fourth port: the worker calls it once per completed job, after the result is durable and before delivery. Only a *producer* needs it — `cron.py` records attempts when it enqueues, and without the matching outcome its backoff reads a `failures` count nothing increments. It shipped broken exactly that way once, with unit tests green because they called the store directly, so the composition test now asserts the daemon's own wiring leaves a failure on record. Implementations must not raise, and the worker guards the call anyway: it sits between a durable result and its delivery, so a bookkeeping bug must not cost the reply.
 
-**Failures are alerted to a monitoring surface.** `AlertSink` is the fifth port: the worker calls it once per completed job, after delivery, only when `result.ok` is False. A cron-origin failure has no live thread — the entry's log is the only record, and nobody is watching it — so the sink posts a compact heads-up to a configured channel or chat. The sink decides whether the origin is alertable; the core never reads `origin`. The factory `build_alert_sink` (`jobs/alerts.py`) reads `slack.alert_target` and `telegram.alert_target` and returns None when neither is set, so alerts are opt-in and an install that never configured one behaves exactly as it did before. The sinks are wrapped in three layers: `CronOriginAlertSink` alerts only cron-origin failures (a Slack-origin job's failure already replies in its thread, where the requester is watching); `MultiAlertSink` fans out to every configured platform, each guarded, and raises only when every sink failed — which is what keeps the cooldown from silencing the next attempt; `CooldownAlertSink` allows one alert per entry per `ALERT_COOLDOWN_S` (30 min), in-memory, because a failing entry fires on its own schedule and would otherwise spam the channel at every fire. The cron producer alerts through the same factory for its own failures — a side-effect command or a producer exiting non-zero — see [cron.md](cron.md). Two paths deliberately never alert: a cancelled job's interrupted notice is not a failure (the job re-runs), and a redelivered result does not re-alert (the alert fired at completion; a worker that crashed between completing and delivering loses it, which the entry's log already records).
+**Failures are alerted to a monitoring surface.** `AlertSink` is the fifth port: the worker calls it once per completed job, after delivery, only when `result.ok` is False. A cron-origin failure has no live thread — the entry's log is the only record, and nobody is watching it — so the sink posts a compact heads-up to a configured channel or chat. The heads-up is a plain `cron entry <entry> failed` header (Slack prefixes `:x: `, and operators may match on that exact start, so it carries no markup) and the first `ALERT_BODY_LIMIT` characters of the failure, cleaned first so the budget is not spent on noise: terminal escape sequences from a pane capture are stripped, the `codex exec` banner (workspace path, sandbox mode, session id) and its prompt echo are dropped in favor of codex's `ERROR:` lines, and a bare exit code becomes `Exited with code N. See the entry log.` The sink decides whether the origin is alertable; the core never reads `origin`. The factory `build_alert_sink` (`jobs/alerts.py`) reads `slack.alert_target` and `telegram.alert_target` and returns None when neither is set, so alerts are opt-in and an install that never configured one behaves exactly as it did before. The sinks are wrapped in three layers: `CronOriginAlertSink` alerts only cron-origin failures (a Slack-origin job's failure already replies in its thread, where the requester is watching); `MultiAlertSink` fans out to every configured platform, each guarded, and raises only when every sink failed — which is what keeps the cooldown from silencing the next attempt; `CooldownAlertSink` allows one alert per entry per `ALERT_COOLDOWN_S` (30 min), in-memory, because a failing entry fires on its own schedule and would otherwise spam the channel at every fire. The cron producer alerts through the same factory for its own failures — a side-effect command or a producer exiting non-zero — see [cron.md](cron.md). Two paths deliberately never alert: a cancelled job's interrupted notice is not a failure (the job re-runs), and a redelivered result does not re-alert (the alert fired at completion; a worker that crashed between completing and delivering loses it, which the entry's log already records).
 
 A cancelled job's origin is **told**, from `worker.run_once`'s `except CancelledError`. It is a notice, not a delivery: nothing is marked, because there is no result to redeliver — the job itself re-runs. The notice is shielded and bounded by `NOTICE_BUDGET_S`, so the cancellation it reports cannot be delayed past the supervisor's grace, and a notifier that raises is logged rather than allowed to swallow the cancel. "It re-runs at the next start" is invisible from the thread that asked, which is the whole reason this exists.
 
@@ -68,6 +87,17 @@ A cancelled job's origin is **told**, from `worker.run_once`'s `except Cancelled
 **`done/` is pruned to 7 days on completion** (`DONE_RETENTION_S`), deliberately shorter than the 30-day log and workspace windows: the archive is rescanned in full on every completion, so widening it charges the hot path rather than the disk. By age rather than count, so a burst of small jobs cannot evict this morning's.
 
 **`complete()` writes two files into `done/`** — `<id>.result.json` first (so a crash between the two still leaves a durable result), then the job file moves in. Anything counting finished jobs must count `*.result.json`; counting `*.json` double-counts every one of them.
+
+
+**A failed run can explain itself, behind a flag.** `jobs.diagnose_failures` (default off) makes `OrchestratorAgentRunner` read the run's own transcript before it builds the failure `Result`, and append what the timestamps say. The alert already carries whatever the CLI reported, which for a timeout is only that it timed out; the signals answer the next question. Four rules, all arithmetic and substring matching, no model call: whether the run reached the backend's own "the agent finished" event (if it did, the fault is on our side of the CLI boundary, which is the difference between a real agent crash and cotf mis-reading a healthy run); how the wall clock split between the model and its tool calls; whether a `.py` or `.sh` path named in the prompt ever appears in a tool call; and whether three or more tool results came back as errors.
+
+The rules are shared and the readers are not. `transcript._RunFacts` is what a rule sees, `_codex_facts` reads a rollout and `_claude_facts` reads a session file, and `transcript.diagnose` picks the reader from the job's own resolved profile — never the daemon's global backend, or an entry whose profile switched backends would be diagnosed against a format it never wrote. A backend with no reader gets no signals rather than a guess. The finished-event marker is each backend's own name for it, `task_complete` for codex and `end_turn` for claude, so a signal names something an operator can grep the transcript for. `_failure_signals` in `jobs/agent_runner.py` is the gate that keeps the whole thing opt-in and non-fatal — a diagnosis is a courtesy on a path that is already failing, so a broken read must never replace the real error with its own traceback.
+
+Two things the claude arm has to do that the codex arm does not. A keyed job resumes its claude session, so one file holds every fire the key has ever had: `_claude_last_fire` trims to the last prompt row (a `user` row whose content is a plain string — a tool result is a `user` row too, but its content is a list, and a subagent's prompt sits on a sidechain), or the run times in hours and today's failure is explained by last week's tool calls. And the last row is not the verdict: a finished turn writes `system` rows for its stop hook and its duration after the last message, then untimestamped bookkeeping (`mode`, `ai-title`, `last-prompt`). So finishing is `end_turn` anywhere in the fire — reading it off the last row called 9 of 96 real fires unfinished — and the event reported for an unfinished one is the last *message* row, which names what the agent was doing (`assistant/tool_use` for a turn killed holding a tool call, `assistant/stop_sequence` for one the API cut off). Sidechain rows do count toward tool time: a delegating run spends its wall clock inside them, and dropping them reads it as a stall.
+
+Measured against 96 real fires on one deployment: 82 reached `end_turn`, and every one of the other 14 was a genuine unfinished turn — an API error, or a fire whose last message is the prompt itself.
+
+Locating the rollout is the part with a trap. `_find_codex_rollout_by_cwd` looks right and is not: it reads only the single freshest rollout in the store, which is correct for its 1Hz live tailer (the run being watched *is* the freshest file) and wrong for a post-mortem. On a host firing cron every 15 minutes, several newer rollouts exist by the time a failure is diagnosed, and that helper found nothing on every real failure it was tried against. `_find_finished_rollout_by_cwd` is the post-mortem lookup: newest first, one line read per candidate, first cwd match wins, capped by `_MAX_ROLLOUT_CANDIDATES`. Unit tests do not catch this — each fixture writes one rollout, so any lookup passes. `TestRollutLookupUnderLoad` writes several.
 
 ## Reading the queue from outside
 
@@ -120,7 +150,15 @@ A queue deeper than the row cap gets a trailing `… N more` row, so the cap nev
 
 The widget ids are `tab-jobs` / `#jobs-panel` / `#jobs-queue-header` / `#jobs-queue`. **`#cron-entries` is a different widget** — the cron tab's cron table — and must not be reused.
 
-The watch pane tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
+The preview mode shows the highlighted job's prompt in full, through
+`file_queue.read_job_prompt`. The queue listing cuts every row's prompt at
+`PROMPT_PREVIEW_LIMIT`, because the listing is memoized and would otherwise pin every
+queued prompt in the observing process; the preview asks for one job instead and pays
+one file read for it. The dashboard caches that read per job id and prunes the cache
+against the listing, because a job's prompt is written at enqueue and never changes,
+while a job that leaves the queue should not keep its prompt in memory.
+
+The live view tails a running job's live agent session: the runner publishes each in-flight job's `session_uuid` and workspace in `in_flight` (`jobs/agent_runner.py`), and the worker's heartbeat carries it as `running_jobs` — the same shape the chat orchestrator publishes, so the dashboard resolves both with one normalizer. The entry is cleared when the run ends (including on cancel), so the pane goes blank when the job leaves the queue.
 
 ## Workspaces
 
@@ -152,6 +190,16 @@ A keyed workspace is never swept, however old. It *is* the continuity for the ne
 | `jobs.timeout` | `agent.DEFAULT_TIMEOUT` | Per-job wall clock; `0` or negative means no limit. A `Job.timeout` from a producer overrides it |
 | `jobs.concurrency` | `1` | How many jobs run at once. A property of the machine, deliberately separate from a producer's own `max_concurrent` |
 | `jobs.workspace_keep_days` | `30` | How long a finished one-shot workspace is kept before the startup sweep retires it; `0` keeps them forever. Keyed workspaces are never swept |
+| `jobs.diagnose_failures` | `false` | Experimental. On failure, read the run's own transcript and append deterministic signals to the alert text. codex and claude |
 | `JOBS_SLACK_TOKEN` | falls back to `SLACK_TOKEN` | Notifier token. Stays in `.env`: it is a credential |
 
 Set `JOBS_SLACK_TOKEN` to a **bot** (`xoxb-`) token. Inheriting a user (`xoxp-`) token from `SLACK_TOKEN` makes the worker post results as that user, and the Slack frontend — a separate process with its own dedup set — re-ingests them as new input, one spurious agent turn per job. `cli._notifier_loop_warning` warns about exactly this at startup.
+
+
+## Panes
+
+A job runs inside its own tmux pane when tmux is present, named
+`cotf-job-<run id>` where the run id is the workspace's directory name. The TUI's live
+view mirrors it, and `OrchestratorAgentRunner` reaps it with `tmux.kill` in the same
+`finally` that clears `in_flight`. The worker sweeps whatever a killed worker left behind
+at startup, beside the workspace sweep. See [panes](panes.md).

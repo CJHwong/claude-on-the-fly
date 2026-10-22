@@ -25,12 +25,19 @@ logger = logging.getLogger(__name__)
 # Immutable ref, reviewed when this dependency was updated. Never execute a
 # mutable branch URL from daemon preflight: a repository force-push must not turn
 # a routine hook refresh into arbitrary code execution.
-PTY_INSTALL_COMMIT = "323796ca5052127352d00a3e5c68eb403001a8b8"
+PTY_INSTALL_COMMIT = "9c85c484ec38af7eaede41d374bba2f412450a79"
+PTY_INSTALL_REPO = "CJHwong/claude-interactive-p"
 INSTALL_URL = (
-    "https://raw.githubusercontent.com/CJHwong/claude-interactive-p/"
+    f"https://raw.githubusercontent.com/{PTY_INSTALL_REPO}/"
     f"{PTY_INSTALL_COMMIT}/install.sh"
 )
-MANUAL_HINT = f"curl -fsSL {INSTALL_URL} | bash"
+# The fetched installer bootstraps its sibling files in a second request. Pin
+# that request too, rather than allowing its default `main` ref to drift.
+MANUAL_HINT = (
+    f"curl -fsSL {INSTALL_URL} | "
+    f"CLAUDE_INTERACTIVE_P_REPO={PTY_INSTALL_REPO} "
+    f"CLAUDE_INTERACTIVE_P_REF={PTY_INSTALL_COMMIT} bash"
+)
 
 
 @dataclass(frozen=True)
@@ -106,7 +113,7 @@ def run_installer(
         return False, "bash not on PATH"
     try:
         proc = runner(
-            f"curl -fsSL {INSTALL_URL} | bash",
+            MANUAL_HINT,
             shell=True,
             check=False,
             capture_output=True,

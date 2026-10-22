@@ -88,6 +88,42 @@ def _optional(value: object, *types: type) -> bool:
     return isinstance(value, types)
 
 
+def _parse_available_at(value: object) -> datetime | None:
+    """The payload's `available_at` as a naive local datetime, or None.
+
+    Raises ValueError when the value is present but wrong — a type mismatch or
+    an unparseable / timezone-carrying string — so `_load` can quarantine the
+    file as poison. A naive comparison would silently compare an aware datetime
+    against the local clock and raise TypeError mid-claim, which is worse than
+    refusing the file up front.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"available_at must be a string, got {value!r}")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        raise ValueError(f"available_at {value!r} carries a timezone offset")
+    return parsed
+
+
+def _due(path: Path) -> bool:
+    """Whether a queued job's `available_at` has passed. Unreadable or
+    unparseable files read as due, so `_load` quarantines them rather than a
+    bad timestamp silently parking the work in `new/` forever."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        available_at = data.get("available_at")
+    except (OSError, ValueError, AttributeError):
+        return True
+    if available_at is None:
+        return True
+    try:
+        return datetime.fromisoformat(available_at) <= datetime.now()
+    except (ValueError, TypeError):
+        return True
+
+
 class FileInboxQueue:
     """File-backed `JobQueue`. Pass the directory that holds the maildir tree."""
 
@@ -120,6 +156,14 @@ class FileInboxQueue:
             "session_key": job.session_key,
             "timeout": job.timeout,
             "platform": job.platform,
+            "profile": job.profile,
+            "min_tool_calls": job.min_tool_calls,
+            # Naive local ISO string; absent when the job is immediately due.
+            "available_at": (
+                job.available_at.isoformat(timespec="seconds")
+                if job.available_at is not None
+                else None
+            ),
         }
         name = queue_filename(job.id, job.key)
         staging = self._tmp / name
@@ -149,9 +193,19 @@ class FileInboxQueue:
     def claim(self) -> Job | None:
         """Take the oldest runnable job, or None. Ids are time-sortable, so
         `sorted(new/)` is FIFO. The atomic `new→cur` rename is the claim; a lost
-        race (`FileNotFoundError`) or a poison file is skipped."""
+        race (`FileNotFoundError`) or a poison file is skipped.
+
+        A job whose `available_at` is still in the future is not runnable and is
+        skipped without claiming it. That costs one payload read per scanned
+        file, and the scan runs on every poll — the price of a deep backlog of
+        *future* jobs. The common case pays one read: the oldest file is due and
+        claimed, or the queue is empty and nothing is read at all. An unreadable
+        file reads as due, so the claim's own `_load` decides its fate rather
+        than a transient read error silently parking the work."""
         self._ensure_tree()
         for src in sorted(self._new.glob("*.json")):
+            if not _due(src):
+                continue
             dest = self._cur / src.name
             try:
                 os.rename(src, dest)
@@ -315,10 +369,13 @@ class FileInboxQueue:
         """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            # The four dispatch fields are read with `.get` defaults rather than
+            # The five dispatch fields are read with `.get` defaults rather than
             # required: a job enqueued before they existed, or by a producer that
             # does not care about any of them, is an ordinary unkeyed one-shot
-            # and not poison.
+            # and not poison. The same tolerance runs the other way, and it is
+            # worth knowing about: a worker older than the field ignores a
+            # `profile` it does not understand and runs the daemon default, so a
+            # mixed-version rollout downgrades the model rather than failing.
             job = Job(
                 id=data["id"],
                 prompt=data["prompt"],
@@ -327,6 +384,9 @@ class FileInboxQueue:
                 session_key=data.get("session_key"),
                 timeout=data.get("timeout"),
                 platform=data.get("platform") or "jobs",
+                profile=data.get("profile"),
+                min_tool_calls=data.get("min_tool_calls") or 0,
+                available_at=_parse_available_at(data.get("available_at")),
             )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("jobs: poison job file %s → failed/ (%s)", path.name, exc)
@@ -340,6 +400,12 @@ class FileInboxQueue:
             or not _optional(job.key, str)
             or not _optional(job.session_key, str)
             or not _optional(job.timeout, int, float)
+            or not _optional(job.profile, str)
+            # Not `_optional`: the floor is compared against a count, so a
+            # string here would decide the job's outcome by whatever the
+            # comparison happened to do rather than by the operator's intent.
+            or not isinstance(job.min_tool_calls, int)
+            or isinstance(job.min_tool_calls, bool)
         ):
             logger.warning(
                 "jobs: malformed job %s → failed/ (bad field types)", path.name
@@ -479,12 +545,12 @@ def _enqueued_at(job_id: str) -> datetime | None:
         return None
 
 
-def _read_row_fields(path: Path) -> tuple[str | None, dict]:
-    """The job's prompt head and its origin, from one read of the file.
+def _read_row_fields(path: Path) -> tuple[str | None, dict, datetime | None]:
+    """The job's prompt head, its origin, and its `available_at`, from one read.
 
-    ``(None, {})`` if the file vanished (claimed mid-read) or does not parse —
-    each field degrades on its own, so a hand-mangled record costs one cell
-    rather than the whole listing.
+    ``(None, {}, None)`` if the file vanished (claimed mid-read) or does not
+    parse — each field degrades on its own, so a hand-mangled record costs one
+    cell rather than the whole listing.
 
     The prompt is truncated here rather than at render time: the row it lands in
     is memoized for as long as the queue holds still, so returning the whole
@@ -496,15 +562,58 @@ def _read_row_fields(path: Path) -> tuple[str | None, dict]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None, {}
+        return None, {}, None
     if not isinstance(data, dict):
-        return None, {}
+        return None, {}, None
     prompt = data.get("prompt")
     origin = data.get("origin")
+    raw_available = data.get("available_at")
+    try:
+        available = (
+            datetime.fromisoformat(raw_available)
+            if isinstance(raw_available, str)
+            else None
+        )
+    except ValueError:
+        available = None
     return (
         prompt[:PROMPT_PREVIEW_LIMIT] if isinstance(prompt, str) else None,
         origin if isinstance(origin, dict) else {},
+        available,
     )
+
+
+def read_job_prompt(root: Path, job_id: str) -> str | None:
+    """One unfinished job's prompt in full, read on demand.
+
+    `read_queue_rows` cuts every row's prompt at `PROMPT_PREVIEW_LIMIT`,
+    because the listing it returns is memoized and would otherwise pin every
+    queued prompt in the observing process. A reader that wants one job's
+    prompt whole asks here instead and pays one file read for the one job it
+    is looking at.
+
+    None when the job is no longer queued or running — it finished, or the
+    worker claimed it between the listing and this read — and when the record
+    does not parse. Same contract as the listing: a read never fails its
+    caller.
+    """
+    for directory in (root / "cur", root / "new"):
+        try:
+            paths = sorted(directory.glob(f"{job_id}*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            # The glob is a prefix match, so a longer id starting with this one
+            # would answer for it. The filename parse is the exact test.
+            if job_id_from_filename(path.name) != job_id:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            prompt = data.get("prompt") if isinstance(data, dict) else None
+            return prompt if isinstance(prompt, str) else None
+    return None
 
 
 def read_queue_depth(root: Path) -> QueueDepth:
@@ -577,7 +686,7 @@ def _scan_rows(cur: Path, new: Path, limit: int) -> list[QueueRow]:
             if job_id in seen:
                 continue
             seen.add(job_id)
-            prompt, origin = _read_row_fields(path)
+            prompt, origin, available_at = _read_row_fields(path)
             rows.append(
                 QueueRow(
                     id=job_id,
@@ -585,6 +694,7 @@ def _scan_rows(cur: Path, new: Path, limit: int) -> list[QueueRow]:
                     origin=origin,
                     enqueued_at=_enqueued_at(job_id),
                     in_flight=in_flight,
+                    available_at=available_at,
                 )
             )
     return rows

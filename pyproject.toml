@@ -28,9 +28,17 @@ claude-watchdog = "claude_on_the_fly.watchdog:main"
 
 [dependency-groups]
 dev = [
+    # docs/examples/cron/resource_watch.py declares it inline for operators; the
+    # suite needs it too, or its tests skip in CI.
+    "psutil>=5.9",
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
+    # Parallel test workers. The suite's cost is breadth -- 5000-odd tests at
+    # about 25ms each -- so workers are the only lever that moves it. See the
+    # pytest steps in .github/workflows/ci.yml for the one file that cannot run
+    # under them.
+    "pytest-xdist>=3.6",
     # Pinned to the same minor the pre-commit hook installs. Undeclared, `uv run
     # ruff` fell through to whatever ruff was on PATH, so a hand-run fix could
     # differ from what the gate applies.
@@ -68,10 +76,10 @@ ignore = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", "docs/examples"]
 
-# Coverage is deliberately NOT in `addopts`: it roughly triples the suite's wall
-# clock (~30s -> ~105s), and the inner loop runs `uv run pytest` constantly. Run
+# Coverage is deliberately NOT in `addopts`: it adds about a minute to the suite's
+# wall clock (~150s -> ~210s), and the inner loop runs `uv run pytest` constantly. Run
 # the gate explicitly instead:
 #
 #     uv run pytest --cov=claude_on_the_fly --cov-report=term-missing

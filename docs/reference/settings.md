@@ -30,6 +30,7 @@ falls back for that section without discarding unrelated sections.
 |---|---|
 | Immediate | The next authorization, policy, or formatting check reads it |
 | Next turn | The next agent spawn reads it |
+| New conversation | Account selection reads it before the first turn; saved conversations keep their account and fallback list |
 | Next grant | Existing grants keep their expiry; newly requested grants use it |
 | Startup | Read while constructing a frontend, worker, handler, or service |
 | Restart required | The running process deliberately retains its startup value |
@@ -39,6 +40,8 @@ falls back for that section without discarding unrelated sections.
 | Setting | Restart | Reason |
 |---|---|---|
 | `sandbox.mode` | Chat daemon | Broker, proxy, and jail posture are constructed together |
+| `sandbox.egress` | Chat daemon | Decides whether the per-session egress proxy is constructed, and whether it asks |
+| `accounts` | Chat and jobs daemons | Account profiles and credential broker routes are constructed at startup |
 | `commands` | Chat daemon | PATH shims and command broker are constructed once |
 | `permissions.mode` | Chat daemon | Approval service and backend artifacts are constructed once |
 | `slack.slash_command` | Slack daemon | Registered with Slack at startup |
@@ -50,6 +53,7 @@ falls back for that section without discarding unrelated sections.
 | `jobs.poll_interval_s` | Jobs daemon | Worker loop receives it at startup |
 | `jobs.timeout` | Jobs daemon | Agent runner is constructed with it |
 | `jobs.workspace_keep_days` | Jobs daemon | Read once, by the startup workspace sweep |
+| `jobs.diagnose_failures` | Jobs daemon | Read per failed job, for a backend that has a reader |
 
 The chat frontend reports changes represented by `settings.RESTART_REQUIRED` on the
 next turn. The jobs worker cannot post that notice; restart it explicitly after editing
@@ -64,6 +68,10 @@ restart notification:
 - `logs.keep_days` acts when pruning runs, normally daemon startup.
 - `logs.host_tag` selects the current log filename at handler construction; a daily
   rollover reads it again.
+- `agent.profiles` is read per turn, so an edit to an existing profile takes
+  effect on the next fire. Adding a profile is different: the CLI check that
+  refuses a bad one runs during preflight, so a newly added profile is not
+  validated until the daemon restarts.
 
 ## Validation
 

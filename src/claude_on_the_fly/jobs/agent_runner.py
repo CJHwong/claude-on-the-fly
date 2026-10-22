@@ -28,16 +28,21 @@ workspace), for every `__runs/` entry past the retention window. Keeping them
 until then means a run that failed overnight can still be inspected. A keyed
 workspace is never swept; it is the continuity.
 
-NOTE (stdin inheritance): `agent._exec` spawns the CLI without passing `stdin=`,
-so the child inherits this process's stdin. That is harmless for the supervised
-worker — `supervisor.spawn` starts daemons with `stdin=subprocess.DEVNULL` — but
-a worker run in the foreground from a terminal hands the agent CLI that terminal's
-stdin, and it may consume input meant for the shell. Run the worker detached
-(`claude-tui start jobs`), or redirect its stdin, if that matters to you.
+NOTE (stdin): the claude print path no longer inherits this worker's stdin.
+`agent._exec` passes `stdin=` every time — a pipe carrying the turn's prompt, or
+DEVNULL when there is none — and the codex backend passes DEVNULL in its own
+spawn. For those, a foreground worker started from a terminal no longer hands the
+agent CLI that terminal's stdin to consume.
+
+Two spawns still inherit, and both belong to the pty mode: the `claude-pty` spawn
+(`_exec_pty`) and the skills probe (`_probe_skills`). Neither was measured, so
+neither was changed. On a `CLAUDE_MODE=pty` deployment the old advice still
+applies: run the worker detached (`claude-tui start jobs`) or redirect its stdin.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import time
@@ -45,8 +50,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from claude_on_the_fly import agent
+from claude_on_the_fly import agent, sandbox, settings, tmux, transcript
 from claude_on_the_fly.agent import ClaudeUnavailableError, current_backend_key
+from claude_on_the_fly.jobs.brokers import JobBrokers
 from claude_on_the_fly.jobs.core import Job, Result
 from claude_on_the_fly.jobs.keys import safe_segment
 from claude_on_the_fly.transcript import remove_workspace_sessions
@@ -112,6 +118,68 @@ def sweep_run_workspaces(data_dir: Path, *, days: int) -> list[Path]:
     return removed
 
 
+def _apply_tool_call_floor(job: Job, response: agent.Response) -> Result:
+    """The run's Result, failed when it did less work than the entry demands.
+
+    A backend that answers raises nothing, so an agent that refused, or replied
+    without acting, used to be recorded `ok=True` and alerted nobody. That is not
+    hypothetical: a scheduled fire replied that a security boundary prohibited the
+    work it was asked to do, made no tool call, and went down as a success.
+
+    Failing here rather than in the worker is what keeps this to one change. The
+    worker already alerts on `not ok` and the cron log already writes `FAILED`,
+    so the floor rides the path a raised error takes and needs no new plumbing.
+
+    The agent's own text is kept, behind the reason. `_alert_body` truncates from
+    the tail, so a leading line is the part that reaches the alert intact.
+    """
+    tool_calls = sum(response.tool_counts.values())
+    if job.min_tool_calls and tool_calls < job.min_tool_calls:
+        return Result(
+            ok=False,
+            text=(
+                f"Job did nothing: made {tool_calls} tool "
+                f"call{'' if tool_calls == 1 else 's'}, below the floor of "
+                f"{job.min_tool_calls}.\n{response.body}"
+            ),
+            tool_calls=tool_calls,
+        )
+    return Result(ok=True, text=response.body, tool_calls=tool_calls)
+
+
+def _failure_signals(
+    workspace: Path,
+    session_uuid: str,
+    prompt: str,
+    timeout: float | None,
+    profile: agent.AgentProfile,
+) -> str:
+    """Deterministic notes about a failed run, or "" when there are none.
+
+    Opt-in. The alert an operator reads carries whatever the CLI said, which for
+    a timeout is only that it timed out; these say whether the agent finished,
+    where the time went, and whether the work ever started.
+
+    The backend comes from the job's own resolved profile, not the daemon's
+    global config: an entry running a profile that switched backends would
+    otherwise be diagnosed against a transcript format it never wrote. A backend
+    with no reader gets no signals rather than a guess.
+
+    Guarded whole: a diagnosis is a courtesy on a path that is already failing,
+    so a broken read must not replace the real error with its own traceback.
+    """
+    if settings.get("JOBS_DIAGNOSE_FAILURES", "").lower() not in {"1", "true", "yes"}:
+        return ""
+    try:
+        signals = transcript.diagnose(
+            profile.backend, workspace, session_uuid, prompt=prompt, timeout_s=timeout
+        )
+    except Exception:
+        logger.exception("jobs: could not diagnose the failed run")
+        return ""
+    return "".join(f"\n- {signal}" for signal in signals)
+
+
 @dataclass
 class OrchestratorAgentRunner:
     """`AgentRunner` that drives `agent.run` in a fresh per-job workspace.
@@ -133,6 +201,9 @@ class OrchestratorAgentRunner:
     # session from this. Populated when a run starts, cleared when it ends —
     # including on cancel, via the finally below.
     in_flight: dict[str, dict] = field(default_factory=dict)
+    # The jobs daemon's sandbox services. None when the daemon runs none, which
+    # leaves a job exactly as it was: no broker env, the real binaries on PATH.
+    brokers: JobBrokers | None = None
 
     async def run(self, job: Job) -> Result:
         # A keyed job's run id IS its session key, which is what makes the
@@ -145,7 +216,47 @@ class OrchestratorAgentRunner:
             platform_dir / run_id if keyed else platform_dir / RUNS_DIRNAME / run_id
         )
         workspace.mkdir(parents=True, exist_ok=True)
+        # Host the run in its own tmux server, the same as a chat turn, so the
+        # TUI can mirror a job nobody is watching in a conversation. The name
+        # carries the key rather than the run id, because the key is what an
+        # operator recognises in the watch list; an unkeyed job falls back to the
+        # id, which is at least unique.
+        # None when hosting is off, tmux is absent, or the socket path would not
+        # fit an address: every one of those means an unhosted turn, not a failed
+        # one.
+        pane = (
+            tmux.pane_for(tmux.job_session_name(run_id))
+            if tmux.hosting_available()
+            else None
+        )
+        env_token = None
+        job_services = contextlib.AsyncExitStack()
         try:
+            # Resolved once, before the brokers, because the relay they open has
+            # to bridge this profile's model server. Used again for the session
+            # seed and the run. A bad profile name is the operator's typo, so it
+            # reports as a failed job with the name in it rather than as a
+            # traceback.
+            try:
+                profile = agent.resolve_profile(job.profile)
+            except ValueError as exc:
+                logger.error("jobs: %s", exc)
+                return Result(ok=False, text=f"Job failed: {exc}")
+            overrides = dict(pane.env) if pane is not None else {}
+            if self.brokers is not None:
+                # The command token, egress proxy and Linux relay a chat turn gets,
+                # held for this run only.
+                overrides.update(
+                    await job_services.enter_async_context(
+                        self.brokers.for_job(
+                            workspace,
+                            run_id,
+                            sandbox.model_endpoint_env(profile.mode),
+                        )
+                    )
+                )
+            if overrides:
+                env_token = sandbox.session_env(overrides)
             # Keyed on `job.key`, the same field that names the unit of work in the
             # log line below: a poller aimed at one tracker can run its own
             # instructions without every other job inheriting them.
@@ -153,10 +264,13 @@ class OrchestratorAgentRunner:
                 workspace,
                 agent.persona_for("jobs", (job.key,) if job.key else ()),
             )
+            # The profile is part of the session identity, so an entry that
+            # changes model starts a fresh transcript rather than resuming one
+            # the new model never wrote.
             session_uuid = str(
                 uuid5(
                     NAMESPACE_URL,
-                    f"{job.platform}/{current_backend_key()}/{run_id}",
+                    f"{job.platform}/{current_backend_key(profile)}/{run_id}",
                 )
             )
             self.in_flight[job.id] = {
@@ -180,16 +294,33 @@ class OrchestratorAgentRunner:
                     # fallback for jobs that have no key.
                     channel_context=job.key or self.channel_context,
                     timeout=timeout,
+                    profile=profile,
                 )
             except ClaudeUnavailableError as exc:
                 logger.warning("jobs: agent unavailable: %s", exc)
                 return Result(ok=False, text=f"Claude is unavailable: {exc}")
             except Exception as exc:  # NOT BaseException — CancelledError propagates
                 logger.exception("jobs: agent run failed")
-                return Result(ok=False, text=f"Job failed: {exc}")
-            return Result(ok=True, text=response.body)
+                notes = _failure_signals(
+                    workspace, session_uuid, job.prompt, timeout, profile
+                )
+                # Signals lead, the CLI's own text follows. `_alert_body` caps
+                # the alert at 500 characters from the tail, and a backend that
+                # dumps its banner on failure is unbounded — appending would
+                # put the diagnosis exactly where truncation eats it. With no
+                # signals the text is byte-identical to what it always was.
+                text = f"Job failed:{notes}\n{exc}" if notes else f"Job failed: {exc}"
+                return Result(ok=False, text=text)
+            return _apply_tool_call_floor(job, response)
         finally:
             self.in_flight.pop(job.id, None)
+            if env_token is not None:
+                sandbox.reset_session_env(env_token)
+            await job_services.aclose()
+            if pane is not None:
+                # Ends the server, which is the only reap that reaches a process
+                # the agent left running inside the pane.
+                tmux.kill(pane)
             # No workspace is deleted here, keyed or not.
             #
             # A keyed job's workspace and session ARE its continuity: the next run

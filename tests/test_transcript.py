@@ -11,9 +11,10 @@ from claude_on_the_fly.transcript import (
     Turn,
     _workspace_to_claude_hash,
     extract_claude,
+    extract_claude_model,
     extract_codex,
-    extract_codex_cumulative_tokens,
     extract_codex_model,
+    extract_codex_usage_events,
     format_handoff,
     remove_workspace_sessions,
 )
@@ -73,6 +74,14 @@ class TestWorkspaceToClaudeHash:
 
 def _claude_user(text: str) -> dict:
     return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+def _claude_assistant_with_model(model: str | None) -> dict:
+    """An assistant record carrying a `model`, the way claude writes one."""
+    message: dict = {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
+    if model is not None:
+        message["model"] = model
+    return {"type": "assistant", "message": message}
 
 
 def _claude_assistant_text(text: str) -> dict:
@@ -408,8 +417,10 @@ class TestExtractCodexModel:
         )
         assert extract_codex_model("thread-abc") == "gpt-4.1"
 
-    def test_returns_first_turn_context_model(self, codex_sessions_dir, ndjson):
-        """Codex emits turn_context per turn; the first hit is sufficient."""
+    def test_returns_last_turn_context_model(self, codex_sessions_dir, ndjson):
+        """Codex appends one turn_context per turn, so the last is the model
+        that answered. Reading the first kept naming the model a resumed thread
+        opened with, long after a switch moved it."""
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-x.jsonl"
@@ -419,7 +430,7 @@ class TestExtractCodexModel:
                 {"type": "turn_context", "payload": {"model": "second-model"}},
             )
         )
-        assert extract_codex_model("thread-x") == "first-model"
+        assert extract_codex_model("thread-x") == "second-model"
 
     def test_skips_non_string_model_values(self, codex_sessions_dir, ndjson):
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
@@ -435,11 +446,11 @@ class TestExtractCodexModel:
         assert extract_codex_model("thread-y") == "real-model"
 
 
-class TestExtractCodexCumulativeTokens:
-    def test_returns_none_when_no_rollout(self, codex_sessions_dir):
-        assert extract_codex_cumulative_tokens("nonexistent") is None
+class TestExtractCodexUsageEvents:
+    def test_returns_empty_when_no_rollout(self, codex_sessions_dir):
+        assert extract_codex_usage_events("nonexistent") == []
 
-    def test_returns_latest_total_token_usage(self, codex_sessions_dir, ndjson):
+    def test_returns_each_calls_own_usage(self, codex_sessions_dir, ndjson):
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-abc.jsonl"
@@ -475,14 +486,16 @@ class TestExtractCodexCumulativeTokens:
                 },
             )
         )
-        out = extract_codex_cumulative_tokens("thread-abc")
-        assert out == {
-            "input_tokens": 300,
-            "output_tokens": 40,
-            "reasoning_output_tokens": 5,
-        }
+        # Every record, not just the last: one exec that fans out to several
+        # model calls appends several, and the turn cost is their sum.
+        # `total_token_usage` is deliberately not read -- codex writes each
+        # call's own figures there too, so it is not a running total.
+        assert extract_codex_usage_events("thread-abc") == [
+            {"input_tokens": 100},
+            {"input_tokens": 200},
+        ]
 
-    def test_skips_non_dict_total(self, codex_sessions_dir, ndjson):
+    def test_skips_non_dict_usage(self, codex_sessions_dir, ndjson):
         rollout_dir = codex_sessions_dir / "2026" / "05" / "18"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-2026-05-18T12-00-00-thread-x.jsonl"
@@ -492,12 +505,12 @@ class TestExtractCodexCumulativeTokens:
                     "type": "event_msg",
                     "payload": {
                         "type": "token_count",
-                        "info": {"total_token_usage": "not a dict"},
+                        "info": {"last_token_usage": "not a dict"},
                     },
                 },
             )
         )
-        assert extract_codex_cumulative_tokens("thread-x") is None
+        assert extract_codex_usage_events("thread-x") == []
 
 
 class TestPrependHandoff:
@@ -1014,6 +1027,41 @@ class TestFindCodexRolloutByCwd:
         monkeypatch.setattr(Path, "stat", stat_fails)
         assert transcript._find_codex_rollout_by_cwd("/ws") is None
 
+    def test_a_symlinked_workspace_matches_the_path_codex_recorded(
+        self, codex_sessions_dir, tmp_path
+    ):
+        """codex writes the `-C` argument back verbatim, so the recorded cwd and
+        the caller's own name can be two spellings of one directory. A string
+        equality missed that and the turn answered "No response" after codex had
+        already run the work and billed for it."""
+        real = tmp_path / "real_ws"
+        real.mkdir()
+        link = tmp_path / "link_ws"
+        link.symlink_to(real)
+        expected = self._rollout(codex_sessions_dir, "linked", str(link))
+
+        assert transcript._find_codex_rollout_by_cwd(str(real)) == expected
+        assert transcript._find_codex_rollout_by_cwd(str(link)) == expected
+
+    def test_two_different_directories_still_do_not_match(
+        self, codex_sessions_dir, tmp_path
+    ):
+        """Resolving both sides must not widen the match to anything else."""
+        mine = tmp_path / "mine"
+        mine.mkdir()
+        self._rollout(codex_sessions_dir, "theirs", str(tmp_path / "theirs"))
+
+        assert transcript._find_codex_rollout_by_cwd(str(mine)) is None
+
+    def test_a_recorded_cwd_that_is_not_a_string_is_refused(self, codex_sessions_dir):
+        """A rollout written by a future codex could hold anything there."""
+        rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-2026-07-30T12-00-00-x.jsonl").write_bytes(
+            json.dumps({"type": "session_meta", "payload": {"cwd": 7}}).encode() + b"\n"
+        )
+        assert transcript._find_codex_rollout_by_cwd("/ws") is None
+
     def test_a_first_line_that_is_not_session_meta_is_refused(self, codex_sessions_dir):
         rollout_dir = codex_sessions_dir / "2026" / "07" / "30"
         rollout_dir.mkdir(parents=True)
@@ -1073,11 +1121,11 @@ class TestCodexRolloutScannersSkipIrrelevantRecords:
                 "type": "event_msg",
                 "payload": {
                     "type": "token_count",
-                    "info": {"total_token_usage": {"input_tokens": 7}},
+                    "info": {"last_token_usage": {"input_tokens": 7}},
                 },
             },
         )
-        assert extract_codex_cumulative_tokens("thread-abc") == {"input_tokens": 7}
+        assert extract_codex_usage_events("thread-abc") == [{"input_tokens": 7}]
 
     def test_prompt_tokens_skips_records_that_are_not_token_counts(
         self, codex_sessions_dir
@@ -1232,14 +1280,24 @@ class TestPrependLatestHandoff:
             lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("scan blew up")),
         )
         with caplog.at_level("ERROR", logger="claude_on_the_fly.transcript"):
-            assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+            assert (
+                transcript.prepend_latest_handoff(
+                    tmp_path, "hi", session_uuid="u", platform="cron"
+                )
+                == "hi"
+            )
         assert "starting clean" in "\n".join(r.getMessage() for r in caplog.records)
 
     def test_nothing_prior_leaves_the_prompt_alone(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(
             transcript, "find_latest_prior_transcript", lambda *_a, **_kw: None
         )
-        assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+        assert (
+            transcript.prepend_latest_handoff(
+                tmp_path, "hi", session_uuid="u", platform="cron"
+            )
+            == "hi"
+        )
 
     def test_turns_that_format_to_nothing_leave_the_prompt_alone(
         self, tmp_path: Path, monkeypatch
@@ -1249,7 +1307,12 @@ class TestPrependLatestHandoff:
             "find_latest_prior_transcript",
             lambda *_a, **_kw: ([], "claude"),
         )
-        assert transcript.prepend_latest_handoff(tmp_path, "hi") == "hi"
+        assert (
+            transcript.prepend_latest_handoff(
+                tmp_path, "hi", session_uuid="u", platform="cron"
+            )
+            == "hi"
+        )
 
     def test_a_real_handoff_is_prefixed(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(
@@ -1257,7 +1320,9 @@ class TestPrependLatestHandoff:
             "find_latest_prior_transcript",
             lambda *_a, **_kw: ([Turn(role="user", text="earlier")], "codex"),
         )
-        out = transcript.prepend_latest_handoff(tmp_path, "now")
+        out = transcript.prepend_latest_handoff(
+            tmp_path, "now", session_uuid="u", platform="cron"
+        )
         assert out.endswith("now")
         assert "earlier" in out
 
@@ -1416,3 +1481,283 @@ class TestCodexSessionsDirsResolution:
         assert (
             transcript.codex_sessions_dirs()[-1] == tmp_path / "elsewhere" / "sessions"
         )
+
+
+class TestHandoffScope:
+    """A shared chat workspace holds every thread's transcript, so the handoff
+    for a backend switch must come from the same session, not the newest file."""
+
+    def _two_sessions(self, monkeypatch):
+        monkeypatch.setattr(
+            transcript,
+            "_list_claude_session_files",
+            lambda _ws: [(Path("/x"), "other-thread", 200.0)],
+        )
+        monkeypatch.setattr(
+            transcript,
+            "_list_codex_session_files",
+            lambda _ws: [(Path("/y"), "mine", 100.0)],
+        )
+        monkeypatch.setattr(
+            transcript, "extract_codex", lambda _ws, uuid: [Turn("user", uuid)]
+        )
+        monkeypatch.setattr(
+            transcript, "extract_claude", lambda _ws, uuid: [Turn("user", uuid)]
+        )
+
+    def test_only_uuid_ignores_a_newer_sibling(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        result = transcript.find_latest_prior_transcript(tmp_path, only_uuid="mine")
+        assert result is not None
+        turns, backend = result
+        assert backend == "codex"
+        assert turns[0].text == "mine"
+
+    def test_only_uuid_with_no_match_is_none(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        assert (
+            transcript.find_latest_prior_transcript(tmp_path, only_uuid="nope") is None
+        )
+
+    def test_chat_platform_hands_off_the_same_session(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        out = transcript.prepend_latest_handoff(
+            tmp_path, "now", session_uuid="mine", platform="slack"
+        )
+        assert "mine" in out
+        assert "other-thread" not in out
+
+    def test_cron_hands_off_the_newest_other_session(self, tmp_path, monkeypatch):
+        self._two_sessions(monkeypatch)
+        out = transcript.prepend_latest_handoff(
+            tmp_path, "now", session_uuid="mine", platform="cron"
+        )
+        assert "other-thread" in out
+
+
+class TestRolloutSnapshot:
+    def _rollout(self, root: Path, thread: str, cwd: str) -> Path:
+        rollout_dir = root / "2026" / "07" / "30"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        path = rollout_dir / f"rollout-2026-07-30T12-00-00-{thread}.jsonl"
+        path.write_bytes(
+            json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}).encode()
+            + b"\n"
+        )
+        return path
+
+    def test_snapshot_lists_every_rollout(self, codex_sessions_dir):
+        first = self._rollout(codex_sessions_dir, "a", "/ws")
+        second = self._rollout(codex_sessions_dir, "b", "/ws")
+        assert transcript.snapshot_rollouts() == frozenset({first, second})
+
+    def test_an_excluded_sibling_is_not_matched_even_when_freshest(
+        self, codex_sessions_dir
+    ):
+        """A resumed thread in the same directory keeps its rollout fresh. It was
+        there before this turn started, so it is excluded, and the new one wins."""
+        mine = self._rollout(codex_sessions_dir, "mine", "/ws")
+        sibling = self._rollout(codex_sessions_dir, "sibling", "/ws")
+        stamp = time.time() + 5
+        import os
+
+        os.utime(sibling, (stamp, stamp))
+        assert transcript._find_codex_rollout_by_cwd("/ws") == sibling
+        assert (
+            transcript._find_codex_rollout_by_cwd("/ws", exclude=frozenset({sibling}))
+            == mine
+        )
+
+
+class TestExtractClaudeModel:
+    """The model the footer names in pty mode.
+
+    pty's envelope has no per-message model, so the session claude wrote is the
+    only place the answering model appears.
+    """
+
+    def test_missing_file_returns_none(self, claude_projects_dir):
+        assert extract_claude_model(Path("/private/tmp/nope"), "uuid-x") is None
+
+    def test_returns_the_last_assistant_model(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-model-a")
+        session_dir = claude_projects_dir / "-private-tmp-ws-model-a"
+        session_dir.mkdir()
+        # The real shape of the bug: an auxiliary haiku record precedes the
+        # opus one that actually answered.
+        (session_dir / "u1.jsonl").write_bytes(
+            ndjson(
+                _claude_assistant_with_model("claude-haiku-4-5-20251001"),
+                _claude_user("go on"),
+                _claude_assistant_with_model("claude-opus-5"),
+            )
+        )
+        assert extract_claude_model(workspace, "u1") == "claude-opus-5"
+
+    def test_ignores_assistant_records_with_no_model(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-model-b")
+        session_dir = claude_projects_dir / "-private-tmp-ws-model-b"
+        session_dir.mkdir()
+        (session_dir / "u1.jsonl").write_bytes(
+            ndjson(
+                _claude_assistant_with_model("claude-sonnet-5"),
+                _claude_assistant_with_model(None),
+            )
+        )
+        assert extract_claude_model(workspace, "u1") == "claude-sonnet-5"
+
+    def test_no_assistant_record_returns_none(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-model-c")
+        session_dir = claude_projects_dir / "-private-tmp-ws-model-c"
+        session_dir.mkdir()
+        (session_dir / "u1.jsonl").write_bytes(ndjson(_claude_user("only me")))
+        assert extract_claude_model(workspace, "u1") is None
+
+
+# ---------------------------------------------------------------------------
+# Per-turn token accounting — claude_session_size / extract_claude_turn_tokens
+# ---------------------------------------------------------------------------
+
+
+def _claude_assistant_usage(inp: int, cache: int, out: int) -> dict:
+    """One priced assistant record, shaped like a real session JSONL line."""
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "usage": {
+                "input_tokens": inp,
+                "cache_read_input_tokens": cache,
+                "output_tokens": out,
+            },
+        },
+    }
+
+
+class TestClaudeTurnTokens:
+    """pty has no per-turn figure of its own, so the turn is read off the file.
+
+    `modelUsage` is pty's pass over the whole session. Quoting it in a footer
+    reported the session's running total as one turn's bill.
+    """
+
+    def _session(self, claude_projects_dir, ndjson, *records) -> Path:
+        session_dir = claude_projects_dir / "-private-tmp-ws-tok"
+        session_dir.mkdir(exist_ok=True)
+        path = session_dir / "s1.jsonl"
+        path.write_bytes(ndjson(*records))
+        return path
+
+    def test_a_first_turn_reads_its_whole_file(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-tok")
+        assert transcript.claude_session_size(workspace, "s1") == 0
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            _claude_assistant_usage(10, 5, 3),
+            _claude_assistant_usage(20, 1, 7),
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (36, 10)
+
+    def test_a_resumed_turn_excludes_every_earlier_turn(
+        self, claude_projects_dir, ndjson
+    ):
+        """The regression itself: without the offset this returns the total."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(claude_projects_dir, ndjson, _claude_assistant_usage(900, 0, 90))
+        offset = transcript.claude_session_size(workspace, "s1")
+        path = claude_projects_dir / "-private-tmp-ws-tok" / "s1.jsonl"
+        with path.open("ab") as handle:
+            handle.write(ndjson(_claude_assistant_usage(11, 4, 2)))
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", offset) == (15, 2)
+
+    def test_a_turn_that_added_no_priced_record_returns_none(
+        self, claude_projects_dir, ndjson
+    ):
+        """None, not (0, 0): the caller falls back rather than posting a zero."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(claude_projects_dir, ndjson, _claude_assistant_usage(5, 0, 1))
+        offset = transcript.claude_session_size(workspace, "s1")
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", offset) is None
+
+    def test_a_missing_session_returns_none(self, claude_projects_dir):
+        assert (
+            transcript.extract_claude_turn_tokens(Path("/private/tmp/nope"), "s1", 0)
+            is None
+        )
+
+    def test_a_half_written_line_is_skipped_not_fatal(
+        self, claude_projects_dir, ndjson
+    ):
+        """A snapshot taken mid-write lands inside a line. Lose that record's
+        tokens, not the turn's whole count."""
+        workspace = Path("/private/tmp/ws-tok")
+        path = self._session(
+            claude_projects_dir, ndjson, _claude_assistant_usage(100, 0, 10)
+        )
+        with path.open("ab") as handle:
+            handle.write(ndjson(_claude_assistant_usage(8, 2, 4)))
+
+        # Two bytes into the first record: its line is now unparseable.
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 2) == (10, 4)
+
+    def test_a_non_assistant_record_is_not_priced(self, claude_projects_dir, ndjson):
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            {"type": "user", "message": {"usage": {"input_tokens": 999}}},
+            _claude_assistant_usage(3, 0, 1),
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (3, 1)
+
+    def test_a_blank_line_is_stepped_over(self, claude_projects_dir, ndjson):
+        """claude writes this file live, so a trailing or torn newline is normal."""
+        workspace = Path("/private/tmp/ws-tok")
+        path = self._session(
+            claude_projects_dir, ndjson, _claude_assistant_usage(6, 0, 2)
+        )
+        with path.open("ab") as handle:
+            handle.write(b"\n   \n")
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (6, 2)
+
+    def test_an_assistant_record_without_usage_is_not_priced(
+        self, claude_projects_dir, ndjson
+    ):
+        """Not every assistant record carries usage. It must not read as a zero
+        and it must not mark the turn as measured on its own."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            {"type": "assistant", "message": {"model": "claude-opus-5"}},
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) is None
+
+    def test_a_garbage_usage_value_counts_as_zero(self, claude_projects_dir, ndjson):
+        """Another process writes this file, so a negative or a string is
+        possible and must not propagate into a footer."""
+        workspace = Path("/private/tmp/ws-tok")
+        self._session(
+            claude_projects_dir,
+            ndjson,
+            {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": -5,
+                        "cache_read_input_tokens": "lots",
+                        "output_tokens": 4,
+                    }
+                },
+            },
+        )
+
+        assert transcript.extract_claude_turn_tokens(workspace, "s1", 0) == (0, 4)

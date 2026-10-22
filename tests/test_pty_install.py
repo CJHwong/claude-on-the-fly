@@ -136,6 +136,23 @@ def test_run_installer_requires_curl() -> None:
     assert "curl" in msg
 
 
+def test_installer_pins_the_bootstrapped_runtime_files() -> None:
+    captured = {}
+
+    def runner(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    ok, _ = pty_install.run_installer(runner=runner)
+
+    assert ok is True
+    assert captured["cmd"] == pty_install.MANUAL_HINT
+    assert captured["cmd"].endswith(
+        "| CLAUDE_INTERACTIVE_P_REPO=CJHwong/claude-interactive-p "
+        f"CLAUDE_INTERACTIVE_P_REF={pty_install.PTY_INSTALL_COMMIT} bash"
+    )
+
+
 def test_prompt_consent_returns_false_on_eof() -> None:
     def boom() -> str:
         raise EOFError

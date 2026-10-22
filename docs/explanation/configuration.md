@@ -32,7 +32,7 @@ environment instead means reading its own configuration and calling it the daemo
 
 That distinction had teeth. The session-log directory was derived from `CLAUDE_CONFIG_DIR`
 at import time, so a deployment setting it in `.env` had the daemon writing transcripts
-under one directory while the dashboard looked under another, and the watch pane reported
+under one directory while the dashboard looked under another, and the live view reported
 that the agent had not run a turn over a session that was streaming. The symptom was
 indistinguishable from nothing having happened.
 

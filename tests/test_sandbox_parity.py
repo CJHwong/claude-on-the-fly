@@ -257,6 +257,46 @@ def test_contract_holds_on_this_platform(case, world):
     assert not failures, f"{case.what} ({path}): " + "; ".join(failures)
 
 
+def test_git_can_start_a_repository_inside_the_workspace(world):
+    """The workspace is a work surface for git, not only for `cat` and `echo`.
+
+    git canonicalizes its cwd on every command, which stats each directory from
+    the root down. Under an opaque $HOME that walk used to die at the home
+    directory on macOS, so no git command worked inside the workspace at all.
+    """
+    project = world["project"]
+    proc = subprocess.run(
+        sandbox.wrap(
+            [
+                "/bin/sh",
+                "-c",
+                f"git init -q {project}/fresh && git -C {project}/fresh status --porcelain",
+            ],
+            project,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_the_ancestor_grant_is_metadata_on_the_path_and_nothing_beside_it(world):
+    project, home = world["project"], world["home"]
+    # Each directory on the way down is visible to stat()...
+    assert (
+        _run(
+            ["/bin/sh", "-c", f"test -d {home} && test -d {home}/.claude-on-the-fly"],
+            project,
+        )
+        == 0
+    )
+    # ...a sibling that is not on the path is not. (A listing of the home is not
+    # part of the contract: Linux mounts an empty tmpfs there, which lists fine
+    # and shows nothing, while seatbelt refuses the readdir outright.)
+    assert _run(["/bin/sh", "-c", f"test -e {home}/.ssh"], project) != 0
+
+
 # The daemons' bookkeeping, as the paths the state cases above use.
 _STATE_FILES = (
     "state/slack.turns.json",
@@ -349,3 +389,257 @@ def test_the_jail_can_run_the_interpreter_it_was_started_from(world):
         timeout=60,
     )
     assert "INTERPRETER_RAN" in proc.stdout, proc.stderr[:300]
+
+
+def test_an_entry_the_codex_home_links_out_to_is_readable(world, monkeypatch):
+    """Sharing one set of skills between backends is done with a symlink out of
+    ~/.codex, and both jails have to see through it.
+
+    Neither does so for free. Seatbelt matches the path the kernel resolves, so
+    the grant on the codex home covers the link and not the file; bubblewrap
+    mounts, so the target dangles unless it is mounted too. Both report the file
+    as missing rather than as denied, which is how this survived two readings of
+    the profile. Measured before the fix: codex exited 1 with "Operation not
+    permitted (os error 1)" naming no path, and the kernel logged
+    `deny(1) file-read-data .../.agents/agents`.
+
+    `skills` rather than `agents`, though `agents` is what found it. A protected
+    entry cannot be a symlink on Linux at all -- bwrap answers "Can't mount on
+    symlink destination" and the preflight refuses the layout outright, which is
+    a deliberate platform difference and has its own test. `skills` is not
+    protected (codex writes its own tree inside it), so it is the entry where
+    both platforms promise the same thing.
+    """
+    home, project = world["home"], world["project"]
+    shared = home / ".agents" / "skills"
+    shared.mkdir(parents=True)
+    (shared / "review.md").write_text("how to review\n")
+    # Same parent, not linked from the codex home. The grant is for what the
+    # operator wired in, not for the tree that happens to contain it.
+    beside = home / ".agents" / "private"
+    beside.mkdir()
+    (beside / "secret.txt").write_text("PARITY\n")
+    codex = home / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    (codex / "skills").symlink_to(shared)
+    # conftest pins CODEX_HOME at its own tmp home so no test can touch the real
+    # ~/.codex, and that pin wins over the redirected HOME. Point it at this
+    # world's copy, or the grant is computed for a directory nothing here made.
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+
+    assert _can_read(str(shared / "review.md"), project)
+    assert not _can_read(str(beside / "secret.txt"), project)
+
+
+def _grant_with_a_repo(world, monkeypatch) -> dict[str, Path]:
+    """A write grant laid out the way a deployment keeps one: a repository at
+    the grant, another one level down, and the data dir's schedule linked into
+    it."""
+    home, data = world["home"], world["data"]
+    soul = home / "soul"
+    for repo in (soul, soul / "tool"):
+        (repo / ".git" / "hooks").mkdir(parents=True)
+        (repo / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+        (repo / ".git" / "config").write_text("[core]\n")
+    (soul / "config").mkdir()
+    schedule = soul / "config" / "cotf-cron.yaml"
+    schedule.write_text("jobs: []\n")
+    (data / "cron.yaml").symlink_to(schedule)
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", str(soul))
+    return {"soul": soul, "tool": soul / "tool", "schedule": schedule}
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "{soul}/.git/hooks/pre-commit",
+        "{soul}/.git/hooks/post-checkout",
+        "{soul}/.git/config",
+        "{tool}/.git/hooks/pre-commit",
+        "{tool}/.git/config",
+        "{schedule}",
+    ],
+)
+def test_a_write_grant_keeps_what_runs_outside_the_jail(target, world, monkeypatch):
+    """git runs a granted repository's hooks and honours its config on the
+    operator's next command, and the cron daemon runs the linked schedule. All
+    of them outside the jail."""
+    paths = _grant_with_a_repo(world, monkeypatch)
+    path = target.format(**{k: str(v) for k, v in paths.items()})
+    project = world["project"]
+    assert _can_read(path, project) or not Path(path).exists()
+    assert not _can_write(path, project), f"{path} is writable"
+
+
+def test_a_write_grant_still_takes_ordinary_writes(world, monkeypatch):
+    """The denies are narrow: a note, a new file beside the schedule, and git's
+    own objects under `.git` are what the grant is for."""
+    paths = _grant_with_a_repo(world, monkeypatch)
+    soul, project = paths["soul"], world["project"]
+    for path in (
+        soul / "notes.md",
+        soul / "config" / "other.yaml",
+        soul / ".git" / "HEAD",
+        paths["tool"] / ".git" / "index",
+    ):
+        assert _can_write(str(path), project), f"{path} is not writable"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Move the parent aside, edit the file there, move it back.
+        "mv {soul}/.git {soul}/moved && echo x >> {soul}/moved/config"
+        " && mv {soul}/moved {soul}/.git",
+        "mv {tool} {soul}/moved && echo x >> {soul}/moved/.git/hooks/pre-commit"
+        " && mv {soul}/moved {tool}",
+        "mv {soul}/config {soul}/moved && echo x >> {soul}/moved/cotf-cron.yaml"
+        " && mv {soul}/moved {soul}/config",
+        # Move the parent aside and put a fresh one where it was.
+        "mv {soul}/.git {soul}/moved && mkdir -p {soul}/.git/hooks"
+        " && echo x > {soul}/.git/hooks/pre-commit",
+        "mv {soul}/config {soul}/moved && mkdir {soul}/config && echo x > {schedule}",
+    ],
+    ids=["git-dir", "repo-dir", "schedule-dir", "fresh-git-dir", "fresh-schedule"],
+)
+def test_a_rename_does_not_carry_the_protection_away(script, world, monkeypatch):
+    """A bind moves with its parent under bwrap, so renaming the parent and
+    putting a fresh file where the protected one was is the obvious way round.
+    Seatbelt matches paths, so the shape to defeat there is renaming the parent
+    out of the pattern and back."""
+    paths = _grant_with_a_repo(world, monkeypatch)
+    command = script.format(**{k: str(v) for k, v in paths.items()})
+    assert _run(["/bin/sh", "-c", command], world["project"]) != 0
+    # Whichever step refused, nothing at a path git or cron reads holds the
+    # agent's content. Seatbelt lets a whole repository move, which is harmless:
+    # its hooks go with it and stay under the pattern, and a fresh `.git` at the
+    # old path is refused.
+    for path in (
+        paths["soul"] / ".git" / "config",
+        paths["soul"] / ".git" / "hooks" / "pre-commit",
+        paths["tool"] / ".git" / "hooks" / "pre-commit",
+        paths["schedule"],
+    ):
+        assert not path.exists() or "x" not in path.read_text(), path
+
+
+def test_naming_a_protected_path_opens_only_that_path(world, monkeypatch):
+    paths = _grant_with_a_repo(world, monkeypatch)
+    soul, project = paths["soul"], world["project"]
+    hooks = soul / ".git" / "hooks"
+    monkeypatch.setenv("COTF_SANDBOX_WRITE_PATHS", f"{soul}:{hooks}")
+    assert _can_write(str(hooks / "pre-commit"), project)
+    assert not _can_write(str(soul / ".git" / "config"), project)
+
+
+def test_an_entry_the_claude_config_links_out_to_is_readable(world, monkeypatch):
+    """The claude side of the codex case above: a skill linked out of the claude
+    config dir. Linux mounts the target; seatbelt needs a read grant on it."""
+    home, project = world["home"], world["project"]
+    shared = home / "soul" / "skills" / "review"
+    shared.mkdir(parents=True)
+    (shared / "SKILL.md").write_text("how to review\n")
+    beside = home / "soul" / "private.md"
+    beside.write_text("PARITY\n")
+    config = home / ".claude"
+    (config / "skills").mkdir(parents=True, exist_ok=True)
+    (config / "skills" / "review").symlink_to(shared)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+    assert _can_read(str(config / "skills" / "review" / "SKILL.md"), project)
+    assert not _can_read(str(beside), project)
+
+
+@pytest.fixture
+def codex_login(world, monkeypatch):
+    """The operator's codex home with a ChatGPT login in it."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex = world["home"] / ".codex"
+    codex.mkdir(exist_ok=True)
+    (codex / "auth.json").write_text('{"tokens": "PARITY"}\n')
+    (codex / "config.toml").write_text('model = "parity"\n')
+    return codex
+
+
+def test_the_brokered_codex_login_is_hidden_from_the_turn(
+    world, codex_login, monkeypatch
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    project = world["project"]
+    auth = codex_login / "auth.json"
+    # A link the turn plants in its own workspace resolves onto the same file.
+    (project / "login.json").symlink_to(auth)
+
+    assert not _can_read(str(auth), project)
+    assert not _can_write(str(auth), project)
+    assert not _can_read(str(project / "login.json"), project)
+    # Only the login: codex still reads the config beside it.
+    assert _can_read(str(codex_login / "config.toml"), project)
+
+
+def test_the_codex_login_stays_readable_when_the_broker_does_not_hold_it(
+    world, codex_login, monkeypatch
+):
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.delenv(codex_auth.BASE_URL_ENV, raising=False)
+    assert _can_read(str(codex_login / "auth.json"), world["project"])
+
+
+def test_a_relocated_codex_home_keeps_its_state_writable(world, monkeypatch):
+    """codex opens `state_N.sqlite` in its home on every run. The rule granting
+    it named `$HOME/.codex`, so a relocated CODEX_HOME made a jailed pty turn
+    die with "attempt to write a readonly database". The login beside it stays
+    governed by the same home."""
+    relocated = world["home"] / "elsewhere" / "codex"
+    relocated.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(relocated))
+    project = world["project"]
+    assert _can_write(str(relocated / "state_5.sqlite"), project)
+    assert _can_write(str(relocated / "state_5.sqlite-wal"), project)
+    assert not _can_write(str(relocated / "config.toml"), project)
+
+
+def test_a_refresh_during_a_turn_does_not_expose_the_login(
+    world, codex_login, monkeypatch, tmp_path
+):
+    """The broker rewrites the login while a jailed turn is running. On Linux the
+    file is hidden by a bind mount, and a rename over the path on the host drops
+    that mount in the turn's namespace: measured, the turn then read the new
+    login. The broker writes in place, so the mask has to survive the refresh."""
+    import json
+    import time
+
+    from claude_on_the_fly import codex_auth
+
+    monkeypatch.setenv(codex_auth.BASE_URL_ENV, "http://127.0.0.1:1/_session/t/chatgpt")
+    auth = codex_login / "auth.json"
+    auth.write_text(
+        json.dumps({"tokens": {"access_token": "OLD", "refresh_token": "R"}})
+    )
+    project = world["project"]
+    ready = project / "ready"
+    script = f"cat '{auth}' >/dev/null 2>&1; touch '{ready}'; sleep 3; cat '{auth}'"
+    proc = subprocess.Popen(
+        sandbox.wrap(["/bin/sh", "-c", script], project),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 30
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists(), "the jailed process never started"
+
+    login = codex_auth.ChatGPTLogin(auth, tmp_path / "codex-auth.lock")
+    login._write(
+        json.loads(auth.read_text()),
+        {"access_token": "REFRESHED", "refresh_token": "ROTATED"},
+    )
+    out, _ = proc.communicate(timeout=30)
+
+    assert "REFRESHED" in auth.read_text()
+    assert "REFRESHED" not in out
+    assert proc.returncode != 0

@@ -20,10 +20,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import shutil
 import sys
+import time
+import unicodedata
+from collections.abc import Iterable
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -70,7 +75,145 @@ _PASSTHROUGH_ENDPOINTS = frozenset(
 # claude-pty reads this for its tmux session name. The daemon sets it so it knows
 # which pane to type an approval into; claude-pty's own default is PID-based and
 # therefore unpredictable from outside.
-_PASSTHROUGH_PTY = frozenset({"CLAUDE_PTY_TMUX_SESSION", "CLAUDE_PTY_NO_TMUX"})
+# CLAUDE_PTY_LOCK_WAIT_SEC is here so an operator can raise it; agent_env lowers
+# the default below a turn, see _PTY_LOCK_WAIT_SECONDS.
+_PASSTHROUGH_PTY = frozenset(
+    {
+        "CLAUDE_PTY_TMUX_SESSION",
+        "CLAUDE_PTY_NO_TMUX",
+        "CLAUDE_PTY_LOCK_WAIT_SEC",
+    }
+)
+
+# How long a spawned claude-pty waits for its startup lock before giving up.
+# claude-pty's own default is 600s, which is longer than every turn timeout cotf
+# uses, so a lock it cannot take costs the whole turn and explains nothing: the
+# turn dies on cotf's timeout while the script is still spinning, and the reason
+# never reaches a log. Below a turn instead, the script loses the race on its own
+# terms and prints "claude-pty: lock wait timeout after Ns (holder pid=...)",
+# which names the holder. Kept generous enough for the contended case it exists
+# for: a real hold is released the moment the statusline sidecar appears, ~500ms.
+_PTY_LOCK_WAIT_SECONDS = "60"
+# claude keeps its own OAuth credential in the login keychain, which jail.sb denies
+# by design. That deny cannot be narrowed to one item: seatbelt matches file paths
+# and every secret on the machine lives inside one database, so allowing claude's
+# credential allows all of them. Measured, with an unrelated item planted to check:
+# dropping the deny exposed that item too, and it would expose the broker's own
+# cotf-anthropic key -- the agent reading the key the broker exists to hide.
+#
+# The daemon runs outside the jail, so it can read that one item and pass the agent
+# the single value it needs. Same posture fs-allow-reads.sb already takes for the
+# other backend, whose own auth.json stays readable because the agent process must
+# read it to authenticate.
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+# Where the claude CLI keeps the same credential on Linux, under the config dir.
+_CLAUDE_CREDENTIALS_FILE = ".credentials.json"
+
+
+def _claude_oauth_token() -> str | None:
+    """The claude CLI's own OAuth access token, or None when there is not one.
+
+    None rather than an exception for every failure shape -- no keychain item, a
+    value that is not the JSON the CLI writes, a missing field. A jailed turn
+    without this fails with "Not logged in", which is exactly what happened before
+    this existed, so an unreadable credential must not take the daemon down.
+
+    Never logged, and never returned anywhere that logs its values: agent_env
+    reports variable names and a dropped count, never contents.
+    """
+    raw = _claude_credential_text()
+    if raw is None:
+        return None
+    try:
+        oauth = json.loads(raw)["claudeAiOauth"]
+        token = oauth["accessToken"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        logger.warning(
+            "sandbox: the claude credential is not the shape the claude CLI "
+            "writes, so a jailed claude turn will report 'Not logged in'"
+        )
+        return None
+    if not isinstance(token, str) or not token:
+        return None
+    # Warn rather than withhold: an expired token fails the turn with an auth error
+    # naming the cause, where withholding it fails with "Not logged in" and blames
+    # the wrong thing. The CLI refreshes the item itself; nothing here can, because
+    # a refresh rotates the credential the operator's own CLI is using.
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
+        logger.warning(
+            "sandbox: the claude credential expired; run any claude command "
+            "outside the jail to refresh it, or a jailed turn will fail to "
+            "authenticate"
+        )
+    return token
+
+
+def _claude_credential_text() -> str | None:
+    """The raw credential the claude CLI stored, from wherever this platform keeps it.
+
+    macOS keeps it in the login keychain. Linux keeps it in `.credentials.json`
+    under the config dir, which the jail masks because it holds the refresh token
+    as well. Read here, outside the jail, only under `jail`: under `env` the CLI
+    can still read and refresh its own file, and an env token would shadow a
+    credential that refreshes with one that expires.
+    """
+    from claude_on_the_fly import accounts, broker, envfile
+
+    account = accounts.current()
+    if account is not None and (
+        account.backend != "claude" or account.mode == "ollama"
+    ):
+        return None
+    platform = _platform()
+    if platform == "linux":
+        if mode() != "jail":
+            return None
+        try:
+            return (envfile.claude_config_dir() / _CLAUDE_CREDENTIALS_FILE).read_text()
+        except OSError:
+            return None
+    # The login keychain is a macOS store, and `read_keychain` shells out to
+    # `security`, which no other platform has. `broker.has_keychain` now refuses
+    # that call too, so this is the outer of two guards rather than the only one
+    # -- it stays because it is the one the tests drive, through `_platform`.
+    if platform != "darwin":
+        return None
+    service = _CLAUDE_KEYCHAIN_SERVICE
+    if account is not None and account.home is not None:
+        profile_path = unicodedata.normalize("NFC", str(account.home))
+        suffix = hashlib.sha256(profile_path.encode("utf-8")).hexdigest()[:8]
+        service = f"{service}-{suffix}"
+    try:
+        return broker.read_keychain(service)
+    except (KeyError, OSError):
+        return None
+
+
+def claude_pty_startup_is_delegated() -> bool:
+    """True when the daemon has to serialize claude-pty's startup itself.
+
+    claude-pty gates claude's supervisor boot with `mkdir <config>/.pty-lock`,
+    because two TUIs entering that boot window together leave one hung. The Linux
+    jail mounts the config directory read-only, so the mkdir fails and the script
+    spins to its timeout. Measured in a container: "mkdir: cannot create
+    directory '/root/.claude/.pty-lock': Read-only file system".
+
+    A writable mount over the lock is not the fix. The mkdir then fails with
+    EEXIST, and the script's recovery only reclaims a lock whose pid file names a
+    dead process, so an always-present directory spins exactly the same way. An
+    overlay is not the fix either: a private one per turn makes the lock succeed
+    while serializing nothing, which is worse than not locking, and a shared one
+    gives two threads a writable directory they can both see.
+
+    So on Linux the daemon takes the escape hatch the script documents,
+    CLAUDE_PTY_NO_LOCK=1, and holds the gate itself. Say the narrower guarantee
+    out loud: this covers the turns this daemon starts, not a claude the operator
+    runs in their own terminal on the same host.
+    """
+    return mode() == "jail" and _platform() == "linux"
+
+
 _PROXY_VARS = frozenset(
     {
         "HTTP_PROXY",
@@ -230,13 +373,10 @@ you need genuinely lives in another conversation, ask for it.
 Common blocked scenarios and the remedy to relay to the user:
 - Reading a file outside the allowed set (e.g. `cat ~/.aws/credentials`) \
 {block_read}. Remedy: the operator adds the path to `sandbox.extra_paths`.
-- Writing a file outside the workspace {block_write}. Remedy: the operator \
-widens the sandbox write profile.
-- Reaching an external host that is not yet approved pauses while the operator \
-is asked, then either succeeds or returns 403 with an "[sandbox] egress policy" \
-body. A 403 means they declined: say which host you needed and why, then carry \
-on with what you can. Do not retry in a loop, and do not look for another route \
-to the same host.
+- Writing a file outside the write set {block_write}. Remedy: the operator \
+adds the path to `sandbox.write_paths`.
+- {net_scenario} Say which host you needed and why, then carry on with what you \
+can. Do not retry in a loop, and do not look for another route to the same host.
 {keychain}
 - {brokered} A credentialed CLI that is not on that list will fail on its own \
 config or token file, because the sandbox denies credential stores. That is \
@@ -247,6 +387,41 @@ of {settings_path}. Report which command you needed and stop there — do not lo
 for the credential yourself, and do not reach the same service by another route \
 (a different host, another tool's token, a provider-side integration). Doing that \
 launders the boundary rather than respecting it."""
+
+
+# What `sandbox.egress` does to an external call, as (network line, blocked
+# scenario). The guidance is built without knowing whether this session can ask
+# anyone: a job never can, and a chat can only when an operator chat is set. So
+# `gated` names both outcomes rather than promising a wait that may not happen.
+_EGRESS_GUIDANCE = {
+    "gated": (
+        "External HTTPS goes through the local egress proxy, which gates it by "
+        "destination: pre-approved hosts just work. An unknown host pauses while "
+        "the operator is asked when this session can ask, and is refused at once "
+        "when it cannot.",
+        "Reaching an unknown external host either pauses while the operator is "
+        "asked, or is refused at once when no one can be asked. A refusal is a 403 "
+        'whose status line starts "Forbidden by egress policy" and says why. A '
+        "private address the work needs takes the operator's `egress.private_allow`, "
+        "plus approval, or `egress.allow` when no one can approve it.",
+    ),
+    "open": (
+        "External HTTPS goes through the local egress proxy, which lets any public "
+        "host through without asking. It still refuses private, loopback and "
+        "metadata addresses and any host the operator blocked.",
+        "Reaching a private, loopback or metadata address, or a host the operator "
+        'blocked, fails with a 403 whose status line starts "Forbidden by egress '
+        'policy" and says why. Any other public host works. A private address the '
+        "work needs takes the operator's `egress.private_allow`.",
+    ),
+    "off": (
+        "This session has no internet access: the egress proxy is off, so an "
+        "external call fails to connect or resolve. Only the brokered services "
+        "work.",
+        "Every external call fails, because this session has no internet. The "
+        "remedy is an operator change to `sandbox.egress`.",
+    ),
+}
 
 
 # How a policy block actually reads, per platform. Both sets are measured against
@@ -268,8 +443,11 @@ error, they are simply absent from your view of the filesystem. Do not conclude 
 the file does not exist on the machine, and do not go looking for it elsewhere.
 - "Read-only file system" (EROFS) means sandbox policy: the location is outside \
 your write set.
-- "Permission denied" (EACCES) means a genuine file-permission problem, not the \
-sandbox."""
+- "Permission denied" (EACCES) on a masked credential means sandbox policy: \
+a `.env` file, `~/.claude/.credentials.json`, claude's `history.jsonl` and the \
+ssh-agent socket are masked on purpose, and no grant will open them. If a tool \
+needs that credential, the remedy is brokering the tool, below. Anywhere else, \
+"Permission denied" is a genuine file-permission problem."""
 
 _MACOS_KEYCHAIN = """\
 - Reading the keychain (e.g. `security find-generic-password`) is denied, but it \
@@ -329,6 +507,77 @@ def enabled() -> bool:
     return mode() != "off"
 
 
+_EGRESS_MODES = ("gated", "open", "off")
+
+
+def egress_mode() -> str:
+    """Resolved `sandbox.egress`: 'gated' (default), 'open', or 'off'.
+
+    A separate setting from `sandbox.mode` because they answer different
+    questions. `sandbox.mode` decides whether the agent ever holds a credential.
+    This decides what happens to its outbound HTTPS, along two axes that are not
+    the same axis:
+
+    - 'gated'  the proxy runs and asks the operator about any host outside
+               `egress.allow`.
+    - 'open'   the proxy runs and tunnels any public host without asking. The
+               refusals that are not about allowlisting still apply: a malformed
+               name, a `never_ask` metadata endpoint, and an address that
+               resolves private or loopback without `egress.private_allow`.
+    - 'off'    no proxy at all.
+
+    'open' exists because `egress.allow` matches host names exactly, with no
+    wildcard and no suffix match. An agent that reads the open web reaches a new
+    host most turns -- measured on one deployment, 420 distinct hosts in 35 days
+    -- so gating turns nearly every turn into a prompt and then hits the approval
+    rate limit. It is the setting for an agent whose job is reading the web.
+
+    What 'open' buys over simply not jailing the network: the proxy still pins
+    the resolved address, still refuses a metadata endpoint, and still keeps the
+    namespace free of the host's loopback services. What it costs: the tunnel is
+    not inspected, so an approved-by-default host is a covert channel. Paired
+    with the jail's filesystem denies that is the intended trade -- the agent
+    cannot reach the operator's credentials, and it can still read the web.
+
+    'off' is legal under `jail` and means exactly what it says: the relay bridges
+    whatever brokered loopback ports the turn has, so model calls still work
+    through the credential broker, and the agent has no internet. That is a
+    deliberate lockdown posture rather than a broken one.
+
+    Read at startup, like `mode`: the proxy is constructed once, so the spawn
+    boundary must keep answering with the mode those services were built for.
+    """
+    raw = settings.startup_value("sandbox.egress", "gated")
+    # YAML 1.1 reads a bare `off` as the boolean False, and `on` as True, so an
+    # operator who writes the documented value unquoted never reaches the string
+    # branch at all. Both spellings are accepted rather than answering "'False'
+    # is not one of [...]" to somebody who wrote exactly what the template
+    # shows. Found by running a real config file through startup; no amount of
+    # COTF_SANDBOX_EGRESS monkeypatching reproduces it, because the environment
+    # variable is always a string.
+    if isinstance(raw, bool):
+        value = "gated" if raw else "off"
+    else:
+        value = str(raw).strip().lower() or "gated"
+    if value not in _EGRESS_MODES:
+        raise SandboxModeError(
+            f"sandbox.egress={raw!r} is not one of {list(_EGRESS_MODES)}. Fix the "
+            f"value in {settings.operator_settings()}, or drop the key to keep "
+            f"egress gated."
+        )
+    return value
+
+
+def egress_proxy_enabled() -> bool:
+    """Whether a per-session egress proxy is constructed at all."""
+    return egress_mode() != "off"
+
+
+def egress_asks() -> bool:
+    """Whether the proxy asks the operator about a host outside the allowlist."""
+    return egress_mode() == "gated"
+
+
 def _is_passthrough(key: str) -> bool:
     return (
         key in _PASSTHROUGH
@@ -338,6 +587,30 @@ def _is_passthrough(key: str) -> bool:
         or key.startswith(_PASSTHROUGH_PREFIXES)
         or key.endswith(_PASSTHROUGH_SUFFIXES)
     )
+
+
+def _account_env(env: dict[str, str]) -> dict[str, str]:
+    """Select one profile without changing the daemon environment."""
+    from claude_on_the_fly import accounts
+
+    account = accounts.current()
+    if account is None:
+        return env
+    for name in accounts.AUTH_OVERRIDE_ENV:
+        env.pop(name, None)
+    from claude_on_the_fly import codex_auth
+
+    env.pop("COTF_CHATGPT_BASE_URL", None)
+    if account.backend == "codex":
+        url = codex_auth.published_url()
+        if url is not None:
+            env["COTF_CHATGPT_BASE_URL"] = url
+    if account.backend == "claude":
+        if account.home is None:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            env["CLAUDE_CONFIG_DIR"] = str(account.source_home)
+    return env
 
 
 def agent_env() -> dict[str, str] | None:
@@ -357,9 +630,11 @@ def agent_env() -> dict[str, str] | None:
     claude-pty named its own tmux session -- a turn that parked at a permission
     dialog no one could answer.
     """
+    from claude_on_the_fly import accounts
+
     overrides = _SESSION_ENV.get() or {}
     if not enabled():
-        if not overrides:
+        if not overrides and accounts.current() is None:
             return None
         # Inherit and layer, not curate: nothing is being withheld in this mode,
         # so building the env from an allowlist would break every spawn that
@@ -369,7 +644,7 @@ def agent_env() -> dict[str, str] | None:
             len(overrides),
             sorted(overrides),
         )
-        return {**os.environ, **overrides}
+        return {**_account_env(dict(os.environ)), **overrides}
     env = {key: value for key, value in os.environ.items() if _is_passthrough(key)}
     dropped = len(os.environ) - len(env)
     # The jail grants the claude session directory by name, derived from the
@@ -377,16 +652,42 @@ def agent_env() -> dict[str, str] | None:
     # key, so a deployment that sets it in DATA_DIR/.env had the daemon pointing
     # one way and the spawned CLI defaulting to ~/.claude -- which would leave the
     # grant on a directory the CLI never writes, and the session unpersisted with
-    # nothing in the log. Stated explicitly so the two cannot disagree. Resolving
-    # to claude's own default when unset is what the CLI would have done anyway.
+    # nothing in the log. Forward it so the two cannot disagree.
+    #
+    # Only when the daemon actually has one. Setting it to claude's default is
+    # not the no-op it reads as: the default *directory* is ~/.claude, but the
+    # default settings *file* is ~/.claude.json at home root, and naming the
+    # directory moves that file to ~/.claude/.claude.json. On an install that
+    # never set the variable those two files differ, and the one the variable
+    # selects has no `hasCompletedOnboarding`. A -p turn does not care. A pty
+    # turn runs the real TUI, which then opens the first-run theme picker and
+    # waits for a keypress no one can send, so the turn burns its whole timeout
+    # parked on a wizard. Measured: claude-pty passed in 4s with the variable
+    # absent and timed out at 150s with it set to the default.
     from claude_on_the_fly import envfile
 
-    env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
+    configured_claude_config = envfile.daemon_environment().get("CLAUDE_CONFIG_DIR")
+    if configured_claude_config:
+        env["CLAUDE_CONFIG_DIR"] = str(envfile.claude_config_dir())
     # Stated for the reason the profiles no longer grant writes to ~/.cache/uv:
     # see uv_cache_dir(). HOME is a passthrough key, so without this the child
     # resolves the operator's cache and the write deny costs capability instead of
     # buying isolation.
     env["UV_CACHE_DIR"] = str(uv_cache_dir())
+    # setdefault, not assignment: the key is a passthrough one, so an operator who
+    # set it in the daemon environment has already said what they want.
+    env.setdefault("CLAUDE_PTY_LOCK_WAIT_SEC", _PTY_LOCK_WAIT_SECONDS)
+    # Assignment, not setdefault: where the lock cannot be taken at all, an
+    # operator who set this to 0 would be asking for a turn that always spins.
+    if claude_pty_startup_is_delegated():
+        env["CLAUDE_PTY_NO_LOCK"] = "1"
+    # Only on this branch, never when the sandbox is off: an environment token
+    # shadows the CLI's stored credential, so setting it on a turn that can reach
+    # the keychain would change how an unjailed turn authenticates for no reason.
+    env = _account_env(env)
+    claude_token = _claude_oauth_token()
+    if claude_token is not None:
+        env["ANTHROPIC_AUTH_TOKEN"] = claude_token
     env.update(overrides)
     env = _with_shims_on_path(env)
     # Names only, never values: this is the one record that "the secret did not
@@ -442,11 +743,20 @@ def _with_shims_on_path(env: dict[str, str]) -> dict[str, str]:
     Prepended only when the dir has shims in it, so a deployment with no command
     broker running gets its PATH untouched rather than a phantom entry.
 
+    And only when this spawn can reach a broker. The dir is shared by every
+    daemon, but only the chat daemon runs a broker, so a cron job was handed
+    shims with no endpoint and every brokered tool failed where the real binary
+    would have run.
+
     Note this is convenience routing, not a boundary: the agent can still invoke
     /opt/homebrew/bin/gh directly. That path is useless because the profile denies
     the credential, and *that* deny is the boundary. The shim restores capability
     under the deny; it does not create the isolation.
     """
+    from claude_on_the_fly import commands
+
+    if not env.get(commands.ENDPOINT_ENV):
+        return env
     shims = shim_dir()
     try:
         populated = shims.is_dir() and any(shims.iterdir())
@@ -467,6 +777,35 @@ def _port_from_url(value: str) -> str | None:
     return port if port.isdigit() else None
 
 
+_OLLAMA_PORT = "11434"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0", "")
+
+
+def model_endpoint_env(profile_mode: str) -> dict[str, str]:
+    """The model server a jailed ollama turn must reach, as a session override.
+
+    Ollama mode publishes no base URL, so on a Linux jail nothing bridged the
+    ollama port into the namespace and `ollama launch` could not connect. Naming
+    the server in `OLLAMA_HOST` puts it in `_loopback_ports`, which the relay
+    bridges. The value is the ollama client's own default, so the child sees no
+    change. Only an ollama turn gets it: the ollama API has no auth, and a native
+    turn handed the port could pull or delete models.
+
+    Empty outside the jail, so no deployment's environment changes, and for a
+    server off this host, which the relay cannot bridge.
+    """
+    if mode() != "jail" or profile_mode != "ollama":
+        return {}
+    # Ollama's own variable, not a cotf setting, so it is read where ollama reads
+    # it: the environment this daemon and its children share.
+    configured = os.environ.get("OLLAMA_HOST", "").strip()
+    host, _, port = configured.split("://", 1)[-1].partition(":")
+    if host not in _LOOPBACK_HOSTS:
+        return {}
+    port = port.split("/", 1)[0] or _OLLAMA_PORT
+    return {"OLLAMA_HOST": f"http://127.0.0.1:{port}"}
+
+
 def _spawn_env() -> dict[str, str]:
     """What the agent will actually receive: os.environ plus session overrides.
 
@@ -475,7 +814,7 @@ def _spawn_env() -> dict[str, str]:
     process environment, so reading os.environ narrowed the jail to the broker
     port alone and locked the agent out of the very proxy it was handed.
     """
-    return {**os.environ, **(_SESSION_ENV.get() or {})}
+    return {**_account_env(dict(os.environ)), **(_SESSION_ENV.get() or {})}
 
 
 def _loopback_ports() -> list[str]:
@@ -484,8 +823,9 @@ def _loopback_ports() -> list[str]:
     Order is stable so the emitted profile is deterministic: credential broker
     (any published `*_BASE_URL`), then the egress proxy (`HTTPS_PROXY`), then the
     command broker (`COTF_CMD_ENDPOINT`), then the approval service
-    (`COTF_APPROVE_URL`, present only when permissions mode is `ask`). Duplicates
-    are collapsed.
+    (`COTF_APPROVE_URL`, present only when permissions mode is `ask`), then the
+    ollama server (`OLLAMA_HOST`, see `model_endpoint_env`). Duplicates are
+    collapsed.
     """
     env = _spawn_env()
     found: list[str] = []
@@ -495,7 +835,7 @@ def _loopback_ports() -> list[str]:
             if port is not None:
                 found.append(port)
                 break
-    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT", "COTF_APPROVE_URL"):
+    for key in ("HTTPS_PROXY", "COTF_CMD_ENDPOINT", "COTF_APPROVE_URL", "OLLAMA_HOST"):
         port = _port_from_url(env.get(key, ""))
         if port is not None:
             found.append(port)
@@ -509,7 +849,7 @@ def _fs_base_profile() -> Path:
     return sandbox_macos._fs_base_profile()
 
 
-def _loopback_specs() -> tuple[str, str, str, str]:
+def _loopback_specs() -> tuple[str, str, str, str, str]:
     """This turn's loopback allows. Resolves the ports here and hands them to the
     profile builder, which stays pure."""
     return sandbox_macos._loopback_specs(_loopback_ports())
@@ -603,14 +943,37 @@ def _extra_path_stores() -> list[Path]:
 
     stores = [Path(store).expanduser() for store in _CREDENTIAL_STORES]
     stores.append(Path(DATA_DIR))
+    stores.extend(_account_homes())
     return [Path(os.path.realpath(store)) for store in stores]
 
 
 def _extra_path_files() -> list[Path]:
     """The file-level credential paths an entry may not reach, realpath'd."""
     return [
-        Path(os.path.realpath(Path(file).expanduser())) for file in _CREDENTIAL_FILES
+        *(
+            Path(os.path.realpath(Path(file).expanduser()))
+            for file in _CREDENTIAL_FILES
+        ),
+        *_account_credential_paths(),
     ]
+
+
+def resolve_grant_entry(entry: str) -> Path:
+    """One operator path entry, expanded and resolved, ready to be judged.
+
+    `~` is expanded first. Without that, `~/notes` resolves against the daemon's
+    working directory into a path that does not exist, so the grant silently does
+    nothing: it is not refused, nothing is logged, and the operator's next move is
+    to widen the entry until something works. Measured before this existed --
+    `sandbox.extra_paths: [~/.gitconfig]`, which `docs/how-to/enable-sandboxing.md`
+    has recommended verbatim, produced `<cwd>/~/.gitconfig`.
+
+    Shared by `sandbox.extra_paths`, `sandbox.write_paths` and the command
+    broker's `allow_paths` so one syntax cannot mean three things. The refusal
+    checks run on what this returns, so expanding here is also what makes
+    `~/.ssh` reach the credential comparison at all.
+    """
+    return Path(os.path.realpath(Path(entry).expanduser()))
 
 
 def _extra_path_refusal(resolved: Path) -> str | None:
@@ -666,7 +1029,7 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
     paths = [p for p in settings.get("COTF_SANDBOX_EXTRA_PATHS").split(":") if p]
     granted: list[str] = []
     for entry in paths:
-        resolved = Path(os.path.realpath(entry))
+        resolved = resolve_grant_entry(entry)
         refusal = _extra_path_refusal(resolved)
         if refusal is not None:
             logger.error(
@@ -688,6 +1051,215 @@ def _extra_read_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
         )
         granted = granted[:cap]
     return granted
+
+
+# Paths a `sandbox.write_paths` entry must not reach, on top of every refusal a
+# read grant already carries. A write grant is not a bigger read grant: it hands
+# the agent the ability to leave something behind that *runs later, outside the
+# jail*. A shell rc is sourced by the operator's next login, a systemd unit or a
+# LaunchAgent is started by init, a file dropped on PATH is executed by the next
+# person who types its name, and a hook under an agent's config tree runs on the
+# host the next time that agent starts. None of those are credential stores, so
+# `_extra_path_refusal` passes them, and each one turns a contained write into
+# host execution.
+#
+# Directories and files together, checked the same way the credential lists are:
+# an entry inside one is an escape outright, and an entry that merely contains
+# one re-opens it.
+_WRITE_ESCAPE_PATHS = (
+    # Sourced by the operator's next interactive shell.
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.profile",
+    "~/.zshrc",
+    "~/.zshenv",
+    "~/.zprofile",
+    # Started by init, with no shell involved.
+    "~/.config/systemd",
+    "~/.config/autostart",
+    "~/Library/LaunchAgents",
+    # On PATH, so a name collision is enough; nobody has to open the file. The
+    # live PATH is added to these by `_write_escape_paths`; the two literals stay
+    # because a deployment whose daemon PATH omits them is still a deployment
+    # whose operator has them in an interactive shell.
+    "~/.local/bin",
+    "~/bin",
+    # git runs what its config tells it to: `core.hooksPath` points at a hook
+    # directory, and an alias beginning `!` is a shell command. Both execute on
+    # the operator's next git invocation, outside the jail, and the command
+    # broker itself shells out to credentialed CLIs.
+    "~/.gitconfig",
+    "~/.config/git",
+    # systemd reads user units from either location, so naming only the first
+    # leaves the second as an equivalent way in.
+    "~/.local/share/systemd",
+    "~/.config/environment.d",
+    # Agent config trees. Their hooks and instruction files run on the host, and
+    # both are mounted read-only inside the jail precisely so a turn cannot edit
+    # them. A write grant here would undo that from the other direction.
+    "~/.claude",
+    "~/.codex",
+    "~/.agents",
+)
+
+
+def _write_escape_paths() -> list[Path]:
+    """`_WRITE_ESCAPE_PATHS`, realpath'd, plus the config trees this deployment
+    actually uses.
+
+    The literals name `~/.claude` and `~/.codex`, which is where those trees are
+    by default and not where they have to be: `CLAUDE_CONFIG_DIR` moves one of
+    them anywhere. Both are write-denied by the profile, and the `_WRITE_*` allows
+    are written *after* those denies, so a redirected tree missing from this list
+    is a grant that re-opens its own deny. Appended rather than listed for the
+    same reason `_extra_path_stores` appends DATA_DIR: the path is resolved per
+    deployment, so a literal cannot carry it.
+    """
+    from claude_on_the_fly import envfile
+
+    paths = [Path(path).expanduser() for path in _WRITE_ESCAPE_PATHS]
+    paths.append(envfile.claude_config_dir())
+    paths.append(_codex_operator_home())
+    # Every directory on the daemon's PATH, derived rather than listed. A literal
+    # list goes stale the moment a deployment uses a different toolchain: measured
+    # against a real PATH, `/opt/homebrew/bin`, `~/go/bin`, `~/.cargo/bin` and a
+    # mise shim directory were all grantable while the comment above claimed PATH
+    # directories were covered. `/opt/homebrew` is the example `extra_paths` value
+    # in the shipped template, so copying it into `write_paths` was the likely
+    # first mistake. An empty entry means the working directory, which is not a
+    # path anyone meant to name, so it is skipped rather than resolved.
+    paths += [
+        Path(entry) for entry in os.environ.get("PATH", "").split(os.pathsep) if entry
+    ]
+    return [Path(os.path.realpath(path)) for path in paths]
+
+
+def _write_path_refusal(resolved: Path) -> str | None:
+    """Why this resolved `sandbox.write_paths` entry cannot be granted, or None.
+
+    Every reason a read grant is refused refuses a write grant too, so the read
+    check runs first and its wording is reused. The escape list is the part that
+    is specific to writing.
+    """
+    refusal = _extra_path_refusal(resolved)
+    if refusal is not None:
+        return refusal
+    for escape in _write_escape_paths():
+        if resolved.is_relative_to(escape):
+            return f"it resolves inside {escape}, which runs outside the sandbox"
+        if escape.is_relative_to(resolved):
+            return f"it contains {escape}, which runs outside the sandbox"
+    return None
+
+
+def _extra_write_paths(cap: int | None = _MAX_EXTRA_PATHS) -> list[str]:
+    """Operator write grants for deny-most, from `sandbox.write_paths`, realpath'd.
+
+    Shaped exactly like `_extra_read_paths`, including dropping a refused entry
+    and granting the rest: the reasoning there about failing closed applies here
+    unchanged, and an operator who has to debug both should not find two
+    different behaviours.
+
+    A granted entry is writable *and* readable. Writing to a path the profile
+    will not let the agent stat is not a capability anyone asked for, and on
+    Linux the read follows from the bind anyway, so making macOS agree is what
+    keeps one setting from meaning two things.
+    """
+    entries = [p for p in settings.get("COTF_SANDBOX_WRITE_PATHS").split(":") if p]
+    granted: list[str] = []
+    for entry in entries:
+        resolved = resolve_grant_entry(entry)
+        refusal = _write_path_refusal(resolved)
+        if refusal is not None:
+            logger.error(
+                "sandbox.write_paths entry %r (resolved to %s) is refused: %s. "
+                "Granting the rest and continuing; name a narrower path in %s.",
+                entry,
+                resolved,
+                refusal,
+                settings.operator_settings(),
+            )
+            continue
+        granted.append(str(resolved))
+    if cap is not None and len(granted) > cap:
+        logger.warning(
+            "sandbox.write_paths has %d granted entries; granting only the first "
+            "%d (seatbelt has no arrays)",
+            len(granted),
+            cap,
+        )
+        granted = granted[:cap]
+    return granted
+
+
+def _shortest_roots(paths: list[Path]) -> list[Path]:
+    """`paths` with every entry that sits under another entry removed.
+
+    A seatbelt subpath grant already covers everything below it, so keeping a
+    child as well spends a slot on a rule that changes nothing. Shallowest first,
+    so a parent is always seen before the children it absorbs.
+    """
+    ordered = sorted({str(p): p for p in paths}.values(), key=lambda p: len(p.parts))
+    roots: list[Path] = []
+    for path in ordered:
+        if not any(path.is_relative_to(root) for root in roots):
+            roots.append(path)
+    return roots
+
+
+def _codex_link_read_paths() -> list[Path]:
+    """Resolved link targets of the codex home and claude config that deny-most hides.
+
+    The read grant on that home covers the links and not what they point at:
+    seatbelt matches the path the kernel resolves, so an entry symlinked
+    elsewhere under the opaque $HOME is unreadable while the profile still reads
+    as though it were granted. Sharing one set of agents, skills or instructions
+    between backends is the ordinary way to get there -- `~/.codex/agents ->
+    ~/.agents/agents` is what found this, and codex exited 1 with "Operation not
+    permitted (os error 1)" with no path in the message. The kernel named it:
+    `deny(1) file-read-data /Users/<user>/.agents/agents`.
+
+    The Linux jail has mounted these targets read-only since the session
+    boundary landed, for the same reason in mount terms. This is the macOS half.
+
+    Three filters, in order of how much they remove. A target outside $HOME needs
+    nothing, since deny-most allows reads globally and only carves the home out.
+    A target inside the codex home or the claude config dir is already granted by
+    the rule for that tree. And a target `sandbox.extra_paths` would refuse is
+    refused here too: an operator who links `~/.codex/agents` at `$HOME` or at
+    `~/.ssh` gets a logged refusal rather than a profile that re-opens the home.
+    """
+    from claude_on_the_fly import codex_state, envfile
+
+    home = Path(os.path.realpath(Path.home()))
+    operator = _codex_operator_home()
+    granted = [
+        operator,
+        Path(os.path.realpath(envfile.claude_config_dir())),
+        home / ".claude",
+    ]
+    kept: list[Path] = []
+    # The claude config dir's links too: the same trap, and Linux mounts those
+    # targets read-only already. `_claude_link_targets` has refused credential
+    # stores and the home by now, so the check below never fires for them.
+    targets = [*codex_state.shared_link_targets(operator), *_claude_link_targets()]
+    for target in targets:
+        if not target.is_relative_to(home):
+            continue
+        if any(target.is_relative_to(tree) for tree in granted):
+            continue
+        refusal = _extra_path_refusal(target)
+        if refusal is not None:
+            logger.error(
+                "sandbox: the codex home links to %s, which cannot be granted "
+                "because %s. codex will report it as missing. Repoint the link "
+                "or move the content out of that tree",
+                target,
+                refusal,
+            )
+            continue
+        kept.append(target)
+    return _shortest_roots(kept)
 
 
 def _deny_most_in_force() -> bool:
@@ -764,8 +1336,12 @@ def agent_guidance(workspace: Path | None = None) -> str:
         else "No credentialed CLI is brokered in this deployment."
     )
 
+    linux = _platform().startswith("linux")
+    granted = _extra_write_paths(cap=None) if linux else _extra_write_paths()
     writes = (
-        f"the workspace ({project}), your memory ({MEMORY_DIR}), and your temp dir."
+        f"the workspace ({project}), your memory ({MEMORY_DIR}), "
+        + "".join(f"{path}, " for path in granted)
+        + "and your temp dir."
     )
     if _deny_most_in_force():
         reads = (
@@ -780,31 +1356,27 @@ def agent_guidance(workspace: Path | None = None) -> str:
             "the keychain, SSH private keys, cloud credentials (~/.aws/credentials), "
             "and token files (~/.npmrc, ~/.netrc, ~/.env)."
         )
-    if _platform().startswith("linux"):
+    external, net_scenario = _EGRESS_GUIDANCE[egress_mode()]
+    if linux:
         # Accurate for the namespace: no host service beyond the brokered ones is
         # reachable, but external hosts are, through the proxy. Saying "external
         # hosts are blocked" here would make the agent decline work it can do.
         net = (
             "Your network namespace reaches only the local broker services; no other "
-            "port on the host is reachable. External hosts go through the local "
-            "egress proxy, which gates them by destination: pre-approved hosts just "
-            "work, an unknown one pauses while the operator is asked. Ports you bind "
-            "yourself are private to this session and work normally."
+            f"port on the host is reachable. {external} Ports you bind yourself are "
+            "private to this session and work normally."
         )
     elif settings.get("COTF_SANDBOX_BROKER_ONLY_LOOPBACK").lower() in _TRUTHY:
+        # Local ports only. The proxy is one of the broker services, so external
+        # hosts still work through it: measured, a public host answered 200.
         net = (
-            "Outbound network reaches ONLY the local broker; other local ports and "
-            "external hosts are blocked."
+            "Local network reaches only the broker services; no other local port "
+            f"is reachable. {external}"
         )
     else:
-        net = (
-            "Outbound HTTPS goes through a local egress proxy that gates it by "
-            "destination host. Pre-approved hosts just work; an unknown host "
-            "pauses the request while the operator is asked to approve it, so a "
-            "first call to a new host may take up to a minute."
-        )
-    linux = _platform().startswith("linux")
+        net = external
     return _JAIL_GUIDANCE.format(
+        net_scenario=net_scenario,
         mechanism=(
             "a Linux bubblewrap sandbox in its own network namespace"
             if linux
@@ -830,7 +1402,42 @@ def agent_guidance(workspace: Path | None = None) -> str:
     )
 
 
-_RUNTIME_SLOTS = 5
+# The binaries a wrapper execs, which `argv[0]` alone never names. claude-pty is
+# a shell script: it runs `claude` for the turn and `tmux` to host it in a pane.
+# Under deny-most neither is granted, so the script dies rc 127 before it does
+# anything, and the failure reads as "command not found" rather than as a denial.
+# `ollama launch <agent>` execs the agent, claude or codex, and without it
+# answered "claude is not installed" from inside the jail.
+_EXECS_BEHIND = {"claude-pty": ("claude", "tmux"), "ollama": ("claude", "codex")}
+
+
+def _install_library_dir(binary: Path) -> Path | None:
+    """The `lib/` beside a `<prefix>/bin/<name>` install, when there is one.
+
+    A CLI in `bin/` keeps its code in a sibling rather than beside itself: node
+    puts it in `<prefix>/lib/node_modules`, so granting `bin/` alone leaves the
+    package unreadable. Measured under deny-most: "Cannot read package config
+    .../@openai/codex/package.json: operation not permitted", after the binary
+    had already started.
+
+    `lib/` and not the prefix. The prefix is whatever the installer chose, and
+    for `~/.local/bin/claude` that is `~/.local` -- one grant covering mise's
+    installs, its state and every other tool the operator keeps there, to buy
+    nothing, because claude's code is under `~/.local/share` rather than in a
+    sibling `lib/`. Asking for the directory that actually holds the code keeps
+    the grant the size of the problem.
+
+    None when it does not exist, so a layout that keeps its code elsewhere costs
+    no slot at all.
+    """
+    if binary.parent.name != "bin":
+        return None
+    library = binary.parent.parent / "lib"
+    return library if library.is_dir() else None
+
+
+# The kernel's own limit on symlinks followed in one lookup (MAXSYMLINKS).
+_MAX_LINK_HOPS = 40
 
 
 def _runtime_read_paths(argv: list[str]) -> list[Path]:
@@ -844,10 +1451,29 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
     needed, and outside one they collapse to the same path harmlessly. The
     package directory is listed separately because an editable install leaves it
     outside either prefix, and the Linux relay launcher imports from it.
+
+    Every entry is listed twice, as written and as resolved, because seatbelt
+    matches the path the kernel arrives at and a grant naming a symlink covers
+    nothing. uv is the case this was measured on: `sys.base_prefix` is
+    `.../uv/python/cpython-3.12-macos-aarch64-none`, a symlink to the same name
+    carrying the patch version. The grant matched nothing, dyld could not load
+    `lib/libpython3.12.dylib` from the resolved tree, and the interpreter died on
+    SIGABRT before running a line -- which under `deny-most` made the egress
+    preflight inconclusive and refused to start *any* turn, on the project's own
+    documented install method.
+
+    A wrapper contributes the binaries it execs as well as itself, and a
+    `<prefix>/bin/<name>` install contributes the `lib/` beside it. See `_EXECS_BEHIND` and
+    `_install_library_dir` for what each is worth and how far each reaches.
     """
     paths: list[Path] = []
-    binary = shutil.which(argv[0]) if argv else None
-    if binary:
+    names = list(argv[:1])
+    if names:
+        names += _EXECS_BEHIND.get(Path(names[0]).name, ())
+    for name in names:
+        binary = shutil.which(name)
+        if binary is None:
+            continue
         # Two directories, because a launcher and the code it runs need not share
         # one. `claude` installs as a symlink in ~/.local/bin pointing into
         # ~/.local/share/claude/versions/<v>, and granting only the resolved
@@ -860,13 +1486,56 @@ def _runtime_read_paths(argv: list[str]) -> list[Path]:
         # The parent in each case, not the file: an npm-installed CLI is a shim
         # beside the package tree it loads. Read-only, and they hold executables
         # rather than secrets.
-        paths.append(Path(binary).parent)
-        paths.append(Path(os.path.realpath(binary)).parent)
+        for candidate in (Path(binary), Path(os.path.realpath(binary))):
+            paths.append(candidate.parent)
+            library = _install_library_dir(candidate)
+            if library is not None:
+                paths.append(library)
     paths += [Path(sys.prefix), Path(sys.base_prefix), Path(__file__).parent]
     seen: dict[str, Path] = {}
     for path in paths:
         seen.setdefault(str(path), path)
+        resolved = Path(os.path.realpath(path))
+        seen.setdefault(str(resolved), resolved)
+    # A uv venv's python links to `.../uv/python/cpython-3.X-<platform>/bin/...`,
+    # and `cpython-3.X-<platform>` is itself a link to the patch directory. The
+    # list above holds both ends of that chain but not the link between them, and
+    # on Linux $HOME is a tmpfs, so the link does not exist inside the jail and
+    # exec fails on a path that looks granted. Measured: "bwrap: execvp
+    # .venv/bin/python: No such file or directory", failing the preflight and
+    # every shim. A link is added only when its target is already granted, so
+    # this recreates a path and grants nothing new.
+    for link in _linked_dirs(Path(sys.executable)):
+        if os.path.realpath(link) in seen:
+            seen.setdefault(str(link), link)
     return list(seen.values())
+
+
+def linux_runtime_grants(argv: list[str]) -> tuple[list[Path], dict[Path, str]]:
+    """`_runtime_read_paths` split the way bwrap needs it: (mounts, links).
+
+    Resolved paths are mounted; each symlinked entry is recreated as a link,
+    because bwrap refuses a symlink as a mount destination. Public so the live
+    jail tests build the same split rather than a copy that drifts from it.
+    """
+    runtime = _runtime_read_paths(argv)
+    mounts = [path for path in runtime if str(path) == os.path.realpath(path)]
+    links = {path: os.readlink(path) for path in runtime if path.is_symlink()}
+    return mounts, links
+
+
+def _linked_dirs(path: Path) -> list[Path]:
+    """Symlinked directories `path` passes through, following each link it names."""
+    found: list[Path] = []
+    current = path
+    for _ in range(_MAX_LINK_HOPS):
+        found += [parent for parent in current.parents if parent.is_symlink()]
+        try:
+            target = os.readlink(current)
+        except OSError:
+            break
+        current = current.parent / target
+    return found
 
 
 def scoped_sessions() -> bool:
@@ -926,6 +1595,67 @@ def _claude_session_paths(workspace: Path) -> tuple[Path, Path, Path]:
         else projects
     )
     return (Path(os.path.realpath(envfile.claude_config_dir())), projects, thread)
+
+
+def _codex_auth_denied() -> Path | None:
+    """The operator's codex `auth.json` when the broker holds it, else None.
+
+    Keyed on the URL the broker published, like the codex argv, so the jail
+    hides the file exactly when a turn is pointed at the broker instead.
+    """
+    from claude_on_the_fly import codex_auth
+
+    if codex_auth.published_url() is None:
+        return None
+    from claude_on_the_fly import accounts, envfile
+
+    account = accounts.current()
+    if account is not None and account.backend == "codex":
+        return Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+    return _codex_operator_home() / "auth.json"
+
+
+def _codex_operator_home() -> Path:
+    """The codex home the operator configured, which `CODEX_HOME` can move.
+
+    Distinct from `_CODEX_HOME`, which names the *running thread's* home and is
+    narrowed to `sessions/` when the session boundary is off. The rules that
+    protect what codex executes and is told -- config.toml, AGENTS.md, hooks.json,
+    prompts -- have to name the operator's tree instead, and they used to spell it
+    `$HOME/.codex` literally. A relocated CODEX_HOME then matched none of them:
+    measured, its config.toml was unreadable under deny-most, so codex could not
+    read its own settings, and its protection came only from the blanket $HOME
+    deny rather than from any rule that knew what the file was.
+
+    Resolves to `~/.codex` when CODEX_HOME is unset, so a deployment that never
+    set it keeps exactly the rules it had.
+    """
+    from claude_on_the_fly import envfile
+
+    return Path(os.path.realpath(envfile.codex_home(envfile.daemon_environment())))
+
+
+def _pane_socket() -> Path:
+    """cotf's tmux socket, as one literal path the jail may connect to.
+
+    A jailed `claude-pty` hosts its turn in a tmux session, and tmux reaches its
+    server over a unix socket. The profile denies network-outbound, which on macOS
+    covers AF_UNIX connect, so without this every jailed pty turn lost its pane.
+
+    The comment this replaces said unix sockets could not be scoped to a path and
+    that only `(remote unix)` worked, which would have meant opening the Docker
+    socket and ssh-agent to get a pane. That is wrong, and was measured: a profile
+    carrying `(allow network-outbound (literal <socket>))` loads and lets tmux
+    connect, while the same profile without the line answers "Operation not
+    permitted" on the same socket. One literal path, so no other socket is opened.
+
+    Resolved, like every other param: seatbelt matches the resolved path, and a
+    data dir behind a symlink would otherwise leave this matching nothing while
+    the profile still loaded.
+    """
+    from claude_on_the_fly import tmux
+
+    return Path(os.path.realpath(tmux.socket_path()))
 
 
 def _codex_session_paths(workspace: Path) -> tuple[Path, Path]:
@@ -1014,8 +1744,9 @@ _CLAUDE_RUNTIME_WRITES = (
 # Files under the claude config directory a turn must not read, named one by one
 # the way the credential denies are. history.jsonl is every prompt typed in every
 # project on the host, so it crosses threads exactly like projects/ does, and no
-# measured turn writes it.
-_CLAUDE_READ_DENIED = ("history.jsonl",)
+# measured turn writes it. The credentials file holds the refresh token; a jailed
+# turn gets the access token alone through ANTHROPIC_AUTH_TOKEN instead.
+_CLAUDE_READ_DENIED = ("history.jsonl", _CLAUDE_CREDENTIALS_FILE)
 
 
 # ~/.codex is writable on Linux, with the dangerous entries mounted read-only back
@@ -1049,7 +1780,8 @@ _CODEX_PROTECTED = (
     "prompts",
     # The backend's own OAuth token. The agent must read it to authenticate, so
     # it stays readable; only the write is denied, which keeps a turn from
-    # swapping the operator's credential for one it controls.
+    # swapping the operator's credential for one it controls. When the broker
+    # holds the ChatGPT login, `_linux_grants` masks it instead.
     "auth.json",
 )
 
@@ -1162,6 +1894,288 @@ def _ensure_session_mount_sources(workspace: Path) -> None:
             logger.warning("sandbox: could not create mount source %s: %s", source, exc)
 
 
+# Directories under the claude config dir whose entries may each link elsewhere,
+# the way `~/.claude/skills/<name>` does when skills are shared from a repo.
+_CLAUDE_LINKED_DIRS = ("skills", "agents", "commands")
+
+
+def _claude_link_targets() -> list[Path]:
+    """Where links in the claude config dir point, for the Linux jail to mount.
+
+    The config dir is mounted read-only, but a link out of it dangles inside the
+    jail unless its target is mounted too. `~/.claude/skills -> ~/<repo>/skills`
+    left claude with no skills at all. The claude counterpart of
+    `codex_state.shared_link_targets`. A target the extra-path check would refuse,
+    a credential store or the home itself, is not followed.
+    """
+    from claude_on_the_fly import envfile
+
+    config = envfile.claude_config_dir()
+    entries = [*_safe_children(config)]
+    for name in _CLAUDE_LINKED_DIRS:
+        entries += _safe_children(config / name)
+    targets: dict[str, Path] = {}
+    for entry in entries:
+        if not entry.is_symlink():
+            continue
+        real = Path(os.path.realpath(entry))
+        if _extra_path_refusal(real) is None:
+            targets.setdefault(str(real), real)
+    return list(targets.values())
+
+
+def _safe_children(directory: Path) -> list[Path]:
+    try:
+        return list(directory.iterdir())
+    except OSError:
+        return []
+
+
+# Paths inside a repository that git acts on outside the jail: it runs the hooks
+# and honours the config (`core.hooksPath`, `core.fsmonitor`, aliases) on the
+# operator's next command there. The workspace denies the same two; a write
+# grant needs them too, because it is the operator's own tree.
+_GRANT_PROTECTED_NAMES = (".git/hooks", ".git/config")
+
+
+def _data_dir_link_targets() -> list[Path]:
+    """Where the data dir's `cron.yaml` and `config.yaml` live, when they are links.
+
+    The cron daemon runs `cron.yaml` unjailed and the broker obeys `config.yaml`,
+    so a write grant over the tree they point into would let a turn edit either.
+    The data dir itself is refused as a grant; its links are how the files end up
+    inside one. A plain file adds nothing: it is still under the refused data dir.
+    """
+    from claude_on_the_fly.agent import DATA_DIR
+
+    targets: list[Path] = []
+    for name in ("cron.yaml", settings.FILENAME):
+        path = Path(DATA_DIR) / name
+        if path.is_symlink():
+            targets.append(Path(os.path.realpath(path)))
+    return targets
+
+
+def _write_grant_protected(granted: list[str]) -> list[Path]:
+    """The existing protected paths inside `granted`, minus any the operator named.
+
+    A repository at the grant or one level below it is checked; git has no
+    registry of the repositories under a tree, and a full walk per spawn is a
+    cost every turn would pay. Only paths that exist are returned: the workspace
+    gets placeholders for absent denies, and an operator's own tree must not.
+    Naming a protected path itself in `sandbox.write_paths` is the consent that
+    leaves it writable.
+    """
+    roots = [Path(path) for path in granted]
+    candidates = _data_dir_link_targets()
+    for root in roots:
+        children = [c for c in _safe_children(root) if not c.is_symlink()]
+        for repo in (root, *(c for c in children if c.is_dir())):
+            candidates += [repo / name for name in _GRANT_PROTECTED_NAMES]
+    protected: list[Path] = []
+    for path in candidates:
+        if path in roots or path in protected or not path.exists():
+            continue
+        if any(path.is_relative_to(root) for root in roots):
+            protected.append(path)
+    return protected
+
+
+def _rename_pins(protected: list[Path], granted: list[str]) -> list[Path]:
+    """The directories between a grant and each protected path inside it.
+
+    A read-only bind moves with its parent: measured under bwrap, `mv .git
+    moved` succeeds, and a fresh `.git/hooks` is then the one git runs. The
+    kernel refuses to rename a mount point (EBUSY), so each of these is bound
+    onto itself read-write. Writes inside them are unchanged.
+    """
+    roots = [Path(path) for path in granted]
+    pins: list[Path] = []
+    for path in protected:
+        # The deepest grant, so a nested grant is not bound a second time.
+        inside = [root for root in roots if path.is_relative_to(root)]
+        root = max(inside, key=lambda root: len(root.parts))
+        for parent in path.parents:
+            if parent == root or not parent.is_relative_to(root):
+                break
+            if parent not in pins:
+                pins.append(parent)
+    return pins
+
+
+def _macos_write_protection(granted: list[str]) -> tuple[list[str], list[str]]:
+    """The seatbelt half of the write-grant protection: (protect, unprotect).
+
+    The profile denies `.git`, `.git/hooks` and `.git/config` under every write
+    slot by pattern, at any depth, so git needs nothing from here. Seatbelt
+    matches paths rather than following a mount, so a renamed parent does not
+    carry a deny away the way it does under bwrap; the `.git` node itself is
+    denied because moving it would.
+
+    `protect` is the data dir's link targets inside a grant; the profile denies
+    each and its ancestors. `unprotect` is every entry naming a protected path,
+    re-allowed after the denies, which is the consent `_write_grant_protected`
+    reads the same way.
+    """
+    roots = [Path(path) for path in granted]
+    protect = [
+        str(target)
+        for target in _data_dir_link_targets()
+        if any(target.is_relative_to(root) and target != root for root in roots)
+    ]
+    unprotect = [
+        path
+        for path in granted
+        if "/.git/hooks/" in f"{path}/"
+        or path.endswith("/.git/config")
+        or any(Path(path).is_relative_to(target) for target in protect)
+    ]
+    return protect, unprotect
+
+
+def _account_policy_active() -> bool:
+    from claude_on_the_fly import accounts
+
+    return accounts.current() is not None or bool(accounts.all_accounts())
+
+
+def _account_profile_roots() -> list[tuple[str, Path]]:
+    from claude_on_the_fly import accounts, envfile
+
+    profiles = [
+        (account.backend, account.source_home)
+        for account in accounts.all_accounts().values()
+    ]
+    if profiles or accounts.current() is not None:
+        daemon = envfile.daemon_environment()
+        profiles.extend(
+            [
+                ("claude", envfile.claude_config_dir(daemon)),
+                ("codex", envfile.codex_home(daemon)),
+            ]
+        )
+    return list(
+        dict.fromkeys(
+            (backend, Path(os.path.realpath(root))) for backend, root in profiles
+        )
+    )
+
+
+def _account_homes() -> list[Path]:
+    return [root for _, root in _account_profile_roots()]
+
+
+def _account_credential_paths() -> list[Path]:
+    paths = []
+    for backend, root in _account_profile_roots():
+        name = "auth.json" if backend == "codex" else _CLAUDE_CREDENTIALS_FILE
+        paths.append(Path(os.path.realpath(root / name)))
+    return paths
+
+
+def _account_denied_homes() -> list[Path]:
+    from claude_on_the_fly import accounts, envfile
+
+    if not _account_policy_active():
+        return []
+    active = [Path(os.path.realpath(envfile.claude_config_dir()))]
+    if accounts.current() is None:
+        active.append(_codex_operator_home())
+    return [home for home in _account_homes() if home not in active]
+
+
+def _account_config_reads() -> list[Path]:
+    from claude_on_the_fly import codex_state
+
+    base = _codex_operator_home()
+    return [
+        Path(os.path.realpath(base / name))
+        for name in (*codex_state._SHARED_ENTRIES, *codex_state._SHARED_MERGED)
+        if name != "auth.json" and (base / name).exists()
+    ]
+
+
+def _protect_account_mounts(grants: dict[str, list[Path]], workspace: Path) -> None:
+    from claude_on_the_fly import accounts, envfile
+
+    if not _account_policy_active():
+        return
+    denied = _account_denied_homes()
+    grants["opaque"].extend(path for path in denied if path.is_dir())
+    grants["read_write"] = [
+        path
+        for path in grants["read_write"]
+        if not any(path.is_relative_to(root) for root in denied)
+    ]
+    grants["read_only"] = [
+        path
+        for path in grants["read_only"]
+        if not any(path.is_relative_to(root) for root in denied)
+    ]
+    for key in ("write_denied", "write_denied_dirs"):
+        grants[key] = [
+            path
+            for path in grants.get(key, [])
+            if not any(path == root / "auth.json" for root in denied)
+        ]
+    grants["read_only"].extend(_account_config_reads())
+    selected_auth = None
+    account = accounts.current()
+    if account is None or account.backend == "codex":
+        selected_auth = Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+    grants.setdefault("masked", []).extend(
+        path
+        for path in _account_credential_paths()
+        if path.exists() and (path != selected_auth or _codex_auth_denied() is not None)
+    )
+    _, _, thread = _claude_session_paths(workspace)
+    grants["read_write"].append(thread)
+    account = accounts.current()
+    if account is not None and account.backend == "codex":
+        auth = Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+        if _codex_auth_denied() is None and auth.exists():
+            grants["read_write"].append(auth)
+
+
+def _account_seatbelt_rules(workspace: Path) -> str:
+    from claude_on_the_fly import accounts, codex_state, envfile
+
+    account = accounts.current()
+    if not _account_policy_active():
+        return ""
+    rules = [
+        f"(deny file-read* file-write* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        for path in _account_denied_homes()
+    ]
+    for path in _account_config_reads():
+        rules.append(
+            f"(allow file-read* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        )
+    _, _, claude_thread = _claude_session_paths(workspace)
+    codex_home = codex_state.home_dir(workspace)
+    sessions = Path(os.path.realpath(codex_home / "sessions"))
+    for path in (claude_thread, sessions):
+        rules.append(
+            f"(allow file-read* file-write* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        )
+    for path in _account_credential_paths():
+        rules.append(
+            f"(deny file-read* file-write* (subpath {json.dumps(str(path), ensure_ascii=False)}))"
+        )
+    if (account is None or account.backend == "codex") and _codex_auth_denied() is None:
+        auth = Path(os.path.realpath(envfile.codex_home() / "auth.json"))
+        rules.append(
+            f"(allow file-read* file-write* (literal {json.dumps(str(auth), ensure_ascii=False)}))"
+        )
+    for path in _account_config_reads():
+        quoted = json.dumps(str(path), ensure_ascii=False)
+        rules.append(
+            '(deny file-read* file-write* (regex (string-append "^" '
+            f'(regex-quote {quoted}) "/(.*/)?\\\\.env[^/]*$")))'
+        )
+    return "\n".join(rules)
+
+
 def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     """The deny-most contract as mount lists. Mirrors fs-deny-most.sb."""
     from claude_on_the_fly import codex_state
@@ -1171,9 +2185,13 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
     data_dir = Path(os.path.realpath(DATA_DIR))
     project = Path(os.path.realpath(workspace))
     tmpdir = Path(os.path.realpath(os.environ.get("TMPDIR", "/tmp")))
-    codex = home / ".codex"
+    # CODEX_HOME can move the tree; `$HOME/.codex` then names nothing codex uses.
+    codex = _codex_operator_home()
     claude_config, claude_projects, claude_project = _claude_session_paths(workspace)
     codex_sessions, codex_home = _codex_session_paths(workspace)
+    codex_auth = _codex_auth_denied()
+    granted_writes = _extra_write_paths(cap=None)
+    protected = _write_grant_protected(granted_writes)
     read_write = [
         project,
         Path(os.path.realpath(MEMORY_DIR)),
@@ -1206,8 +2224,14 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # the data dir, which is opaque, so without this the directory the backend
         # just pointed the child at would not exist inside the namespace.
         codex_home,
+        Path(os.path.realpath(codex_home / "sessions")),
+        # Operator write grants. Last so a narrower entry cannot be shadowed by
+        # one of the fixed grants above; bwrap applies these by depth, not by
+        # argv order, so position here is for the reader rather than the kernel.
+        *(Path(p) for p in granted_writes),
+        *_rename_pins(protected, granted_writes),
     ]
-    return {
+    grants = {
         # $HOME opaque, and the data dir too so a redirected COTF_DATA_DIR outside
         # $HOME gets the same treatment. memory/ and shims/ are granted back below
         # at greater depth, so the sibling .env and logs/ stay hidden either way.
@@ -1242,7 +2266,9 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
             # inside the namespace: a link into ~/.agents resolves nowhere here, and
             # codex then reports a missing file rather than a hidden one.
             *codex_state.shared_link_targets(),
-            home / ".claude",
+            *([home / ".claude"] if not _account_policy_active() else []),
+            claude_config,
+            *_claude_link_targets(),
             codex,
             data_dir / "shims",
             # Read-only, where it used to be read-write: a warm cache still
@@ -1253,7 +2279,8 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         "read_write": read_write,
         "write_denied": [
             *_project_write_denies(project, _PROJECT_WRITE_DENIES),
-            *_codex_protected(codex),
+            *(path for path in _codex_protected(codex) if path != codex_auth),
+            *protected,
         ],
         "write_denied_dirs": [
             *_project_write_denies(project, _PROJECT_WRITE_DENY_DIRS),
@@ -1265,6 +2292,10 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         # needs a mount over that file, which is what masked does.
         "masked": [
             *_linux_masked(data_dir),
+            # Hidden rather than read-only when the broker holds the login. Not
+            # in write_denied too: two mounts on one path leave argv order
+            # deciding which wins.
+            *([codex_auth] if codex_auth is not None and codex_auth.exists() else []),
             *(
                 path
                 for name in _CLAUDE_READ_DENIED
@@ -1273,12 +2304,15 @@ def _linux_grants(workspace: Path) -> dict[str, list[Path]]:
         ],
     }
 
+    _protect_account_mounts(grants, workspace)
+    return grants
+
 
 def _linux_masked(data_dir: Path) -> list[Path]:
     """Paths a coarser grant would otherwise expose, named individually.
 
-    Two of them, and neither has a macOS counterpart because seatbelt expresses
-    both with a rule rather than a mount.
+    None of them has a macOS counterpart, because seatbelt expresses each with a
+    rule rather than a mount.
 
     The ssh-agent socket is the sharper one. `SSH_AUTH_SOCK` is forwarded to the
     agent on both platforms, and on macOS the socket behind it is unusable
@@ -1296,7 +2330,16 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     now. Glob rather than an exact name because the macOS regex is unanchored at
     the end and so already covers `.env.bak` and friends -- which is the shape a
     backup taken before an edit actually has.
+
+    An operator grant needs the same sweep for a sharper reason. `sandbox.extra_paths`
+    names a directory an operator added for real reasons, which is exactly where a
+    token file sits beside the files they wanted granted, and the grant is a
+    read-only bind over the whole tree. `_extra_path_refusal` does not catch it:
+    that check mirrors the profile's own read denies, which had no rule for a
+    dotenv outside the data dir.
     """
+    from claude_on_the_fly import codex_state, envfile
+
     masked: list[Path] = []
     auth_sock = os.environ.get("SSH_AUTH_SOCK")
     if auth_sock:
@@ -1304,8 +2347,151 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     for granted in ("memory", "shims"):
         base = data_dir / granted
         if base.is_dir():
-            masked += sorted(base.rglob(".env*"))
+            # Realpath for the same reason the sweep below uses it: `memory` is
+            # commonly a symlink into the operator's own notes repository, and a
+            # mask over the link's name leaves the file readable under its real
+            # one.
+            masked += sorted(
+                Path(os.path.realpath(found)) for found in base.rglob(".env*")
+            )
+    masked += _dotenvs_under(Path(p) for p in _extra_read_paths(cap=None))
+    # And the write grants, for the same reason and one sharper. A read grant
+    # leaks a token; a write grant also lets a turn rewrite one, so a token
+    # left unmasked here can be replaced rather than merely read. The two are
+    # swept separately because an operator names them separately: a tree can be
+    # writable without being listed in `sandbox.extra_paths`, and sweeping only
+    # the read list would cover that tree solely by luck -- measured on a real
+    # host, where the granted tree happened to also be reachable through a
+    # symlink inside the claude config directory.
+    masked += _dotenvs_under(
+        (Path(p) for p in _extra_write_paths(cap=None)),
+        source="sandbox.write_paths",
+        cap=None,
+        follow=False,
+    )
+    # And the trees the operator's codex home links out to, which `_linux_grants`
+    # mounts read-only for the same reason it mounts an operator grant: cotf did
+    # not choose the tree, the operator did. A shared skills directory is exactly
+    # where a token file sits beside the skill that uses it -- measured on a real
+    # home, `~/.agents/skills/<skill>/.env`. macOS covers this with a regex per
+    # `_CODEX_LINK_*` slot; a mount namespace has no patterns, so the files are
+    # resolved now.
+    masked += _dotenvs_under(
+        codex_state.shared_link_targets(),
+        source="the codex home's links",
+        cap=None,
+    )
+    # And the two config trees, which are mounted read-only wholesale. macOS
+    # covers every one of these with a single regex at the end of the profile;
+    # a mount namespace has no patterns, so each file is named. Measured on a
+    # real home: a plugin marketplace keeps a service `.env` inside its cache,
+    # under both `~/.claude/plugins` and `~/.codex/plugins`.
+    masked += _dotenvs_under(
+        [envfile.claude_config_dir(), _codex_operator_home()],
+        source="the claude and codex config trees",
+        cap=None,
+    )
     return masked
+
+
+# Directories worth never descending into during the operator sweep. A grant is an
+# arbitrary tree rather than one cotf owns, so the walk has to be bounded or a spawn
+# pays for it: `.git` alone can hold tens of thousands of objects, and neither of
+# these ever holds a dotenv the operator meant to protect.
+_SWEEP_PRUNED = frozenset({".git", "node_modules", ".venv", "__pycache__"})
+
+# Enough to name every real token file in a config tree, small enough that a grant
+# pointed somewhere pathological fails loudly rather than hanging the spawn.
+_MAX_SWEPT_DOTENVS = 64
+
+
+def _dotenvs_under(
+    roots: Iterable[Path],
+    source: str = "sandbox.extra_paths",
+    cap: int | None = _MAX_SWEPT_DOTENVS,
+    follow: bool = True,
+) -> list[Path]:
+    """Every `.env*` file beneath these trees, for masking on Linux.
+
+    `cap` refuses a tree holding more dotenvs than it will mask, and only
+    `sandbox.extra_paths` passes one. That check means "this grant is too broad
+    to be safe, narrow it", which is advice only an operator who wrote the entry
+    can act on. The trees cotf mounts itself -- the two config directories, and
+    whatever the codex home links out to -- have no such remedy: refusing them
+    does not narrow a grant, it stops the daemon serving. There the whole list is
+    masked however long it runs. Measured on a real home: `~/.codex` holds 132
+    dotenvs across its plugin caches, which is 17KB of bwrap argv and far under
+    any limit, so the cap was bounding correctness rather than work.
+
+    `rglob` is not used here, unlike the data-dir sweep above: that walks a tree
+    cotf owns and keeps small, while these are the operator's own and can be a
+    whole repository. `os.walk` is pruned in place instead.
+
+    Symlinked directories *are* followed, and a visited set of realpaths breaks the
+    loops that makes possible. Not following them was a hole rather than a
+    safeguard: the sweep exists because `--ro-bind / /` makes the link's target
+    readable whatever the link is called, so stopping at the link leaves the file
+    exposed under its real name while the mask list says it is covered. Measured on
+    a real home: `~/.claude/skills` is a symlink to a skills repository, and the
+    token file one skill keeps beside itself stayed readable inside the jail.
+    macOS never had this hole, because one unanchored regex matches the real path
+    too -- so following links here is what makes the two platforms agree.
+
+    `follow` is False for one caller: the write grants. Every other tree swept here
+    is mounted read-only, so only the operator can put a link in it. A write grant
+    is the one tree the agent itself can write, and a link it plants pointing at
+    `/` would make each later spawn walk the whole filesystem before the agent
+    starts. Not following costs nothing there, because a link out of the tree
+    exposes nothing new: the target is reached by its own path, and under
+    deny-most `$HOME` is an opaque tmpfs, so a link into it resolves to nothing
+    inside the namespace.
+    """
+    found: list[Path] = []
+    visited: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for parent, dirnames, filenames in os.walk(root, followlinks=follow):
+            # Realpath rather than the walked path: two links to one directory are
+            # the same tree, and the second visit is what would loop forever.
+            real = os.path.realpath(parent)
+            if real in visited:
+                dirnames[:] = []
+                continue
+            visited.add(real)
+            dirnames[:] = [name for name in dirnames if name not in _SWEEP_PRUNED]
+            # The realpath, not the walked path. A mask is a bind mount over a
+            # path, so covering `~/.claude/skills/x/.env` does nothing for the
+            # same file reached as `~/repo/skills/x/.env`, which `--ro-bind / /`
+            # also exposes. Masking the real name covers both, since a read
+            # through the link resolves to it.
+            found += [
+                Path(os.path.realpath(Path(parent) / name))
+                for name in filenames
+                if name.startswith(".env")
+            ]
+            if cap is not None and len(found) > cap:
+                logger.error(
+                    "%s sweep found more than %d dotenv files under %s; refusing to "
+                    "mask a partial list, so the grant is not safe to use as written. "
+                    "Narrow the entry to the directory the agent actually needs.",
+                    source,
+                    cap,
+                    root,
+                )
+                raise _SweepTooBroad(str(root))
+    return sorted(set(found))
+
+
+class _SweepTooBroad(RuntimeError):
+    """An `sandbox.extra_paths` entry holds more dotenvs than the sweep will mask.
+
+    Raised rather than truncated on purpose. A partial mask list fails open: the
+    operator believes the tree is covered while some of it is readable, which is
+    the failure mode a deny list must never have. `sandbox.extra_paths` itself can
+    drop a refused entry and carry on, because that direction only ever grants
+    less than asked.
+    """
 
 
 def _codex_protected(codex: Path) -> list[Path]:
@@ -1352,7 +2538,25 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     # The parent directory rather than the file: an npm-installed CLI is a shim
     # next to the package tree it loads. Read-only, and it holds executables
     # rather than secrets.
-    grants["read_only"] += _runtime_read_paths(argv)
+    #
+    # Resolved form only. bwrap mounts rather than matches, and it refuses a
+    # symlink destination outright -- "Can't mount on symlink destination /bin",
+    # which aborts the whole jail rather than dropping one grant. Merged-usr is
+    # the normal layout on Debian, Ubuntu and Fedora, so `/bin` and `/lib` are
+    # symlinks on most Linux hosts. `_runtime_read_paths` lists every entry both
+    # as written and as resolved for seatbelt's sake, so the resolved twin is
+    # mounted and the symlink form is recreated as a link instead. Dropping it
+    # was not free: a uv venv's python runs through `cpython-3.X-*`, a link under
+    # the opaque $HOME, and without it exec failed on a path that looked granted.
+    runtime_mounts, links = linux_runtime_grants(argv)
+    grants["read_only"] += runtime_mounts
+    # memory/ is granted at its real path inside an opaque data dir, so an
+    # operator who links it into a repo loses the path the agent is told. The
+    # target is already granted; this puts the name back.
+    from claude_on_the_fly.agent import MEMORY_DIR
+
+    if Path(MEMORY_DIR).is_symlink():
+        links[Path(MEMORY_DIR)] = os.readlink(MEMORY_DIR)
     # Same reason `ensure_write_deny_targets` materialises its targets: a mount
     # source has to exist on the host, because bwrap cannot create one inside the
     # read-only root. Both are this turn's own session directories, so creating
@@ -1365,20 +2569,27 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
     )
     sockets = _SESSION_SOCKETS.get() or {}
     if not sockets:
-        # Reached by any caller that spawns without opening a relay first -- the
-        # jobs daemon is the live example, since it runs as its own process and
-        # builds no broker or proxy at all. The namespace then has no route to
-        # any host service, so the agent cannot reach a brokered model endpoint.
+        # Reached by any caller that spawns without opening a relay first. Chat
+        # turns and jobs both open one, so this is a caller that forgot, or a
+        # jobs daemon whose brokers did not start. The namespace then has no
+        # route to any host service, so the agent cannot reach a brokered model
+        # endpoint.
         #
         # macOS is in the same position for the same reason (nothing in that
         # process is listening on loopback, and the profile denies the internet),
         # so this is not a Linux regression. It is only invisible there, which is
         # why it is said out loud here rather than left to look like a hang.
-        logger.warning(
+        # The startup probes spawn in the probe workspace with no relay by
+        # design, many times per start, so theirs stays at DEBUG.
+        probing = os.path.realpath(workspace) == os.path.realpath(
+            DATA_DIR / "jail" / "probe"
+        )
+        logger.log(
+            logging.DEBUG if probing else logging.WARNING,
             "sandbox: jailing %s with no brokered loopback port. Nothing on the "
             "host is reachable from inside the namespace, so a backend needing a "
-            "model endpoint will fail. Chat turns open a relay; the jobs daemon "
-            "does not, and `sandbox.mode: jail` does not support it.",
+            "model endpoint will fail. Chat turns and jobs open a relay; this "
+            "spawn did not.",
             argv[0] if argv else "?",
         )
     jailed = sandbox_linux.jail_argv(
@@ -1391,6 +2602,7 @@ def _linux_wrap(argv: list[str], workspace: Path) -> list[str]:
         masked=grants["masked"],
         sockets=sockets,
         placeholders=placeholders,
+        links=links,
     )
     logger.info(
         "sandbox: jailed %s under bubblewrap (project=%s, brokered ports=%s)",
@@ -1473,21 +2685,55 @@ def wrap(argv: list[str], workspace: Path) -> list[str]:
     # Linux needs no equivalent. `_linux_grants` puts `_codex_protected` under
     # `write_denied` whatever the setting says, so the shared tree keeps its
     # instruction files read-only there either way.
-    codex_write = codex_home if scoped_sessions() else codex_sessions
-    return sandbox_macos.jail_argv(
+    from claude_on_the_fly import accounts
+
+    selected = accounts.current()
+    account_codex = selected is not None and selected.backend == "codex"
+    codex_write = codex_home if scoped_sessions() or account_codex else codex_sessions
+    resolved = sandbox_macos.realpaths(workspace, DATA_DIR)
+    granted_writes = _extra_write_paths() if base == _DENY_MOST_PROFILE else []
+    protect, unprotect = _macos_write_protection(granted_writes)
+    wrapped = sandbox_macos.jail_argv(
         argv,
-        **sandbox_macos.realpaths(workspace, DATA_DIR),
+        **resolved,
         claude_config=claude_config,
         claude_projects=claude_projects,
         claude_project=claude_project,
         codex_sessions=codex_sessions,
         codex_home=codex_write,
+        codex_operator_home=_codex_operator_home(),
+        codex_auth_file=_codex_auth_denied(),
+        pane_socket=_pane_socket(),
         base=base,
         profile=_JAIL_PROFILE,
         runtime_paths=[str(path) for path in _runtime_read_paths(argv)],
         loopback=sandbox_macos._loopback_specs(_loopback_ports()),
         extra_paths=_extra_read_paths() if base == _DENY_MOST_PROFILE else [],
+        write_paths=granted_writes,
+        protect_paths=protect,
+        unprotect_paths=unprotect,
+        # Only under deny-most. The other base allows reads across $HOME, so
+        # every one of these is already reachable and computing them would buy a
+        # directory walk per spawn for nothing.
+        codex_link_paths=(
+            [str(path) for path in _codex_link_read_paths()]
+            if base == _DENY_MOST_PROFILE
+            else []
+        ),
+        ancestor_paths=sandbox_macos.home_ancestors(
+            resolved["project"], resolved["home"]
+        ),
     )
+
+    rules = _account_seatbelt_rules(workspace)
+    if rules:
+        profile_index = wrapped.index("-f")
+        profile = wrapped[profile_index + 1]
+        wrapped[profile_index : profile_index + 2] = [
+            "-p",
+            f"(import {json.dumps(profile, ensure_ascii=False)})\n{rules}",
+        ]
+    return wrapped
 
 
 # Credential stores the profile is expected to deny. Probed at startup so the
@@ -1531,9 +2777,13 @@ def _deny_probe_specs() -> tuple[str, ...]:
     from claude_on_the_fly.agent import DATA_DIR
 
     own = str(DATA_DIR / ".env")
+    # The codex login joins the probes only while the broker holds it; otherwise
+    # the jail grants it on purpose and a probe would report a failure.
+    codex_auth = _codex_auth_denied()
+    brokered = (str(codex_auth),) if codex_auth is not None else ()
     if os.path.realpath(Path(_DEFAULT_COTF_ENV).expanduser()) == os.path.realpath(own):
-        return _DENY_PROBES
-    return (*_DENY_PROBES, own)
+        return (*_DENY_PROBES, *brokered)
+    return (*_DENY_PROBES, own, *brokered)
 
 
 def _probe_workspace() -> Path:
@@ -1725,10 +2975,20 @@ _EGRESS_PROBE = (
 
 
 async def _run_jailed(argv: list[str], workspace: Path, timeout: int = 20):
-    """Run argv under the live jail. Returns (returncode, combined output)."""
+    """Run argv under the live jail. Returns (returncode, combined output).
+
+    In the workspace, because the child otherwise inherits whatever directory the
+    daemon was started from and `deny-most` grants no such thing. Measured: the
+    egress probe died on `getcwd()` before importing `socket`, since python
+    resolves the empty `sys.path` entry against the cwd. The failure names no
+    path and no rule -- `PermissionError: [Errno 1] Operation not permitted` out
+    of `importlib` -- and it made every turn refuse to start on a daemon launched
+    from an ungranted directory.
+    """
     proc = await asyncio.create_subprocess_exec(
         *wrap(argv, workspace),
         env=agent_env() or {},
+        cwd=workspace,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1807,9 +3067,13 @@ async def preflight() -> None:
     if mode() != "jail":
         return
     _log_inert_settings()
-    # First, and before anything is spawned: this is a layout problem, so paying
-    # for two jail probes to discover it afterwards is waste.
-    _preflight_protected_symlinks()
+    # First: on Linux this is a layout problem the mount namespace refuses, and it
+    # answers without spawning anything, so the turn fails before the jail probes
+    # rather than after them. On macOS it does spawn, one probe per symlink, because
+    # whether a link is a hole depends on where it points and that is not knowable
+    # from the layout alone. A probe that cannot run reports the link as reachable,
+    # so a jail too broken to spawn warns here and then fails on the echo below.
+    await _preflight_protected_symlinks()
     workspace = _probe_workspace()
     try:
         code, output = await _run_jailed(["/bin/echo", "cotf"], workspace)
@@ -1849,7 +3113,38 @@ async def preflight() -> None:
     )
 
 
-def _preflight_protected_symlinks() -> None:
+async def _symlink_target_is_writable(target: Path, workspace: Path) -> bool:
+    """Whether a jailed process can open `target` for writing.
+
+    Opens for append and writes nothing, so a target that turns out to be
+    reachable is reported without being modified. Seatbelt refuses at open(),
+    which is what makes the empty open a sufficient question. `>>` would create an
+    absent file, so the caller only probes targets that already exist.
+
+    A probe that cannot run answers True: this decides whether to warn, and the
+    safe direction is to warn.
+    """
+    argv = wrap(["/bin/sh", "-c", f"exec 3>> '{target}'"], workspace)
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            *argv,
+            env=agent_env() or {},
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(probe.wait(), timeout=15)
+    except (OSError, TimeoutError) as exc:
+        logger.warning(
+            "sandbox: could not test whether %s is writable in the jail (%s); "
+            "treating it as reachable",
+            target,
+            exc,
+        )
+        return True
+    return probe.returncode == 0
+
+
+async def _preflight_protected_symlinks() -> None:
     """Report execution-control paths that are symlinks, before a turn hits them.
 
     These are the entries the jail protects because they decide what the agent
@@ -1870,7 +3165,7 @@ def _preflight_protected_symlinks() -> None:
     weakening but an established layout, so it warns rather than refusing to serve
     a deployment that has been working.
     """
-    codex = Path(os.path.realpath(Path.home())) / ".codex"
+    codex = _codex_operator_home()
     linked = [path for path in _codex_protected(codex) if path.is_symlink()]
     if not linked:
         return
@@ -1882,13 +3177,41 @@ def _preflight_protected_symlinks() -> None:
             "Replace each with a real file or directory, or move the content and "
             "drop the link, then restart."
         )
+    # Whether the link is a hole depends entirely on where it points, so ask
+    # rather than assume. A link into a tree the profile already denies for its
+    # own reasons -- ~/.claude, say -- is covered, and warning about it every
+    # start trains an operator to ignore the one case that is not covered.
+    workspace = _probe_workspace()
+    reachable = [
+        path
+        for path, writable in zip(
+            linked,
+            await asyncio.gather(
+                *(
+                    _symlink_target_is_writable(Path(os.path.realpath(path)), workspace)
+                    for path in linked
+                )
+            ),
+            strict=True,
+        )
+        if writable
+    ]
+    if not reachable:
+        logger.info(
+            "sandbox: %d execution-control path(s) are symlinks (%s), and each "
+            "target is denied by another rule, so they are covered",
+            len(linked),
+            names,
+        )
+        return
     logger.warning(
-        "sandbox: %d execution-control path(s) are symlinks: %s. Seatbelt matches "
-        "the resolved path, so each write deny protects the link and not the file "
-        "behind it, and a jailed turn could rewrite instructions the next run "
-        "reads. Replace them with real files to close that.",
-        len(linked),
-        names,
+        "sandbox: %d execution-control path(s) are symlinks whose target a jailed "
+        "turn can write: %s. Seatbelt matches the resolved path, so the write deny "
+        "protects the link and not the file behind it, and a turn could rewrite "
+        "instructions the next run reads. Replace them with real files, or point "
+        "them at a path the profile already denies.",
+        len(reachable),
+        ", ".join(f"{path} -> {os.path.realpath(path)}" for path in reachable),
     )
 
 

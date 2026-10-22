@@ -84,6 +84,113 @@ def test_alert_body_unknown_entry_degrades() -> None:
     assert body.startswith("cron entry ? failed")
 
 
+def test_alert_body_strips_terminal_escape_sequences() -> None:
+    """A pane capture keeps the TUI's colors; a chat surface prints them raw."""
+    text = (
+        "Job failed: \x1b[39;49m\x1b[K  _Previous Behavior_\x1b[39m\x1b[49m\x1b[0m\n"
+        "\x1b]0;codex\x07\x1b[r\x1b[21;3Hdone\x1b(B"
+    )
+    body = _alert_body(_origin(), _result(text))
+    assert body == "cron entry jira failed\nJob failed:   _Previous Behavior_\ndone"
+
+
+def test_alert_body_cleans_before_truncating() -> None:
+    """Escape bytes must not spend the character budget."""
+    text = "\x1b[39;49m\x1b[K" * 200 + "real reason"
+    body = _alert_body(_origin(), _result(text))
+    assert body == "cron entry jira failed\nreal reason"
+
+
+_CODEX_BANNER = (
+    "Reading additional input from stdin...\n"
+    "OpenAI Codex v0.154.0\n"
+    "--------\n"
+    "workdir: /private/tmp/run\n"
+    "model: some-model\n"
+    "provider: openai\n"
+    "approval: never\n"
+    "sandbox: danger-full-access\n"
+    "reasoning effort: medium\n"
+    "reasoning summaries: none\n"
+    "session id: 01a0a46e-c2ba-75d1-a343-2f91016d2f18\n"
+    "--------\n"
+    "user\n"
+    "You are an autonomous assistant.\n"
+    "Run the nightly report.\n"
+)
+
+
+def test_alert_body_drops_the_codex_banner_and_prompt_echo() -> None:
+    """Shape captured from `codex exec` 0.154.0 failing: the banner leaks the
+    workspace path, sandbox mode and session id, and the echoed prompt fills
+    the whole budget before the error line is reached."""
+    text = (
+        "Job failed: "
+        + _CODEX_BANNER
+        + "warning: Model metadata for `some-model` not found.\n"
+        + "hook: SessionStart\n"
+        + 'ERROR: {"status":400,"message":"model is not supported"}\n'
+        + 'ERROR: {"status":400,"message":"model is not supported"}'
+    )
+    body = _alert_body(_origin(), _result(text))
+    assert body == (
+        "cron entry jira failed\n"
+        'Job failed:\nERROR: {"status":400,"message":"model is not supported"}'
+    )
+    for leak in ("workdir", "sandbox", "session id", "autonomous assistant"):
+        assert leak not in body
+
+
+def test_alert_body_keeps_codex_narration_without_an_error_line() -> None:
+    text = "Job failed: " + _CODEX_BANNER + "codex\nI could not finish the run."
+    body = _alert_body(_origin(), _result(text))
+    assert body == (
+        "cron entry jira failed\nJob failed:\ncodex\nI could not finish the run."
+    )
+
+
+def test_alert_body_banner_with_only_a_prompt_echo_points_at_the_log() -> None:
+    body = _alert_body(_origin(), _result("Job failed: " + _CODEX_BANNER))
+    assert body == "cron entry jira failed\nJob failed:\nSee the entry log."
+
+
+def test_alert_body_keeps_leading_signals_ahead_of_the_banner() -> None:
+    notes = "\n- no task_complete, last event was reasoning"
+    text = f"Job failed:{notes}\n" + _CODEX_BANNER + "ERROR: stream closed"
+    body = _alert_body(_origin(), _result(text))
+    assert body == (
+        "cron entry jira failed\n"
+        "Job failed:\n- no task_complete, last event was reasoning\n"
+        "ERROR: stream closed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "detail"),
+    [
+        ("command exited 1", "Exited with code 1. See the entry log."),
+        (
+            "command exited -9 (timed out after 900s)",
+            "Exited with code -9 (timed out after 900s). See the entry log.",
+        ),
+        ("Job failed: Exit code -1", "Exited with code -1. See the entry log."),
+    ],
+)
+def test_alert_body_rewords_a_bare_exit_code(text: str, detail: str) -> None:
+    body = _alert_body(_origin(), _result(text))
+    assert body == f"cron entry jira failed\n{detail}"
+
+
+def test_alert_body_with_no_failure_text_points_at_the_log() -> None:
+    body = _alert_body(_origin(), _result("\x1b[0m  "))
+    assert body == "cron entry jira failed\nSee the entry log."
+
+
+def test_alert_body_leaves_an_exit_code_with_more_text_alone() -> None:
+    body = _alert_body(_origin(), _result("command exited 1\nmore"))
+    assert body == "cron entry jira failed\ncommand exited 1\nmore"
+
+
 # --- Slack -----------------------------------------------------------------
 
 
@@ -97,7 +204,20 @@ async def test_slack_sink_posts_one_compact_message() -> None:
     call = client.calls[0]
     assert call["channel"] == "C42"
     assert call["text"] == ":x: cron entry jira failed"
-    assert call["blocks"][0]["text"].startswith(":x: cron entry jira failed\nboom")
+    assert call["blocks"][0]["text"] == ":x: cron entry jira failed\nboom"
+
+
+async def test_slack_alert_keeps_the_plain_cron_prefix_for_workflow_matching() -> None:
+    """An operator's Slack workflow matches `:x: cron` at the start of the
+    alert, so nothing may sit between the emoji and the word."""
+    client = _FakeSlackClient()
+    sink = SlackAlertSink(client, "C42")
+
+    await sink.alert(_origin("nightly-report"), _result("command exited 1"))
+
+    call = client.calls[0]
+    assert call["text"].startswith(":x: cron entry nightly-report failed")
+    assert call["blocks"][0]["text"].startswith(":x: cron entry nightly-report failed")
 
 
 # --- Telegram --------------------------------------------------------------
@@ -121,6 +241,22 @@ async def test_telegram_sink_posts_to_the_bot_api() -> None:
     assert payload["chat_id"] == "123"
     assert payload["parse_mode"] == "Markdown"
     assert payload["text"] == "cron entry jira failed\nboom"
+
+
+async def test_telegram_sink_escapes_the_entry_and_the_detail() -> None:
+    requests: list[bytes] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    sink = TelegramAlertSink("bot-token", "123", client)
+
+    await sink.alert(_origin("nightly_report"), _result("a_b"))
+
+    payload = json.loads(requests[0])
+    assert payload["text"] == "cron entry nightly\\_report failed\na\\_b"
 
 
 async def test_telegram_sink_raises_on_an_error_response() -> None:

@@ -26,9 +26,7 @@ from collections.abc import Mapping
 from typing import cast
 from uuid import uuid4
 
-from dotenv import load_dotenv
-
-from claude_on_the_fly import agent, checks, sandbox, settings
+from claude_on_the_fly import agent, checks, envfile, sandbox, settings, tmux
 from claude_on_the_fly.heartbeat import (
     HeartbeatWriter,
     InstanceAlreadyClaimed,
@@ -40,6 +38,7 @@ from claude_on_the_fly.jobs.agent_runner import (
     sweep_run_workspaces,
 )
 from claude_on_the_fly.jobs.alerts import build_alert_sink
+from claude_on_the_fly.jobs.brokers import JobBrokers
 from claude_on_the_fly.jobs.core import (
     AgentRunner,
     AlertSink,
@@ -47,6 +46,7 @@ from claude_on_the_fly.jobs.core import (
     JobQueue,
     Notifier,
     OutcomeRecorder,
+    parse_when,
 )
 from claude_on_the_fly.jobs.key_state import (
     KeyStateOutcomeRecorder,
@@ -125,7 +125,9 @@ def _timeout_s() -> float | None:
     return timeout if timeout > 0 else None
 
 
-def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
+def _notifier_loop_warning(
+    token_var: str | None, token: str, env: Mapping[str, str]
+) -> str | None:
     """Return a warning when the worker would post under the frontend's own user
     identity, else None.
 
@@ -134,7 +136,18 @@ def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
     process with a per-process dedup set, so it re-ingests those results as new
     input — one spurious agent turn per job. A bot (`xoxb-`) token, or an
     explicit `JOBS_SLACK_TOKEN` the deployer chose, is left alone.
+
+    But the token only ever reaches Slack for a `kind="slack"` job, and only
+    the Slack frontend's job trigger (`SLACK_JOB_COMMAND`) can create one — see
+    `slack.py`'s `_build_job_queue() if self._job_command else None`. An
+    enqueue-only worker (cron, `claude-jobs enqueue`, a git hook) never
+    produces one, so `RoutingNotifier` never calls the Slack route and the
+    token kind is moot. `checks.effective_job_command` is the same gate
+    `_slack_job_producer_note` already uses to report whether Slack can reach
+    this worker at all, so this reuses it instead of re-deriving the answer.
     """
+    if checks.effective_job_command(env) is None:
+        return None
     if token_var != "JOBS_SLACK_TOKEN" and token.startswith("xoxp-"):
         return (
             "jobs notifier inherits the frontend's user token; job results post "
@@ -146,7 +159,7 @@ def _notifier_loop_warning(token_var: str | None, token: str) -> str | None:
 
 
 def build_components(
-    token: str, env: Mapping[str, str]
+    token: str, env: Mapping[str, str], brokers: JobBrokers | None = None
 ) -> tuple[JobQueue, AgentRunner, Notifier, OutcomeRecorder, AlertSink | None]:
     """Wire the worker's adapters from config — the single construction
     point the daemon uses.
@@ -164,7 +177,9 @@ def build_components(
     from claude_on_the_fly.cron import append_log
 
     queue = make_queue()
-    runner = OrchestratorAgentRunner(data_dir=agent.DATA_DIR, timeout=_timeout_s())
+    runner = OrchestratorAgentRunner(
+        data_dir=agent.DATA_DIR, timeout=_timeout_s(), brokers=brokers
+    )
     # One worker drains both producers, so delivery has to fan back out by where
     # the job came from: a Slack thread, or the cron entry's own log file.
     notifier = RoutingNotifier(
@@ -214,6 +229,7 @@ async def _run(token: str) -> None:
     heartbeat.claim()
     heartbeat_task: asyncio.Task[None] | None = None
     ledger: ProcessLedger | None = None
+    brokers: JobBrokers | None = None
     listener_attached = False
     try:
         # Before anything claims a job, and after the signal handlers so the probes
@@ -232,8 +248,15 @@ async def _run(token: str) -> None:
         # opposite choice is silent and irreversible: the reads have happened.
         await sandbox.verify_boundary()
 
+        # After the boundary is proven and before anything claims work: a job's
+        # agent needs the brokers a chat turn has, or every brokered tool fails
+        # and a Linux-jailed job cannot reach its model. Nobody can answer a
+        # prompt for a job, so everything that would ask is refused instead.
+        brokers = JobBrokers()
+        await brokers.start()
+
         queue, runner, notifier, recorder, alert_sink = build_components(
-            token, settings.environment()
+            token, settings.environment(), brokers
         )
 
         # Reap what a previous worker orphaned, before anything claims work:
@@ -249,6 +272,13 @@ async def _run(token: str) -> None:
             )
         agent.add_process_listener(ledger.on_process)
         listener_attached = True
+
+        # Panes this worker's last life left behind. Beside the workspace sweep
+        # because it is the same startup-is-the-cadence argument, and a pane is a
+        # child of cotf's tmux server rather than of this worker, so the process
+        # ledger above never saw it. Only `cotf-job-`: chat panes belong to the
+        # orchestrator, which reaps its own on its own restart.
+        tmux.sweep(tmux.JOB_SESSION_PREFIX)
 
         # Retention for finished one-shot workspaces. Startup is the whole cadence:
         # the sweep is bounded by what one worker's lifetime accumulated, and a worker
@@ -286,6 +316,8 @@ async def _run(token: str) -> None:
             alert_sink=alert_sink,
         )
     finally:
+        if brokers is not None:
+            await brokers.stop()
         if listener_attached and ledger is not None:
             agent.remove_process_listener(ledger.on_process)
         if heartbeat_task is not None:
@@ -322,7 +354,7 @@ def _cmd_run() -> int:
             f"set JOBS_SLACK_TOKEN or SLACK_TOKEN in {agent.DATA_DIR / '.env'}\n"
         )
         return 2
-    loop_warning = _notifier_loop_warning(token_var, token)
+    loop_warning = _notifier_loop_warning(token_var, token, os.environ)
     if loop_warning:
         logger.warning("%s", loop_warning)
     try:
@@ -370,14 +402,31 @@ def _cmd_doctor() -> int:
     return 0
 
 
-def _cmd_enqueue(prompt: str, channel: str | None, thread_ts: str | None) -> int:
+def _cmd_enqueue(
+    prompt: str,
+    channel: str | None,
+    thread_ts: str | None,
+    at: str | None,
+) -> int:
     """Drop one job into the shared queue without going through Slack — a smoke
     producer for testing the worker end to end."""
     queue = make_queue()
     job_id = f"{time.time_ns()}-{uuid4().hex[:8]}"
     origin = {"channel": channel or "", "thread_ts": thread_ts, "sender_id": "cli"}
-    queue.enqueue(Job(id=job_id, prompt=prompt, origin=origin))
-    sys.stdout.write(f"queued job {job_id}\n")
+    try:
+        available_at = parse_when(at) if at is not None else None
+    except ValueError as exc:
+        sys.stderr.write(f"claude-jobs enqueue: {exc}\n")
+        return 2
+    queue.enqueue(
+        Job(id=job_id, prompt=prompt, origin=origin, available_at=available_at)
+    )
+    when = (
+        f" (not before {available_at.isoformat(timespec='seconds')})"
+        if available_at
+        else ""
+    )
+    sys.stdout.write(f"queued job {job_id}{when}\n")
     return 0
 
 
@@ -393,6 +442,14 @@ def _build_parser() -> argparse.ArgumentParser:
     enq.add_argument("prompt", help="The task prompt to run")
     enq.add_argument("--channel", default=None, help="Slack channel id for the reply")
     enq.add_argument("--thread-ts", default=None, help="Slack thread ts for the reply")
+    enq.add_argument(
+        "--at",
+        default=None,
+        help=(
+            "Run no earlier than this local time: ISO 'YYYY-MM-DD HH:MM' "
+            "(or YYYY-MM-DD), or relative like '30m', '2h', '1d'"
+        ),
+    )
     return parser
 
 
@@ -406,14 +463,14 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 
 
 def main() -> int:
-    load_dotenv()
+    envfile.load_into_process()
     argv = _normalize_argv(sys.argv[1:])
     args = _build_parser().parse_args(argv)
 
     if args.cmd == "doctor":
         return _cmd_doctor()
     if args.cmd == "enqueue":
-        return _cmd_enqueue(args.prompt, args.channel, args.thread_ts)
+        return _cmd_enqueue(args.prompt, args.channel, args.thread_ts, args.at)
     return _cmd_run()
 
 

@@ -1,0 +1,9 @@
+<cotf-suggest>
+System instruction, not user text. Answer the user first, then ALWAYS end your reply with the block. The block is mandatory in every reply: a JSON array of 3 short follow-up options when the conversation has a real decision fork, or an empty array when it does not. The block is the END of your reply, never the whole reply.
+
+Example of a complete reply:
+The Eiffel Tower is in Paris, built for the 1889 World's Fair.
+<suggestions>["Tell me more about its history", "Show me photos", "Compare it with other landmarks"]</suggestions>
+
+A tapped option is sent back verbatim as the user's next message, so each option must be a step you can execute with no further input ("Audit the release posts") or a question you can answer by doing work ("What is it doing now?").
+</cotf-suggest>

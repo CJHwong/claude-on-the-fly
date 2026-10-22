@@ -27,6 +27,7 @@ from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Footer, RichLog, Static
 
+from claude_on_the_fly import accounts, takeover
 from claude_on_the_fly.agent import (
     DATA_DIR,
     get_backend,
@@ -254,7 +255,11 @@ class HistoryScreen(OverlayScreen):
         # resumes that exact session — not whatever the current env points at.
         workspace, sid = resolved
         try:
-            cmd = get_backend().takeover_command(workspace, sid)
+            cmd = (
+                takeover.command(workspace, sid)
+                if accounts.all_accounts()
+                else get_backend().takeover_command(workspace, sid)
+            )
         except Exception as exc:
             self._notify(f"takeover failed: {exc}", "error")
             return
@@ -269,8 +274,8 @@ class HistoryScreen(OverlayScreen):
             # Re-tokenize and re-quote both pieces before placing them in a
             # shell command copied to the clipboard.
             safe_cmd = shlex.join(shlex.split(cmd))
-            takeover = f"cd -- {shlex.quote(str(workspace))} && {safe_cmd}"
-            self.app.copy_to_clipboard(takeover)
+            clipboard_command = f"cd -- {shlex.quote(str(workspace))} && {safe_cmd}"
+            self.app.copy_to_clipboard(clipboard_command)
         except Exception as exc:
             self._notify(f"clipboard write failed: {exc}", "error")
             return
