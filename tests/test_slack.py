@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from collections import deque
@@ -6045,6 +6046,194 @@ class TestSlashCommand:
         """Registering it is a handshake with Slack, so a live reload would point the
         daemon at a command nothing is listening for."""
         assert "slack.slash_command" in settings.RESTART_REQUIRED
+
+
+class TestBotChannelScopes:
+    """A bot's conversation boundary applies before either sender path."""
+
+    @staticmethod
+    def _event(*, subtype="bot_message", user=None, channel="C012EXAMPLE"):
+        event = {
+            "bot_id": "B012EXAMPLE",
+            "app_id": "A012EXAMPLE",
+            "username": "Example app",
+            "channel": channel,
+            "channel_type": "channel",
+            "ts": "200.0",
+            "text": "<@U_SELF> inspect this",
+        }
+        if subtype is not None:
+            event["subtype"] = subtype
+        if user is not None:
+            event["user"] = user
+        return event
+
+    @pytest.mark.parametrize(
+        ("subtype", "user"),
+        [
+            ("bot_message", None),
+            (None, "U_ALLOWED"),
+            ("thread_broadcast", None),
+            ("thread_broadcast", "U_ALLOWED"),
+        ],
+    )
+    @pytest.mark.parametrize("allowed_channel", [True, False])
+    async def test_both_sender_paths_enforce_the_same_boundary(
+        self, frontend, operator_settings, subtype, user, allowed_channel
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        operator_settings.write_text(
+            "slack:\n  bot_channel_ids:\n    B012EXAMPLE: [C012EXAMPLE]\n"
+        )
+        event = self._event(
+            subtype=subtype,
+            user=user,
+            channel="C012EXAMPLE" if allowed_channel else "C012OTHERXX",
+        )
+        original = event.copy()
+
+        await frontend._ingest_event(event)
+
+        assert event == original
+        if allowed_channel:
+            frontend._on_message.assert_awaited_once()
+            chat_id, text = frontend._on_message.await_args.args
+            assert chat_id == _session_key("C012EXAMPLE", "200.0")
+            assert frontend.sender_identity(chat_id) == (user or "B012EXAMPLE")
+            assert f"[from-id: {user or 'B012EXAMPLE'}]" in text
+            assert "inspect this" in text
+        else:
+            frontend._on_message.assert_not_awaited()
+            assert not frontend._sessions
+            assert not frontend._pending_msg
+            assert "200.0" not in frontend._processed_ts
+            frontend._app.client.conversations_info.assert_not_awaited()
+            frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.parametrize("channel", ["C012EXAMPLE", "D012EXAMPLE", "G012EXAMPLE"])
+    async def test_exact_public_private_and_dm_ids_are_supported(
+        self, frontend, operator_settings, channel
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        operator_settings.write_text(
+            json.dumps({"slack": {"bot_channel_ids": {"B012EXAMPLE": [channel]}}})
+        )
+        await frontend._ingest_event(self._event(channel=channel))
+        frontend._on_message.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "channels",
+        [
+            None,
+            [],
+            "C012EXAMPLE",
+            {"C012EXAMPLE": True},
+            ["C012EXAMPLE", None],
+            ["C012EXAMPLE", 123],
+            ["C012EXAMPLE", "*"],
+            ["C012EXAMPLE", "C1"],
+            ["C012EXAMPLE", "c012example"],
+            ["C012EXAMPLE", "U012EXAMPLE"],
+            ["C012EXAMPLE", "C012EXAMPLE\n"],
+            ["C012EXAMPLE", " C012EXAMPLE"],
+            ["C012EXAMPLE", "#example"],
+        ],
+    )
+    async def test_malformed_scoped_lists_fail_closed_even_with_a_matching_item(
+        self, frontend, operator_settings, channels
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        operator_settings.write_text(
+            json.dumps({"slack": {"bot_channel_ids": {"B012EXAMPLE": channels}}})
+        )
+        await frontend._ingest_event(self._event())
+        frontend._on_message.assert_not_awaited()
+        assert not frontend._sessions
+
+    @pytest.mark.parametrize("scopes", [None, [], "*", False, 123])
+    async def test_a_non_mapping_table_refuses_bots_but_leaves_humans_alone(
+        self, frontend, operator_settings, caplog, scopes
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        operator_settings.write_text(json.dumps({"slack": {"bot_channel_ids": scopes}}))
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            await frontend._ingest_event(self._event())
+        frontend._on_message.assert_not_awaited()
+        assert "bot_channel_ids must be a mapping" in caplog.text
+
+        human = self._event(subtype=None, user="U_ALLOWED")
+        del human["bot_id"]
+        await frontend._ingest_event(human)
+        frontend._on_message.assert_awaited_once()
+
+    @pytest.mark.parametrize("scopes", ["absent", {}, {"B_ANOTHER": []}])
+    async def test_unscoped_bots_keep_their_existing_behavior(
+        self, frontend, operator_settings, scopes
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        slack = {} if scopes == "absent" else {"bot_channel_ids": scopes}
+        operator_settings.write_text(json.dumps({"slack": slack}))
+        await frontend._ingest_event(self._event())
+        frontend._on_message.assert_awaited_once()
+
+    @pytest.mark.parametrize("channel", [None, "", "C012EXAMPL", "C012EXAMPLEX"])
+    async def test_channel_matching_is_exact_and_requires_a_channel(
+        self, frontend, operator_settings, channel
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        operator_settings.write_text(
+            "slack:\n  bot_channel_ids:\n    B012EXAMPLE: [C012EXAMPLE]\n"
+        )
+        event = self._event(channel=channel)
+        if channel is None:
+            del event["channel"]
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_not_awaited()
+
+    async def test_scope_edits_apply_to_the_next_event_without_a_restart(
+        self, frontend, operator_settings
+    ):
+        frontend._pinned_allowed_bot_ids = {"B012EXAMPLE"}
+        for index, (scopes, accepted) in enumerate(
+            [
+                ({"B012EXAMPLE": ["C012OTHERXX"]}, False),
+                ({"B012EXAMPLE": ["C012EXAMPLE"]}, True),
+                ({"B012EXAMPLE": []}, False),
+                ({}, True),
+            ]
+        ):
+            operator_settings.write_text(
+                json.dumps({"slack": {"bot_channel_ids": scopes}})
+            )
+            event = self._event()
+            event["ts"] = f"{200 + index}.0"
+            await frontend._ingest_event(event)
+            assert frontend._on_message.await_count == int(accepted)
+            frontend._on_message.reset_mock()
+        assert "slack.bot_channel_ids" not in settings.RESTART_REQUIRED
+
+    @pytest.mark.parametrize("gate", ["not_allowed", "blocked", "policy", "mention"])
+    async def test_scope_membership_does_not_bypass_other_admission_gates(
+        self, frontend, operator_settings, gate
+    ):
+        frontend._pinned_allowed_bot_ids = (
+            set() if gate == "not_allowed" else {"B012EXAMPLE"}
+        )
+        frontend._pinned_blocked_senders = (
+            {"B012EXAMPLE"} if gate == "blocked" else set()
+        )
+        frontend._pinned_bot_policies = (
+            {"B012EXAMPLE": {"mode": "drop"}} if gate == "policy" else {}
+        )
+        operator_settings.write_text(
+            "slack:\n  bot_channel_ids:\n    B012EXAMPLE: [C012EXAMPLE]\n"
+        )
+        event = self._event()
+        if gate == "mention":
+            event = self._event(subtype=None, user="U_ALLOWED")
+            event["text"] = "no mention"
+        await frontend._ingest_event(event)
+        frontend._on_message.assert_not_awaited()
 
 
 class TestBotPolicies:
