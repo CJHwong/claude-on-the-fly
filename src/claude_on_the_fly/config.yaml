@@ -600,6 +600,16 @@ slack:
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
   # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
 
+  # Optional exact conversation boundary per bot id, checked before subtype and
+  # sender routing, including app messages that also carry a bot-user id.
+  # Does not authorize a sender or bypass mention/block/policy gates.
+  # Missing bot entries keep their existing behavior. An invalid table rejects
+  # every bot event; an empty or invalid channel list rejects that bot's events.
+  # Lists must contain only C..., D..., or G... ids (at least 9 characters).
+  # Read per event; no restart required. This structured setting is YAML-only.
+  # bot_channel_ids:
+  #   B012EXAMPLE: [C012EXAMPLE]
+
   # Optional per-bot gate, evaluated before a session or agent process is created.
   # Bot ids here must still appear in allowed_senders. Invalid policies log an
   # error and preserve normal trusted-bot behavior rather than dropping work.

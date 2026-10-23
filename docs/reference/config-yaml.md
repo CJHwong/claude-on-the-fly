@@ -315,6 +315,7 @@ not an unbounded workspace history replay.
 | `allowed_senders` | list / token identity | Humans or explicitly listed bot IDs allowed to trigger | Immediate |
 | `blocked_senders` | list / empty | Deny list; wins over allowed | Immediate |
 | `silent_senders` | list / empty | Trigger without posting a reply | Immediate |
+| `bot_channel_ids` | mapping / empty | Optional exact conversation IDs per bot; restricts both bot posts and app bot-user messages; see below | Immediate, next event |
 | `bot_policies` | mapping / empty | Per-allowed-bot pre-agent gate; see below | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, `detailed`; invalid uses summary | Immediate |
 | `slash_command` | string / unset | Bot-token Slack command | Restart required |
@@ -337,6 +338,29 @@ a bare `*` starts a YAML alias and makes the configuration invalid.
 
 `*` allows any human but never implicitly allows bots. With a bot token, list your own
 human Slack ID or your DMs are ignored.
+
+`bot_channel_ids` is a YAML-only mapping from a bot's `B…` id to a nonempty list
+of exact conversation IDs, for example:
+
+```yaml
+slack:
+  bot_channel_ids:
+    B012EXAMPLE: [C012EXAMPLE, G012EXAMPLE]
+```
+
+Each conversation ID must start with `C`, `D`, or `G`, followed by at least eight
+uppercase letters or digits. Names, wildcards, prefixes, and substrings do not
+match. Every bot event carrying that `bot_id` must pass the boundary, including
+events with a `user` field or `thread_broadcast` subtype, before other routing.
+It does not grant sender access, bypass mention/block/policy gates, or authorize
+agent actions. Original event provenance remains unchanged.
+
+An absent table, an empty mapping, or a bot with no entry preserves that bot's
+existing behavior. A non-mapping table rejects every event carrying a bot ID and
+logs an error. An empty list, a non-list value, or any invalid item rejects all
+events for that scoped bot, even if another list item matches the channel. Human
+events without a bot ID remain unaffected. Edits apply to the next event without
+a restart. This controls ingress only; it does not revoke already accepted turns.
 
 `bot_policies` is keyed by an allowed bot's `B…` id. Supported modes are `all`
 (every message reaches the agent), `selective` (`process_if` decides), and `drop`

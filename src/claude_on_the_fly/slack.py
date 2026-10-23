@@ -2677,6 +2677,29 @@ class SlackFrontend(Frontend):
     async def _ingest_event(self, event: dict) -> None:
         subtype = event.get("subtype")
         bot_id = event.get("bot_id", "")
+        # Check the channel before routing by subtype or bot-user identity: apps
+        # can carry both bot_id and user, and still need the same boundary.
+        if bot_id:
+            channel_scopes = settings.operator("slack").get("bot_channel_ids", {})
+            if not isinstance(channel_scopes, Mapping):
+                logger.error(
+                    "slack: refusing bot event: bot_channel_ids must be a mapping"
+                )
+                return
+            if bot_id in channel_scopes:
+                channels = channel_scopes[bot_id]
+                if (
+                    not isinstance(channels, list)
+                    or not channels
+                    or any(
+                        not isinstance(value, str)
+                        or not re.fullmatch(r"[CDG][A-Z0-9]{8,}", value)
+                        for value in channels
+                    )
+                    or event.get("channel") not in channels
+                ):
+                    self._skip(False, "bot channel scope rejected bot_id=%s", bot_id)
+                    return
         # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
         # no user field. Only let through bots trusted by bot_id and not blocked.
         # A bot's "Also send to channel" reply is a thread_broadcast with the same
