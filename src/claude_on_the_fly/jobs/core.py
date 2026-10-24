@@ -303,6 +303,11 @@ class AlertSink(Protocol):
     The sink decides whether this origin is alertable; the core never reads
     origin. Implementations must not raise: an alert that fails must not cost
     the reply it follows, and the worker guards the call anyway.
+
+    `repeat` marks a failure of an entry that alerted recently; a platform
+    sink replies under that alert instead of posting a new one.
     """
 
-    async def alert(self, origin: dict[str, Any], result: Result) -> None: ...
+    async def alert(
+        self, origin: dict[str, Any], result: Result, *, repeat: bool = False
+    ) -> None: ...
