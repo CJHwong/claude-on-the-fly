@@ -1769,6 +1769,110 @@ def _profile_overlay(name: str) -> dict[str, object]:
     return cast("dict[str, object]", block)
 
 
+# The chat platforms whose conversations `agent.channel_profiles` can route. A
+# key outside this set is refused rather than ignored: `slak:` would otherwise
+# leave every channel it names on the global model with nothing said.
+CHANNEL_PROFILE_PLATFORMS = ("slack", "telegram")
+
+
+def _channel_profile_routes() -> dict[str, dict[str, object]]:
+    """`agent.channel_profiles` with its shape checked and its rows unchecked.
+
+    Raises ValueError on a structural defect: the table or a platform's entry
+    is not a mapping, or a platform key is unknown. Those fail every lookup, on
+    every platform, since there is no telling which channels a misspelt or
+    malformed platform entry meant to move. A row naming a missing profile is
+    left for `_checked_row`, so it fails only its own channel.
+    """
+    raw = settings.operator("agent").get("channel_profiles")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "agent.channel_profiles: must be a mapping of platform to "
+            f"{{channel id: profile name}}, got {type(raw).__name__}"
+        )
+    table: dict[str, dict[str, object]] = {}
+    for platform, channels in raw.items():
+        if platform not in CHANNEL_PROFILE_PLATFORMS:
+            raise ValueError(
+                f"agent.channel_profiles: unknown platform {platform!r} "
+                f"(supported: {', '.join(CHANNEL_PROFILE_PLATFORMS)})"
+            )
+        if channels is None:
+            continue
+        if not isinstance(channels, dict):
+            raise ValueError(
+                f"agent.channel_profiles.{platform}: must be a mapping of channel "
+                f"id to profile name, got {type(channels).__name__}"
+            )
+        # Compared as text, as `accounts._subject_rule` does: YAML reads an
+        # unquoted Telegram chat id as an int, the frontend hands back a str.
+        table[str(platform)] = {str(k): v for k, v in channels.items()}
+    return table
+
+
+def _checked_row(platform: str, channel: str, name: object, known: list[str]) -> str:
+    """One row's profile name, or ValueError naming the row."""
+    where = f"agent.channel_profiles.{platform}.{channel}"
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{where}: must name a profile, got {name!r}")
+    if name not in known:
+        defined = ", ".join(known) or "none"
+        raise ValueError(
+            f"{where}: unknown profile {name!r} (defined in agent.profiles: {defined})"
+        )
+    return name
+
+
+def validate_channel_profiles() -> None:
+    """Refuse a malformed `agent.channel_profiles`, every row. Raises ValueError.
+
+    Preflight runs this, so neither the chat daemon nor the jobs worker starts
+    with a bad row anywhere.
+    """
+    known = profile_names()
+    for platform, rows in _channel_profile_routes().items():
+        for channel, name in rows.items():
+            _checked_row(platform, channel, name, known)
+
+
+def channel_profile(platform: str, channel: str) -> str | None:
+    """The profile `agent.channel_profiles` assigns this conversation, or None.
+
+    None means "run on the global configuration", and is returned when nothing
+    maps this channel, including when the frontend cannot name the channel
+    (`""`). A row naming a profile that does not exist raises instead, for the
+    reason `_profile_overlay` gives: falling back would put the channel on the
+    model it was explicitly moved off, silently. Only this channel's row is
+    checked, because the file is re-read per turn and an edit made while the
+    daemon runs never passes through preflight: a typo in one row must fail
+    that channel, not every chat on the platform.
+
+    Why this is not `routing.<platform>.channels` in `accounts.py`, which already
+    maps a channel to something: that table selects an ACCOUNT, and using it here
+    would cost three things. Configuring any account or route switches every
+    chat into account mode (`accounts.apply_profile` clears the daemon default
+    and a selection file is persisted per session); an account carries a model
+    but no effort; and a Claude account with no `home` runs without the
+    daemon's CLAUDE_CONFIG_DIR (`sandbox` drops it), so the operator's own
+    config directory is lost. A named agent profile carries
+    model and effort and changes nothing else.
+
+    Session identity: a chat session's uuid is seeded from the chat id and its
+    `/new` state alone (`Orchestrator.session_uuid`); `AgentProfile.key` seeds
+    only job and cron sessions. So mapping a channel that already has threads
+    does NOT restart them: their next turn continues the same session on the
+    new profile, as a global configuration edit would.
+    """
+    if not channel:
+        return None
+    rows = _channel_profile_routes().get(platform, {})
+    if channel not in rows:
+        return None
+    return _checked_row(platform, channel, rows[channel], profile_names())
+
+
 def _overlay_str(block: object, key: str, where: str, fallback: str) -> str:
     """`block[key]` when the profile sets it, else the global value.
 

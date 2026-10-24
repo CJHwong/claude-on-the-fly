@@ -448,9 +448,10 @@ agent:
   # accepts minimal and ultra. A level the active backend doesn't accept is
   # ignored with a warning.
 
-  # Named overrides of everything above, for one cron entry at a time. An entry
-  # in cron.yaml says `profile: cheap` and runs on that block; an entry that
-  # names none runs on the settings above, unchanged. Same nesting and same key
+  # Named overrides of everything above, for one cron entry or one chat channel
+  # at a time. An entry in cron.yaml says `profile: cheap` and runs on that block,
+  # and channel_profiles below names one per channel; anything that names none
+  # runs on the settings above, unchanged. Same nesting and same key
   # names, so a profile reads like the block it overrides. Any key you leave out
   # is inherited, which is why `local` below only has to name the two that
   # differ. A profile also beats the matching environment variable: it is named
@@ -469,6 +470,24 @@ agent:
   #       mode: ollama
   #     ollama:
   #       model: qwen3:30b
+
+  # Run every conversation in one chat channel or DM on a named profile from
+  # above; channels and DMs without a row stay on the global settings. Keys are
+  # platform (slack, telegram), then the channel id (Slack's C0…/D0…, Telegram's
+  # chat id), then a profile name. A routed account's model and a `$model` pin
+  # still apply on top. A bad table stops claude-slack, claude-telegram and
+  # claude-jobs from starting. Read per turn: each turn re-checks the table's
+  # structure and its own row and resolves the profile it names (the CLI check
+  # runs only at start). A turn in a channel whose row fails is not run: the
+  # sender gets the usual resend offer and the daemon log names the problem. A
+  # bad platform key or a non-mapping fails every conversation on every platform,
+  # DMs included, except one the frontend cannot place in a channel. A failing
+  # channel never falls back to the global model.
+  # Mapping a channel does not restart its threads; their next turn resumes on
+  # the new profile.
+  # channel_profiles:
+  #   slack:
+  #     C0123456789: triage
 
   # Compact before answering once the previous turn left the context at or above
   # this share of the window. Unset means compaction only on $compact.

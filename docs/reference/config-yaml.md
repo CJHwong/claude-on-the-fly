@@ -44,8 +44,9 @@ configuration writes, not those persona links.
 | `pricing_ttl_seconds` | integer / `604800` | `0` always refreshes; negative never expires | Immediate |
 | `pane` | boolean / true | Host each turn in its own tmux server so the dashboard's live view mirrors the agent's terminal; `false`, `0`, `no` or `off` switches it off, anything else leaves it on. Inert without tmux | Next turn |
 | `pty.auto_install` | boolean / false | Install missing claude-pty without prompting | Startup |
-| `profiles` | mapping / unset | Named overrides of the keys above, one per cron entry. Same nesting and same key names; an omitted key inherits the global value. Validated at daemon start | Next turn |
 | `pty.auto_refresh` | boolean / true | Re-splice incomplete pty hooks | Startup |
+| `profiles` | mapping / unset | Named overrides of the keys above, named by a cron entry's `profile` or by `channel_profiles`. Same nesting and same key names; an omitted key inherits the global value. Resolved and CLI-checked at daemon start | Next turn |
+| `channel_profiles` | mapping / unset | Platform (`slack`, `telegram`) → channel id → profile name. Every conversation in a mapped channel runs on that profile; see [One channel on a profile](#one-channel-on-a-profile). Fully checked when `claude-slack`, `claude-telegram` or `claude-jobs` starts; afterwards each turn re-checks the table's structure and its own channel's row, and resolves the profile it names, but never re-runs the CLI check | Next turn |
 
 `pane` and the per-backend `mode` answer different questions. `mode` picks what runs
 — `claude.mode: pty` for claude's TUI, `codex.mode: pty` for codex's — and `pane`
@@ -90,9 +91,10 @@ the routed model's own, and the idle compaction reads only that count, never the
 
 ### Profiles
 
-A profile answers the same questions the block above does, for one cron entry at a
-time. A `cron.yaml` entry names one with `profile: cheap`; an entry that names none
-runs on the settings above, unchanged.
+A profile answers the same questions the block above does, for one cron entry or one
+chat channel at a time. A `cron.yaml` entry names one with `profile: cheap`, and
+`channel_profiles` (below) names one per channel; anything that names none runs on the
+settings above, unchanged.
 
 ```yaml
 agent:
@@ -134,6 +136,71 @@ fire of whichever entry names it. Profiles that differ only by model share one c
 The model is part of the session identity, so a keyed entry whose profile changes its
 model starts a fresh transcript rather than resuming one that model never wrote.
 Effort is not, so raising it leaves the transcript alone.
+
+#### One channel on a profile
+
+`channel_profiles` runs every conversation in one chat channel on a named profile.
+A DM is mapped the same way, by its own id (a Slack `D…` id, a Telegram private chat
+id); channels and DMs without a row keep the global settings:
+
+```yaml
+agent:
+  profiles:
+    triage:
+      claude:
+        model: haiku
+        effort: low
+  channel_profiles:
+    slack:
+      C0123456789: triage
+```
+
+- **Layering.** The channel's profile replaces the global block as the base. Account
+  selection applies on top of it: a routed account that sets `model` wins over the
+  profile's model, and one that sets `mode` wins over its mode. An account that moves
+  into or out of `ollama` mode without setting `model` takes the global
+  `<backend>.model` rather than the profile's. Effort comes from the profile, since an
+  account cannot set it. A
+  conversation's `$model` pin applies last, so a pin made in a mapped channel wins over
+  both, effort included when the pin names one. A bare `$model` names the channel's
+  profile in its report.
+- **Refusals at start.** A platform other than `slack` or `telegram`, a value that is
+  not a mapping, or a row that does not name a profile defined under `profiles` stops
+  `claude-slack`, `claude-telegram` and the `claude-jobs` worker from starting; all
+  three run the same backend check. Every profile a row names is resolved and its CLI
+  checked then, like any other profile.
+- **Edits while running.** The file is read per turn. Each turn re-checks the table's
+  structure and its own channel's row, then resolves the profile that row names,
+  re-validating its backend, mode, ollama model and key types exactly as at start;
+  only the CLI check waits for a restart. A row that fails, or names a profile that no
+  longer resolves, fails that channel's turns: the turn is not run, the sender gets the
+  usual resend offer, and the daemon log names the problem, the same as a fault in the
+  global `agent` block. Every other channel and DM keeps running. A structural defect
+  (an unknown platform key, a platform entry or the whole table that is not a mapping)
+  fails every conversation on every platform, DMs included, except one the frontend
+  cannot place in a channel, since there is no telling which channels it meant to
+  move. A channel whose row fails never
+  runs on the global model in its place. Two cases are not looked up at all and run on
+  the global configuration: a conversation the frontend cannot place in a channel, and
+  any conversation while the operator file cannot be parsed, since none of that file,
+  this mapping included, is then in effect.
+- **Sessions.** A chat session's identity is its chat id and its `/new` state, not its
+  profile, so mapping a channel that already has threads does not restart them. When
+  the profile changes only the model or effort, their next turn resumes the same transcript on the new model, as
+  a global model edit would. One difference from a `$model` pin: a pin drops the
+  conversation's cached context reading, a configuration edit does not, so the first
+  automatic-compaction check after the change still measures against the previous
+  model's window. When the profile sets `backend` or `mode`, the channel switches
+  exactly as a global `backend` or `mode` edit would, not as a plain resume: after a
+  backend change a thread resumes that backend's own transcript if it has one, and is
+  otherwise carried over through the cross-backend handoff. Cron differs here: a keyed
+  entry's session identity includes the backend, mode and model its profile resolves
+  to, so changing any of those starts a fresh transcript, while an effort-only change
+  keeps it.
+- **Why not `routing`.** `routing.<platform>.channels` picks an *account*, not a model.
+  Configuring any account switches every chat into account mode, an account cannot set
+  effort, and a Claude account with no `home` runs without the daemon's
+  `CLAUDE_CONFIG_DIR`, so the CLI falls back to its own default directory.
 
 ## `accounts`
 

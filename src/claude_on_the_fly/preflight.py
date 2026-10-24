@@ -101,6 +101,12 @@ def check_backend() -> None:
         accounts.validate()
     except accounts.AccountError as exc:
         raise _exit(str(exc)) from exc
+    # Every profile it names is resolved by the loop below, so checking the
+    # names exist is all this has to add.
+    try:
+        agent.validate_channel_profiles()
+    except ValueError as exc:
+        raise _exit(str(exc)) from exc
     checked: set[tuple[str, str]] = set()
     for name in (None, *agent.profile_names()):
         profile = _resolve_or_exit(name)

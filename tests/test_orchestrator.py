@@ -376,6 +376,313 @@ class TestModelPin:
         assert row["backend"] == "claude:native:opus"
 
 
+# ---------------------------------------------------------------------------
+# A channel on a named profile (`agent.channel_profiles`)
+# ---------------------------------------------------------------------------
+
+_MAPPED = "C0123456789"
+
+
+class ChannelFrontend(StubFrontend):
+    """Chat 1 and 4 are in the mapped channel, 2 in another channel, 3 a DM."""
+
+    CHANNELS = {1: _MAPPED, 2: "C0OTHER0000", 3: "D0DMDMDMDM0", 4: _MAPPED}
+
+    def account_subjects(self, chat_id: int) -> tuple[str, str]:
+        return self.CHANNELS[chat_id], "U0SOMEONE"
+
+
+class TestChannelProfile:
+    """The wiring from a channel id to the profile its turns run on.
+
+    Config is written with the backend named and the agent env cleared, so the
+    developer's own CLAUDE_MODEL cannot make the global and the profile agree
+    and pass a test that proves nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean_agent_env(self, monkeypatch) -> None:
+        for name in (
+            "AGENT_BACKEND",
+            "CLAUDE_MODE",
+            "CLAUDE_MODEL",
+            "CLAUDE_EFFORT",
+            "CODEX_MODE",
+            "CODEX_MODEL",
+            "CODEX_EFFORT",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def write(path: Path, channel_profiles: object) -> None:
+        import yaml
+
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "agent": {
+                        "backend": "claude",
+                        "claude": {"model": "opus", "effort": "high"},
+                        "profiles": {
+                            "triage": {"claude": {"model": "haiku", "effort": "low"}}
+                        },
+                        "channel_profiles": channel_profiles,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def orch(platform: str, event_log: EventLog) -> Orchestrator:
+        return Orchestrator(ChannelFrontend(), platform, event_log=event_log)
+
+    def test_a_mapped_channel_runs_on_the_named_profile(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+
+        profile = self.orch("slack", event_log).current_profile(1)
+
+        assert (profile.model, profile.effort) == ("haiku", "low")
+        assert profile == agent_mod.resolve_profile("triage")
+
+    def test_another_channel_and_a_dm_keep_the_global(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        orch = self.orch("slack", event_log)
+
+        for chat_id in (2, 3):
+            profile = orch.current_profile(chat_id)
+            assert (profile.model, profile.effort) == ("opus", "high")
+            assert profile == agent_mod.resolve_profile()
+
+    def test_a_model_pin_in_a_mapped_channel_wins(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        orch = self.orch("slack", event_log)
+
+        orch.on_model(1, ["sonnet"])
+
+        profile = orch.current_profile(1)
+        assert profile.model == "sonnet"
+        # Effort was not pinned, so it is still the channel profile's, not the
+        # global one: the pin lands on the channel's profile, not instead of it.
+        assert profile.effort == "low"
+        # The other conversation in the same channel is untouched.
+        assert orch.current_profile(4).model == "haiku"
+
+    def test_unpinning_returns_to_the_channel_profile_not_the_global(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        orch = self.orch("slack", event_log)
+
+        orch.on_model(1, ["sonnet", "high"])
+        orch.on_model(1, ["default"])
+
+        assert orch.current_profile(1) == agent_mod.resolve_profile("triage")
+
+    def test_the_report_names_the_channel_profile(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        orch = self.orch("slack", event_log)
+
+        mapped = orch.on_model(1, [])
+        other = orch.on_model(2, [])
+
+        assert "Model: haiku" in mapped
+        assert "Effort: low" in mapped
+        assert "`triage` profile" in mapped
+        assert "Model: opus" in other
+        assert "profile" not in other
+
+    def test_the_mapping_is_per_platform(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """The same channel id under another platform's key moves nothing."""
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+
+        for platform in ("telegram", "test"):
+            assert (
+                self.orch(platform, event_log).current_profile(1)
+                == agent_mod.resolve_profile()
+            )
+
+    def test_a_telegram_chat_id_written_as_a_number_matches(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """YAML reads an unquoted id as an int; the frontend hands back a str."""
+        self.write(operator_settings, {"telegram": {-1001234: "triage"}})
+        orch = Orchestrator(StubFrontend(), "telegram", event_log=event_log)
+
+        assert orch.current_profile(-1001234).model == "haiku"
+        assert orch.current_profile(42).model == "opus"
+
+    def test_an_unknown_profile_fails_only_its_own_channel(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """A row edited while the daemon runs is checked on lookup, not at start,
+        so a typo must stop the channel it names and nothing else."""
+        self.write(
+            operator_settings,
+            {"slack": {_MAPPED: "triagee", "C0OTHER0000": "triage"}},
+        )
+        orch = self.orch("slack", event_log)
+
+        with pytest.raises(ValueError, match=r"unknown profile 'triagee'"):
+            orch.current_profile(1)
+        # Another mapped channel still runs on its own profile, and a DM still
+        # runs on the global configuration.
+        assert orch.current_profile(2) == agent_mod.resolve_profile("triage")
+        assert orch.current_profile(3) == agent_mod.resolve_profile()
+
+    def test_a_malformed_row_fails_only_its_own_channel(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: None, "C0OTHER0000": ""}})
+        orch = self.orch("slack", event_log)
+
+        with pytest.raises(ValueError, match=r"slack\.C0123456789: must name"):
+            orch.current_profile(1)
+        with pytest.raises(ValueError, match=r"slack\.C0OTHER0000: must name"):
+            orch.current_profile(2)
+        assert orch.current_profile(3) == agent_mod.resolve_profile()
+
+    def test_a_structural_defect_fails_every_conversation_on_every_platform(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """A misspelt platform key could have meant any channel, so nothing on
+        any platform is resolved as if the table were fine: a mapped channel, a
+        DM, and a conversation on a platform the table does not name."""
+        self.write(operator_settings, {"slak": {_MAPPED: "triage"}})
+
+        for platform, chat_id in (("slack", 1), ("slack", 3), ("telegram", 2)):
+            with pytest.raises(ValueError, match=r"unknown platform 'slak'"):
+                self.orch(platform, event_log).current_profile(chat_id)
+
+    def test_a_channel_the_frontend_cannot_name_runs_on_the_global(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        frontend = ChannelFrontend()
+        frontend.CHANNELS = {1: ""}
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+
+        assert orch.current_profile(1) == agent_mod.resolve_profile()
+
+    def test_a_slack_thread_maps_to_its_parent_channel(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """The real Slack frontend, not the stub: a thread's chat id is a hash
+        of channel and thread, and it is the channel half that is looked up."""
+        from claude_on_the_fly.slack import SlackFrontend, _session_key
+
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        frontend = SlackFrontend("app", "token", "operator")
+        thread = _session_key(_MAPPED, "1700000000.000100")
+        frontend._remember_session(thread, _MAPPED, "1700000000.000100")
+        dm = _session_key("D0DMDMDMDM0", "1700000000.000200")
+        frontend._remember_session(dm, "D0DMDMDMDM0", "1700000000.000200")
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+
+        assert orch.current_profile(thread) == agent_mod.resolve_profile("triage")
+        assert orch.current_profile(dm) == agent_mod.resolve_profile()
+
+    def test_the_compaction_runs_on_the_channel_profile(
+        self, operator_settings, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        orch = self.orch("slack", event_log)
+        compact = AsyncMock(return_value=None)
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "compact", compact),
+        ):
+            asyncio.run(orch._process(1, Turn("", compact=True)))
+
+        used = compact.await_args.kwargs["profile"]
+        assert (used.model, used.effort) == ("haiku", "low")
+
+    def test_a_turn_in_a_misconfigured_channel_never_runs(
+        self, operator_settings, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        """The failure is the drain's to handle; what matters here is that no
+        agent was spawned on the global model in its place."""
+        self.write(operator_settings, {"slack": {_MAPPED: "triagee"}})
+        orch = self.orch("slack", event_log)
+        run = AsyncMock(return_value=Response(body="answer"))
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "run", run),
+            pytest.raises(ValueError),
+        ):
+            asyncio.run(orch._process(1, Turn("question")))
+
+        run.assert_not_awaited()
+
+    def test_a_misconfigured_channel_takes_the_drains_resend_path(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """Through the real queue: the turn is parked and offered back, the same
+        as a fault in the global agent block, and nothing runs."""
+        self.write(operator_settings, {"slack": {_MAPPED: "triagee"}})
+        frontend = ChannelFrontend()
+        frontend.notify_nudge = AsyncMock()  # type: ignore[method-assign]
+        frontend.retire_failed_turn = AsyncMock()  # type: ignore[method-assign]
+        orch = Orchestrator(frontend, "slack", event_log=event_log)
+        run = AsyncMock(return_value=Response(body="answer"))
+
+        async def deliver() -> None:
+            await orch.on_message(1, "question")
+            await orch._running[1]
+
+        with patch.object(agent_mod, "run", run):
+            asyncio.run(deliver())
+
+        run.assert_not_awaited()
+        frontend.notify_nudge.assert_awaited_once()
+        assert frontend.notify_nudge.await_args.args[0] == 1
+        frontend.retire_failed_turn.assert_awaited_once()
+        assert frontend.retire_failed_turn.await_args.args[0] == 1
+        # Nothing but the resend offer: no notice of its own in the channel.
+        assert frontend.sent == []
+
+    def test_the_turn_runs_on_the_channel_profile(
+        self, operator_settings, event_log: EventLog, tmp_path: Path
+    ) -> None:
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+        orch = self.orch("slack", event_log)
+        run = AsyncMock(return_value=Response(body="answer"))
+
+        with (
+            patch("claude_on_the_fly.orchestrator.DATA_DIR", tmp_path),
+            patch.object(agent_mod, "run", run),
+        ):
+            asyncio.run(orch._process(1, Turn("question")))
+
+        used = run.await_args.kwargs["profile"]
+        assert (used.model, used.effort) == ("haiku", "low")
+
+    def test_mapping_a_channel_keeps_its_session(
+        self, operator_settings, event_log: EventLog
+    ) -> None:
+        """Chat sessions are keyed on the chat, not the profile, so a channel
+        mapped after it has threads resumes them rather than restarting them."""
+        orch = self.orch("slack", event_log)
+        before = orch.session_uuid(1)
+
+        self.write(operator_settings, {"slack": {_MAPPED: "triage"}})
+
+        assert orch.current_profile(1).model == "haiku"
+        assert orch.session_uuid(1) == before
+
+
 class TestSessionUUID:
     def test_same_chat_id_returns_same_uuid(self, orch: Orchestrator) -> None:
         assert orch.session_uuid(1) == orch.session_uuid(1)
