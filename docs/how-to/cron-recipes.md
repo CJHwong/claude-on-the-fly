@@ -4,7 +4,7 @@ Each recipe is a pattern a real deployment runs. A short recipe is an entry on t
 
 Most recipes rely on two cron daemon rules:
 
-- A bare `command` that exits non-zero, and a producer that exits non-zero, alert `slack.alert_target` or `telegram.alert_target`. At most one alert goes out per entry per 30 minutes. A script can therefore raise an alert by printing the reason and exiting 1, with no Slack code.
+- A bare `command` that exits non-zero, and a producer that exits non-zero, alert `slack.alert_target` or `telegram.alert_target`. Within 30 minutes of an entry's alert, its next failures reply under that alert instead of posting a new one. A script can therefore raise an alert by printing the reason and exiting 1, with no Slack code.
 - A producer that prints nothing starts no agent. A poll that finds no work costs one shell command, not a model session.
 
 Each script in an example directory opens with how to set it up. The scripts run with `uv run --script`, and a skill is linked into the agent's skills directory, so clone the repository once:

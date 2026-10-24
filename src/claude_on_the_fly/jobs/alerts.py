@@ -32,10 +32,11 @@ from claude_on_the_fly.jobs.slack_notifier import (
 
 logger = logging.getLogger(__name__)
 
-# How long a failed entry stays quiet before it can alert again. In-memory on
-# purpose: the durable record of a failure is the entry's log and the
-# key-state file, and the alert is only the operator's heads-up. A restart
-# resets the memory, which is fine — the next failure alerts again.
+# How long after a full alert a failed entry's next failures go out as repeats,
+# replies under that alert, instead of new alerts. In-memory on purpose: the
+# durable record of a failure is the entry's log and the key-state file, and
+# the alert is only the operator's heads-up. A restart resets the memory,
+# which is fine — the next failure alerts again.
 ALERT_COOLDOWN_S = 1800.0
 # The alert is a heads-up, not the report. The full failure text lives in the
 # entry's log (and the origin thread, when there is one); this is the first
@@ -121,6 +122,13 @@ def _alert_body(origin: Mapping[str, Any], result: Result) -> str:
     return f"cron entry {entry} failed\n{_failure_detail(result.text)}"
 
 
+def _repeat_body(result: Result) -> str:
+    """A repeat's text. It replies under the first alert, which already names
+    the entry, and it must not open with that alert's header: a workflow
+    matching `:x: cron` would take the reply for a new alert."""
+    return f"Failed again.\n{_failure_detail(result.text)}"
+
+
 class SlackAlertSink:
     """Posts a failure alert to a configured Slack channel.
 
@@ -131,14 +139,32 @@ class SlackAlertSink:
     def __init__(self, client: _PostsMessages, channel: str) -> None:
         self._client = client
         self._channel = channel
+        # Each entry's last full alert, so a repeat can reply under it.
+        self._thread_ts: dict[str, str] = {}
 
-    async def alert(self, origin: Mapping[str, Any], result: Result) -> None:
+    async def alert(
+        self, origin: Mapping[str, Any], result: Result, *, repeat: bool = False
+    ) -> None:
+        entry = str(origin.get("entry") or "")
+        thread_ts = self._thread_ts.get(entry) if repeat else None
+        if thread_ts:
+            body = _repeat_body(result)
+            await self._client.chat_postMessage(
+                channel=self._channel,
+                thread_ts=thread_ts,
+                text=_fallback_text(body),
+                blocks=_blocks(body),
+            )
+            return
         body = ":x: " + _alert_body(origin, result)
-        await self._client.chat_postMessage(
+        response = await self._client.chat_postMessage(
             channel=self._channel,
             text=_fallback_text(body),
             blocks=_blocks(body),
         )
+        ts = response.get("ts")
+        if isinstance(ts, str):
+            self._thread_ts[entry] = ts
 
 
 class TelegramAlertSink:
@@ -153,26 +179,43 @@ class TelegramAlertSink:
         self._token = bot_token
         self._chat_id = chat_id
         self._client = client
+        # Each entry's last full alert, so a repeat can reply to it.
+        self._message_id: dict[str, int] = {}
 
-    async def alert(self, origin: Mapping[str, Any], result: Result) -> None:
-        payload = {
+    async def alert(
+        self, origin: Mapping[str, Any], result: Result, *, repeat: bool = False
+    ) -> None:
+        entry = str(origin.get("entry") or "")
+        reply_to = self._message_id.get(entry) if repeat else None
+        text = _repeat_body(result) if reply_to else _alert_body(origin, result)
+        payload: dict[str, Any] = {
             "chat_id": self._chat_id,
-            "text": escape_markdown(_alert_body(origin, result), version=1),
+            "text": escape_markdown(text, version=1),
             "parse_mode": "Markdown",
         }
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
         response = await self._client.post(
             f"https://api.telegram.org/bot{self._token}/sendMessage", json=payload
         )
         response.raise_for_status()
+        if reply_to:
+            return
+        message_id = (response.json().get("result") or {}).get("message_id")
+        if isinstance(message_id, int):
+            self._message_id[entry] = message_id
 
 
 class CooldownAlertSink:
-    """Suppresses repeat alerts for the same entry within `window_s`.
+    """Marks a failure as a repeat when its entry alerted within `window_s`.
 
     A failing entry fires on its own schedule, and without this the alert
-    channel would hear about the same failure at every fire. The window is
-    recorded only after a successful post, so a sink that is down retries on
-    the next failure instead of being silenced by its own outage.
+    channel would get a new alert at every fire. A repeat is still delivered,
+    as a reply under the first alert, because a failure nobody sees is worse
+    than a busy thread. The window runs from the last full alert, so a repeat
+    does not extend it. The window is recorded only after a successful post,
+    so a sink that is down retries on the next failure instead of being
+    silenced by its own outage.
     """
 
     def __init__(self, inner: Any, window_s: float = ALERT_COOLDOWN_S) -> None:
@@ -189,6 +232,7 @@ class CooldownAlertSink:
         # VM, a recently rebooted host), `now - 0.0 < window` is true and the
         # FIRST alert would be swallowed as a "repeat".
         if last is not None and now - last < self._window_s:
+            await self._inner.alert(origin, result, repeat=True)
             return
         await self._inner.alert(origin, result)
         self._last_alerted_at[entry] = now
@@ -205,11 +249,13 @@ class MultiAlertSink:
     def __init__(self, sinks: list[Any]) -> None:
         self._sinks = sinks
 
-    async def alert(self, origin: Mapping[str, Any], result: Result) -> None:
+    async def alert(
+        self, origin: Mapping[str, Any], result: Result, *, repeat: bool = False
+    ) -> None:
         failures = 0
         for sink in self._sinks:
             try:
-                await sink.alert(origin, result)
+                await sink.alert(origin, result, repeat=repeat)
             except Exception:
                 failures += 1
                 logger.exception("alerts: one sink failed; continuing")
@@ -229,10 +275,12 @@ class CronOriginAlertSink:
     def __init__(self, inner: Any) -> None:
         self._inner = inner
 
-    async def alert(self, origin: Mapping[str, Any], result: Result) -> None:
+    async def alert(
+        self, origin: Mapping[str, Any], result: Result, *, repeat: bool = False
+    ) -> None:
         if str(origin.get("kind") or "") != "cron":
             return
-        await self._inner.alert(origin, result)
+        await self._inner.alert(origin, result, repeat=repeat)
 
 
 def build_alert_sink(env: Mapping[str, str]) -> Any | None:

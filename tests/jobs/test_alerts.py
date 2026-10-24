@@ -36,19 +36,25 @@ class _FakeSlackClient:
 
     async def chat_postMessage(self, *, channel: str, **kwargs: Any) -> dict:
         self.calls.append({"channel": channel, **kwargs})
-        return {"ok": True}
+        return {"ok": True, "ts": f"1700000000.{len(self.calls):06d}"}
 
 
 class _RecordingSink:
     def __init__(self) -> None:
         self.calls: list[tuple[dict, Result]] = []
+        self.repeats: list[bool] = []
 
-    async def alert(self, origin: dict, result: Result) -> None:
+    async def alert(
+        self, origin: dict, result: Result, *, repeat: bool = False
+    ) -> None:
         self.calls.append((origin, result))
+        self.repeats.append(repeat)
 
 
 class _RaisingSink:
-    async def alert(self, origin: dict, result: Result) -> None:
+    async def alert(
+        self, origin: dict, result: Result, *, repeat: bool = False
+    ) -> None:
         raise RuntimeError("sink down")
 
 
@@ -58,7 +64,9 @@ class _FlakySink:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def alert(self, origin: dict, result: Result) -> None:
+    async def alert(
+        self, origin: dict, result: Result, *, repeat: bool = False
+    ) -> None:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("down")
@@ -220,6 +228,56 @@ async def test_slack_alert_keeps_the_plain_cron_prefix_for_workflow_matching() -
     assert call["blocks"][0]["text"].startswith(":x: cron entry nightly-report failed")
 
 
+async def test_slack_repeat_replies_in_the_first_alerts_thread() -> None:
+    client = _FakeSlackClient()
+    sink = SlackAlertSink(client, "C42")
+
+    await sink.alert(_origin(), _result("boom"))
+    await sink.alert(_origin(), _result("boom again"), repeat=True)
+
+    first, again = client.calls
+    assert "thread_ts" not in first
+    assert again["channel"] == "C42"
+    assert again["thread_ts"] == "1700000000.000001"
+    assert again["blocks"][0]["text"] == "Failed again.\nboom again"
+
+
+async def test_slack_repeat_does_not_start_with_the_alert_prefix() -> None:
+    """A repeat is a reply, not a new alert: a workflow matching `:x: cron`
+    must not take it for one."""
+    client = _FakeSlackClient()
+    sink = SlackAlertSink(client, "C42")
+
+    await sink.alert(_origin(), _result("boom"))
+    await sink.alert(_origin(), _result("boom"), repeat=True)
+
+    assert not client.calls[1]["text"].startswith(":x:")
+
+
+async def test_slack_repeat_without_a_known_thread_posts_a_full_alert() -> None:
+    """After a restart the first alert's ts is gone; the repeat must still
+    reach the channel, as a full alert."""
+    client = _FakeSlackClient()
+    sink = SlackAlertSink(client, "C42")
+
+    await sink.alert(_origin(), _result("boom"), repeat=True)
+
+    call = client.calls[0]
+    assert "thread_ts" not in call
+    assert call["text"] == ":x: cron entry jira failed"
+
+
+async def test_slack_repeat_threads_per_entry() -> None:
+    client = _FakeSlackClient()
+    sink = SlackAlertSink(client, "C42")
+
+    await sink.alert(_origin("jira"), _result("boom"))
+    await sink.alert(_origin("prune"), _result("boom"))
+    await sink.alert(_origin("jira"), _result("boom"), repeat=True)
+
+    assert client.calls[2]["thread_ts"] == "1700000000.000001"
+
+
 # --- Telegram --------------------------------------------------------------
 
 
@@ -270,17 +328,54 @@ async def test_telegram_sink_raises_on_an_error_response() -> None:
         await sink.alert(_origin(), _result("boom"))
 
 
+async def test_telegram_repeat_replies_to_the_first_alert() -> None:
+    payloads: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 77}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    sink = TelegramAlertSink("bot-token", "123", client)
+
+    await sink.alert(_origin(), _result("boom"))
+    await sink.alert(_origin(), _result("boom"), repeat=True)
+
+    assert "reply_to_message_id" not in payloads[0]
+    assert payloads[1]["reply_to_message_id"] == 77
+    assert payloads[1]["text"] == "Failed again.\nboom"
+
+
 # --- cooldown --------------------------------------------------------------
 
 
-async def test_cooldown_suppresses_repeats_within_the_window() -> None:
+async def test_cooldown_marks_repeats_within_the_window() -> None:
+    """A repeat inside the window is still delivered, marked as a repeat, so
+    the sink can reply under the first alert instead of posting a new one."""
     inner = _RecordingSink()
     sink = CooldownAlertSink(inner, window_s=60.0)
 
     await sink.alert(_origin(), _result("boom"))
     await sink.alert(_origin(), _result("boom"))
 
-    assert len(inner.calls) == 1
+    assert inner.repeats == [False, True]
+
+
+async def test_cooldown_repeat_does_not_extend_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window runs from the last full alert. A repeat must not push it
+    forward, or a job failing every 20 minutes would never alert again."""
+    # The patch reaches the event loop's clock too, so it must stay callable.
+    now = [1000.0]
+    monkeypatch.setattr("claude_on_the_fly.jobs.alerts.time.monotonic", lambda: now[0])
+    inner = _RecordingSink()
+    sink = CooldownAlertSink(inner, window_s=60.0)
+
+    for now[0] in (1000.0, 1040.0, 1070.0):
+        await sink.alert(_origin(), _result("boom"))
+
+    assert inner.repeats == [False, True, False]
 
 
 async def test_cooldown_first_alert_fires_on_a_young_clock(
@@ -363,6 +458,15 @@ async def test_cron_origin_alerts_cron_failures_only() -> None:
     await sink.alert({}, _result("boom"))
 
     assert len(inner.calls) == 1
+
+
+async def test_wrappers_pass_the_repeat_mark_through() -> None:
+    inner = _RecordingSink()
+    sink = CronOriginAlertSink(MultiAlertSink([inner]))
+
+    await sink.alert(_origin(), _result("boom"), repeat=True)
+
+    assert inner.repeats == [True]
 
 
 # --- factory ---------------------------------------------------------------
