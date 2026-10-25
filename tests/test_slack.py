@@ -24,6 +24,7 @@ from claude_on_the_fly.slack import (
     DEFAULT_REPLY_SOFT_LIMIT,
     JOB_LIST_LIMIT,
     RATE_LIMIT_RETRIES,
+    TIMEOUT_RETRIES,
     SlackFrontend,
     _render_job_list,
     _reply_messages,
@@ -313,6 +314,63 @@ class TestSlackFrontendInit:
             handlers["AsyncRateLimitErrorRetryHandler"].max_retry_count
             == RATE_LIMIT_RETRIES
         )
+
+    def test_timed_out_calls_are_retried(self):
+        """The default connection handler covers disconnects, not timeouts: an
+        aiohttp 30 s timeout raised asyncio.TimeoutError with no message and the
+        reply was dropped after one try (2026-10-26)."""
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        handlers = {type(h).__name__: h for h in frontend._app.client.retry_handlers}
+        assert "AsyncTimeoutRetryHandler" in handlers
+        assert handlers["AsyncTimeoutRetryHandler"].max_retry_count == TIMEOUT_RETRIES
+
+
+class TestAsyncTimeoutRetryHandler:
+    @staticmethod
+    def _request():
+        from slack_sdk.http_retry.request import HttpRequest
+
+        return HttpRequest(
+            method="POST",
+            url="https://slack.com/api/chat.postMessage",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_retries_timeout(self):
+        from slack_sdk.http_retry.state import RetryState
+
+        handler = slack_mod.AsyncTimeoutRetryHandler()
+        retry = await handler.can_retry_async(
+            state=RetryState(),
+            request=self._request(),
+            error=TimeoutError(),
+        )
+        assert retry is True
+
+    @pytest.mark.asyncio
+    async def test_stops_after_max_retries(self):
+        from slack_sdk.http_retry.state import RetryState
+
+        handler = slack_mod.AsyncTimeoutRetryHandler(max_retry_count=1)
+        retry = await handler.can_retry_async(
+            state=RetryState(current_attempt=1),
+            request=self._request(),
+            error=TimeoutError(),
+        )
+        assert retry is False
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_errors(self):
+        from slack_sdk.http_retry.state import RetryState
+
+        handler = slack_mod.AsyncTimeoutRetryHandler()
+        retry = await handler.can_retry_async(
+            state=RetryState(),
+            request=self._request(),
+            error=ValueError("bad"),
+        )
+        assert retry is False
 
 
 # ---------------------------------------------------------------------------
