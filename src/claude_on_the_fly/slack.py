@@ -23,6 +23,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.http_retry.builtin_async_handlers import (
+    AsyncConnectionErrorRetryHandler,
     AsyncRateLimitErrorRetryHandler,
 )
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
@@ -426,6 +427,14 @@ DEFAULT_SESSION_CAP = 1000
 # turn's setup rather than how long it sleeps. Three covers the burst a queue of
 # turns produces; a limit that outlasts three backoffs is an outage, not a burst.
 RATE_LIMIT_RETRIES = 3
+# Attempts a Slack call gets when the request itself times out. slack_sdk's
+# built-in connection handler covers ServerConnectionError,
+# ServerDisconnectedError and ClientOSError, but not asyncio.TimeoutError,
+# which is what aiohttp raises when its 30 s ClientTimeout elapses. A timeout
+# during a network flap therefore dropped the call on the first try: on
+# 2026-10-26 three replies were lost in sixteen minutes this way, each after
+# exactly 30 s.
+TIMEOUT_RETRIES = 2
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
@@ -1268,6 +1277,23 @@ def _render_forward(fwd: dict) -> str:
     return "\n".join(lines)
 
 
+class AsyncTimeoutRetryHandler(AsyncConnectionErrorRetryHandler):
+    """Retry a Slack call that raised asyncio.TimeoutError.
+
+    slack_sdk registers a connection-error handler by default, but its error
+    types do not include timeouts. aiohttp raises asyncio.TimeoutError when the
+    client's 30 s total timeout elapses, and that exception carries no message,
+    so the existing log line recorded a blank reason and the reply was dropped.
+    The parent is reused only for its retry plumbing; the error list is replaced.
+    """
+
+    def __init__(self, max_retry_count: int = TIMEOUT_RETRIES) -> None:
+        super().__init__(
+            max_retry_count=max_retry_count,
+            error_types=[TimeoutError],
+        )
+
+
 class SlackFrontend(Frontend):
     def __init__(
         self,
@@ -1345,6 +1371,14 @@ class SlackFrontend(Frontend):
         # Slack's own Retry-After.
         self._app.client.retry_handlers.append(
             AsyncRateLimitErrorRetryHandler(max_retry_count=RATE_LIMIT_RETRIES)
+        )
+        # The default connection-error handler does not cover timeouts, so a
+        # request that waited out the 30 s client timeout was never retried and
+        # the reply was lost (2026-10-26: three in sixteen minutes). Retrying a
+        # timing-out POST can duplicate a message that did reach Slack; a rare
+        # duplicate is the better trade against a reply the user never sees.
+        self._app.client.retry_handlers.append(
+            AsyncTimeoutRetryHandler(max_retry_count=TIMEOUT_RETRIES)
         )
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
@@ -3210,7 +3244,15 @@ class SlackFrontend(Frontend):
             )
             return error
         except Exception as exc:
-            logger.error("send: failed to post part %s/%s: %s", index, total, exc)
+            # These exceptions often carry an empty str(), so name the class
+            # too; "TimeoutError()" is diagnosable where "" was not.
+            logger.error(
+                "send: failed to post part %s/%s: %s: %r",
+                index,
+                total,
+                type(exc).__name__,
+                exc,
+            )
             # Not a Slack error code, so it never matches _FALLBACK_ERRORS.
             return "transport_error"
 
