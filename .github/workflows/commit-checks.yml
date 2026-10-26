@@ -40,7 +40,7 @@ jobs:
           # Exact patch, matching the commitlint hook's language_version in
           # .pre-commit-config.yaml. A floating '22' would let the runner's node
           # drift away from the one a contributor's hook is built against.
-          node-version: '22.20.0'
+          node-version: '22.23.4'
 
       # Installed from pinned direct packages rather than a committed
       # package-lock.json. A lockfile would fix the transitive tree too, but it
