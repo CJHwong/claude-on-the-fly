@@ -485,6 +485,106 @@ def frontend(monkeypatch):
 
 
 class TestIngestEvent:
+    @pytest.mark.parametrize(
+        "slow_method", ["_fetch_thread_context", "_identify_session", "_save_files"]
+    )
+    async def test_concurrent_redelivery_dispatches_once(self, frontend, slow_method):
+        event = {
+            "ts": "200.0",
+            "thread_ts": "100.0",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+            "text": "one request",
+            "files": [{"id": "F1", "name": "note.txt"}],
+        }
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow_lookup(*arguments):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await release.wait()
+            return [] if slow_method == "_save_files" else "testuser"
+
+        with (
+            patch.object(
+                frontend,
+                "_fetch_thread_context",
+                new_callable=AsyncMock,
+                return_value="",
+            ),
+            patch.object(frontend, "_save_files", new_callable=AsyncMock),
+            patch.object(frontend, slow_method, side_effect=slow_lookup),
+        ):
+            original = asyncio.create_task(frontend._ingest_event(dict(event)))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await frontend._ingest_event(dict(event))
+            finally:
+                release.set()
+                await original
+
+        frontend._on_message.assert_awaited_once()
+        assert calls == 1
+        assert event["ts"] in frontend._processed_ts
+        await frontend._ingest_event(dict(event))
+        frontend._on_message.assert_awaited_once()
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    async def test_failed_ingestion_allows_redelivery(self, frontend, cancelled):
+        event = {
+            "ts": "200.0",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+            "text": "one request",
+        }
+        failure = asyncio.CancelledError if cancelled else RuntimeError
+        with (
+            patch.object(frontend, "_identify_session", side_effect=failure),
+            pytest.raises(failure),
+        ):
+            await frontend._ingest_event(dict(event))
+
+        assert event["ts"] not in frontend._processed_ts
+        await frontend._ingest_event(dict(event))
+        frontend._on_message.assert_awaited_once()
+
+    async def test_different_event_runs_during_slow_ingestion(self, frontend):
+        event = {
+            "ts": "200.0",
+            "thread_ts": "100.0",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+            "text": "first request",
+        }
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_context(*arguments):
+            entered.set()
+            await release.wait()
+            return "prior messages"
+
+        with patch.object(frontend, "_fetch_thread_context", side_effect=slow_context):
+            original = asyncio.create_task(frontend._ingest_event(dict(event)))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await frontend._ingest_event(
+                    {**event, "ts": "201.0", "text": "second request"}
+                )
+                frontend._on_message.assert_awaited_once()
+            finally:
+                release.set()
+                await original
+
+        assert frontend._on_message.await_count == 2
+
     async def test_skips_non_allowed_subtype(self, frontend):
         await frontend._ingest_event({"subtype": "bot_message", "ts": "1"})
         frontend._on_message.assert_not_awaited()

@@ -1391,6 +1391,7 @@ class SlackFrontend(Frontend):
         # command-anchor session instead of an unregistered root.
         self._our_sent_timestamps: deque[str] = deque(maxlen=500)
         self._processed_events_cache: tuple[Path, ProcessedEvents] | None = None
+        self._ingesting_events: set[tuple[str, str]] = set()
         self._watermarks_cache: tuple[Path, SlackWatermarks] | None = None
         self._watermarks_restored = False
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
@@ -2709,6 +2710,19 @@ class SlackFrontend(Frontend):
         await self._catchup()
 
     async def _ingest_event(self, event: dict) -> None:
+        # Reconnects can deliver the same event while its first copy awaits Slack.
+        # Keep failed and gated events eligible for a later replay.
+        event_key = (event.get("channel", ""), event.get("ts", ""))
+        if event_key in self._ingesting_events:
+            self._skip(True, "already ingesting channel=%s ts=%s", *event_key)
+            return
+        self._ingesting_events.add(event_key)
+        try:
+            await self._process_event(event)
+        finally:
+            self._ingesting_events.remove(event_key)
+
+    async def _process_event(self, event: dict) -> None:
         subtype = event.get("subtype")
         bot_id = event.get("bot_id", "")
         # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
