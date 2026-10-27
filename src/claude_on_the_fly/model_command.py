@@ -154,12 +154,17 @@ def parse(tokens: list[str], profile: AgentProfile) -> Report | Change | Refusal
     return Change(values, note=_note_for(values, profile, catalogue))
 
 
-def describe(profile: AgentProfile, *, pinned: bool) -> str:
+def describe(
+    profile: AgentProfile, *, pinned: bool, channel_profile: str | None = None
+) -> str:
     """The state of one conversation, and what it could be switched to.
 
     `pinned` says at least one field was set from a chat rather than from the
     configuration file, which is worth saying: it is the only way to tell a
     conversation that was moved from one that was always where it is.
+    `channel_profile` names the `agent.channel_profiles` entry this channel runs
+    on, for the same reason: without it a channel on another model than the rest
+    of the daemon reads as if the global configuration said so.
     """
     catalogue = _catalogue(profile)
     where = " (pinned)" if pinned else ""
@@ -168,6 +173,11 @@ def describe(profile: AgentProfile, *, pinned: bool) -> str:
         f"Effort: {_effort_label(profile)}.",
         f"Backend: {profile.backend}, {profile.mode}.",
     ]
+    if channel_profile:
+        lines.append(
+            f"This channel runs on the `{channel_profile}` profile"
+            + (", with this conversation's pin on top." if pinned else ".")
+        )
     models = _model_options(profile, catalogue)
     if models:
         lines.append(f"Models: {_join([_code(model) for model in models])}.")

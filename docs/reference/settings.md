@@ -73,6 +73,10 @@ restart notification:
   effect on the next fire. Adding a profile is different: the CLI check that
   refuses a bad one runs during preflight, so a newly added profile is not
   validated until the daemon restarts.
+- `agent.channel_profiles` is read per turn too. Each turn checks the table's
+  structure and its own channel's row, and resolves the profile that row names, which
+  re-validates that profile's settings. Only the CLI check runs during preflight, so a
+  row pointing at a newly added profile is not CLI-checked until the daemon restarts.
 
 ## Validation
 

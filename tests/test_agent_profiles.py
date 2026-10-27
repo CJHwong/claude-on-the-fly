@@ -695,6 +695,89 @@ class TestPreflightValidatesEveryProfile:
         assert claude.call_count == 1
 
 
+class TestPreflightValidatesChannelProfiles:
+    """`agent.channel_profiles` is refused at start the way a cron entry's
+    unknown profile is refused at load: before the first message, not on it."""
+
+    _PROFILES = {"triage": {"claude": {"model": "haiku", "effort": "low"}}}
+
+    def check(self, operator_settings, channel_profiles: object) -> None:
+        write_agent_config(
+            operator_settings,
+            {"profiles": self._PROFILES, "channel_profiles": channel_profiles},
+        )
+        with patch.object(preflight, "check_claude_cli"):
+            preflight.check_backend()
+
+    def test_a_valid_mapping_starts(self, clean_agent_env, operator_settings) -> None:
+        self.check(
+            operator_settings,
+            {"slack": {"C0123456789": "triage"}, "telegram": {-100123: "triage"}},
+        )
+
+    def test_an_unknown_profile_refuses_and_names_it(
+        self, clean_agent_env, operator_settings
+    ) -> None:
+        with pytest.raises(
+            SystemExit,
+            match=r"agent\.channel_profiles\.slack\.C0123456789: unknown profile "
+            r"'nope' \(defined in agent\.profiles: triage\)",
+        ):
+            self.check(operator_settings, {"slack": {"C0123456789": "nope"}})
+
+    def test_a_mapping_with_no_profiles_defined_refuses(
+        self, clean_agent_env, operator_settings
+    ) -> None:
+        write_agent_config(
+            operator_settings, {"channel_profiles": {"slack": {"C0X": "triage"}}}
+        )
+        with (
+            patch.object(preflight, "check_claude_cli"),
+            pytest.raises(SystemExit, match=r"defined in agent\.profiles: none"),
+        ):
+            preflight.check_backend()
+
+    def test_an_unknown_platform_refuses(
+        self, clean_agent_env, operator_settings
+    ) -> None:
+        with pytest.raises(SystemExit, match=r"unknown platform 'slak'"):
+            self.check(operator_settings, {"slak": {"C0X": "triage"}})
+
+    @pytest.mark.parametrize(
+        ("table", "message"),
+        [
+            (["slack"], r"agent\.channel_profiles: must be a mapping"),
+            ({"slack": ["C0X"]}, r"agent\.channel_profiles\.slack: must be a mapping"),
+            ({"slack": {"C0X": None}}, r"C0X: must name a profile"),
+            ({"slack": {"C0X": {"model": "haiku"}}}, r"C0X: must name a profile"),
+        ],
+    )
+    def test_a_malformed_table_refuses(
+        self, clean_agent_env, operator_settings, table, message
+    ) -> None:
+        with pytest.raises(SystemExit, match=message):
+            self.check(operator_settings, table)
+
+    def test_unset_or_empty_starts(self, clean_agent_env, operator_settings) -> None:
+        self.check(operator_settings, None)
+        self.check(operator_settings, {})
+        self.check(operator_settings, {"slack": None})
+
+
+class TestChannelProfileLookup:
+    def test_no_channel_never_matches(self, clean_agent_env, operator_settings) -> None:
+        """A frontend that cannot name the channel answers "", which must not
+        match a key someone wrote as an empty string."""
+        write_agent_config(
+            operator_settings,
+            {
+                "profiles": {"triage": {"claude": {"model": "haiku"}}},
+                "channel_profiles": {"slack": {"": "triage"}},
+            },
+        )
+        assert agent.channel_profile("slack", "") is None
+
+
 # ---------------------------------------------------------------------------
 # The runner that resolves it
 # ---------------------------------------------------------------------------

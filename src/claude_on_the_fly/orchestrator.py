@@ -769,16 +769,21 @@ class Orchestrator:
     ) -> agent.AgentProfile:
         """The agent configuration this conversation runs on.
 
-        The resolved global configuration with whatever this conversation pinned
-        on top, which is the one answer a turn, a compaction, and a `$model`
-        report all read. Raises ValueError on a configuration that does not
-        resolve, exactly as `agent.resolve_profile` does: the caller that can
-        tell somebody is the one that should catch it.
+        The resolved base configuration with the account selection and whatever
+        this conversation pinned on top, which is the one answer a turn, a
+        compaction, and a `$model` report all read. Raises ValueError on a
+        configuration that does not resolve, exactly as `agent.resolve_profile`
+        does: the caller that can tell somebody is the one that should catch it.
+
+        Layered in this order, each on top of the last: the global `agent:`
+        block, or the named profile `agent.channel_profiles` maps this channel
+        to; then the account selection; then this conversation's `$model` pin,
+        so a pin made in a mapped channel still wins.
         """
         from claude_on_the_fly import accounts
 
-        profile = agent.resolve_profile()
         channel, user = self._frontend.account_subjects(chat_id)
+        profile = agent.resolve_profile(agent.channel_profile(self._platform, channel))
         chosen = accounts.selection(
             self._platform,
             self.session_uuid(chat_id),
@@ -801,6 +806,8 @@ class Orchestrator:
         """
         try:
             profile = self.current_profile(chat_id)
+            channel, _ = self._frontend.account_subjects(chat_id)
+            channel_profile = agent.channel_profile(self._platform, channel)
         except ValueError as exc:
             return f"I cannot read the agent configuration, so I changed nothing: {exc}"
 
@@ -809,7 +816,9 @@ class Orchestrator:
             return result.text
         if isinstance(result, model_command.Report):
             return model_command.describe(
-                profile, pinned=bool(self._overrides(chat_id))
+                profile,
+                pinned=bool(self._overrides(chat_id)),
+                channel_profile=channel_profile,
             )
 
         self._apply_model_change(chat_id, result.values)

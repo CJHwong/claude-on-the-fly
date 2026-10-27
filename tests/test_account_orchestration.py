@@ -293,3 +293,36 @@ async def test_fallback_updates_idle_profile_to_successful_account(
     assert len(observed) == 1
     assert observed[0].account == "second"
     assert observed[0].model == "replacement-model"
+
+
+@pytest.mark.parametrize(
+    ("account_model", "expected"), [("account-model", "account-model"), (None, "haiku")]
+)
+def test_a_channel_profile_sits_under_the_routed_account(
+    setup_accounts, tmp_path, account_model, expected
+):
+    """The documented layering: channel profile, then account, then pin. A
+    routed account that sets a model wins over the channel's; one that does not
+    leaves the channel's model, and effort always comes from the profile."""
+    config, document = setup_accounts
+    if account_model is not None:
+        document["accounts"]["first"]["model"] = account_model
+    document["agent"] = {
+        "claude": {"model": "opus", "effort": "high"},
+        "profiles": {"triage": {"claude": {"model": "haiku", "effort": "low"}}},
+        "channel_profiles": {"slack": {"1": "triage"}},
+    }
+    config.write_text(yaml.safe_dump(document))
+    instance = Orchestrator(
+        StubFrontend(), "slack", event_log=EventLog(tmp_path / "events")
+    )
+
+    profile = instance.current_profile(1)
+
+    assert (profile.account, profile.model, profile.effort) == (
+        "first",
+        expected,
+        "low",
+    )
+    instance.on_model(1, ["sonnet"])
+    assert instance.current_profile(1).model == "sonnet"
