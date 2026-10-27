@@ -21,6 +21,7 @@ import logging
 from typing import Any, Protocol
 
 from claude_on_the_fly.jobs.core import Result
+from claude_on_the_fly.jobs.failure_text import public_failure_text
 from claude_on_the_fly.slack_mrkdwn import split_blocks
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,11 @@ class SlackThreadNotifier:
             logger.warning("jobs: notify skipped — origin has no channel: %r", origin)
             return
         thread_ts = origin.get("thread_ts")
-        body = result.text if result.ok else f":warning: Job failed\n{result.text}"
+        body = (
+            result.text
+            if result.ok
+            else f":warning: Job failed\n{public_failure_text(result.text)}"
+        )
         blocks = _blocks(body)
         # Post in batches of at most SLACK_MAX_BLOCKS so a large result is
         # delivered across several messages instead of tripping Slack's

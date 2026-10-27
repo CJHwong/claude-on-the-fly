@@ -179,6 +179,83 @@ def test_alert_body_keeps_leading_signals_ahead_of_the_banner() -> None:
     )
 
 
+# Captured from a failed hosted codex turn: the TUI redraw drops the line
+# breaks, so the start screen, the workspace path and the error share one line.
+_TUI_ERROR = (
+    "Error: account/read failed during TUI bootstrap: account/read failed: "
+    "workspace routing discovery timed out (code -32603)"
+)
+_TUI_SCREENS = [
+    ">_ OpenAI Codex (v0.163.0)loading›Ask Codex to do anything?forshortcuts "
+    "~/.claude-on-the-fly/workspaces/cron/sys-x_ACE-1-review-11-1991380",
+    ">_ OpenAI Codex (v0.160.0)loading  Resuming session…›Ask Codex to do "
+    "anything?forshortcuts ~/.claude-on-the-fly/workspaces/slack/channel/C0"
+    "prmissions: YOLO mode  Resuming session…",
+    ">_OpenAI Codex (v0.158.0)loadingWhatarewecookingup?›Ask Codex to do "
+    "anything?forshortcuts ~/.claude-on-the-fly/workspaces/cron/sys-y  "
+    "permissions: YOLO modeWhatarewecookingup?",
+]
+
+
+@pytest.mark.parametrize("screen", _TUI_SCREENS)
+def test_alert_body_keeps_only_the_error_of_a_tui_capture(screen: str) -> None:
+    body = _alert_body(_origin(), _result(f"Job failed: {screen}{_TUI_ERROR}"))
+    assert body == f"cron entry jira failed\nJob failed:\n{_TUI_ERROR}"
+
+
+@pytest.mark.parametrize("screen", _TUI_SCREENS)
+def test_alert_body_tui_capture_without_an_error_points_at_the_log(
+    screen: str,
+) -> None:
+    body = _alert_body(_origin(), _result(f"Job failed: {screen}"))
+    assert body == "cron entry jira failed\nJob failed:\nSee the entry log."
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        # The pane tail keeps up to 40 rows, so the footer can follow the error.
+        (
+            ">_ OpenAI Codex (v0.163.0)\nError: account/read failed\n› Ask Codex"
+            "\n  ~/.claude-on-the-fly/workspaces/cron/r1  permissions: YOLO mode",
+            "Error: account/read failed",
+        ),
+        # An error that quotes another keeps its cause.
+        (
+            ">_ OpenAI Codex (v0.163.0)loading  permissions: YOLO mode"
+            "Error: account/read failed: Error: 401 Unauthorized",
+            "Error: account/read failed: Error: 401 Unauthorized",
+        ),
+        # The 2000-character tail can cut the screen's header off.
+        (
+            "Codex (v0.163.0)loading›Ask Codex to do anything?forshortcuts "
+            "~/.claude-on-the-fly/workspaces/cron/r1  permissions: YOLO modeError: x",
+            "Error: x",
+        ),
+        (
+            ">_ OpenAI Codex (v0.163.0)loading  permissions: YOLO mode"
+            "■ stream error: 429 Too Many Requests",
+            "error: 429 Too Many Requests",
+        ),
+    ],
+)
+def test_alert_body_tui_capture_edge_shapes(text: str, error: str) -> None:
+    body = _alert_body(_origin(), _result(f"Job failed: {text}"))
+    assert body.endswith(f"\n{error}")
+    for leak in ("workspaces", "YOLO", "Ask Codex"):
+        assert leak not in body
+
+
+def test_alert_body_keeps_leading_signals_ahead_of_a_tui_capture() -> None:
+    notes = "\n- no task_complete, last event was reasoning"
+    text = f"Job failed:{notes}\n{_TUI_SCREENS[0]}{_TUI_ERROR}"
+    body = _alert_body(_origin(), _result(text))
+    assert body == (
+        "cron entry jira failed\n"
+        f"Job failed:\n- no task_complete, last event was reasoning\n{_TUI_ERROR}"
+    )
+
+
 @pytest.mark.parametrize(
     ("text", "detail"),
     [

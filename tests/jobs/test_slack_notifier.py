@@ -67,6 +67,37 @@ async def test_failure_result_is_marked() -> None:
     assert "stack trace" in kwargs["blocks"][0]["text"]
 
 
+async def test_failure_drops_a_codex_tui_capture() -> None:
+    """The origin thread can be a public channel, and the start screen names
+    the host's workspace path and its permission mode."""
+    client = _client()
+    notifier = SlackThreadNotifier(client)
+    text = (
+        "Job failed: >_ OpenAI Codex (v0.163.0)loading›Ask Codex to do "
+        "anything?forshortcuts ~/.claude-on-the-fly/workspaces/slack/channel/C0"
+        "permissions: YOLO modeError: account/read failed"
+    )
+    await notifier.notify({"channel": "C1"}, Result(ok=False, text=text))
+    rendered = client.chat_postMessage.call_args.kwargs["blocks"][0]["text"]
+    assert "Error: account/read failed" in rendered
+    for leak in ("workspaces", "YOLO", "OpenAI Codex"):
+        assert leak not in rendered
+
+
+async def test_failure_drops_the_codex_exec_banner() -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client)
+    text = (
+        "Job failed: OpenAI Codex v0.154.0\n--------\nworkdir: /Users/h/ws\n"
+        "sandbox: danger-full-access\n--------\nERROR: boom"
+    )
+    await notifier.notify({"channel": "C1"}, Result(ok=False, text=text))
+    rendered = client.chat_postMessage.call_args.kwargs["blocks"][0]["text"]
+    assert "ERROR: boom" in rendered
+    for leak in ("workdir", "/Users/h/ws", "danger-full-access"):
+        assert leak not in rendered
+
+
 async def test_no_channel_skips_post() -> None:
     client = _client()
     notifier = SlackThreadNotifier(client)
