@@ -24,6 +24,7 @@ import httpx
 from telegram.helpers import escape_markdown
 
 from claude_on_the_fly.jobs.core import Result
+from claude_on_the_fly.jobs.failure_text import SEE_THE_LOG, public_failure_text
 from claude_on_the_fly.jobs.slack_notifier import (
     _blocks,
     _fallback_text,
@@ -46,9 +47,6 @@ ALERT_BODY_LIMIT = 500
 TELEGRAM_API_TIMEOUT_S = 10.0
 
 
-# What a reader gets when the failure text says nothing on its own.
-SEE_THE_LOG = "See the entry log."
-
 # Terminal control sequences. A hosted turn's failure text is a pane capture,
 # which keeps the TUI's colors and cursor moves; a chat surface prints them as
 # `[39;49m[K` garbage. CSI, OSC (bounded to its own line, the same rule as
@@ -58,50 +56,16 @@ _ESCAPE = re.compile(
 )
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
-# `codex exec` writes this banner to stderr before anything else, and the
-# backend raises that stderr on a failing exit. It names the workspace path, the
-# sandbox mode and the session id, none of which belong in a monitoring
-# channel. Shape measured on codex 0.154.0.
-_CODEX_BANNER = re.compile(
-    r"(?:Reading additional input from stdin\.\.\.\n)?"
-    r"OpenAI Codex v\S+[^\n]*\n-{4,}\n(?:[^\n]*\n)*?-{4,}\n"
-)
-# After the banner codex echoes the whole prompt under a `user` line, with no
-# closing delimiter. The echo ends at the first line codex itself writes.
-_CODEX_NARRATION = re.compile(
-    r"^(?:thinking|codex|exec|tokens used|(?:ERROR|warning|hook|mcp startup):.*)$",
-    re.MULTILINE,
-)
 _BARE_EXIT = re.compile(
     r"(?:command exited|Job failed: Exit code) (-?\d+)((?: \([^\n]*\))?)"
 )
-
-
-def _without_codex_banner(text: str) -> str:
-    """Drop the banner and the prompt echo, keep what codex said after them.
-
-    Only the failure lines are kept when there are any: the warnings and hook
-    lines before them would otherwise use the whole character budget.
-    """
-    match = _CODEX_BANNER.search(text)
-    if match is None:
-        return text
-    head = text[: match.start()].rstrip()
-    rest = text[match.end() :]
-    if rest.startswith("user\n"):
-        narration = _CODEX_NARRATION.search(rest, len("user\n"))
-        rest = rest[narration.start() :] if narration else ""
-    errors = [line for line in rest.splitlines() if line.startswith("ERROR:")]
-    if errors:
-        rest = "\n".join(dict.fromkeys(errors))
-    return "\n".join(part for part in (head, rest.strip() or SEE_THE_LOG) if part)
 
 
 def _failure_detail(text: str) -> str:
     """The failure text made readable, then capped. Cleaning comes first so
     escape bytes and the banner do not spend the budget."""
     detail = _CONTROL.sub("", _ESCAPE.sub("", text))
-    detail = _without_codex_banner(detail).strip()
+    detail = public_failure_text(detail).strip()
     bare = _BARE_EXIT.fullmatch(detail)
     if bare:
         return f"Exited with code {bare[1]}{bare[2]}. {SEE_THE_LOG}"
