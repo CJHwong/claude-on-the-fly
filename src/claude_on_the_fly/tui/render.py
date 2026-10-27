@@ -227,6 +227,23 @@ def _format_extra_notes(extra: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def health_notes(extra: dict) -> list[str]:
+    """Warnings a chat daemon reports while its process and heartbeat look fine.
+
+    The daemon stays up when its message handler raises, so the state glyph
+    alone shows a daemon that fails every message as healthy.
+    """
+    notes = []
+    handler = extra.get("handler")
+    failures = handler.get("failures") if isinstance(handler, dict) else 0
+    if isinstance(failures, int) and failures > 0:
+        notes.append(f"{failures} handler failure(s)")
+    canary = extra.get("canary")
+    if isinstance(canary, dict) and canary.get("ok") is False:
+        notes.append("canary failed")
+    return notes
+
+
 def _state_markup(state: str) -> str:
     glyph = _STATE_GLYPH.get(state, "?")
     style = _STATE_STYLES.get(state, "")
@@ -326,20 +343,25 @@ def chat_header(frontends: list[FrontendStatus], selected: int, active: int) -> 
         if f.last_heartbeat_age_s is not None:
             parts.append(f"[dim]hb {fmt_age(f.last_heartbeat_age_s)}[/dim]")
         parts.append(f"{active} active" if active else "[dim]idle[/dim]")
+        parts.extend(f"[bold red]{note}[/]" for note in health_notes(f.extra))
         return f"[bold]{f.name}[/bold]  " + "  ·  ".join(parts)
 
     cells = []
     for i, f in enumerate(frontends):
         glyph = _STATE_GLYPH.get(f.state, "?")
         suffix = "" if f.state == "running" else f.state
+        warning = ", ".join(health_notes(f.extra))
         if i == selected:
             body = f"{f.name} {glyph}" + (f" {suffix}" if suffix else "")
+            body += f" {warning}" if warning else ""
             cells.append(f"[reverse] {body} [/reverse]")
         else:
             style = _STATE_STYLES.get(f.state, "")
             cell = f"{f.name} [{style}]{glyph}[/]" if style else f"{f.name} {glyph}"
             if suffix:
                 cell += f" [dim]{suffix}[/dim]"
+            if warning:
+                cell += f" [bold red]{warning}[/]"
             cells.append(cell)
     line = "[bold]CHAT[/bold]  " + "  ·  ".join(cells)
     line += f"  ·  {active} active" if active else "  ·  [dim]idle[/dim]"
@@ -358,7 +380,9 @@ def frontends_table(frontends: list[FrontendStatus], now: datetime) -> Table:
     for f in frontends:
         notes = f.error or ""
         if not notes and f.extra:
-            notes = _format_extra_notes(f.extra)
+            notes = ", ".join(
+                filter(None, [_format_extra_notes(f.extra), *health_notes(f.extra)])
+            )
         table.add_row(
             f.name,
             state_cell(f.state),

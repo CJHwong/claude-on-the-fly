@@ -14,6 +14,7 @@ import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from claude_on_the_fly import (
@@ -58,6 +59,8 @@ from claude_on_the_fly.events import (
 )
 from claude_on_the_fly.heartbeat import HeartbeatWriter
 from claude_on_the_fly.interim import InterimProgress, interim_progress_enabled
+from claude_on_the_fly.jobs.alerts import ALERT_COOLDOWN_S, build_alert_sink
+from claude_on_the_fly.jobs.core import Result
 from claude_on_the_fly.jobs.orphans import ProcessLedger
 from claude_on_the_fly.protocol import Frontend
 from claude_on_the_fly.turns import PendingTurn, TurnJournal, new_turn_id
@@ -161,6 +164,17 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 # under the supervisor's safe grace (`supervisor.SAFE_GRACE_S`) so the notices
 # finish inside the window rather than being cut off by the SIGKILL that ends it.
 SHUTDOWN_NOTICE_BUDGET_S = 8.0
+
+# The startup canary: one real agent turn, judged by its reply.
+CANARY_PROMPT = "Reply with exactly the word PONG and nothing else."
+CANARY_TIMEOUT_S = 180.0
+CANARY_DETAIL_LIMIT = 300
+
+
+def _utc_now_iso() -> str:
+    """The heartbeat's own timestamp format, so the dashboard parses one shape."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 # Prepended to a resumed turn whose agent had already started before the daemon
 # stopped. The turn is replayed rather than handed back, because somebody asked
@@ -565,7 +579,17 @@ class Orchestrator:
         egress_manager: SessionEgress | None = None,
         permissions_manager: SessionPermissions | None = None,
         command_broker: commands.CommandBroker | None = None,
+        alert_sink: Any | None = None,
     ) -> None:
+        # None when no alert target is configured: failures stay in the log.
+        self._alert_sink = alert_sink
+        # The frontend's message handler can fail while the daemon stays up and
+        # its heartbeat stays fresh. These are the only record of that state.
+        self._handler_failures = 0
+        self._last_handler_error: dict[str, str] | None = None
+        self._last_handled_at: str | None = None
+        self._last_handler_alert_at: float | None = None
+        self._canary: dict[str, Any] | None = None
         # None when sandboxing is off: no proxy, no per-session env, and the
         # spawn sites behave exactly as they did before any of this existed.
         self._egress = egress_manager
@@ -1591,10 +1615,127 @@ class Orchestrator:
         # Queued turns live only in this process's memory, so the heartbeat is
         # the one place an outside reader can learn they exist. The supervisor
         # needs that to say what a stop is about to cost before it signals.
-        return {
+        extra: dict[str, Any] = {
             "running_jobs": running_jobs,
             "queued_turns": sum(queue.qsize() for queue in self._queues.values()),
+            "handler": {
+                "failures": self._handler_failures,
+                "last_error": self._last_handler_error,
+                "last_handled_at": self._last_handled_at,
+            },
         }
+        # Absent until a canary runs: `claude-tui status` prints scalar extras,
+        # and a None here would read as `canary=None` on every row.
+        if self._canary is not None:
+            extra["canary"] = self._canary
+        return extra
+
+    def note_handler_success(self) -> None:
+        """The frontend handled one inbound event without raising."""
+        self._last_handled_at = _utc_now_iso()
+
+    async def note_handler_failure(self, error: BaseException) -> None:
+        """Count a message handler that raised, and alert the operator.
+
+        The platform library catches the error, so the daemon looks healthy
+        while every message fails. On 2026-10-27, 52 messages failed over ten
+        hours and left only a log line.
+
+        One alert per cooldown window, not one per failure. The alert target can
+        be a conversation this daemon serves, and then each alert arrives as a
+        new message; with a broken handler that message fails too and would
+        alert again, forever. The count in the heartbeat keeps every failure.
+        """
+        self._handler_failures += 1
+        detail = f"{type(error).__name__}: {error}"
+        self._last_handler_error = {"at": _utc_now_iso(), "error": detail}
+        now = time.monotonic()
+        last = self._last_handler_alert_at
+        if last is not None and now - last < ALERT_COOLDOWN_S:
+            return
+        self._last_handler_alert_at = now
+        await self._alert_operator(
+            "message handler",
+            f"{detail}\n{self._handler_failures} failure(s) since start.",
+        )
+
+    async def run_canary(self) -> None:
+        """One real agent turn at startup, so a broken agent fails loudly now.
+
+        It proves the backend CLI, its login and the sandbox route to the model
+        in this daemon's own environment. A daemon started outside the login
+        session cannot read the keychain, and then every turn fails. Off unless
+        `<platform>.startup_canary` is set.
+        """
+        flag = settings.get(f"{self._platform.upper()}_STARTUP_CANARY")
+        if flag.strip().lower() not in _TRUTHY:
+            return
+        started = time.monotonic()
+        try:
+            body = await self._canary_turn()
+        except Exception as exc:  # NOT BaseException: a stop must cancel it
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        else:
+            # Exact, not a substring: a reply that echoes the prompt or says
+            # it cannot answer PONG still contains the word.
+            detail = body.strip()
+            ok = detail.rstrip(".!").upper() == "PONG"
+        self._canary = {
+            "ok": ok,
+            "at": _utc_now_iso(),
+            "duration_s": round(time.monotonic() - started, 1),
+            "detail": detail[:CANARY_DETAIL_LIMIT],
+        }
+        if ok:
+            logger.info("canary: agent answered in %.1fs", self._canary["duration_s"])
+            return
+        logger.error("canary: agent turn failed: %s", self._canary["detail"])
+        await self._alert_operator("startup canary", self._canary["detail"])
+
+    async def _canary_turn(self) -> str:
+        """The canary's agent run, with the per-turn sandbox route it needs.
+
+        One session for every start, so restarts do not pile up a transcript
+        and an account selection each. It grows by one exchange per start.
+        """
+        profile = agent.resolve_profile()
+        workspace = workspace_path(f"{self._platform}/canary", DATA_DIR)
+        workspace.mkdir(parents=True, exist_ok=True)
+        overrides = sandbox.model_endpoint_env(profile.mode)
+        relay: sandbox.SessionRelay | None = None
+        env_token = None
+        try:
+            relay = await sandbox.open_session_relay(overrides, "canary")
+            env_token = sandbox.session_env(overrides) if overrides else None
+            response = await agent.run(
+                workspace,
+                str(uuid5(NAMESPACE_URL, f"{self._platform}/canary")),
+                CANARY_PROMPT,
+                self._platform,
+                channel_context="startup canary",
+                timeout=CANARY_TIMEOUT_S,
+                profile=profile,
+            )
+        finally:
+            if env_token is not None:
+                sandbox.reset_session_env(env_token)
+            if relay is not None:
+                await relay.close()
+        return response.body
+
+    async def _alert_operator(self, what: str, detail: str) -> None:
+        """Send one daemon failure to the configured alert target, if any.
+
+        A failed alert is logged and dropped. The log and the heartbeat still
+        hold the failure.
+        """
+        if self._alert_sink is None:
+            return
+        origin = {"kind": "daemon", "entry": f"{self._platform} {what}"}
+        try:
+            await self._alert_sink.alert(origin, Result(ok=False, text=detail))
+        except Exception:
+            logger.exception("alerts: could not deliver the %s alert", what)
 
     def interrupted_chats(self) -> dict[int, tuple[bool, int]]:
         """chat_id -> (a turn is running, how many turns wait behind it).
@@ -2030,6 +2171,7 @@ async def run(frontend: Frontend, platform: str) -> None:
             egress_manager=session_egress,
             permissions_manager=session_permissions,
             command_broker=command_broker,
+            alert_sink=build_alert_sink(settings.environment(), cron_only=False),
         )
         frontend.set_orchestrator(orch)
 
@@ -2050,6 +2192,9 @@ async def run(frontend: Frontend, platform: str) -> None:
         await orch.resume_pending()
 
         frontend_task = asyncio.create_task(frontend.start(orch.on_message))
+        # Beside the listener, not before it: a slow agent must not hold back
+        # the messages that are already arriving.
+        canary_task = asyncio.create_task(orch.run_canary())
         logger.info("Running (%s). Ctrl+C to stop.", platform)
 
         await stop.wait()
@@ -2063,8 +2208,13 @@ async def run(frontend: Frontend, platform: str) -> None:
         # Before `orch.shutdown`, so no idle compaction is queued behind a stop.
         idle_task.cancel()
         frontend_task.cancel()
+        canary_task.cancel()
         await asyncio.gather(
-            heartbeat_task, idle_task, frontend_task, return_exceptions=True
+            heartbeat_task,
+            idle_task,
+            frontend_task,
+            canary_task,
+            return_exceptions=True,
         )
         await orch.shutdown()
         await frontend.stop()

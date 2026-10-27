@@ -554,6 +554,29 @@ class TestIngestEvent:
         await frontend._ingest_event(dict(event))
         frontend._on_message.assert_awaited_once()
 
+    async def test_a_handled_event_is_reported_to_the_orchestrator(self, frontend):
+        frontend._orchestrator = MagicMock()
+        frontend._orchestrator.note_handler_failure = AsyncMock()
+        event = {
+            "ts": "200.0",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ALLOWED",
+            "text": "one request",
+        }
+
+        with (
+            patch.object(frontend, "_identify_session", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            await frontend._ingest_event(dict(event))
+        frontend._orchestrator.note_handler_success.assert_not_called()
+        (error,) = frontend._orchestrator.note_handler_failure.await_args.args
+        assert isinstance(error, RuntimeError)
+
+        await frontend._ingest_event(dict(event))
+        frontend._orchestrator.note_handler_success.assert_called_once_with()
+
     async def test_different_event_runs_during_slow_ingestion(self, frontend):
         event = {
             "ts": "200.0",
@@ -7894,3 +7917,71 @@ class TestRefusalsAreTraceable:
             SlackFrontend._skip(True, "already processed ts=%s", "100%s.5")
 
         assert "ts=100%s.5" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Handler failures
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerFailures:
+    async def test_a_failure_before_the_orchestrator_is_set_still_raises(
+        self, frontend
+    ):
+        event = {"ts": "1.0", "channel": "D1", "user": "U_ALLOWED", "text": "hi"}
+        with (
+            patch.object(frontend, "_process_event", side_effect=NameError("x")),
+            pytest.raises(NameError),
+        ):
+            await frontend._ingest_event(event)
+
+    async def test_bolt_still_logs_and_the_orchestrator_hears(
+        self, monkeypatch, caplog
+    ):
+        """A real AsyncApp: the re-raise must reach Bolt's own log line."""
+        from slack_bolt.request.async_request import AsyncBoltRequest
+        from slack_sdk.web.async_slack_response import AsyncSlackResponse
+
+        # Bolt authorizes each request with auth.test on a client it builds per
+        # request, so the answer has to be patched on the class to stay offline.
+        auth = AsyncSlackResponse(
+            client=None,
+            http_verb="POST",
+            api_url="https://slack.com/api/auth.test",
+            req_args={},
+            data={"ok": True, "user_id": "U_SELF", "team_id": "T1"},
+            headers={},
+            status_code=200,
+        )
+        monkeypatch.setattr(
+            "slack_sdk.web.async_client.AsyncWebClient.auth_test",
+            AsyncMock(return_value=auth),
+        )
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        frontend._orchestrator = MagicMock()
+        frontend._orchestrator.note_handler_failure = AsyncMock()
+        broken = NameError("name 'event_origin' is not defined")
+        monkeypatch.setattr(frontend, "_process_event", AsyncMock(side_effect=broken))
+
+        @frontend._app.event({"type": "message"})
+        async def handle_message(event):
+            await frontend._ingest_event(event)
+
+        body = {
+            "type": "event_callback",
+            "team_id": "T1",
+            "event": {"type": "message", "channel": "D1", "user": "U1", "ts": "1.0"},
+        }
+        await frontend._app.async_dispatch(
+            AsyncBoltRequest(body=body, mode="socket_mode")
+        )
+        for _ in range(50):
+            if "Failed to run listener function" in caplog.text:
+                break
+            await asyncio.sleep(0.01)
+
+        frontend._orchestrator.note_handler_failure.assert_awaited_once_with(broken)
+        assert (
+            "Failed to run listener function "
+            "(error: name 'event_origin' is not defined)" in caplog.text
+        )

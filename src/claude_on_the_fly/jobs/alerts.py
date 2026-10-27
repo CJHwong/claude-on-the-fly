@@ -117,8 +117,12 @@ def _alert_body(origin: Mapping[str, Any], result: Result) -> str:
     lines. The header is the part that must survive truncation.
 
     The header stays plain `cron entry <entry> failed`. Operators match on the
-    Slack line starting `:x: cron`, so no markup may sit before the word."""
+    Slack line starting `:x: cron`, so no markup may sit before the word. A
+    daemon's own failure (kind `daemon`) is not a cron entry and must not match
+    that line, so it names itself instead."""
     entry = origin.get("entry") or "?"
+    if origin.get("kind") == "daemon":
+        return f"{entry} failed\n{_failure_detail(result.text)}"
     return f"cron entry {entry} failed\n{_failure_detail(result.text)}"
 
 
@@ -283,13 +287,16 @@ class CronOriginAlertSink:
         await self._inner.alert(origin, result, repeat=repeat)
 
 
-def build_alert_sink(env: Mapping[str, str]) -> Any | None:
+def build_alert_sink(env: Mapping[str, str], *, cron_only: bool = True) -> Any | None:
     """The configured alert sink, or None when no target is configured.
 
     Opt-in: with neither `slack.alert_target` nor `telegram.alert_target` set,
     nothing is built and failures stay where they always were (the entry's
     log). A target with no token is skipped with a warning rather than built
     broken — the doctor check names the same condition.
+
+    `cron_only=False` is for a chat daemon alerting its own failures: those
+    have no thread to reply into, so the cron-origin filter would drop them.
     """
     sinks: list[Any] = []
     channel = env.get("SLACK_ALERT_TARGET", "").strip()
@@ -321,4 +328,7 @@ def build_alert_sink(env: Mapping[str, str]) -> Any | None:
             )
     if not sinks:
         return None
-    return CooldownAlertSink(CronOriginAlertSink(MultiAlertSink(sinks)))
+    sink: Any = MultiAlertSink(sinks)
+    if cron_only:
+        sink = CronOriginAlertSink(sink)
+    return CooldownAlertSink(sink)

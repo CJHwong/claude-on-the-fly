@@ -2719,8 +2719,17 @@ class SlackFrontend(Frontend):
         self._ingesting_events.add(event_key)
         try:
             await self._process_event(event)
+        except Exception as exc:
+            # Bolt catches this and keeps the daemon up, so a handler bug fails
+            # every message in silence. Report it, then re-raise so Bolt still
+            # logs its own line for the watchers that match it.
+            if self._orchestrator is not None:
+                await self._orchestrator.note_handler_failure(exc)
+            raise
         finally:
             self._ingesting_events.remove(event_key)
+        if self._orchestrator is not None:
+            self._orchestrator.note_handler_success()
 
     async def _process_event(self, event: dict) -> None:
         subtype = event.get("subtype")

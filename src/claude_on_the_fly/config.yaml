@@ -653,7 +653,12 @@ slack:
   # Trigger and queue are constructed at Slack startup, so changing it needs a restart.
   # job_command: "$job"
   # Failure-alert target: a Slack channel or DM id. Unset = no alerts. Needs a restart.
+  # Gets cron and job failures, and this daemon's own: a message handler that
+  # raises, or a startup canary that fails.
   # alert_target: C0123456789
+  # Run one real agent turn at startup and alert if it does not answer PONG.
+  # Proves the agent CLI and its login work from this daemon. Costs one turn per start.
+  # startup_canary: false
 
   # Threads retained before LRU eviction, turns per thread before the $continue gate;
   # seconds a gate notice is held (0 posts now), seconds a "tag me" notice waits (0 = never).
