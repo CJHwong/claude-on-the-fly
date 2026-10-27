@@ -369,13 +369,17 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 
 ## `slack`
 
-Slack keeps a bounded watermark for the 50 most recently active conversations.
-After a daemon restart, the initial Socket Mode connection scans conversations
-whose last processed message was within the previous hour, using the same
-20-message-per-conversation catch-up already used for an in-process reconnect.
+Slack keeps a bounded watermark for the 100 most recently active conversations,
+where a thread COTF answered in counts as its own conversation. After a daemon
+restart, the initial Socket Mode connection scans conversations whose last
+processed message was within the previous 24 hours, using the same catch-up an
+in-process reconnect uses: channel history and thread replies, paged to the end,
+oldest first, at most 500 messages per scan. The same scan first retries
+messages whose handler raised before they reached the agent
+(`state/slack.failed_events.json`, up to 100 events, kept for 24 hours).
 The processed-event ledger discards Slack redeliveries, so a message found by
 both paths still runs once. This is deliberately recent-conversation recovery,
-not an unbounded workspace history replay.
+not an unbounded workspace history replay. None of these bounds is a setting.
 
 | Key | Type / default | Effect | Lifecycle |
 |---|---|---|---|

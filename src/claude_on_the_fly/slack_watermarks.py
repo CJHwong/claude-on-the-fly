@@ -6,6 +6,10 @@ could not ask Slack for messages sent while the daemon was down.  This module
 persists the same small map; it is intentionally not a workspace-wide history
 index.
 
+A conversation is a channel or one thread in it.  Slack's history call does not
+return thread replies, and most traffic here is thread replies, so a thread the
+daemon has answered in keeps its own entry beside its channel's.
+
 Both dimensions are bounded.  Only the most recently active conversations are
 kept, and callers only restore entries whose Slack timestamp is recent.  A long
 outage therefore cannot turn startup into an unbounded burst of history calls or
@@ -24,11 +28,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Matches the processed-event ledger's 1,000-entry cap at the existing
-# 20-message history limit: even a maximally full startup scan stays within the
-# durable dedupe window.
-DEFAULT_CAPACITY = 50
-DEFAULT_MAX_AGE_SECONDS = 3600.0
+# Catch-up pages through every new message, so the entry count no longer bounds
+# how many messages one scan ingests. MAX_CATCHUP_MESSAGES does that, and it
+# stays at half the processed-event ledger's 1,000-entry cap
+# (`event_dedupe.DEFAULT_CAPACITY`): a full scan cannot push out the ids that
+# dedupe its own replays, and the other half is left for COTF's own posted
+# timestamps and the live events that arrive during the scan. The entry count
+# now bounds the Slack calls instead, at least one per entry, and thread
+# entries share it with channel entries.
+DEFAULT_CAPACITY = 100
+MAX_CATCHUP_MESSAGES = 500
+# A day, not an hour. A handler bug or a stopped daemon can last a working day
+# (the 2026-10-27 incident ran ten hours), and an hour-old cutoff dropped every
+# conversation from the restart scan. The message cap above still bounds the
+# replay, so the wider window cannot turn into an unbounded burst.
+DEFAULT_MAX_AGE_SECONDS = 24 * 3600.0
 
 
 @dataclass(frozen=True)
@@ -36,6 +50,8 @@ class SlackWatermark:
     channel: str
     ts: str
     channel_type: str = ""
+    # "" is the channel itself; a timestamp is one thread in it.
+    thread_ts: str = ""
 
 
 def _event_time(value: str) -> float | None:
@@ -52,7 +68,7 @@ class SlackWatermarks:
     def __init__(self, path: Path, *, capacity: int = DEFAULT_CAPACITY) -> None:
         self._path = path
         self._capacity = capacity
-        self._entries: OrderedDict[str, SlackWatermark] = OrderedDict()
+        self._entries: OrderedDict[tuple[str, str], SlackWatermark] = OrderedDict()
         self._load()
 
     def _load(self) -> None:
@@ -75,41 +91,59 @@ class SlackWatermarks:
             channel = row.get("channel")
             event_ts = row.get("ts")
             channel_type = row.get("channel_type", "")
+            # Absent in files written before thread entries existed.
+            thread_ts = row.get("thread_ts", "")
             if (
                 not isinstance(channel, str)
                 or not channel
                 or not isinstance(event_ts, str)
                 or _event_time(event_ts) is None
                 or not isinstance(channel_type, str)
+                or not isinstance(thread_ts, str)
+                or (thread_ts and _event_time(thread_ts) is None)
             ):
                 continue
-            self._entries[channel] = SlackWatermark(
-                channel=channel, ts=event_ts, channel_type=channel_type
+            key = (channel, thread_ts)
+            self._entries[key] = SlackWatermark(
+                channel=channel,
+                ts=event_ts,
+                channel_type=channel_type,
+                thread_ts=thread_ts,
             )
-            self._entries.move_to_end(channel)
+            self._entries.move_to_end(key)
             while len(self._entries) > self._capacity:
                 self._entries.popitem(last=False)
 
     def __len__(self) -> int:
         return len(self._entries)
 
-    def record(self, channel: str, event_ts: str, channel_type: str = "") -> None:
+    def record(
+        self,
+        channel: str,
+        event_ts: str,
+        channel_type: str = "",
+        *,
+        thread_ts: str = "",
+    ) -> None:
         """Advance one conversation without ever moving its timestamp backward."""
         candidate_time = _event_time(event_ts)
         if not channel or candidate_time is None:
             return
-        current = self._entries.get(channel)
+        if thread_ts and _event_time(thread_ts) is None:
+            return
+        key = (channel, thread_ts)
+        current = self._entries.get(key)
         if current is not None:
             current_time = _event_time(current.ts)
             if current_time is not None and candidate_time < current_time:
                 event_ts = current.ts
             if not channel_type:
                 channel_type = current.channel_type
-        entry = SlackWatermark(channel, event_ts, channel_type)
+        entry = SlackWatermark(channel, event_ts, channel_type, thread_ts)
         if current == entry:
             return
-        self._entries[channel] = entry
-        self._entries.move_to_end(channel)
+        self._entries[key] = entry
+        self._entries.move_to_end(key)
         while len(self._entries) > self._capacity:
             self._entries.popitem(last=False)
         self._save()

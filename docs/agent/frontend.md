@@ -140,6 +140,60 @@ produces work whose reply belongs somewhere other than the caller, it is a
 producer: emit `Job`s and let the worker run them. Ask before making it a
 `Frontend`.
 
+## Slack catch-up
+
+`SlackFrontend._catchup` runs on every Socket Mode `hello`, the first one after a
+start included. It has three inputs:
+
+| Input | Source | Read with |
+|---|---|---|
+| Failed events | `slack_failed_events.py`, `state/slack.failed_events.json` | Replayed through `_ingest_event`, oldest first |
+| Channel positions | `_active_channels`, restored from `state/slack.watermarks.json` | `conversations.history` |
+| Thread positions | `_active_threads`, same file, entries with a `thread_ts` | `conversations.replies`, root skipped |
+
+`_on_socket_message` is a Socket Mode client message listener, because Bolt never
+dispatches the `hello` frame to `app.event`. It stores `connection_info.app_id` and
+runs `_on_hello` as `_hello_task`. The SDK already runs each frame's listeners under
+`ensure_future`, so the task is not there to unblock frames. It is there so `stop()`
+can cancel a long scan, and its done callback logs a failure that nothing else reads.
+
+**Positions.** History never returns thread replies, so a message with a `thread_ts`
+(a root included, since COTF answers a root in a thread) moves its thread's position.
+Only a top-level message (no `thread_ts`, or `thread_ts == ts`) moves the channel's
+position. If a reply moved the channel, a live reply that lands during catch-up would
+push the channel past a top-level message the outage missed. These live-path moves
+happen for a message that is processed, for `$stop`, and for a gated message. A gated
+message moves its position but stays unprocessed, so the Continue button can still
+replay it.
+
+**One scan.**
+1. Catch-up builds its targets only from positions inside the 24-hour restore window.
+   It drops older positions from memory.
+2. One scan ingests at most `slack_watermarks.MAX_CATCHUP_MESSAGES` (500). That is half
+   the processed-event ledger, so a scan cannot push out the ids that dedupe it.
+3. A channel or thread stops paging once it holds more than the remaining budget.
+4. With only `oldest` set, Slack gives the oldest page first for both history and
+   replies (checked live; history lists each page newest first). Stopping early
+   therefore keeps the oldest messages, and the position never passes an unread one.
+5. Catch-up moves the position of the channel or thread it reads past every message
+   it reads: one that ran, was skipped, was gated, or raised. The next scan therefore
+   continues past the cap instead of re-reading the same skipped messages.
+6. Catch-up alone skips a post by this app: an `app_id` or `bot_profile.app_id` equal to
+   the `hello` app id, or, under a bot token, `user == _user_id`. The ledger and
+   `_our_sent_timestamps` roll over, and the worker's job results never enter this
+   process's ledger. Live delivery keeps Bolt's own self-event filter.
+
+**The processed mark is the line between retry and no retry.** The message path marks
+`ts` processed just before `self._on_message`, after the turn text is built. The
+command paths (`$stop`, `$compact`, `$model`, `$job`, the bot gate) mark first, on
+purpose: an unmarked `$stop` was re-read at every reconnect and aborted the next turn.
+When `_process_event` raises, `_keep_failed_event` stores the raw event only if `ts` is
+not marked: nothing with a side effect ran, so a replay cannot run anything twice. A
+marked `ts` is logged and not stored. A stored event is dropped after 24 hours, not after a number
+of attempts: the socket reconnects several times in a long outage, each reconnect
+replays the store, and a cap would spend the attempts before the fix ships. A raise inside
+catch-up is logged and the scan moves on; `_ingest_event` has already stored it.
+
 ## Recovery after a stop
 
 `turns.py` is the durable half. A turn is journaled when it is *accepted*, so the

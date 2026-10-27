@@ -118,11 +118,22 @@ next one without a restart.
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
 - Each thread = one Claude session. All threads of a DM, group DM or channel share one working directory and one conversation memory (`memory/notes.md` in that directory), on top of the per-person memory
 - The app must be invited to private channels (`/invite @your-app-name`)
-- A restart reloads recent active-conversation watermarks and asks Slack history
-  for messages sent while Socket Mode was down. The scan is bounded to the 50
-  most recently active conversations, one hour of history, and 20 messages per
-  conversation; Slack redeliveries are deduplicated against the same durable
-  processed-event ledger.
+- A restart reloads recent active-conversation watermarks and asks Slack for
+  messages sent while Socket Mode was down: channel history, plus the replies
+  in each thread COTF answered in. The scan covers the 100 most recently active
+  conversations and threads, 24 hours of history, and at most 500 messages in
+  one scan, oldest first. Past that cap it logs a warning, and the next
+  catch-up continues where this one stopped. Catch-up skips the posts made by
+  this app, including job results. Slack redeliveries are deduplicated against
+  the same durable processed-event ledger.
+- A message held back by the reply limit is not re-read by a later catch-up,
+  so a restart never runs it without Continue. The Continue backlog lives in
+  memory, so after a restart send the message again. A `$stop` runs once and
+  is not re-read either.
+- A message whose handler raises before Claude gets it is kept in
+  `state/slack.failed_events.json` and retried at the next catch-up, including
+  the first connection after a restart. It is retried at every catch-up until it
+  goes through, and dropped with a warning in the log after 24 hours.
 
 See the [`slack` reference](../reference/config-yaml.md#slack) for every field.
 
